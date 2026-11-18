@@ -1321,18 +1321,29 @@ const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
 const ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT: f32 = COMPOSER_SURFACE_MIN_HEIGHT + 24.0;
 const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
-/// The slim composer's height: the input line plus one tight control row. The
-/// full box reserves two text rows, a stacked trailing column and a padded
-/// control row under them, which is what made it tower over a split pane.
-const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 64.0;
+/// The one-line composer is a single row: the input line and its controls
+/// share it, so the surface is one control's height plus the row's insets
+/// and hairlines (6 + 32 + 6 + 2). The multi-row box keeps the taller chrome
+/// it always had; the difference between the two is what the height morph
+/// glides across.
+const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 46.0;
 /// One text line plus the row's own breathing room.
 const COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT: f32 = 26.0;
 const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 16.0;
 /// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
 /// a one-line bar reads as a pill, so its padding is tighter.
 const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
+/// The multi-row box grows with its draft: each wrapped line adds one line
+/// advance to the surface, from the two-row floor it always reserved up to
+/// the input's own row cap, past which the textarea scrolls inside.
+const COMPOSER_INPUT_LINE_HEIGHT: f32 = 22.0;
+const COMPOSER_INPUT_MAX_ROWS: usize = 8;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
+/// The run-options column docked beside the model list: reasoning levels,
+/// conversation modes and feature toggles live here instead of as separate
+/// chips on the composer, so one panel owns the whole run configuration.
+const COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH: f32 = 200.0;
 /// One sign-in method row in the runtime authentication submenu. The loading
 /// placeholder reads the same figure, so the list does not resize under it.
 const RUNTIME_AUTH_METHOD_ROW_HEIGHT: f32 = 48.0;
@@ -2362,7 +2373,6 @@ struct SessionToolState {
 #[derive(Debug, Clone)]
 enum RuntimeChoiceMenuAction {
     NewSession(SessionRuntimeSelection),
-    ActiveSession(SessionRuntimeSelection),
     Feature {
         target: RuntimeFeatureTarget,
         feature_id: String,
@@ -4165,6 +4175,23 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
         return wrapped;
     }
     text.lines().count().max(1)
+}
+
+/// The height the composer surface asks for, before the morph glides to it.
+///
+/// A one-line draft is a single-row bar. Past one line the box grows with the
+/// draft — one line advance per wrapped row — starting from the two-row floor
+/// it always reserved and stopping at the input's own row cap, where the
+/// textarea starts scrolling inside a fixed surface. An expanded composer
+/// fills its parent instead and asks for no height of its own.
+fn composer_surface_height(density: ComposerDensity, wrapped_rows: usize) -> f32 {
+    match density {
+        ComposerDensity::Slim => COMPOSER_SLIM_SURFACE_HEIGHT,
+        ComposerDensity::Full => {
+            let rows = wrapped_rows.clamp(2, COMPOSER_INPUT_MAX_ROWS);
+            ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT + (rows - 2) as f32 * COMPOSER_INPUT_LINE_HEIGHT
+        }
+    }
 }
 
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
@@ -6291,6 +6318,10 @@ pub struct SessionView {
     suggestion_request_serial: u64,
     composer_history: ComposerHistoryState,
     composer_expanded: bool,
+    /// The session whose draft the surface's height morph last painted. A
+    /// borrow that moved to another session snaps the morph instead of
+    /// gliding between two sessions' heights.
+    composer_surface_session: Option<VibexSessionId>,
     composer_goal_editing: bool,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
@@ -6448,6 +6479,7 @@ impl SessionView {
             suggestion_task: None,
             composer_history: ComposerHistoryState::default(),
             composer_expanded: false,
+            composer_surface_session: None,
             composer_goal_editing: false,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
@@ -59533,14 +59565,6 @@ impl VibexWorkbench {
                         RuntimeChoiceMenuAction::NewSession(selection) => {
                             this.choose_new_session_runtime(selection.clone(), window, cx)
                         }
-                        RuntimeChoiceMenuAction::ActiveSession(selection) => {
-                            this.choose_runtime_selection(
-                                ComposerTarget::Session,
-                                selection.clone(),
-                                window,
-                                cx,
-                            )
-                        }
                         RuntimeChoiceMenuAction::Feature {
                             target,
                             feature_id,
@@ -64749,68 +64773,11 @@ impl VibexWorkbench {
         self.view_session_id.is_some() && self.view_session_id == self.selected_session_id
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_composer_runtime_choice(
-        &mut self,
-        id: String,
-        label: String,
-        icon: AnyElement,
-        choices: Vec<RuntimeCascadeChoice>,
-        selected_value: String,
-        default_value: Option<String>,
-        compact: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected_label = choices
-            .iter()
-            .find(|choice| choice.value == selected_value)
-            .map(|choice| choice.label.clone())
-            .unwrap_or_else(|| label.to_string());
-        let tooltip = format!("{label}: {selected_label}");
-        let content = runtime_selector_dropdown_content(icon, selected_label, compact, cx);
-        let menu_id = format!("composer-runtime-choice-{id}{}", self.composer_menu_scope());
-        let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
-            .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
-        let choices_empty = choices.is_empty();
-        let controls_pending = self.active_runtime_controls_pending();
-        let trigger = Button::new(format!("composer-runtime-{id}"))
-            .xsmall()
-            .ghost()
-            .h(px(32.0))
-            .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.px_2())
-            .tooltip(tooltip)
-            .child(content)
-            .disabled(choices_empty || controls_pending);
-        let choice_count = choices.len();
-        let items_selected_value = selected_value.clone();
-        self.render_runtime_choice_popover(
-            menu_id,
-            trigger,
-            choice_count,
-            move || {
-                choices
-                    .into_iter()
-                    .map(|choice| RuntimeChoiceMenuItem {
-                        selected: choice.value == items_selected_value,
-                        id: choice.value,
-                        label: choice.label,
-                        action: RuntimeChoiceMenuAction::ActiveSession(choice.selection),
-                    })
-                    .collect()
-            },
-            default_value,
-            self.composer_geometry,
-            menu_max_height,
-            self.composer_menu_scope_focused(),
-            cx,
-        )
-    }
-
     fn render_composer_runtime_cascade(
         &mut self,
         desired: SessionRuntimeSelection,
         catalog: Rc<SessionRuntimeOptionCatalog>,
+        projection: Rc<RuntimeCascadeProjection>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -64820,8 +64787,20 @@ impl VibexWorkbench {
                 && option.selection.model == desired.model
         });
         let selected_provider_model_label = runtime_provider_model_label(selected_option, &desired);
+        // The trigger names the run configuration, not just the model: the
+        // reasoning level rides beside the model name so the reader can see
+        // the whole choice without opening the panel.
+        let effort_suffix = projection
+            .reasoning_efforts
+            .iter()
+            .find(|choice| choice.value == runtime_reasoning_effort_value(Some(&desired)))
+            .map(|choice| format!(" · {}", choice.label));
+        let trigger_label = match &effort_suffix {
+            Some(suffix) => format!("{selected_provider_model_label}{suffix}"),
+            None => selected_provider_model_label.clone(),
+        };
         let tooltip = format!(
-            "{}: {selected_provider_model_label}",
+            "{}: {trigger_label}",
             locale::text(
                 "Authentication source / Model",
                 "认证方式 / 模型",
@@ -64843,12 +64822,7 @@ impl VibexWorkbench {
                     theme::semantic_color("chart-2", cx.theme().is_dark()),
                 )
             });
-        let content = runtime_selector_dropdown_content(
-            model_icon,
-            selected_provider_model_label,
-            compact,
-            cx,
-        );
+        let content = runtime_selector_dropdown_content(model_icon, trigger_label, compact, cx);
         let trigger_bounds_entity = cx.weak_entity();
         let trigger_session = self
             .view_session_id
@@ -64856,7 +64830,11 @@ impl VibexWorkbench {
             .map(|session_id| session_id.as_str().to_string());
         let tracked_content = div()
             .when(compact, |this| this.size_full())
-            .when(!compact, |this| this.flex_none())
+            // A long provider/model name must not push the send action off a
+            // narrow pane: the label truncates inside a bounded chip.
+            .when(!compact, |this| {
+                this.flex_none().max_w(px(240.0)).overflow_hidden()
+            })
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
                     let changed = this
@@ -64916,6 +64894,21 @@ impl VibexWorkbench {
         );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
+        // The run options dock beside the model list as one column, so the
+        // panel widens by the column instead of scattering the same choices
+        // across the composer as separate chips.
+        let options_docked = matches!(
+            self.composer_runtime_menu_view,
+            ComposerRuntimeMenuView::AuthSource
+        ) && (!projection.reasoning_efforts.is_empty()
+            || !projection.modes.is_empty()
+            || !projection.features.is_empty());
+        let panel_width = if options_docked {
+            (menu_width + COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH)
+                .min(self.last_visibility.layout.viewport_width as f32 - 32.0)
+        } else {
+            menu_width
+        };
         // See the new-session twin: one fixed height per viewport, so
         // switching Agent or typing a query never resizes the panel.
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
@@ -65136,7 +65129,7 @@ impl VibexWorkbench {
         };
         let menu_panel = v_flex()
             .id("composer-runtime-cascade-content")
-            .w(px(menu_width))
+            .w(px(panel_width))
             .h(px(menu_placement.height))
             .min_h_0()
             .overflow_hidden()
@@ -65145,7 +65138,30 @@ impl VibexWorkbench {
             .border_color(cx.theme().border.opacity(0.70))
             .bg(cx.theme().popover)
             .shadow_lg()
-            .child(menu_content);
+            .child(
+                h_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .h_full()
+                            .min_h_0()
+                            .w(px(menu_width))
+                            .min_w_0()
+                            .flex_none()
+                            .child(menu_content),
+                    )
+                    .when(options_docked && menu_mounted, |this| {
+                        this.child(
+                            div()
+                                .h_full()
+                                .w(px(1.0))
+                                .flex_none()
+                                .bg(cx.theme().border.opacity(0.70)),
+                        )
+                        .child(self.render_composer_runtime_options(&desired, &projection, cx))
+                    }),
+            );
         let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -65164,6 +65180,302 @@ impl VibexWorkbench {
             // picks the side. The legacy `top`/`bottom` inset would add to it.
             .offset(px(menu_placement.trigger_offset));
         div().flex_none().child(popover).into_any_element()
+    }
+
+    /// The run-options column docked beside the cascade's model list.
+    ///
+    /// One panel owns the whole run configuration: the model list picks what
+    /// runs, this column tunes how it runs — reasoning levels first, then the
+    /// conversation mode, then the feature toggles. Picking a level or a mode
+    /// keeps the panel open so the reader can keep tuning; the model list's
+    /// own pick still closes it, because that is the choice the panel was
+    /// opened for.
+    fn render_composer_runtime_options(
+        &mut self,
+        desired: &SessionRuntimeSelection,
+        projection: &RuntimeCascadeProjection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rest_background = runtime_menu_rest_background(cx);
+        let highlight_background = runtime_menu_highlight_background(cx);
+        let selected_background = runtime_menu_selected_background(cx);
+        let controls_pending = self.active_runtime_controls_pending();
+        let scope = self.composer_menu_scope();
+        let heading = |label: String| {
+            div()
+                .w_full()
+                .flex_none()
+                .px(px(10.0))
+                .pt(px(8.0))
+                .pb(px(4.0))
+                .text_size(type_scale::menu_heading())
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(label)
+        };
+        let mut column = v_flex()
+            .id(format!("composer-runtime-options{scope}"))
+            .h_full()
+            .min_h_0()
+            .w(px(COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH))
+            .flex_none()
+            .overflow_y_scroll()
+            .scroll_gutter()
+            .pb(px(6.0));
+        if !projection.reasoning_efforts.is_empty() {
+            let default_effort = runtime_default_reasoning_effort(&projection.reasoning_efforts);
+            let selected_value = runtime_reasoning_effort_value(Some(desired));
+            column = column.child(heading(
+                locale::text("Thinking depth", "思考深度", "思考深度").to_string(),
+            ));
+            for choice in projection.reasoning_efforts.iter().cloned() {
+                let selected = choice.value == selected_value
+                    || (selected_value.is_empty()
+                        && default_effort.as_deref() == Some(choice.value.as_str()));
+                let is_default = default_effort.as_deref() == Some(choice.value.as_str());
+                let row_id = format!("composer-runtime-options-effort:{}{scope}", choice.value);
+                let selection = choice.selection;
+                column = column.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .mx(px(6.0))
+                        .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(type_scale::menu_row())
+                        .bg(if selected {
+                            selected_background
+                        } else {
+                            hover_blend(&row_id, rest_background, highlight_background)
+                        })
+                        .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            );
+                            // Tuning keeps the panel up: the reader came to
+                            // configure the run, not to pick one level and
+                            // start over.
+                            this.runtime_menu_closing_since = None;
+                            this.composer_runtime_menu_open = true;
+                            cx.notify();
+                        }))
+                        .child(div().min_w_0().flex_1().truncate().child(choice.label))
+                        .when(is_default, |this| {
+                            this.child(runtime_menu_default_badge(cx))
+                        })
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
+                );
+            }
+        }
+        if !projection.modes.is_empty() {
+            let selected_value = desired.mode_id.clone().unwrap_or_default();
+            column = column.child(heading(
+                locale::text("Conversation mode", "对话模式", "對話模式").to_string(),
+            ));
+            for choice in projection.modes.iter().cloned() {
+                let selected = choice.value == selected_value;
+                let row_id = format!("composer-runtime-options-mode:{}{scope}", choice.value);
+                let selection = choice.selection;
+                column = column.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .mx(px(6.0))
+                        .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(type_scale::menu_row())
+                        .bg(if selected {
+                            selected_background
+                        } else {
+                            hover_blend(&row_id, rest_background, highlight_background)
+                        })
+                        .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            );
+                            this.runtime_menu_closing_since = None;
+                            this.composer_runtime_menu_open = true;
+                            cx.notify();
+                        }))
+                        .child(div().min_w_0().flex_1().truncate().child(choice.label))
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
+                );
+            }
+        }
+        for feature in projection.features.iter().cloned() {
+            let current = feature.value_for(&desired.config_values);
+            let tooltip = runtime_feature_tooltip(&feature, current.as_ref());
+            match feature.kind {
+                SessionRuntimeFeatureKind::Toggle => {
+                    let feature_id = feature.id.clone();
+                    let checked = current.as_ref().is_some_and(|value| value.value == "true");
+                    column =
+                        column.child(
+                            h_flex()
+                                .mx(px(6.0))
+                                .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                                .flex_none()
+                                .px_2()
+                                .items_center()
+                                .gap_2()
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(type_scale::menu_row())
+                                        .child(feature.label.clone()),
+                                )
+                                .child(
+                                    Switch::new(SharedString::from(format!(
+                                        "composer-runtime-options-feature-{}{scope}",
+                                        feature.id
+                                    )))
+                                    .small()
+                                    .checked(checked)
+                                    .disabled(controls_pending)
+                                    .tooltip(tooltip)
+                                    .on_click(cx.listener(move |this, enabled: &bool, _, cx| {
+                                        this.set_runtime_feature_value(
+                                            RuntimeFeatureTarget::ActiveSession,
+                                            &feature_id,
+                                            enabled.to_string(),
+                                            cx,
+                                        )
+                                    })),
+                                ),
+                        );
+                }
+                SessionRuntimeFeatureKind::Select => {
+                    let values = runtime_feature_values(&feature);
+                    let selected_value = current
+                        .as_ref()
+                        .map(|value| value.value.clone())
+                        .unwrap_or_default();
+                    column = column.child(heading(feature.label.clone()));
+                    for value in values {
+                        let selected = value.value == selected_value;
+                        let row_id = format!(
+                            "composer-runtime-options-feature:{}:{}{scope}",
+                            feature.id, value.value
+                        );
+                        let feature_id = feature.id.clone();
+                        let next_value = value.value.clone();
+                        let label = value.label.clone().unwrap_or_else(|| value.value.clone());
+                        column = column.child(
+                            div()
+                                .id(SharedString::from(row_id.clone()))
+                                .mx(px(6.0))
+                                .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                                .flex_none()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .text_size(type_scale::menu_row())
+                                .bg(if selected {
+                                    selected_background
+                                } else {
+                                    hover_blend(&row_id, rest_background, highlight_background)
+                                })
+                                .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_runtime_feature_value(
+                                        RuntimeFeatureTarget::ActiveSession,
+                                        &feature_id,
+                                        next_value.clone(),
+                                        cx,
+                                    )
+                                }))
+                                .child(div().min_w_0().flex_1().truncate().child(label))
+                                .when(selected, |this| {
+                                    this.child(Icon::new(IconName::Check).size(px(14.0)))
+                                }),
+                        );
+                    }
+                }
+                SessionRuntimeFeatureKind::String => {
+                    // A free-text feature opens its own dialog, exactly as
+                    // the chip it replaces did. The row names the feature and
+                    // its current value; the dialog carries the description.
+                    let selected_label = current
+                        .as_ref()
+                        .and_then(|value| value.label.clone())
+                        .unwrap_or_else(|| {
+                            current
+                                .as_ref()
+                                .map(|value| value.value.clone())
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or_else(|| feature.label.clone())
+                        });
+                    let row_id = format!("composer-runtime-options-string:{}{scope}", feature.id);
+                    let feature_label = feature.label.clone();
+                    column = column.child(
+                        div()
+                            .id(SharedString::from(row_id.clone()))
+                            .mx(px(6.0))
+                            .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(type_scale::menu_row())
+                            .bg(hover_blend(&row_id, rest_background, highlight_background))
+                            .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.prompt_runtime_feature_value(
+                                    RuntimeFeatureTarget::ActiveSession,
+                                    feature.clone(),
+                                    window,
+                                    cx,
+                                )
+                            }))
+                            .child(div().min_w_0().flex_1().truncate().child(feature_label))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(88.0))
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(selected_label),
+                            )
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(px(13.0))
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    );
+                }
+            }
+        }
+        column.into_any_element()
     }
 
     fn render_composer_terminal_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
@@ -77494,11 +77806,12 @@ impl VibexWorkbench {
         // on a one-line bar.
         let composer_draft = composer_input.read(cx).value();
         let composer_draft_is_empty = composer_draft.trim().is_empty();
+        let composer_rows = {
+            let input = composer_input.read(cx);
+            composer_wrapped_rows(input, composer_draft.as_str())
+        };
         let composer_density = composer_density(
-            {
-                let input = composer_input.read(cx);
-                composer_wrapped_rows(input, composer_draft.as_str())
-            },
+            composer_rows,
             composer_draft_is_empty,
             self.composer_attachments.is_empty(),
             composer_extension_visible,
@@ -77513,60 +77826,71 @@ impl VibexWorkbench {
             self.composer_expanded,
         );
         let composer_is_slim = composer_density == ComposerDensity::Slim;
+        // The surface's height glides to the height its content asks for. The
+        // decision above commits the final layout at once — the caret and the
+        // draft survive — while the box the reader sees sweeps between the
+        // one-line bar and the growing multi-row box over one short ease-out.
+        // A session switch snaps: the borrowed view is another draft, and
+        // morphing between two sessions' heights would animate a change the
+        // reader made by navigating, not by typing.
+        let composer_surface_target = composer_surface_height(composer_density, composer_rows);
+        let composer_morph_key = format!(
+            "composer-surface{}",
+            self.view_session_id
+                .as_ref()
+                .map_or_else(|| "@primary".to_string(), |id| format!("@{}", id.as_str()))
+        );
+        let composer_morph_snap = motion::reduced_motion(cx)
+            || self.composer_expanded
+            || self.composer_surface_session.as_ref() != self.view_session_id.as_ref();
+        self.composer_surface_session = self.view_session_id.clone();
+        let composer_surface_height_now = motion::resolve_height(
+            &composer_morph_key,
+            composer_surface_target,
+            composer_morph_snap,
+            cx.entity_id(),
+        );
+        // How settled the committed density is (0..1): 1 when the box rests
+        // at its target, less while the glide is still travelling. The chrome
+        // that differs between the two densities — the corner radius — rides
+        // the same progress so nothing snaps mid-morph.
+        let composer_density_span =
+            (ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT - COMPOSER_SLIM_SURFACE_HEIGHT).max(1.0);
+        let composer_density_settle = (1.0
+            - (composer_surface_target - composer_surface_height_now).abs()
+                / composer_density_span)
+            .clamp(0.0, 1.0);
+        let composer_surface_radius = if composer_is_slim {
+            motion::lerp(
+                COMPOSER_SURFACE_RADIUS,
+                COMPOSER_SLIM_SURFACE_RADIUS,
+                composer_density_settle,
+            )
+        } else {
+            motion::lerp(
+                COMPOSER_SLIM_SURFACE_RADIUS,
+                COMPOSER_SURFACE_RADIUS,
+                composer_density_settle,
+            )
+        };
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let session_uninitialized = self.selected_session_runtime_uninitialized();
         let (runtime_controls_cascade, runtime_controls_other) =
             if let Some((desired, catalog, projection)) = runtime_projection {
+                // The reasoning levels, conversation modes and feature
+                // toggles live in the cascade's own docked options column
+                // (see `render_composer_runtime_options`): one panel owns the
+                // whole run configuration, and the composer's bar carries one
+                // run-configuration control instead of a row of chips.
                 let cascade = self.render_composer_runtime_cascade(
                     desired.clone(),
                     catalog,
+                    projection.clone(),
                     compact_runtime_controls,
                     cx,
                 );
-                let mut other = Vec::new();
-                if !projection.reasoning_efforts.is_empty() {
-                    let default_effort =
-                        runtime_default_reasoning_effort(&projection.reasoning_efforts);
-                    other.push(self.render_composer_runtime_choice(
-                        "effort".into(),
-                        locale::text("Thinking depth", "思考深度", "思考深度").into(),
-                        new_session_selector_icon(
-                            "icons/vibex/brain.svg",
-                            theme::semantic_color("chart-3", is_dark),
-                        ),
-                        projection.reasoning_efforts.clone(),
-                        runtime_reasoning_effort_value(Some(&desired)),
-                        default_effort,
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                if !projection.modes.is_empty() {
-                    other.push(self.render_composer_runtime_choice(
-                        "mode".into(),
-                        locale::text("Conversation mode", "对话模式", "對話模式").into(),
-                        new_session_selector_icon(
-                            "icons/vibex/shield-alert.svg",
-                            theme::semantic_color("chart-4", is_dark),
-                        ),
-                        projection.modes.clone(),
-                        desired.mode_id.clone().unwrap_or_default(),
-                        None,
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                for feature in projection.features.iter().cloned() {
-                    other.push(self.render_runtime_feature(
-                        RuntimeFeatureTarget::ActiveSession,
-                        feature,
-                        desired.clone(),
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                (cascade, other)
+                (cascade, Vec::<AnyElement>::new())
             } else if session_uninitialized && !compact_runtime_controls {
                 // Imported sessions have no runtime selection yet. Offer the
                 // session's Agent for first activation instead of hiding the
@@ -77614,6 +77938,9 @@ impl VibexWorkbench {
             } else {
                 (Empty.into_any_element(), Vec::new())
             };
+        // The cascade seats on exactly one of the two layouts, so the branch
+        // that mounts it takes it out of the slot.
+        let mut runtime_controls_cascade = Some(runtime_controls_cascade);
         // A slim bar seats the action on its own row, where 28 px matches the
         // controls beside it; the full box seats it in the trailing column, where
         // 32 px matches the two stacked buttons above it.
@@ -77655,6 +77982,10 @@ impl VibexWorkbench {
                 .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx)))
                 .into_any_element()
         };
+        // The send/stop action seats on exactly one of the two layouts — the
+        // slim bar's own row or the full box's control row — so the branch
+        // that mounts it takes it out of the slot.
+        let mut primary_action = Some(primary_action);
         v_flex()
             .id("agent-composer")
             .relative()
@@ -77935,23 +78266,18 @@ impl VibexWorkbench {
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            // The slim bar is one row tall; the full box keeps
-                            // its reserved two rows and control column. Both read
-                            // the same border, fill and shadow, so the densities
-                            // differ only in the room they ask for.
-                            .min_h(px(if composer_is_slim {
-                                COMPOSER_SLIM_SURFACE_HEIGHT
-                            } else {
-                                ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
-                            }))
+                            // The surface paints the morphed height while the
+                            // density decision has already committed its final
+                            // layout: the box sweeps between the one-line bar
+                            // and the growing multi-row box, and the caret and
+                            // draft inside it never remount. Both densities
+                            // read the same border, fill and shadow.
+                            .h(px(composer_surface_height_now))
+                            .overflow_hidden()
                             .when(self.composer_expanded, |this| {
-                                this.flex_1().min_h(px(240.0))
+                                this.h_auto().flex_1().min_h(px(240.0))
                             })
-                            .rounded(px(if composer_is_slim {
-                                COMPOSER_SLIM_SURFACE_RADIUS
-                            } else {
-                                COMPOSER_SURFACE_RADIUS
-                            }))
+                            .rounded(px(composer_surface_radius))
                             .border_1()
                             .border_color(cx.theme().border)
                             .bg(composer_background)
@@ -77995,15 +78321,17 @@ impl VibexWorkbench {
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
-                                    // The slim bar centres its one line; the full
-                                    // box aligns the text to the top of the two
-                                    // rows it reserves.
+                                    // The slim bar is ONE row: the input line and
+                                    // every control share it, vertically centred.
+                                    // The full box aligns the text to the top of
+                                    // the rows it reserves and keeps its control
+                                    // row underneath.
                                     .map(|this| {
                                         if composer_is_slim {
-                                            this.min_h(px(COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT))
+                                            this.flex_1()
                                                 .items_center()
                                                 .px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
-                                                .py_1()
+                                                .py(px(6.0))
                                         } else {
                                             this.min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
                                                 .flex_1()
@@ -78014,6 +78342,28 @@ impl VibexWorkbench {
                                         }
                                     })
                                     .gap_2()
+                                    .when(composer_is_slim, |this| {
+                                        this.child(
+                                            Button::new("choose-composer-attachments")
+                                                .ghost()
+                                                .compact()
+                                                .size(px(32.0))
+                                                .icon(IconName::Plus)
+                                                .tooltip(locale::text(
+                                                    "Add attachments",
+                                                    "添加附件",
+                                                    "新增附件",
+                                                ))
+                                                .disabled(self.agent_action_pending)
+                                                .on_click(cx.listener(
+                                                    |this, _, window, cx| {
+                                                        this.choose_composer_attachments(
+                                                            window, cx,
+                                                        )
+                                                    },
+                                                )),
+                                        )
+                                    })
                                     .child(
                                         div()
                                             .relative()
@@ -78244,20 +78594,20 @@ impl VibexWorkbench {
                                                     )),
                                             )
                                     )
-                                    // The trailing column is three stacked
-                                    // controls, so it is taller than the text
-                                    // beside it and sets the floor for the whole
-                                    // surface. A slim bar has one row to spend, so
-                                    // the same three controls are laid along that
-                                    // row instead — see the slim branch below.
-                                    .when(!composer_is_slim, |this| {
-                                        this.child(
-                                            v_flex()
-                                                .flex_none()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    Button::new("toggle-composer-expanded")
+                                    // The trailing cluster keeps the three
+                                    // surface controls together in both
+                                    // densities: the slim bar lays them along
+                                    // its one row beside the send action, the
+                                    // full box stacks them in the corner above
+                                    // the control row. Nothing is dropped from
+                                    // either density.
+                                    .map(|this| {
+                                        let controls = h_flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .gap_1()
+                                            .child(
+                                                Button::new("toggle-composer-expanded")
                                                     .xsmall()
                                                     .ghost()
                                                     .compact()
@@ -78286,87 +78636,73 @@ impl VibexWorkbench {
                                                         cx.notify();
                                                     })),
                                             )
-                                            .when_some(self.view_session_id.clone(), |this, session_id| {
-                                                this.child(self.render_message_schedule_button(
-                                                    MessageScheduleTarget::Session(session_id),
-                                                    enabled,
-                                                    cx,
-                                                ))
-                                            })
-                                            .child(self.render_composer_terminal_menu(cx)),
-                                        )
-                                    })
-                                    // The same three controls, on the bar's own
-                                    // row. Nothing is dropped from the slim
-                                    // composer: it is the full one with its
-                                    // column folded flat.
-                                    .when(composer_is_slim, |this| {
-                                        this.child(
-                                            Button::new("toggle-composer-expanded")
-                                                .xsmall()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(28.0))
-                                                .px_0()
-                                                .icon(if self.composer_expanded {
-                                                    IconName::Minimize
-                                                } else {
-                                                    IconName::Maximize
-                                                })
-                                                .tooltip(if self.composer_expanded {
-                                                    locale::text(
-                                                        "Collapse input",
-                                                        "收起输入框",
-                                                        "收合輸入框",
-                                                    )
-                                                } else {
-                                                    locale::text(
-                                                        "Expand input",
-                                                        "展开输入框",
-                                                        "展開輸入框",
-                                                    )
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.composer_expanded =
-                                                        !this.composer_expanded;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .when_some(
-                                            self.view_session_id.clone(),
-                                            |this, session_id| {
-                                                this.child(
-                                                    self.render_message_schedule_button(
-                                                        MessageScheduleTarget::Session(
-                                                            session_id,
+                                            .when_some(
+                                                self.view_session_id.clone(),
+                                                |this, session_id| {
+                                                    this.child(
+                                                        self.render_message_schedule_button(
+                                                            MessageScheduleTarget::Session(
+                                                                session_id,
+                                                            ),
+                                                            enabled,
+                                                            cx,
                                                         ),
-                                                        enabled,
-                                                        cx,
+                                                    )
+                                                },
+                                            )
+                                            .child(self.render_composer_terminal_menu(cx));
+                                        if composer_is_slim {
+                                            this.child(controls)
+                                                .children(runtime_controls_cascade.take())
+                                                .child(button_with_aria_label(
+                                                    Button::new("open-session-usage")
+                                                        .ghost()
+                                                        .compact()
+                                                        .size(px(30.0))
+                                                        .on_click(cx.listener(|this, _, _, cx| {
+                                                            let session_filter =
+                                                                this.selected_session_id.clone();
+                                                            this.open_usage(session_filter, cx);
+                                                        }))
+                                                        .child(render_cache_token_ring(
+                                                            self.token_usage.as_ref(),
+                                                            cx,
+                                                        )),
+                                                    locale::text(
+                                                        "Open usage statistics",
+                                                        "打开用量统计",
+                                                        "開啟用量統計",
                                                     ),
-                                                )
-                                            },
-                                        )
-                                        .child(self.render_composer_terminal_menu(cx))
+                                                ))
+                                                .children(primary_action.take())
+                                        } else {
+                                            this.child(
+                                                v_flex()
+                                                    .flex_none()
+                                                    .items_center()
+                                                    .child(controls),
+                                            )
+                                        }
                                     }),
                             )
                             .when_some(self.composer_message_schedule(), |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
                             })
-                            .child(
+                            // The full box keeps its control row under the
+                            // text: attachments on the left, the runtime
+                            // cascade and the send action on the right. The
+                            // slim bar has already seated every one of these
+                            // on its single row above.
+                            .when(!composer_is_slim, |this| {
+                                this.child(
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
-                                    .map(|this| {
-                                        if composer_is_slim {
-                                            this.px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
-                                                .pb_1()
-                                        } else {
-                                            this.px_3().pb_3()
-                                        }
-                                    })
+                                    .px_3()
+                                    .pb_3()
                                     .child(
                                         h_flex()
                                             .id("composer-runtime-controls-scroll")
@@ -78453,16 +78789,17 @@ impl VibexWorkbench {
                                                     )
                                                 },
                                             )
-                                            .child(runtime_controls_cascade),
+                                            .children(runtime_controls_cascade.take()),
                                     )
                                     .child(
                                         h_flex()
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(primary_action),
+                                            .children(primary_action.take()),
                                     ),
-                            ),
+                                )
+                            }),
                     ),
             )
             .into_any_element()
@@ -102305,6 +102642,8 @@ impl Render for VibexWorkbench {
         // still has a blend mid-flight is asked for its next frame directly, so
         // a fade inside a cached subtree advances without rebuilding the window.
         motion::schedule_hover_frames(window);
+        // The composer's height glide rides the same per-frame drive.
+        motion::schedule_height_morph_frames(window);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);
@@ -111874,7 +112213,7 @@ mod tests {
             .find("self.render_composer_terminal_menu(cx)")
             .expect("terminal mode action should exist");
         let primary_action = composer
-            .find(".child(primary_action)")
+            .find(".children(primary_action.take())")
             .expect("send or stop action should exist");
 
         assert!(fullscreen < terminal);
@@ -121733,30 +122072,34 @@ mod tests {
         assert!(composer.contains("session_content_max_width"));
         assert!(!composer.contains("COMPOSER_MAX_WIDTH"));
         assert!(composer.contains("toggle-composer-expanded"));
-        assert!(composer.contains("this.flex_1().min_h(px(240.0))"));
+        assert!(composer.contains("this.h_auto().flex_1().min_h(px(240.0))"));
         assert!(composer.contains("this.flex_1().min_h_0()"));
         assert!(composer.contains("ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT"));
         assert!(composer.contains("ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT"));
         assert!(composer.contains(".min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
-        // Both densities are drawn by the same renderer, chosen from the draft.
+        // Both densities are drawn by the same renderer, chosen from the draft,
+        // and the surface's height glides to the height the content asks for.
         assert!(composer.contains("let composer_density = composer_density("));
         assert!(composer.contains("COMPOSER_SLIM_SURFACE_HEIGHT"));
         assert!(composer.contains("COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT"));
+        assert!(composer.contains("let composer_surface_target = composer_surface_height("));
+        assert!(composer.contains("motion::resolve_height("));
+        assert!(composer.contains(".h(px(composer_surface_height_now))"));
+        assert!(composer.contains(".rounded(px(composer_surface_radius))"));
         assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
             .expect("composer fullscreen control should remain present");
-        let slim_branch = composer
-            .find(".when(!composer_is_slim, |this| {")
-            .expect("the stacked trailing column should be gated to the full box");
-        assert!(
-            slim_branch < fullscreen_button,
-            "the stacked column, expand control included, belongs to the full box"
-        );
         let terminal_button = composer
             .find("self.render_composer_terminal_menu(cx)")
             .expect("composer terminal control should remain present");
         assert!(fullscreen_button < terminal_button);
+        // The full box keeps its control row under the text; the slim bar has
+        // already seated every control on its single row.
+        let control_row = composer
+            .find(".when(!composer_is_slim, |this| {")
+            .expect("the control row should be gated to the full box");
+        assert!(terminal_button < control_row);
         assert!(composer.contains(".pb_1()"));
         assert!(composer.contains(".when(composer_extension_visible, |this|"));
         assert!(composer.contains("px(-2.0)"));
@@ -121980,45 +122323,62 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("session composer should remain inspectable");
-        assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
+        // One attachment control per density: the slim bar seats it on its
+        // single row, the full box on its control row.
+        assert_eq!(composer.matches("choose-composer-attachments").count(), 2);
         assert!(!composer.contains("choose-composer-images"));
         assert!(composer.contains("composer-runtime-controls-cascade"));
-        assert!(composer.contains(".child(runtime_controls_cascade)"));
+        assert!(composer.contains(".children(runtime_controls_cascade.take())"));
         assert!(composer.contains("children(runtime_controls_other)"));
-        let attachment = composer
+        let slim_attachment = composer
             .find("choose-composer-attachments")
             .expect("composer attachment control should be present");
+        let slim_cascade = composer
+            .find(".children(runtime_controls_cascade.take())")
+            .expect("the slim bar should seat the run-configuration control");
+        let token_usage = composer
+            .find("open-session-usage")
+            .expect("composer token usage control should be present");
+        let submit = composer
+            .find(".children(primary_action.take())")
+            .expect("composer submit control should remain present");
+        // The slim row reads left to right: attach, type, tune, send.
+        assert!(slim_attachment < slim_cascade);
+        assert!(slim_cascade < token_usage);
+        assert!(token_usage < submit);
         let other_runtime_controls = composer
             .find("children(runtime_controls_other)")
             .expect("composer secondary runtime controls should stay beside attachments");
         let cascade_runtime_controls = composer
             .find("composer-runtime-controls-cascade")
             .expect("composer cascade should stay beside the submit control");
-        let token_usage = composer
-            .find("open-session-usage")
-            .expect("composer token usage control should be present");
-        let cascade_content = composer
-            .find(".child(runtime_controls_cascade)")
-            .expect("composer cascade content should be present");
-        let submit = composer
-            .find(".child(primary_action)")
-            .expect("composer submit control should remain present");
-        assert!(attachment < other_runtime_controls);
         assert!(other_runtime_controls < cascade_runtime_controls);
-        assert!(cascade_runtime_controls < token_usage);
-        assert!(token_usage < cascade_content);
-        assert!(cascade_runtime_controls < submit);
-        let composer_effort = composer
+        // Thinking depth, conversation mode and the feature toggles are no
+        // longer chips on the composer: the cascade's docked options column
+        // owns them, so one panel carries the whole run configuration.
+        assert!(!composer.contains("Thinking depth"));
+        assert!(!composer.contains("Conversation mode"));
+        assert!(!composer.contains("render_runtime_feature("));
+        assert!(composer.contains("render_composer_runtime_cascade("));
+        let options = source
+            .split_once("    fn render_composer_runtime_options(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .map(|(body, _)| body)
+            .expect("the docked options column should remain inspectable");
+        let options_effort = options
             .find("Thinking depth")
-            .expect("composer reasoning control should be rendered");
-        let composer_mode = composer
+            .expect("the options column should own the reasoning levels");
+        let options_mode = options
             .find("Conversation mode")
-            .expect("composer mode control should be rendered");
-        let composer_feature = composer
-            .find("render_runtime_feature(")
-            .expect("composer feature controls should be rendered");
-        assert!(composer_effort < composer_mode);
-        assert!(composer_mode < composer_feature);
+            .expect("the options column should own the conversation modes");
+        let options_feature = options
+            .find("SessionRuntimeFeatureKind::Toggle")
+            .expect("the options column should own the feature toggles");
+        assert!(options_effort < options_mode);
+        assert!(options_mode < options_feature);
+        assert!(options.contains("choose_runtime_selection("));
+        assert!(options.contains("set_runtime_feature_value("));
+        assert!(options.contains("prompt_runtime_feature_value("));
     }
 
     /// The fullscreen composer is an input box, not just a taller surface: the
@@ -123701,6 +124061,45 @@ mod tests {
         assert!(!composer_runtime_controls_are_compact(861.0));
     }
 
+    /// The surface's height is a pure function of the draft: one line is a
+    /// bar, each further wrapped line adds one line advance, and the growth
+    /// stops at the input's own row cap where the textarea starts scrolling.
+    #[test]
+    fn composer_surface_height_grows_with_the_draft_and_stops_at_the_row_cap() {
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Slim, 1),
+            COMPOSER_SLIM_SURFACE_HEIGHT
+        );
+        // The full box never shrinks below the two-row floor it always kept.
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 1),
+            ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 2),
+            ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 3),
+            ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT + COMPOSER_INPUT_LINE_HEIGHT
+        );
+        let capped = composer_surface_height(ComposerDensity::Full, COMPOSER_INPUT_MAX_ROWS);
+        assert_eq!(
+            capped,
+            ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
+                + (COMPOSER_INPUT_MAX_ROWS - 2) as f32 * COMPOSER_INPUT_LINE_HEIGHT
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, COMPOSER_INPUT_MAX_ROWS + 4),
+            capped,
+            "past the cap the textarea scrolls inside a fixed surface"
+        );
+        assert!(
+            COMPOSER_SLIM_SURFACE_HEIGHT < ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT,
+            "the bar must be shorter than the box, or the morph has nothing to glide"
+        );
+    }
+
     #[test]
     fn runtime_menu_height_does_not_follow_its_content() {
         // Switching Agent or typing a query must never resize the panel, so
@@ -123713,7 +124112,7 @@ mod tests {
             .expect("new-session runtime cascade should remain inspectable");
         let composer = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("current-session runtime cascade should remain inspectable");
 
@@ -124728,7 +125127,7 @@ mod tests {
             .expect("new-session runtime cascade should remain inspectable");
         let current_session = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("current-session runtime cascade should remain inspectable");
         let provider_groups = source
@@ -125119,7 +125518,7 @@ mod tests {
 
         let cascade = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("the composer cascade should remain inspectable");
         assert!(cascade.contains("let focused_pane = self.composer_menu_scope_focused();"));
@@ -125129,15 +125528,16 @@ mod tests {
         assert!(cascade.contains(".filter(|_| focused_pane);"));
         assert!(cascade.contains("Popover::new(format!(\"composer-runtime-cascade{scope}\"))"));
 
-        let choice = source
-            .split_once("    fn render_composer_runtime_choice(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+        // The docked options column shares the cascade's pane scope: its rows
+        // and its scroll id carry the same suffix, so one pane's column cannot
+        // open or scroll inside another pane's panel.
+        let options = source
+            .split_once("    fn render_composer_runtime_options(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
             .map(|(body, _)| body)
-            .expect("the composer choice chips should remain inspectable");
-        // The menu id carries the pane, and the chip only honours the flag on the
-        // pane that owns the keyboard.
-        assert!(choice.contains("self.composer_menu_scope()"));
-        assert!(choice.contains("self.composer_menu_scope_focused(),"));
+            .expect("the docked options column should remain inspectable");
+        assert!(options.contains("let scope = self.composer_menu_scope();"));
+        assert!(options.contains("composer-runtime-options{scope}"));
 
         let popover = source
             .split_once("    fn render_runtime_choice_popover(")
@@ -132391,7 +132791,7 @@ mod tests {
         let source = include_str!("app.rs");
         let workbench = source
             .split_once("    fn render_agent_workbench_for(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_choice("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
             .map(|(body, _)| body)
             .expect("agent workbench should remain inspectable");
         let list_id = workbench
