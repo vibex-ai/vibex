@@ -1245,6 +1245,18 @@ PermissionRepository::pending_for_session(VibexSessionId)
   index is also scoped to the live turn: a new prompt supersedes whatever the
   previous turn left unanswered, while a `steer` joins the running turn and
   supersedes nothing.
+- A resolution settles its request for the whole session, not for the turn that
+  happens to hold both items. A `steer` or interrupt splits the projected turn
+  list, so the resolution a drain appends can land in the turn the steer opened
+  while the card it answers stays in the earlier turn. Every client projection
+  must therefore settle each turn's pending set against the session's
+  resolutions, not only against the items that fall inside that turn.
+- A permission banner and its dismissal must read one shared answer: the request
+  is unresolved, not acknowledged, and the session's persisted state can still
+  be parked on it. Recording a dismissal for a request the state can no longer
+  answer hides the banner with nothing to bring it back, and rendering the
+  banner from a wider set than the dismissal records brings it back on every
+  frame. Both were the stuck "waiting for review" banner after an interrupt.
 
 ### 4. Validation & Error Matrix
 

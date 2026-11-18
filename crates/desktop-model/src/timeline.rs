@@ -305,12 +305,20 @@ impl From<TimelineTurnRef<'_>> for TimelineTurn {
 pub(crate) fn timeline_turn_refs<'a>(
     items: impl IntoIterator<Item = &'a TimelineItem>,
 ) -> Vec<TimelineTurnRef<'a>> {
+    let items = items.into_iter().collect::<Vec<_>>();
+    // A resolution answers its request for the whole session, not only for the
+    // turn that happens to hold both rows. A steer splits the projection: the
+    // resolution an interrupt appends lands in the turn the steer opened, while
+    // the card it answers stays behind in the turn that asked. Settling every
+    // turn against the window's resolutions is what keeps the asking turn from
+    // reporting a card that has already been answered elsewhere.
+    let resolved = resolved_user_input_ids(&items);
     let mut turns = Vec::new();
     let mut current = empty_turn_ref();
     for item in items {
         if item.kind == TimelineItemKind::UserMessage {
             if current.user_item.is_some() || !current.response_items.is_empty() {
-                finish_turn_ref(&mut current);
+                finish_turn_ref(&mut current, &resolved);
                 turns.push(current);
                 current = empty_turn_ref();
             }
@@ -323,7 +331,7 @@ pub(crate) fn timeline_turn_refs<'a>(
                     vibex_core::TimelineSource::Agent | vibex_core::TimelineSource::Provider
                 )
             {
-                finish_turn_ref(&mut current);
+                finish_turn_ref(&mut current, &resolved);
                 turns.push(current);
                 current = empty_turn_ref();
             }
@@ -334,10 +342,29 @@ pub(crate) fn timeline_turn_refs<'a>(
         }
     }
     if current.user_item.is_some() || !current.response_items.is_empty() {
-        finish_turn_ref(&mut current);
+        finish_turn_ref(&mut current, &resolved);
         turns.push(current);
     }
     turns
+}
+
+/// The permission and elicitation requests the window holds a resolution for.
+///
+/// A request and the item that answers it are one verdict on the session,
+/// however far apart the projection's turn split puts them.
+fn resolved_user_input_ids<'a>(items: &[&'a TimelineItem]) -> BTreeSet<&'a str> {
+    items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            TimelinePayload::PermissionResolution(resolution) => {
+                Some(resolution.request_id.as_str())
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
+                Some(resolution.request_id.as_str())
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 fn empty_turn_ref<'a>() -> TimelineTurnRef<'a> {
@@ -363,25 +390,25 @@ fn normalize_items(
     by_sequence.into_values().collect()
 }
 
-fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>) {
+fn finish_turn_ref(turn: &mut TimelineTurnRef<'_>, resolved: &BTreeSet<&str>) {
     let mut pending_permission_ids = BTreeSet::new();
     for item in &turn.response_items {
+        // A request the window already holds a resolution for is not still
+        // pending here. Its card stays in this turn even after a steer splits
+        // the projection, so this is the only place that can stop it from
+        // asking forever once the answering item landed in a later turn.
         match &item.payload {
             TimelinePayload::PermissionRequest(request)
-                if request.status == PermissionRequestStatus::Pending =>
+                if request.status == PermissionRequestStatus::Pending
+                    && !resolved.contains(request.id.as_str()) =>
             {
                 pending_permission_ids.insert(request.id.to_string());
-            }
-            TimelinePayload::PermissionResolution(resolution) => {
-                pending_permission_ids.remove(resolution.request_id.as_str());
             }
             TimelinePayload::ElicitationRequest(request)
-                if request.status == ElicitationRequestStatus::Pending =>
+                if request.status == ElicitationRequestStatus::Pending
+                    && !resolved.contains(request.id.as_str()) =>
             {
                 pending_permission_ids.insert(request.id.to_string());
-            }
-            TimelinePayload::ElicitationResolution(resolution) => {
-                pending_permission_ids.remove(resolution.request_id.as_str());
             }
             _ => {}
         }
@@ -872,6 +899,73 @@ mod tests {
         assert_eq!(
             live_turn_pending_permission_ids(&[item(&session, 2, permission_request(&abandoned))]),
             BTreeSet::from([abandoned.to_string()])
+        );
+    }
+
+    /// A steer splits the projection, not the session.
+    ///
+    /// The card stays in the turn that asked, but the resolution an interrupt
+    /// appends lands after the steer, in the turn the steer opened. Settling
+    /// each turn against the window's resolutions is what keeps the asking
+    /// turn from reporting a request that has already been answered — the
+    /// state the permission alert and its dismissal read.
+    #[test]
+    fn a_resolution_after_a_steer_settles_the_turn_that_asked() {
+        let session = VibexSessionId::parse("session_steered").unwrap();
+        let request = vibex_core::RequestId::parse("request_steered").unwrap();
+        let permission_request =
+            TimelinePayload::PermissionRequest(vibex_core::PermissionRequest {
+                id: request.clone(),
+                session_id: session.clone(),
+                project_id: None,
+                workspace_id: None,
+                provider_request_id: None,
+                risk_category: vibex_core::PermissionRiskCategory::Command,
+                title: "Run command?".into(),
+                details: Vec::new(),
+                allowed_responses: vec![vibex_core::PermissionResponseKind::Approve],
+                response_options: Vec::new(),
+                status: PermissionRequestStatus::Pending,
+                requested_at_ms: 2,
+                expires_at_ms: None,
+            });
+        let prompt = |text: &str, delivery| {
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: text.into(),
+                attachments: Vec::new(),
+                delivery,
+                ..Default::default()
+            })
+        };
+        let resolution = TimelinePayload::PermissionResolution(vibex_core::PermissionResolution {
+            request_id: request.clone(),
+            session_id: session.clone(),
+            response: vibex_core::PermissionResponseKind::Deny,
+            responder_device_id: None,
+            provider_resolution_id: None,
+            note: Some("interrupted".into()),
+            resolved_at_ms: 4,
+            responder: None,
+        });
+
+        let items = vec![
+            item(&session, 1, prompt("first", UserMessageDelivery::Prompt)),
+            item(&session, 2, permission_request),
+            item(&session, 3, prompt("aside", UserMessageDelivery::Steer)),
+            item(&session, 4, resolution),
+        ];
+        let turns = timeline_turns(&items);
+
+        assert_eq!(
+            turns.len(),
+            2,
+            "the steer opens a second turn, so the card and its answer sit apart"
+        );
+        assert!(
+            turns
+                .iter()
+                .all(|turn| turn.pending_permission_ids.is_empty()),
+            "the session answered the card, so no turn may still report it pending"
         );
     }
 }

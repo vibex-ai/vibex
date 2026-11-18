@@ -33643,18 +33643,58 @@ impl VibexWorkbench {
         let Some(session_id) = session_id else {
             return false;
         };
-        let Some(dismissed) = self
-            .ui_state
+        let Some(signature) = self.pending_permission_alert_signature() else {
+            return false;
+        };
+        self.ui_state
             .session
             .dismissed_permission_alerts
             .get(session_id.as_str())
-        else {
+            .is_some_and(|dismissed| dismissed == &signature)
+    }
+
+    /// Whether the permission alert belongs on screen for this pane.
+    ///
+    /// The banner, its dismissal and the frame after a click all read this one
+    /// answer, so the three can never disagree. Two conditions make a request
+    /// answerable: the window still holds it unresolved (the signature), and
+    /// the session's persisted state can still be parked on it. An interrupt
+    /// can cancel the native callback without a resolution item ever reaching a
+    /// client, and a settled, failed or closed session has no surface left to
+    /// answer its card; that is when the banner must go away for good instead
+    /// of coming back on the next frame.
+    ///
+    /// A session this pane cannot look up keeps its alert: an optimistic
+    /// session is registered a moment later, and hiding a request the reader
+    /// could answer is worse than showing one that is about to be.
+    fn permission_alert_is_pending(&self, session_id: Option<&VibexSessionId>) -> bool {
+        let Some(session_id) = session_id else {
             return false;
         };
-        self.pending_permission_alert_signature().as_deref() == Some(dismissed.as_str())
+        if self.pending_permission_alert_signature().is_none() {
+            return false;
+        }
+        if self.permission_alert_is_dismissed(Some(session_id)) {
+            return false;
+        }
+        self.registered_session(session_id.as_str())
+            .is_none_or(|session| {
+                session_awaits_user_input(
+                    session.display_state(),
+                    &self.pending_user_request_ids,
+                    session_id.as_str(),
+                )
+            })
     }
 
     /// The pending-request set the alert covers, as one comparable string.
+    ///
+    /// A resolution settles its request for the whole session, not for the turn
+    /// the projection happened to put it in: a steer, an interrupt and a fresh
+    /// prompt all split the turn, and the item that answers a card can land
+    /// after that split. Reading the window's requests and resolutions is what
+    /// keeps the signature — and with it the banner and its dismissal — from
+    /// claiming a card is still open once it has been answered elsewhere.
     fn pending_permission_alert_signature(&self) -> Option<String> {
         let pending = self.timeline.pending_permission_ids();
         (!pending.is_empty()).then(|| pending.into_iter().collect::<Vec<_>>().join("|"))
@@ -63759,11 +63799,14 @@ impl VibexWorkbench {
                 .map(VibexSessionId::as_str)
                 .unwrap_or("none")
         ));
-        // A dismissed alert stays hidden while the same requests are pending,
-        // so acknowledging a request the user cannot answer yet does not cost
-        // them the timeline row it occupies.
+        // The banner, its dismissal and the frame after a click all read one
+        // answer: the request is still unresolved, unacknowledged, and the
+        // session can still be parked on it. A card nobody can answer — an
+        // interrupt that cancelled the callback, a session that settled — never
+        // reaches the banner, so closing it records a request that is already
+        // gone instead of one that came back on the next frame.
         let pending_permission = turns_summary.has_pending_permission
-            && !self.permission_alert_is_dismissed(live_session_id.as_ref());
+            && self.permission_alert_is_pending(live_session_id.as_ref());
         self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
@@ -119040,15 +119083,38 @@ mod tests {
         assert!(dismiss.contains("dismissed_permission_alerts"));
         assert!(dismiss.contains("self.queue_ui_state();"));
 
+        // The banner is shown only while the request is still answerable, and
+        // the check reads the same signature the dismissal records.
+        let banner = source
+            .split_once("        let pending_permission = turns_summary.has_pending_permission")
+            .map(|(_, tail)| tail)
+            .and_then(|tail| tail.split_once(";\n"))
+            .map(|(body, _)| body)
+            .expect("the banner condition should remain inspectable");
+        assert!(banner.contains("self.permission_alert_is_pending(live_session_id.as_ref())"));
+
         // A dismissal only holds while the same requests are pending, so the
         // next request shows the alert again.
         let dismissed = source
             .split_once("    fn permission_alert_is_dismissed(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// The pending-request set"))
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether the permission alert belongs"))
             .map(|(body, _)| body)
             .expect("alert dismissal state should remain inspectable");
         assert!(dismissed.contains("dismissed_permission_alerts"));
         assert!(dismissed.contains("pending_permission_alert_signature"));
+
+        // Closing the banner must be a real dismissal: the alert only owns
+        // requests the session can still be parked on, so a click that hides it
+        // leaves nothing pending to bring it back on the next frame.
+        let answerable = source
+            .split_once("    fn permission_alert_is_pending(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pending-request set"))
+            .map(|(body, _)| body)
+            .expect("the alert's answerability should remain inspectable");
+        assert!(answerable.contains("self.pending_permission_alert_signature()"));
+        assert!(answerable.contains("self.permission_alert_is_dismissed(Some(session_id))"));
+        assert!(answerable.contains("session_awaits_user_input("));
+        assert!(answerable.contains("session.display_state()"));
     }
 
     #[test]
