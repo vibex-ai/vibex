@@ -11175,6 +11175,7 @@ dependencies = [
 name = "vibex-mobile-nsh"
 version = "0.1.8"
 dependencies = [
+ "base64 0.22.1",
  "futures-channel",
  "futures-util",
  "jni 0.22.4",

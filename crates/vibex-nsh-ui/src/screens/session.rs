@@ -202,6 +202,16 @@ type QuestionAction = Rc<dyn Fn(&str, QuestionResponse)>;
 /// What the person typed into the terminal.
 type TerminalInput = Rc<dyn Fn(&str)>;
 
+/// A file or photo waiting to be sent with the message.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AttachmentItem {
+    pub id: String,
+    pub label: String,
+    pub mime_type: String,
+    /// A `data:` URL the runtime materializes.
+    pub uri: String,
+}
+
 /// Opens a path (a directory or a file) in the files surface.
 type OpenPath = Rc<dyn Fn(&str)>;
 
@@ -267,6 +277,11 @@ pub struct SessionHost {
     /// The `@` references the session offers.
     pub mentions: Signal<Vec<CommandEntry>>,
     pub on_mention_query: MentionQuery,
+    /// Files and photos waiting to be sent with the message.
+    pub attachments: Signal<Vec<AttachmentItem>>,
+    pub on_attach_image: Action,
+    pub on_attach_file: Action,
+    pub on_remove_attachment: Rc<dyn Fn(&str)>,
     /// Starts a new session in the open session's workspace.
     pub on_new_session: Action,
     /// The terminal surface, when it is open over the shell.
@@ -1263,6 +1278,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let mentions = host.mentions;
     let on_query = host.on_command_query.clone();
     let on_mention = host.on_mention_query.clone();
+    let attachments = host.attachments;
+    let on_remove_attachment = host.on_remove_attachment.clone();
     let submit = {
         let send = send.clone();
         move || {
@@ -1280,43 +1297,120 @@ fn composer(host: SessionHost) -> impl IntoElement {
     };
     view()
         .w_full()
-        .flex_row()
-        .items_end()
-        .gap(px(theme::SPACING_SM))
+        .flex_col()
+        .gap(px(theme::SPACING_XS))
         .px(px(theme::SPACING_MD))
         .py(px(theme::SPACING_SM))
         .border_t_1()
         .border_t_color(theme::border_subtle)
         .bg(theme::background)
         .pb_keyboard()
+        .child(when(
+            move || !attachments.with(|attachments| attachments.is_empty()),
+            move || attachment_chips(attachments, on_remove_attachment.clone()),
+        ))
         .child(
-            field::text_field_with(
-                draft,
-                copy::text("Message the Agent…", "给 Agent 发消息…", "傳訊息給 Agent…"),
-                move |text: &str| {
-                    match text.strip_prefix('/') {
-                        Some(query) => on_query(query),
-                        None => commands.set(Vec::new()),
-                    }
-                    match mention_query(text) {
-                        Some(query) => on_mention(&query),
-                        None => mentions.set(Vec::new()),
-                    }
-                },
-            )
-            .multiline(true)
-            .min_h(px(theme::TOUCH_TARGET))
-            .max_h(px(120.0))
-            .flex_1(),
+            view()
+                .w_full()
+                .flex_row()
+                .items_end()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    field::text_field_with(
+                        draft,
+                        copy::text("Message the Agent…", "给 Agent 发消息…", "傳訊息給 Agent…"),
+                        move |text: &str| {
+                            match text.strip_prefix('/') {
+                                Some(query) => on_query(query),
+                                None => commands.set(Vec::new()),
+                            }
+                            match mention_query(text) {
+                                Some(query) => on_mention(&query),
+                                None => mentions.set(Vec::new()),
+                            }
+                        },
+                    )
+                    .multiline(true)
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .max_h(px(120.0))
+                    .flex_1(),
+                )
+                .child({
+                    let on_attach_image = host.on_attach_image.clone();
+                    action::icon_button(
+                        icon(include_str!("../../assets/icons/image.svg")),
+                        copy::text("Attach a photo", "附加照片", "附加照片"),
+                        move || on_attach_image(),
+                    )
+                })
+                .child({
+                    let on_attach_file = host.on_attach_file.clone();
+                    action::icon_button(
+                        icon(include_str!("../../assets/icons/paperclip.svg")),
+                        copy::text("Attach a file", "附加文件", "附加檔案"),
+                        move || on_attach_file(),
+                    )
+                })
+                .child(
+                    action::primary(
+                        copy::text("Send", "发送", "傳送"),
+                        icon(include_str!("../../assets/icons/send.svg")),
+                        submit,
+                    )
+                    .disabled(move || {
+                        sending.get()
+                            || (draft.with(|draft| draft.trim().is_empty())
+                                && attachments.with(|attachments| attachments.is_empty()))
+                    })
+                    .disabled_style(|style| style.opacity(0.4)),
+                ),
+        )
+}
+
+/// The pending attachments, each removable.
+fn attachment_chips(
+    attachments: Signal<Vec<AttachmentItem>>,
+    on_remove: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .flex_wrap()
+        .gap(px(theme::SPACING_XS))
+        .child(each(
+            move || attachments.get(),
+            |item| item.id.clone(),
+            move |item, _| attachment_chip(item, on_remove.clone()),
+        ))
+}
+
+fn attachment_chip(
+    item: ReadSignal<AttachmentItem>,
+    on_remove: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    button()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .min_h(px(28.0))
+        .px(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_dim)
+        .on_press(move || {
+            let id = item.get_untracked().id;
+            on_remove(&id);
+        })
+        .child(
+            text(move || item.with(|item| item.label.clone()))
+                .text_size(px(theme::FONT_MICRO))
+                .text_color(theme::text_secondary),
         )
         .child(
-            action::primary(
-                copy::text("Send", "发送", "傳送"),
-                icon(include_str!("../../assets/icons/send.svg")),
-                submit,
-            )
-            .disabled(move || sending.get() || draft.with(|draft| draft.trim().is_empty()))
-            .disabled_style(|style| style.opacity(0.4)),
+            text("×")
+                .text_size(px(theme::FONT_MICRO))
+                .text_color(theme::text_muted),
         )
 }
 

@@ -15,9 +15,9 @@ use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
-    self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
-    PermissionOption, QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary,
-    TimelineEntry,
+    self, AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
+    PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, SessionHost,
+    SessionState, SessionSummary, TimelineEntry,
 };
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
@@ -131,6 +131,20 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let resolving = signal(false);
     let commands = signal(Vec::new());
     let mentions = signal(Vec::new());
+    let attachments = signal(Vec::new());
+    let on_attach_image = Rc::new(move || {
+        attachments.update(|items| {
+            items.push(AttachmentItem {
+                id: "attachment-1".to_owned(),
+                label: "photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                uri: "data:image/jpeg;base64,".to_owned(),
+            });
+        });
+    });
+    let on_remove_attachment = Rc::new(move |id: &str| {
+        attachments.update(|items| items.retain(|item| item.id != id));
+    });
     let terminal_open = signal(false);
     let terminal_title = signal(Some(SharedString::from("Terminal")));
     let terminal_error = signal(None::<SharedString>);
@@ -324,6 +338,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         question,
         commands,
         mentions,
+        attachments,
+        on_attach_image,
+        on_attach_file: Rc::new(|| {}),
+        on_remove_attachment,
         resolving,
         on_select: select,
         on_send: send,
@@ -626,4 +644,18 @@ fn a_history_row_opens_the_commit_detail() {
     app.wait_for("Initial commit").unwrap();
     app.press("Initial commit").unwrap();
     app.wait_for("commit detail body").unwrap();
+}
+
+#[test]
+fn a_photo_can_be_attached_and_removed() {
+    let mut app = start();
+    app.press("role:button[Attach a photo]").unwrap();
+    app.wait_for("photo.jpg").unwrap();
+    app.press("photo.jpg").unwrap();
+    app.wait_until(
+        "the chip leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "photo.jpg"),
+    )
+    .unwrap();
 }

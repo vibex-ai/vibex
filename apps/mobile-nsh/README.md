@@ -80,9 +80,12 @@ A successful claim or a tapped saved runtime opens the session shell:
   and the answers converted back to the runtime's typed values;
 - the composer offers the session's `/` commands and `@` references (one
   discovery per session each, filtered locally; a reference replaces the
-  `@…` token in place), and the drawer starts a new session through a sheet
-  that lists the runtime's workspaces and its ready Agent/model options
-  (`list_workspaces`, `list_runtime_options`);
+  `@…` token in place), attaches photos and files through the platform's own
+  picker (`pick_images`, `pick_files`, encoded as the `data:` URLs the runtime
+  materializes), shows them as removable chips, and sends them with the text;
+  the drawer starts a new session through a sheet that lists the runtime's
+  workspaces and its ready Agent/model options (`list_workspaces`,
+  `list_runtime_options`);
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY
   snapshot fills it, its frame stream keeps it live, and what the person types
   goes back to the PTY. Closing the surface leaves the terminal running;
@@ -267,8 +270,7 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. Attachments (the file picker and how a chosen file reaches the runtime).
-2. The platform device name and the release pipeline; the shell's own camera
-   and discovery code against the request queue.
+1. The release pipeline (packaging the Rust app for both stores) and the
+   shell's own camera and discovery code against the request queue.
 3. The rest of the workbench: a syntax-highlighted editor (nsh's `Editor`) in
    place of the plain field.

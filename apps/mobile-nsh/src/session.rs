@@ -13,7 +13,9 @@ use std::{
     sync::Arc,
 };
 
+use base64::Engine as _;
 use nsh_base::{Terminal, TerminalApi};
+use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::prelude::*;
 use vibex_backend::{
     AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, GitBackend,
@@ -25,11 +27,12 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary,
-    MessageProvenance, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeOptionAvailability, SendAgentMessageRequest, SessionRuntimeOption,
-    TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
+    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest,
+    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -39,9 +42,9 @@ use vibex_nsh_ui::{
     screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
-        CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
-        PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
-        QuestionResponse, SessionHost, SessionState, SessionSummary, TimelineEntry,
+        AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
+        PermissionChoice, PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind,
+        QuestionOption, QuestionResponse, SessionHost, SessionState, SessionSummary, TimelineEntry,
     },
 };
 
@@ -102,6 +105,9 @@ pub struct SessionService {
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
     git_commit_detail: Signal<Option<CommitDetailPreview>>,
+    attachments: Signal<Vec<AttachmentItem>>,
+    /// Makes each picked attachment's id unique for the composer.
+    attachment_seq: Rc<Cell<u64>>,
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -178,6 +184,8 @@ impl SessionService {
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
             git_commit_detail: signal(None),
+            attachments: signal(Vec::new()),
+            attachment_seq: Rc::new(Cell::new(0)),
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
@@ -237,6 +245,7 @@ impl SessionService {
             git_history: self.git_history,
             git_show_history: self.git_show_history,
             git_commit_detail: self.git_commit_detail,
+            attachments: self.attachments,
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
             new_runtimes: self.new_runtimes,
@@ -277,6 +286,22 @@ impl SessionService {
             on_mention_query: {
                 let service = self.clone();
                 Rc::new(move |query: &str| service.query_mentions(query))
+            },
+            on_attach_image: {
+                let service = self.clone();
+                Rc::new(move || service.attach_images())
+            },
+            on_attach_file: {
+                let service = self.clone();
+                Rc::new(move || service.attach_files())
+            },
+            on_remove_attachment: {
+                let service = self.clone();
+                Rc::new(move |id: &str| {
+                    service
+                        .attachments
+                        .update(|items| items.retain(|item| item.id != id));
+                })
             },
             on_new_session: {
                 let service = self.clone();
@@ -502,7 +527,8 @@ impl SessionService {
             return;
         };
         let text = text.trim().to_owned();
-        if text.is_empty() || self.sending.get_untracked() {
+        let attachments = self.attachments.get_untracked();
+        if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
             return;
         }
         self.sending.set(true);
@@ -510,10 +536,23 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(send_and_refetch(backend, session_id.clone(), text)).await;
+            let sends = attachments
+                .iter()
+                .map(|item| MessageAttachment {
+                    label: item.label.clone(),
+                    mime_type: Some(item.mime_type.clone()),
+                    uri: Some(item.uri.clone()),
+                    inline_text_offset: None,
+                })
+                .collect::<Vec<_>>();
+            let result =
+                background(send_and_refetch(backend, session_id.clone(), text, sends)).await;
             service.sending.set(false);
             match result {
-                Ok(Ok(page)) => service.apply_page(&session_id, page),
+                Ok(Ok(page)) => {
+                    service.attachments.set(Vec::new());
+                    service.apply_page(&session_id, page);
+                }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
@@ -758,6 +797,71 @@ impl SessionService {
                 service.commands.set(command_entries(discovery));
             }
         });
+    }
+
+    /// Picks photos and keeps them as attachments for the next message.
+    fn attach_images(&self) {
+        self.error.set(None);
+        let service = self.clone();
+        spawn(async move {
+            let mut request = PickRequest::new(true, 4);
+            request.max_dimension = Some(nsh_core::geometry::DevicePixels(1600));
+            let files = pick_images(request).await;
+            service.accept_attachments(files);
+        });
+    }
+
+    /// Picks documents and keeps them as attachments for the next message.
+    fn attach_files(&self) {
+        self.error.set(None);
+        let service = self.clone();
+        spawn(async move {
+            let mut request = FilePickRequest::new(true, 4);
+            request.max_size = Some(8 * 1024 * 1024);
+            let files = pick_files(request).await;
+            service.accept_attachments(files);
+        });
+    }
+
+    /// Encodes what the picker returned as the `data:` URLs the runtime
+    /// materializes.
+    fn accept_attachments(&self, files: Vec<nsh_core::picker::PickedFile>) {
+        let mut too_large = None;
+        for file in files {
+            if file.status == PickedStatus::TooLarge {
+                too_large = Some(file.name);
+                continue;
+            }
+            let seq = self.attachment_seq.get().wrapping_add(1);
+            self.attachment_seq.set(seq);
+            let mime_type = file.mime.clone();
+            let uri = format!(
+                "data:{};base64,{}",
+                mime_type,
+                base64::engine::general_purpose::STANDARD.encode(file.data.bytes())
+            );
+            self.attachments.update(|items| {
+                items.push(AttachmentItem {
+                    id: format!("attachment-{seq}"),
+                    label: file.name,
+                    mime_type,
+                    uri,
+                });
+            });
+        }
+        if let Some(name) = too_large {
+            self.error.set(Some(
+                format!(
+                    "{name}: {}",
+                    copy::text(
+                        "too large to attach",
+                        "文件太大，无法附加",
+                        "檔案太大，無法附加",
+                    )
+                )
+                .into(),
+            ));
+        }
     }
 
     /// Loads the `@` references the open session offers.
@@ -1658,11 +1762,12 @@ async fn fetch_page(
         .await
 }
 
-/// Sends `text` and reads the transcript back.
+/// Sends `text` (and any attachments) and reads the transcript back.
 async fn send_and_refetch(
     backend: Arc<dyn AgentBackend>,
     session_id: VibexSessionId,
     text: String,
+    attachments: Vec<MessageAttachment>,
 ) -> BackendResult<TimelinePage> {
     // The session's own selection is what the runtime expects the send to
     // carry; asking first also notices a runtime that cannot take a turn.
@@ -1673,7 +1778,7 @@ async fn send_and_refetch(
             message_idempotency_key: vibex_core::RequestId::new().into_string(),
             desired_runtime: selection,
             text,
-            attachments: Vec::new(),
+            attachments,
             mentions: Vec::new(),
             reasoning_effort: None,
             correlation_id: None,
