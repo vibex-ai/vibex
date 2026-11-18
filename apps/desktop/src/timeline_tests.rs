@@ -4313,6 +4313,21 @@ fn auto_collapse_draws_a_live_run_as_its_summary_until_the_reader_opens_it(
     );
 }
 
+    /// The surface alone, with no workbench view above it: if this composites,
+    /// the ancestor chain is what stops it.
+    struct BareSurfaceHost {
+        view: Entity<TimelineSurfaceView>,
+    }
+
+    impl Render for BareSurfaceHost {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            div()
+                .w(px(600.0))
+                .h(px(400.0))
+                .child(self.view.clone().cached(StyleRefinement::default().size_full()))
+        }
+    }
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {

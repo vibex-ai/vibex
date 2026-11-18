@@ -10326,6 +10326,61 @@ impl Render for ComposerView {
     }
 }
 
+/// The transcript's own render boundary.
+///
+/// The surface mounts everything a live conversation mounts: the list, its row
+/// measurements, the disclosure springs and the bottom control. `gpui::list`
+/// notifies the view that painted it from inside its own wheel handler, and that
+/// notify goes straight to the view's invalidator — an `observe` callback cannot
+/// refuse it. Built inline in the workbench's render, every scrolled frame
+/// therefore rebuilt the workbench, and with it the sidebar, the composer and
+/// every group pane.
+///
+/// A surface that owns its element tree re-renders alone. It observes the
+/// workbench, so a workbench notify still refreshes it exactly as the inline
+/// render did.
+struct TimelineSurfaceView {
+    workbench: WeakEntity<VibexWorkbench>,
+    #[cfg(test)]
+    render_count: Cell<usize>,
+}
+
+impl TimelineSurfaceView {
+    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+            #[cfg(test)]
+            render_count: Cell::new(0),
+        }
+    }
+}
+
+impl Render for TimelineSurfaceView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.render_count.set(self.render_count.get() + 1);
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let owner = cx.entity_id();
+        // The element is wrapped so the view's own root is a sized container:
+        // `cached` applies its style to the view, and a surface that sizes
+        // itself through `flex_1` inside the pane needs the wrapper to take the
+        // pane's height first.
+        div()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(motion::with_hover_owner(owner, || {
+                workbench.update(cx, |this, cx| this.render_timeline_surface(cx))
+            }))
+            .into_any_element()
+    }
+}
+
 /// The child Agent rail's own render boundary.
 ///
 /// The rail draws whole child timelines with the timeline's own builders, so it
@@ -11699,6 +11754,7 @@ pub struct VibexWorkbench {
     /// The focused timeline's own render boundary, created on first render. See
     /// [`TimelineView`]; `None` only before the first frame.
     timeline_view: Option<Entity<TimelineView>>,
+    timeline_surface_view: Option<Entity<TimelineSurfaceView>>,
     /// The child Agent rail's own render boundary, created on first render. See
     /// [`ChildAgentRailView`]; `None` only before the first frame.
     child_agent_rail_view: Option<Entity<ChildAgentRailView>>,
@@ -13440,6 +13496,7 @@ impl VibexWorkbench {
             session_view_lru: VecDeque::new(),
             sidebar_view: None,
             timeline_view: None,
+            timeline_surface_view: None,
             child_agent_rail_view: None,
             timeline_painted_markdown_surfaces: BTreeSet::new(),
             #[cfg(test)]
@@ -32451,8 +32508,9 @@ impl VibexWorkbench {
     /// the views that read nothing a scroll changes stay retained; see
     /// [`transcript_scroll_notifies`].
     fn install_timeline_scroll_handler(&self) {
-        self.timeline_scroll
-            .set_scroll_handler(|_, _, cx| note_transcript_scroll(cx));
+        self.timeline_scroll.set_scroll_handler(|_, _, cx| {
+            note_transcript_scroll(cx);
+        });
     }
 
     fn sync_timeline_list_rows(&mut self) {
@@ -64206,139 +64264,31 @@ impl VibexWorkbench {
     /// focused: the pane shows the same live timeline as the focused one, but
     /// the composer belongs to the focused pane alone, so the input, its
     /// drafts and its suggestions stay untouched.
-    fn render_agent_workbench_for(
-        &mut self,
-        include_composer: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        // Sample this view's frame cadence before the pass adds to it: a live
-        // label's repeating sweep is only worth its frames while the timeline
-        // is drawing on time. See [`timeline_activity::LiveLabelFrameGate`].
-        self.live_label_frame_gate
-            .observe(cx.background_executor().now(), window.refresh_interval(cx));
-        #[cfg(test)]
-        {
-            self.markdown_surfaces_built = 0;
-        }
-        if include_composer {
-            // Elicitation forms are keyed by request id and owned by the session
-            // that asked the question, so the focused view only settles its own
-            // requests here; the answers being typed into another session's form
-            // are deliberately out of its reach.
-            self.prune_elicitation_forms(cx);
-        }
-        // Replay the row heights prepaint measured for *this* session before the
-        // extent is rebuilt, so a pane's own measurements land in its own view.
-        // Prepaint cannot apply them itself: by then the whole tree is built and
-        // the borrowed view belongs to whichever pane released last, so a split
-        // would write every pane's heights into one view and re-trigger a full
-        // size rebuild on every frame.
-        self.flush_deferred_timeline_turn_heights(cx);
-        self.apply_pending_timeline_row_heights();
-        let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
-        self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
-            AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
-        } else {
-            self.timeline_disclosure_settle_frames.saturating_sub(1)
-        };
-        let disclosure_landed =
-            disclosure_was_settling && self.timeline_disclosure_settle_frames == 0;
-        self.timeline_disclosure_animating = false;
-        if self.timeline_disclosure_settle_frames > 0 {
-            // The spring asks for no frame once it stops, and the settling that
-            // follows is only seen by the renders after that.
-            window.request_animation_frame();
-        }
-        // The list inset and activity columns share the window's rem scale.
-        // Resolved heights from another scale cannot seed this layout.
-        if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
-            self.capture_timeline_scroll_anchor();
-            self.invalidate_timeline_layout_measurements();
-        }
-        self.timeline_list_padding_top_px = f32::from(window.rem_size());
-        let selected = self.selected_session().cloned();
-        let mut turns = self.conversation_turns_cached();
-        if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
-            self.rebuild_timeline_sizes();
-            turns = self.conversation_turns_cached();
-        }
-        if disclosure_landed {
-            self.resume_timeline_follow_after_disclosure();
-        }
-        // Resolve a pending bottom scroll only after the row extent is rebuilt:
-        // an invalidated size table would otherwise swallow the request because
-        // `scroll_timeline_to_latest` skips an empty table.
-        self.apply_pending_timeline_scroll();
-        // The list lays out the rows it was told about, so the table and its
-        // count have to agree before the element is built.
-        self.sync_timeline_list_rows();
-        self.install_timeline_scroll_handler();
-        self.prefetch_older_timeline_if_needed(cx);
-        self.request_expanded_timeline_details(cx);
-        let turns_summary = self.conversation_turns_summary;
-        self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
-        let rendered_turns = self.conversation_turns_render_cache.clone();
-        let row_sizes = self.timeline_row_sizes.clone();
-        let rendered_row_sizes = row_sizes.clone();
-        // `gpui::list` renders a row through `&mut App` alone, so the view is
-        // reached the way every other row callback in this file reaches it.
-        let render_entity = cx.weak_entity();
-        // The row renderer runs inside the list's own layout borrow, so nothing
-        // it does may read the list's state. The one decision a row makes about
-        // the scroll position is whether the turn hangs from the bottom edge,
-        // and that is resolved here, before the element is built.
-        self.resolve_timeline_rows_hang_from_bottom();
-        let rows_hang_from_bottom = self.timeline_rows_hang_from_bottom();
+    /// Builds the transcript's surface: the empty state, the list of turns and
+    /// the bottom control.
+    ///
+    /// Called from [`TimelineSurfaceView`], which owns the element tree. Built
+    /// inline in the workbench's own render, every frame the list asked for
+    /// rebuilt the workbench, and a workbench notify refreshes the sidebar, the
+    /// composer and every group pane.
+    fn render_timeline_surface(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
-        // The same insets keep the timeline, the composer and the banners
-        // between them on one spine: the pane's gutter, widened on both sides
-        // when the preview rail is pinned inside the left one.
         let content_insets = self.session_content_insets();
-        // The live view owns the session, not the selection: a group pane
-        // renders another session's runtime controls while the selection still
-        // names the focused pane.
         let live_session_id = self.timeline.session_id.clone();
-        // The banner, its dismissal and the frame after a click all read one
-        // answer: the request is still unresolved, unacknowledged, and the
-        // session can still be parked on it. A card nobody can answer — an
-        // interrupt that cancelled the callback, a session that settled — never
-        // reaches the banner, so closing it records a request that is already
-        // gone instead of one that came back on the next frame.
-        let pending_permission = turns_summary.has_pending_permission
-            && self.permission_alert_is_pending(live_session_id.as_ref());
-        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0), cx);
-        let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
-        let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
-        // The rail is the pane's reading lane, not the conversation viewport's.
-        // Every composer extension (plan, queue, goal) resizes the viewport
-        // from below, and a rail anchored to it slid a tick up under the
-        // reader's eye whenever one of them opened. A group pane builds its own
-        // rail over its own composer instead.
-        let turn_preview_rail = if include_composer {
-            self.render_session_pane_rail(cx)
-        } else {
-            None
-        };
+        let selected = self.selected_session().cloned();
+        let turns = self.conversation_turns_cached();
+        let rendered_turns = self.conversation_turns_render_cache.clone();
+        let rendered_row_sizes = self.timeline_row_sizes.clone();
+        let render_entity = cx.weak_entity();
+        let rows_hang_from_bottom = self.timeline_rows_hang_from_bottom();
         let timeline_layout_entity = cx.weak_entity();
-        // Prepaint runs after the whole element tree is built, so by then the
-        // borrowed view may already belong to another pane. Carry the measured
-        // session with the closure and write the width back into *that* view,
-        // otherwise a split's two widths would take turns invalidating each
-        // other's row measurements.
         let timeline_layout_session_id = self.timeline.session_id.clone();
-        // The row measurement needs the same routing as the width, so carry a
-        // cheap second copy of the session id into the virtual list's closure.
         let timeline_measure_session_id: Option<SharedString> = self
             .timeline
             .session_id
             .as_ref()
             .map(|session_id| SharedString::from(session_id.as_str()));
-        // The virtual list builds its rows during layout and prepaint, after the
-        // render pass has handed this pane's view back. Carry the session so the
-        // closure can borrow it again: a row resolved against the focused pane's
-        // view loses its payloads, its expansion state and its measurements.
         let timeline_render_session_id = self.timeline.session_id.clone();
         let timeline_surface = div()
             .relative()
@@ -64564,6 +64514,118 @@ impl VibexWorkbench {
                         }),
                 )
             });
+        timeline_surface.into_any_element()
+    }
+
+    fn render_agent_workbench_for(
+        &mut self,
+        include_composer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Sample this view's frame cadence before the pass adds to it: a live
+        // label's repeating sweep is only worth its frames while the timeline
+        // is drawing on time. See [`timeline_activity::LiveLabelFrameGate`].
+        self.live_label_frame_gate
+            .observe(cx.background_executor().now(), window.refresh_interval(cx));
+        #[cfg(test)]
+        {
+            self.markdown_surfaces_built = 0;
+        }
+        if include_composer {
+            // Elicitation forms are keyed by request id and owned by the session
+            // that asked the question, so the focused view only settles its own
+            // requests here; the answers being typed into another session's form
+            // are deliberately out of its reach.
+            self.prune_elicitation_forms(cx);
+        }
+        // Replay the row heights prepaint measured for *this* session before the
+        // extent is rebuilt, so a pane's own measurements land in its own view.
+        // Prepaint cannot apply them itself: by then the whole tree is built and
+        // the borrowed view belongs to whichever pane released last, so a split
+        // would write every pane's heights into one view and re-trigger a full
+        // size rebuild on every frame.
+        self.flush_deferred_timeline_turn_heights(cx);
+        self.apply_pending_timeline_row_heights();
+        let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
+        self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
+            AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
+        } else {
+            self.timeline_disclosure_settle_frames.saturating_sub(1)
+        };
+        let disclosure_landed =
+            disclosure_was_settling && self.timeline_disclosure_settle_frames == 0;
+        self.timeline_disclosure_animating = false;
+        if self.timeline_disclosure_settle_frames > 0 {
+            // The spring asks for no frame once it stops, and the settling that
+            // follows is only seen by the renders after that.
+            window.request_animation_frame();
+        }
+        // The list inset and activity columns share the window's rem scale.
+        // Resolved heights from another scale cannot seed this layout.
+        if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
+            self.capture_timeline_scroll_anchor();
+            self.invalidate_timeline_layout_measurements();
+        }
+        self.timeline_list_padding_top_px = f32::from(window.rem_size());
+        let turns = self.conversation_turns_cached();
+        if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
+            self.rebuild_timeline_sizes();
+        }
+        if disclosure_landed {
+            self.resume_timeline_follow_after_disclosure();
+        }
+        // Resolve a pending bottom scroll only after the row extent is rebuilt:
+        // an invalidated size table would otherwise swallow the request because
+        // `scroll_timeline_to_latest` skips an empty table.
+        self.apply_pending_timeline_scroll();
+        // The list lays out the rows it was told about, so the table and its
+        // count have to agree before the element is built.
+        self.sync_timeline_list_rows();
+        self.install_timeline_scroll_handler();
+        self.prefetch_older_timeline_if_needed(cx);
+        self.request_expanded_timeline_details(cx);
+        let turns_summary = self.conversation_turns_summary;
+        self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
+        // The row renderer runs inside the list's own layout borrow, so nothing
+        // it does may read the list's state. The one decision a row makes about
+        // the scroll position is whether the turn hangs from the bottom edge,
+        // and that is resolved before the element is built.
+        self.resolve_timeline_rows_hang_from_bottom();
+        let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        // The same insets keep the timeline, the composer and the banners
+        // between them on one spine: the pane's gutter, widened on both sides
+        // when the preview rail is pinned inside the left one.
+        let content_insets = self.session_content_insets();
+        // The live view owns the session, not the selection: a group pane
+        // renders another session's runtime controls while the selection still
+        // names the focused pane.
+        let live_session_id = self.timeline.session_id.clone();
+        // The banner, its dismissal and the frame after a click all read one
+        // answer: the request is still unresolved, unacknowledged, and the
+        // session can still be parked on it. A card nobody can answer — an
+        // interrupt that cancelled the callback, a session that settled — never
+        // reaches the banner, so closing it records a request that is already
+        // gone instead of one that came back on the next frame.
+        let pending_permission = turns_summary.has_pending_permission
+            && self.permission_alert_is_pending(live_session_id.as_ref());
+        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0), cx);
+        let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
+        let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
+        // The rail is the pane's reading lane, not the conversation viewport's.
+        // Every composer extension (plan, queue, goal) resizes the viewport
+        // from below, and a rail anchored to it slid a tick up under the
+        // reader's eye whenever one of them opened. A group pane builds its own
+        // rail over its own composer instead.
+        let turn_preview_rail = if include_composer {
+            self.render_session_pane_rail(cx)
+        } else {
+            None
+        };
+        let timeline_surface = self
+            .ensure_timeline_surface_view(cx)
+            .cached(StyleRefinement::default().flex_1().min_h_0())
+            .into_any_element();
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
@@ -79702,6 +79764,17 @@ impl VibexWorkbench {
         let workbench = cx.entity();
         let view = cx.new(|cx| SessionTerminalView::new(&workbench, cx));
         self.session_terminal_view = Some(view.clone());
+        view
+    }
+
+    /// The transcript surface's own render boundary, created on first use.
+    fn ensure_timeline_surface_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineSurfaceView> {
+        if let Some(view) = self.timeline_surface_view.as_ref() {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| TimelineSurfaceView::new(&workbench, cx));
+        self.timeline_surface_view = Some(view.clone());
         view
     }
 
@@ -133026,16 +133099,26 @@ mod tests {
             view.contains("timeline_scroll: gpui::ListState"),
             "the scroll state belongs to the view, so two panes cannot share it"
         );
-        let workbench = source
-            .split_once("    fn render_agent_workbench_for(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+        let surface = source
+            .split_once("    fn render_timeline_surface(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_agent_workbench_for(")
+            })
             .map(|(body, _)| body)
-            .expect("agent workbench should remain inspectable");
-        assert!(workbench.contains("gpui::list("));
+            .expect("the transcript surface should remain inspectable");
+        assert!(surface.contains("gpui::list("));
         assert!(
-            !workbench.contains("let timeline_list_id"),
+            !surface.contains("let timeline_list_id"),
             "the per-session element id is no longer what keeps the panes apart"
         );
+        // The surface owns its element tree, so a scroll rebuilds it alone.
+        let view = source
+            .split_once("struct TimelineSurfaceView {")
+            .and_then(|(_, tail)| tail.split_once("\n/// The child Agent rail's own render boundary."))
+            .map(|(body, _)| body)
+            .expect("the transcript surface's view should remain inspectable");
+        assert!(view.contains("cx.observe(workbench, |_, _, cx| cx.notify()).detach();"));
+        assert!(view.contains("this.render_timeline_surface(cx)"));
     }
 
     /// A drag that never leaves the pane it started in splits that pane, and a
