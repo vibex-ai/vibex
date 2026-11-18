@@ -205,6 +205,9 @@ type TerminalInput = Rc<dyn Fn(&str)>;
 /// Opens a path (a directory or a file) in the files surface.
 type OpenPath = Rc<dyn Fn(&str)>;
 
+/// Opens a path's diff, staged or not.
+type OpenDiff = Rc<dyn Fn(&str, bool)>;
+
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 
@@ -281,12 +284,24 @@ pub struct SessionHost {
     pub on_open_dir: OpenPath,
     pub on_open_file: OpenPath,
     pub on_files_back: Action,
+    /// The Git surface, when it is open over the shell.
+    pub git_open: Signal<bool>,
+    pub git_branch: Signal<Option<SharedString>>,
+    pub git_changes: Signal<Vec<crate::screens::git::GitChangeRow>>,
+    pub git_diff: Signal<Option<crate::screens::git::GitDiffPreview>>,
+    pub git_error: Signal<Option<SharedString>>,
+    pub on_open_git: Action,
+    pub on_close_git: Action,
+    pub on_open_git_diff: OpenDiff,
+    pub on_git_back: Action,
+    pub on_refresh_git: Action,
 }
 
 /// The session shell, or the terminal or files surface over it.
 pub fn session(host: SessionHost) -> impl IntoElement {
     let terminal_open = host.terminal_open;
     let files_open = host.files_open;
+    let git_open = host.git_open;
     let terminal = crate::screens::terminal::TerminalHost {
         title: host.terminal_title,
         error: host.terminal_error,
@@ -305,20 +320,38 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         on_back: host.on_files_back.clone(),
         on_close: host.on_close_files.clone(),
     };
+    let git = crate::screens::git::GitHost {
+        open: host.git_open,
+        branch: host.git_branch,
+        changes: host.git_changes,
+        diff: host.git_diff,
+        error: host.git_error,
+        on_open_diff: host.on_open_git_diff.clone(),
+        on_back: host.on_git_back.clone(),
+        on_refresh: host.on_refresh_git.clone(),
+        on_close: host.on_close_git.clone(),
+    };
     let shell_host = host;
     view()
         .flex_1()
         .bg(theme::background)
-        .child(when(move || files_open.get(), {
+        .child(when(move || git_open.get(), {
+            let git = git.clone();
+            move || crate::screens::git::git(git.clone())
+        }))
+        .child(when(move || !git_open.get() && files_open.get(), {
             let files = files.clone();
             move || crate::screens::files::files(files.clone())
         }))
-        .child(when(move || !files_open.get() && terminal_open.get(), {
-            let terminal = terminal.clone();
-            move || crate::screens::terminal::terminal(terminal.clone())
-        }))
         .child(when(
-            move || !files_open.get() && !terminal_open.get(),
+            move || !git_open.get() && !files_open.get() && terminal_open.get(),
+            {
+                let terminal = terminal.clone();
+                move || crate::screens::terminal::terminal(terminal.clone())
+            },
+        ))
+        .child(when(
+            move || !git_open.get() && !files_open.get() && !terminal_open.get(),
             move || shell(shell_host.clone()),
         ))
 }
@@ -1240,6 +1273,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_new_session = host.on_new_session.clone();
     let on_open_terminal = host.on_open_terminal.clone();
     let on_open_files = host.on_open_files.clone();
+    let on_open_git = host.on_open_git.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1298,6 +1332,18 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             })
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_muted),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Changes", "变更", "變更"),
+                                icon(include_str!("../../assets/icons/history.svg")),
+                                false,
+                                {
+                                    let on_open_git = on_open_git.clone();
+                                    move || on_open_git()
+                                },
+                            )
+                            .w_full(),
                         )
                         .child(
                             action::secondary(

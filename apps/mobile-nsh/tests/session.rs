@@ -12,6 +12,7 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
+use vibex_nsh_ui::screens::git::{GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::session::{
     self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
     PermissionOption, QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary,
@@ -165,6 +166,25 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }));
     });
     let on_files_back = Rc::new(move || files_preview.set(None));
+    let git_open = signal(false);
+    let git_branch = signal(Some(SharedString::from("main")));
+    let git_changes = signal(vec![GitChangeRow {
+        path: "src/main.rs".to_owned(),
+        status: "M".to_owned(),
+        staged: false,
+        additions: 3,
+        deletions: 1,
+    }]);
+    let git_diff = signal(None::<GitDiffPreview>);
+    let git_error = signal(None::<SharedString>);
+    let on_open_git_diff = Rc::new(move |path: &str, _staged: bool| {
+        git_diff.set(Some(GitDiffPreview {
+            title: path.to_owned(),
+            body: "diff --git a/src/main.rs b/src/main.rs".to_owned(),
+            truncated: false,
+        }));
+    });
+    let on_git_back = Rc::new(move || git_diff.set(None));
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -260,6 +280,16 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_dir,
         on_open_file,
         on_files_back,
+        git_open,
+        git_branch,
+        git_changes,
+        git_diff,
+        git_error,
+        on_open_git: Rc::new(move || git_open.set(true)),
+        on_close_git: Rc::new(move || git_open.set(false)),
+        on_open_git_diff,
+        on_git_back,
+        on_refresh_git: Rc::new(|| {}),
     }
 }
 
@@ -430,4 +460,23 @@ fn the_files_surface_lists_a_directory_and_reads_a_file() {
     app.wait_for("main.rs").unwrap();
     app.press("main.rs").unwrap();
     app.wait_for("fn main() {}").unwrap();
+}
+
+/// The shell with its Git surface open.
+#[component]
+fn GitShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.git_open.set(true);
+    session::session(host)
+}
+
+#[test]
+fn the_git_surface_lists_changes_and_shows_a_diff() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("src/main.rs").unwrap();
+    app.wait_for("diff --git a/src/main.rs b/src/main.rs")
+        .unwrap();
 }

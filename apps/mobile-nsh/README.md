@@ -87,7 +87,9 @@ A successful claim or a tapped saved runtime opens the session shell:
   goes back to the PTY. Closing the surface leaves the terminal running;
 - the drawer opens a read-only file browser: one directory at a time from
   `file_tree`, a file's text from `read_file`, with back through the
-  directories and the preview.
+  directories and the preview;
+- the drawer opens the workspace's Git status: branch, changed paths with
+  additions and deletions, and a path's diff from `git_diff`.
 
 Attachments and `@`-mentions land with their own passes. The shell's tests
 mount it over a fixture; the live, answer and terminal paths are
@@ -132,9 +134,10 @@ Two layers:
   Markdown reply renders, the composer appends what was sent and clears, a
   permission card is answered and leaves, a question collects a typed answer
   and leaves, the `/` and `@` palettes insert a command and a reference, New
-  session opens a session, the terminal shows a program's output, and the
-  files surface lists a directory and reads a file. Each migrated screen adds
-  the flows its GPUI pair has.
+  session opens a session, the terminal shows a program's output, the files
+  surface lists a directory and reads a file, and the Git surface lists a
+  change and shows its diff. Each migrated screen adds the flows its GPUI
+  pair has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -254,5 +257,5 @@ the shipping GPUI client, taken before the screen moves.
    instead of reusing the open session's.
 2. The platform device name and the release pipeline; the shell's own camera
    and discovery code against the request queue.
-3. The rest of the workbench: editable files and Git (nsh's `Editor` and
-   `DiffView`).
+3. The rest of the workbench: editing (nsh's `Editor` and `DiffView`), and the
+   Git actions (stage, revert, commit) beyond the read-only status.

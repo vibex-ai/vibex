@@ -16,24 +16,26 @@ use std::{
 use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use vibex_backend::{
-    AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, MutationRequest,
-    TerminalBackend,
+    AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, GitBackend,
+    MutationRequest, TerminalBackend,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    FetchTimelineRequest, FileReadRequest, FileTreeRequest, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
-    TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitDiffRequest,
+    GitStatusSummary, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, SendAgentMessageRequest, TerminalCreateRequest, TerminalId,
+    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
+    VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::files::{FileEntry, FilePreview},
+    screens::git::{GitChangeRow, GitDiffPreview},
     screens::session::{
         CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
         PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
@@ -52,6 +54,7 @@ pub struct SessionService {
     backend: Arc<dyn AgentBackend>,
     terminal_backend: Arc<dyn TerminalBackend>,
     file_backend: Arc<dyn FileBackend>,
+    git_backend: Arc<dyn GitBackend>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
@@ -80,6 +83,11 @@ pub struct SessionService {
     files_preview: Signal<Option<FilePreview>>,
     files_error: Signal<Option<SharedString>>,
     files_workspace: Rc<RefCell<Option<WorkspaceId>>>,
+    git_open: Signal<bool>,
+    git_branch: Signal<Option<SharedString>>,
+    git_changes: Signal<Vec<GitChangeRow>>,
+    git_diff: Signal<Option<GitDiffPreview>>,
+    git_error: Signal<Option<SharedString>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -95,12 +103,14 @@ impl SessionService {
         let backend = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
         let file_backend: Arc<dyn FileBackend> = backend.clone();
+        let git_backend: Arc<dyn GitBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let service = Self {
             backend,
             terminal_backend,
             file_backend,
+            git_backend,
             sessions: signal(Vec::new()),
             active: signal(None),
             timeline: signal(Vec::new()),
@@ -127,6 +137,11 @@ impl SessionService {
             files_preview: signal(None),
             files_error: signal(None),
             files_workspace: Rc::new(RefCell::new(None)),
+            git_open: signal(false),
+            git_branch: signal(None),
+            git_changes: signal(Vec::new()),
+            git_diff: signal(None),
+            git_error: signal(None),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -159,6 +174,11 @@ impl SessionService {
             files_entries: self.files_entries,
             files_preview: self.files_preview,
             files_error: self.files_error,
+            git_open: self.git_open,
+            git_branch: self.git_branch,
+            git_changes: self.git_changes,
+            git_diff: self.git_diff,
+            git_error: self.git_error,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -228,6 +248,26 @@ impl SessionService {
             on_files_back: {
                 let service = self.clone();
                 Rc::new(move || service.files_back())
+            },
+            on_open_git: {
+                let service = self.clone();
+                Rc::new(move || service.open_git())
+            },
+            on_close_git: {
+                let service = self.clone();
+                Rc::new(move || service.close_git())
+            },
+            on_open_git_diff: {
+                let service = self.clone();
+                Rc::new(move |path: &str, staged: bool| service.open_git_diff(path, staged))
+            },
+            on_git_back: {
+                let service = self.clone();
+                Rc::new(move || service.git_back())
+            },
+            on_refresh_git: {
+                let service = self.clone();
+                Rc::new(move || service.refresh_git())
             },
         }
     }
@@ -996,6 +1036,118 @@ impl SessionService {
         Some(workspace)
     }
 
+    /// Opens the workspace's Git status over the shell.
+    fn open_git(&self) {
+        self.files_open.set(false);
+        self.terminal_open.set(false);
+        self.git_open.set(true);
+        self.git_diff.set(None);
+        self.refresh_git();
+    }
+
+    fn close_git(&self) {
+        self.git_open.set(false);
+        self.git_diff.set(None);
+        self.git_error.set(None);
+    }
+
+    /// Reloads the status list.
+    fn refresh_git(&self) {
+        self.git_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.git_error.set(Some(
+                    copy::text(
+                        "Open a session first; Git belongs to its workspace.",
+                        "请先打开一个会话，Git 属于它的工作区。",
+                        "請先開啟一個工作階段，Git 屬於它的工作區。",
+                    )
+                    .into(),
+                ));
+                return;
+            };
+            let result = background(async move { git.git_status(workspace).await }).await;
+            match result {
+                Ok(Ok(status)) => service.apply_git_status(status),
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reading Git status did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn apply_git_status(&self, status: GitStatusSummary) {
+        self.git_branch.set(
+            status
+                .branch
+                .clone()
+                .map(SharedString::from)
+                .map(Some)
+                .unwrap_or(None),
+        );
+        self.git_changes.set(
+            status
+                .changes
+                .into_iter()
+                .map(|change| GitChangeRow {
+                    status: change_letter(change.kind).to_owned(),
+                    path: change.path,
+                    staged: change.staged,
+                    additions: change.additions,
+                    deletions: change.deletions,
+                })
+                .collect(),
+        );
+    }
+
+    /// Reads a path's diff into the preview.
+    fn open_git_diff(&self, path: &str, staged: bool) {
+        self.git_error.set(None);
+        let path = path.to_owned();
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let title = path.clone();
+            let result = background(async move {
+                git.git_diff(GitDiffRequest {
+                    workspace_id: workspace,
+                    path,
+                    staged,
+                })
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(diff)) => service.git_diff.set(Some(GitDiffPreview {
+                    title,
+                    body: diff.diff,
+                    truncated: diff.truncated,
+                })),
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reading the diff did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Leaves the diff, then the surface.
+    fn git_back(&self) {
+        if self.git_diff.get_untracked().is_some() {
+            self.git_diff.set(None);
+        } else {
+            self.close_git();
+        }
+    }
+
     /// Re-reads the open session's transcript without clearing it.
     fn reload(&self, session_id: &VibexSessionId) {
         let service = self.clone();
@@ -1085,6 +1237,20 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
             vibex_core::AgentSessionState::Error => SessionState::Failed,
             _ => SessionState::Idle,
         },
+    }
+}
+
+fn change_letter(kind: GitChangeKind) -> &'static str {
+    match kind {
+        GitChangeKind::Added => "A",
+        GitChangeKind::Modified => "M",
+        GitChangeKind::Deleted => "D",
+        GitChangeKind::Renamed => "R",
+        GitChangeKind::Copied => "C",
+        GitChangeKind::TypeChanged => "T",
+        GitChangeKind::Untracked => "?",
+        GitChangeKind::Unmerged => "U",
+        GitChangeKind::Unknown => "·",
     }
 }
 
