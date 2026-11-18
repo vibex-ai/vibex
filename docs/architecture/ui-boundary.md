@@ -12,7 +12,12 @@ projections and applies the native compact visual treatment used by Zedra.
 - `apps/desktop` is the complete local GPUI workbench and owns the
   `DesktopRuntime`.
 - `apps/mobile` is a native GPUI iOS/Android client built on the published
-  `gpui-pre` family plus `gpui-pre-mobile`'s Android/iOS platform layer.
+  `gpui-pre` family plus `gpui-pre-mobile`'s Android/iOS platform layer. It is
+  the shipping mobile client until the Native Shell client reaches parity.
+- `apps/mobile-nsh` is the iOS/Android client rebuilt on Native Shell (`nsh`):
+  one Rust app whose views are the platform's own (UIKit, Android views), with
+  the UI layer in `crates/vibex-nsh-ui`. It is a client under the same rules as
+  the GPUI client; the two run side by side while screens migrate.
 - Mobile renders a GUI Agent timeline: user messages, Markdown responses,
   process/tool details, approvals, and the composer. It does not replace the
   session page with a terminal UI.
@@ -29,12 +34,15 @@ Shared across desktop and mobile:
 - Framework-neutral timeline and session projections in `crates/desktop-model`.
 - Backend capability contracts and workflow state in `crates/vibex-backend` and
   `crates/vibex-ui`.
+- Semantic tokens in `crates/vibex-ui/theme/tokens.json`; the nsh client
+  generates its theme file from the same source rather than defining colors.
 - Remote/Relay protocol behavior and tests.
 
-The native mobile renderer owns only platform bootstrap, pairing/storage, input,
-and the compact composition of those shared projections. It must not introduce a
-second Agent protocol, a local authority, or a separate terminal-first session
-experience.
+The native mobile renderers own only platform bootstrap, pairing/storage, input,
+and the compact composition of those shared projections. Neither client may
+introduce a second Agent protocol, a local authority, or a separate
+terminal-first session experience. `crates/vibex-nsh-ui` is composition only: it
+depends on `nsh-core` and `nsh-base`, never on GPUI, transport or runtime code.
 
 ## Visual Contract
 
@@ -48,6 +56,13 @@ The native mobile surface follows Zedra's restrained dark palette, compact spaci
 small radii, clear hierarchy, and edge-drawer navigation. Product-specific
 content remains Vibex GUI session content rather than Zedra's terminal workflow.
 
+The nsh client draws the same palette from `apps/mobile-nsh/theme.json`
+(generated from the token source; `cargo run -p vibex-mobile-nsh --bin
+gen-theme` refreshes it, and a test fails when it is stale). Its parity contract
+keeps information architecture, copy, spacing and states identical, while text
+metrics, scrolling, the keyboard, selection and navigation transitions are the
+platform's own.
+
 ## Required Checks
 
 ```text
@@ -55,6 +70,7 @@ node scripts/generate-tokens.mjs
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
 cargo test -p vibex-mobile --locked
+cargo test -p vibex-mobile-nsh --locked   # theme sync + headless pairing flows
 ```
 
 Platform SDK builds are separate validation: Android requires the Android

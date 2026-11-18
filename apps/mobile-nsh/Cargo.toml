@@ -1,0 +1,25 @@
+[package]
+name = "vibex-mobile-nsh"
+version = "0.1.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Vibex mobile client, rebuilt on Native Shell (nsh)."
+
+[lib]
+name = "vibex_mobile_nsh"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+log.workspace = true
+nsh-base.workspace = true
+nsh-core.workspace = true
+serde_json.workspace = true
+vibex-nsh-ui = { path = "../../crates/vibex-nsh-ui" }
+
+[dev-dependencies]
+# The headless driver: mounts the real root with no platform, so the app's
+# flows are tested as the engine renders them.
+nsh-engine = { version = "=0.6.0", default-features = false }
+nsh-testing = { version = "=0.6.0", default-features = false }

@@ -1,0 +1,9 @@
+{
+  "name": "Vibex",
+  "id": "ai.vibex.mobile.nsh",
+  "version": "0.1.8",
+  "appearance": "system",
+  "rust": ".",
+  "root": "App",
+  "theme": "theme.json"
+}

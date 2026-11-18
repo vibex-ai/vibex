@@ -1,0 +1,3 @@
+//! One module per screen of the mobile client.
+
+pub mod pairing;
