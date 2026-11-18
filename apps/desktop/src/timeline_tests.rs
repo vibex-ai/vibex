@@ -469,7 +469,9 @@ impl Render for TimelineBottomFollowProbe {
                 .w_full()
                 .h(px(height))
                 .on_prepaint(move |bounds, _, _| {
-                    painted.borrow_mut().push(TimelinePaintFrame { row_bounds: bounds });
+                    painted
+                        .borrow_mut()
+                        .push(TimelinePaintFrame { row_bounds: bounds });
                 })
                 .into_any_element()
         })
@@ -808,26 +810,25 @@ impl Render for ReasoningTimelineProbe {
                 let measured_turn = measured_turn.clone();
                 let entity = entity.clone();
                 h_flex()
-                        .w_full()
-                        .h(row_height)
-                        .items_start()
-                        .overflow_hidden()
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .flex_none()
-                                .on_prepaint(move |bounds, _, cx| {
-                                    let height = f32::from(bounds.size.height).ceil();
-                                    measured_turn.set(Some(height));
-                                    if (height - f32::from(row_height)).abs() >= 1.0 {
-                                        let _ = entity.update(cx, |_, cx| cx.notify());
-                                    }
-                                })
-
-                                .child(content)
-                                .child(div().h(px(300.0)).flex_none()),
-                        )
-                        .into_any_element()
+                    .w_full()
+                    .h(row_height)
+                    .items_start()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .flex_none()
+                            .on_prepaint(move |bounds, _, cx| {
+                                let height = f32::from(bounds.size.height).ceil();
+                                measured_turn.set(Some(height));
+                                if (height - f32::from(row_height)).abs() >= 1.0 {
+                                    let _ = entity.update(cx, |_, cx| cx.notify());
+                                }
+                            })
+                            .child(content)
+                            .child(div().h(px(300.0)).flex_none()),
+                    )
+                    .into_any_element()
             },
         )
         .w(px(500.0))
@@ -896,7 +897,12 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         .timeline_follow
                         .set_following_bottom(following_bottom);
                     if !following_bottom {
-                        let offset = view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y + px(290.0);
+                        let offset = view
+                            .session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
+                            + px(290.0);
                         view.session
                             .timeline_scroll
                             .set_offset_from_scrollbar(point(px(0.0), offset));
@@ -905,8 +911,12 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                 });
                 cx.run_until_parked();
                 for expanded in [false, true, false, true] {
-                    let before =
-                        view.read_with(cx, |view, _| view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y);
+                    let before = view.read_with(cx, |view, _| {
+                        view.session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
+                    });
                     observed.borrow_mut().clear();
                     let trigger = cx.debug_bounds("toggle-reasoning").unwrap();
                     cx.simulate_click(
@@ -935,7 +945,10 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         let height = view.session.timeline_measured_turn_heights["active"];
                         assert_eq!(view.session.timeline_row_sizes[0].height, px(height));
                         assert_eq!(view.session.timeline_process_unit_heights.len(), unit_count);
-                        view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y
+                        view.session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
                     });
                     let mut previous = before;
                     assert!(!observed.borrow().is_empty());
@@ -1052,9 +1065,13 @@ impl Render for SidebarTimelineProbe {
                                         div()
                                             .debug_selector(move || format!("resize-row-{index}"))
                                             .w_full()
-                                            .when_some(content_max_width, |this, width| this.max_w(px(width)))
+                                            .when_some(content_max_width, |this, width| {
+                                                this.max_w(px(width))
+                                            })
                                             .h(px(120.0))
-                                            .child("A timeline row that fits at either sidebar width"),
+                                            .child(
+                                                "A timeline row that fits at either sidebar width",
+                                            ),
                                     )
                                     .into_any_element()
                             },
@@ -1124,7 +1141,10 @@ fn sidebar_width_changes_preserve_timeline_vertical_position(cx: &mut TestAppCon
                     break;
                 }
             }
-            assert!(!selector.is_empty(), "no row is on screen at offset {offset:?}");
+            assert!(
+                !selector.is_empty(),
+                "no row is on screen at offset {offset:?}"
+            );
             let before = cx.debug_bounds(selector).unwrap();
             let initial_offset = scroll.scroll_px_offset_for_scrollbar().y;
             let initial_max = scroll.max_offset_for_scrollbar().y;
@@ -1546,8 +1566,9 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
     let collapsed_rail = cx
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should be laid out");
-    let collapsed_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.viewport_bounds());
+    let collapsed_viewport = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.viewport_bounds()
+    });
     let collapsed_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should be laid out");
@@ -1563,8 +1584,9 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
     let expanded_rail = cx
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should still be laid out");
-    let expanded_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.viewport_bounds());
+    let expanded_viewport = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.viewport_bounds()
+    });
     let expanded_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should still be laid out");
@@ -3973,7 +3995,9 @@ fn click_activity_header(cx: &mut VisualTestContext, row_id: &str) -> Point<Pixe
 }
 
 fn timeline_offset(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Pixels {
-    workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y)
+    workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    })
 }
 
 fn timeline_is_on_the_bottom_edge(
@@ -4313,20 +4337,63 @@ fn auto_collapse_draws_a_live_run_as_its_summary_until_the_reader_opens_it(
     );
 }
 
-    /// The surface alone, with no workbench view above it: if this composites,
-    /// the ancestor chain is what stops it.
-    struct BareSurfaceHost {
-        view: Entity<TimelineSurfaceView>,
-    }
+/// The surface alone, with no workbench view above it: if this composites,
+/// the ancestor chain is what stops it.
+struct BareSurfaceHost {
+    view: Entity<TimelineSurfaceView>,
+}
 
-    impl Render for BareSurfaceHost {
-        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-            div()
-                .w(px(600.0))
-                .h(px(400.0))
-                .child(self.view.clone().cached(StyleRefinement::default().size_full()))
-        }
+impl Render for BareSurfaceHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(600.0)).h(px(400.0)).child(
+            self.view
+                .clone()
+                .cached(StyleRefinement::default().size_full()),
+        )
     }
+}
+
+/// The workbench's own list state and rows, but drawn *inside* a view that
+/// is mounted through `cached`, exactly like the surface is.
+struct CachedListHost {
+    state: gpui::ListState,
+    workbench: Entity<VibexWorkbench>,
+}
+
+impl Render for CachedListHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let state = self.state.clone();
+        let workbench = self.workbench.clone();
+        gpui::list(state, move |index, window, cx| {
+            let turn =
+                workbench.read_with(cx, |w, _| w.conversation_turns_cache.get(index).cloned());
+            let Some(turn) = turn else {
+                return div().into_any_element();
+            };
+            let mut built = div().into_any_element();
+            let _ = workbench.update(cx, |w, cx| {
+                built = w.render_timeline_turn(&turn, index, true, true, window, cx);
+            });
+            built
+        })
+        .w(px(600.0))
+        .h(px(400.0))
+    }
+}
+
+struct CachedListWrapper {
+    inner: Entity<CachedListHost>,
+}
+
+impl Render for CachedListWrapper {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        div().w(px(600.0)).h(px(400.0)).child(
+            self.inner
+                .clone()
+                .cached(StyleRefinement::default().size_full()),
+        )
+    }
+}
 
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {

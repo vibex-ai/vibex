@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, App, BorderStyle, Element, Hsla, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
-    Styled, Window, WindowAppearance, div, px,
+    AnyElement, App, BorderStyle, Context, Element, Hsla, InteractiveElement, Interactivity,
+    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, WindowAppearance, div, px,
 };
 use gpui_base::Selectable;
 use gpui_component::{
@@ -250,23 +250,50 @@ impl<E> RenderOnce for PinnedScrollbarBox<E>
 where
     E: InteractiveElement + Styled + ParentElement + Element + 'static,
 {
-    fn render(mut self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let scroller = self.scroller;
         let mut outer = self.outer.child(scroller);
         if let Some(bar) = self.bar.take() {
-            // The overlay is a sibling placed after the scroller, so it paints
-            // over the rows. `inset_0` pins it to the viewport while
-            // `viewport_from_layout` makes it measure against the same box,
-            // which is what keeps the thumb fixed as the content moves.
+            // The bar gets a view of its own: see [`ScrollbarOverlay`]. It is a
+            // sibling placed after the scroller, so it paints over the rows,
+            // and `inset_0` pins it to the viewport while
+            // `viewport_from_layout` makes it measure against the same box.
+            let overlay =
+                window.use_keyed_state("scrollbar-overlay", cx, |_, _| ScrollbarOverlay { bar });
             outer = outer.child(
                 div()
                     .absolute()
                     .inset_0()
-                    .debug_selector(|| "scrollbar-overlay".to_string())
-                    .child(bar),
+                    .child(overlay.cached(StyleRefinement::default().size_full())),
             );
         }
         outer
+    }
+}
+
+/// The bar's own render boundary.
+///
+/// `Scrollbar` asks for an animation frame while its fade runs, and
+/// `Window::request_animation_frame` attributes the request to
+/// `window.current_view()`. Painted as a child of the view that holds the
+/// scroller, that view is the one a list's layer belongs to, and the layer is
+/// refused for as long as the fade runs — every scrolled frame. A view of its
+/// own moves the attribution off the scroller's owner.
+struct ScrollbarOverlay {
+    bar: gpui_base::Scrollbar,
+}
+
+impl gpui::Render for ScrollbarOverlay {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let bar = std::mem::replace(
+            &mut self.bar,
+            gpui_base::Scrollbar::new(&gpui::ScrollHandle::new()),
+        );
+        div()
+            .absolute()
+            .inset_0()
+            .debug_selector(|| "scrollbar-overlay".to_string())
+            .child(bar)
     }
 }
 

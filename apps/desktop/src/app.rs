@@ -39,12 +39,12 @@ use gpui::{
     Global, GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage,
-    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString,
-    Size, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    StyledImage as _, StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, deferred, div, img,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
+    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString, Size, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
+    Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowId, WindowKind, WindowOptions, deferred, div, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, rgb, size,
 };
 use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
@@ -6536,8 +6536,7 @@ impl SessionView {
             let content: Pixels = self.timeline_row_sizes.iter().map(|row| row.height).sum();
             let viewport = self.timeline_scroll.viewport_bounds().size.height;
             if content <= viewport {
-                self.timeline_scroll
-                    .scroll_to(gpui::ListOffset::default());
+                self.timeline_scroll.scroll_to(gpui::ListOffset::default());
             } else {
                 self.timeline_scroll.scroll_to_end();
             }
@@ -16155,7 +16154,10 @@ impl VibexWorkbench {
         let profiles = SshProfileStore::at_home(&config.home_dir)
             .load()
             .unwrap_or_default();
-        let Some(profile) = profiles.into_iter().find(|profile| profile.id == profile_id) else {
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
             self.runtime_edit_homes_error = Some("the SSH profile was not found".to_string());
             cx.notify();
             return;
@@ -64609,7 +64611,10 @@ impl VibexWorkbench {
         // gone instead of one that came back on the next frame.
         let pending_permission = turns_summary.has_pending_permission
             && self.permission_alert_is_pending(live_session_id.as_ref());
-        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0), cx);
+        self.sync_timeline_bottom_control(
+            self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
+            cx,
+        );
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
         // The rail is the pane's reading lane, not the conversation viewport's.
@@ -79768,7 +79773,10 @@ impl VibexWorkbench {
     }
 
     /// The transcript surface's own render boundary, created on first use.
-    fn ensure_timeline_surface_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineSurfaceView> {
+    fn ensure_timeline_surface_view(
+        &mut self,
+        cx: &mut Context<Self>,
+    ) -> Entity<TimelineSurfaceView> {
         if let Some(view) = self.timeline_surface_view.as_ref() {
             return view.clone();
         }
@@ -91192,7 +91200,11 @@ fn runtime_home_kind_labels(
     use crate::ssh_connection::homes::RuntimeHomeKind as Kind;
     match kind {
         Kind::Managed => ("Independent data", "独立数据", "獨立資料"),
-        Kind::DesktopStable => ("Desktop data · stable", "桌面端数据 · stable", "桌面端資料 · stable"),
+        Kind::DesktopStable => (
+            "Desktop data · stable",
+            "桌面端数据 · stable",
+            "桌面端資料 · stable",
+        ),
         Kind::DesktopRc => ("Desktop data · rc", "桌面端数据 · rc", "桌面端資料 · rc"),
         Kind::DesktopPreview => (
             "Desktop data · preview",
@@ -131551,7 +131563,9 @@ mod tests {
 
         assert!(renderer.contains("agent_turn_preview_rail_visible_slots("));
         assert!(renderer.contains("timeline_visible_row_range("));
-        assert!(renderer.contains("f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)"));
+        assert!(
+            renderer.contains("f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)")
+        );
         assert!(renderer.contains("f32::from(self.timeline_scroll.viewport_bounds().size.height)"));
         // The pointer still outranks the reading position for its own slot, and
         // the reading position outranks the pointer's neighbourhood fade. The
@@ -133101,9 +133115,7 @@ mod tests {
         );
         let surface = source
             .split_once("    fn render_timeline_surface(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn render_agent_workbench_for(")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_workbench_for("))
             .map(|(body, _)| body)
             .expect("the transcript surface should remain inspectable");
         assert!(surface.contains("gpui::list("));
@@ -133114,7 +133126,9 @@ mod tests {
         // The surface owns its element tree, so a scroll rebuilds it alone.
         let view = source
             .split_once("struct TimelineSurfaceView {")
-            .and_then(|(_, tail)| tail.split_once("\n/// The child Agent rail's own render boundary."))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The child Agent rail's own render boundary.")
+            })
             .map(|(body, _)| body)
             .expect("the transcript surface's view should remain inspectable");
         assert!(view.contains("cx.observe(workbench, |_, _, cx| cx.notify()).detach();"));
