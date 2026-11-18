@@ -31,8 +31,8 @@ use vibex_core::{
     PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
     ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
     SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -46,6 +46,7 @@ use vibex_nsh_ui::{
         PermissionChoice, PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind,
         QuestionOption, QuestionResponse, SessionHost, SessionState, SessionSummary, TimelineEntry,
     },
+    screens::terminal::TerminalChoice,
 };
 
 use crate::pairing::error_text;
@@ -83,6 +84,8 @@ pub struct SessionService {
     terminal_id: Rc<RefCell<Option<TerminalId>>>,
     /// Bytes of a UTF-8 character split across two frames.
     terminal_pending: Rc<RefCell<Vec<u8>>>,
+    terminal_choices: Signal<Vec<TerminalChoice>>,
+    terminal_menu: Signal<bool>,
     /// Bumped when the terminal closes, so its stream stops writing.
     terminal_generation: Rc<Cell<u64>>,
     files_open: Signal<bool>,
@@ -167,6 +170,8 @@ impl SessionService {
             terminal_ref: component_ref::<Terminal>(),
             terminal_id: Rc::new(RefCell::new(None)),
             terminal_pending: Rc::new(RefCell::new(Vec::new())),
+            terminal_choices: signal(Vec::new()),
+            terminal_menu: signal(false),
             terminal_generation: Rc::new(Cell::new(0)),
             files_open: signal(false),
             files_path: signal(String::new()),
@@ -231,6 +236,8 @@ impl SessionService {
             terminal_title: self.terminal_title,
             terminal_error: self.terminal_error,
             terminal_ref: self.terminal_ref,
+            terminal_choices: self.terminal_choices,
+            terminal_menu: self.terminal_menu,
             files_open: self.files_open,
             files_path: self.files_path,
             files_entries: self.files_entries,
@@ -369,6 +376,22 @@ impl SessionService {
             on_interrupt: {
                 let service = self.clone();
                 Rc::new(move || service.interrupt_active())
+            },
+            on_terminal_menu: {
+                let service = self.clone();
+                Rc::new(move || service.terminal_menu.set(true))
+            },
+            on_close_terminal_menu: {
+                let service = self.clone();
+                Rc::new(move || service.terminal_menu.set(false))
+            },
+            on_select_terminal: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.select_terminal(id))
+            },
+            on_new_terminal: {
+                let service = self.clone();
+                Rc::new(move || service.new_terminal())
             },
             on_terminal_title: {
                 let service = self.clone();
@@ -1285,69 +1308,108 @@ impl SessionService {
         };
         self.terminal_open.set(true);
         self.terminal_error.set(None);
+        self.terminal_menu.set(false);
         self.terminal_title
             .set(Some(copy::text("Terminal", "终端", "終端").into()));
-        let generation = self.terminal_generation.get().wrapping_add(1);
-        self.terminal_generation.set(generation);
         let service = self.clone();
         let backend = self.backend.clone();
         let terminal_backend = self.terminal_backend.clone();
-        let opening_terminal = terminal_backend.clone();
+        let opening = terminal_backend.clone();
         spawn(async move {
             let result = background(async move {
                 let session = backend.open_session(active_id).await?;
-                let terminals = opening_terminal
-                    .list_terminals(session.workspace_id.clone())
-                    .await?;
-                let terminal = match terminals
-                    .into_iter()
-                    .find(|terminal| terminal.status == TerminalStatus::Running)
-                {
-                    Some(terminal) => terminal,
-                    None => {
-                        opening_terminal
-                            .create_terminal(MutationRequest::new(TerminalCreateRequest {
-                                workspace_id: session.workspace_id,
-                                title: None,
-                                shell: None,
-                                cwd: None,
-                                rows: 24,
-                                cols: 80,
-                            }))
-                            .await?
-                    }
-                };
-                let snapshot = opening_terminal
-                    .terminal_snapshot(terminal.id.clone())
-                    .await?;
-                Ok::<_, BackendError>((terminal, snapshot))
+                let terminals = opening.list_terminals(session.workspace_id.clone()).await?;
+                Ok::<_, BackendError>((session.workspace_id, terminals))
             })
             .await;
-            let (terminal, snapshot) = match result {
+            let (workspace, terminals) = match result {
                 Ok(Ok(opened)) => opened,
                 Ok(Err(error)) => {
                     service.terminal_error.set(Some(error_text(&error)));
-                    service.terminal_open.set(false);
                     return;
                 }
                 Err(error) => {
                     service
                         .terminal_error
                         .set(Some(format!("the terminal did not open: {error}").into()));
-                    service.terminal_open.set(false);
                     return;
                 }
             };
-            *service.terminal_id.borrow_mut() = Some(terminal.id.clone());
-            service.terminal_pending.borrow_mut().clear();
-            service
-                .terminal_title
-                .set(Some(terminal.title.clone().into()));
+            service.set_terminal_choices(&terminals);
+            if let Some(terminal) = terminals
+                .iter()
+                .find(|terminal| terminal.status == TerminalStatus::Running)
+                .or_else(|| terminals.first())
+            {
+                service.attach_terminal(terminal.id.clone(), terminal.title.clone());
+                return;
+            }
+            let created = background(async move {
+                terminal_backend
+                    .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                        workspace_id: workspace,
+                        title: None,
+                        shell: None,
+                        cwd: None,
+                        rows: 24,
+                        cols: 80,
+                    }))
+                    .await
+            })
+            .await;
+            match created {
+                Ok(Ok(terminal)) => {
+                    service
+                        .terminal_choices
+                        .update(|choices| push_terminal_choice(choices, &terminal));
+                    service.attach_terminal(terminal.id, terminal.title);
+                }
+                Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
+                Err(error) => service.terminal_error.set(Some(
+                    format!("creating the terminal did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Shows a terminal's current screen and follows it.
+    fn attach_terminal(&self, id: TerminalId, title: String) {
+        let generation = self.terminal_generation.get().wrapping_add(1);
+        self.terminal_generation.set(generation);
+        self.terminal_pending.borrow_mut().clear();
+        self.reset_terminal_output();
+        *self.terminal_id.borrow_mut() = Some(id.clone());
+        self.terminal_title.set(Some(title.into()));
+        self.terminal_error.set(None);
+        let service = self.clone();
+        let terminal_backend = self.terminal_backend.clone();
+        spawn(async move {
+            let snapshot = background({
+                let backend = terminal_backend.clone();
+                let id = id.clone();
+                async move { backend.terminal_snapshot(id).await }
+            })
+            .await;
+            let snapshot = match snapshot {
+                Ok(Ok(snapshot)) => snapshot,
+                Ok(Err(error)) => {
+                    service.terminal_error.set(Some(error_text(&error)));
+                    return;
+                }
+                Err(error) => {
+                    service.terminal_error.set(Some(
+                        format!("reading the terminal did not finish: {error}").into(),
+                    ));
+                    return;
+                }
+            };
+            if service.terminal_generation.get() != generation {
+                return;
+            }
             for chunk in snapshot.chunks {
                 service.write_terminal_output(chunk.data);
             }
-            let subscription = match terminal_backend
-                .subscribe_terminal(terminal.id.clone(), snapshot.next_sequence)
+            let subscription = match terminal_backend.subscribe_terminal(id, snapshot.next_sequence)
             {
                 Ok(subscription) => subscription,
                 Err(error) => {
@@ -1373,11 +1435,74 @@ impl SessionService {
         });
     }
 
+    /// Starts another terminal in the workspace and shows it.
+    fn new_terminal(&self) {
+        let service = self.clone();
+        let terminal_backend = self.terminal_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let created = background(async move {
+                terminal_backend
+                    .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                        workspace_id: workspace,
+                        title: None,
+                        shell: None,
+                        cwd: None,
+                        rows: 24,
+                        cols: 80,
+                    }))
+                    .await
+            })
+            .await;
+            match created {
+                Ok(Ok(terminal)) => {
+                    service
+                        .terminal_choices
+                        .update(|choices| push_terminal_choice(choices, &terminal));
+                    service.attach_terminal(terminal.id, terminal.title);
+                    service.terminal_menu.set(false);
+                }
+                Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
+                Err(error) => service.terminal_error.set(Some(
+                    format!("creating the terminal did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Shows another of the workspace's terminals.
+    fn select_terminal(&self, id: &str) {
+        let Ok(id) = TerminalId::parse(id) else {
+            return;
+        };
+        let title = self
+            .terminal_choices
+            .with(|choices| {
+                choices
+                    .iter()
+                    .find(|choice| choice.id == id.as_str())
+                    .map(|choice| choice.title.clone())
+            })
+            .unwrap_or_else(|| copy::text("Terminal", "终端", "終端").to_owned());
+        self.terminal_menu.set(false);
+        self.attach_terminal(id, title);
+    }
+
+    /// Replaces the terminal list from a backend listing.
+    fn set_terminal_choices(&self, terminals: &[vibex_core::TerminalSession]) {
+        let choices = terminals.iter().map(terminal_choice).collect::<Vec<_>>();
+        self.terminal_choices.set(choices);
+    }
+
     /// Closes the terminal surface; the PTY keeps running on the runtime.
     fn close_terminal(&self) {
         self.terminal_generation
             .set(self.terminal_generation.get().wrapping_add(1));
         self.terminal_open.set(false);
+        self.terminal_menu.set(false);
         *self.terminal_id.borrow_mut() = None;
     }
 
@@ -2088,6 +2213,30 @@ fn decode_terminal_bytes(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
             pending.drain(..valid);
             text
         }
+    }
+}
+
+/// The sheet's row for one terminal.
+fn terminal_choice(terminal: &TerminalSession) -> TerminalChoice {
+    TerminalChoice {
+        id: terminal.id.as_str().to_owned(),
+        title: terminal.title.clone(),
+        status: match terminal.status {
+            TerminalStatus::Running => "running",
+            TerminalStatus::Exited => "exited",
+            TerminalStatus::Killed => "killed",
+            TerminalStatus::Stale => "stale",
+        }
+        .to_owned(),
+    }
+}
+
+fn push_terminal_choice(choices: &mut Vec<TerminalChoice>, terminal: &TerminalSession) {
+    let choice = terminal_choice(terminal);
+    if let Some(existing) = choices.iter_mut().find(|existing| existing.id == choice.id) {
+        *existing = choice;
+    } else {
+        choices.push(choice);
     }
 }
 

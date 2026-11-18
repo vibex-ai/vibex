@@ -19,6 +19,7 @@ use vibex_nsh_ui::screens::session::{
     PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, SessionHost,
     SessionState, SessionSummary, TimelineEntry,
 };
+use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
     TimelineEntry {
@@ -149,6 +150,30 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let terminal_title = signal(Some(SharedString::from("Terminal")));
     let terminal_error = signal(None::<SharedString>);
     let terminal_ref = component_ref::<Terminal>();
+    let terminal_choices = signal(vec![
+        TerminalChoice {
+            id: "t1".to_owned(),
+            title: "Terminal".to_owned(),
+            status: "running".to_owned(),
+        },
+        TerminalChoice {
+            id: "t2".to_owned(),
+            title: "Build".to_owned(),
+            status: "running".to_owned(),
+        },
+    ]);
+    let terminal_menu = signal(false);
+    let on_select_terminal = Rc::new(move |id: &str| {
+        if let Some(choice) = terminal_choices.with(|choices| {
+            choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.title.clone())
+        }) {
+            terminal_title.set(Some(choice.into()));
+            terminal_menu.set(false);
+        }
+    });
     let files_open = signal(false);
     let files_path = signal(String::new());
     let files_entries = signal(vec![
@@ -402,6 +427,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_terminal_resize: Rc::new(|_, _| {}),
         on_terminal_title: Rc::new(|_| {}),
         on_interrupt,
+        terminal_choices,
+        terminal_menu,
+        on_terminal_menu: Rc::new(move || terminal_menu.set(true)),
+        on_close_terminal_menu: Rc::new(move || terminal_menu.set(false)),
+        on_select_terminal,
+        on_new_terminal: Rc::new(|| {}),
         files_open,
         files_path,
         files_entries,
@@ -781,4 +812,21 @@ fn a_running_turn_can_be_stopped_from_the_composer() {
     app.wait_for("role:button[Stop]").unwrap();
     app.press("role:button[Stop]").unwrap();
     app.wait_for("role:button[Send]").unwrap();
+}
+
+#[test]
+fn the_terminal_list_switches_between_terminals() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Terminals]").unwrap();
+    app.press("role:button[Terminals]").unwrap();
+    app.wait_for("Build").unwrap();
+    app.press("Build").unwrap();
+    app.wait_until(
+        "the title follows",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().contains(&"Build"),
+    )
+    .unwrap();
 }

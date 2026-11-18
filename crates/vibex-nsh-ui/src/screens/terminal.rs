@@ -7,10 +7,19 @@
 
 use std::rc::Rc;
 
-use nsh_base::{Terminal, TerminalEvent, terminal as terminal_view};
+use nsh_base::{SheetEvent, Terminal, TerminalEvent, button, sheet, terminal as terminal_view};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
+
+/// One of the workspace's terminals.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TerminalChoice {
+    pub id: String,
+    pub title: String,
+    /// "running", "exited" or "stale".
+    pub status: String,
+}
 
 /// How the terminal screen reaches the session.
 #[derive(Clone)]
@@ -25,6 +34,13 @@ pub struct TerminalHost {
     pub on_resize: Rc<dyn Fn(u32, u32)>,
     /// The title the program set.
     pub on_title: Rc<dyn Fn(&str)>,
+    /// The workspace's terminals, and whether the list is open.
+    pub terminals: Signal<Vec<TerminalChoice>>,
+    pub terminal_menu: Signal<bool>,
+    pub on_open_menu: Rc<dyn Fn()>,
+    pub on_close_menu: Rc<dyn Fn()>,
+    pub on_select_terminal: Rc<dyn Fn(&str)>,
+    pub on_new_terminal: Rc<dyn Fn()>,
     pub on_close: Rc<dyn Fn()>,
 }
 
@@ -33,6 +49,8 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let on_data = host.on_data.clone();
     let on_resize = host.on_resize.clone();
     let on_title = host.on_title.clone();
+    let terminal_menu = host.terminal_menu;
+    let terminals = host.terminals;
     let title = host.title;
     let error = host.error;
     view()
@@ -72,7 +90,15 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             .text_size(px(theme::FONT_HEADING))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
-                        ),
+                        )
+                        .child({
+                            let on_open_menu = host.on_open_menu.clone();
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/menu.svg")),
+                                copy::text("Terminals", "终端列表", "終端清單"),
+                                move || on_open_menu(),
+                            )
+                        }),
                 ),
         )
         .child(when(
@@ -97,6 +123,86 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 })
                 .on_title_change(move |title: &SharedString| on_title(title))
                 .flex_1(),
+        )
+        .child(terminal_sheet(
+            terminal_menu,
+            terminals,
+            host.on_close_menu.clone(),
+            host.on_select_terminal.clone(),
+            host.on_new_terminal.clone(),
+        ))
+}
+
+/// The list of the workspace's terminals, with New terminal.
+fn terminal_sheet(
+    open: Signal<bool>,
+    terminals: Signal<Vec<TerminalChoice>>,
+    on_close: Rc<dyn Fn()>,
+    on_select: Rc<dyn Fn(&str)>,
+    on_new: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Terminals", "终端", "終端"))
+                        .text_size(px(theme::FONT_HEADING))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(each(
+                    move || terminals.get(),
+                    |terminal| terminal.id.clone(),
+                    move |terminal, _| {
+                        let on_select = on_select.clone();
+                        button()
+                            .w_full()
+                            .min_h(px(48.0))
+                            .px(px(theme::SPACING_MD))
+                            .py(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::background_dim)
+                            .flex_col()
+                            .items_start()
+                            .active(|style| style.opacity(0.8))
+                            .on_press(move || on_select(&terminal.get_untracked().id))
+                            .child(
+                                text(move || terminal.get().title)
+                                    .truncate()
+                                    .text_size(px(theme::FONT_DETAIL))
+                                    .text_color(theme::foreground),
+                            )
+                            .child(
+                                text(move || terminal.get().status)
+                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_color(theme::text_muted),
+                            )
+                    },
+                ))
+                .child({
+                    let on_new = on_new.clone();
+                    action::primary(
+                        copy::text("New terminal", "新建终端", "新增終端"),
+                        icon(include_str!("../../assets/icons/terminal.svg")),
+                        move || on_new(),
+                    )
+                    .w_full()
+                }),
         )
 }
 

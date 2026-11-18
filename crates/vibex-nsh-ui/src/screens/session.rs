@@ -297,6 +297,12 @@ pub struct SessionHost {
     pub on_terminal_data: TerminalInput,
     pub on_terminal_resize: Rc<dyn Fn(u32, u32)>,
     pub on_terminal_title: Rc<dyn Fn(&str)>,
+    pub terminal_choices: Signal<Vec<crate::screens::terminal::TerminalChoice>>,
+    pub terminal_menu: Signal<bool>,
+    pub on_terminal_menu: Action,
+    pub on_close_terminal_menu: Action,
+    pub on_select_terminal: Rc<dyn Fn(&str)>,
+    pub on_new_terminal: Action,
     /// Stops the active session's turn.
     pub on_interrupt: Action,
     /// The files surface, when it is open over the shell.
@@ -371,6 +377,12 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         on_data: host.on_terminal_data.clone(),
         on_resize: host.on_terminal_resize.clone(),
         on_title: host.on_terminal_title.clone(),
+        terminals: host.terminal_choices,
+        terminal_menu: host.terminal_menu,
+        on_open_menu: host.on_terminal_menu.clone(),
+        on_close_menu: host.on_close_terminal_menu.clone(),
+        on_select_terminal: host.on_select_terminal.clone(),
+        on_new_terminal: host.on_new_terminal.clone(),
         on_close: host.on_close_terminal.clone(),
     };
     let files = crate::screens::files::FilesHost {
