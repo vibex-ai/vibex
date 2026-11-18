@@ -80,8 +80,9 @@ A successful claim or a tapped saved runtime opens the session shell:
   and the answers converted back to the runtime's typed values;
 - the composer offers the session's `/` commands and `@` references (one
   discovery per session each, filtered locally; a reference replaces the
-  `@…` token in place), and the drawer starts a new session in the open
-  workspace with its runtime selection;
+  `@…` token in place), and the drawer starts a new session through a sheet
+  that lists the runtime's workspaces and its ready Agent/model options
+  (`list_workspaces`, `list_runtime_options`);
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY
   snapshot fills it, its frame stream keeps it live, and what the person types
   goes back to the PTY. Closing the surface leaves the terminal running;
@@ -134,10 +135,10 @@ Two layers:
   Markdown reply renders, the composer appends what was sent and clears, a
   permission card is answered and leaves, a question collects a typed answer
   and leaves, the `/` and `@` palettes insert a command and a reference, New
-  session opens a session, the terminal shows a program's output, the files
-  surface lists a directory and reads a file, and the Git surface lists a
-  change and shows its diff. Each migrated screen adds the flows its GPUI
-  pair has.
+  session opens through the picker and its sheet collects a workspace and a
+  runtime, the terminal shows a program's output, the files surface lists a
+  directory and reads a file, and the Git surface lists a change and shows its
+  diff. Each migrated screen adds the flows its GPUI pair has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -253,8 +254,7 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. Attachments, and the full new-session picker (workspace, Agent, model)
-   instead of reusing the open session's.
+1. Attachments (the file picker and how a chosen file reaches the runtime).
 2. The platform device name and the release pipeline; the shell's own camera
    and discovery code against the request queue.
 3. The rest of the workbench: editing (nsh's `Editor` and `DiffView`), and the

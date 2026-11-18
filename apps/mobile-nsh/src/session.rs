@@ -17,7 +17,7 @@ use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use vibex_backend::{
     AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, GitBackend,
-    MutationRequest, TerminalBackend,
+    MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
@@ -26,9 +26,10 @@ use vibex_core::{
     FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitDiffRequest,
     GitStatusSummary, MessageProvenance, PermissionRequest, PermissionRequestStatus,
     PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, TerminalCreateRequest, TerminalId,
-    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
-    VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
+    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest,
+    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -36,6 +37,7 @@ use vibex_nsh_ui::{
     copy,
     screens::files::{FileEntry, FilePreview},
     screens::git::{GitChangeRow, GitDiffPreview},
+    screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
         CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
         PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
@@ -55,6 +57,7 @@ pub struct SessionService {
     terminal_backend: Arc<dyn TerminalBackend>,
     file_backend: Arc<dyn FileBackend>,
     git_backend: Arc<dyn GitBackend>,
+    workspace_backend: Arc<dyn WorkspaceBackend>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
@@ -88,6 +91,15 @@ pub struct SessionService {
     git_changes: Signal<Vec<GitChangeRow>>,
     git_diff: Signal<Option<GitDiffPreview>>,
     git_error: Signal<Option<SharedString>>,
+    new_session_open: Signal<bool>,
+    new_workspaces: Signal<Vec<WorkspaceChoice>>,
+    new_runtimes: Signal<Vec<RuntimeChoice>>,
+    new_workspace: Signal<Option<String>>,
+    new_runtime: Signal<Option<String>>,
+    new_busy: Signal<bool>,
+    new_error: Signal<Option<SharedString>>,
+    workspace_records: Rc<RefCell<Vec<WorkspaceSummary>>>,
+    runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -104,6 +116,7 @@ impl SessionService {
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
         let file_backend: Arc<dyn FileBackend> = backend.clone();
         let git_backend: Arc<dyn GitBackend> = backend.clone();
+        let workspace_backend: Arc<dyn WorkspaceBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let service = Self {
@@ -111,6 +124,7 @@ impl SessionService {
             terminal_backend,
             file_backend,
             git_backend,
+            workspace_backend,
             sessions: signal(Vec::new()),
             active: signal(None),
             timeline: signal(Vec::new()),
@@ -142,6 +156,15 @@ impl SessionService {
             git_changes: signal(Vec::new()),
             git_diff: signal(None),
             git_error: signal(None),
+            new_session_open: signal(false),
+            new_workspaces: signal(Vec::new()),
+            new_runtimes: signal(Vec::new()),
+            new_workspace: signal(None),
+            new_runtime: signal(None),
+            new_busy: signal(false),
+            new_error: signal(None),
+            workspace_records: Rc::new(RefCell::new(Vec::new())),
+            runtime_options: Rc::new(RefCell::new(Vec::new())),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -179,6 +202,13 @@ impl SessionService {
             git_changes: self.git_changes,
             git_diff: self.git_diff,
             git_error: self.git_error,
+            new_session_open: self.new_session_open,
+            new_workspaces: self.new_workspaces,
+            new_runtimes: self.new_runtimes,
+            new_workspace: self.new_workspace,
+            new_runtime: self.new_runtime,
+            new_busy: self.new_busy,
+            new_error: self.new_error,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -215,7 +245,15 @@ impl SessionService {
             },
             on_new_session: {
                 let service = self.clone();
-                Rc::new(move || service.new_session())
+                Rc::new(move || service.open_new_session())
+            },
+            on_create_session: {
+                let service = self.clone();
+                Rc::new(move || service.create_new_session())
+            },
+            on_close_new_session: {
+                let service = self.clone();
+                Rc::new(move || service.new_session_open.set(false))
             },
             on_open_terminal: {
                 let service = self.clone();
@@ -702,48 +740,137 @@ impl SessionService {
         });
     }
 
-    /// Starts a session in the open session's workspace with its runtime.
-    fn new_session(&self) {
-        let Some(active) = self.active.get_untracked() else {
-            self.fail_text(copy::text(
-                "Open a session first; the new one reuses its workspace.",
-                "请先打开一个会话，新会话会复用它的工作区。",
-                "請先開啟一個工作階段，新工作階段會沿用它的工作區。",
-            ));
+    /// Opens the new-session sheet with the runtime's choices.
+    fn open_new_session(&self) {
+        self.files_open.set(false);
+        self.git_open.set(false);
+        self.terminal_open.set(false);
+        self.new_session_open.set(true);
+        self.new_error.set(None);
+        self.new_busy.set(true);
+        let service = self.clone();
+        let workspaces = self.workspace_backend.clone();
+        let catalog_backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                let spaces = workspaces.list_workspaces().await?;
+                let catalog = catalog_backend.list_runtime_options().await?;
+                Ok::<_, BackendError>((spaces, catalog))
+            })
+            .await;
+            service.new_busy.set(false);
+            match result {
+                Ok(Ok((spaces, catalog))) => {
+                    let workspace_choices = spaces
+                        .iter()
+                        .map(|space| WorkspaceChoice {
+                            id: space.workspace.id.as_str().to_owned(),
+                            name: space.project.name.clone(),
+                            detail: space.workspace.root_path.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    let runtime_choices = catalog
+                        .options
+                        .iter()
+                        .filter(|option| {
+                            option.availability == RuntimeOptionAvailability::Available
+                        })
+                        .enumerate()
+                        .map(|(index, option)| RuntimeChoice {
+                            id: index.to_string(),
+                            title: format!("{} · {}", option.agent_label, option.model_label),
+                            detail: option.auth_source_label.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    if workspace_choices.is_empty() || runtime_choices.is_empty() {
+                        service.new_error.set(Some(
+                            copy::text(
+                                "No workspace or ready Agent is available on this runtime.",
+                                "该运行时没有可用的工作区或就绪的 Agent。",
+                                "該執行環境沒有可用的工作區或就緒的 Agent。",
+                            )
+                            .into(),
+                        ));
+                    }
+                    service
+                        .new_workspace
+                        .set(workspace_choices.first().map(|choice| choice.id.clone()));
+                    service
+                        .new_runtime
+                        .set(runtime_choices.first().map(|choice| choice.id.clone()));
+                    service.new_workspaces.set(workspace_choices);
+                    service.new_runtimes.set(runtime_choices);
+                    *service.workspace_records.borrow_mut() = spaces;
+                    *service.runtime_options.borrow_mut() = catalog.options;
+                }
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("loading the new-session choices did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Creates the session the sheet describes.
+    fn create_new_session(&self) {
+        if self.new_busy.get_untracked() {
+            return;
+        }
+        let Some(workspace_id) = self.new_workspace.get_untracked() else {
             return;
         };
-        let Ok(active_id) = VibexSessionId::parse(active) else {
+        let Some(runtime_id) = self.new_runtime.get_untracked() else {
             return;
         };
+        let Ok(index) = runtime_id.parse::<usize>() else {
+            return;
+        };
+        let workspace = self
+            .workspace_records
+            .borrow()
+            .iter()
+            .find(|space| space.workspace.id.as_str() == workspace_id)
+            .cloned();
+        let option = self
+            .runtime_options
+            .borrow()
+            .iter()
+            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
+            .nth(index)
+            .cloned();
+        let (Some(workspace), Some(option)) = (workspace, option) else {
+            return;
+        };
+        self.new_busy.set(true);
+        self.new_error.set(None);
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                let session = backend.open_session(active_id.clone()).await?;
-                let selection = backend.runtime_selection(active_id).await?.desired;
-                backend
-                    .create_session(MutationRequest::new(CreateAgentSessionRequest {
-                        runtime: selection,
-                        workspace_root: session.workspace_root,
-                        workspace_mode: session.workspace_mode,
-                        title: None,
-                        safety: None,
-                        session_id: Some(VibexSessionId::new()),
-                        defer_runtime_materialization: false,
-                        tools: Default::default(),
-                    }))
-                    .await
-            })
-            .await;
+            let request = CreateAgentSessionRequest {
+                runtime: option.selection,
+                workspace_root: workspace.workspace.root_path.clone(),
+                workspace_mode: workspace.workspace.mode,
+                title: None,
+                safety: None,
+                session_id: Some(VibexSessionId::new()),
+                defer_runtime_materialization: false,
+                tools: Default::default(),
+            };
+            let result =
+                background(
+                    async move { backend.create_session(MutationRequest::new(request)).await },
+                )
+                .await;
+            service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
+                    service.new_session_open.set(false);
                     service.refresh();
                     service.open(session.id.as_str());
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("creating the session did not finish: {error}"),
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("creating the session did not finish: {error}").into(),
                 )),
             }
         });

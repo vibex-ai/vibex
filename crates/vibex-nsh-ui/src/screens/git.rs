@@ -128,10 +128,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
         ))
 }
 
-fn change_list(
-    changes: Signal<Vec<GitChangeRow>>,
-    on_open_diff: OpenDiff,
-) -> impl IntoElement {
+fn change_list(changes: Signal<Vec<GitChangeRow>>, on_open_diff: OpenDiff) -> impl IntoElement {
     view().flex_1().min_h(px(0.0)).child(
         virtual_list(
             move || changes.with(|changes| changes.len()),

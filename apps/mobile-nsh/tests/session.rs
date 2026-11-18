@@ -13,6 +13,7 @@ use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::git::{GitChangeRow, GitDiffPreview};
+use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
     PermissionOption, QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary,
@@ -185,6 +186,38 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }));
     });
     let on_git_back = Rc::new(move || git_diff.set(None));
+    let new_session_open = signal(false);
+    let new_workspaces = signal(vec![WorkspaceChoice {
+        id: "w1".to_owned(),
+        name: "Vibex".to_owned(),
+        detail: "/code/vibex".to_owned(),
+    }]);
+    let new_runtimes = signal(vec![RuntimeChoice {
+        id: "0".to_owned(),
+        title: "Claude · Sonnet".to_owned(),
+        detail: "Subscription".to_owned(),
+    }]);
+    let new_workspace = signal(Some("w1".to_owned()));
+    let new_runtime = signal(Some("0".to_owned()));
+    let new_busy = signal(false);
+    let new_error = signal(None::<SharedString>);
+    let on_create_session = Rc::new(move || {
+        sessions.update(|sessions| {
+            sessions.insert(
+                0,
+                SessionSummary {
+                    id: "s3".to_owned(),
+                    title: "Created session".to_owned(),
+                    agent: "Claude".to_owned(),
+                    meta: "now".to_owned(),
+                    state: SessionState::Idle,
+                },
+            );
+        });
+        active.set(Some("s3".to_owned()));
+        timeline.set(transcript("s3"));
+        new_session_open.set(false);
+    });
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -225,22 +258,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     });
     let on_open_terminal = Rc::new(move || terminal_open.set(true));
     let on_close_terminal = Rc::new(move || terminal_open.set(false));
-    let on_new_session = Rc::new(move || {
-        sessions.update(|sessions| {
-            sessions.insert(
-                0,
-                SessionSummary {
-                    id: "s3".to_owned(),
-                    title: "Fresh session".to_owned(),
-                    agent: "Claude".to_owned(),
-                    meta: "now".to_owned(),
-                    state: SessionState::Idle,
-                },
-            );
-        });
-        active.set(Some("s3".to_owned()));
-        timeline.set(transcript("s3"));
-    });
+    let on_new_session = Rc::new(move || new_session_open.set(true));
     SessionHost {
         sessions,
         active,
@@ -290,6 +308,15 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_git_diff,
         on_git_back,
         on_refresh_git: Rc::new(|| {}),
+        new_session_open,
+        new_workspaces,
+        new_runtimes,
+        new_workspace,
+        new_runtime,
+        new_busy,
+        new_error,
+        on_create_session,
+        on_close_new_session: Rc::new(move || new_session_open.set(false)),
     }
 }
 
@@ -402,12 +429,14 @@ fn the_slash_palette_inserts_a_command() {
 }
 
 #[test]
-fn a_new_session_reuses_the_open_workspace_and_opens() {
+fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
     app.press("role:button[New session]").unwrap();
-    app.wait_for("Fresh session").unwrap();
+    app.wait_for("Claude · Sonnet").unwrap();
+    app.press("role:button[Create]").unwrap();
+    app.wait_for("Created session").unwrap();
 }
 
 /// The shell with its terminal open; it writes a line into the terminal after

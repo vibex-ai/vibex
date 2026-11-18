@@ -208,6 +208,10 @@ type OpenPath = Rc<dyn Fn(&str)>;
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
 
+use crate::screens::new_session::{
+    NewSessionHost, RuntimeChoice, WorkspaceChoice, new_session as new_session_sheet,
+};
+
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 
@@ -284,6 +288,16 @@ pub struct SessionHost {
     pub on_open_dir: OpenPath,
     pub on_open_file: OpenPath,
     pub on_files_back: Action,
+    /// The new-session sheet, and what it offers.
+    pub new_session_open: Signal<bool>,
+    pub new_workspaces: Signal<Vec<WorkspaceChoice>>,
+    pub new_runtimes: Signal<Vec<RuntimeChoice>>,
+    pub new_workspace: Signal<Option<String>>,
+    pub new_runtime: Signal<Option<String>>,
+    pub new_busy: Signal<bool>,
+    pub new_error: Signal<Option<SharedString>>,
+    pub on_create_session: Action,
+    pub on_close_new_session: Action,
     /// The Git surface, when it is open over the shell.
     pub git_open: Signal<bool>,
     pub git_branch: Signal<Option<SharedString>>,
@@ -416,7 +430,18 @@ fn shell(host: SessionHost) -> impl IntoElement {
             move || question_card(question, resolving, on_question.clone())
         }))
         .child(composer(host.clone()))
-        .child(drawer(host, drawer_open))
+        .child(drawer(host.clone(), drawer_open))
+        .child(new_session_sheet(NewSessionHost {
+            open: host.new_session_open,
+            workspaces: host.new_workspaces,
+            runtimes: host.new_runtimes,
+            workspace: host.new_workspace,
+            runtime: host.new_runtime,
+            busy: host.new_busy,
+            error: host.new_error,
+            on_close: host.on_close_new_session.clone(),
+            on_create: host.on_create_session.clone(),
+        }))
 }
 
 /// The top bar: the drawer, the title, a refresh.
