@@ -7,16 +7,11 @@
 //! changes is who draws them: `nsh` mounts platform views, so the camera, the
 //! keyboard, the sheets and the scrolling are the platform's.
 //!
-//! The screen owns only transient view state (which sheet is open, what is
-//! typed). Everything authoritative — the saved runtimes, whether a runtime is
-//! reachable, what a scan found — arrives through [`PairingHost`], which the
-//! app builds. The callbacks are the seams the transport fills in; today the
-//! app logs them.
-//!
-//! The two lists are snapshots for now, taken when the screen is built. The
-//! transport integration moves them behind signals with the rest of the app's
-//! state, the way the GPUI client reads its store; the layout below does not
-//! depend on how that lands.
+//! The page owns only transient view state (which sheet is open, what is
+//! typed). The saved runtimes, their reachability, the claim in flight and its
+//! error are signals the app's pairing service owns; this module binds them.
+//! The callbacks are the service's seams: the screen never scans, dials or
+//! stores anything itself.
 
 use std::rc::Rc;
 
@@ -77,29 +72,42 @@ pub struct NearbyRuntime {
     pub name: String,
 }
 
+/// A callback the app supplies for a page action.
+type Action = Rc<dyn Fn()>;
+/// A claim of an entry and the server address a bare code needs.
+type Connect = Rc<dyn Fn(&str, &str)>;
+/// Fills the sheet's entry field from the clipboard.
+type Paste = Rc<dyn Fn(Signal<String>)>;
+/// An action on a runtime the page names by id or discovery key.
+type Pick = Rc<dyn Fn(&str)>;
+
 /// What the page may do, and the state it shows.
 ///
-/// Every callback is the host's: the screen never scans, dials or stores
-/// anything itself. The app builds one of these from the transport layer; the
-/// migration fills them in screen by screen.
+/// Every callback is the service's: the screen never scans, dials or stores
+/// anything itself. The app builds one of these over its pairing service.
 #[derive(Clone)]
 pub struct PairingHost {
     /// The runtimes this phone saved, most recent first.
-    pub saved: Vec<SavedRuntime>,
+    pub saved: Signal<Vec<SavedRuntime>>,
     /// The runtimes nearby discovery has found so far.
-    pub nearby: Vec<NearbyRuntime>,
+    pub nearby: Signal<Vec<NearbyRuntime>>,
+    /// A pairing action is in flight (the buttons rest and say so).
+    pub busy: Signal<bool>,
+    /// What the last action failed with, shown under the entries.
+    pub error: Signal<Option<SharedString>>,
     /// Open the camera to scan the desktop's QR code.
-    pub on_scan: Rc<dyn Fn()>,
-    /// Claim the pasted or typed pairing entry.
-    pub on_connect: Rc<dyn Fn(&str)>,
-    /// Read the clipboard for a pairing entry.
-    pub on_paste: Rc<dyn Fn() -> Option<String>>,
+    pub on_scan: Action,
+    /// Claim the typed or pasted entry; the second argument is the server
+    /// address a bare code needs.
+    pub on_connect: Connect,
+    /// Read the clipboard into the sheet's entry field.
+    pub on_paste: Paste,
     /// Start discovery for runtimes on the same network.
-    pub on_find: Rc<dyn Fn()>,
+    pub on_find: Action,
     /// Connect to a saved runtime.
-    pub on_pick_saved: Rc<dyn Fn(&str)>,
+    pub on_pick_saved: Pick,
     /// Pair with a runtime discovery found.
-    pub on_pick_nearby: Rc<dyn Fn(&str)>,
+    pub on_pick_nearby: Pick,
 }
 
 /// The pairing page.
@@ -107,9 +115,11 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     let manual_open = signal(false);
     let nearby_open = signal(false);
     let draft = signal(String::new());
+    let server = signal(String::new());
 
-    let has_saved = !host.saved.is_empty();
-    let saved_host = host.clone();
+    let saved = host.saved;
+    let busy = host.busy;
+    let error = host.error;
 
     let page = view()
         .w_full()
@@ -117,21 +127,36 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .flex_1()
         .flex_col()
         .child(brand::wordmark())
-        .when(has_saved, |page| {
-            page.child(saved_runtimes(saved_host.clone()))
-        })
+        .child(when(move || saved.with(|saved| !saved.is_empty()), {
+            let on_pick = host.on_pick_saved.clone();
+            move || saved_runtimes(saved, on_pick.clone())
+        }))
         .child(
             view()
                 .flex_1()
                 .flex_col()
                 .justify_center()
-                .when(!has_saved, |middle| {
-                    middle.child(entries_stack(host.clone(), manual_open, nearby_open))
-                }),
+                .child(when(move || saved.with(|saved| saved.is_empty()), {
+                    let host = host.clone();
+                    move || entries_stack(host.clone(), manual_open, nearby_open)
+                }))
+                .child(when(
+                    move || busy.get(),
+                    move || {
+                        text(copy::text("Pairing...", "配对中…", "配對中…"))
+                            .text_size(px(theme::FONT_CAPTION))
+                            .text_color(theme::text_muted)
+                    },
+                ))
+                .child(when(
+                    move || error.get().is_some(),
+                    move || error_message(error),
+                )),
         )
-        .when(has_saved, |page| {
-            page.child(entries_row(host.clone(), manual_open, nearby_open))
-        });
+        .child(when(move || saved.with(|saved| !saved.is_empty()), {
+            let host = host.clone();
+            move || entries_row(host.clone(), manual_open, nearby_open)
+        }));
 
     view()
         .flex_1()
@@ -141,8 +166,15 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .pt_safe_area_plus(px(PAGE_TOP_PAD))
         .pb_safe_area_plus(px(theme::SPACING_LG))
         .child(page)
-        .child(manual_sheet(host.clone(), manual_open, draft))
+        .child(manual_sheet(host.clone(), manual_open, draft, server))
         .child(nearby_sheet(host, nearby_open))
+}
+
+/// The last action's failure, worded for the person holding the phone.
+fn error_message(error: Signal<Option<SharedString>>) -> impl IntoElement {
+    text(move || error.get().unwrap_or_default())
+        .text_size(px(theme::FONT_CAPTION))
+        .text_color(theme::accent_red)
 }
 
 /// The three ways in, stacked in the middle of a page with nothing saved.
@@ -155,9 +187,9 @@ fn entries_stack(
         .flex_col()
         .w_full()
         .gap(px(theme::SPACING_SM))
-        .child(scan_entry(host).w_full())
-        .child(find_entry(nearby_open).w_full())
-        .child(link_entry(manual_open).w_full())
+        .child(scan_entry(host.clone()).w_full())
+        .child(find_entry(host.busy, nearby_open).w_full())
+        .child(link_entry(host.busy, manual_open).w_full())
 }
 
 /// The same three ways as a row pinned under a page that has saved runtimes.
@@ -171,61 +203,76 @@ fn entries_row(
         .w_full()
         .gap(px(theme::SPACING_SM))
         .py(px(theme::SPACING_MD))
-        .child(scan_entry(host).flex_1())
-        .child(find_entry(nearby_open).flex_1())
-        .child(link_entry(manual_open).flex_1())
+        .child(scan_entry(host.clone()).flex_1())
+        .child(find_entry(host.busy, nearby_open).flex_1())
+        .child(link_entry(host.busy, manual_open).flex_1())
 }
 
 /// The primary entry: the camera.
 fn scan_entry(host: PairingHost) -> ButtonElement {
-    let on_scan = host.on_scan;
+    let on_scan = host.on_scan.clone();
+    let busy = host.busy;
     action::primary(
-        copy::text("Scan", "扫码", "掃碼"),
+        move || {
+            if busy.get() {
+                copy::text("Pairing...", "配对中…", "配對中…")
+            } else {
+                copy::text("Scan", "扫码", "掃碼")
+            }
+        },
         icon(include_str!("../../assets/icons/scan-line.svg")),
-        move || on_scan(),
+        move || {
+            if !busy.get_untracked() {
+                on_scan();
+            }
+        },
     )
+    .disabled(move || busy.get())
+    .disabled_style(|style| style.opacity(0.6))
 }
 
 /// Find a runtime on the same network.
-fn find_entry(nearby_open: Signal<bool>) -> ButtonElement {
+fn find_entry(busy: Signal<bool>, nearby_open: Signal<bool>) -> ButtonElement {
     action::secondary(
         copy::text("Find", "查找", "尋找"),
         icon(include_str!("../../assets/icons/wifi-outlined.svg")),
         false,
         move || nearby_open.set(true),
     )
+    .disabled(move || busy.get())
+    .disabled_style(|style| style.opacity(0.4))
 }
 
 /// Paste a pairing link or type a code.
-fn link_entry(manual_open: Signal<bool>) -> ButtonElement {
+fn link_entry(busy: Signal<bool>, manual_open: Signal<bool>) -> ButtonElement {
     action::secondary(
         copy::text("Link", "链接", "連結"),
         icon(include_str!("../../assets/icons/clipboard-paste.svg")),
         false,
         move || manual_open.set(true),
     )
+    .disabled(move || busy.get())
+    .disabled_style(|style| style.opacity(0.4))
 }
 
 /// The runtimes this phone saved, above the entries.
-fn saved_runtimes(host: PairingHost) -> impl IntoElement {
+fn saved_runtimes(saved: Signal<Vec<SavedRuntime>>, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
     view()
         .flex_col()
         .w_full()
         .gap(px(theme::SPACING_SM))
         .pt(px(theme::SPACING_XL))
-        .children(
-            host.saved
-                .into_iter()
-                .map(move |runtime| saved_row(runtime, host.on_pick_saved.clone())),
-        )
+        .child(each(
+            move || saved.get(),
+            |runtime| runtime.id.clone(),
+            move |runtime, _| saved_row(runtime, on_pick.clone()),
+        ))
 }
 
 /// One saved runtime: a status dot, its name, and the display it runs on.
-fn saved_row(runtime: SavedRuntime, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
-    let status = runtime.status;
-    let id = runtime.id;
+fn saved_row(runtime: ReadSignal<SavedRuntime>, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
     button()
-        .on_press(move || on_pick(&id))
+        .on_press(move || on_pick(&runtime.get_untracked().id))
         .w_full()
         .min_h(px(RUNTIME_ROW_HEIGHT))
         .rounded(px(theme::RADIUS_CONTROL))
@@ -244,11 +291,10 @@ fn saved_row(runtime: SavedRuntime, on_pick: Rc<dyn Fn(&str)>) -> impl IntoEleme
                 .h(px(8.0))
                 .flex_shrink_0()
                 .rounded(px(4.0))
-                .bg(move || status.dot())
-                .when(status == RuntimeStatus::Probing, |dot| dot.opacity(0.6)),
+                .bg(move || runtime.get().status.dot()),
         )
         .child(
-            text(runtime.name)
+            text(move || runtime.get().name)
                 .flex_1()
                 .truncate()
                 .text_size(px(theme::FONT_BODY))
@@ -265,10 +311,15 @@ fn saved_row(runtime: SavedRuntime, on_pick: Rc<dyn Fn(&str)>) -> impl IntoEleme
 }
 
 /// The manual entry sheet.
-fn manual_sheet(host: PairingHost, open: Signal<bool>, draft: Signal<String>) -> impl IntoElement {
+fn manual_sheet(
+    host: PairingHost,
+    open: Signal<bool>,
+    draft: Signal<String>,
+    server: Signal<String>,
+) -> impl IntoElement {
     let paste = host.on_paste.clone();
     let connect = host.on_connect.clone();
-    let connect_draft = draft;
+    let busy = host.busy;
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -300,6 +351,19 @@ fn manual_sheet(host: PairingHost, open: Signal<bool>, draft: Signal<String>) ->
                     .text_size(px(theme::FONT_CAPTION))
                     .text_color(theme::text_muted),
                 )
+                .child(when(
+                    move || needs_address(&draft.get()),
+                    move || {
+                        view()
+                            .gap(px(theme::SPACING_XS))
+                            .child(
+                                text(copy::text("Server address", "服务器地址", "伺服器位址"))
+                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_color(theme::text_muted),
+                            )
+                            .child(field::text_field(server, "https://desktop.example:8443"))
+                    },
+                ))
                 .child(
                     view()
                         .flex_row()
@@ -312,11 +376,7 @@ fn manual_sheet(host: PairingHost, open: Signal<bool>, draft: Signal<String>) ->
                                 copy::text("Paste", "粘贴", "貼上"),
                                 icon(include_str!("../../assets/icons/clipboard-paste.svg")),
                                 false,
-                                move || {
-                                    if let Some(text) = paste() {
-                                        draft.set(text);
-                                    }
-                                },
+                                move || paste(draft),
                             )
                         }),
                 )
@@ -332,18 +392,26 @@ fn manual_sheet(host: PairingHost, open: Signal<bool>, draft: Signal<String>) ->
                 .child({
                     let connect = connect.clone();
                     action::primary(
-                        copy::text("Connect", "连接", "連線"),
+                        move || {
+                            if busy.get() {
+                                copy::text("Connecting…", "连接中…", "連線中…")
+                            } else {
+                                copy::text("Connect", "连接", "連線")
+                            }
+                        },
                         icon(include_str!("../../assets/icons/plug-zap.svg")),
                         move || {
-                            let entry = connect_draft.get_untracked();
-                            let entry = entry.trim();
-                            if !entry.is_empty() {
-                                connect(entry);
+                            if busy.get_untracked() {
+                                return;
                             }
+                            let entry = draft.get_untracked();
+                            let address = server.get_untracked();
+                            connect(entry.trim(), address.trim());
+                            open.set(false);
                         },
                     )
                     .w_full()
-                    .disabled(move || connect_draft.with(|entry| entry.trim().is_empty()))
+                    .disabled(move || busy.get() || draft.with(|entry| entry.trim().is_empty()))
                     .disabled_style(|style| style.opacity(0.4))
                 }),
         )
@@ -351,9 +419,9 @@ fn manual_sheet(host: PairingHost, open: Signal<bool>, draft: Signal<String>) ->
 
 /// The nearby discovery sheet.
 fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
-    let candidates = host.nearby.clone();
-    let empty = candidates.is_empty();
+    let nearby = host.nearby;
     let on_find = host.on_find.clone();
+    let on_pick = host.on_pick_nearby.clone();
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -377,32 +445,32 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
-                .when(empty, |sheet| {
-                    sheet.child(
+                .child(when(
+                    move || nearby.with(|nearby| nearby.is_empty()),
+                    || {
                         view().h(px(56.0)).items_center().justify_center().child(
                             text(copy::text("Searching...", "正在搜索…", "正在搜尋…"))
                                 .text_size(px(theme::FONT_DETAIL))
                                 .text_color(theme::text_muted),
-                        ),
-                    )
-                })
-                .children(candidates.into_iter().map({
-                    let on_pick = host.on_pick_nearby.clone();
-                    move |candidate| nearby_row(candidate, on_pick.clone(), open)
+                        )
+                    },
+                ))
+                .child(each(move || nearby.get(), |runtime| runtime.key.clone(), {
+                    let on_pick = on_pick.clone();
+                    move |runtime, _| nearby_row(runtime, on_pick.clone(), open)
                 })),
         )
 }
 
 /// One runtime discovery found.
 fn nearby_row(
-    runtime: NearbyRuntime,
+    runtime: ReadSignal<NearbyRuntime>,
     on_pick: Rc<dyn Fn(&str)>,
     open: Signal<bool>,
 ) -> impl IntoElement {
-    let key = runtime.key;
     button()
         .on_press(move || {
-            on_pick(&key);
+            on_pick(&runtime.get_untracked().key);
             open.set(false);
         })
         .w_full()
@@ -426,7 +494,7 @@ fn nearby_row(
                 .min_w(px(0.0))
                 .flex_col()
                 .child(
-                    text(runtime.name)
+                    text(move || runtime.get().name)
                         .truncate()
                         .text_size(px(theme::FONT_DETAIL))
                         .text_color(theme::foreground),
@@ -443,6 +511,19 @@ fn nearby_row(
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::foreground),
         )
+}
+
+/// Whether the entry is a bare code, which needs the server's address too.
+///
+/// The pairing crate owns the authoritative rule for claiming
+/// (`vibex_mobile_pairing::is_pairing_link`); this is the page's copy of the
+/// shapes it accepts, used only to decide whether the address field shows.
+fn needs_address(entry: &str) -> bool {
+    let entry = entry.trim();
+    !entry.is_empty()
+        && !(entry.starts_with("vibex://")
+            || entry.contains("#/pair/")
+            || entry.contains("#/code/"))
 }
 
 /// An SVG from this crate's assets, drawn inline.

@@ -61,6 +61,10 @@ becomes a second authority or database.
 7. `crates/vibex-nsh-ui` owns the Native Shell UI layer (tokens, styled controls,
    screens). It depends on `nsh-core` and `nsh-base` only, never on GPUI, and it
    holds no transport or authority: the app's host seams supply both.
+8. `crates/vibex-mobile-pairing` owns the phone's pairing core: entry
+   classification, credential claims, the credential schema and the on-device
+   store. It is platform-neutral (no GPUI, no nsh) and shared by the mobile
+   clients; it never becomes an authority, only a client that claims a grant.
 
 ## Session Presentation Contract
 

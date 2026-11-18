@@ -12,7 +12,7 @@ use crate::theme;
 
 /// The page's main action: a filled row with an icon and a label.
 pub fn primary(
-    label: &'static str,
+    label: impl IntoReactive<SharedString>,
     icon: ImageSrc,
     on_press: impl Fn() + 'static,
 ) -> ButtonElement {
@@ -21,7 +21,7 @@ pub fn primary(
 
 /// An alternative action, aligned with [`primary`].
 pub fn secondary(
-    label: &'static str,
+    label: impl IntoReactive<SharedString>,
     icon: ImageSrc,
     selected: bool,
     on_press: impl Fn() + 'static,
@@ -30,7 +30,7 @@ pub fn secondary(
 }
 
 fn action(
-    label: &'static str,
+    label: impl IntoReactive<SharedString>,
     icon: ImageSrc,
     primary: bool,
     selected: bool,

@@ -32,6 +32,7 @@ members = [
   "crates/terminal",
   "crates/vibex-backend",
   "crates/vibex-brands",
+  "crates/vibex-mobile-pairing",
   "crates/vibex-nsh-ui",
   "crates/vibex-remote-client",
   "crates/vibex-ui",

@@ -25,8 +25,9 @@ does not today.
 
 | Path | What |
 | --- | --- |
-| `apps/mobile-nsh` | The `nsh` app: `nsh.json`, the root component, host seams, theme generation |
+| `apps/mobile-nsh` | The `nsh` app: `nsh.json`, the root component, the pairing service, host seams, theme generation |
 | `crates/vibex-nsh-ui` | The shared UI layer: theme, styled controls, screens |
+| `crates/vibex-mobile-pairing` | Platform-neutral pairing: entries, claims, credentials, the on-device store |
 | `theme.json` | The palette, generated from `crates/vibex-ui/theme/tokens.json` |
 
 `crates/vibex-nsh-ui` depends only on `nsh-core` and `nsh-base`; it does not
@@ -37,8 +38,21 @@ moves, so they take the platform's behavior instead of drawing their own.
 
 The pairing page, which is the phone's front door: the wordmark, the saved
 runtimes list, the three ways in (scan the QR code, find a runtime on the same
-network, paste a link) and the manual and nearby sheets. The actions are host
-seams: they log today, and the transport integration fills them in next.
+network, paste a link) and the manual and nearby sheets.
+
+The page is backed by a real pairing service:
+
+- entries (a `vibex://` link, a server connection string, or a code plus the
+  server address) are classified and claimed on a background task through
+  `crates/vibex-mobile-pairing`;
+- a claimed credential is stored in `pairing.json` in the app's data directory
+  (owner-only, written atomically) and appears in the saved list, which probes
+  each runtime's reachability;
+- paste reads the system clipboard through `nsh`.
+
+The camera and local-network discovery are still host seams: they say so on
+the page instead of pretending to work. The host integration fills them in
+with the scanner activity and the discovery bridge.
 
 ## Run it
 
@@ -71,8 +85,10 @@ Two layers:
   parser reads every token (including translucent and custom ones).
 - **Headless flows**: the root is mounted with `nsh`'s headless driver, with no
   simulator: the pairing page shows its three entries, the link sheet opens and
-  its connect action stays disabled until there is something to claim, and the
-  nearby sheet opens. Each migrated screen adds the flows its GPUI pair has.
+  its connect action stays disabled until there is something to claim, a bare
+  code without an address is refused with the copy that says what is missing,
+  and the nearby sheet opens. Each migrated screen adds the flows its GPUI pair
+  has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -112,9 +128,9 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. Pairing transport: camera, clipboard, LAN discovery and `vibex-remote-client`.
-2. The session shell: sidebar, timeline, composer.
+1. The session shell: sidebar, timeline, composer, over the remote backend.
+2. The camera and local-network discovery bridges in the Kotlin/Swift host,
+   plus the host's device name and the release pipeline.
 3. Workbench: files, Git and the terminal (nsh's `Editor`, `DiffView` and
    `Terminal`, the latter able to drive the `alacritty_terminal` state the
    client already keeps).
-4. The Kotlin/Swift host integration and the release pipeline.

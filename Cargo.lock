@@ -10970,13 +10970,28 @@ dependencies = [
 name = "vibex-mobile-nsh"
 version = "0.1.8"
 dependencies = [
- "log",
  "nsh-base",
  "nsh-core",
  "nsh-engine",
  "nsh-testing",
  "serde_json",
+ "tempfile",
+ "vibex-backend",
+ "vibex-mobile-pairing",
  "vibex-nsh-ui",
+]
+
+[[package]]
+name = "vibex-mobile-pairing"
+version = "0.1.8"
+dependencies = [
+ "serde",
+ "serde_json",
+ "tokio",
+ "url",
+ "vibex-backend",
+ "vibex-core",
+ "vibex-remote-client",
 ]
 
 [[package]]

@@ -36,6 +36,8 @@ Shared across desktop and mobile:
   `crates/vibex-ui`.
 - Semantic tokens in `crates/vibex-ui/theme/tokens.json`; the nsh client
   generates its theme file from the same source rather than defining colors.
+- Platform-neutral pairing (entries, claims, credentials, the on-device store)
+  in `crates/vibex-mobile-pairing`, shared by the mobile clients.
 - Remote/Relay protocol behavior and tests.
 
 The native mobile renderers own only platform bootstrap, pairing/storage, input,

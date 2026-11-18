@@ -1,0 +1,17 @@
+[package]
+name = "vibex-mobile-pairing"
+version = "0.1.8"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Platform-neutral pairing core and credential store for the Vibex mobile clients."
+
+[dependencies]
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+url.workspace = true
+vibex-backend = { path = "../vibex-backend" }
+vibex-core = { path = "../core" }
+vibex-remote-client = { path = "../vibex-remote-client" }
