@@ -157,6 +157,9 @@ by `bash -n` and by the compiler checks that can run on Linux.
 
 ## Tests
 
+What is covered, and what a device still has to confirm, is in
+[`VERIFICATION.md`](VERIFICATION.md).
+
 ```sh
 cargo test -p vibex-mobile-nsh
 ```
