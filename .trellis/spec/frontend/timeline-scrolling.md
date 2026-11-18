@@ -86,6 +86,12 @@ lose reveal inside turns taller than the viewport, and change the first-frame
 extent. Forking or vendoring the crate is prohibited by
 [`rust-dependency-sources.md`](../backend/rust-dependency-sources.md).
 
+The API gap is the *only* reason the transcript stays put. It is not that the
+transcript has nothing to gain: `v_virtual_list` is `gpui_base::VirtualList`,
+which contains no `fast::layers` code at all, while `MessageScroller` renders
+`gpui::list`, which carries the full list layer. See the decision at the end of
+§5 for the measurement and for what would reopen the question.
+
 ## 5. Required Upstream API Before Migrating
 
 The main transcript can move to `MessageScroller` once the published state
@@ -122,13 +128,34 @@ And until a release carries the new API, any migration would have to work
 through the published surface, which is a larger rewrite of the row builders
 than the geometry changes alone suggest.
 
-**Decision (closed): the main transcript stays on `v_virtual_list`.** The fork's
-`feat/message-scroller-api` branch is not a path this workspace may take, and
-even if it were, §7.1 and §8 show a list layer would not engage on either real
-surface. The open question this section used to carry — push upstream or
-abandon — is answered as *abandon for the transcript*: the requirement list
-above stays as the record of what a future upstream release would have to ship
-before the question is worth reopening, and no work is planned against it.
+**Decision: the main transcript stays on `v_virtual_list` for now, but not
+because a list layer would not pay.** An earlier revision of this section closed
+the question on the claim that a list layer would not engage on the transcript.
+That claim was wrong, and the reason is worth recording because it is the whole
+argument for revisiting the migration later.
+
+The two elements are not the same thing:
+
+| Element | `fast::layers` references | List layer |
+| --- | --- | --- |
+| `gpui::list` — what `MessageScroller` renders internally | 17 | supported (`begin_list` / `paint_row` / `end_list`) |
+| `gpui_base::VirtualList` — what `v_virtual_list` is | **0** | none |
+
+So the transcript does not merely fail to composite today: the element it uses
+has no list-layer code path at all, and measured on the real transcript the
+container composites zero frames across twelve scrolled frames. `MessageScroller`
+wraps `gpui::list`, which *does* carry the full list layer — rows replay instead
+of being rebuilt, and a list layer is exempt from the tile budget. On the
+transcript that is the difference between rebuilding the visible turns every
+scrolled frame and replaying them.
+
+What actually keeps the migration closed is the API gap, not the payoff. Four of
+the five state accessors, the row-height hints, and the owning-entity renderer
+are all missing from the published `0.10.0`, and the dependency-source policy
+forbids the fork. The requirement list above therefore stands as the gate: when
+a release ships that surface, the migration becomes worth measuring, and the
+measurement to run first is `layer_frames_composited` on the transcript, not a
+wall-clock comparison.
 
 Until then, keep the per-turn virtual list and adopt only compatible
 `MessageScroller` affordances (for example, the log role or the jump-button
@@ -249,7 +276,11 @@ rather than merged.
 ### 7.3 What has to be true before either migration is worth doing
 
 A scroll layer only pays for itself when its content is stable across scrolled
-frames. The sidebar has two independent blockers, and both have to go:
+frames. This subsection is about the **sidebar**; the transcript's situation is
+the opposite one and is recorded in §5 — its element has no list layer at all,
+so there is nothing to stabilise until it moves to an element that does.
+
+The sidebar has two independent blockers, and both have to go:
 
 1. The scrollbar's fade must not be attributed to the view that owns the
    scroller (the overlay experiment in §7.2).
@@ -263,11 +294,11 @@ container is already opaque. Painting the container solid would only be needed
 if it were ever hosted over a translucent surface.
 
 Until both hold, neither `MessageScroller` nor an overlay scrollbar changes what
-the reader pays, and the existing `SidebarSessionRun` is the right shape. Both
-were measured, not inferred: removing the bar alone lifts `owner_animating` and
-the container composites for eight frames before the dependency record demotes
-it again, which is the same finding the overlay experiment reached from the
-other side.
+the reader pays *for the sidebar*, and the existing `SidebarSessionRun` is the
+right shape. Both were measured, not inferred: removing the bar alone lifts
+`owner_animating` and the container composites for eight frames before the
+dependency record demotes it again, which is the same finding the overlay
+experiment reached from the other side.
 
 If the migration is revisited, the mechanics are unchanged: flatten every
 section (project, workspace, folder, group, session run) into one row list,
