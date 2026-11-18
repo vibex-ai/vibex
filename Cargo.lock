@@ -5846,6 +5846,7 @@ dependencies = [
  "serde_json",
  "unicode-segmentation",
  "unicode-width",
+ "vte",
 ]
 
 [[package]]

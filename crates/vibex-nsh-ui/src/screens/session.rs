@@ -199,6 +199,9 @@ pub enum QuestionResponse {
 /// Answers a question card.
 type QuestionAction = Rc<dyn Fn(&str, QuestionResponse)>;
 
+/// What the person typed into the terminal.
+type TerminalInput = Rc<dyn Fn(&str)>;
+
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 
@@ -243,10 +246,42 @@ pub struct SessionHost {
     pub on_command_query: CommandQuery,
     /// Starts a new session in the open session's workspace.
     pub on_new_session: Action,
+    /// The terminal surface, when it is open over the shell.
+    pub terminal_open: Signal<bool>,
+    pub terminal_title: Signal<Option<SharedString>>,
+    pub terminal_error: Signal<Option<SharedString>>,
+    pub terminal_ref: ComponentRef<nsh_base::Terminal>,
+    pub on_open_terminal: Action,
+    pub on_close_terminal: Action,
+    pub on_terminal_data: TerminalInput,
 }
 
-/// The session shell.
+/// The session shell, or the terminal when it is open over it.
 pub fn session(host: SessionHost) -> impl IntoElement {
+    let terminal_open = host.terminal_open;
+    let terminal = crate::screens::terminal::TerminalHost {
+        title: host.terminal_title,
+        error: host.terminal_error,
+        term_ref: host.terminal_ref,
+        on_data: host.on_terminal_data.clone(),
+        on_close: host.on_close_terminal.clone(),
+    };
+    let shell_host = host;
+    view()
+        .flex_1()
+        .bg(theme::background)
+        .child(when(move || terminal_open.get(), {
+            let terminal = terminal.clone();
+            move || crate::screens::terminal::terminal(terminal.clone())
+        }))
+        .child(when(
+            move || !terminal_open.get(),
+            move || shell(shell_host.clone()),
+        ))
+}
+
+/// The shell proper: header, transcript, cards, composer and drawer.
+fn shell(host: SessionHost) -> impl IntoElement {
     let drawer_open = signal(false);
 
     view()
@@ -1126,6 +1161,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
     let on_new_session = host.on_new_session.clone();
+    let on_open_terminal = host.on_open_terminal.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1184,6 +1220,18 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             })
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_muted),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Terminal", "终端", "終端"),
+                                icon(include_str!("../../assets/icons/terminal.svg")),
+                                false,
+                                {
+                                    let on_open_terminal = on_open_terminal.clone();
+                                    move || on_open_terminal()
+                                },
+                            )
+                            .w_full(),
                         )
                         .child(
                             action::primary(

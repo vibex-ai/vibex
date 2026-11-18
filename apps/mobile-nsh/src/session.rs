@@ -13,16 +13,20 @@ use std::{
     sync::Arc,
 };
 
+use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
-use vibex_backend::{AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest};
+use vibex_backend::{
+    AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest, TerminalBackend,
+};
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, MessageProvenance, PermissionRequest, PermissionRequestStatus,
     PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
+    ResolvePermissionRequest, SendAgentMessageRequest, TerminalCreateRequest, TerminalId,
+    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
+    VibexSessionId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -44,6 +48,7 @@ const TIMELINE_LIMIT: u32 = 200;
 #[derive(Clone)]
 pub struct SessionService {
     backend: Arc<dyn AgentBackend>,
+    terminal_backend: Arc<dyn TerminalBackend>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
@@ -57,6 +62,13 @@ pub struct SessionService {
     question_request: Rc<RefCell<Option<ElicitationRequest>>>,
     commands: Signal<Vec<CommandEntry>>,
     commands_loaded: Rc<Cell<bool>>,
+    terminal_open: Signal<bool>,
+    terminal_title: Signal<Option<SharedString>>,
+    terminal_error: Signal<Option<SharedString>>,
+    terminal_ref: ComponentRef<Terminal>,
+    terminal_id: Rc<RefCell<Option<TerminalId>>>,
+    /// Bumped when the terminal closes, so its stream stops writing.
+    terminal_generation: Rc<Cell<u64>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -69,10 +81,13 @@ impl SessionService {
         bundle: &MobileCredentialBundle,
         on_disconnect: Rc<dyn Fn()>,
     ) -> BackendResult<Self> {
-        let backend: Arc<dyn AgentBackend> = bundle.backend()?;
+        let backend = bundle.backend()?;
+        let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
+        let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let service = Self {
             backend,
+            terminal_backend,
             sessions: signal(Vec::new()),
             active: signal(None),
             timeline: signal(Vec::new()),
@@ -85,6 +100,12 @@ impl SessionService {
             question_request: Rc::new(RefCell::new(None)),
             commands: signal(Vec::new()),
             commands_loaded: Rc::new(Cell::new(false)),
+            terminal_open: signal(false),
+            terminal_title: signal(None),
+            terminal_error: signal(None),
+            terminal_ref: component_ref::<Terminal>(),
+            terminal_id: Rc::new(RefCell::new(None)),
+            terminal_generation: Rc::new(Cell::new(0)),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -107,6 +128,10 @@ impl SessionService {
             pending: self.pending,
             question: self.question,
             commands: self.commands,
+            terminal_open: self.terminal_open,
+            terminal_title: self.terminal_title,
+            terminal_error: self.terminal_error,
+            terminal_ref: self.terminal_ref,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -140,6 +165,18 @@ impl SessionService {
             on_new_session: {
                 let service = self.clone();
                 Rc::new(move || service.new_session())
+            },
+            on_open_terminal: {
+                let service = self.clone();
+                Rc::new(move || service.open_terminal())
+            },
+            on_close_terminal: {
+                let service = self.clone();
+                Rc::new(move || service.close_terminal())
+            },
+            on_terminal_data: {
+                let service = self.clone();
+                Rc::new(move |data: &str| service.terminal_input(data))
             },
         }
     }
@@ -595,6 +632,153 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    /// Opens the workspace's terminal full-screen over the shell.
+    fn open_terminal(&self) {
+        if self.terminal_open.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            self.fail_text(copy::text(
+                "Open a session first; its workspace owns the terminal.",
+                "请先打开一个会话，终端属于它的工作区。",
+                "請先開啟一個工作階段，終端屬於它的工作區。",
+            ));
+            return;
+        };
+        let Ok(active_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        self.terminal_open.set(true);
+        self.terminal_error.set(None);
+        self.terminal_title
+            .set(Some(copy::text("Terminal", "终端", "終端").into()));
+        let generation = self.terminal_generation.get().wrapping_add(1);
+        self.terminal_generation.set(generation);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        let terminal_backend = self.terminal_backend.clone();
+        let opening_terminal = terminal_backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                let session = backend.open_session(active_id).await?;
+                let terminals = opening_terminal
+                    .list_terminals(session.workspace_id.clone())
+                    .await?;
+                let terminal = match terminals
+                    .into_iter()
+                    .find(|terminal| terminal.status == TerminalStatus::Running)
+                {
+                    Some(terminal) => terminal,
+                    None => {
+                        opening_terminal
+                            .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                                workspace_id: session.workspace_id,
+                                title: None,
+                                shell: None,
+                                cwd: None,
+                                rows: 24,
+                                cols: 80,
+                            }))
+                            .await?
+                    }
+                };
+                let snapshot = opening_terminal
+                    .terminal_snapshot(terminal.id.clone())
+                    .await?;
+                Ok::<_, BackendError>((terminal, snapshot))
+            })
+            .await;
+            let (terminal, snapshot) = match result {
+                Ok(Ok(opened)) => opened,
+                Ok(Err(error)) => {
+                    service.terminal_error.set(Some(error_text(&error)));
+                    service.terminal_open.set(false);
+                    return;
+                }
+                Err(error) => {
+                    service
+                        .terminal_error
+                        .set(Some(format!("the terminal did not open: {error}").into()));
+                    service.terminal_open.set(false);
+                    return;
+                }
+            };
+            *service.terminal_id.borrow_mut() = Some(terminal.id.clone());
+            service
+                .terminal_title
+                .set(Some(terminal.title.clone().into()));
+            for chunk in snapshot.chunks {
+                service.write_terminal_output(chunk.data);
+            }
+            let subscription = match terminal_backend
+                .subscribe_terminal(terminal.id.clone(), snapshot.next_sequence)
+            {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    service.terminal_error.set(Some(error_text(&error)));
+                    return;
+                }
+            };
+            let mut subscription = subscription;
+            while service.terminal_generation.get() == generation {
+                match subscription.next().await {
+                    Ok(Some(batch)) => {
+                        if batch.reset_required {
+                            service.reset_terminal_output();
+                        }
+                        for frame in batch.frames {
+                            service.write_terminal_output(
+                                String::from_utf8_lossy(&frame.bytes).into_owned(),
+                            );
+                        }
+                    }
+                    Ok(None) | Err(_) => break,
+                }
+            }
+        });
+    }
+
+    /// Closes the terminal surface; the PTY keeps running on the runtime.
+    fn close_terminal(&self) {
+        self.terminal_generation
+            .set(self.terminal_generation.get().wrapping_add(1));
+        self.terminal_open.set(false);
+        *self.terminal_id.borrow_mut() = None;
+    }
+
+    /// Sends what the person typed to the PTY.
+    fn terminal_input(&self, data: &str) {
+        let Some(terminal_id) = self.terminal_id.borrow().clone() else {
+            return;
+        };
+        let data = data.to_owned();
+        let backend = self.terminal_backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .write_terminal(MutationRequest::new(TerminalWriteRequest {
+                        terminal_id,
+                        data,
+                    }))
+                    .await
+            })
+            .await;
+            let _ = result;
+        });
+    }
+
+    fn write_terminal_output(&self, text: String) {
+        if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
+            api.write(text);
+        }
+    }
+
+    fn reset_terminal_output(&self) {
+        if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
+            api.reset();
+        }
     }
 
     /// Re-reads the open session's transcript without clearing it.

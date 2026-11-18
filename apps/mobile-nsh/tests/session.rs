@@ -7,6 +7,7 @@
 
 use std::rc::Rc;
 
+use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
@@ -126,6 +127,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let question = signal(question);
     let resolving = signal(false);
     let commands = signal(Vec::new());
+    let terminal_open = signal(false);
+    let terminal_title = signal(Some(SharedString::from("Terminal")));
+    let terminal_error = signal(None::<SharedString>);
+    let terminal_ref = component_ref::<Terminal>();
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -156,6 +161,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             insertion: "/review ".to_owned(),
         }]);
     });
+    let on_open_terminal = Rc::new(move || terminal_open.set(true));
+    let on_close_terminal = Rc::new(move || terminal_open.set(false));
     let on_new_session = Rc::new(move || {
         sessions.update(|sessions| {
             sessions.insert(
@@ -192,6 +199,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_question,
         on_command_query,
         on_new_session,
+        terminal_open,
+        terminal_title,
+        terminal_error,
+        terminal_ref,
+        on_open_terminal,
+        on_close_terminal,
+        on_terminal_data: Rc::new(|_| {}),
     }
 }
 
@@ -310,4 +324,27 @@ fn a_new_session_reuses_the_open_workspace_and_opens() {
     app.wait_for("Fix the tests").unwrap();
     app.press("role:button[New session]").unwrap();
     app.wait_for("Fresh session").unwrap();
+}
+
+/// The shell with its terminal open; it writes a line into the terminal after
+/// the first frame, as the runtime's snapshot would.
+#[component]
+fn TerminalShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.terminal_open.set(true);
+    let terminal_ref = host.terminal_ref;
+    set_timeout(std::time::Duration::from_millis(50), move || {
+        if let Some(api) = terminal_ref.api::<TerminalApi>() {
+            api.write("hello from the pty\n".to_owned());
+        }
+    });
+    session::session(host)
+}
+
+#[test]
+fn the_terminal_opens_and_shows_the_programs_output() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
 }
