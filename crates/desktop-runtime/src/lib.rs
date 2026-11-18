@@ -3054,6 +3054,17 @@ impl DesktopRuntime {
 
     async fn start_inner(config: DesktopRuntimeConfig) -> VibexResult<Arc<Self>> {
         startup_stage("runtime_config_validate", || config.validate())?;
+        // A runtime started by a deployment inherits the reader's proxy through
+        // its environment: the desktop's own preference is applied to the
+        // process that launches this one, and SSH forwards nothing, so the
+        // launcher writes it into this process's env file instead. Applying it
+        // before the first outbound client exists is what makes a managed Agent
+        // install on a remote host take the same route a local one does.
+        match network_proxy::initialize_from_environment() {
+            Ok(Some(_)) => {}
+            Ok(None) => {}
+            Err(error) => eprintln!("vibex-network-proxy: ignored forwarded route: {error}"),
+        }
         vibex_config_switch::secrets::configure_provider_secret_store(
             provider_secret_store_config(&config),
         );

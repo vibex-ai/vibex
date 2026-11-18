@@ -7,6 +7,8 @@
 use std::fmt;
 use std::time::Duration;
 
+use vibex_desktop_model::NetworkProxyUiState;
+
 use super::command::{SshCommand, SshOutput};
 use super::error::SshFailure;
 
@@ -26,6 +28,11 @@ pub struct LaunchConfig {
     pub binary: String,
     pub workspace_roots: Vec<String>,
     pub remote_port: u16,
+    /// The outbound proxy the remote runtime should route its own network work
+    /// through. The reader configures it here, on the machine they are sitting
+    /// at; SSH forwards no environment, so it only reaches the remote host
+    /// through the env file this config writes.
+    pub network_proxy: NetworkProxyUiState,
     /// macOS-only: use a user LaunchAgent instead of `nohup`.
     pub launch_agent_label: Option<String>,
 }
@@ -72,6 +79,10 @@ impl LaunchConfig {
             binary: format!("{remote_install_root}/current/vibex-server"),
             workspace_roots: workspace_roots.to_vec(),
             remote_port,
+            // The proxy is a preference of the desktop process, not of this
+            // launch, so the config starts from whatever that process has
+            // applied. Callers that know better override it explicitly.
+            network_proxy: vibex_desktop_runtime::network_proxy::current_settings(),
             launch_agent_label: None,
         })
     }
@@ -82,7 +93,7 @@ impl LaunchConfig {
     }
 
     pub fn env_pairs(&self) -> Vec<(&'static str, String)> {
-        vec![
+        let mut pairs = vec![
             ("VIBEX_HOME", self.runtime_home.clone()),
             ("VIBEX_DB_PATH", format!("{}/vibex.db", self.runtime_home)),
             ("VIBEX_BIND_ADDR", format!("127.0.0.1:{}", self.remote_port)),
@@ -95,7 +106,16 @@ impl LaunchConfig {
             ("VIBEX_WORKSPACE_ROOTS", self.workspace_roots.join(":")),
             ("VIBEX_PROVIDER_SECRET_STORE", "file".to_string()),
             ("VIBEX_ACQUIRE_HOME_LOCK", "true".to_string()),
-        ]
+        ];
+        // The reader's proxy is a desktop preference, so it does not reach the
+        // remote host on its own: SSH forwards no environment, and the
+        // launcher's own process variables die with the session. Publishing it
+        // in the env file is what lets the remote runtime — and the managed
+        // Agent installs it runs — take the same route the local one does.
+        pairs.extend(vibex_desktop_runtime::network_proxy::environment_pairs(
+            &self.network_proxy,
+        ));
+        pairs
     }
 
     pub fn with_port(&self, remote_port: u16) -> Self {
@@ -364,6 +384,35 @@ mod tests {
         )));
         assert!(env.contains(&("VIBEX_PROVIDER_SECRET_STORE", "file".to_string())));
         assert!(env.contains(&("VIBEX_ACQUIRE_HOME_LOCK", "true".to_string())));
+    }
+
+    /// The proxy has to reach the remote host in the env file.
+    ///
+    /// The reader configures it on the machine they are sitting at, and SSH
+    /// forwards no environment, so an env file without these pairs leaves the
+    /// remote runtime — and every managed Agent install it runs — with no route
+    /// at all. That is exactly the remote `agent_download_failed`.
+    #[test]
+    fn the_remote_env_file_carries_the_reader_proxy() {
+        let mut config = config(8765);
+        config.network_proxy = NetworkProxyUiState {
+            mode: vibex_desktop_model::NetworkProxyMode::Custom,
+            proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+            bypass: "localhost,127.0.0.1".to_string(),
+        };
+        let env = config.env_pairs();
+        assert!(env.contains(&(
+            vibex_desktop_runtime::network_proxy::PROXY_MODE_ENV,
+            "custom".to_string()
+        )));
+        assert!(env.contains(&(
+            vibex_desktop_runtime::network_proxy::PROXY_URL_ENV,
+            "socks5://127.0.0.1:1080".to_string()
+        )));
+        assert!(env.contains(&(
+            vibex_desktop_runtime::network_proxy::PROXY_BYPASS_ENV,
+            "localhost,127.0.0.1".to_string()
+        )));
     }
 
     #[test]

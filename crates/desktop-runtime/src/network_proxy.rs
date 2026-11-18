@@ -182,6 +182,96 @@ pub fn initialize(settings: &NetworkProxyUiState) -> Result<NetworkProxyUiState,
     Ok(normalized)
 }
 
+/// Environment variable naming the route a deployment hands this process.
+pub const PROXY_MODE_ENV: &str = "VIBEX_NETWORK_PROXY_MODE";
+/// Environment variable carrying the address of a `custom` route.
+pub const PROXY_URL_ENV: &str = "VIBEX_NETWORK_PROXY_URL";
+/// Environment variable carrying the bypass list of a `custom` route.
+pub const PROXY_BYPASS_ENV: &str = "VIBEX_NETWORK_PROXY_BYPASS";
+
+fn mode_token(mode: NetworkProxyMode) -> &'static str {
+    match mode {
+        NetworkProxyMode::System => "system",
+        NetworkProxyMode::Direct => "direct",
+        NetworkProxyMode::Custom => "custom",
+    }
+}
+
+/// The environment pairs that carry a proxy preference to another process.
+///
+/// The desktop's preference is a process-wide setting, not something a child
+/// or a remote host inherits: SSH does not forward the desktop's `HTTP_PROXY`,
+/// so a runtime launched on another machine starts with no proxy at all. These
+/// `VIBEX_`-prefixed pairs are the wire format between the two, written into a
+/// remote runtime's env file by the launcher and read back by
+/// [`initialize_from_environment`]. `System` travels as the mode alone so the
+/// receiving machine resolves its *own* system proxy instead of being handed
+/// the sending machine's.
+pub fn environment_pairs(settings: &NetworkProxyUiState) -> Vec<(&'static str, String)> {
+    let mut pairs = vec![(PROXY_MODE_ENV, mode_token(settings.mode).to_string())];
+    // A dormant address is retained on purpose while another mode is selected,
+    // so it is only published when `custom` actually routes through it.
+    if settings.mode == NetworkProxyMode::Custom
+        && let Some(url) = settings
+            .proxy_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    {
+        pairs.push((PROXY_URL_ENV, url.to_string()));
+    }
+    pairs.push((PROXY_BYPASS_ENV, settings.bypass.clone()));
+    pairs
+}
+
+/// The proxy preference this process was started with, if any.
+///
+/// `Ok(None)` means no deployment handed this process a route, which is the
+/// ordinary case for a desktop or a locally launched runtime.
+pub fn settings_from_environment() -> Result<Option<NetworkProxyUiState>, String> {
+    settings_from_lookup(|key| std::env::var(key).ok())
+}
+
+/// The parsing half of [`settings_from_environment`], over an arbitrary lookup.
+///
+/// Split out so the wire format can be exercised without mutating the test
+/// process's environment.
+fn settings_from_lookup(
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Result<Option<NetworkProxyUiState>, String> {
+    let Some(mode) = lookup(PROXY_MODE_ENV)
+        .map(|value| value.trim().to_ascii_lowercase())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(None);
+    };
+    let mode = match mode.as_str() {
+        "system" => NetworkProxyMode::System,
+        "direct" => NetworkProxyMode::Direct,
+        "custom" => NetworkProxyMode::Custom,
+        _ => return Err(format!("unknown network proxy mode: {mode}")),
+    };
+    Ok(Some(NetworkProxyUiState {
+        mode,
+        proxy_url: lookup(PROXY_URL_ENV)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+        bypass: lookup(PROXY_BYPASS_ENV).unwrap_or_default(),
+    }))
+}
+
+/// Applies a route a deployment handed this process in its environment.
+///
+/// A remote runtime is started by the launcher's env file, so this is the only
+/// way its outbound clients — managed Agent installs above all — learn about
+/// the proxy the reader configured on the machine they are sitting at.
+pub fn initialize_from_environment() -> Result<Option<NetworkProxyUiState>, String> {
+    let Some(settings) = settings_from_environment()? else {
+        return Ok(None);
+    };
+    initialize(&settings).map(Some)
+}
+
 /// Apply a user-initiated settings change immediately.
 pub fn configure(settings: &NetworkProxyUiState) -> Result<NetworkProxyUiState, String> {
     let normalized = normalize_settings(settings)?;
@@ -649,5 +739,93 @@ mod tests {
                 .filter(|(key, _)| NO_PROXY_ENV_KEYS.contains(key))
                 .all(|(_, value)| value.is_none())
         );
+    }
+
+    /// The pairs a launcher writes into a remote runtime's env file are the
+    /// same preference a local runtime initializes from. Reading them back is
+    /// what makes a remote install take the reader's proxy.
+    #[test]
+    fn the_environment_bridge_round_trips_every_mode() {
+        for settings in [
+            NetworkProxyUiState::default(),
+            NetworkProxyUiState {
+                mode: NetworkProxyMode::Direct,
+                proxy_url: None,
+                bypass: String::new(),
+            },
+            custom("socks5://127.0.0.1:1080"),
+        ] {
+            let pairs = environment_pairs(&settings);
+            assert_eq!(pairs[0].0, PROXY_MODE_ENV);
+            let restored = settings_from_lookup(|key| {
+                pairs
+                    .iter()
+                    .find(|(pair_key, _)| *pair_key == key)
+                    .map(|(_, value)| value.clone())
+            })
+            .unwrap()
+            .unwrap();
+            assert_eq!(restored.mode, settings.mode);
+            assert_eq!(restored.proxy_url, settings.proxy_url);
+            assert_eq!(restored.bypass, settings.bypass);
+        }
+    }
+
+    /// A route the launcher published is what the receiving process applies,
+    /// not the desktop's own snapshot: the two machines resolve their system
+    /// proxy independently, so only an explicit `custom` route travels.
+    #[test]
+    fn a_direct_route_publishes_no_address_even_with_one_configured() {
+        let settings = NetworkProxyUiState {
+            mode: NetworkProxyMode::Direct,
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            bypass: DEFAULT_NETWORK_PROXY_BYPASS.to_string(),
+        };
+        let pairs = environment_pairs(&settings);
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == PROXY_MODE_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some("direct")
+        );
+        assert!(pairs.iter().all(|(key, _)| *key != PROXY_URL_ENV));
+        // The bypass list still travels: `direct` has to clear an ambient
+        // proxy the receiving host may already carry.
+        assert_eq!(
+            pairs
+                .iter()
+                .find(|(key, _)| *key == PROXY_BYPASS_ENV)
+                .map(|(_, value)| value.as_str()),
+            Some(DEFAULT_NETWORK_PROXY_BYPASS)
+        );
+    }
+
+    /// A mode that is selected but not routed yet keeps its dormant address
+    /// off the wire: the receiving machine must not start dialing it.
+    #[test]
+    fn a_dormant_address_is_not_published() {
+        let settings = NetworkProxyUiState {
+            mode: NetworkProxyMode::System,
+            proxy_url: Some("http://127.0.0.1:7890".to_string()),
+            bypass: DEFAULT_NETWORK_PROXY_BYPASS.to_string(),
+        };
+        assert!(
+            environment_pairs(&settings)
+                .iter()
+                .all(|(key, _)| *key != PROXY_URL_ENV)
+        );
+    }
+
+    /// An address that is present but unusable still has to fail loudly on the
+    /// machine that receives it, not silently route nowhere.
+    #[test]
+    fn an_invalid_forwarded_address_is_rejected() {
+        let settings = NetworkProxyUiState {
+            mode: NetworkProxyMode::Custom,
+            proxy_url: Some("ftp://proxy.local:21".to_string()),
+            bypass: String::new(),
+        };
+        assert!(normalize_settings(&settings).is_err());
     }
 }
