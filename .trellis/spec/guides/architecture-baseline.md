@@ -103,7 +103,18 @@ theme generation.
   information architecture, copy and spacing ladder, not pixel-identical
   rendering.
 - The app stays a client: camera, clipboard, discovery and the remote transport
-  arrive through the host seams, never as local authority.
+  arrive through the host seams, never as local authority. Attachments are the
+  exception that proves it: `nsh`'s own picker (`pick_images`, `pick_files`)
+  hands the app bytes, which travel to the authoritative runtime as `data:`
+  URLs rather than being read from a phone path.
+- Files are edited with `nsh`'s `Editor` (highlighting in the language the
+  runtime reports) and written with a revision guard; Git status, staging,
+  commit, revert and commit detail call the same backend contracts the desktop
+  workbench uses. Branch switching is absent because the backend exposes no
+  checkout call.
+- The platform names the phone for pairing (`nativeSetDeviceName` /
+  `vibex_mobile_nsh_set_device_name`), and packaging is `nsh package` behind
+  `apps/mobile-nsh/scripts/build-{android,ios}.sh`.
 - The UI layer is written to be reusable if the desktop moves to `nsh`'s GPUI
   backend; it must not assume a phone-only composition.
 
