@@ -69,9 +69,9 @@ definite height, and the card's row set is reconciled before every draw.
 
 ## 4. Why the Main Transcript Does Not Use MessageScroller
 
-`gpui-component 0.8.x`'s `MessageScrollerState` exposes `logical_scroll_top`,
-`scroll_to_item(index)`, `scroll_to_end`, and row-count mutations. It does not
-expose:
+`MessageScrollerState` in the resolved `gpui-component 0.10.0` exposes
+`logical_scroll_top`, `scroll_to_item`, `scroll_to_offset`, `scroll_to_end`, and
+row-count mutations. It does not expose:
 
 - `scroll_to(ListOffset)` / `scroll_by`, so an offset inside a turn cannot be
   restored;
@@ -86,16 +86,17 @@ lose reveal inside turns taller than the viewport, and change the first-frame
 extent. Forking or vendoring the crate is prohibited by
 [`rust-dependency-sources.md`](../backend/rust-dependency-sources.md).
 
-The API gap is the *only* reason the transcript stays put. It is not that the
-transcript has nothing to gain: `v_virtual_list` is `gpui_base::VirtualList`,
-which contains no `fast::layers` code at all, while `MessageScroller` renders
-`gpui::list`, which carries the full list layer. See the decision at the end of
-§5 for the measurement and for what would reopen the question.
+That is an argument against the *wrapper*, not against the element. Every one of
+those capabilities exists on `ListState`, which `MessageScrollerState` wraps and
+does not re-export, and `gpui::list(state, renderer)` is public gpui — the same
+shape §3a already uses for the Providers → Models tab. `v_virtual_list` is
+`gpui_base::VirtualList`, which contains no `fast::layers` code at all, so the
+transcript gets no list layer today; `gpui::list` carries the full one. §5
+records the measurement and the shape of the migration.
 
-## 5. Required Upstream API Before Migrating
+## 5. What the Wrapper Would Need, and What Is Already Available
 
-The main transcript can move to `MessageScroller` once the published state
-exposes:
+`MessageScroller` — the wrapper — would need its published state to expose:
 
 ```rust
 MessageScrollerState::scroll_to(ListOffset);
@@ -122,17 +123,17 @@ rest of the list above is not, and `MessageScroller::new` still takes
 accessors, the row-height hints, and the owning-entity renderer are all still
 absent from what this workspace can build against.
 
-Two things follow. The API gap is no longer the blocker — the *payoff* is
-(see §7.1: a layer only pays when its content is stable across scrolled frames).
-And until a release carries the new API, any migration would have to work
-through the published surface, which is a larger rewrite of the row builders
-than the geometry changes alone suggest.
+Two things follow. The payoff is real and the element is the reason (see the
+measurement below): the transcript's element has no list layer, while
+`gpui::list` does. And the `MessageScrollerState` surface above is a thin
+re-export, not the whole capability — most of what the requirement list asks
+for is already reachable one level down.
 
-**Decision: the main transcript stays on `v_virtual_list` for now, but not
-because a list layer would not pay.** An earlier revision of this section closed
-the question on the claim that a list layer would not engage on the transcript.
-That claim was wrong, and the reason is worth recording because it is the whole
-argument for revisiting the migration later.
+**Status: the transcript can get a list layer, without changing or forking
+`gpui-component`.** An earlier revision of this section closed the question on
+the claim that a list layer would not engage on the transcript. That claim was
+wrong, and the reason is worth recording because it is the whole argument for
+the migration.
 
 The two elements are not the same thing:
 
@@ -149,17 +150,36 @@ of being rebuilt, and a list layer is exempt from the tile budget. On the
 transcript that is the difference between rebuilding the visible turns every
 scrolled frame and replaying them.
 
-What actually keeps the migration closed is the API gap, not the payoff. Four of
-the five state accessors, the row-height hints, and the owning-entity renderer
-are all missing from the published `0.10.0`, and the dependency-source policy
-forbids the fork. The requirement list above therefore stands as the gate: when
-a release ships that surface, the migration becomes worth measuring, and the
-measurement to run first is `layer_frames_composited` on the transcript, not a
-wall-clock comparison.
+**The API gap is not a wall: use `gpui::list` directly.** Everything the
+requirement list asks for already exists one level down, on `ListState` — the
+type `MessageScrollerState` wraps and never re-exports:
 
-Until then, keep the per-turn virtual list and adopt only compatible
-`MessageScroller` affordances (for example, the log role or the jump-button
-visual language) without removing the pixel-scroll state.
+| Wanted | Where it lives in `gpui-fast 0.1.16` |
+| --- | --- |
+| `scroll_to(ListOffset)` | `ListState::scroll_to` |
+| `scroll_by` | `ListState::scroll_by` |
+| `viewport_bounds` | `ListState::viewport_bounds` |
+| offset / max offset | `ListState::scroll_px_offset_for_scrollbar`, `max_offset_for_scrollbar` |
+| row height hints | `ListState::with_uniform_item_height`, per-item `size_hint` |
+| renderer owning entity | not on `list()`, but a captured `WeakEntity` is the standard pattern here already |
+
+`gpui::list(state, renderer)` is a public gpui constructor, and `ListState` is
+`Clone`, so a view can own one and still pass it to the element. Nothing in
+`gpui-component` has to change, and nothing has to be forked — this is the
+dependency-source policy's preferred outcome, not an exception to it.
+
+Measured: a plain `gpui::list` over 200 stable rows composites **eleven frames of
+twelve** scrolled frames, against **zero** for the same content through
+`v_virtual_list`. So "can the transcript get a list layer" is answered yes, and
+the remaining work is a row-builder rewrite onto `ListState`, not a wait on an
+upstream release.
+
+The transcript still runs on `v_virtual_list` today, because moving it is a row
+builder rewrite that has not been done — not because anything upstream blocks it.
+When that rewrite happens, `gpui::list` with a view-owned `ListState` is the
+shape to build on: no crate change, no fork, and the per-turn pixel anchors and
+in-turn reveal move onto `ListState`'s own `scroll_to(ListOffset)` and
+`bounds_for_item` rather than the current handle.
 
 ## 6. Tests Required
 

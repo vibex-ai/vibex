@@ -134,12 +134,19 @@ took, which is why the same probe failed alone and passed in the suite.
 
 ## 5. Timeline list layer
 
-[Session Timeline Scrolling](./timeline-scrolling.md) names the `MessageScroller`
-API the main transcript needs before it can move off `v_virtual_list`. As of
-gpui-component 0.10.0 the published state still does not expose
-`scroll_by`, `viewport_bounds`, `offset`, `max_offset`, per-row size hints, or a
-row renderer that receives the owning view, so the transcript stays on its own
-virtual list and the child Agent rail stays on `MessageScroller`.
+The transcript gets no list layer today, and the reason is the element, not the
+app: `v_virtual_list` is `gpui_base::VirtualList`, which contains no
+`fast::layers` code at all, while `gpui::list` carries the full one. Measured, a
+plain `gpui::list` over 200 stable rows composites eleven of twelve scrolled
+frames against zero for the same content through `v_virtual_list`.
+
+`MessageScroller` would bring that, but its published state in
+`gpui-component 0.10.0` is missing most of the surface the transcript needs.
+`ListState` — which it wraps and does not re-export — has all of it, and
+`gpui::list(state, renderer)` is public gpui, so the migration is a row-builder
+rewrite with no crate change and no fork. See
+[Session Timeline Scrolling](./timeline-scrolling.md) §4–§5 for the capability
+table and the measurement.
 
 ## 6. The composer boundary
 
