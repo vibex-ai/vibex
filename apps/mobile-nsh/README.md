@@ -87,8 +87,10 @@ A successful claim or a tapped saved runtime opens the session shell:
   workspaces and its ready Agent/model options (`list_workspaces`,
   `list_runtime_options`);
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY
-  snapshot fills it, its frame stream keeps it live, and what the person types
-  goes back to the PTY. Closing the surface leaves the terminal running;
+  snapshot fills it, its frame stream keeps it live (a character split across
+  two frames is carried to the next), its size changes are forwarded
+  (`resize_terminal`), and what the person types goes back to the PTY. Closing
+  the surface leaves the terminal running;
 - the drawer opens a file browser: one directory at a time from `file_tree`,
   a file's text from `read_file` edited in `nsh`'s `Editor` (line numbers,
   folding, syntax highlighting in the language the runtime reports) and

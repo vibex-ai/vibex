@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::{Terminal, terminal as terminal_view};
+use nsh_base::{Terminal, TerminalEvent, terminal as terminal_view};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
@@ -21,12 +21,15 @@ pub struct TerminalHost {
     pub term_ref: ComponentRef<Terminal>,
     /// What the person typed (and pasted), for the program.
     pub on_data: Rc<dyn Fn(&str)>,
+    /// The grid's new size, in columns and rows.
+    pub on_resize: Rc<dyn Fn(u32, u32)>,
     pub on_close: Rc<dyn Fn()>,
 }
 
 /// The terminal screen.
 pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let on_data = host.on_data.clone();
+    let on_resize = host.on_resize.clone();
     let title = host.title;
     let error = host.error;
     view()
@@ -84,6 +87,11 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .component_ref(&host.term_ref)
                 .accessibility_label(copy::text("Terminal", "终端", "終端"))
                 .on_data(move |data: &SharedString| on_data(data))
+                .on_resize(move |event: &TerminalEvent| {
+                    if let TerminalEvent::Resize(cols, rows) = event {
+                        on_resize(*cols, *rows);
+                    }
+                })
                 .flex_1(),
         )
 }

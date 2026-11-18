@@ -30,9 +30,9 @@ use vibex_core::{
     MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
     PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
     ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
-    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest,
-    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalStatus,
+    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -81,6 +81,8 @@ pub struct SessionService {
     terminal_error: Signal<Option<SharedString>>,
     terminal_ref: ComponentRef<Terminal>,
     terminal_id: Rc<RefCell<Option<TerminalId>>>,
+    /// Bytes of a UTF-8 character split across two frames.
+    terminal_pending: Rc<RefCell<Vec<u8>>>,
     /// Bumped when the terminal closes, so its stream stops writing.
     terminal_generation: Rc<Cell<u64>>,
     files_open: Signal<bool>,
@@ -161,6 +163,7 @@ impl SessionService {
             terminal_error: signal(None),
             terminal_ref: component_ref::<Terminal>(),
             terminal_id: Rc::new(RefCell::new(None)),
+            terminal_pending: Rc::new(RefCell::new(Vec::new())),
             terminal_generation: Rc::new(Cell::new(0)),
             files_open: signal(false),
             files_path: signal(String::new()),
@@ -326,6 +329,10 @@ impl SessionService {
             on_terminal_data: {
                 let service = self.clone();
                 Rc::new(move |data: &str| service.terminal_input(data))
+            },
+            on_terminal_resize: {
+                let service = self.clone();
+                Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
             },
             on_open_files: {
                 let service = self.clone();
@@ -1111,6 +1118,7 @@ impl SessionService {
                 }
             };
             *service.terminal_id.borrow_mut() = Some(terminal.id.clone());
+            service.terminal_pending.borrow_mut().clear();
             service
                 .terminal_title
                 .set(Some(terminal.title.clone().into()));
@@ -1134,9 +1142,8 @@ impl SessionService {
                             service.reset_terminal_output();
                         }
                         for frame in batch.frames {
-                            service.write_terminal_output(
-                                String::from_utf8_lossy(&frame.bytes).into_owned(),
-                            );
+                            let text = service.decode_terminal_frame(&frame.bytes);
+                            service.write_terminal_output(text);
                         }
                     }
                     Ok(None) | Err(_) => break,
@@ -1181,9 +1188,36 @@ impl SessionService {
     }
 
     fn reset_terminal_output(&self) {
+        self.terminal_pending.borrow_mut().clear();
         if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
             api.reset();
         }
+    }
+
+    /// Decodes a frame, keeping a character split across frames for the next
+    /// one instead of writing a replacement mark.
+    fn decode_terminal_frame(&self, bytes: &[u8]) -> String {
+        decode_terminal_bytes(&mut self.terminal_pending.borrow_mut(), bytes)
+    }
+
+    /// Tells the runtime the grid's new size.
+    fn terminal_resize(&self, cols: u32, rows: u32) {
+        let Some(terminal_id) = self.terminal_id.borrow().clone() else {
+            return;
+        };
+        let backend = self.terminal_backend.clone();
+        spawn(async move {
+            let _ = background(async move {
+                backend
+                    .resize_terminal(MutationRequest::new(TerminalResizeRequest {
+                        terminal_id,
+                        rows: rows.min(u32::from(u16::MAX)) as u16,
+                        cols: cols.min(u32::from(u16::MAX)) as u16,
+                    }))
+                    .await
+            })
+            .await;
+        });
     }
 
     /// Opens the workspace's files over the shell, at the root.
@@ -1810,6 +1844,25 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
     }
 }
 
+/// Decodes a terminal frame, keeping an incomplete UTF-8 tail for the next
+/// frame instead of showing a replacement mark for it.
+fn decode_terminal_bytes(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
+    pending.extend_from_slice(bytes);
+    match std::str::from_utf8(pending) {
+        Ok(text) => {
+            let text = text.to_owned();
+            pending.clear();
+            text
+        }
+        Err(error) => {
+            let valid = error.valid_up_to();
+            let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
+            pending.drain(..valid);
+            text
+        }
+    }
+}
+
 fn change_letter(kind: GitChangeKind) -> &'static str {
     match kind {
         GitChangeKind::Added => "A",
@@ -2051,5 +2104,29 @@ fn age(timestamp_ms: i64) -> String {
         60..=3_599 => format!("{}m", seconds / 60),
         3_600..=86_399 => format!("{}h", seconds / 3_600),
         _ => format!("{}d", seconds / 86_400),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::decode_terminal_bytes;
+
+    #[test]
+    fn a_character_split_across_frames_keeps_its_bytes() {
+        let mut pending = Vec::new();
+        let bytes = "é".as_bytes();
+        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..1]), "");
+        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[1..]), "é");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn text_before_an_incomplete_tail_is_written_at_once() {
+        let mut pending = Vec::new();
+        let bytes = "a😀".as_bytes();
+        let split = bytes.len() - 2;
+        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..split]), "a");
+        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[split..]), "😀");
+        assert!(pending.is_empty());
     }
 }

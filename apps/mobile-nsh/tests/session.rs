@@ -359,6 +359,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_terminal,
         on_close_terminal,
         on_terminal_data: Rc::new(|_| {}),
+        on_terminal_resize: Rc::new(|_, _| {}),
         files_open,
         files_path,
         files_entries,

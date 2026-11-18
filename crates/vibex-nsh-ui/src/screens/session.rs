@@ -292,6 +292,7 @@ pub struct SessionHost {
     pub on_open_terminal: Action,
     pub on_close_terminal: Action,
     pub on_terminal_data: TerminalInput,
+    pub on_terminal_resize: Rc<dyn Fn(u32, u32)>,
     /// The files surface, when it is open over the shell.
     pub files_open: Signal<bool>,
     pub files_path: Signal<String>,
@@ -352,6 +353,7 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         error: host.terminal_error,
         term_ref: host.terminal_ref,
         on_data: host.on_terminal_data.clone(),
+        on_resize: host.on_terminal_resize.clone(),
         on_close: host.on_close_terminal.clone(),
     };
     let files = crate::screens::files::FilesHost {
