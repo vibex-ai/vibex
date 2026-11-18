@@ -202,6 +202,9 @@ type QuestionAction = Rc<dyn Fn(&str, QuestionResponse)>;
 /// What the person typed into the terminal.
 type TerminalInput = Rc<dyn Fn(&str)>;
 
+/// Opens a path (a directory or a file) in the files surface.
+type OpenPath = Rc<dyn Fn(&str)>;
+
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 
@@ -217,6 +220,16 @@ pub struct CommandEntry {
 
 /// Asks for the commands matching what follows `/`.
 type CommandQuery = Rc<dyn Fn(&str)>;
+
+/// Asks for the references matching what follows `@`.
+type MentionQuery = Rc<dyn Fn(&str)>;
+
+/// Which prefix opened the palette.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PaletteKind {
+    Slash,
+    Mention,
+}
 
 /// What the shell may do, and the state it shows.
 #[derive(Clone)]
@@ -244,6 +257,9 @@ pub struct SessionHost {
     /// The `/` commands the session offers, filtered by what is typed.
     pub commands: Signal<Vec<CommandEntry>>,
     pub on_command_query: CommandQuery,
+    /// The `@` references the session offers.
+    pub mentions: Signal<Vec<CommandEntry>>,
+    pub on_mention_query: MentionQuery,
     /// Starts a new session in the open session's workspace.
     pub on_new_session: Action,
     /// The terminal surface, when it is open over the shell.
@@ -254,11 +270,23 @@ pub struct SessionHost {
     pub on_open_terminal: Action,
     pub on_close_terminal: Action,
     pub on_terminal_data: TerminalInput,
+    /// The files surface, when it is open over the shell.
+    pub files_open: Signal<bool>,
+    pub files_path: Signal<String>,
+    pub files_entries: Signal<Vec<crate::screens::files::FileEntry>>,
+    pub files_preview: Signal<Option<crate::screens::files::FilePreview>>,
+    pub files_error: Signal<Option<SharedString>>,
+    pub on_open_files: Action,
+    pub on_close_files: Action,
+    pub on_open_dir: OpenPath,
+    pub on_open_file: OpenPath,
+    pub on_files_back: Action,
 }
 
-/// The session shell, or the terminal when it is open over it.
+/// The session shell, or the terminal or files surface over it.
 pub fn session(host: SessionHost) -> impl IntoElement {
     let terminal_open = host.terminal_open;
+    let files_open = host.files_open;
     let terminal = crate::screens::terminal::TerminalHost {
         title: host.terminal_title,
         error: host.terminal_error,
@@ -266,16 +294,31 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         on_data: host.on_terminal_data.clone(),
         on_close: host.on_close_terminal.clone(),
     };
+    let files = crate::screens::files::FilesHost {
+        open: host.files_open,
+        path: host.files_path,
+        entries: host.files_entries,
+        file: host.files_preview,
+        error: host.files_error,
+        on_open_dir: host.on_open_dir.clone(),
+        on_open_file: host.on_open_file.clone(),
+        on_back: host.on_files_back.clone(),
+        on_close: host.on_close_files.clone(),
+    };
     let shell_host = host;
     view()
         .flex_1()
         .bg(theme::background)
-        .child(when(move || terminal_open.get(), {
+        .child(when(move || files_open.get(), {
+            let files = files.clone();
+            move || crate::screens::files::files(files.clone())
+        }))
+        .child(when(move || !files_open.get() && terminal_open.get(), {
             let terminal = terminal.clone();
             move || crate::screens::terminal::terminal(terminal.clone())
         }))
         .child(when(
-            move || !terminal_open.get(),
+            move || !files_open.get() && !terminal_open.get(),
             move || shell(shell_host.clone()),
         ))
 }
@@ -306,11 +349,25 @@ fn shell(host: SessionHost) -> impl IntoElement {
                 })),
         )
         .child(when(
-            move || !host.commands.with(|commands| commands.is_empty()),
+            move || {
+                host.draft.with(|draft| draft.starts_with('/'))
+                    && !host.commands.with(|commands| commands.is_empty())
+            },
             {
                 let commands = host.commands;
                 let draft = host.draft;
-                move || command_palette(commands, draft)
+                move || command_palette(commands, draft, PaletteKind::Slash)
+            },
+        ))
+        .child(when(
+            move || {
+                mention_query(&host.draft.get()).is_some()
+                    && !host.mentions.with(|mentions| mentions.is_empty())
+            },
+            {
+                let mentions = host.mentions;
+                let draft = host.draft;
+                move || command_palette(mentions, draft, PaletteKind::Mention)
             },
         ))
         .child(when(move || host.pending.get().is_some(), {
@@ -623,7 +680,11 @@ fn error_card(body: Memo<String>) -> impl IntoElement {
 ///
 /// The list is what the session's runtime offers, narrowed by the text after
 /// the slash; pressing a row writes its insertion into the composer.
-fn command_palette(commands: Signal<Vec<CommandEntry>>, draft: Signal<String>) -> impl IntoElement {
+fn command_palette(
+    commands: Signal<Vec<CommandEntry>>,
+    draft: Signal<String>,
+    kind: PaletteKind,
+) -> impl IntoElement {
     view()
         .w_full()
         .max_h(px(240.0))
@@ -655,15 +716,23 @@ fn command_palette(commands: Signal<Vec<CommandEntry>>, draft: Signal<String>) -
                         })
                     },
                     |command| command.id.clone(),
-                    move |command, _| command_row(command, draft),
+                    move |command, _| command_row(command, draft, kind),
                 ))),
         )
 }
 
-fn command_row(command: ReadSignal<CommandEntry>, draft: Signal<String>) -> impl IntoElement {
+fn command_row(
+    command: ReadSignal<CommandEntry>,
+    draft: Signal<String>,
+    kind: PaletteKind,
+) -> impl IntoElement {
     button()
         .on_press(move || {
-            draft.set(command.get_untracked().insertion);
+            let insertion = command.get_untracked().insertion;
+            draft.set(match kind {
+                PaletteKind::Slash => insertion,
+                PaletteKind::Mention => insert_mention(&draft.get_untracked(), &insertion),
+            });
         })
         .w_full()
         .rounded(px(theme::RADIUS_CONTROL))
@@ -1101,7 +1170,9 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let sending = host.sending;
     let send = host.on_send.clone();
     let commands = host.commands;
+    let mentions = host.mentions;
     let on_query = host.on_command_query.clone();
+    let on_mention = host.on_mention_query.clone();
     let submit = {
         let send = send.clone();
         move || {
@@ -1132,9 +1203,15 @@ fn composer(host: SessionHost) -> impl IntoElement {
             field::text_field_with(
                 draft,
                 copy::text("Message the Agent…", "给 Agent 发消息…", "傳訊息給 Agent…"),
-                move |text: &str| match text.strip_prefix('/') {
-                    Some(query) => on_query(query),
-                    None => commands.set(Vec::new()),
+                move |text: &str| {
+                    match text.strip_prefix('/') {
+                        Some(query) => on_query(query),
+                        None => commands.set(Vec::new()),
+                    }
+                    match mention_query(text) {
+                        Some(query) => on_mention(&query),
+                        None => mentions.set(Vec::new()),
+                    }
                 },
             )
             .multiline(true)
@@ -1162,6 +1239,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_disconnect = host.on_disconnect.clone();
     let on_new_session = host.on_new_session.clone();
     let on_open_terminal = host.on_open_terminal.clone();
+    let on_open_files = host.on_open_files.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1220,6 +1298,18 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             })
                             .text_size(px(theme::FONT_CAPTION))
                             .text_color(theme::text_muted),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Files", "文件", "檔案"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                {
+                                    let on_open_files = on_open_files.clone();
+                                    move || on_open_files()
+                                },
+                            )
+                            .w_full(),
                         )
                         .child(
                             action::secondary(
@@ -1313,6 +1403,32 @@ fn session_row(
                     .text_color(theme::text_muted),
                 ),
         )
+}
+
+/// What was typed after `@` when it is still one reference, if any.
+fn mention_query(text: &str) -> Option<String> {
+    let at = text.rfind('@')?;
+    let after = &text[at + 1..];
+    if after.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if at > 0
+        && !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|previous| previous.is_whitespace() || previous == '(')
+    {
+        return None;
+    }
+    Some(after.to_owned())
+}
+
+/// Replaces the `@…` token with the reference the person picked.
+fn insert_mention(text: &str, insertion: &str) -> String {
+    match text.rfind('@') {
+        Some(at) => format!("{}{insertion}", &text[..at]),
+        None => insertion.to_owned(),
+    }
 }
 
 /// An SVG from this crate's assets, drawn inline.

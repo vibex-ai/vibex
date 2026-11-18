@@ -78,12 +78,16 @@ A successful claim or a tapped saved runtime opens the session shell:
 - a pending question is a typed form: one field per kind (text, a number, a
   choice, yes/no, multi-select), required fields checked before submitting,
   and the answers converted back to the runtime's typed values;
-- the composer offers the session's `/` commands (one discovery per session,
-  filtered locally), and the drawer starts a new session in the open
+- the composer offers the session's `/` commands and `@` references (one
+  discovery per session each, filtered locally; a reference replaces the
+  `@…` token in place), and the drawer starts a new session in the open
   workspace with its runtime selection;
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY
   snapshot fills it, its frame stream keeps it live, and what the person types
-  goes back to the PTY. Closing the surface leaves the terminal running.
+  goes back to the PTY. Closing the surface leaves the terminal running;
+- the drawer opens a read-only file browser: one directory at a time from
+  `file_tree`, a file's text from `read_file`, with back through the
+  directories and the preview.
 
 Attachments and `@`-mentions land with their own passes. The shell's tests
 mount it over a fixture; the live, answer and terminal paths are
@@ -127,9 +131,10 @@ Two layers:
   drawer lists sessions, switching one swaps the transcript, a streaming
   Markdown reply renders, the composer appends what was sent and clears, a
   permission card is answered and leaves, a question collects a typed answer
-  and leaves, the `/` palette inserts a command, New session opens a session,
-  and the terminal shows a program's output. Each migrated screen adds the
-  flows its GPUI pair has.
+  and leaves, the `/` and `@` palettes insert a command and a reference, New
+  session opens a session, the terminal shows a program's output, and the
+  files surface lists a directory and reads a file. Each migrated screen adds
+  the flows its GPUI pair has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -245,8 +250,9 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. Attachments and `@`-mentions, and the full new-session picker (workspace,
-   Agent, model) instead of reusing the open session's.
+1. Attachments, and the full new-session picker (workspace, Agent, model)
+   instead of reusing the open session's.
 2. The platform device name and the release pipeline; the shell's own camera
    and discovery code against the request queue.
-3. The rest of the workbench: files and Git (nsh's `Editor` and `DiffView`).
+3. The rest of the workbench: editable files and Git (nsh's `Editor` and
+   `DiffView`).

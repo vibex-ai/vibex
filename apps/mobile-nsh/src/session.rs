@@ -16,22 +16,24 @@ use std::{
 use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use vibex_backend::{
-    AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest, TerminalBackend,
+    AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, MutationRequest,
+    TerminalBackend,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    FetchTimelineRequest, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, SendAgentMessageRequest, TerminalCreateRequest, TerminalId,
-    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
-    VibexSessionId, unix_timestamp_ms,
+    FetchTimelineRequest, FileReadRequest, FileTreeRequest, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest,
+    TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
+    screens::files::{FileEntry, FilePreview},
     screens::session::{
         CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
         PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
@@ -49,6 +51,7 @@ const TIMELINE_LIMIT: u32 = 200;
 pub struct SessionService {
     backend: Arc<dyn AgentBackend>,
     terminal_backend: Arc<dyn TerminalBackend>,
+    file_backend: Arc<dyn FileBackend>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
@@ -62,6 +65,8 @@ pub struct SessionService {
     question_request: Rc<RefCell<Option<ElicitationRequest>>>,
     commands: Signal<Vec<CommandEntry>>,
     commands_loaded: Rc<Cell<bool>>,
+    mentions: Signal<Vec<CommandEntry>>,
+    mentions_loaded: Rc<Cell<bool>>,
     terminal_open: Signal<bool>,
     terminal_title: Signal<Option<SharedString>>,
     terminal_error: Signal<Option<SharedString>>,
@@ -69,6 +74,12 @@ pub struct SessionService {
     terminal_id: Rc<RefCell<Option<TerminalId>>>,
     /// Bumped when the terminal closes, so its stream stops writing.
     terminal_generation: Rc<Cell<u64>>,
+    files_open: Signal<bool>,
+    files_path: Signal<String>,
+    files_entries: Signal<Vec<FileEntry>>,
+    files_preview: Signal<Option<FilePreview>>,
+    files_error: Signal<Option<SharedString>>,
+    files_workspace: Rc<RefCell<Option<WorkspaceId>>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -83,11 +94,13 @@ impl SessionService {
     ) -> BackendResult<Self> {
         let backend = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
+        let file_backend: Arc<dyn FileBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let service = Self {
             backend,
             terminal_backend,
+            file_backend,
             sessions: signal(Vec::new()),
             active: signal(None),
             timeline: signal(Vec::new()),
@@ -100,12 +113,20 @@ impl SessionService {
             question_request: Rc::new(RefCell::new(None)),
             commands: signal(Vec::new()),
             commands_loaded: Rc::new(Cell::new(false)),
+            mentions: signal(Vec::new()),
+            mentions_loaded: Rc::new(Cell::new(false)),
             terminal_open: signal(false),
             terminal_title: signal(None),
             terminal_error: signal(None),
             terminal_ref: component_ref::<Terminal>(),
             terminal_id: Rc::new(RefCell::new(None)),
             terminal_generation: Rc::new(Cell::new(0)),
+            files_open: signal(false),
+            files_path: signal(String::new()),
+            files_entries: signal(Vec::new()),
+            files_preview: signal(None),
+            files_error: signal(None),
+            files_workspace: Rc::new(RefCell::new(None)),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -128,10 +149,16 @@ impl SessionService {
             pending: self.pending,
             question: self.question,
             commands: self.commands,
+            mentions: self.mentions,
             terminal_open: self.terminal_open,
             terminal_title: self.terminal_title,
             terminal_error: self.terminal_error,
             terminal_ref: self.terminal_ref,
+            files_open: self.files_open,
+            files_path: self.files_path,
+            files_entries: self.files_entries,
+            files_preview: self.files_preview,
+            files_error: self.files_error,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -162,6 +189,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |query: &str| service.query_commands(query))
             },
+            on_mention_query: {
+                let service = self.clone();
+                Rc::new(move |query: &str| service.query_mentions(query))
+            },
             on_new_session: {
                 let service = self.clone();
                 Rc::new(move || service.new_session())
@@ -177,6 +208,26 @@ impl SessionService {
             on_terminal_data: {
                 let service = self.clone();
                 Rc::new(move |data: &str| service.terminal_input(data))
+            },
+            on_open_files: {
+                let service = self.clone();
+                Rc::new(move || service.open_files())
+            },
+            on_close_files: {
+                let service = self.clone();
+                Rc::new(move || service.close_files())
+            },
+            on_open_dir: {
+                let service = self.clone();
+                Rc::new(move |path: &str| service.load_dir(path.to_owned()))
+            },
+            on_open_file: {
+                let service = self.clone();
+                Rc::new(move |path: &str| service.open_file(path.to_owned()))
+            },
+            on_files_back: {
+                let service = self.clone();
+                Rc::new(move || service.files_back())
             },
         }
     }
@@ -286,6 +337,8 @@ impl SessionService {
         *self.question_request.borrow_mut() = None;
         self.commands.set(Vec::new());
         self.commands_loaded.set(false);
+        self.mentions.set(Vec::new());
+        self.mentions_loaded.set(false);
         self.error.set(None);
         let service = self.clone();
         let backend = self.backend.clone();
@@ -565,24 +618,46 @@ impl SessionService {
             })
             .await;
             if let Ok(Ok(discovery)) = result {
-                let mut entries = Vec::new();
-                let mut seen = std::collections::BTreeSet::new();
-                for entry in discovery
-                    .response
-                    .entries
-                    .into_iter()
-                    .chain(discovery.quick_phrases)
-                {
-                    if seen.insert(entry.id.clone()) {
-                        entries.push(CommandEntry {
-                            id: entry.id,
-                            label: entry.label,
-                            description: entry.description.unwrap_or_default(),
-                            insertion: entry.insertion_text,
-                        });
-                    }
-                }
-                service.commands.set(entries);
+                service.commands.set(command_entries(discovery));
+            }
+        });
+    }
+
+    /// Loads the `@` references the open session offers.
+    ///
+    /// Like the `/` list, one read per session: the palette narrows it
+    /// locally while the person types.
+    fn query_mentions(&self, _query: &str) {
+        if self.mentions_loaded.get() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        self.mentions_loaded.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .discover_agent_commands(AgentCommandDiscoverRequest {
+                        agent_id: None,
+                        provider_profile_id: None,
+                        session_id: Some(session_id),
+                        workspace_id: None,
+                        trigger: Some(AgentCommandTrigger::Mention),
+                        query: None,
+                        limit: Some(40),
+                    })
+                    .await
+            })
+            .await;
+            if let Ok(Ok(discovery)) = result {
+                let entries = command_entries(discovery);
+                service.mentions.set(entries);
             }
         });
     }
@@ -781,6 +856,146 @@ impl SessionService {
         }
     }
 
+    /// Opens the workspace's files over the shell, at the root.
+    fn open_files(&self) {
+        if self.files_open.get_untracked() {
+            return;
+        }
+        self.files_open.set(true);
+        self.files_preview.set(None);
+        self.files_error.set(None);
+        self.load_dir(String::new());
+    }
+
+    fn close_files(&self) {
+        self.files_open.set(false);
+        self.files_preview.set(None);
+        self.files_error.set(None);
+    }
+
+    /// Lists `path` (the workspace root when empty).
+    fn load_dir(&self, path: String) {
+        self.files_path.set(path.clone());
+        self.files_preview.set(None);
+        self.files_error.set(None);
+        let service = self.clone();
+        let file_backend = self.file_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.files_error.set(Some(
+                    copy::text(
+                        "Open a session first; the files belong to its workspace.",
+                        "请先打开一个会话，文件属于它的工作区。",
+                        "請先開啟一個工作階段，檔案屬於它的工作區。",
+                    )
+                    .into(),
+                ));
+                return;
+            };
+            let tree_path = if path.is_empty() { None } else { Some(path) };
+            let result = background(async move {
+                file_backend
+                    .file_tree(FileTreeRequest {
+                        workspace_id: workspace,
+                        path: tree_path,
+                        max_depth: Some(1),
+                        include_hidden: false,
+                    })
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(entries)) => {
+                    let mut rows = entries
+                        .into_iter()
+                        .map(|entry| FileEntry {
+                            path: entry.path,
+                            name: entry.name,
+                            directory: entry.kind == vibex_core::FileEntryKind::Directory,
+                        })
+                        .collect::<Vec<_>>();
+                    rows.sort_by(|left, right| {
+                        right
+                            .directory
+                            .cmp(&left.directory)
+                            .then_with(|| left.name.cmp(&right.name))
+                    });
+                    service.files_entries.set(rows);
+                }
+                Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
+                Err(error) => service.files_error.set(Some(
+                    format!("listing the files did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Reads a file into the preview.
+    fn open_file(&self, path: String) {
+        self.files_error.set(None);
+        let service = self.clone();
+        let file_backend = self.file_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                file_backend
+                    .read_file(FileReadRequest {
+                        workspace_id: workspace,
+                        path,
+                        max_bytes: Some(512 * 1024),
+                    })
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(file)) => service.files_preview.set(Some(FilePreview {
+                    title: file.name,
+                    body: file.content.unwrap_or_default(),
+                    truncated: file.truncated,
+                })),
+                Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
+                Err(error) => service.files_error.set(Some(
+                    format!("reading the file did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Leaves the preview, then the directory, then the surface.
+    fn files_back(&self) {
+        if self.files_preview.get_untracked().is_some() {
+            self.files_preview.set(None);
+            return;
+        }
+        let path = self.files_path.get_untracked();
+        if path.is_empty() {
+            self.close_files();
+            return;
+        }
+        let parent = path
+            .rsplit_once('/')
+            .map(|(parent, _)| parent.to_owned())
+            .unwrap_or_default();
+        self.load_dir(parent);
+    }
+
+    /// The open session's workspace, fetched once.
+    async fn workspace(&self, agent: &Arc<dyn AgentBackend>) -> Option<WorkspaceId> {
+        if let Some(workspace) = self.files_workspace.borrow().clone() {
+            return Some(workspace);
+        }
+        let active = self.active.get_untracked()?;
+        let session_id = VibexSessionId::parse(active).ok()?;
+        let session = agent.open_session(session_id).await.ok()?;
+        let workspace = session.workspace_id;
+        *self.files_workspace.borrow_mut() = Some(workspace.clone());
+        Some(workspace)
+    }
+
     /// Re-reads the open session's transcript without clearing it.
     fn reload(&self, session_id: &VibexSessionId) {
         let service = self.clone();
@@ -871,6 +1086,30 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
             _ => SessionState::Idle,
         },
     }
+}
+
+/// The palette rows a discovery answers with, deduplicated by id.
+fn command_entries(discovery: vibex_core::AgentCommandDiscovery) -> Vec<CommandEntry> {
+    let mut entries = Vec::new();
+    let mut seen = std::collections::BTreeSet::new();
+    for entry in discovery
+        .response
+        .entries
+        .into_iter()
+        .chain(discovery.quick_phrases)
+        .chain(discovery.delegation_entries)
+        .chain(discovery.session_entries)
+    {
+        if seen.insert(entry.id.clone()) {
+            entries.push(CommandEntry {
+                id: entry.id,
+                label: entry.label,
+                description: entry.description.unwrap_or_default(),
+                insertion: entry.insertion_text,
+            });
+        }
+    }
+    entries
 }
 
 /// The card the phone shows for a pending question.

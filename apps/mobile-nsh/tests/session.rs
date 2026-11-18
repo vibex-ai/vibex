@@ -11,6 +11,7 @@ use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
+use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::session::{
     self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
     PermissionOption, QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary,
@@ -127,10 +128,43 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let question = signal(question);
     let resolving = signal(false);
     let commands = signal(Vec::new());
+    let mentions = signal(Vec::new());
     let terminal_open = signal(false);
     let terminal_title = signal(Some(SharedString::from("Terminal")));
     let terminal_error = signal(None::<SharedString>);
     let terminal_ref = component_ref::<Terminal>();
+    let files_open = signal(false);
+    let files_path = signal(String::new());
+    let files_entries = signal(vec![
+        FileEntry {
+            path: "src".to_owned(),
+            name: "src".to_owned(),
+            directory: true,
+        },
+        FileEntry {
+            path: "README.md".to_owned(),
+            name: "README.md".to_owned(),
+            directory: false,
+        },
+    ]);
+    let files_preview = signal(None::<FilePreview>);
+    let files_error = signal(None::<SharedString>);
+    let on_open_dir = Rc::new(move |path: &str| {
+        files_path.set(path.to_owned());
+        files_entries.set(vec![FileEntry {
+            path: "src/main.rs".to_owned(),
+            name: "main.rs".to_owned(),
+            directory: false,
+        }]);
+    });
+    let on_open_file = Rc::new(move |path: &str| {
+        files_preview.set(Some(FilePreview {
+            title: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            body: "fn main() {}".to_owned(),
+            truncated: false,
+        }));
+    });
+    let on_files_back = Rc::new(move || files_preview.set(None));
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -152,6 +186,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     });
     let on_question = Rc::new(move |_: &str, _| {
         question.set(None);
+    });
+    let on_mention_query = Rc::new(move |_: &str| {
+        mentions.set(vec![CommandEntry {
+            id: "file:src/main.rs".to_owned(),
+            label: "src/main.rs".to_owned(),
+            description: "Workspace file".to_owned(),
+            insertion: "@src/main.rs ".to_owned(),
+        }]);
     });
     let on_command_query = Rc::new(move |_: &str| {
         commands.set(vec![CommandEntry {
@@ -190,6 +232,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         pending,
         question,
         commands,
+        mentions,
         resolving,
         on_select: select,
         on_send: send,
@@ -198,6 +241,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_permission,
         on_question,
         on_command_query,
+        on_mention_query,
         on_new_session,
         terminal_open,
         terminal_title,
@@ -206,6 +250,16 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_terminal,
         on_close_terminal,
         on_terminal_data: Rc::new(|_| {}),
+        files_open,
+        files_path,
+        files_entries,
+        files_preview,
+        files_error,
+        on_open_files: Rc::new(move || files_open.set(true)),
+        on_close_files: Rc::new(move || files_open.set(false)),
+        on_open_dir,
+        on_open_file,
+        on_files_back,
     }
 }
 
@@ -347,4 +401,33 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("hello from the pty").unwrap();
+}
+
+#[test]
+fn the_at_palette_inserts_a_workspace_reference() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "@src").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("src/main.rs").unwrap();
+    app.wait_for("text:@src/main.rs ").unwrap();
+}
+
+/// The shell with its files surface open.
+#[component]
+fn FilesShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.files_open.set(true);
+    session::session(host)
+}
+
+#[test]
+fn the_files_surface_lists_a_directory_and_reads_a_file() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("src").unwrap();
+    app.wait_for("main.rs").unwrap();
+    app.press("main.rs").unwrap();
+    app.wait_for("fn main() {}").unwrap();
 }
