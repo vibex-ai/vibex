@@ -136,17 +136,22 @@ took, which is why the same probe failed alone and passed in the suite.
 
 The transcript gets no list layer today, and the reason is the element, not the
 app: `v_virtual_list` is `gpui_base::VirtualList`, which contains no
-`fast::layers` code at all, while `gpui::list` carries the full one. Measured, a
-plain `gpui::list` over 200 stable rows composites eleven of twelve scrolled
-frames against zero for the same content through `v_virtual_list`.
+`fast::layers` code at all, while `gpui::list` carries the full one.
 
-`MessageScroller` would bring that, but its published state in
-`gpui-component 0.10.0` is missing most of the surface the transcript needs.
-`ListState` — which it wraps and does not re-export — has all of it, and
-`gpui::list(state, renderer)` is public gpui, so the migration is a row-builder
-rewrite with no crate change and no fork. See
+The transcript now renders through `gpui::list` with a view-owned `ListState`,
+with no crate change and no fork: everything the migration needed was already
+on `ListState`, which `MessageScrollerState` wraps and does not re-export. See
 [Session Timeline Scrolling](./timeline-scrolling.md) §4–§5 for the capability
-table and the measurement.
+table and for the five things the rewrite had to solve (the borrow the row
+renderer runs inside, the missing row-height hint, the padding split between
+the two offset getters, and the end anchor).
+
+**The layer still does not engage, and the element is no longer why.** Measured
+after the migration, the same `ListState` drawn through a bare `gpui::list`
+composites eleven of twelve scrolled frames while the workbench's own path
+composites zero. A wheel over the transcript notifies the workbench, and
+`owner_scrolled_only` wants the scroll to be the only thing that did — §7.3's
+second blocker, which the transcript now shares with the sidebar.
 
 ## 6. The composer boundary
 

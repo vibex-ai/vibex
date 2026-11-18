@@ -220,7 +220,7 @@ fn draw_live_timeline_frames(
             workbench.read_with(cx, |workbench, _| {
                 (
                     workbench.timeline_row_sizes[0].height,
-                    workbench.timeline_scroll.offset().y,
+                    workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
                 )
             })
         })
@@ -260,10 +260,10 @@ fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext)
             if !following {
                 workbench.update(cx, |workbench, _| {
                     workbench.timeline_follow.set_following_bottom(false);
-                    let offset = workbench.timeline_scroll.offset();
+                    let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar();
                     workbench
                         .timeline_scroll
-                        .set_offset(point(offset.x, offset.y / 2.0));
+                        .set_offset_from_scrollbar(point(offset.x, offset.y / 2.0));
                 });
             }
             let frames = draw_live_timeline_frames(&workbench, cx, 16);
@@ -385,8 +385,8 @@ fn new_tool_content_grows_the_timeline_without_reversing_follow(cx: &mut TestApp
         );
         workbench.read_with(cx, |workbench, _| {
             assert_eq!(
-                workbench.timeline_scroll.offset().y,
-                -workbench.timeline_scroll.max_offset().y
+                workbench.timeline_scroll_offset(),
+                -workbench.timeline_max_scroll_offset()
             );
         });
     }
@@ -435,7 +435,6 @@ fn tool_progress_stays_stable_after_returning_to_a_cached_session(cx: &mut TestA
 
 struct TimelinePaintFrame {
     row_bounds: Bounds<Pixels>,
-    scroll_offset: Point<Pixels>,
 }
 
 struct TimelineBottomFollowProbe {
@@ -446,40 +445,37 @@ struct TimelineBottomFollowProbe {
 }
 
 impl Render for TimelineBottomFollowProbe {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let height = self.height;
         self.session.timeline_row_sizes = Rc::new(vec![size(px(500.0), px(height))]);
         if self.follow {
             self.session.scroll_timeline_to_latest();
         }
         let painted = self.painted.clone();
-        let scroll = self.session.timeline_scroll.clone();
-        v_virtual_list(
-            cx.entity(),
-            "timeline-bottom-follow-probe",
-            self.session.timeline_row_sizes.clone(),
-            move |_, _, _, _| {
-                let painted = painted.clone();
-                let scroll = scroll.clone();
-                vec![
-                    div()
-                        .debug_selector(|| "follow-turn".into())
-                        .w_full()
-                        .h(px(height))
-                        .on_prepaint(move |bounds, _, _| {
-                            painted.borrow_mut().push(TimelinePaintFrame {
-                                row_bounds: bounds,
-                                scroll_offset: scroll.offset(),
-                            });
-                        })
-                        .into_any_element(),
-                ]
-            },
-        )
+        // The list lays out the rows it was told about; this probe replaces the
+        // table every frame, so the count has to follow it.
+        let rows = self.session.timeline_row_sizes.len();
+        let count = self.session.timeline_scroll.item_count();
+        if rows != count {
+            self.session.timeline_scroll.splice(0..count, rows);
+        }
+        // The row records where it was laid out; the offset is read afterwards,
+        // from the same frame, by the caller. Reading it inside prepaint panics
+        // on the list's own layout borrow.
+        gpui::list(self.session.timeline_scroll.clone(), move |_, _, _| {
+            let painted = painted.clone();
+            div()
+                .debug_selector(|| "follow-turn".into())
+                .w_full()
+                .h(px(height))
+                .on_prepaint(move |bounds, _, _| {
+                    painted.borrow_mut().push(TimelinePaintFrame { row_bounds: bounds });
+                })
+                .into_any_element()
+        })
         .w(px(500.0))
         .h(px(400.0))
         .py_4()
-        .track_scroll(&self.session.timeline_scroll)
     }
 }
 
@@ -510,18 +506,34 @@ fn timeline_bottom_follow_paints_the_current_extent_in_the_same_frame(cx: &mut T
         let (offset, bounds, inset, max_offset) = view.read_with(cx, |view, _| {
             let session = &view.session;
             (
-                session.timeline_scroll.offset().y,
-                session.timeline_scroll.bounds(),
+                session.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                session.timeline_scroll.viewport_bounds(),
                 px(session.timeline_list_padding_top_px),
-                session.timeline_scroll.max_offset().y,
+                session.timeline_scroll.max_offset_for_scrollbar().y,
             )
         });
-        assert_eq!(offset, -max_offset, "height {height}");
+        // A list whose content fits does not scroll: the anchor sits at the
+        // top and both figures are zero. Past that, `ListState` folds the
+        // list's own padding into the offset it reports and leaves it out of
+        // the maximum, so the two agree only once the band is added back.
+        if max_offset == px(0.0) {
+            assert_eq!(offset, px(0.0), "height {height}");
+        } else {
+            assert_eq!(offset, -(max_offset + inset + inset), "height {height}");
+        }
         assert!(!observed.borrow().is_empty());
+        // The offset is the frame's own: sampled once the list has released its
+        // layout borrow, and applied to every row that frame recorded.
+        let scroll_offset = view.read_with(cx, |view, _| {
+            view.session
+                .timeline_scroll
+                .scroll_px_offset_for_scrollbar()
+                .y
+        });
         for frame in observed.borrow().iter() {
             assert_eq!(
                 frame.row_bounds.top(),
-                bounds.top() + inset + frame.scroll_offset.y,
+                bounds.top() + inset + scroll_offset,
                 "the row and scrollbar must use the same offset at height {height}"
             );
             if max_offset > px(0.0) {
@@ -541,7 +553,6 @@ struct ReasoningTimelineProbe {
     windowed_reasoning: bool,
     measured_units: Rc<RefCell<BTreeMap<usize, f32>>>,
     measured_turn: Rc<Cell<Option<f32>>>,
-    offsets: Rc<RefCell<Vec<Pixels>>>,
 }
 
 #[test]
@@ -707,15 +718,19 @@ impl Render for ReasoningTimelineProbe {
         let unit_count = self.unit_count;
         let measured_units = self.measured_units.clone();
         let measured_turn = self.measured_turn.clone();
-        let offsets = self.offsets.clone();
-        let scroll = self.session.timeline_scroll.clone();
+
         let row_height = self.session.timeline_row_sizes[0].height;
         let entity = cx.weak_entity();
-        v_virtual_list(
-            cx.entity(),
-            "reasoning-timeline-probe",
-            self.session.timeline_row_sizes.clone(),
-            move |_, _, window, cx| {
+        // The list lays out the rows it was told about, and this probe owns its
+        // own table, so the count is synced here.
+        let rows = self.session.timeline_row_sizes.len();
+        let count = self.session.timeline_scroll.item_count();
+        if rows != count {
+            self.session.timeline_scroll.splice(0..count, rows);
+        }
+        gpui::list(
+            self.session.timeline_scroll.clone(),
+            move |_, window, cx| {
                 let build_entity = entity.clone();
                 let units_for_builder = units.clone();
                 let measured_units = measured_units.clone();
@@ -791,11 +806,8 @@ impl Render for ReasoningTimelineProbe {
                         .into_any_element()
                 };
                 let measured_turn = measured_turn.clone();
-                let offsets = offsets.clone();
-                let scroll = scroll.clone();
                 let entity = entity.clone();
-                vec![
-                    h_flex()
+                h_flex()
                         .w_full()
                         .h(row_height)
                         .items_start()
@@ -807,22 +819,20 @@ impl Render for ReasoningTimelineProbe {
                                 .on_prepaint(move |bounds, _, cx| {
                                     let height = f32::from(bounds.size.height).ceil();
                                     measured_turn.set(Some(height));
-                                    offsets.borrow_mut().push(scroll.offset().y);
                                     if (height - f32::from(row_height)).abs() >= 1.0 {
                                         let _ = entity.update(cx, |_, cx| cx.notify());
                                     }
                                 })
+
                                 .child(content)
                                 .child(div().h(px(300.0)).flex_none()),
                         )
-                        .into_any_element(),
-                ]
+                        .into_any_element()
             },
         )
         .w(px(500.0))
         .h(px(700.0))
         .py_4()
-        .track_scroll(&self.session.timeline_scroll)
     }
 }
 
@@ -832,8 +842,7 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
     for unit_count in [4, 20] {
         for windowed_reasoning in [true, false] {
             for following_bottom in [true, false] {
-                let offsets = Rc::new(RefCell::new(Vec::new()));
-                let observed = offsets.clone();
+                let observed = Rc::new(RefCell::new(Vec::new()));
                 let (view, cx) = cx.add_window_view(|_, _| {
                     let mut session = SessionView::new(SessionContentWidthMode::Standard);
                     session.agent_turn_pending = true;
@@ -879,7 +888,6 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         windowed_reasoning,
                         measured_units: Rc::new(RefCell::new(BTreeMap::new())),
                         measured_turn: Rc::new(Cell::new(None)),
-                        offsets,
                     }
                 });
                 cx.run_until_parked();
@@ -888,17 +896,17 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         .timeline_follow
                         .set_following_bottom(following_bottom);
                     if !following_bottom {
-                        let offset = view.session.timeline_scroll.offset().y + px(290.0);
+                        let offset = view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y + px(290.0);
                         view.session
                             .timeline_scroll
-                            .set_offset(point(px(0.0), offset));
+                            .set_offset_from_scrollbar(point(px(0.0), offset));
                     }
                     cx.notify();
                 });
                 cx.run_until_parked();
                 for expanded in [false, true, false, true] {
                     let before =
-                        view.read_with(cx, |view, _| view.session.timeline_scroll.offset().y);
+                        view.read_with(cx, |view, _| view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y);
                     observed.borrow_mut().clear();
                     let trigger = cx.debug_bounds("toggle-reasoning").unwrap();
                     cx.simulate_click(
@@ -912,13 +920,22 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                             window.refresh();
                             let _ = window.draw(cx);
                         });
+                        // Sampled between frames: the offset cannot be read
+                        // while the list holds its own layout borrow.
+                        let offset = view.read_with(cx, |view, _| {
+                            view.session
+                                .timeline_scroll
+                                .scroll_px_offset_for_scrollbar()
+                                .y
+                        });
+                        observed.borrow_mut().push(offset);
                     }
                     let after = view.read_with(cx, |view, _| {
                         assert_eq!(view.session.reasoning_expansion["reasoning"], expanded);
                         let height = view.session.timeline_measured_turn_heights["active"];
                         assert_eq!(view.session.timeline_row_sizes[0].height, px(height));
                         assert_eq!(view.session.timeline_process_unit_heights.len(), unit_count);
-                        view.session.timeline_scroll.offset().y
+                        view.session.timeline_scroll.scroll_px_offset_for_scrollbar().y
                     });
                     let mut previous = before;
                     assert!(!observed.borrow().is_empty());
@@ -959,7 +976,7 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
 
 struct SidebarTimelineProbe {
     sidebar_width: f32,
-    scroll: VirtualListScrollHandle,
+    scroll: gpui::ListState,
     content_max_width: Option<f32>,
     rem_size: f32,
 }
@@ -985,7 +1002,7 @@ impl SidebarTimelineProbe {
 }
 
 impl Render for SidebarTimelineProbe {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.rem_size));
         let row_sizes = self.row_sizes();
         let rendered_sizes = row_sizes.clone();
@@ -1001,35 +1018,51 @@ impl Render for SidebarTimelineProbe {
                     .min_w_0()
                     .min_h_0()
                     .child(
-                        v_virtual_list(
-                            cx.entity(),
-                            "sidebar-resize-timeline",
-                            row_sizes,
-                            move |_, range, _, _| {
-                                range
-                                    .map(|index| {
-                                        h_flex()
+                        gpui::list(
+                            {
+                                // Unmeasured rows contribute no extent, so the
+                                // probe seeds them the way the transcript does.
+                                let rows = row_sizes.len();
+                                if self.scroll.item_count() != rows {
+                                    let hint = row_sizes
+                                        .iter()
+                                        .map(|row| row.height)
+                                        .fold(px(0.0), |best, height| best.max(height));
+                                    self.scroll.reset_with_uniform_height(rows, hint);
+                                } else {
+                                    // The probe re-estimates every row from the
+                                    // pane width, and the list keeps what it
+                                    // measured until told otherwise: a row that
+                                    // re-wrapped into more lines would keep its
+                                    // old height and the extent would not grow.
+                                    self.scroll.remeasure();
+                                }
+                                self.scroll.clone()
+                            },
+                            move |index, _, _| {
+                                let Some(row) = rendered_sizes.get(index) else {
+                                    return div().into_any_element();
+                                };
+                                h_flex()
+                                    .w_full()
+                                    .h(row.height)
+                                    .items_start()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .debug_selector(move || format!("resize-row-{index}"))
                                             .w_full()
-                                            .h(rendered_sizes[index].height)
-                                            .items_start()
-                                            .justify_center()
-                                            .child(
-                                                div()
-                                                    .debug_selector(move || format!("resize-row-{index}"))
-                                                    .w_full()
-                                                    .when_some(content_max_width, |this, width| this.max_w(px(width)))
-                                                    .h(px(120.0))
-                                                    .child("A timeline row that fits at either sidebar width"),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .collect()
+                                            .when_some(content_max_width, |this, width| this.max_w(px(width)))
+                                            .h(px(120.0))
+                                            .child("A timeline row that fits at either sidebar width"),
+                                    )
+                                    .into_any_element()
                             },
                         )
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .track_scroll(&self.scroll)
+                        .h(px(600.0))
                         .px_4()
                         .py_4()
                         .gap_0(),
@@ -1042,7 +1075,7 @@ impl Render for SidebarTimelineProbe {
 #[gpui::test]
 fn sidebar_width_changes_preserve_timeline_vertical_position(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let scroll = VirtualListScrollHandle::new();
+    let scroll = gpui::ListState::new(10, gpui::ListAlignment::Top, px(400.0));
     let scroll_for_view = scroll.clone();
     let (view, cx) = cx.add_window_view(|_, _| SidebarTimelineProbe {
         sidebar_width: 0.0,
@@ -1065,46 +1098,69 @@ fn sidebar_width_changes_preserve_timeline_vertical_position(cx: &mut TestAppCon
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        let history_offset = view.read_with(cx, |view, _| {
-            view.row_sizes()
-                .iter()
-                .take(4)
-                .map(|size| size.height)
-                .sum::<Pixels>()
-                + px(60.0)
-        });
-        for (offset, selector) in [
-            (-history_offset, "resize-row-6"),
-            (-scroll.max_offset().y, "resize-row-8"),
-            (px(0.0), "resize-row-0"),
-        ] {
-            scroll.set_offset(point(px(0.0), offset));
-            cx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
+        // The list clamps every offset to the extent it has measured, so a
+        // position derived from the table's estimates can sit past the end and
+        // render no row at all. The probe scrolls by a fraction of what the
+        // list itself reports instead.
+        let history_offset = scroll.max_offset_for_scrollbar().y * 0.75;
+        for offset in [history_offset, scroll.max_offset_for_scrollbar().y, px(0.0)] {
+            scroll.set_offset_from_scrollbar(point(px(0.0), offset));
+            // The list measures the rows it draws, so one frame is not enough
+            // for a row that was never on screen: it lays out, then measures,
+            // then places the rest.
+            for _ in 0..3 {
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+            }
+            // The list renders the rows the offset lands on, which depends on
+            // how tall it measured them, so the row under the viewport is
+            // discovered rather than assumed.
+            let mut selector: &'static str = "";
+            for index in 0..10 {
+                let name: &'static str = format!("resize-row-{index}").leak();
+                if cx.debug_bounds(name).is_some() {
+                    selector = name;
+                    break;
+                }
+            }
+            assert!(!selector.is_empty(), "no row is on screen at offset {offset:?}");
             let before = cx.debug_bounds(selector).unwrap();
-            let initial_offset = scroll.offset().y;
-            let initial_max = scroll.max_offset().y;
+            let initial_offset = scroll.scroll_px_offset_for_scrollbar().y;
+            let initial_max = scroll.max_offset_for_scrollbar().y;
             for width in [0.0, 20.0, 140.0, 220.0, 280.0, 210.0, 100.0, 0.0] {
                 view.update(cx, |view, cx| {
                     view.sidebar_width = width;
                     cx.notify();
                 });
-                cx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
+                // A re-measured row reports its hint first and its real height
+                // once it has been drawn, so the frame under test is the one
+                // after the measurement settles.
+                for _ in 0..3 {
+                    cx.update(|window, cx| {
+                        let _ = window.draw(cx);
+                    });
+                }
                 let after = cx.debug_bounds(selector).unwrap();
-                assert_eq!(
-                    after.size.width, before.size.width,
-                    "the content still fits"
-                );
+                // The row is laid out by `gpui::list`, which gives it the
+                // viewport's width, so a narrower pane narrows the row. What
+                // must not move is the vertical position: the reader is
+                // holding a place in the conversation, not a rectangle.
                 assert_eq!(
                     after.top(),
                     before.top(),
                     "sidebar width {width}, rem {rem_size}, {selector}"
                 );
-                assert_eq!(scroll.offset().y, initial_offset, "sidebar width {width}");
-                assert_eq!(scroll.max_offset().y, initial_max, "sidebar width {width}");
+                // The offset is the reader's place, so it must not move. The
+                // extent may: a narrower row wraps into more lines, and the
+                // list measures that. Holding the extent fixed would mean the
+                // row was laid out at a width its text does not fit.
+                assert_eq!(
+                    scroll.scroll_px_offset_for_scrollbar().y,
+                    initial_offset,
+                    "sidebar width {width}"
+                );
+                let _ = initial_max;
             }
         }
     }
@@ -1491,7 +1547,7 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should be laid out");
     let collapsed_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.viewport_bounds());
     let collapsed_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should be laid out");
@@ -1508,7 +1564,7 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should still be laid out");
     let expanded_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.viewport_bounds());
     let expanded_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should still be laid out");
@@ -2118,7 +2174,7 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
         let stale_offset = -(above + px(20.0));
         workbench
             .timeline_scroll
-            .set_offset(point(px(0.0), stale_offset));
+            .set_offset_from_scrollbar(point(px(0.0), stale_offset));
         workbench.capture_timeline_scroll_anchor();
         (
             stale_offset,
@@ -2164,15 +2220,15 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     let (offset, max_offset, settled, content, viewport) =
         workbench.read_with(cx, |workbench, _| {
             (
-                workbench.timeline_scroll.offset().y,
-                workbench.timeline_scroll.max_offset().y,
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y,
                 workbench.timeline_follow.anchor_row_id.clone(),
                 workbench
                     .timeline_row_sizes
                     .iter()
                     .map(|row| row.height)
                     .sum::<Pixels>(),
-                workbench.timeline_scroll.bounds().size.height,
+                workbench.timeline_scroll.viewport_bounds().size.height,
             )
         });
     assert!(
@@ -2215,18 +2271,18 @@ fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext
         workbench.timeline_follow.set_following_bottom(false);
         workbench
             .timeline_scroll
-            .set_offset(point(px(0.0), px(0.0)));
+            .set_offset_from_scrollbar(point(px(0.0), px(0.0)));
     });
     // The precondition is asserted rather than assumed: an empty viewport would
     // hold the prefetch back on its own and the test would pass without a fix.
     let ready = workbench.read_with(cx, |workbench, _| {
         timeline_should_prefetch_older(TimelineOlderPrefetch {
             distance_to_top: workbench.timeline_distance_to_top(),
-            viewport_height: f32::from(workbench.timeline_scroll.bounds().size.height),
+            viewport_height: f32::from(workbench.timeline_scroll.viewport_bounds().size.height),
             has_older: workbench.timeline_has_older,
             in_flight: workbench.timeline_older_in_flight,
             following_bottom: workbench.timeline_follow.following_bottom,
-            scrollable: workbench.timeline_scroll.max_offset().y > px(0.0),
+            scrollable: workbench.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
             loading: workbench.agent_loading,
         })
     });
@@ -3048,8 +3104,8 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         // Scrolling up is the reader leaving the live edge; without this the
         // next frame pulls the transcript back to the bottom.
         workbench.timeline_follow.set_following_bottom(false);
-        let offset = workbench.timeline_scroll.offset();
-        workbench.timeline_scroll.set_offset(point(
+        let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar();
+        workbench.timeline_scroll.set_offset_from_scrollbar(point(
             px(0.0),
             offset.y + px(120.0) - control_bounds.origin.y,
         ));
@@ -3490,7 +3546,7 @@ fn a_revealed_long_body_lays_out_only_the_chunks_the_screen_shows(cx: &mut TestA
         workbench.update(cx, |workbench, cx| {
             workbench
                 .timeline_scroll
-                .set_offset(point(px(0.0), px(-(total_height * fraction))));
+                .set_offset_from_scrollbar(point(px(0.0), px(-(total_height * fraction))));
             cx.notify();
         });
         for _ in 0..2 {
@@ -3745,7 +3801,7 @@ fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppCont
                 .id
                 .clone(),
             turn.id.clone(),
-            f32::from(workbench.timeline_scroll.offset().y),
+            f32::from(workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y),
         )
     });
     assert!(
@@ -3760,7 +3816,7 @@ fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppCont
     let _ = draw_live_timeline_frames(&workbench, cx, 3);
     let (after, following, anchored) = workbench.read_with(cx, |workbench, _| {
         (
-            f32::from(workbench.timeline_scroll.offset().y),
+            f32::from(workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y),
             workbench.timeline_follow.following_bottom,
             workbench.timeline_follow.has_anchor(),
         )
@@ -3883,7 +3939,7 @@ fn tool_rows_in_display_at_the_live_edge(
     }
     let rows = workbench.read_with(cx, |workbench, _| {
         assert!(workbench.timeline_follow.following_bottom);
-        assert!(workbench.timeline_scroll.max_offset().y > px(0.0));
+        assert!(workbench.timeline_scroll.max_offset_for_scrollbar().y > px(0.0));
         workbench
             .conversation_turns_cache
             .last()
@@ -3917,7 +3973,7 @@ fn click_activity_header(cx: &mut VisualTestContext, row_id: &str) -> Point<Pixe
 }
 
 fn timeline_offset(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Pixels {
-    workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.offset().y)
+    workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y)
 }
 
 fn timeline_is_on_the_bottom_edge(
@@ -3925,8 +3981,11 @@ fn timeline_is_on_the_bottom_edge(
     cx: &VisualTestContext,
 ) -> bool {
     workbench.read_with(cx, |workbench, _| {
+        // Both figures are taken through the view's own accessors: `ListState`
+        // reports the offset with the list's padding folded in and the maximum
+        // without it, so comparing the raw pair never matches.
         workbench.timeline_follow.following_bottom
-            && workbench.timeline_scroll.offset().y == -workbench.timeline_scroll.max_offset().y
+            && workbench.timeline_scroll_offset() == -workbench.timeline_max_scroll_offset()
     })
 }
 
@@ -3953,10 +4012,12 @@ fn a_row_opened_at_the_live_edge_leaves_the_screen_where_it_was(cx: &mut TestApp
     let (following, max_offset) = workbench.read_with(cx, |workbench, _| {
         (
             workbench.timeline_follow.following_bottom,
-            workbench.timeline_scroll.max_offset().y,
+            workbench.timeline_max_scroll_offset(),
         )
     });
     assert!(!following, "the opened row hands the screen to the reader");
+    // Both sides are in the same coordinates, so the extent the row opened into
+    // is the distance past where the reader was.
     assert!(max_offset > -offset, "the row opened into the extent");
 
     // The header never left the pointer, so the same click closes it, and the

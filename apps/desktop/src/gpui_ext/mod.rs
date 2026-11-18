@@ -372,6 +372,56 @@ pub fn docs_help_button(
         })
 }
 
+/// [`gpui_base::ScrollbarHandle`] over a [`gpui::ListState`].
+///
+/// A `list` owns its scroll position rather than exposing a `ScrollHandle`, so
+/// `pinned_scrollbar` cannot be handed one. This is the bridge: the bar reads
+/// the list's own offsets and writes back through the list's own scrollbar
+/// entry points, which is the same contract a `ScrollHandle` keeps.
+///
+/// The two directions are not symmetric. `ListState` reports where the
+/// viewport starts as an item and an offset into it, so the pixel offset is
+/// recovered from `scroll_px_offset_for_scrollbar`; writing takes a pixel
+/// offset directly through `set_offset_from_scrollbar`. Both are what the
+/// list's own bar does internally, so a drag here moves the list exactly as a
+/// drag on its built-in bar would.
+#[derive(Clone)]
+pub struct ListScrollbarHandle {
+    state: gpui::ListState,
+}
+
+impl ListScrollbarHandle {
+    pub fn new(state: gpui::ListState) -> Self {
+        Self { state }
+    }
+}
+
+impl gpui_base::ScrollbarHandle for ListScrollbarHandle {
+    fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.state.viewport_bounds()
+    }
+
+    fn offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.state.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
+        self.state.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<gpui::Pixels> {
+        (self.state.max_offset_for_scrollbar() + self.state.viewport_bounds().size.into()).into()
+    }
+
+    fn start_drag(&self) {
+        self.state.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.state.scrollbar_drag_ended();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use gpui::AssetSource as _;

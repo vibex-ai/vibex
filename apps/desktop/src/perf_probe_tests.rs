@@ -353,7 +353,7 @@ fn measure_in_column(
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
             // The timeline builds its rows inside a virtual list: each row is
             // requested for layout, measured, and then laid out again.
-            v_virtual_list(
+            gpui_base::v_virtual_list(
                 cx.entity(),
                 "perf-probe-list",
                 Rc::new(vec![size(px(self.column_width), px(400.0))]),
@@ -505,7 +505,7 @@ fn measure_virtual_row(
     }
     impl Render for Host {
         fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-            v_virtual_list(
+            gpui_base::v_virtual_list(
                 cx.entity(),
                 "perf-probe-timeline",
                 Rc::new(vec![size(px(720.0), px(self.row_height))]),
@@ -1350,7 +1350,7 @@ fn measure_wrapped(cx: &mut TestAppContext, body: &str, shape: u8) {
                     .overflow_hidden()
                     .child(div().w_full().min_w_0().max_w(px(720.0)).child(view))
                     .into_any_element(),
-                _ => v_virtual_list(
+                _ => gpui_base::v_virtual_list(
                     cx.entity(),
                     format!("probe-list-{}", self.shape),
                     Rc::new(vec![size(px(720.0), px(600.0))]),
@@ -1461,10 +1461,10 @@ fn probe_expanded_scroll(cx: &mut TestAppContext) {
         });
     }
     let viewport = workbench.read_with(cx, |workbench, _| {
-        f32::from(workbench.timeline_scroll.bounds().size.height)
+        f32::from(workbench.timeline_scroll.viewport_bounds().size.height)
     });
     let max_offset = workbench.read_with(cx, |workbench, _| {
-        f32::from(workbench.timeline_scroll.max_offset().y)
+        f32::from(workbench.timeline_scroll.max_offset_for_scrollbar().y)
     });
     let step = (viewport / 3.0).max(120.0);
     let mut samples = Vec::new();
@@ -1475,7 +1475,7 @@ fn probe_expanded_scroll(cx: &mut TestAppContext) {
         workbench.update(cx, |workbench, cx| {
             workbench
                 .timeline_scroll
-                .set_offset(point(px(0.0), px(-offset)));
+                .set_offset_from_scrollbar(point(px(0.0), px(-offset)));
             cx.notify();
         });
         let start = Instant::now();

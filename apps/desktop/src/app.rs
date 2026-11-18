@@ -39,7 +39,7 @@ use gpui::{
     Global, GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage,
-    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString,
+    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString,
     Size, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
     StyledImage as _, StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
@@ -50,7 +50,7 @@ use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
-    Theme, ThemeStyled as _, VirtualListScrollHandle, WindowExt as _,
+    Theme, ThemeStyled as _, WindowExt as _,
     accordion::Accordion,
     animation::EffectTransition as Transition,
     attachment::{
@@ -93,7 +93,7 @@ use gpui_component::{
     tab::{Tab, TabBar},
     tag::Tag,
     tooltip::Tooltip,
-    v_flex, v_virtual_list,
+    v_flex,
 };
 use gpui_fps::FpsMonitor;
 use image::ImageDecoder as _;
@@ -6147,7 +6147,14 @@ pub struct SessionView {
     turn_preview_active_index: Option<usize>,
     timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
-    timeline_scroll: VirtualListScrollHandle,
+    /// The transcript's own scroll position and row layout.
+    ///
+    /// A `gpui::list` owns both, and it is the element that carries gpui-fast's
+    /// list layer: rows are replayed from the layer rather than rebuilt on every
+    /// scrolled frame. `v_virtual_list` had no layer path at all, so the
+    /// transcript composited nothing while it scrolled. See
+    /// `.trellis/spec/frontend/timeline-scrolling.md`.
+    timeline_scroll: gpui::ListState,
     /// Whether the backend reported history below this view's oldest item.
     ///
     /// Per view, because it describes the window that view holds rather than
@@ -6217,6 +6224,12 @@ pub struct SessionView {
     #[cfg(test)]
     timeline_group_rows_built: Vec<usize>,
     timeline_disclosure_animating: bool,
+    /// This frame's answer to [`Self::timeline_rows_hang_from_bottom`].
+    ///
+    /// Resolved before the transcript element is built, because the row
+    /// builders run inside `gpui::list`'s own layout borrow and cannot read the
+    /// list's scroll state.
+    timeline_rows_hang_from_bottom_cached: bool,
     /// Frames until the row table has caught up with the last disclosure that
     /// moved. A virtual row's box is the height an earlier frame measured, so a
     /// disclosure that has stopped moving still draws against a stale box.
@@ -6405,7 +6418,7 @@ impl SessionView {
             turn_preview_active_index: None,
             timeline_item_index: RefCell::new(TimelineItemIndex::default()),
             timeline_follow: TimelineFollowState::default(),
-            timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_scroll: gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)),
             timeline_has_older: false,
             timeline_starts_mid_turn: false,
             timeline_older_in_flight: 0,
@@ -6433,6 +6446,7 @@ impl SessionView {
             #[cfg(test)]
             timeline_group_rows_built: Vec::new(),
             timeline_disclosure_animating: false,
+            timeline_rows_hang_from_bottom_cached: false,
             timeline_disclosure_settle_frames: 0,
             timeline_disclosure_holds_screen: false,
             live_label_frame_gate: timeline_activity::LiveLabelFrameGate::default(),
@@ -6511,17 +6525,22 @@ impl SessionView {
 
     fn scroll_timeline_to_latest(&self) {
         if !self.timeline_row_sizes.is_empty() {
-            // VirtualList clamps this offset to its freshly laid-out viewport
-            // before placing rows. The base handle's deferred scroll_to_bottom
-            // runs after the list snapshots its offset, painting one frame at
-            // the old position while the scrollbar already shows the new one.
-            let content_height = self
-                .timeline_row_sizes
-                .iter()
-                .map(|row| row.height)
-                .sum::<Pixels>();
-            self.timeline_scroll
-                .set_offset(point(px(0.0), -content_height));
+            // `scroll_to_end` anchors past the last row and lets the list clamp
+            // the offset to the extent it lays out in this same frame. Naming a
+            // pixel position instead needs the content height before the list
+            // has laid it out, and a turn that grew this frame would be missed.
+            //
+            // A transcript that fits its viewport has nowhere to go: the anchor
+            // is dropped rather than placed past the last row, which would park
+            // the viewport on a padding band below content that already shows.
+            let content: Pixels = self.timeline_row_sizes.iter().map(|row| row.height).sum();
+            let viewport = self.timeline_scroll.viewport_bounds().size.height;
+            if content <= viewport {
+                self.timeline_scroll
+                    .scroll_to(gpui::ListOffset::default());
+            } else {
+                self.timeline_scroll.scroll_to_end();
+            }
         }
     }
 
@@ -8131,6 +8150,30 @@ fn user_message_edit_action_state(
     } else {
         UserMessageEditActionState::Disabled
     }
+}
+
+/// How far the viewport's bottom is above the content's bottom.
+///
+/// `offset_y` is where the viewport starts (zero at the top, negative as it
+/// moves down) and `max_offset_y` is how far it can travel, as a positive
+/// distance. At the bottom edge the two cancel to zero.
+/// A single height to seed an unmeasured row with.
+///
+/// `ListState` gives every row it has not measured the same hint, so the best
+/// available answer is the median of the rows the table does know: it is the
+/// height an unmeasured turn is most likely to land near, and unlike a mean it
+/// is not dragged off by one very long turn.
+fn timeline_row_height_hint(rows: &[Size<Pixels>]) -> Option<Pixels> {
+    let mut heights = rows
+        .iter()
+        .map(|row| row.height)
+        .filter(|height| *height > px(0.0))
+        .collect::<Vec<_>>();
+    if heights.is_empty() {
+        return None;
+    }
+    heights.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
+    Some(heights[heights.len() / 2])
 }
 
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
@@ -12117,14 +12160,14 @@ impl VibexWorkbench {
     /// travelled, so the prefetch starts about a screen and a half early and
     /// keeps up to two pages in flight.
     fn prefetch_older_timeline_if_needed(&mut self, cx: &mut Context<Self>) {
-        let viewport = f32::from(self.timeline_scroll.bounds().size.height);
+        let viewport = f32::from(self.timeline_scroll.viewport_bounds().size.height);
         if !timeline_should_prefetch_older(TimelineOlderPrefetch {
             distance_to_top: self.timeline_distance_to_top(),
             viewport_height: viewport,
             has_older: self.timeline_has_older,
             in_flight: self.timeline_older_in_flight,
             following_bottom: self.timeline_follow.following_bottom,
-            scrollable: self.timeline_scroll.max_offset().y > px(0.0),
+            scrollable: self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
             // A restored view keeps the content it already holds on screen while
             // the window that replaces it travels, so `agent_loading` is false
             // there. The load's own buffer is what says a read is still coming:
@@ -12350,7 +12393,7 @@ impl VibexWorkbench {
 
     /// How far the viewport is from the top of the transcript.
     fn timeline_distance_to_top(&self) -> f32 {
-        (-f32::from(self.timeline_scroll.offset().y)).max(0.0)
+        (-f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)).max(0.0)
     }
 }
 
@@ -32163,7 +32206,8 @@ impl VibexWorkbench {
                     self.clear_child_agent_context();
                     self.selected_session_id = None;
                     self.timeline = TimelineModel::default();
-                    self.timeline_scroll = VirtualListScrollHandle::new();
+                    self.timeline_scroll =
+                        gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0));
                     self.runtime_selection = None;
                     self.token_usage = None;
                 }
@@ -32306,6 +32350,35 @@ impl VibexWorkbench {
             }
             DesktopEvent::Shutdown => false,
         }
+    }
+
+    /// Keeps the list's row count and height hints in step with the table.
+    ///
+    /// `gpui::list` owns the rows it lays out, so a table it does not know
+    /// about renders nothing. The count is spliced rather than reset: a reset
+    /// drops the scroll anchor, and the transcript's anchor is the reader's
+    /// place in a conversation that keeps growing.
+    ///
+    /// Heights go in as a uniform hint from the table's own rows. The list
+    /// measures what it draws and replaces the hint as rows come into view, so
+    /// the hint only has to be good enough for the scrollbar and for placing
+    /// rows above the viewport, which is what the estimate already was.
+    fn sync_timeline_list_rows(&mut self) {
+        let rows = self.timeline_row_sizes.len();
+        let count = self.timeline_scroll.item_count();
+        if rows == count {
+            return;
+        }
+        // A row the list has never measured contributes nothing to the extent,
+        // so a list that grows without a hint reports a zero-length document
+        // until every row has been on screen once — the scrollbar has no thumb
+        // and the transcript cannot be scrolled at all. `reset_with_uniform_height`
+        // is the one published entry point that seeds that hint. It also drops
+        // the scroll anchor, so it is used only when the row count moves, which
+        // is when the old anchor cannot describe the new table anyway.
+        let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
+        self.timeline_scroll
+            .reset_with_uniform_height(rows, hint.max(px(1.0)));
     }
 
     fn rebuild_timeline_sizes(&mut self) -> bool {
@@ -33386,10 +33459,38 @@ impl VibexWorkbench {
         changed
     }
 
+    /// The transcript's scroll position, in the list's own content coordinates.
+    ///
+    /// `ListState` reports the offset with the list's padding folded in and the
+    /// maximum without it, so subtracting the two raw values leaves a band
+    /// equal to the padding: the transcript then reads as never reaching its
+    /// bottom edge. Both are taken through one accessor so every caller shares
+    /// the same coordinates.
+    fn timeline_scroll_offset(&self) -> Pixels {
+        // Measured on a 600px row in a 400px viewport with `py_4`: the maximum
+        // is 200 — content less viewport, padding excluded — while the offset
+        // at the bottom edge is -232. The difference is the list's top *and*
+        // bottom padding: its scroll arithmetic adds both, and the maximum
+        // getter reports neither. The offset is already in the coordinates the
+        // bottom edge is defined in, so it is returned as reported.
+        self.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    }
+
+    /// How far the transcript can travel, as a positive distance.
+    ///
+    /// `ListState` reports the offset with the list's top *and* bottom padding
+    /// folded in and this maximum with neither, so the padding band is added
+    /// back here. That is what puts a viewport on the bottom edge at
+    /// `offset == -max`, which is how the rest of this file reads it.
+    fn timeline_max_scroll_offset(&self) -> Pixels {
+        self.timeline_scroll.max_offset_for_scrollbar().y
+            + px(2.0 * self.timeline_list_padding_top_px)
+    }
+
     fn timeline_distance_to_bottom(&self) -> f32 {
         timeline_distance_to_bottom(
-            f32::from(self.timeline_scroll.offset().y),
-            f32::from(self.timeline_scroll.max_offset().y),
+            f32::from(self.timeline_scroll_offset()),
+            f32::from(self.timeline_max_scroll_offset()),
         )
     }
 
@@ -33578,11 +33679,21 @@ impl VibexWorkbench {
     /// Only a disclosure may do this. A stream's shorter reparse is held in
     /// place by the same slack, and hanging it would bounce the whole turn.
     fn timeline_rows_hang_from_bottom(&self) -> bool {
-        self.timeline_disclosure_settle_frames > 0
+        self.timeline_rows_hang_from_bottom_cached
+    }
+
+    /// Resolves [`Self::timeline_rows_hang_from_bottom`] for this frame.
+    ///
+    /// The row builders run while `gpui::list` holds its own layout borrow, and
+    /// reading the list's scroll state from inside that borrow panics. The
+    /// decision is therefore taken once, before the element is built, and every
+    /// row builder in the frame reads the cached answer.
+    fn resolve_timeline_rows_hang_from_bottom(&mut self) {
+        self.timeline_rows_hang_from_bottom_cached = self.timeline_disclosure_settle_frames > 0
             && !self.timeline_disclosure_holds_screen
             && !self.rendering_child_agent_timeline()
-            && self.timeline_scroll.max_offset().y > px(0.0)
-            && self.timeline_distance_to_bottom() < 1.0
+            && self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0)
+            && self.timeline_distance_to_bottom() < 1.0;
     }
 
     /// Picks the follow back up when a disclosure lands on the bottom edge.
@@ -33607,9 +33718,9 @@ impl VibexWorkbench {
             .map(|row| row.height)
             .sum::<Pixels>()
             + px(self.timeline_list_padding_top_px * 2.0);
-        let max_offset = content - self.timeline_scroll.bounds().size.height;
+        let max_offset = content - self.timeline_scroll.viewport_bounds().size.height;
         let distance = timeline_distance_to_bottom(
-            f32::from(self.timeline_scroll.offset().y),
+            f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
             f32::from(max_offset).max(0.0),
         );
         if distance <= AGENT_TIMELINE_DISCLOSURE_LANDING_SLACK_PX {
@@ -33642,7 +33753,7 @@ impl VibexWorkbench {
         let row_heights = self.timeline_row_heights();
         let Some((row_index, offset_in_row)) = timeline_scroll_anchor_from_offset(
             &row_heights,
-            f32::from(self.timeline_scroll.offset().y),
+            f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
             self.timeline_list_padding_top_px,
         ) else {
             return;
@@ -33707,7 +33818,7 @@ impl VibexWorkbench {
         });
         if let Some(offset_y) = offset_y {
             self.timeline_scroll
-                .set_offset(point(px(0.0), px(offset_y)));
+                .set_offset_from_scrollbar(point(px(0.0), px(offset_y)));
             return true;
         }
         // An anchor that resolved to nothing means the row table no longer holds
@@ -33732,7 +33843,8 @@ impl VibexWorkbench {
     /// describes a window with more content above it than this one has, and the
     /// virtual list resolves that by clamping to the newest row.
     fn settle_timeline_anchor_on_oldest_row(&mut self) {
-        self.timeline_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.timeline_scroll
+            .set_offset_from_scrollbar(point(px(0.0), px(0.0)));
         let Some((turn_id, span)) = self
             .conversation_turns_cache
             .first()
@@ -33752,7 +33864,7 @@ impl VibexWorkbench {
             ScrollDelta::Lines(point) => point.y,
             ScrollDelta::Pixels(point) => f32::from(point.y),
         };
-        if delta_y == 0.0 || self.timeline_scroll.max_offset().y <= px(0.0) {
+        if delta_y == 0.0 || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0) {
             return;
         }
 
@@ -33800,9 +33912,9 @@ impl VibexWorkbench {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let bounds = self.timeline_scroll.bounds();
+        let bounds = self.timeline_scroll.viewport_bounds();
         if event.button != MouseButton::Left
-            || self.timeline_scroll.max_offset().y <= px(0.0)
+            || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0)
             || !bounds.contains(&event.position)
             || event.position.x < bounds.right() - px(AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX)
         {
@@ -33845,8 +33957,10 @@ impl VibexWorkbench {
         self.timeline_follow.set_following_bottom(false);
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
-        self.timeline_scroll
-            .scroll_to_item(turn_index, ScrollStrategy::Top);
+        self.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: turn_index,
+            offset_in_item: px(0.0),
+        });
         cx.notify();
     }
 
@@ -33871,7 +33985,7 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
         self.pending_permission_reveal_item_id = Some(target.item_id);
         self.timeline_scroll
-            .scroll_to_item(target.turn_index, ScrollStrategy::Center);
+            .scroll_to_reveal_item(target.turn_index);
         cx.notify();
     }
 
@@ -45471,7 +45585,7 @@ impl VibexWorkbench {
             self.session_generation = self.session_generation.saturating_add(1);
             self.selected_session_id = None;
             self.timeline = TimelineModel::default();
-            self.timeline_scroll = VirtualListScrollHandle::new();
+            self.timeline_scroll = gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0));
             self.timeline_row_sizes = Rc::new(Vec::new());
             self.invalidate_timeline_render_caches();
             self.runtime_selection = None;
@@ -46709,8 +46823,7 @@ impl VibexWorkbench {
             self.timeline_follow.set_following_bottom(false);
             self.timeline_scroll_to_latest_pending = false;
             self.timeline_scroll_anchor_pending = false;
-            self.timeline_scroll
-                .scroll_to_item(turn_index, ScrollStrategy::Center);
+            self.timeline_scroll.scroll_to_reveal_item(turn_index);
         }
         cx.notify();
     }
@@ -47175,8 +47288,7 @@ impl VibexWorkbench {
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
         self.rebuild_timeline_sizes();
-        self.timeline_scroll
-            .scroll_to_item(turn_index, ScrollStrategy::Center);
+        self.timeline_scroll.scroll_to_reveal_item(turn_index);
         cx.notify();
         true
     }
@@ -63701,9 +63813,9 @@ impl VibexWorkbench {
                 self.timeline_row_sizes
                     .iter()
                     .map(|row_size| f32::from(row_size.height)),
-                f32::from(self.timeline_scroll.offset().y),
+                f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
                 self.timeline_list_padding_top_px,
-                f32::from(self.timeline_scroll.bounds().size.height),
+                f32::from(self.timeline_scroll.viewport_bounds().size.height),
             );
             agent_turn_preview_rail_visible_slots(&rail_entries, visible_rows)
         };
@@ -63896,8 +64008,7 @@ impl VibexWorkbench {
                         this.timeline_follow.set_following_bottom(false);
                         this.timeline_scroll_to_latest_pending = false;
                         this.timeline_scroll_anchor_pending = false;
-                        this.timeline_scroll
-                            .scroll_to_item(row_index, ScrollStrategy::Center);
+                        this.timeline_scroll.scroll_to_reveal_item(row_index);
                         cx.notify();
                     }))
                     .child(
@@ -64067,6 +64178,9 @@ impl VibexWorkbench {
         // an invalidated size table would otherwise swallow the request because
         // `scroll_timeline_to_latest` skips an empty table.
         self.apply_pending_timeline_scroll();
+        // The list lays out the rows it was told about, so the table and its
+        // count have to agree before the element is built.
+        self.sync_timeline_list_rows();
         self.prefetch_older_timeline_if_needed(cx);
         self.request_expanded_timeline_details(cx);
         let turns_summary = self.conversation_turns_summary;
@@ -64074,6 +64188,15 @@ impl VibexWorkbench {
         let rendered_turns = self.conversation_turns_render_cache.clone();
         let row_sizes = self.timeline_row_sizes.clone();
         let rendered_row_sizes = row_sizes.clone();
+        // `gpui::list` renders a row through `&mut App` alone, so the view is
+        // reached the way every other row callback in this file reaches it.
+        let render_entity = cx.weak_entity();
+        // The row renderer runs inside the list's own layout borrow, so nothing
+        // it does may read the list's state. The one decision a row makes about
+        // the scroll position is whether the turn hangs from the bottom edge,
+        // and that is resolved here, before the element is built.
+        self.resolve_timeline_rows_hang_from_bottom();
+        let rows_hang_from_bottom = self.timeline_rows_hang_from_bottom();
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         // The same insets keep the timeline, the composer and the banners
@@ -64084,15 +64207,6 @@ impl VibexWorkbench {
         // renders another session's runtime controls while the selection still
         // names the focused pane.
         let live_session_id = self.timeline.session_id.clone();
-        // The virtual list is one element per session: its id scopes the cached
-        // row layout, so two panes must never share it.
-        let timeline_list_id = SharedString::from(format!(
-            "agent-timeline-turns-{}",
-            live_session_id
-                .as_ref()
-                .map(VibexSessionId::as_str)
-                .unwrap_or("none")
-        ));
         // The banner, its dismissal and the frame after a click all read one
         // answer: the request is still unresolved, unacknowledged, and the
         // session can still be parked on it. A card nobody can answer — an
@@ -64101,7 +64215,7 @@ impl VibexWorkbench {
         // gone instead of one that came back on the next frame.
         let pending_permission = turns_summary.has_pending_permission
             && self.permission_alert_is_pending(live_session_id.as_ref());
-        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
+        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0), cx);
         let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
         let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
         // The rail is the pane's reading lane, not the conversation viewport's.
@@ -64215,42 +64329,48 @@ impl VibexWorkbench {
                             }
                         }))
                         .child(
-                            // The transcript keeps the per-turn virtual list
-                            // rather than `MessageScroller`: this list needs
-                            // pixel anchors and reveal inside turns taller than
-                            // the viewport, and the published scroller state
-                            // exposes only row-level navigation. See
+                            // The transcript renders through `gpui::list`, not
+                            // `v_virtual_list`: only `gpui::list` carries
+                            // gpui-fast's list layer, which replays a scrolled
+                            // row instead of rebuilding it. `v_virtual_list` is
+                            // `gpui_base::VirtualList` and has no layer path at
+                            // all, so the transcript composited nothing while it
+                            // scrolled. See
                             // `.trellis/spec/frontend/timeline-scrolling.md`.
-                            v_virtual_list(
-                                cx.entity().clone(),
-                                // Element state is keyed by this id, and the
-                                // virtual list caches its measured row layout
-                                // there. A constant id made every pane share
-                                // one cache: a pane picked up the other pane's
-                                // row heights and scroll offset, which showed up
-                                // as a shrunken timeline with a blank band and a
-                                // viewport that jumped when focus moved.
-                                timeline_list_id.clone(),
-                                row_sizes,
-                                move |this, visible_range, window, cx| {
-                                    // Layout and prepaint run after the render
-                                    // pass, so the borrowed view belongs to the
-                                    // focused pane by now. Building this pane's
-                                    // rows against it would freeze a working
-                                    // pane's conversation and hand its rows the
-                                    // other session's expansions and caches.
-                                    this.with_session_view_for_render(
-                                        timeline_render_session_id.as_ref(),
-                                        |this| {
-                                            let rendered_turns = rendered_turns.borrow().clone();
-                                            let turn_count = rendered_turns.len();
-                                            let hangs_from_bottom =
-                                                this.timeline_rows_hang_from_bottom();
-                                            visible_range
-                                                .filter_map(|index| {
-                                                    let turn = rendered_turns.get(index)?;
-                                                    let row_height =
-                                                        rendered_row_sizes.get(index)?.height;
+                            gpui::list(
+                                self.timeline_scroll.clone(),
+                                move |index, window, cx| {
+                                    // `gpui::list` hands the row renderer only
+                                    // the index, so the owning view is reached
+                                    // through the weak entity the shell already
+                                    // holds. Layout and prepaint run after the
+                                    // render pass, so the borrowed view belongs
+                                    // to the focused pane by now. Building this
+                                    // pane's rows against it would freeze a
+                                    // working pane's conversation and hand its
+                                    // rows the other session's expansions and
+                                    // caches.
+                                    let Some(entity) = render_entity.upgrade() else {
+                                        return div().into_any_element();
+                                    };
+                                    entity.update(cx, |this, cx| {
+                                        this.with_session_view_for_render(
+                                            timeline_render_session_id.as_ref(),
+                                            |this| {
+                                                let rendered_turns =
+                                                    rendered_turns.borrow().clone();
+                                                let turn_count = rendered_turns.len();
+                                                let hangs_from_bottom = rows_hang_from_bottom;
+                                                let Some(turn) = rendered_turns.get(index)
+                                                else {
+                                                    return div().into_any_element();
+                                                };
+                                                let Some(row_height) =
+                                                    rendered_row_sizes.get(index).map(|row| row.height)
+                                                else {
+                                                    return div().into_any_element();
+                                                };
+                                                {
                                                     let measured_height_entity = cx.weak_entity();
                                                     let measured_turn_id = turn.id.clone();
                                                     let measured_session_id =
@@ -64263,8 +64383,7 @@ impl VibexWorkbench {
                                                         window,
                                                         cx,
                                                     );
-                                                    Some(
-                                                        h_flex()
+                                                    h_flex()
                                                             // A turn keeps its layout node by id
                                                             // when older history is prepended and
                                                             // every index shifts under it.
@@ -64326,16 +64445,14 @@ impl VibexWorkbench {
                                                                     )
                                                                     .child(turn_content),
                                                             )
-                                                            .into_any_element(),
-                                                    )
-                                                })
-                                                .collect()
-                                        },
-                                    )
+                                                            .into_any_element()
+                                                }
+                                            },
+                                        )
+                                    })
                                 },
                             )
                             .size_full()
-                            .track_scroll(&self.timeline_scroll)
                             .px(px(content_insets.horizontal))
                             .py_4()
                             .gap_0(),
@@ -68983,13 +69100,17 @@ impl VibexWorkbench {
             .flat_map(|row| row.item_ids.iter().cloned())
             .collect::<Vec<_>>();
         let entity = cx.weak_entity();
-        let scroll = self.timeline_scroll.clone();
         div()
             .w_full()
             .min_w_0()
             .on_prepaint(move |bounds, _, cx| {
                 let _ = entity.update(cx, |this, cx| {
-                    this.reveal_session_search_row(&item_ids, aim, bounds, &scroll, cx);
+                    // The shift itself cannot be applied here: `ListState`
+                    // borrows its own layout for the whole prepaint, and
+                    // reading or writing the offset inside that borrow panics.
+                    // The row reports where it landed; the next render moves
+                    // the viewport onto it.
+                    this.reveal_session_search_row(&item_ids, aim, bounds, cx);
                 });
             })
             .child(element)
@@ -69027,7 +69148,6 @@ impl VibexWorkbench {
         item_ids: &[String],
         aim: f32,
         bounds: Bounds<Pixels>,
-        scroll: &VirtualListScrollHandle,
         cx: &mut Context<Self>,
     ) {
         let reveals_permission = self
@@ -69041,17 +69161,17 @@ impl VibexWorkbench {
         if !reveals_permission && !reveals_match {
             return;
         }
-        // The row's prepaint bounds already carry the scroll offset, so they
-        // are directly comparable with the viewport the handle tracked. A
-        // viewport with no height has nothing to reveal inside, and the
-        // turn-level scroll the caller already asked for still stands.
-        let viewport = scroll.bounds();
         if reveals_permission {
             self.pending_permission_reveal_item_id = None;
         }
         if reveals_match {
             self.pending_session_search_reveal_item_id = None;
         }
+        // The row's prepaint bounds already carry the scroll offset, so they
+        // are directly comparable with the viewport. A viewport with no height
+        // has nothing to reveal inside, and the turn-level scroll the caller
+        // already asked for still stands.
+        let viewport = self.timeline_scroll.viewport_bounds();
         if viewport.size.height <= px(0.0) {
             return;
         }
@@ -69059,11 +69179,10 @@ impl VibexWorkbench {
         if delta_y == px(0.0) {
             return;
         }
-        let offset = scroll.offset();
-        scroll.set_offset(point(offset.x, offset.y + delta_y));
-        // The virtual list picked the rows it renders from the offset this
-        // frame was laid out with, so the shifted viewport needs one more pass
-        // to fill itself from the new position.
+        // `scroll_by` takes a distance rather than an absolute offset, so it
+        // needs no read of the current position — which is what a prepaint
+        // cannot do. The list resolves it when it next lays out.
+        self.timeline_scroll.scroll_by(-delta_y);
         cx.notify();
     }
 
@@ -109475,7 +109594,7 @@ mod tests {
             v_flex()
                 .w(px(list_width))
                 .child(
-                    v_virtual_list(
+                    gpui_base::v_virtual_list(
                         cx.entity(),
                         "user-message-fit-list",
                         row_sizes,
@@ -113411,7 +113530,7 @@ mod tests {
         // two panes would share it.
         for field in [
             "timeline: TimelineModel",
-            "timeline_scroll: VirtualListScrollHandle",
+            "timeline_scroll: gpui::ListState",
             "timeline_follow: TimelineFollowState",
             "streaming_row_state",
             "runtime_selection",
@@ -113697,7 +113816,8 @@ mod tests {
         // newest row, which is the jump this path exists to prevent.
         assert!(restore.contains("self.timeline_follow.has_anchor()"));
         assert!(restore.contains("self.settle_timeline_anchor_on_oldest_row()"));
-        assert!(restore.contains("self.timeline_scroll.set_offset(point(px(0.0), px(0.0)))"));
+        assert!(restore.contains("self.timeline_scroll"));
+        assert!(restore.contains(".set_offset_from_scrollbar(point(px(0.0), px(0.0)))"));
 
         let resolve = source
             .split_once("    fn timeline_anchor_row_index(")
@@ -118668,7 +118788,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline wheel handler should remain inspectable");
 
-        assert!(handler.contains("self.timeline_scroll.max_offset().y <= px(0.0)"));
+        assert!(handler.contains("self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0)"));
         assert!(handler.contains(".timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)"));
         assert_eq!(handler.matches("cx.notify();").count(), 1);
 
@@ -119710,11 +119830,11 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("permission reveal should remain inspectable");
-        // The virtual list only scrolls whole turns, so the card is revealed
-        // once its row has been laid out.
+        // The list only scrolls whole rows, so the card is revealed once its
+        // row has been laid out.
         assert!(reveal.contains("self.pending_permission_reveal_item_id = Some(target.item_id);"));
         assert!(reveal.contains("self.timeline_scroll"));
-        assert!(reveal.contains("ScrollStrategy::Center"));
+        assert!(reveal.contains("scroll_to_reveal_item"));
 
         let dismiss = source
             .split_once("    fn dismiss_pending_permission_alert(")
@@ -131265,8 +131385,8 @@ mod tests {
 
         assert!(renderer.contains("agent_turn_preview_rail_visible_slots("));
         assert!(renderer.contains("timeline_visible_row_range("));
-        assert!(renderer.contains("f32::from(self.timeline_scroll.offset().y)"));
-        assert!(renderer.contains("f32::from(self.timeline_scroll.bounds().size.height)"));
+        assert!(renderer.contains("f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)"));
+        assert!(renderer.contains("f32::from(self.timeline_scroll.viewport_bounds().size.height)"));
         // The pointer still outranks the reading position for its own slot, and
         // the reading position outranks the pointer's neighbourhood fade. The
         // reading bar is a position marker, not a second selection, so it stays
@@ -132793,31 +132913,36 @@ mod tests {
         assert!(owner.contains("MarkdownSurfaceOwner::BorrowedView"));
     }
 
-    /// Every pane's timeline is its own virtual list.
+    /// Every pane's timeline owns its own scroll state.
     ///
-    /// The list caches its measured row layout under its element id, so a
-    /// constant id made the panes share one cache: a pane drew the other pane's
-    /// row heights (a shrunken timeline with a blank band) and picked up its
-    /// scroll offset when focus moved.
+    /// The list caches its measured row layout in its `ListState`, so a shared
+    /// state made the panes share one cache: a pane drew the other pane's row
+    /// heights (a shrunken timeline with a blank band) and picked up its scroll
+    /// offset when focus moved. The state is a field of `SessionView`, so the
+    /// isolation is now structural rather than an element id that has to be
+    /// kept unique by hand.
     #[test]
-    fn every_pane_timeline_is_its_own_virtual_list() {
+    fn every_pane_timeline_is_its_own_list() {
         let source = include_str!("app.rs");
+        let view = source
+            .split_once("pub struct SessionView {")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
+            .map(|(body, _)| body)
+            .expect("the session view should remain inspectable");
+        assert!(
+            view.contains("timeline_scroll: gpui::ListState"),
+            "the scroll state belongs to the view, so two panes cannot share it"
+        );
         let workbench = source
             .split_once("    fn render_agent_workbench_for(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
             .map(|(body, _)| body)
             .expect("agent workbench should remain inspectable");
-        let list_id = workbench
-            .find("let timeline_list_id = SharedString::from(format!(")
-            .expect("the timeline list id should be built per session");
-        let list = workbench
-            .find("timeline_list_id.clone(),")
-            .expect("the virtual list should use the per-session id");
-        assert!(list_id < list);
-        assert!(workbench.contains("\"agent-timeline-turns-{}"));
-        assert!(workbench.contains("VibexSessionId::as_str"));
-        // The old constant id must be gone from the call.
-        assert!(!workbench.contains("\"agent-timeline-turns\","));
+        assert!(workbench.contains("gpui::list("));
+        assert!(
+            !workbench.contains("let timeline_list_id"),
+            "the per-session element id is no longer what keeps the panes apart"
+        );
     }
 
     /// A drag that never leaves the pane it started in splits that pane, and a

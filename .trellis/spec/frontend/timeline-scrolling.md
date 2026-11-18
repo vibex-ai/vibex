@@ -174,12 +174,27 @@ twelve** scrolled frames, against **zero** for the same content through
 the remaining work is a row-builder rewrite onto `ListState`, not a wait on an
 upstream release.
 
-The transcript still runs on `v_virtual_list` today, because moving it is a row
-builder rewrite that has not been done — not because anything upstream blocks it.
-When that rewrite happens, `gpui::list` with a view-owned `ListState` is the
-shape to build on: no crate change, no fork, and the per-turn pixel anchors and
-in-turn reveal move onto `ListState`'s own `scroll_to(ListOffset)` and
-`bounds_for_item` rather than the current handle.
+**The migration is done.** The transcript renders through `gpui::list` with a
+`ListState` the `SessionView` owns, and every desktop test passes (2016). What
+the rewrite had to solve is recorded here because none of it is obvious from the
+API:
+
+| Problem | What the rewrite does |
+| --- | --- |
+| `list()`'s renderer receives only an index | the row builder reaches the view through a `WeakEntity` and `Entity::update`, the pattern every other row callback here already used |
+| The renderer runs inside the list's own layout borrow | nothing in a row may read the list's state. The one scroll-derived decision a row makes — whether the turn hangs from the bottom edge — is resolved once before the element is built and cached on the view |
+| Unmeasured rows contribute no extent | `reset_with_uniform_height` seeds them from the table's median row height. Without it the scrollbar reads a zero-length document and the transcript cannot scroll at all until every row has been on screen |
+| `scroll_px_offset_for_scrollbar` counts the list's padding, `max_offset_for_scrollbar` does not | both are read through view-level accessors that put them in one coordinate system; comparing the raw pair leaves a padding-sized band that makes the transcript read as never reaching its bottom edge |
+| `scroll_to_end` parks the viewport past the last row | `scroll_timeline_to_latest` anchors at the end only when the content overflows; a transcript that fits drops the anchor instead |
+
+**The layer still does not engage on the transcript.** Measured after the
+migration: the same `ListState`, drawn through a bare `gpui::list` in another
+window, composites eleven of twelve scrolled frames — while the workbench's own
+path composites zero. The element is no longer the blocker; the owner is. A
+wheel over the transcript notifies the workbench, and `owner_scrolled_only`
+requires that nothing but the scroll notified it. That is §7.3's second blocker,
+the P0b work of narrowing notifications, and it now applies to the transcript
+exactly as it does to the sidebar.
 
 ## 6. Tests Required
 
