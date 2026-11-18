@@ -77131,7 +77131,7 @@ impl VibexWorkbench {
         let composer_density = composer_density(
             {
                 let input = composer_input.read(cx);
-                composer_wrapped_rows(&input, composer_draft.as_str())
+                composer_wrapped_rows(input, composer_draft.as_str())
             },
             composer_draft_is_empty,
             self.composer_attachments.is_empty(),
