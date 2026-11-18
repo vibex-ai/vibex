@@ -11,14 +11,19 @@ use std::{cell::RefCell, rc::Rc, sync::Arc};
 use nsh_core::prelude::*;
 use vibex_backend::{AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest};
 use vibex_core::{
-    FetchTimelineRequest, MessageProvenance, SendAgentMessageRequest, TimelinePage,
+    ApprovalResponder, FetchTimelineRequest, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
+    ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage, TimelinePayload,
     UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
-    screens::session::{EntryKind, SessionHost, SessionState, SessionSummary, TimelineEntry},
+    screens::session::{
+        EntryKind, PendingPermission, PermissionChoice, PermissionOption, SessionHost,
+        SessionState, SessionSummary, TimelineEntry,
+    },
 };
 
 use crate::pairing::error_text;
@@ -37,6 +42,8 @@ pub struct SessionService {
     sending: Signal<bool>,
     error: Signal<Option<SharedString>>,
     runtime: Signal<Option<SharedString>>,
+    pending: Signal<Option<PendingPermission>>,
+    resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
     on_disconnect: Rc<dyn Fn()>,
@@ -59,6 +66,8 @@ impl SessionService {
             sending: signal(false),
             error: signal(None),
             runtime: signal(Some(runtime.into())),
+            pending: signal(None),
+            resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
         };
@@ -77,6 +86,8 @@ impl SessionService {
             sending: self.sending,
             error: self.error,
             runtime: self.runtime,
+            pending: self.pending,
+            resolving: self.resolving,
             on_select: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.open(id))
@@ -90,6 +101,12 @@ impl SessionService {
                 Rc::new(move || service.refresh())
             },
             on_disconnect: self.on_disconnect.clone(),
+            on_permission: {
+                let service = self.clone();
+                Rc::new(move |request_id: &str, choice: PermissionChoice| {
+                    service.resolve_permission(request_id, choice)
+                })
+            },
         }
     }
 
@@ -193,6 +210,7 @@ impl SessionService {
         };
         self.active.set(Some(session_id.as_str().to_owned()));
         self.timeline.set(Vec::new());
+        self.pending.set(None);
         self.error.set(None);
         let service = self.clone();
         let backend = self.backend.clone();
@@ -265,6 +283,109 @@ impl SessionService {
             })
             .collect::<Vec<_>>();
         self.timeline.set(rows);
+        self.refresh_pending();
+    }
+
+    /// Re-reads the pending permission from the projection.
+    ///
+    /// The newest pending request wins: a runtime blocks on one at a time per
+    /// session, and an older one still marked pending cannot be answered.
+    fn refresh_pending(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            self.pending.set(None);
+            return;
+        };
+        let pending = self
+            .model
+            .borrow()
+            .items
+            .iter()
+            .rev()
+            .find_map(|item| match &item.payload {
+                TimelinePayload::PermissionRequest(request)
+                    if request.status == PermissionRequestStatus::Pending
+                        && request.session_id.as_str() == active =>
+                {
+                    Some(permission_pending(request))
+                }
+                _ => None,
+            });
+        self.pending.set(pending);
+    }
+
+    /// Answers a permission card and re-reads the transcript.
+    fn resolve_permission(&self, request_id: &str, choice: PermissionChoice) {
+        if self.resolving.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let Ok(request_id) = RequestId::parse(request_id) else {
+            return;
+        };
+        let response = match choice {
+            PermissionChoice::Allow => PermissionResponseKind::Approve,
+            PermissionChoice::AlwaysAllow => PermissionResponseKind::AlwaysAllowForSession,
+            PermissionChoice::Deny => PermissionResponseKind::Deny,
+        };
+        self.resolving.set(true);
+        self.error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let request_session = session_id.clone();
+            let request_request = request_id.clone();
+            let result = background(async move {
+                backend
+                    .resolve_permission(MutationRequest::new(ResolvePermissionRequest {
+                        session_id: request_session.clone(),
+                        request_id: request_request.clone(),
+                        resolution: PermissionResolution {
+                            request_id: request_request,
+                            session_id: request_session,
+                            response,
+                            responder_device_id: None,
+                            provider_resolution_id: None,
+                            note: None,
+                            resolved_at_ms: unix_timestamp_ms(),
+                            responder: Some(ApprovalResponder::Human),
+                        },
+                    }))
+                    .await
+            })
+            .await;
+            service.resolving.set(false);
+            match result {
+                Ok(Ok(_)) => {
+                    service.pending.set(None);
+                    service.reload(&session_id);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("resolving the permission did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Re-reads the open session's transcript without clearing it.
+    fn reload(&self, session_id: &VibexSessionId) {
+        let service = self.clone();
+        let backend = self.backend.clone();
+        let session_id = session_id.clone();
+        spawn(async move {
+            let result = background(fetch_page(backend, session_id.clone())).await;
+            match result {
+                Ok(Ok(page)) => service.apply_page(&session_id, page),
+                Ok(Err(error)) => service.fail(&error),
+                Err(_) => {}
+            }
+        });
     }
 
     fn fail(&self, error: &BackendError) {
@@ -334,6 +455,66 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
             vibex_core::AgentSessionState::Error => SessionState::Failed,
             _ => SessionState::Idle,
         },
+    }
+}
+
+/// The card the phone shows for a pending request.
+fn permission_pending(request: &PermissionRequest) -> PendingPermission {
+    let options = if request.response_options.is_empty() {
+        request
+            .allowed_responses
+            .iter()
+            .map(|kind| PermissionOption {
+                id: format!("{kind:?}"),
+                label: default_option_label(*kind).to_owned(),
+                choice: choice_of(*kind),
+            })
+            .collect()
+    } else {
+        request
+            .response_options
+            .iter()
+            .map(|option| PermissionOption {
+                id: option.option_id.clone(),
+                label: option.label.clone(),
+                choice: choice_of(option.response),
+            })
+            .collect()
+    };
+    PendingPermission {
+        request_id: request.id.as_str().to_owned(),
+        title: request.title.clone(),
+        details: request
+            .details
+            .iter()
+            .map(|detail| {
+                if detail.value.trim().is_empty() {
+                    detail.label.clone()
+                } else {
+                    format!("{}: {}", detail.label, detail.value)
+                }
+            })
+            .take(6)
+            .collect(),
+        options,
+    }
+}
+
+fn choice_of(response: PermissionResponseKind) -> PermissionChoice {
+    match response {
+        PermissionResponseKind::Approve => PermissionChoice::Allow,
+        PermissionResponseKind::AlwaysAllowForSession => PermissionChoice::AlwaysAllow,
+        PermissionResponseKind::Deny => PermissionChoice::Deny,
+    }
+}
+
+fn default_option_label(response: PermissionResponseKind) -> &'static str {
+    match response {
+        PermissionResponseKind::Approve => copy::text("Allow", "允许", "允許"),
+        PermissionResponseKind::AlwaysAllowForSession => {
+            copy::text("Always allow", "本会话始终允许", "本工作階段一律允許")
+        }
+        PermissionResponseKind::Deny => copy::text("Deny", "拒绝", "拒絕"),
     }
 }
 

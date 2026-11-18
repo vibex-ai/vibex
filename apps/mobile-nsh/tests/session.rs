@@ -11,7 +11,8 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::session::{
-    self, EntryKind, SessionHost, SessionState, SessionSummary, TimelineEntry,
+    self, EntryKind, PendingPermission, PermissionChoice, PermissionOption, SessionHost,
+    SessionState, SessionSummary, TimelineEntry,
 };
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
@@ -64,6 +65,32 @@ fn transcript(session: &str) -> Vec<TimelineEntry> {
 /// these tests cover.
 #[component]
 fn Shell() -> impl IntoElement {
+    session::session(host_with(None))
+}
+
+/// The same shell with a permission waiting for an answer.
+#[component]
+fn PermissionShell() -> impl IntoElement {
+    session::session(host_with(Some(PendingPermission {
+        request_id: "req_1".to_owned(),
+        title: "Run cargo test?".to_owned(),
+        details: vec!["Command: cargo test".to_owned()],
+        options: vec![
+            PermissionOption {
+                id: "approve".to_owned(),
+                label: "Allow".to_owned(),
+                choice: PermissionChoice::Allow,
+            },
+            PermissionOption {
+                id: "deny".to_owned(),
+                label: "Deny".to_owned(),
+                choice: PermissionChoice::Deny,
+            },
+        ],
+    })))
+}
+
+fn host_with(pending: Option<PendingPermission>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
     let timeline = signal(transcript("s1"));
@@ -71,6 +98,8 @@ fn Shell() -> impl IntoElement {
     let sending = signal(false);
     let error = signal(None::<SharedString>);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
+    let pending = signal(pending);
+    let resolving = signal(false);
 
     let select = Rc::new(move |id: &str| {
         active.set(Some(id.to_owned()));
@@ -87,7 +116,10 @@ fn Shell() -> impl IntoElement {
             ))
         });
     });
-    session::session(SessionHost {
+    let on_permission = Rc::new(move |_: &str, _: PermissionChoice| {
+        pending.set(None);
+    });
+    SessionHost {
         sessions,
         active,
         timeline,
@@ -95,11 +127,14 @@ fn Shell() -> impl IntoElement {
         sending,
         error,
         runtime,
+        pending,
+        resolving,
         on_select: select,
         on_send: send,
         on_refresh: Rc::new(|| {}),
         on_disconnect: Rc::new(|| {}),
-    })
+        on_permission,
+    }
 }
 
 fn start() -> Headless {
@@ -176,4 +211,15 @@ fn a_branch_may_build_a_service_and_start_its_task() {
     app.wait_for("toggle").unwrap();
     app.press("toggle").unwrap();
     app.wait_for("Laptop, reachable").unwrap();
+}
+
+#[test]
+fn a_permission_card_is_answered_and_leaves() {
+    let mut config = EngineConfig::new(Root::of::<PermissionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Run cargo test?").unwrap();
+    app.press("role:button[Allow]").unwrap();
+    app.wait_for_gone("Run cargo test?", std::time::Duration::from_secs(5))
+        .unwrap();
 }

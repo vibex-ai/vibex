@@ -99,6 +99,38 @@ pub struct TimelineEntry {
     pub streaming: bool,
 }
 
+/// The answer a permission card offers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PermissionChoice {
+    /// Allow this one action.
+    Allow,
+    /// Allow this kind of action for the session.
+    AlwaysAllow,
+    /// Refuse it.
+    Deny,
+}
+
+/// Answers a permission card.
+type PermissionAction = Rc<dyn Fn(&str, PermissionChoice)>;
+
+/// One button of a permission card.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PermissionOption {
+    pub id: String,
+    pub label: String,
+    pub choice: PermissionChoice,
+}
+
+/// A permission the Agent is waiting on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingPermission {
+    pub request_id: String,
+    pub title: String,
+    /// What the action would do, one line each.
+    pub details: Vec<String>,
+    pub options: Vec<PermissionOption>,
+}
+
 /// What the shell may do, and the state it shows.
 #[derive(Clone)]
 pub struct SessionHost {
@@ -110,10 +142,15 @@ pub struct SessionHost {
     pub error: Signal<Option<SharedString>>,
     /// The connected runtime's label, shown in the drawer.
     pub runtime: Signal<Option<SharedString>>,
+    /// The permission the Agent waits on, shown above the composer.
+    pub pending: Signal<Option<PendingPermission>>,
+    /// An answer to that permission is in flight.
+    pub resolving: Signal<bool>,
     pub on_select: Rc<dyn Fn(&str)>,
     pub on_send: Rc<dyn Fn(&str)>,
     pub on_refresh: Rc<dyn Fn()>,
     pub on_disconnect: Rc<dyn Fn()>,
+    pub on_permission: PermissionAction,
 }
 
 /// The session shell.
@@ -141,6 +178,12 @@ pub fn session(host: SessionHost) -> impl IntoElement {
                     }
                 })),
         )
+        .child(when(move || host.pending.get().is_some(), {
+            let pending = host.pending;
+            let resolving = host.resolving;
+            let on_permission = host.on_permission.clone();
+            move || permission_card(pending, resolving, on_permission.clone())
+        }))
         .child(composer(host.clone()))
         .child(drawer(host, drawer_open))
 }
@@ -428,6 +471,74 @@ fn error_card(body: Memo<String>) -> impl IntoElement {
             text(move || body.get())
                 .text_size(px(theme::FONT_DETAIL))
                 .text_color(theme::accent_red),
+        )
+}
+
+/// The permission card, above the composer.
+///
+/// The Agent is blocked while this shows, so it is a first-class action, not a
+/// timeline row: the title says what is being asked, the lines say what it
+/// would do, and every answer the runtime allows is a button.
+fn permission_card(
+    pending: Signal<Option<PendingPermission>>,
+    resolving: Signal<bool>,
+    on_permission: PermissionAction,
+) -> impl IntoElement {
+    let request = pending.get_untracked().expect("shown while pending");
+    let request_id = request.request_id.clone();
+    let buttons = request.options.into_iter().map({
+        let on_permission = on_permission.clone();
+        let request_id = request_id.clone();
+        move |option| {
+            let id = request_id.clone();
+            let choice = option.choice;
+            let on_permission = on_permission.clone();
+            let button = if choice == PermissionChoice::Allow {
+                action::primary(
+                    option.label,
+                    icon(include_str!("../../assets/icons/check.svg")),
+                    move || on_permission(&id, choice),
+                )
+            } else {
+                action::secondary(
+                    option.label,
+                    icon(include_str!("../../assets/icons/x.svg")),
+                    false,
+                    move || on_permission(&id, choice),
+                )
+            };
+            button
+                .w_full()
+                .disabled(move || resolving.get())
+                .disabled_style(|style| style.opacity(0.5))
+        }
+    });
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_MD))
+        .border_t_1()
+        .border_t_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            text(request.title)
+                .text_size(px(theme::FONT_BODY))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::foreground),
+        )
+        .children(request.details.into_iter().map(|detail| {
+            text(detail)
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_secondary)
+        }))
+        .child(
+            view()
+                .flex_col()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .pt(px(theme::SPACING_XS))
+                .children(buttons),
         )
 }
 
