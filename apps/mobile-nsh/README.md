@@ -124,8 +124,28 @@ The iOS/Android hosts come from `nsh`'s generated runners for a Rust app.
 Shipping in the existing Kotlin/Swift shells (which own notifications, the
 foreground service, the scanner and sharing) is the embedding path: the
 platform crates mount this crate's root in an `AppView`/`NshView`, and the
-host keeps its native integrations. That wiring lands with the transport
-migration; see "Next" below.
+host keeps its native integrations; see "Embedding in the existing shells".
+
+## Build and release
+
+`nsh package` turns the app into an installable project/binary; the scripts
+here wrap it with the toolchain checks that make a failure actionable:
+
+```sh
+apps/mobile-nsh/scripts/build-android.sh   # needs ANDROID_HOME and an NDK
+apps/mobile-nsh/scripts/build-ios.sh       # needs Xcode
+```
+
+Both forward extra arguments to `nsh package`, so `--run`, `--release` or a
+signing flag go through unchanged. Signing, the App Store/Play upload and the
+store metadata stay with the generated Gradle/Xcode projects (or a release CI
+step) rather than this repository; the app's name, id and version live in
+`nsh.json`, and the theme is generated from the design tokens (see "Theme").
+
+Neither script can be exercised on this machine: there is no `nsh` CLI, no
+Android SDK/NDK and no Xcode here. The Android and iOS platform crates also
+fail to build without those toolchains, so the packaging path is verified only
+by `bash -n` and by the compiler checks that can run on Linux.
 
 ## Tests
 
