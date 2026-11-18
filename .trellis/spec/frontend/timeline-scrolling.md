@@ -196,6 +196,24 @@ requires that nothing but the scroll notified it. That is §7.3's second blocker
 the P0b work of narrowing notifications, and it now applies to the transcript
 exactly as it does to the sidebar.
 
+Two things were measured while narrowing it, and both matter to whoever picks
+this up:
+
+- **The rows are the cost, not the shell.** Stubbing the row builder's content
+  takes a scrolled frame from thirteen rebuilt views to one. So the work below
+  is worth doing on its own account even before the layer engages: a scrolled
+  frame stops rebuilding every visible turn.
+- **`gpui::list` notifies the view that painted it, and no subscription can
+  refuse that.** The notify is delivered by `App::notify` straight to the
+  view's invalidator, not through the observer list, so a view that records the
+  scroll count and skips the notify in its `observe` callback is still rebuilt.
+  The count (`TranscriptScrollNotifies`, taken in the list's own scroll handler,
+  which runs just before the notify) therefore buys nothing until the list is
+  painted by a view that holds nothing else. That is the shape §7.3 already
+  describes for the sidebar and the shape `ChildAgentRailView` uses: the
+  element and its scroll state move into a view of their own, and a scroll then
+  rebuilds that view alone.
+
 ## 6. Tests Required
 
 - `cargo test -p vibex-desktop --locked timeline` covers anchor restore,
