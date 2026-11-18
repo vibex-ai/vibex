@@ -300,7 +300,11 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. The release pipeline (packaging the Rust app for both stores) and the
-   shell's own camera and discovery code against the request queue.
-3. The rest of the workbench: a syntax-highlighted editor (nsh's `Editor`) in
-   place of the plain field.
+The code-side migration is complete; what remains needs a host or a device:
+
+1. The Kotlin/Swift shells' camera and discovery implementations against the
+   request queue and event contract above, and the store signing/upload steps
+   that belong to the generated projects or release CI.
+2. Optional parity work: switching a session's model/reasoning in place
+   (`set_desired_runtime`, which needs the selection's revisions), a session
+   search in the drawer, and richer file creation/deletion.
