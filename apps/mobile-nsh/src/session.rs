@@ -28,11 +28,11 @@ use vibex_core::{
     FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary,
     MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
-    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalStatus,
-    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
-    WorkspaceId, unix_timestamp_ms,
+    PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
+    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -110,6 +110,9 @@ pub struct SessionService {
     attachments: Signal<Vec<AttachmentItem>>,
     /// Makes each picked attachment's id unique for the composer.
     attachment_seq: Rc<Cell<u64>>,
+    session_actions: Signal<Option<String>>,
+    session_rename: Signal<String>,
+    session_busy: Signal<bool>,
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -189,6 +192,9 @@ impl SessionService {
             git_commit_detail: signal(None),
             attachments: signal(Vec::new()),
             attachment_seq: Rc::new(Cell::new(0)),
+            session_actions: signal(None),
+            session_rename: signal(String::new()),
+            session_busy: signal(false),
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
@@ -249,6 +255,9 @@ impl SessionService {
             git_show_history: self.git_show_history,
             git_commit_detail: self.git_commit_detail,
             attachments: self.attachments,
+            session_actions: self.session_actions,
+            session_rename: self.session_rename,
+            session_busy: self.session_busy,
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
             new_runtimes: self.new_runtimes,
@@ -314,6 +323,29 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.create_new_session())
             },
+            on_session_menu: {
+                let service = self.clone();
+                Rc::new(move |id: &str, title: &str| {
+                    service.session_rename.set(title.to_owned());
+                    service.session_actions.set(Some(id.to_owned()));
+                })
+            },
+            on_close_session_actions: {
+                let service = self.clone();
+                Rc::new(move || service.session_actions.set(None))
+            },
+            on_rename_session: {
+                let service = self.clone();
+                Rc::new(move || service.rename_open_session())
+            },
+            on_archive_session: {
+                let service = self.clone();
+                Rc::new(move || service.archive_open_session())
+            },
+            on_delete_session: {
+                let service = self.clone();
+                Rc::new(move || service.delete_open_session())
+            },
             on_close_new_session: {
                 let service = self.clone();
                 Rc::new(move || service.new_session_open.set(false))
@@ -333,6 +365,14 @@ impl SessionService {
             on_terminal_resize: {
                 let service = self.clone();
                 Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
+            },
+            on_terminal_title: {
+                let service = self.clone();
+                Rc::new(move |title: &str| {
+                    if !title.trim().is_empty() {
+                        service.terminal_title.set(Some(title.to_owned().into()));
+                    }
+                })
             },
             on_open_files: {
                 let service = self.clone();
@@ -910,6 +950,154 @@ impl SessionService {
         });
     }
 
+    /// Renames the session the actions sheet is open on.
+    fn rename_open_session(&self) {
+        if self.session_busy.get_untracked() {
+            return;
+        }
+        let Some(id) = self.session_actions.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
+            return;
+        };
+        let title = self.session_rename.get_untracked().trim().to_owned();
+        if title.is_empty() {
+            return;
+        }
+        self.session_busy.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .rename_session(MutationRequest::new(RenameAgentSessionRequest {
+                        session_id,
+                        title,
+                    }))
+                    .await
+            })
+            .await;
+            service.session_busy.set(false);
+            match result {
+                Ok(Ok(session)) => {
+                    let row = summary(&session);
+                    service.sessions.update(|sessions| {
+                        if let Some(existing) = sessions.iter_mut().find(|s| s.id == row.id) {
+                            *existing = row;
+                        }
+                    });
+                    service.session_actions.set(None);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_rename_task_failed",
+                    format!("renaming the session did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Archives the session the actions sheet is open on.
+    fn archive_open_session(&self) {
+        let Some(id) = self.session_actions.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
+            return;
+        };
+        self.session_busy.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .archive_session(MutationRequest::new(session_id))
+                    .await
+            })
+            .await;
+            service.session_busy.set(false);
+            match result {
+                Ok(Ok(())) => {
+                    service.drop_session(&id);
+                    service.session_actions.set(None);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_archive_task_failed",
+                    format!("archiving the session did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Deletes the session the actions sheet is open on, after confirming it.
+    fn delete_open_session(&self) {
+        let Some(id) = self.session_actions.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let answer = nsh_base::alert_dialog()
+                .title(copy::text(
+                    "Delete this session?",
+                    "删除这个会话？",
+                    "刪除這個工作階段？",
+                ))
+                .description(copy::text(
+                    "Its transcript leaves this runtime. This cannot be undone.",
+                    "它的对话记录会从运行时删除，且无法撤销。",
+                    "它的對話記錄會從執行環境刪除，且無法復原。",
+                ))
+                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                .destructive("delete", copy::text("Delete", "删除", "刪除"))
+                .show()
+                .await;
+            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("delete")) {
+                return;
+            }
+            service.session_busy.set(true);
+            let result = background(async move {
+                backend
+                    .delete_session(MutationRequest::new(session_id))
+                    .await
+            })
+            .await;
+            service.session_busy.set(false);
+            match result {
+                Ok(Ok(())) => {
+                    service.drop_session(&id);
+                    service.session_actions.set(None);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_delete_task_failed",
+                    format!("deleting the session did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Removes a session row and opens the next one when it was the active.
+    fn drop_session(&self, id: &str) {
+        self.sessions
+            .update(|sessions| sessions.retain(|s| s.id != id));
+        if self.active.get_untracked().as_deref() != Some(id) {
+            return;
+        }
+        match self.sessions.get_untracked().first().map(|s| s.id.clone()) {
+            Some(next) => self.open(&next),
+            None => {
+                self.active.set(None);
+                self.timeline.set(Vec::new());
+            }
+        }
+    }
+
     /// Opens the new-session sheet with the runtime's choices.
     fn open_new_session(&self) {
         self.files_open.set(false);
@@ -1166,6 +1354,7 @@ impl SessionService {
             return;
         };
         let data = data.to_owned();
+        let service = self.clone();
         let backend = self.terminal_backend.clone();
         spawn(async move {
             let result = background(async move {
@@ -1177,7 +1366,13 @@ impl SessionService {
                     .await
             })
             .await;
-            let _ = result;
+            match result {
+                Ok(Ok(())) => {}
+                Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
+                Err(error) => service.terminal_error.set(Some(
+                    format!("writing to the terminal did not finish: {error}").into(),
+                )),
+            }
         });
     }
 

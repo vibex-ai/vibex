@@ -218,6 +218,9 @@ type OpenPath = Rc<dyn Fn(&str)>;
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
 
+/// Opens the actions sheet for a session, with its id and title.
+type SessionMenu = Rc<dyn Fn(&str, &str)>;
+
 use crate::screens::new_session::{
     NewSessionHost, RuntimeChoice, WorkspaceChoice, new_session as new_session_sheet,
 };
@@ -293,6 +296,7 @@ pub struct SessionHost {
     pub on_close_terminal: Action,
     pub on_terminal_data: TerminalInput,
     pub on_terminal_resize: Rc<dyn Fn(u32, u32)>,
+    pub on_terminal_title: Rc<dyn Fn(&str)>,
     /// The files surface, when it is open over the shell.
     pub files_open: Signal<bool>,
     pub files_path: Signal<String>,
@@ -318,6 +322,16 @@ pub struct SessionHost {
     pub new_error: Signal<Option<SharedString>>,
     pub on_create_session: Action,
     pub on_close_new_session: Action,
+    /// The id of the session whose actions are open, if any.
+    pub session_actions: Signal<Option<String>>,
+    /// The title being edited in that sheet.
+    pub session_rename: Signal<String>,
+    pub session_busy: Signal<bool>,
+    pub on_session_menu: SessionMenu,
+    pub on_close_session_actions: Action,
+    pub on_rename_session: Action,
+    pub on_archive_session: Action,
+    pub on_delete_session: Action,
     /// The Git surface, when it is open over the shell.
     pub git_open: Signal<bool>,
     pub git_branch: Signal<Option<SharedString>>,
@@ -354,6 +368,7 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         term_ref: host.terminal_ref,
         on_data: host.on_terminal_data.clone(),
         on_resize: host.on_terminal_resize.clone(),
+        on_title: host.on_terminal_title.clone(),
         on_close: host.on_close_terminal.clone(),
     };
     let files = crate::screens::files::FilesHost {
@@ -480,6 +495,15 @@ fn shell(host: SessionHost) -> impl IntoElement {
         }))
         .child(composer(host.clone()))
         .child(drawer(host.clone(), drawer_open))
+        .child(session_actions_sheet(
+            host.session_actions,
+            host.session_rename,
+            host.session_busy,
+            host.on_close_session_actions.clone(),
+            host.on_rename_session.clone(),
+            host.on_archive_session.clone(),
+            host.on_delete_session.clone(),
+        ))
         .child(new_session_sheet(NewSessionHost {
             open: host.new_session_open,
             workspaces: host.new_workspaces,
@@ -1416,6 +1440,91 @@ fn attachment_chip(
         )
 }
 
+/// Rename, archive or delete one session.
+fn session_actions_sheet(
+    actions: Signal<Option<String>>,
+    rename: Signal<String>,
+    busy: Signal<bool>,
+    on_close: Rc<dyn Fn()>,
+    on_rename: Rc<dyn Fn()>,
+    on_archive: Rc<dyn Fn()>,
+    on_delete: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    let open = computed(move || actions.get().is_some());
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Session", "会话", "工作階段"))
+                        .text_size(px(theme::FONT_HEADING))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .flex_row()
+                        .items_end()
+                        .gap(px(theme::SPACING_SM))
+                        .child(field::text_field(
+                            rename,
+                            copy::text("Session title", "会话标题", "工作階段標題"),
+                        ))
+                        .child({
+                            let on_rename = on_rename.clone();
+                            action::primary(
+                                copy::text("Rename", "重命名", "重新命名"),
+                                icon(include_str!("../../assets/icons/check.svg")),
+                                move || on_rename(),
+                            )
+                            .disabled(move || {
+                                busy.get() || rename.with(|title| title.trim().is_empty())
+                            })
+                            .disabled_style(|style| style.opacity(0.4))
+                        }),
+                )
+                .child({
+                    let on_archive = on_archive.clone();
+                    action::secondary(
+                        copy::text("Archive", "归档", "封存"),
+                        icon(include_str!("../../assets/icons/folder.svg")),
+                        false,
+                        move || on_archive(),
+                    )
+                    .w_full()
+                    .disabled(move || busy.get())
+                    .disabled_style(|style| style.opacity(0.4))
+                })
+                .child({
+                    let on_delete = on_delete.clone();
+                    action::secondary(
+                        copy::text("Delete", "删除", "刪除"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || on_delete(),
+                    )
+                    .w_full()
+                    .disabled(move || busy.get())
+                    .disabled_style(|style| style.opacity(0.4))
+                }),
+        )
+}
+
 /// The session drawer, from the left edge.
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
@@ -1427,6 +1536,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_open_terminal = host.on_open_terminal.clone();
     let on_open_files = host.on_open_files.clone();
     let on_open_git = host.on_open_git.clone();
+    let on_session_menu = host.on_session_menu.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1462,7 +1572,13 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                     {
                                         let on_select = on_select.clone();
                                         move |session, _| {
-                                            session_row(session, active, on_select.clone(), open)
+                                            session_row(
+                                                session,
+                                                active,
+                                                on_select.clone(),
+                                                on_session_menu.clone(),
+                                                open,
+                                            )
                                         }
                                     },
                                 )),
@@ -1550,58 +1666,84 @@ fn session_row(
     session: ReadSignal<SessionSummary>,
     active: Signal<Option<String>>,
     on_select: Rc<dyn Fn(&str)>,
+    on_menu: SessionMenu,
     open: Signal<bool>,
 ) -> impl IntoElement {
-    button()
+    view()
         .w_full()
         .rounded(px(theme::RADIUS_CONTROL))
-        .px(px(theme::SPACING_MD))
-        .py(px(theme::SPACING_SM))
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_SM))
-        .active(|style| style.opacity(0.85))
-        .on_press(move || {
-            on_select(&session.get_untracked().id);
-            open.set(false);
-        })
         .child(
-            view()
-                .w(px(8.0))
-                .h(px(8.0))
-                .flex_shrink_0()
-                .rounded(px(4.0))
-                .bg(move || session.get().state.dot()),
-        )
-        .child(
-            view()
+            button()
                 .flex_1()
-                .min_w(px(0.0))
-                .gap(px(2.0))
+                .px(px(theme::SPACING_MD))
+                .py(px(theme::SPACING_SM))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .active(|style| style.opacity(0.85))
+                .on_press(move || {
+                    on_select(&session.get_untracked().id);
+                    open.set(false);
+                })
                 .child(
-                    text(move || session.get().title.clone())
-                        .truncate()
-                        .text_size(px(theme::FONT_BODY))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(move || {
-                            let id = session.get().id;
-                            if active.with(|active| active.as_deref() == Some(id.as_str())) {
-                                theme::foreground()
-                            } else {
-                                theme::text_secondary()
-                            }
-                        }),
+                    view()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .flex_shrink_0()
+                        .rounded(px(4.0))
+                        .bg(move || session.get().state.dot()),
                 )
                 .child(
-                    text(move || {
-                        let session = session.get();
-                        format!("{} · {}", session.agent, session.meta)
-                    })
-                    .truncate()
-                    .text_size(px(theme::FONT_MICRO))
-                    .text_color(theme::text_muted),
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .gap(px(2.0))
+                        .child(
+                            text(move || session.get().title.clone())
+                                .truncate()
+                                .text_size(px(theme::FONT_BODY))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(move || {
+                                    let id = session.get().id;
+                                    if active.with(|active| active.as_deref() == Some(id.as_str()))
+                                    {
+                                        theme::foreground()
+                                    } else {
+                                        theme::text_secondary()
+                                    }
+                                }),
+                        )
+                        .child(
+                            text(move || {
+                                let session = session.get();
+                                format!("{} · {}", session.agent, session.meta)
+                            })
+                            .truncate()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted),
+                        ),
                 ),
         )
+        .child({
+            button()
+                .min_h(px(theme::TOUCH_TARGET))
+                .min_w(px(theme::TOUCH_TARGET))
+                .items_center()
+                .justify_center()
+                .active(|style| style.opacity(0.7))
+                .accessibility_label(copy::text("Session actions", "会话操作", "工作階段操作"))
+                .on_press(move || {
+                    let session = session.get_untracked();
+                    on_menu(&session.id, &session.title);
+                })
+                .child(
+                    text("⋯")
+                        .text_size(px(theme::FONT_HEADING))
+                        .text_color(theme::text_muted),
+                )
+        })
 }
 
 /// What was typed after `@` when it is still one reference, if any.

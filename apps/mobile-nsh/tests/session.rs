@@ -253,6 +253,39 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             }
         });
     });
+    let session_actions = signal(None::<String>);
+    let session_rename = signal(String::new());
+    let session_busy = signal(false);
+    let on_session_menu = Rc::new(move |id: &str, title: &str| {
+        session_rename.set(title.to_owned());
+        session_actions.set(Some(id.to_owned()));
+    });
+    let on_rename_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        let title = session_rename.get_untracked();
+        sessions.update(|sessions| {
+            if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
+                session.title = title.clone();
+            }
+        });
+        session_actions.set(None);
+    });
+    let on_archive_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        sessions.update(|sessions| sessions.retain(|session| session.id != id));
+        session_actions.set(None);
+    });
+    let on_delete_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        sessions.update(|sessions| sessions.retain(|session| session.id != id));
+        session_actions.set(None);
+    });
     let new_session_open = signal(false);
     let new_workspaces = signal(vec![WorkspaceChoice {
         id: "w1".to_owned(),
@@ -360,6 +393,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_close_terminal,
         on_terminal_data: Rc::new(|_| {}),
         on_terminal_resize: Rc::new(|_, _| {}),
+        on_terminal_title: Rc::new(|_| {}),
         files_open,
         files_path,
         files_entries,
@@ -396,6 +430,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_revert_git,
         on_git_back,
         on_refresh_git: Rc::new(|| {}),
+        session_actions,
+        session_rename,
+        session_busy,
+        on_session_menu,
+        on_close_session_actions: Rc::new(|| {}),
+        on_rename_session,
+        on_archive_session,
+        on_delete_session,
         new_session_open,
         new_workspaces,
         new_runtimes,
@@ -657,6 +699,68 @@ fn a_photo_can_be_attached_and_removed() {
         "the chip leaves",
         std::time::Duration::from_secs(5),
         |screen| screen.texts().iter().all(|text| *text != "photo.jpg"),
+    )
+    .unwrap();
+}
+
+/// The shell with a single session, so the drawer's action button is unique.
+#[component]
+fn OneSessionShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.set(vec![SessionSummary {
+        id: "s1".to_owned(),
+        title: "Fix the tests".to_owned(),
+        agent: "Claude".to_owned(),
+        meta: "2m".to_owned(),
+        state: SessionState::Running,
+    }]);
+    session::session(host)
+}
+
+#[test]
+fn a_session_can_be_renamed_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.wait_for("role:button[Rename]").unwrap();
+    app.type_text("text:Fix the tests", " v2").unwrap();
+    app.press("role:button[Rename]").unwrap();
+    app.wait_for("Fix the tests v2").unwrap();
+}
+
+#[test]
+fn a_session_can_be_archived_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.press("role:button[Archive]").unwrap();
+    app.wait_until(
+        "the row leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_session_can_be_deleted_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.press("role:button[Delete]").unwrap();
+    app.wait_until(
+        "the row leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
     )
     .unwrap();
 }

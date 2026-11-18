@@ -479,6 +479,29 @@ fn history_row(
 }
 
 /// The diff with the action that discards it.
+/// A long text, one virtualized row per line, so it scrolls.
+fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
+    view().flex_1().min_h(px(0.0)).child(
+        virtual_list(
+            move || lines.with(|lines| lines.len()),
+            move |at: Position| {
+                let line = computed(move || {
+                    lines.with(|lines| lines.get(at.index()).cloned().unwrap_or_default())
+                });
+                view().px(px(theme::SPACING_LG)).child(
+                    text(move || line.get())
+                        .text_size(px(theme::FONT_MICRO))
+                        .line_height(theme::line_height_for(theme::FONT_MICRO))
+                        .text_color(theme::foreground),
+                )
+            },
+        )
+        .keys(move || (0..lines.with(|lines| lines.len())).collect::<Vec<_>>())
+        .estimated_item_size(px(16.0))
+        .flex_1(),
+    )
+}
+
 fn diff_view(
     diff: Signal<Option<GitDiffPreview>>,
     on_revert: Rc<dyn Fn(&str)>,
@@ -490,6 +513,7 @@ fn diff_view(
                 .unwrap_or_default()
         })
     });
+    let lines = computed(move || body.get().lines().map(str::to_owned).collect::<Vec<_>>());
     let title = computed(move || {
         diff.with(|diff| {
             diff.as_ref()
@@ -511,19 +535,14 @@ fn diff_view(
         .flex_1()
         .min_h(px(0.0))
         .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
         .child(
             text(move || title.get())
+                .px(px(theme::SPACING_LG))
                 .text_size(px(theme::FONT_MICRO))
                 .text_color(theme::text_muted),
         )
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::FONT_MICRO))
-                .line_height(theme::line_height_for(theme::FONT_MICRO))
-                .text_color(theme::foreground),
-        )
+        .child(line_list(lines))
         .child(when(move || truncated.get(), || {
             text(copy::text(
                 "The diff is larger than the preview limit.",
@@ -594,18 +613,13 @@ fn commit_detail_view(detail: Signal<Option<CommitDetailPreview>>) -> impl IntoE
     let truncated = computed(move || {
         detail.with(|detail| detail.as_ref().is_some_and(|detail| detail.truncated))
     });
+    let lines = computed(move || body.get().lines().map(str::to_owned).collect::<Vec<_>>());
     view()
         .flex_1()
         .min_h(px(0.0))
         .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::FONT_MICRO))
-                .line_height(theme::line_height_for(theme::FONT_MICRO))
-                .text_color(theme::foreground),
-        )
+        .child(line_list(lines))
         .child(when(
             move || truncated.get(),
             || {

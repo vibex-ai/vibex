@@ -23,6 +23,8 @@ pub struct TerminalHost {
     pub on_data: Rc<dyn Fn(&str)>,
     /// The grid's new size, in columns and rows.
     pub on_resize: Rc<dyn Fn(u32, u32)>,
+    /// The title the program set.
+    pub on_title: Rc<dyn Fn(&str)>,
     pub on_close: Rc<dyn Fn()>,
 }
 
@@ -30,6 +32,7 @@ pub struct TerminalHost {
 pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let on_data = host.on_data.clone();
     let on_resize = host.on_resize.clone();
+    let on_title = host.on_title.clone();
     let title = host.title;
     let error = host.error;
     view()
@@ -92,6 +95,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         on_resize(*cols, *rows);
                     }
                 })
+                .on_title_change(move |title: &SharedString| on_title(title))
                 .flex_1(),
         )
 }
