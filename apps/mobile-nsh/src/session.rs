@@ -23,10 +23,10 @@ use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitDiffRequest,
-    GitStageRequest, GitStatusSummary, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
+    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitRequest,
+    GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
     SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
     TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
     VibexSessionId, WorkspaceId, unix_timestamp_ms,
@@ -36,7 +36,7 @@ use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::files::{FileEntry, FilePreview},
-    screens::git::{GitChangeRow, GitDiffPreview},
+    screens::git::{CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
         CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
@@ -91,6 +91,11 @@ pub struct SessionService {
     git_changes: Signal<Vec<GitChangeRow>>,
     git_diff: Signal<Option<GitDiffPreview>>,
     git_error: Signal<Option<SharedString>>,
+    git_staged: Signal<u32>,
+    git_message: Signal<String>,
+    git_committing: Signal<bool>,
+    git_history: Signal<Vec<CommitRow>>,
+    git_show_history: Signal<bool>,
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -156,6 +161,11 @@ impl SessionService {
             git_changes: signal(Vec::new()),
             git_diff: signal(None),
             git_error: signal(None),
+            git_staged: signal(0),
+            git_message: signal(String::new()),
+            git_committing: signal(false),
+            git_history: signal(Vec::new()),
+            git_show_history: signal(false),
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
@@ -202,6 +212,11 @@ impl SessionService {
             git_changes: self.git_changes,
             git_diff: self.git_diff,
             git_error: self.git_error,
+            git_staged: self.git_staged,
+            git_message: self.git_message,
+            git_committing: self.git_committing,
+            git_history: self.git_history,
+            git_show_history: self.git_show_history,
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
             new_runtimes: self.new_runtimes,
@@ -306,6 +321,14 @@ impl SessionService {
             on_unstage_git: {
                 let service = self.clone();
                 Rc::new(move |path: &str| service.stage_path(path, false))
+            },
+            on_commit_git: {
+                let service = self.clone();
+                Rc::new(move || service.commit_changes())
+            },
+            on_toggle_git_history: {
+                let service = self.clone();
+                Rc::new(move || service.toggle_git_history())
             },
             on_git_back: {
                 let service = self.clone();
@@ -1216,6 +1239,7 @@ impl SessionService {
     }
 
     fn apply_git_status(&self, status: GitStatusSummary) {
+        self.git_staged.set(status.staged_count);
         self.git_branch.set(
             status
                 .branch
@@ -1306,8 +1330,111 @@ impl SessionService {
         });
     }
 
+    /// Commits what is staged with the message in the composer.
+    fn commit_changes(&self) {
+        if self.git_committing.get_untracked() {
+            return;
+        }
+        let message = self.git_message.get_untracked().trim().to_owned();
+        if message.is_empty() {
+            return;
+        }
+        self.git_committing.set(true);
+        self.git_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.git_committing.set(false);
+                return;
+            };
+            let result = background(async move {
+                git.commit(MutationRequest::new(GitCommitRequest {
+                    workspace_id: workspace,
+                    message,
+                    paths: Vec::new(),
+                    amend: false,
+                    push_after: false,
+                }))
+                .await
+            })
+            .await;
+            service.git_committing.set(false);
+            match result {
+                Ok(Ok(_)) => {
+                    service.git_message.set(String::new());
+                    service.refresh_git();
+                }
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service
+                    .git_error
+                    .set(Some(format!("committing did not finish: {error}").into())),
+            }
+        });
+    }
+
+    /// Shows the history, or goes back to the changes.
+    fn toggle_git_history(&self) {
+        if self.git_show_history.get_untracked() {
+            self.git_show_history.set(false);
+            return;
+        }
+        self.git_show_history.set(true);
+        self.git_diff.set(None);
+        self.load_git_history();
+    }
+
+    fn load_git_history(&self) {
+        self.git_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                git.git_history(GitHistoryRequest {
+                    workspace_id: workspace,
+                    limit: Some(40),
+                    before_commit: None,
+                    ref_name: None,
+                    author: None,
+                    query: None,
+                    authored_after_ms: None,
+                    authored_before_ms: None,
+                })
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(history)) => service.git_history.set(
+                    history
+                        .commits
+                        .into_iter()
+                        .map(|commit| CommitRow {
+                            hash: commit.hash,
+                            short_hash: commit.short_hash,
+                            subject: commit.subject,
+                            detail: commit.author_name,
+                        })
+                        .collect(),
+                ),
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reading the history did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
     /// Leaves the diff, then the surface.
     fn git_back(&self) {
+        if self.git_show_history.get_untracked() {
+            self.git_show_history.set(false);
+            return;
+        }
         if self.git_diff.get_untracked().is_some() {
             self.git_diff.set(None);
         } else {

@@ -25,6 +25,15 @@ pub struct GitChangeRow {
     pub deletions: u32,
 }
 
+/// One commit in the history list.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitRow {
+    pub hash: String,
+    pub short_hash: String,
+    pub subject: String,
+    pub detail: String,
+}
+
 /// An opened diff.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitDiffPreview {
@@ -41,6 +50,16 @@ pub struct GitHost {
     pub changes: Signal<Vec<GitChangeRow>>,
     pub diff: Signal<Option<GitDiffPreview>>,
     pub error: Signal<Option<SharedString>>,
+    /// How many paths are staged (the commit's precondition).
+    pub staged: Signal<u32>,
+    /// The commit message being written.
+    pub message: Signal<String>,
+    pub committing: Signal<bool>,
+    /// The commit history, on its own view.
+    pub history: Signal<Vec<CommitRow>>,
+    pub show_history: Signal<bool>,
+    pub on_commit: Rc<dyn Fn()>,
+    pub on_toggle_history: Rc<dyn Fn()>,
     /// Opens a path's diff; the second argument says whether it is the staged
     /// or the working-tree version.
     pub on_open_diff: OpenDiff,
@@ -60,6 +79,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
     let changes = host.changes;
     let error = host.error;
     let on_refresh = host.on_refresh.clone();
+    let show_history = host.show_history;
     view()
         .flex_1()
         .bg(theme::background)
@@ -87,9 +107,14 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             )
                         })
                         .child(
-                            text(move || match branch.get() {
-                                Some(branch) => branch.to_string(),
-                                None => copy::text("Changes", "变更", "變更").to_owned(),
+                            text(move || {
+                                if show_history.get() {
+                                    return copy::text("History", "历史", "歷史").to_owned();
+                                }
+                                match branch.get() {
+                                    Some(branch) => branch.to_string(),
+                                    None => copy::text("Changes", "变更", "變更").to_owned(),
+                                }
                             })
                             .flex_1()
                             .truncate()
@@ -106,6 +131,14 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             )
                         })
                         .child({
+                            let on_toggle_history = host.on_toggle_history.clone();
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/history.svg")),
+                                copy::text("History", "历史", "歷史"),
+                                move || on_toggle_history(),
+                            )
+                        })
+                        .child({
                             let on_close = host.on_close.clone();
                             action::icon_button(
                                 icon(include_str!("../../assets/icons/x.svg")),
@@ -115,8 +148,12 @@ pub fn git(host: GitHost) -> impl IntoElement {
                         }),
                 ),
         )
+        .child(when(move || show_history.get(), {
+            let history = host.history;
+            move || history_list(history)
+        }))
         .child(when(
-            move || error.get().is_some(),
+            move || !show_history.get() && error.get().is_some(),
             move || {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
@@ -125,9 +162,19 @@ pub fn git(host: GitHost) -> impl IntoElement {
                     .text_color(theme::accent_red)
             },
         ))
-        .child(when(move || diff.get().is_some(), move || diff_view(diff)))
+        .child(when(move || !show_history.get() && diff.get().is_none(), {
+            let staged = host.staged;
+            let message = host.message;
+            let committing = host.committing;
+            let on_commit = host.on_commit.clone();
+            move || commit_bar(staged, message, committing, on_commit.clone())
+        }))
         .child(when(
-            move || diff.get().is_none(),
+            move || !show_history.get() && diff.get().is_some(),
+            move || diff_view(diff),
+        ))
+        .child(when(
+            move || !show_history.get() && diff.get().is_none(),
             move || {
                 change_list(
                     changes,
@@ -283,6 +330,103 @@ fn change_row(
                     .text_color(theme::text_secondary),
                 )
         })
+}
+
+/// The message field and the Commit action.
+fn commit_bar(
+    staged: Signal<u32>,
+    message: Signal<String>,
+    committing: Signal<bool>,
+    on_commit: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_end()
+        .gap(px(theme::SPACING_SM))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_SM))
+        .border_b_1()
+        .border_b_color(theme::border_subtle)
+        .child(
+            crate::ui::field::text_field(
+                message,
+                copy::text("Commit message", "提交说明", "提交說明"),
+            )
+            .flex_1(),
+        )
+        .child(
+            action::primary(
+                copy::text("Commit", "提交", "提交"),
+                icon(include_str!("../../assets/icons/check.svg")),
+                {
+                    let on_commit = on_commit.clone();
+                    move || on_commit()
+                },
+            )
+            .disabled(move || {
+                committing.get()
+                    || staged.with(|staged| *staged == 0)
+                    || message.with(|message| message.trim().is_empty())
+            })
+            .disabled_style(|style| style.opacity(0.4)),
+        )
+}
+
+/// The history list.
+fn history_list(history: Signal<Vec<CommitRow>>) -> impl IntoElement {
+    view().flex_1().min_h(px(0.0)).child(
+        virtual_list(
+            move || history.with(|history| history.len()),
+            move |at: Position| history_row(at, history),
+        )
+        .keys(move || {
+            history.with(|history| {
+                history
+                    .iter()
+                    .map(|commit| commit.hash.clone())
+                    .collect::<Vec<_>>()
+            })
+        })
+        .estimated_item_size(px(56.0))
+        .flex_1(),
+    )
+}
+
+fn history_row(at: Position, history: Signal<Vec<CommitRow>>) -> impl IntoElement {
+    let commit = computed(move || history.with(|history| history.get(at.index()).cloned()));
+    view()
+        .w_full()
+        .min_h(px(56.0))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_XS))
+        .flex_col()
+        .justify_center()
+        .gap(px(2.0))
+        .border_b_1()
+        .border_b_color(theme::border_subtle)
+        .child(
+            text(move || {
+                commit
+                    .with(|commit| commit.as_ref().map(|commit| commit.subject.clone()))
+                    .unwrap_or_default()
+            })
+            .truncate()
+            .text_size(px(theme::FONT_DETAIL))
+            .text_color(theme::foreground),
+        )
+        .child(
+            text(move || {
+                commit.with(|commit| {
+                    commit.as_ref().map_or(String::new(), |commit| {
+                        format!("{} · {}", commit.short_hash, commit.detail)
+                    })
+                })
+            })
+            .truncate()
+            .text_size(px(theme::FONT_MICRO))
+            .text_color(theme::text_muted),
+        )
 }
 
 fn diff_view(diff: Signal<Option<GitDiffPreview>>) -> impl IntoElement {

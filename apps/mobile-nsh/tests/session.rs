@@ -12,7 +12,7 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
-use vibex_nsh_ui::screens::git::{GitChangeRow, GitDiffPreview};
+use vibex_nsh_ui::screens::git::{CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
@@ -186,6 +186,24 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }));
     });
     let on_git_back = Rc::new(move || git_diff.set(None));
+    let git_staged = signal(1_u32);
+    let git_message = signal(String::new());
+    let git_committing = signal(false);
+    let git_history = signal(vec![CommitRow {
+        hash: "abc123".to_owned(),
+        short_hash: "abc123".to_owned(),
+        subject: "Initial commit".to_owned(),
+        detail: "Ada".to_owned(),
+    }]);
+    let git_show_history = signal(false);
+    let on_commit_git = Rc::new(move || {
+        if !git_message.get_untracked().trim().is_empty() {
+            git_message.set(String::new());
+        }
+    });
+    let on_toggle_git_history = Rc::new(move || {
+        git_show_history.set(!git_show_history.get_untracked());
+    });
     let on_stage = Rc::new(move |path: &str| {
         git_changes.update(|changes| {
             if let Some(change) = changes.iter_mut().find(|change| change.path == path) {
@@ -322,6 +340,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_git_diff,
         on_stage_git: on_stage,
         on_unstage_git: on_unstage,
+        git_staged,
+        git_message,
+        git_committing,
+        git_history,
+        git_show_history,
+        on_commit_git,
+        on_toggle_git_history,
         on_git_back,
         on_refresh_git: Rc::new(|| {}),
         new_session_open,
@@ -534,4 +559,18 @@ fn a_git_change_can_be_staged_from_the_surface() {
     app.wait_for("src/main.rs").unwrap();
     app.press("Stage").unwrap();
     app.wait_for("Unstage").unwrap();
+}
+
+#[test]
+fn the_git_surface_commits_and_shows_history() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Commit").unwrap();
+    app.type_text("text:Commit message", "init").unwrap();
+    app.press("role:button[Commit]").unwrap();
+    // The composer clears when the commit is accepted.
+    app.wait_for("text:Commit message").unwrap();
+    app.press("role:button[History]").unwrap();
+    app.wait_for("Initial commit").unwrap();
 }
