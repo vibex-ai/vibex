@@ -73,3 +73,17 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeHostRequest(
 ) -> i32 {
     crate::host::take_request_code()
 }
+
+/// Names the phone the way Android reports it (`android.os.Build.MODEL`).
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetDeviceName(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    value: JString<'_>,
+) {
+    env.with_env(|_| -> jni::errors::Result<()> {
+        crate::host::set_device_name(&value.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}

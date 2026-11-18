@@ -47,6 +47,35 @@ pub enum HostEvent {
 
 static SENDER: OnceLock<Mutex<Option<UnboundedSender<HostEvent>>>> = OnceLock::new();
 
+/// The name the platform reports for this phone, once the host sets it.
+static DEVICE_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
+/// Names the phone the way the platform does ("Pixel 8").
+///
+/// The runtime keeps this name in its paired-device list; the phone's own
+/// credential identity is unchanged by it. A name the runtime would reject is
+/// ignored rather than truncated.
+#[cfg_attr(
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "called by the platform entry points only")
+)]
+pub fn set_device_name(name: &str) {
+    let Some(name) = vibex_core::normalize_remote_display_name(name) else {
+        return;
+    };
+    *DEVICE_NAME
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(name);
+}
+
+/// The platform's name for this phone, if the host reported one.
+pub fn device_name() -> Option<String> {
+    DEVICE_NAME
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|slot| slot.clone()))
+}
+
 /// Something the app asks the platform host to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum HostRequest {
@@ -213,6 +242,15 @@ mod tests {
                 key: "desktop-1".to_owned()
             }
         );
+    }
+
+    #[test]
+    fn a_platform_device_name_is_kept_when_usable() {
+        set_device_name("  Pixel 8  ");
+        assert_eq!(device_name().as_deref(), Some("Pixel 8"));
+        set_device_name("   ");
+        // A blank name does not erase the one already reported.
+        assert_eq!(device_name().as_deref(), Some("Pixel 8"));
     }
 
     #[test]

@@ -95,3 +95,17 @@ fn c_string(value: *const c_char) -> Option<String> {
 pub extern "C" fn vibex_mobile_nsh_take_host_request() -> i32 {
     crate::host::take_request_code()
 }
+
+/// Names the phone the way iOS reports it ("Pixel" on Android, "Ada's
+/// iPhone" here), so the runtime's paired-device list is readable.
+///
+/// # Safety
+///
+/// `value` must be a valid NUL-terminated C string, or null.
+#[unsafe(no_mangle)]
+pub extern "C" fn vibex_mobile_nsh_set_device_name(value: *const c_char) {
+    let Some(value) = c_string(value) else {
+        return;
+    };
+    crate::host::set_device_name(&value);
+}

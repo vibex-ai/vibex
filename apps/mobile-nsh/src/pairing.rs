@@ -144,7 +144,7 @@ impl PairingService {
         let entry = entry.to_owned();
         let server = server.to_owned();
         spawn(async move {
-            let device = DEVICE_NAME.to_owned();
+            let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
             // The claim is network I/O: run it on the runtime's threads, not
             // on the engine thread that renders.
             let result =

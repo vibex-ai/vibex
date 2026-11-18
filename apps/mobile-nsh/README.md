@@ -168,7 +168,11 @@ object NshHost {
     external fun nativeRunRoot(handle: Long)
     external fun nativeScanResult(value: String)
     external fun nativeDiscoveryEvent(value: String)
+    external fun nativeSetDeviceName(value: String)
 }
+
+// Once, before mounting: the runtime's paired-device list shows this name.
+NshHost.nativeSetDeviceName(android.os.Build.MODEL)
 
 val view = com.longbridge.nsh.NshView(this)
 container.addView(view, LayoutParams.MATCH_PARENT)
@@ -184,6 +188,7 @@ custom Rust hosts; reading it is the only package-private access involved.
 **iOS** (Swift, with the symbols declared in the bridging header):
 
 ```swift
+vibex_mobile_nsh_set_device_name(UIDevice.current.name)
 let app = vibex_mobile_nsh_attach(container)
 vibex_mobile_nsh_scan_result(payload)          // a scanned pairing link
 vibex_mobile_nsh_discovery_event(json)         // one discovery event
@@ -223,10 +228,9 @@ back through the two event calls; discovery uses this JSON contract:
 {"kind":"failed","message":"…"}
 ```
 
-Still missing from the bridge: the host does not report the platform's device
-name (the pair key stays "Vibex Mobile"), and the shells' camera and discovery
-implementations are theirs to write against the queue and event contract
-above.
+The shells' camera and discovery implementations are theirs to write against
+the request queue and event contract above; the device name is reported
+through `nativeSetDeviceName` / `vibex_mobile_nsh_set_device_name`.
 
 ## Theme
 
