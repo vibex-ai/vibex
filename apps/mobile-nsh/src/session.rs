@@ -6,23 +6,26 @@
 //! The rows are the shared projection `vibex-desktop-model` computes, so the
 //! phone shows what the desktop shows for the same timeline.
 
-use std::{cell::RefCell, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::BTreeMap, rc::Rc, sync::Arc};
 
 use nsh_core::prelude::*;
 use vibex_backend::{AgentBackend, BackendError, BackendEvent, BackendResult, MutationRequest};
 use vibex_core::{
-    ApprovalResponder, FetchTimelineRequest, MessageProvenance, PermissionRequest,
+    ApprovalResponder, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, FetchTimelineRequest, MessageProvenance, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind, RequestId,
-    ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
+    ResolveElicitationRequest, ResolvePermissionRequest, SendAgentMessageRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::session::{
-        EntryKind, PendingPermission, PermissionChoice, PermissionOption, SessionHost,
-        SessionState, SessionSummary, TimelineEntry,
+        EntryKind, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
+        QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption, QuestionResponse,
+        SessionHost, SessionState, SessionSummary, TimelineEntry,
     },
 };
 
@@ -43,6 +46,9 @@ pub struct SessionService {
     error: Signal<Option<SharedString>>,
     runtime: Signal<Option<SharedString>>,
     pending: Signal<Option<PendingPermission>>,
+    question: Signal<Option<PendingQuestion>>,
+    /// The question the card shows, kept for typed submissions.
+    question_request: Rc<RefCell<Option<ElicitationRequest>>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -67,6 +73,8 @@ impl SessionService {
             error: signal(None),
             runtime: signal(Some(runtime.into())),
             pending: signal(None),
+            question: signal(None),
+            question_request: Rc::new(RefCell::new(None)),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
@@ -87,6 +95,7 @@ impl SessionService {
             error: self.error,
             runtime: self.runtime,
             pending: self.pending,
+            question: self.question,
             resolving: self.resolving,
             on_select: {
                 let service = self.clone();
@@ -105,6 +114,12 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |request_id: &str, choice: PermissionChoice| {
                     service.resolve_permission(request_id, choice)
+                })
+            },
+            on_question: {
+                let service = self.clone();
+                Rc::new(move |request_id: &str, response: QuestionResponse| {
+                    service.resolve_question(request_id, response)
                 })
             },
         }
@@ -211,6 +226,8 @@ impl SessionService {
         self.active.set(Some(session_id.as_str().to_owned()));
         self.timeline.set(Vec::new());
         self.pending.set(None);
+        self.question.set(None);
+        *self.question_request.borrow_mut() = None;
         self.error.set(None);
         let service = self.clone();
         let backend = self.backend.clone();
@@ -293,24 +310,42 @@ impl SessionService {
     fn refresh_pending(&self) {
         let Some(active) = self.active.get_untracked() else {
             self.pending.set(None);
+            self.question.set(None);
+            *self.question_request.borrow_mut() = None;
             return;
         };
-        let pending = self
-            .model
-            .borrow()
-            .items
-            .iter()
-            .rev()
-            .find_map(|item| match &item.payload {
-                TimelinePayload::PermissionRequest(request)
-                    if request.status == PermissionRequestStatus::Pending
-                        && request.session_id.as_str() == active =>
-                {
-                    Some(permission_pending(request))
+        let mut pending = None;
+        let mut question = None;
+        let mut question_request = None;
+        {
+            let model = self.model.borrow();
+            for item in model.items.iter().rev() {
+                match &item.payload {
+                    TimelinePayload::PermissionRequest(request)
+                        if pending.is_none()
+                            && request.status == PermissionRequestStatus::Pending
+                            && request.session_id.as_str() == active =>
+                    {
+                        pending = Some(permission_pending(request));
+                    }
+                    TimelinePayload::ElicitationRequest(request)
+                        if question.is_none()
+                            && request.status == ElicitationRequestStatus::Pending
+                            && request.session_id.as_str() == active =>
+                    {
+                        question = Some(pending_question(request));
+                        question_request = Some(request.clone());
+                    }
+                    _ => {}
                 }
-                _ => None,
-            });
+                if pending.is_some() && question.is_some() {
+                    break;
+                }
+            }
+        }
         self.pending.set(pending);
+        self.question.set(question);
+        *self.question_request.borrow_mut() = question_request;
     }
 
     /// Answers a permission card and re-reads the transcript.
@@ -373,6 +408,72 @@ impl SessionService {
         });
     }
 
+    /// Answers a question card and re-reads the transcript.
+    fn resolve_question(&self, request_id: &str, response: QuestionResponse) {
+        if self.resolving.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let Ok(request_id) = RequestId::parse(request_id) else {
+            return;
+        };
+        let Some(request) = self.question_request.borrow().clone() else {
+            return;
+        };
+        let (action, answers) = match response {
+            QuestionResponse::Decline => (ElicitationResolutionAction::Decline, BTreeMap::new()),
+            QuestionResponse::Submit(answers) => match answers_for(&request, &answers) {
+                Ok(answers) => (ElicitationResolutionAction::Accept, answers),
+                Err(message) => {
+                    self.fail_text(&message);
+                    return;
+                }
+            },
+        };
+        self.resolving.set(true);
+        self.error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let request_session = session_id.clone();
+            let request_request = request_id.clone();
+            let result = background(async move {
+                backend
+                    .resolve_elicitation(MutationRequest::new(ResolveElicitationRequest {
+                        session_id: request_session.clone(),
+                        request_id: request_request.clone(),
+                        resolution: ElicitationResolution {
+                            request_id: request_request,
+                            session_id: request_session,
+                            action,
+                            answers,
+                            responder_device_id: None,
+                            resolved_at_ms: unix_timestamp_ms(),
+                        },
+                    }))
+                    .await
+            })
+            .await;
+            service.resolving.set(false);
+            match result {
+                Ok(Ok(_)) => {
+                    service.question.set(None);
+                    service.reload(&session_id);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("resolving the question did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
     /// Re-reads the open session's transcript without clearing it.
     fn reload(&self, session_id: &VibexSessionId) {
         let service = self.clone();
@@ -390,7 +491,14 @@ impl SessionService {
 
     fn fail(&self, error: &BackendError) {
         self.sending.set(false);
+        self.resolving.set(false);
         self.error.set(Some(error_text(error)));
+    }
+
+    fn fail_text(&self, message: &str) {
+        self.sending.set(false);
+        self.resolving.set(false);
+        self.error.set(Some(message.to_owned().into()));
     }
 }
 
@@ -456,6 +564,114 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
             _ => SessionState::Idle,
         },
     }
+}
+
+/// The card the phone shows for a pending question.
+fn pending_question(request: &ElicitationRequest) -> PendingQuestion {
+    PendingQuestion {
+        request_id: request.id.as_str().to_owned(),
+        title: request
+            .title
+            .clone()
+            .filter(|title| !title.trim().is_empty())
+            .unwrap_or_else(|| copy::text("A question", "一个问题", "一個問題").to_owned()),
+        message: request
+            .description
+            .clone()
+            .filter(|message| !message.trim().is_empty())
+            .unwrap_or_else(|| request.message.clone()),
+        fields: request.fields.iter().filter_map(question_field).collect(),
+    }
+}
+
+fn question_field(field: &ElicitationField) -> Option<QuestionField> {
+    let kind = match &field.kind {
+        ElicitationFieldKind::Text {
+            default, options, ..
+        } if !options.is_empty() => QuestionFieldKind::Choice {
+            options: options
+                .iter()
+                .map(|option| QuestionOption {
+                    value: option.value.clone(),
+                    label: option.title.clone(),
+                })
+                .collect(),
+            default: default.clone(),
+        },
+        ElicitationFieldKind::Text { default, .. } => QuestionFieldKind::Text {
+            default: default.clone(),
+        },
+        ElicitationFieldKind::Number { default, .. } => QuestionFieldKind::Text {
+            default: default.clone(),
+        },
+        ElicitationFieldKind::Integer { default, .. } => QuestionFieldKind::Text {
+            default: default.map(|value| value.to_string()),
+        },
+        ElicitationFieldKind::Boolean { default } => {
+            QuestionFieldKind::Boolean { default: *default }
+        }
+        ElicitationFieldKind::MultiSelect {
+            options, default, ..
+        } => QuestionFieldKind::Multi {
+            options: options
+                .iter()
+                .map(|option| QuestionOption {
+                    value: option.value.clone(),
+                    label: option.title.clone(),
+                })
+                .collect(),
+            default: default.clone(),
+        },
+        // A schema the phone cannot draw is left out rather than guessed at.
+        ElicitationFieldKind::Unsupported { .. } => return None,
+    };
+    Some(QuestionField {
+        id: field.id.clone(),
+        title: field.title.clone(),
+        description: field.description.clone(),
+        required: field.required,
+        kind,
+    })
+}
+
+/// The typed answers a question's fields expect.
+fn answers_for(
+    request: &ElicitationRequest,
+    answers: &[(String, QuestionAnswer)],
+) -> Result<BTreeMap<String, ElicitationAnswerValue>, String> {
+    let mut typed = BTreeMap::new();
+    for field in &request.fields {
+        let answer = answers
+            .iter()
+            .find(|(id, _)| id == &field.id)
+            .map(|(_, answer)| answer);
+        let value = match (&field.kind, answer) {
+            (ElicitationFieldKind::Text { .. }, Some(QuestionAnswer::Text(text))) => {
+                ElicitationAnswerValue::String(text.clone())
+            }
+            (ElicitationFieldKind::Number { .. }, Some(QuestionAnswer::Text(text))) => {
+                ElicitationAnswerValue::Number(text.clone())
+            }
+            (ElicitationFieldKind::Integer { .. }, Some(QuestionAnswer::Text(text))) => {
+                let value = text
+                    .trim()
+                    .parse::<i64>()
+                    .map_err(|_| format!("`{}` is not a whole number.", field.title))?;
+                ElicitationAnswerValue::Integer(value)
+            }
+            (ElicitationFieldKind::Boolean { .. }, Some(QuestionAnswer::Boolean(value))) => {
+                ElicitationAnswerValue::Boolean(*value)
+            }
+            (ElicitationFieldKind::MultiSelect { .. }, Some(QuestionAnswer::Texts(values))) => {
+                ElicitationAnswerValue::StringArray(values.clone())
+            }
+            (ElicitationFieldKind::Unsupported { .. }, _) => continue,
+            (_, None) if !field.required => continue,
+            _ => return Err(format!("`{}` needs an answer.", field.title)),
+        };
+        typed.insert(field.id.clone(), value);
+    }
+    Ok(typed)
 }
 
 /// The card the phone shows for a pending request.

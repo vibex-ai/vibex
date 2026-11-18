@@ -14,7 +14,7 @@
 use std::rc::Rc;
 
 use nsh_base::{
-    SheetEvent, button, sheet,
+    ButtonElement, SheetEvent, button, sheet,
     text_view::{MarkdownOptions, text_view},
 };
 use nsh_core::{
@@ -131,6 +131,74 @@ pub struct PendingPermission {
     pub options: Vec<PermissionOption>,
 }
 
+/// The answer to one question field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionAnswer {
+    /// Text, a number, or a chosen option's value.
+    Text(String),
+    /// A yes/no field.
+    Boolean(bool),
+    /// The values chosen in a multi-select field.
+    Texts(Vec<String>),
+}
+
+/// One field of a question the Agent asked.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionField {
+    pub id: String,
+    pub title: String,
+    pub description: Option<String>,
+    pub required: bool,
+    pub kind: QuestionFieldKind,
+}
+
+/// What a question field shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionFieldKind {
+    /// A text field (a number is typed here too).
+    Text { default: Option<String> },
+    /// A choice among options.
+    Choice {
+        options: Vec<QuestionOption>,
+        default: Option<String>,
+    },
+    /// Yes or no.
+    Boolean { default: Option<bool> },
+    /// Any number of the options.
+    Multi {
+        options: Vec<QuestionOption>,
+        default: Vec<String>,
+    },
+}
+
+/// One option of a choice field.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QuestionOption {
+    pub value: String,
+    pub label: String,
+}
+
+/// A question the Agent is waiting on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PendingQuestion {
+    pub request_id: String,
+    pub title: String,
+    pub message: String,
+    pub fields: Vec<QuestionField>,
+}
+
+/// What the person submitted for a question.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum QuestionResponse {
+    /// Every field's answer, in field order.
+    Submit(Vec<(String, QuestionAnswer)>),
+    /// Leave the question unanswered.
+    Decline,
+}
+
+/// Answers a question card.
+type QuestionAction = Rc<dyn Fn(&str, QuestionResponse)>;
+
 /// What the shell may do, and the state it shows.
 #[derive(Clone)]
 pub struct SessionHost {
@@ -144,13 +212,16 @@ pub struct SessionHost {
     pub runtime: Signal<Option<SharedString>>,
     /// The permission the Agent waits on, shown above the composer.
     pub pending: Signal<Option<PendingPermission>>,
-    /// An answer to that permission is in flight.
+    /// The question the Agent waits on, shown above the composer.
+    pub question: Signal<Option<PendingQuestion>>,
+    /// An answer to either is in flight.
     pub resolving: Signal<bool>,
     pub on_select: Rc<dyn Fn(&str)>,
     pub on_send: Rc<dyn Fn(&str)>,
     pub on_refresh: Rc<dyn Fn()>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_permission: PermissionAction,
+    pub on_question: QuestionAction,
 }
 
 /// The session shell.
@@ -183,6 +254,12 @@ pub fn session(host: SessionHost) -> impl IntoElement {
             let resolving = host.resolving;
             let on_permission = host.on_permission.clone();
             move || permission_card(pending, resolving, on_permission.clone())
+        }))
+        .child(when(move || host.question.get().is_some(), {
+            let question = host.question;
+            let resolving = host.resolving;
+            let on_question = host.on_question.clone();
+            move || question_card(question, resolving, on_question.clone())
         }))
         .child(composer(host.clone()))
         .child(drawer(host, drawer_open))
@@ -539,6 +616,347 @@ fn permission_card(
                 .gap(px(theme::SPACING_SM))
                 .pt(px(theme::SPACING_XS))
                 .children(buttons),
+        )
+}
+
+/// The question card, above the composer.
+///
+/// A question carries typed fields; the card draws a field per kind (a text
+/// field, a row of choices, yes/no), checks the required ones, and submits or
+/// declines. The Agent is blocked while it shows.
+fn question_card(
+    question: Signal<Option<PendingQuestion>>,
+    resolving: Signal<bool>,
+    on_question: QuestionAction,
+) -> impl IntoElement {
+    let request = question.get_untracked().expect("shown while pending");
+    let request_id = request.request_id;
+    let mut elements = Vec::new();
+    let mut texts: Vec<(String, Signal<String>)> = Vec::new();
+    let mut choices: Vec<(String, Signal<Option<String>>)> = Vec::new();
+    let mut booleans: Vec<(String, Signal<Option<bool>>)> = Vec::new();
+    let mut multis: Vec<(String, Signal<Vec<String>>)> = Vec::new();
+    let mut required: Vec<(String, QuestionFieldKind)> = Vec::new();
+
+    for field in request.fields {
+        let QuestionField {
+            id,
+            title,
+            description,
+            required: is_required,
+            kind,
+        } = field;
+        if is_required {
+            required.push((id.clone(), kind.clone()));
+        }
+        let placeholder = title.clone();
+        let mut column = view().w_full().gap(px(2.0)).child(
+            text(title)
+                .text_size(px(theme::FONT_DETAIL))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::foreground),
+        );
+        if let Some(description) = description {
+            column = column.child(
+                text(description)
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::text_muted),
+            );
+        }
+        match kind {
+            QuestionFieldKind::Text { default } => {
+                let value = signal(default.unwrap_or_default());
+                texts.push((id.clone(), value));
+                column = column.child(field::text_field(value, move || placeholder.clone()));
+            }
+            QuestionFieldKind::Choice { options, default } => {
+                let selected = signal(default);
+                choices.push((id.clone(), selected));
+                let rows = options
+                    .into_iter()
+                    .map(move |option| choice_button(option.label, option.value, selected));
+                column = column.child(view().flex_col().gap(px(theme::SPACING_XS)).children(rows));
+            }
+            QuestionFieldKind::Boolean { default } => {
+                let selected = signal(default);
+                booleans.push((id.clone(), selected));
+                let yes = boolean_button(copy::text("Yes", "是", "是").to_owned(), true, selected);
+                let no = boolean_button(copy::text("No", "否", "否").to_owned(), false, selected);
+                column = column.child(
+                    view()
+                        .flex_row()
+                        .gap(px(theme::SPACING_SM))
+                        .child(yes)
+                        .child(no),
+                );
+            }
+            QuestionFieldKind::Multi { options, default } => {
+                let chosen = signal(default);
+                multis.push((id.clone(), chosen));
+                let rows = options
+                    .into_iter()
+                    .map(move |option| multi_button(option.label, option.value, chosen));
+                column = column.child(view().flex_col().gap(px(theme::SPACING_XS)).children(rows));
+            }
+        }
+        elements.push(column.into_element());
+    }
+
+    let error = signal(None::<&'static str>);
+    let texts_for_submit = texts.clone();
+    let choices_for_submit = choices.clone();
+    let booleans_for_submit = booleans.clone();
+    let multis_for_submit = multis.clone();
+    let required_for_submit = required.clone();
+    let submit_request = request_id.clone();
+    let submit = {
+        let on_question = on_question.clone();
+        move || {
+            let mut answers = Vec::new();
+            for (id, value) in &texts_for_submit {
+                let text = value.get_untracked();
+                if required_for_submit
+                    .iter()
+                    .any(|(required_id, _)| required_id == id)
+                    && text.trim().is_empty()
+                {
+                    error.set(Some("Fill in the required fields."));
+                    return;
+                }
+                answers.push((id.clone(), QuestionAnswer::Text(text)));
+            }
+            for (id, value) in &choices_for_submit {
+                let Some(value) = value.get_untracked() else {
+                    if required_for_submit
+                        .iter()
+                        .any(|(required_id, _)| required_id == id)
+                    {
+                        error.set(Some("Choose an option for the required fields."));
+                        return;
+                    }
+                    continue;
+                };
+                answers.push((id.clone(), QuestionAnswer::Text(value)));
+            }
+            for (id, value) in &multis_for_submit {
+                let values = value.get_untracked();
+                if required_for_submit
+                    .iter()
+                    .any(|(required_id, _)| required_id == id)
+                    && values.is_empty()
+                {
+                    error.set(Some("Choose at least one option for the required fields."));
+                    return;
+                }
+                if !values.is_empty() {
+                    answers.push((id.clone(), QuestionAnswer::Texts(values)));
+                }
+            }
+            for (id, value) in &booleans_for_submit {
+                let Some(value) = value.get_untracked() else {
+                    if required_for_submit
+                        .iter()
+                        .any(|(required_id, _)| required_id == id)
+                    {
+                        error.set(Some("Answer the required fields."));
+                        return;
+                    }
+                    continue;
+                };
+                answers.push((id.clone(), QuestionAnswer::Boolean(value)));
+            }
+            error.set(None);
+            on_question(&submit_request, QuestionResponse::Submit(answers));
+        }
+    };
+    let decline = {
+        let on_question = on_question.clone();
+        let request_id = request_id.clone();
+        move || on_question(&request_id, QuestionResponse::Decline)
+    };
+
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_MD))
+        .border_t_1()
+        .border_t_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            text(request.title)
+                .text_size(px(theme::FONT_BODY))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(theme::foreground),
+        )
+        .child(
+            text(request.message)
+                .text_size(px(theme::FONT_CAPTION))
+                .text_color(theme::text_secondary),
+        )
+        .children(elements)
+        .child(when(
+            move || error.get().is_some(),
+            move || {
+                text(move || error.get().unwrap_or_default())
+                    .text_size(px(theme::FONT_CAPTION))
+                    .text_color(theme::accent_red)
+            },
+        ))
+        .child(
+            view()
+                .flex_row()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .pt(px(theme::SPACING_XS))
+                .child(
+                    action::primary(
+                        copy::text("Submit", "提交", "提交"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        submit,
+                    )
+                    .flex_1()
+                    .disabled(move || resolving.get())
+                    .disabled_style(|style| style.opacity(0.5)),
+                )
+                .child(
+                    action::secondary(
+                        copy::text("Decline", "拒绝", "拒絕"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        decline,
+                    )
+                    .flex_1()
+                    .disabled(move || resolving.get())
+                    .disabled_style(|style| style.opacity(0.5)),
+                ),
+        )
+}
+
+/// One selectable row of a choice field.
+fn choice_button(label: String, value: String, selected: Signal<Option<String>>) -> ButtonElement {
+    let pressed = value.clone();
+    let border_value = value.clone();
+    let fill_value = value.clone();
+    let text_value = value;
+    button()
+        .on_press(move || selected.set(Some(pressed.clone())))
+        .w_full()
+        .min_h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(move || {
+            if selected.with(|selected| selected.as_deref() == Some(border_value.as_str())) {
+                theme::foreground()
+            } else {
+                theme::border_subtle()
+            }
+        })
+        .bg(move || {
+            if selected.with(|selected| selected.as_deref() == Some(fill_value.as_str())) {
+                theme::background_card()
+            } else {
+                theme::background_dim()
+            }
+        })
+        .items_center()
+        .justify_center()
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(move || {
+                    if selected.with(|selected| selected.as_deref() == Some(text_value.as_str())) {
+                        theme::foreground()
+                    } else {
+                        theme::text_secondary()
+                    }
+                }),
+        )
+}
+
+/// One toggle row of a multi-select field.
+fn multi_button(label: String, value: String, chosen: Signal<Vec<String>>) -> ButtonElement {
+    let pressed = value.clone();
+    let border_value = value.clone();
+    let fill_value = value.clone();
+    let text_value = value;
+    button()
+        .on_press(move || {
+            chosen.update(|chosen| {
+                if let Some(index) = chosen.iter().position(|item| item == &pressed) {
+                    chosen.remove(index);
+                } else {
+                    chosen.push(pressed.clone());
+                }
+            });
+        })
+        .w_full()
+        .min_h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(move || {
+            if chosen.with(|chosen| chosen.contains(&border_value)) {
+                theme::foreground()
+            } else {
+                theme::border_subtle()
+            }
+        })
+        .bg(move || {
+            if chosen.with(|chosen| chosen.contains(&fill_value)) {
+                theme::background_card()
+            } else {
+                theme::background_dim()
+            }
+        })
+        .items_center()
+        .justify_center()
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(move || {
+                    if chosen.with(|chosen| chosen.contains(&text_value)) {
+                        theme::foreground()
+                    } else {
+                        theme::text_secondary()
+                    }
+                }),
+        )
+}
+
+/// One side of a yes/no field.
+fn boolean_button(label: String, value: bool, selected: Signal<Option<bool>>) -> ButtonElement {
+    button()
+        .on_press(move || selected.set(Some(value)))
+        .flex_1()
+        .min_h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(move || {
+            if selected.with(|selected| *selected == Some(value)) {
+                theme::foreground()
+            } else {
+                theme::border_subtle()
+            }
+        })
+        .bg(move || {
+            if selected.with(|selected| *selected == Some(value)) {
+                theme::background_card()
+            } else {
+                theme::background_dim()
+            }
+        })
+        .items_center()
+        .justify_center()
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(move || {
+                    if selected.with(|selected| *selected == Some(value)) {
+                        theme::foreground()
+                    } else {
+                        theme::text_secondary()
+                    }
+                }),
         )
 }
 

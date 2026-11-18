@@ -74,12 +74,15 @@ A successful claim or a tapped saved runtime opens the session shell:
 - a pending permission is a card above the composer: the title says what is
   asked, the lines say what it would do, and every answer the runtime allows
   is a button. Answering sends the resolution as a human reply and re-reads
-  the transcript.
+  the transcript;
+- a pending question is a typed form: one field per kind (text, a number, a
+  choice, yes/no, multi-select), required fields checked before submitting,
+  and the answers converted back to the runtime's typed values.
 
-Question forms (elicitation), attachments, the composer's commands and
-@-mentions land with their own passes. The shell's tests mount it over a
-fixture; the live and answer paths are compile-verified and use the same
-projection and backend types the desktop tests cover.
+Attachments and the composer's commands and @-mentions land with their own
+passes. The shell's tests mount it over a fixture; the live and answer paths
+are compile-verified and use the same projection and backend types the
+desktop tests cover.
 
 ## Run it
 
@@ -116,9 +119,9 @@ Two layers:
   code without an address is refused with the copy that says what is missing,
   and the nearby sheet opens. The session shell's flows are covered too: the
   drawer lists sessions, switching one swaps the transcript, a streaming
-  Markdown reply renders, the composer appends what was sent and clears, and a
-  permission card is answered and leaves. Each migrated screen adds the flows
-  its GPUI pair has.
+  Markdown reply renders, the composer appends what was sent and clears, a
+  permission card is answered and leaves, and a question collects a typed
+  answer and leaves. Each migrated screen adds the flows its GPUI pair has.
 
 `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` in CI
 cover the new crates as they do the rest of the workspace.
@@ -211,8 +214,7 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-1. Question forms (elicitation), attachments, and the composer's commands and
-   @-mentions.
+1. Attachments, and the composer's commands and @-mentions.
 2. The outbound half of the host bridge (asking the shell for the camera and
    discovery), the platform device name and the release pipeline.
 3. Workbench: files, Git and the terminal (nsh's `Editor`, `DiffView` and

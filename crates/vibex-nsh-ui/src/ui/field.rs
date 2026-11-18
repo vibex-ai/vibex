@@ -10,7 +10,7 @@ use crate::theme;
 /// The field is controlled: the owner keeps the text in `value` and
 /// `on_change` writes it back. The platform draws the caret, selection,
 /// autocorrection and keyboard, so the app does not.
-pub fn text_field(value: Signal<String>, placeholder: &'static str) -> Input {
+pub fn text_field(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
     input()
         .value(move || value.get())
         .on_change(move |text: &str| value.set(text.to_owned()))

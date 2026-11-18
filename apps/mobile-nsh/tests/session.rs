@@ -11,8 +11,8 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::session::{
-    self, EntryKind, PendingPermission, PermissionChoice, PermissionOption, SessionHost,
-    SessionState, SessionSummary, TimelineEntry,
+    self, EntryKind, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
+    QuestionField, QuestionFieldKind, SessionHost, SessionState, SessionSummary, TimelineEntry,
 };
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
@@ -65,32 +65,55 @@ fn transcript(session: &str) -> Vec<TimelineEntry> {
 /// these tests cover.
 #[component]
 fn Shell() -> impl IntoElement {
-    session::session(host_with(None))
+    session::session(host_with(None, None))
 }
 
 /// The same shell with a permission waiting for an answer.
 #[component]
 fn PermissionShell() -> impl IntoElement {
-    session::session(host_with(Some(PendingPermission {
-        request_id: "req_1".to_owned(),
-        title: "Run cargo test?".to_owned(),
-        details: vec!["Command: cargo test".to_owned()],
-        options: vec![
-            PermissionOption {
-                id: "approve".to_owned(),
-                label: "Allow".to_owned(),
-                choice: PermissionChoice::Allow,
-            },
-            PermissionOption {
-                id: "deny".to_owned(),
-                label: "Deny".to_owned(),
-                choice: PermissionChoice::Deny,
-            },
-        ],
-    })))
+    session::session(host_with(
+        Some(PendingPermission {
+            request_id: "req_1".to_owned(),
+            title: "Run cargo test?".to_owned(),
+            details: vec!["Command: cargo test".to_owned()],
+            options: vec![
+                PermissionOption {
+                    id: "approve".to_owned(),
+                    label: "Allow".to_owned(),
+                    choice: PermissionChoice::Allow,
+                },
+                PermissionOption {
+                    id: "deny".to_owned(),
+                    label: "Deny".to_owned(),
+                    choice: PermissionChoice::Deny,
+                },
+            ],
+        }),
+        None,
+    ))
 }
 
-fn host_with(pending: Option<PendingPermission>) -> SessionHost {
+/// The same shell with a question waiting for typed answers.
+#[component]
+fn QuestionShell() -> impl IntoElement {
+    session::session(host_with(
+        None,
+        Some(PendingQuestion {
+            request_id: "req_q".to_owned(),
+            title: "Which branch?".to_owned(),
+            message: "Pick the branch the Agent should work on.".to_owned(),
+            fields: vec![QuestionField {
+                id: "branch".to_owned(),
+                title: "Branch".to_owned(),
+                description: None,
+                required: true,
+                kind: QuestionFieldKind::Text { default: None },
+            }],
+        }),
+    ))
+}
+
+fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
     let timeline = signal(transcript("s1"));
@@ -99,6 +122,7 @@ fn host_with(pending: Option<PendingPermission>) -> SessionHost {
     let error = signal(None::<SharedString>);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
+    let question = signal(question);
     let resolving = signal(false);
 
     let select = Rc::new(move |id: &str| {
@@ -119,6 +143,9 @@ fn host_with(pending: Option<PendingPermission>) -> SessionHost {
     let on_permission = Rc::new(move |_: &str, _: PermissionChoice| {
         pending.set(None);
     });
+    let on_question = Rc::new(move |_: &str, _| {
+        question.set(None);
+    });
     SessionHost {
         sessions,
         active,
@@ -128,12 +155,14 @@ fn host_with(pending: Option<PendingPermission>) -> SessionHost {
         error,
         runtime,
         pending,
+        question,
         resolving,
         on_select: select,
         on_send: send,
         on_refresh: Rc::new(|| {}),
         on_disconnect: Rc::new(|| {}),
         on_permission,
+        on_question,
     }
 }
 
@@ -221,5 +250,17 @@ fn a_permission_card_is_answered_and_leaves() {
     app.wait_for("Run cargo test?").unwrap();
     app.press("role:button[Allow]").unwrap();
     app.wait_for_gone("Run cargo test?", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn a_question_collects_an_answer_and_leaves() {
+    let mut config = EngineConfig::new(Root::of::<QuestionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Which branch?").unwrap();
+    app.type_text("text:Branch", "main").unwrap();
+    app.press("role:button[Submit]").unwrap();
+    app.wait_for_gone("Which branch?", std::time::Duration::from_secs(5))
         .unwrap();
 }
