@@ -38919,11 +38919,20 @@ impl VibexWorkbench {
         self.switch_to_composer_terminal(window_handle, window, cx);
     }
 
+    /// Opens a workspace file in the editor panel, wherever the panel is.
+    ///
+    /// The tab comes first and the reveal second, the same order
+    /// [`Self::open_web_link`] uses. The reveal is what opens the panel or
+    /// raises the window that already hosts it, so running it first raises a
+    /// host whose contents are still the file the reader was looking at: the
+    /// panel comes forward showing the old tab and the click reads as spent.
+    /// Opening first means the panel is brought forward with the tab the click
+    /// named already on top, whether it is docked, floating, or popped out.
     fn open_code_file(&mut self, path: String, window: &mut Window, cx: &mut Context<Self>) {
-        self.reveal_code_preview(cx);
         self.code_workbench.update(cx, |workbench, cx| {
             workbench.open_file(path, false, window, cx)
         });
+        self.reveal_code_preview(cx);
     }
 
     fn composer_attachment_workspace_root(&self) -> Option<String> {
@@ -113769,6 +113778,122 @@ mod tests {
         assert!(
             hand_back.contains("preview_window_mode = PreviewWindowMode::Inline"),
             "a user close must return the panel inline for good"
+        );
+    }
+
+    /// A file link opens its own tab before it raises the panel that hosts it.
+    ///
+    /// The panel is one model, so a second link lands beside the first and
+    /// takes the front whether the panel was closed or already on screen. The
+    /// order is what a popped-out panel makes visible: the reveal is what
+    /// raises the host window, and a reveal that runs first raises a window
+    /// that still shows the previous file, so the click reads as spent.
+    /// [`VibexWorkbench::open_web_link`] already opens first and reveals
+    /// second; a file link follows the same order.
+    #[gpui::test]
+    fn a_file_link_opens_its_tab_while_the_editor_panel_is_already_open(cx: &mut TestAppContext) {
+        struct LinkProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for LinkProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                div()
+            }
+        }
+
+        let open_tabs = |workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext| {
+            workbench.read_with(cx, |workbench, cx| {
+                let preview = &workbench.code_workbench.read(cx).preview;
+                (
+                    preview.tabs.keys().cloned().collect::<Vec<_>>(),
+                    preview
+                        .active_tab_id(&preview.focused_pane_id)
+                        .map(str::to_string),
+                )
+            })
+        };
+
+        for panel_open in [false, true] {
+            cx.update(gpui_component::init);
+            let (probe, cx) = cx.add_window_view(|window, cx| {
+                let mut ui_state = DesktopUiStateV1::default();
+                ui_state.appearance.locale = LocaleMode::En;
+                ui_state.workbench.preview_visible = panel_open;
+                let workbench = cx
+                    .new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+                LinkProbe { workbench }
+            });
+            let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+
+            workbench.update_in(cx, |workbench, window, cx| {
+                workbench.open_markdown_link("src/first.rs", "", window, cx);
+            });
+            cx.run_until_parked();
+            let (tabs, active) = open_tabs(&workbench, cx);
+            assert_eq!(
+                tabs,
+                vec!["file:src/first.rs".to_string()],
+                "the first link opens its file (panel_open={panel_open})"
+            );
+            assert_eq!(active.as_deref(), Some("file:src/first.rs"));
+
+            // The panel is on screen now either way; the second link has to
+            // land beside the first one instead of being swallowed by it.
+            workbench.update_in(cx, |workbench, window, cx| {
+                workbench.open_markdown_link("src/second.rs", "", window, cx);
+            });
+            cx.run_until_parked();
+            let (tabs, active) = open_tabs(&workbench, cx);
+            assert_eq!(
+                tabs,
+                vec![
+                    "file:src/first.rs".to_string(),
+                    "file:src/second.rs".to_string()
+                ],
+                "a link opens a tab while the panel is already up (panel_open={panel_open})"
+            );
+            assert_eq!(
+                active.as_deref(),
+                Some("file:src/second.rs"),
+                "the file behind the link comes to the front (panel_open={panel_open})"
+            );
+        }
+
+        // The click only reaches a panel that is brought forward *after* the
+        // tab exists. Revealing first raises the host around whatever it was
+        // already showing — in the popped-out window that is the whole of what
+        // the raise does, so the file behind the link never comes forward.
+        let source = include_str!("app.rs");
+        let body = |name: &str, next: &str| {
+            source
+                .split_once(&format!("    fn {name}("))
+                .and_then(|(_, tail)| tail.split_once(&format!("\n    {next}")))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} should remain inspectable"))
+        };
+        let open_file = body("open_code_file", "fn composer_attachment_workspace_root(");
+        let opened = open_file
+            .find("workbench.open_file(")
+            .expect("the link has to open its file");
+        let revealed = open_file
+            .find("self.reveal_code_preview(cx)")
+            .expect("the link has to bring the panel forward");
+        assert!(
+            opened < revealed,
+            "the tab opens before the panel is revealed, or the reveal raises a host \
+             that still shows the previous file"
+        );
+        let open_web = body("open_web_link", "fn open_composer_token_reference(");
+        let web_opened = open_web
+            .find("workbench.open_web_link(")
+            .expect("a web link opens its page");
+        let web_revealed = open_web
+            .find("self.reveal_code_preview(cx)")
+            .expect("a web link brings the panel forward");
+        assert!(
+            web_opened < web_revealed,
+            "a web link already opens before it reveals; a file link works the same way"
         );
     }
 
