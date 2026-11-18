@@ -23,20 +23,20 @@ use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitRequest,
-    GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, MessageProvenance,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
-    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
-    TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery,
-    VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitDetailRequest,
+    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary,
+    MessageProvenance, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeOptionAvailability, SendAgentMessageRequest, SessionRuntimeOption,
+    TerminalCreateRequest, TerminalId, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::files::{FileEntry, FilePreview},
-    screens::git::{CommitRow, GitChangeRow, GitDiffPreview},
+    screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
         CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
@@ -101,6 +101,7 @@ pub struct SessionService {
     git_committing: Signal<bool>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
+    git_commit_detail: Signal<Option<CommitDetailPreview>>,
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -176,6 +177,7 @@ impl SessionService {
             git_committing: signal(false),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
+            git_commit_detail: signal(None),
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
@@ -234,6 +236,7 @@ impl SessionService {
             git_committing: self.git_committing,
             git_history: self.git_history,
             git_show_history: self.git_show_history,
+            git_commit_detail: self.git_commit_detail,
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
             new_runtimes: self.new_runtimes,
@@ -346,6 +349,14 @@ impl SessionService {
             on_toggle_git_history: {
                 let service = self.clone();
                 Rc::new(move || service.toggle_git_history())
+            },
+            on_open_git_commit: {
+                let service = self.clone();
+                Rc::new(move |hash: &str| service.open_git_commit(hash))
+            },
+            on_revert_git: {
+                let service = self.clone();
+                Rc::new(move |path: &str| service.revert_path(path))
             },
             on_git_back: {
                 let service = self.clone();
@@ -1365,6 +1376,8 @@ impl SessionService {
                     title,
                     body: diff.diff,
                     truncated: diff.truncated,
+                    path: diff.path,
+                    staged: diff.staged,
                 })),
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
                 Err(error) => service.git_error.set(Some(
@@ -1505,8 +1518,89 @@ impl SessionService {
         });
     }
 
+    /// Reads one commit's message and patch.
+    fn open_git_commit(&self, hash: &str) {
+        self.git_error.set(None);
+        let hash = hash.to_owned();
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                git.git_commit_detail(GitCommitDetailRequest {
+                    workspace_id: workspace,
+                    commit_hash: hash,
+                    include_patch: true,
+                })
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(detail)) => {
+                    let mut body = detail.summary.subject.clone();
+                    if let Some(message) = detail.body {
+                        body.push_str("\n\n");
+                        body.push_str(&message);
+                    }
+                    if let Some(patch) = detail.patch {
+                        body.push_str("\n\n");
+                        body.push_str(&patch);
+                    }
+                    service.git_commit_detail.set(Some(CommitDetailPreview {
+                        title: detail.summary.short_hash,
+                        body,
+                        truncated: detail.patch_truncated,
+                    }));
+                }
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reading the commit did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Reverts one path's working-tree changes.
+    fn revert_path(&self, path: &str) {
+        let path = path.to_owned();
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                git.git_revert(MutationRequest::new(GitStageRequest {
+                    workspace_id: workspace,
+                    paths: vec![path],
+                }))
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(status)) => {
+                    service.git_diff.set(None);
+                    service.git_error.set(None);
+                    service.apply_git_status(status);
+                }
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reverting the path did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
     /// Leaves the diff, then the surface.
     fn git_back(&self) {
+        if self.git_commit_detail.get_untracked().is_some() {
+            self.git_commit_detail.set(None);
+            return;
+        }
         if self.git_show_history.get_untracked() {
             self.git_show_history.set(false);
             return;

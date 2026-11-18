@@ -93,8 +93,11 @@ A successful claim or a tapped saved runtime opens the session shell:
 - the drawer opens the workspace's Git status: branch, changed paths with
   additions and deletions, and a path's diff from `git_diff`; each row stages
   or unstages its path (`stage`, `unstage`), the status the runtime returns
-  replaces the list, a message field commits what is staged (`commit`), and
-  the History view lists recent commits (`git_history`).
+  replaces the list, a message field commits what is staged (`commit`), the
+  History view lists recent commits (`git_history`), a commit opens its message
+  and patch (`git_commit_detail`), and an unstaged diff can be discarded with
+  a native confirmation (`git_revert`). Branch switching is not offered: the
+  backend exposes the branch list but no checkout call.
 
 Attachments and `@`-mentions land with their own passes. The shell's tests
 mount it over a fixture; the live, answer and terminal paths are
@@ -262,5 +265,5 @@ the shipping GPUI client, taken before the screen moves.
 1. Attachments (the file picker and how a chosen file reaches the runtime).
 2. The platform device name and the release pipeline; the shell's own camera
    and discovery code against the request queue.
-3. The rest of the workbench: editing (nsh's `Editor` and `DiffView`), and the
-   Git actions still missing (revert, branch switching, commit detail).
+3. The rest of the workbench: a syntax-highlighted editor (nsh's `Editor`) in
+   place of the plain field.

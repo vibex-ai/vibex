@@ -40,6 +40,18 @@ pub struct GitDiffPreview {
     pub title: String,
     pub body: String,
     pub truncated: bool,
+    /// The path it belongs to, for reverting it.
+    pub path: String,
+    /// Whether it is the staged version.
+    pub staged: bool,
+}
+
+/// An opened commit.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CommitDetailPreview {
+    pub title: String,
+    pub body: String,
+    pub truncated: bool,
 }
 
 /// What the surface may do, and the state it shows.
@@ -58,6 +70,11 @@ pub struct GitHost {
     /// The commit history, on its own view.
     pub history: Signal<Vec<CommitRow>>,
     pub show_history: Signal<bool>,
+    /// The commit being read, shown over the history.
+    pub commit_detail: Signal<Option<CommitDetailPreview>>,
+    pub on_open_commit: Rc<dyn Fn(&str)>,
+    /// Reverts the path whose diff is open, after the app confirms it.
+    pub on_revert: Rc<dyn Fn(&str)>,
     pub on_commit: Rc<dyn Fn()>,
     pub on_toggle_history: Rc<dyn Fn()>,
     /// Opens a path's diff; the second argument says whether it is the staged
@@ -80,6 +97,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
     let error = host.error;
     let on_refresh = host.on_refresh.clone();
     let show_history = host.show_history;
+    let commit_detail = host.commit_detail;
     view()
         .flex_1()
         .bg(theme::background)
@@ -108,6 +126,9 @@ pub fn git(host: GitHost) -> impl IntoElement {
                         })
                         .child(
                             text(move || {
+                                if let Some(detail) = commit_detail.get() {
+                                    return detail.title;
+                                }
                                 if show_history.get() {
                                     return copy::text("History", "历史", "歷史").to_owned();
                                 }
@@ -148,12 +169,20 @@ pub fn git(host: GitHost) -> impl IntoElement {
                         }),
                 ),
         )
-        .child(when(move || show_history.get(), {
-            let history = host.history;
-            move || history_list(history)
+        .child(when(move || commit_detail.get().is_some(), {
+            let detail = commit_detail;
+            move || commit_detail_view(detail)
         }))
         .child(when(
-            move || !show_history.get() && error.get().is_some(),
+            move || commit_detail.get().is_none() && show_history.get(),
+            {
+                let history = host.history;
+                let on_open_commit = host.on_open_commit.clone();
+                move || history_list(history, on_open_commit.clone())
+            },
+        ))
+        .child(when(
+            move || commit_detail.get().is_none() && !show_history.get() && error.get().is_some(),
             move || {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
@@ -162,19 +191,25 @@ pub fn git(host: GitHost) -> impl IntoElement {
                     .text_color(theme::accent_red)
             },
         ))
-        .child(when(move || !show_history.get() && diff.get().is_none(), {
-            let staged = host.staged;
-            let message = host.message;
-            let committing = host.committing;
-            let on_commit = host.on_commit.clone();
-            move || commit_bar(staged, message, committing, on_commit.clone())
-        }))
         .child(when(
-            move || !show_history.get() && diff.get().is_some(),
-            move || diff_view(diff),
+            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
+            {
+                let staged = host.staged;
+                let message = host.message;
+                let committing = host.committing;
+                let on_commit = host.on_commit.clone();
+                move || commit_bar(staged, message, committing, on_commit.clone())
+            },
         ))
         .child(when(
-            move || !show_history.get() && diff.get().is_none(),
+            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_some(),
+            {
+                let on_revert = host.on_revert.clone();
+                move || diff_view(diff, on_revert.clone())
+            },
+        ))
+        .child(when(
+            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
             move || {
                 change_list(
                     changes,
@@ -374,11 +409,14 @@ fn commit_bar(
 }
 
 /// The history list.
-fn history_list(history: Signal<Vec<CommitRow>>) -> impl IntoElement {
+fn history_list(
+    history: Signal<Vec<CommitRow>>,
+    on_open_commit: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
     view().flex_1().min_h(px(0.0)).child(
         virtual_list(
             move || history.with(|history| history.len()),
-            move |at: Position| history_row(at, history),
+            move |at: Position| history_row(at, history, on_open_commit.clone()),
         )
         .keys(move || {
             history.with(|history| {
@@ -393,18 +431,29 @@ fn history_list(history: Signal<Vec<CommitRow>>) -> impl IntoElement {
     )
 }
 
-fn history_row(at: Position, history: Signal<Vec<CommitRow>>) -> impl IntoElement {
+fn history_row(
+    at: Position,
+    history: Signal<Vec<CommitRow>>,
+    on_open_commit: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
     let commit = computed(move || history.with(|history| history.get(at.index()).cloned()));
-    view()
+    button()
         .w_full()
         .min_h(px(56.0))
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_XS))
         .flex_col()
+        .items_start()
         .justify_center()
         .gap(px(2.0))
         .border_b_1()
         .border_b_color(theme::border_subtle)
+        .active(|style| style.opacity(0.8))
+        .on_press(move || {
+            if let Some(commit) = commit.get_untracked() {
+                on_open_commit(&commit.hash);
+            }
+        })
         .child(
             text(move || {
                 commit
@@ -429,7 +478,11 @@ fn history_row(at: Position, history: Signal<Vec<CommitRow>>) -> impl IntoElemen
         )
 }
 
-fn diff_view(diff: Signal<Option<GitDiffPreview>>) -> impl IntoElement {
+/// The diff with the action that discards it.
+fn diff_view(
+    diff: Signal<Option<GitDiffPreview>>,
+    on_revert: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
     let body = computed(move || {
         diff.with(|diff| {
             diff.as_ref()
@@ -446,6 +499,14 @@ fn diff_view(diff: Signal<Option<GitDiffPreview>>) -> impl IntoElement {
     });
     let truncated =
         computed(move || diff.with(|diff| diff.as_ref().is_some_and(|diff| diff.truncated)));
+    let path = computed(move || {
+        diff.with(|diff| {
+            diff.as_ref()
+                .map(|diff| diff.path.clone())
+                .unwrap_or_default()
+        })
+    });
+    let staged = computed(move || diff.with(|diff| diff.as_ref().is_some_and(|diff| diff.staged)));
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -463,13 +524,95 @@ fn diff_view(diff: Signal<Option<GitDiffPreview>>) -> impl IntoElement {
                 .line_height(theme::line_height_for(theme::FONT_MICRO))
                 .text_color(theme::foreground),
         )
+        .child(when(move || truncated.get(), || {
+            text(copy::text(
+                "The diff is larger than the preview limit.",
+                "差异超过预览上限。",
+                "差異超過預覽上限。",
+            ))
+            .text_size(px(theme::FONT_MICRO))
+            .text_color(theme::text_muted)
+        }))
+        .child(when(move || !staged.get(), {
+            let on_revert = on_revert.clone();
+            move || {
+                let path = path.get_untracked();
+                let on_revert = on_revert.clone();
+                button()
+                    .w_full()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .justify_center()
+                    .items_center()
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::accent_red)
+                    .active(|style| style.opacity(0.7))
+                    .on_press(move || {
+                        let path = path.clone();
+                        let on_revert = on_revert.clone();
+                        spawn(async move {
+                            let answer = nsh_base::alert_dialog()
+                                .title(copy::text(
+                                    "Revert this file?",
+                                    "还原这个文件？",
+                                    "還原這個檔案？",
+                                ))
+                                .description(copy::text(
+                                    "The working-tree changes to this path are discarded.",
+                                    "该路径在工作区的改动会被丢弃。",
+                                    "該路徑在工作區的改動會被丟棄。",
+                                ))
+                                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                                .destructive("revert", copy::text("Revert", "还原", "還原"))
+                                .show()
+                                .await;
+                            if matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("revert"))
+                            {
+                                on_revert(&path);
+                            }
+                        });
+                    })
+                    .child(
+                        text(copy::text("Revert changes", "还原改动", "還原改動"))
+                            .text_size(px(theme::FONT_DETAIL))
+                            .text_color(theme::accent_red),
+                    )
+            }
+        }))
+}
+
+/// One commit's message and patch.
+fn commit_detail_view(detail: Signal<Option<CommitDetailPreview>>) -> impl IntoElement {
+    let body = computed(move || {
+        detail.with(|detail| {
+            detail
+                .as_ref()
+                .map(|detail| detail.body.clone())
+                .unwrap_or_default()
+        })
+    });
+    let truncated = computed(move || {
+        detail.with(|detail| detail.as_ref().is_some_and(|detail| detail.truncated))
+    });
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_SM))
+        .child(
+            text(move || body.get())
+                .text_size(px(theme::FONT_MICRO))
+                .line_height(theme::line_height_for(theme::FONT_MICRO))
+                .text_color(theme::foreground),
+        )
         .child(when(
             move || truncated.get(),
             || {
                 text(copy::text(
-                    "The diff is larger than the preview limit.",
-                    "差异超过预览上限。",
-                    "差異超過預覽上限。",
+                    "The patch is larger than the preview limit.",
+                    "补丁超过预览上限。",
+                    "補丁超過預覽上限。",
                 ))
                 .text_size(px(theme::FONT_MICRO))
                 .text_color(theme::text_muted)

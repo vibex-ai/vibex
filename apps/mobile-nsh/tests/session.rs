@@ -12,7 +12,7 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
-use vibex_nsh_ui::screens::git::{CommitRow, GitChangeRow, GitDiffPreview};
+use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, CommandEntry, EntryKind, PendingPermission, PendingQuestion, PermissionChoice,
@@ -192,6 +192,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             title: path.to_owned(),
             body: "diff --git a/src/main.rs b/src/main.rs".to_owned(),
             truncated: false,
+            path: path.to_owned(),
+            staged: false,
         }));
     });
     let on_git_back = Rc::new(move || git_diff.set(None));
@@ -205,6 +207,15 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         detail: "Ada".to_owned(),
     }]);
     let git_show_history = signal(false);
+    let git_commit_detail = signal(None::<CommitDetailPreview>);
+    let on_open_git_commit = Rc::new(move |hash: &str| {
+        git_commit_detail.set(Some(CommitDetailPreview {
+            title: hash.to_owned(),
+            body: "commit detail body".to_owned(),
+            truncated: false,
+        }));
+    });
+    let on_revert_git = Rc::new(move |_path: &str| git_diff.set(None));
     let on_commit_git = Rc::new(move || {
         if !git_message.get_untracked().trim().is_empty() {
             git_message.set(String::new());
@@ -358,8 +369,11 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         git_committing,
         git_history,
         git_show_history,
+        git_commit_detail,
         on_commit_git,
         on_toggle_git_history,
+        on_open_git_commit,
+        on_revert_git,
         on_git_back,
         on_refresh_git: Rc::new(|| {}),
         new_session_open,
@@ -599,4 +613,16 @@ fn a_files_save_follows_the_edited_state() {
     app.press("main.rs").unwrap();
     app.wait_for("role:button[Save]").unwrap();
     assert!(app.screen().enabled("role:button[Save]").unwrap());
+}
+
+#[test]
+fn a_history_row_opens_the_commit_detail() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Commit").unwrap();
+    app.press("role:button[History]").unwrap();
+    app.wait_for("Initial commit").unwrap();
+    app.press("Initial commit").unwrap();
+    app.wait_for("commit detail body").unwrap();
 }
