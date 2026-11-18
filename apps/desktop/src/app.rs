@@ -11938,7 +11938,7 @@ impl VibexWorkbench {
         generation: u64,
         cx: &mut Context<Self>,
     ) -> bool {
-        let runtime = self.runtime.clone();
+        let runtime = self.local_authority();
         let backend = self.backend.clone();
         if runtime.is_none() && backend.is_none() {
             return false;
@@ -12157,7 +12157,7 @@ impl VibexWorkbench {
             session_id: item.session_id.clone(),
             sequence,
         };
-        let runtime = self.runtime.clone();
+        let runtime = self.local_authority();
         let backend = self.backend.clone();
         // The row was resolved out of the borrowed view, so the session that
         // owns the read is the one whose timeline carries the item — not the
@@ -14699,7 +14699,7 @@ impl VibexWorkbench {
         if missing.is_empty() {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.local_authority() else {
             return;
         };
         if let Ok(sessions) = runtime.vibex_use().group_member_registry(&missing) {
@@ -19050,6 +19050,22 @@ impl VibexWorkbench {
             .update(cx, |management, cx| management.clear_runtime(cx));
         self.usage_view
             .update(cx, |usage, cx| usage.clear_backend(cx));
+    }
+
+    /// The embedded runtime, but only while it is the authority on screen.
+    ///
+    /// Switching to a remote runtime *parks* the embedded one instead of
+    /// shutting it down, so `self.runtime` stays `Some` for the whole remote
+    /// session. Every Agent read and write that keys off it therefore has to ask
+    /// this instead of the field: the parked runtime never saw a session the
+    /// remote authority owns, and answering such a read from it fails with
+    /// `session_not_found` while the page still holds that session's timeline.
+    /// `None` means "use `self.backend`", which is the installed authority.
+    fn local_authority(&self) -> Option<Arc<DesktopRuntime>> {
+        if self.remote_client.is_some() {
+            return None;
+        }
+        self.runtime.clone()
     }
 
     /// Makes the embedded runtime authoritative again. A parked runtime is
@@ -28812,7 +28828,7 @@ impl VibexWorkbench {
         if self.selected_session_id.as_ref() != Some(session_id) {
             return false;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.local_authority() else {
             // A paired runtime serves the same snapshot over Remote v2. The
             // read is asynchronous, so the indicator updates when it lands
             // instead of reporting an immediate change.
@@ -30076,7 +30092,7 @@ impl VibexWorkbench {
         if mark_agent_session_read(&mut self.unread_agent_completion_session_ids, &session_id) {
             self.publish_sidebar_invalidation();
         }
-        let runtime = self.runtime.clone();
+        let runtime = self.local_authority();
         if runtime.is_none() && self.backend.is_none() {
             return;
         }
@@ -30861,7 +30877,7 @@ impl VibexWorkbench {
             .timeline_follow
             .anchor_span
             .map(|span| span.first_sequence);
-        let (runtime, session_id) = (self.runtime.clone(), self.selected_session_id.clone());
+        let (runtime, session_id) = (self.local_authority(), self.selected_session_id.clone());
         let (Some(runtime), Some(session_id)) = (runtime, session_id) else {
             if let Some(session_id) = self.selected_session_id.clone() {
                 self.timeline.mark_lagged();
@@ -35036,10 +35052,12 @@ impl VibexWorkbench {
         }) {
             return None;
         }
-        if self.runtime.is_none() {
+        if self.local_authority().is_none() {
             // Remote-client mode: command discovery is an authority-local
             // capability, so manual slash expansion stays disabled and typed
-            // text is submitted verbatim.
+            // text is submitted verbatim. A parked embedded runtime is still
+            // `Some`, so the question has to be asked of the authority on
+            // screen rather than of the field.
             return self.take_composer_message_remote(window, cx);
         }
         let session_id = self.view_session_id.clone()?;
@@ -35631,7 +35649,7 @@ impl VibexWorkbench {
     ) {
         let session_id = message.session_id.clone();
         let delivery = composer_queue_message_delivery(behavior);
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.local_authority() else {
             let Some(backend) = self.backend.clone() else {
                 let insert_at = self
                     .composer_queue
@@ -40870,7 +40888,7 @@ impl VibexWorkbench {
         if self.agent_action_pending || self.fork_session_pending || through_sequence <= 0 {
             return;
         }
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.local_authority() else {
             if let Some(backend) = self.backend.clone() {
                 self.fork_session_at_remote(
                     backend,
@@ -43628,8 +43646,11 @@ impl VibexWorkbench {
         selection: SessionRuntimeSelection,
         cx: &mut Context<Self>,
     ) {
+        // Importing a history is a local-only action, so this stays on the
+        // embedded runtime: a parked one must not be asked about a session that
+        // only the paired authority owns.
         let (Some(runtime), Some(session_id)) =
-            (self.runtime.clone(), self.selected_session_id.clone())
+            (self.local_authority(), self.selected_session_id.clone())
         else {
             return;
         };
@@ -48827,7 +48848,9 @@ impl VibexWorkbench {
             }
             return;
         }
-        if self.runtime.is_none() {
+        // A terminal is a local-only authority, so a paired runtime has none to
+        // switch to.
+        if self.local_authority().is_none() {
             return;
         }
         self.switch_to_composer_terminal(window.window_handle(), window, cx);
@@ -73642,32 +73665,45 @@ impl VibexWorkbench {
         let Some(session_id) = self.selected_session_id.clone() else {
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
-            self.agent_error = Some(
-                locale::text(
-                    "Local runtime is not ready",
-                    "本地运行时尚未就绪",
-                    "本地執行時尚未就緒",
-                )
-                .to_string(),
-            );
-            cx.notify();
-            return;
+        // Goal control is a session-scoped write, so it has to reach the
+        // authority that owns the session: the embedded runtime answers for its
+        // own rows, and a paired authority answers over the backend facade. A
+        // parked embedded runtime never saw a remote session, so reading the
+        // field directly would fail here with `session_not_found`.
+        let request = AgentGoalControlRequest {
+            session_id: session_id.clone(),
+            action,
+            objective,
+            expected_revision: None,
+            correlation_id: None,
+        };
+        let runner = match self.local_authority() {
+            Some(runtime) => gpui_tokio::Tokio::spawn(cx, async move {
+                runtime.agent().manager().control_goal(request).await
+            }),
+            None => {
+                let Some(backend) = self.backend.clone() else {
+                    self.agent_error = Some(
+                        locale::text(
+                            "Local runtime is not ready",
+                            "本地运行时尚未就绪",
+                            "本地執行時尚未就緒",
+                        )
+                        .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                };
+                gpui_tokio::Tokio::spawn(cx, async move {
+                    backend
+                        .agent()
+                        .control_goal(MutationRequest::new(request))
+                        .await
+                        .map_err(backend_error_to_vibex)
+                })
+            }
         };
         self.agent_error = None;
-        let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            runtime
-                .agent()
-                .manager()
-                .control_goal(AgentGoalControlRequest {
-                    session_id: session_id.clone(),
-                    action,
-                    objective,
-                    expected_revision: None,
-                    correlation_id: None,
-                })
-                .await
-        });
         cx.spawn(async move |entity, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
@@ -127608,6 +127644,84 @@ mod tests {
             install.contains("upsert(client.credential.clone()"),
             "a pairing that never reached the store still needs a row"
         );
+    }
+
+    /// A session read must never be answered by the parked embedded runtime.
+    ///
+    /// Switching to a paired authority parks the embedded runtime instead of
+    /// shutting it down, so `self.runtime` stays `Some` for the whole remote
+    /// session. Every Agent read that keyed off that field therefore asked the
+    /// parked runtime about a session only the remote authority owns, and the
+    /// answer was `session_not_found` on a page whose timeline had already
+    /// loaded. `local_authority` is the one place that decides, and the session
+    /// paths have to go through it.
+    #[test]
+    fn a_parked_runtime_never_answers_for_a_remote_session() {
+        let source = include_str!("app.rs");
+        let helper = source
+            .split_once("    fn local_authority(&self)")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Makes the embedded runtime authoritative again")
+            })
+            .map(|(body, _)| body)
+            .expect("the authority selector should remain inspectable");
+        assert!(helper.contains("if self.remote_client.is_some() {"));
+        assert!(helper.contains("return None;"));
+        assert!(helper.contains("self.runtime.clone()"));
+
+        // The reads and writes that belong to the authority on screen. A path
+        // that reads `self.runtime` directly answers from the parked runtime.
+        for (name, opener, closer) in [
+            (
+                "session selection",
+                "    fn select_session_with_history(",
+                "\n    /// Remote twin of [`Self::load_agent_session_timeline`]",
+            ),
+            (
+                "older history",
+                "    fn load_older_agent_timeline(",
+                "\n    /// Merges an older page into the borrowed view.",
+            ),
+            (
+                "timeline detail",
+                "    fn request_timeline_detail(",
+                "\n    /// Installs the full payload an activity read produced.",
+            ),
+            (
+                "timeline refetch",
+                "    fn refresh_selected_agent_timeline(",
+                "\n    fn load_agent_session_projection(",
+            ),
+            (
+                "token usage",
+                "    fn refresh_agent_token_usage(",
+                "\n    /// Reads the live token snapshot from the paired runtime.",
+            ),
+            (
+                "composer dispatch",
+                "    fn dispatch_admitted_composer_message(",
+                "\n    /// Probes the latest turn outcome when the composer queue is waiting on an",
+            ),
+            (
+                "fork",
+                "    fn fork_session_at(",
+                "\n    #[allow(clippy::too_many_arguments)]\n    fn begin_inline_user_message_edit(",
+            ),
+        ] {
+            let body = source
+                .split_once(opener)
+                .and_then(|(_, tail)| tail.split_once(closer))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{name} should remain inspectable"));
+            assert!(
+                body.contains("self.local_authority()"),
+                "{name} must read the authority on screen, not the parked runtime"
+            );
+            assert!(
+                !body.contains("self.runtime.clone()"),
+                "{name} must not reach for the parked runtime directly"
+            );
+        }
     }
 
     #[test]
