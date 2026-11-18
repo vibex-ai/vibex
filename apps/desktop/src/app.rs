@@ -43,7 +43,7 @@ use gpui::{
     Size, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
     StyledImage as _, StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind,
     WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, div, img,
+    WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, deferred, div, img,
     linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
 };
 use gpui_base::{TextSelection, text::MarkdownExtensions};
@@ -744,6 +744,17 @@ const TITLE_BAR_SESSION_TITLE_MAX_WIDTH: f32 = 320.0;
 /// pill squeeze a long title to nothing.
 const TITLE_BAR_SESSION_HEADING_EXTRA_WIDTH: f32 = 32.0 + 62.0 + 24.0;
 const TITLE_BAR_SESSION_MENU_WIDTH: f32 = 220.0;
+/// Deferred paint priority for the title-bar update panel.
+///
+/// The panel hangs below the strip, which hides its horizontal overflow, so it
+/// has to be deferred to escape that content mask. It is chrome, not a
+/// decision layer: it belongs below every dialog (`10 + layer`, and a
+/// stackable one climbs from there), so an update that lands while Settings is
+/// open never covers the modal. Below the dialogs and above nothing else, the
+/// first free slot is the one the git-history event relay already takes.
+const UPDATE_PANEL_PRIORITY: usize = 3;
+// A dialog bands from `10 + layer`, so the panel's slot has to stay under it.
+const _: () = assert!(UPDATE_PANEL_PRIORITY < 10);
 /// The runtime manager rides one floating panel whose body swaps between the
 /// list and the detail stage, so management never stacks overlays.
 const RUNTIME_MANAGER_PANEL_WIDTH: f32 = 360.0;
@@ -50670,15 +50681,18 @@ impl VibexWorkbench {
 
     /// The title-bar update entry: an arrow that toggles the update panel.
     ///
-    /// The panel is an ordinary absolutely positioned child rather than a
-    /// `Popover`. Popovers paint in GPUI's deferred pass, which runs after the
-    /// dialog layer, so a popover would float above an open modal — an update
-    /// check that lands while Settings is up must not cover it. An in-tree
-    /// layer stays below Root's dialog layers, and the title bar only clips
-    /// horizontally so the panel can hang below the band.
+    /// The panel is not a `Popover`: a popover paints at `POPUP_PRIORITY`,
+    /// above the dialog layer, and an update check that lands while Settings is
+    /// up must not cover the modal. It cannot be a plain in-tree child either.
+    /// The strip hides its horizontal overflow to keep long titles inside the
+    /// band, and that content mask clips everything painted below the band —
+    /// the panel's own paint and, because a hitbox is intersected with its
+    /// content mask, every click on it. So the panel is deferred at
+    /// [`UPDATE_PANEL_PRIORITY`]: out of the strip's mask, still below the
+    /// dialog band.
     ///
-    /// The trigger owns the toggle because the panel is no longer a `Popover`
-    /// child, and it is built only while open so a closed panel costs nothing.
+    /// The trigger owns the toggle because the panel is not a `Popover` child,
+    /// and it is built only while open so a closed panel costs nothing.
     fn render_update_entry(&mut self, version: &str, cx: &mut Context<Self>) -> AnyElement {
         let open = self.update_panel_open;
         let panel = open.then(|| self.render_update_panel(cx));
@@ -50708,7 +50722,8 @@ impl VibexWorkbench {
             .on_click(cx.listener(|this, _, _, cx| {
                 let open = this.update_panel_open;
                 this.set_update_panel_open(!open, cx);
-            }));
+            }))
+            .debug_selector(|| "title-bar-update-entry".to_string());
         div()
             .relative()
             .flex_none()
@@ -50717,14 +50732,19 @@ impl VibexWorkbench {
             .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
             .child(trigger)
             .when_some(panel, |this, panel| {
+                // `deferred` is what lifts the panel out of the strip's content
+                // mask: the draw carries the strip's `element_offset` but no
+                // mask of its own, so the panel both paints and hit-tests
+                // below the band instead of being clipped away with it.
                 this.child(
-                    div()
-                        .absolute()
-                        // The wrapper is vertically centered in the band, so
-                        // this puts the panel just below the bar's lower edge.
-                        .top(px(TITLE_BAR_HEIGHT))
-                        .right_0()
-                        .child(panel),
+                    deferred(
+                        div()
+                            .absolute()
+                            .top(px(TITLE_BAR_HEIGHT))
+                            .right_0()
+                            .child(panel),
+                    )
+                    .with_priority(UPDATE_PANEL_PRIORITY),
                 )
             })
             .into_any_element()
@@ -50980,6 +51000,7 @@ impl VibexWorkbench {
 
         v_flex()
             .id("update-panel")
+            .debug_selector(|| "update-panel".to_string())
             .w_80()
             .min_w_0()
             .rounded(cx.theme().radius)
@@ -51011,6 +51032,7 @@ impl VibexWorkbench {
                             .px_0()
                             .tooltip(locale::text("Close", "关闭", "關閉"))
                             .icon(IconName::Close)
+                            .debug_selector(|| "update-panel-close".to_string())
                             .on_click(
                                 cx.listener(|this, _, _, cx| this.set_update_panel_open(false, cx)),
                             ),
@@ -129662,11 +129684,17 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn open_pairing("))
             .map(|(body, _)| body)
             .expect("the title-bar update entry should remain inspectable");
-        // The panel is an in-tree layer, not a deferred popover: a popover
-        // paints after the dialog layer and would cover an open modal.
+        // The panel is a deferred layer, not a `Popover`: a popover paints at
+        // `POPUP_PRIORITY`, after the dialog layer, and would cover an open
+        // modal. Deferred is also what keeps it out of the strip's horizontal
+        // clip, which otherwise eats both the panel's paint and its clicks.
         assert!(!entry.contains("Popover::new"));
         assert!(entry.contains("self.update_panel_open"));
         assert!(entry.contains(".on_click("));
+        assert!(entry.contains("deferred("));
+        assert!(entry.contains(".with_priority(UPDATE_PANEL_PRIORITY)"));
+        // The slot's own bound lives beside the constant, as a compile-time
+        // assert; this only pins the call site to it.
         assert!(entry.contains(".absolute()"));
         assert!(entry.contains(".top(px(TITLE_BAR_HEIGHT))"));
         assert!(entry.contains(".right_0()"));
@@ -129724,6 +129752,142 @@ mod tests {
 
         assert!(source.contains("Switch::new(\"auto-update-enabled\")"));
         assert!(source.contains("fn set_auto_update("));
+    }
+
+    /// The update arrow opens a panel that hangs below the chrome band.
+    ///
+    /// The strip hides its horizontal overflow so long titles stay inside it,
+    /// and a content mask also clips hit testing: the panel used to be a plain
+    /// absolute child, so its paint and every click on it landed outside the
+    /// mask and the arrow looked dead. The panel is deferred now; this proves
+    /// the click opens it, that the panel is laid out below the bar rather than
+    /// collapsed into the clipped band, and that its controls are reachable.
+    #[gpui::test]
+    fn the_title_bar_update_entry_opens_a_panel_below_the_band(cx: &mut TestAppContext) {
+        struct UpdateProbe {
+            workbench: Entity<VibexWorkbench>,
+        }
+
+        impl Render for UpdateProbe {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.workbench.clone()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let window = cx.open_window(gpui::size(px(1_600.0), px(1_000.0)), |window, cx| {
+            let mut ui_state = DesktopUiStateV1::default();
+            ui_state.appearance.locale = LocaleMode::En;
+            // The panel offers the download itself only when the update is
+            // not automatic: the automatic branch starts a download against a
+            // runtime this test never brings up.
+            ui_state.desktop_behavior.auto_update = false;
+            let workbench =
+                cx.new(|cx| VibexWorkbench::with_initial_state(None, ui_state, None, window, cx));
+            UpdateProbe { workbench }
+        });
+        cx.run_until_parked();
+        let probe = window.root(cx).expect("probe root");
+        let workbench = probe.read_with(cx, |probe, _| probe.workbench.clone());
+        // A discovered release is what puts the arrow in the band at all.
+        workbench.update(cx, |workbench, cx| {
+            workbench.runtime_status = RuntimeStatus::Ready;
+            workbench.startup_loading = false;
+            workbench.update_snapshot.state = UpdateState::Available {
+                release: test_update_release("9.9.9"),
+            };
+            cx.notify();
+        });
+        cx.run_until_parked();
+        use std::ops::Deref as _;
+        let mut cx = VisualTestContext::from_window(*window.deref(), cx);
+        cx.run_until_parked();
+        // The arrow toggles the panel from its own render, which only happens
+        // once the strip has drawn the entry.
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        assert!(
+            !workbench.read_with(&cx, |workbench, _| workbench.update_panel_open),
+            "the panel starts closed"
+        );
+
+        let arrow = cx
+            .debug_bounds("title-bar-update-entry")
+            .expect("the update arrow should be laid out in the band");
+        assert!(
+            arrow.bottom() <= px(TITLE_BAR_HEIGHT),
+            "the trigger stays inside the band: {arrow:?}"
+        );
+        cx.simulate_click(arrow.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            workbench.read_with(&cx, |workbench, _| workbench.update_panel_open),
+            "clicking the arrow should open the update panel"
+        );
+
+        for _ in 0..2 {
+            cx.update(|window, cx| {
+                let _ = window.draw(cx);
+            });
+            cx.run_until_parked();
+        }
+        let panel = cx
+            .debug_bounds("update-panel")
+            .expect("the open panel should be laid out");
+        assert!(
+            panel.origin.y >= px(TITLE_BAR_HEIGHT),
+            "the panel hangs below the band: {panel:?}"
+        );
+        // Painting outside the band is what the old in-tree child could not do:
+        // the strip's content mask culled the panel's own surface at paint
+        // time, so no quad for it ever reached the scene. Matching the panel's
+        // laid-out bounds keeps page content behind the chrome from standing in
+        // for it.
+        let scale = cx.update(|window, _| window.scale_factor());
+        let painted = cx.update(|window, _| window.painted_quads());
+        let panel_plate = painted.iter().any(|quad| {
+            let x = quad.bounds.origin.x.as_f32() / scale;
+            let y = quad.bounds.origin.y.as_f32() / scale;
+            let width = quad.bounds.size.width.as_f32() / scale;
+            let height = quad.bounds.size.height.as_f32() / scale;
+            (x - panel.origin.x.as_f32()).abs() <= 1.0
+                && (y - panel.origin.y.as_f32()).abs() <= 1.0
+                && (width - panel.size.width.as_f32()).abs() <= 1.0
+                && (height - panel.size.height.as_f32()).abs() <= 1.0
+        });
+        assert!(
+            panel_plate,
+            "the panel should paint its own surface below the band: {panel:?}"
+        );
+
+        // The panel's own controls are what a clipped panel could not reach.
+        let close = cx
+            .debug_bounds("update-panel-close")
+            .expect("the panel close button should be laid out");
+        cx.simulate_click(close.center(), Modifiers::none());
+        cx.run_until_parked();
+        assert!(
+            !workbench.read_with(&cx, |workbench, _| workbench.update_panel_open),
+            "the panel close button should close it"
+        );
+    }
+
+    /// A release whose version parses, with no artifact for this platform: the
+    /// panel then reports the release and offers the download, without any
+    /// download machinery.
+    fn test_update_release(version: &str) -> UpdateRelease {
+        UpdateRelease {
+            version: semver::Version::parse(version).expect("the test version parses"),
+            tag: format!("v{version}"),
+            published_at: "2026-01-01T00:00:00Z".to_string(),
+            notes_url: url::Url::parse("https://example.com/vibex/releases").expect("notes url"),
+            artifact: None,
+            notes: None,
+        }
     }
 
     #[test]
