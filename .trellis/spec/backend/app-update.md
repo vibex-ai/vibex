@@ -81,10 +81,21 @@ falls through to another channel.
 - Permit HTTPS redirects only within the reviewed GitHub asset hosts and cap
   redirect depth.
 - Match artifacts by normalized OS, architecture, and detected package source.
-- Stream into a new `.part` file below the runtime update directory. Never write
+- Stream into a `.part` file below the runtime update directory. Never write
   into a project, settings, database, or credential directory.
+- Keep a `.part` file across retryable failures and resume it with a ranged
+  request; a non-retryable failure drops it. When the server answers a ranged
+  request with the whole artifact, restart from zero instead of appending a
+  second copy. The signed size and hash check still decide whether the
+  assembled file is trustworthy.
 - Bound the stream by the signed size, sync it, then independently re-read and
   verify size plus every signed hash before renaming it to a staged package.
+- Bound the HTTP client with a connect budget and a per-read stall budget, but
+  never a total request deadline. A total deadline covers the response body as
+  well and cancels a healthy artifact download mid-transfer; a package is large
+  enough that it can take minutes on a slow link. Give the small discovery
+  documents (feed, manifest, signature) a wall-clock deadline at the call
+  sites instead.
 - Coalesce identical operations. Progress snapshots are throttled so network
   chunk size cannot flood the UI subscriber.
 - Fetch release notes from the same verified tag, under a bounded size and a
@@ -190,6 +201,7 @@ cargo clippy -p vibex-app-update --all-targets --locked -- -D warnings
 
 Tests cover signature tampering, channel and URL rejection, feed selection,
 download hash rejection, monotonic state, staged-state preservation, AppImage
-backup cleanup/recovery, and marker path validation. Release workflow changes
+backup cleanup/recovery, marker path validation, ranged resume and restart,
+partial-file retention across retryable failures, and the discovery deadline. Release workflow changes
 also run `pnpm check:release` and must declare only artifacts the workflow
 actually builds.

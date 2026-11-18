@@ -13,7 +13,18 @@ use crate::{AppUpdateError, AppUpdateResult, UpdateArtifact, UpdateChannel};
 const MAX_FEED_BYTES: usize = 2 * 1024 * 1024;
 const MAX_SIGNATURE_BYTES: usize = 4 * 1024;
 const MAX_MANIFEST_BYTES: usize = 512 * 1024;
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
+/// Wall-clock budget for one discovery document: the release feed, the manifest,
+/// or its signature. These are small, so a total deadline is the right shape.
+///
+/// The artifact download deliberately has no total deadline. A package is tens
+/// of megabytes and legitimately takes minutes on a slow link; capping it by
+/// wall clock cancels a healthy transfer halfway.
+const DISCOVERY_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for establishing a connection to GitHub.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+/// Budget for one body read that makes no progress. It resets on every read, so
+/// it detects a stalled transfer without capping a progressing one.
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
 const OFFICIAL_RELEASES_FEED: &str = "https://github.com/vibex-ai/vibex/releases.atom";
 const RELEASE_NOTES_ASSET: &str = "vibex-release-notes.md";
 
@@ -39,6 +50,13 @@ pub trait UpdateSource: Send + Sync {
     /// failure as "notes unavailable" and keep the update itself usable.
     async fn release_notes(&self, tag: &str) -> AppUpdateResult<Option<String>>;
 
+    /// Streams `artifact` into `destination`, resuming from any usable bytes
+    /// already present.
+    ///
+    /// Implementations should send a ranged request when `destination` holds a
+    /// partial download, and either complete the file or fail without claiming
+    /// the bytes on disk are complete. Callers verify the assembled file
+    /// independently, so a resumed file is trusted only after that check.
     async fn download_artifact(
         &self,
         artifact: &UpdateArtifact,
@@ -144,16 +162,20 @@ impl UpdateSource for GitHubReleaseSource {
         &self,
         channel: UpdateChannel,
     ) -> AppUpdateResult<Option<SignedManifest>> {
-        let feed = self.feed_bytes().await?;
+        let feed = under_deadline(DISCOVERY_TIMEOUT, self.feed_bytes()).await?;
         let Some((tag, _)) = latest_channel_release(&feed, channel)? else {
             return Ok(None);
         };
-        let manifest = self
-            .release_asset(&tag, "vibex-update.json", MAX_MANIFEST_BYTES)
-            .await?;
-        let signature = self
-            .release_asset(&tag, "vibex-update.json.sig", MAX_SIGNATURE_BYTES)
-            .await?;
+        let manifest = under_deadline(
+            DISCOVERY_TIMEOUT,
+            self.release_asset(&tag, "vibex-update.json", MAX_MANIFEST_BYTES),
+        )
+        .await?;
+        let signature = under_deadline(
+            DISCOVERY_TIMEOUT,
+            self.release_asset(&tag, "vibex-update.json.sig", MAX_SIGNATURE_BYTES),
+        )
+        .await?;
         let signature_base64 = String::from_utf8(signature).map_err(|_| {
             AppUpdateError::new(
                 "app_update_signature_invalid",
@@ -198,39 +220,79 @@ impl UpdateSource for GitHubReleaseSource {
         destination: &Path,
         progress: UpdateDownloadProgress,
     ) -> AppUpdateResult<()> {
-        let response = self
+        // A failed attempt may have left bytes behind. Resume from them when the
+        // server can serve a range; the signed size and hash checks at the end
+        // still decide whether the assembled file is trustworthy.
+        let mut resumed = resumable_offset(destination, artifact.size).await;
+        let mut request = self
             .client
             .get(artifact.url.clone())
-            .header(header::ACCEPT_ENCODING, "identity")
-            .send()
-            .await
-            .map_err(network_error)?;
+            .header(header::ACCEPT_ENCODING, "identity");
+        if resumed > 0 {
+            request = request.header(header::RANGE, format!("bytes={resumed}-"));
+        }
+        let mut response = request.send().await.map_err(network_error)?;
+        if response.status() == StatusCode::RANGE_NOT_SATISFIABLE {
+            // The server cannot serve the bytes already on disk. Refetch the
+            // whole artifact instead of reporting a mismatch for a good resume.
+            resumed = 0;
+            response = self
+                .client
+                .get(artifact.url.clone())
+                .header(header::ACCEPT_ENCODING, "identity")
+                .send()
+                .await
+                .map_err(network_error)?;
+        }
         let response = require_success(response, "app_update_download_failed")?;
+        let mut already_downloaded = resumed;
+        if response.status() == StatusCode::PARTIAL_CONTENT {
+            if content_range_start(response.headers()) != Some(resumed) {
+                return Err(AppUpdateError::new(
+                    "app_update_download_range_mismatch",
+                    "the update server resumed the download at the wrong position",
+                ));
+            }
+        } else if response.status() == StatusCode::OK {
+            // The server ignored the range request: start the artifact over
+            // rather than appending a full copy to the bytes already stored.
+            already_downloaded = 0;
+        }
         if response
             .content_length()
-            .is_some_and(|length| length != artifact.size)
+            .is_some_and(|length| length != artifact.size - already_downloaded)
         {
             return Err(AppUpdateError::new(
                 "app_update_download_size_mismatch",
                 "the update download size does not match the signed manifest",
             ));
         }
-        let mut file = tokio::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(destination)
-            .await
-            .map_err(|_| {
-                AppUpdateError::new(
-                    "app_update_download_file_create_failed",
-                    "the update download file could not be created",
-                )
-            })?;
+        if already_downloaded == 0 {
+            let _ = tokio::fs::remove_file(destination).await;
+        }
+        let mut file = if already_downloaded > 0 {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .append(true)
+                .open(destination)
+                .await
+        } else {
+            tokio::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(destination)
+                .await
+        }
+        .map_err(|_| {
+            AppUpdateError::new(
+                "app_update_download_file_create_failed",
+                "the update download file could not be created",
+            )
+        })?;
         let mut stream = response.bytes_stream();
-        let mut downloaded = 0u64;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(network_error)?;
-            downloaded = downloaded
+            let next = already_downloaded
                 .checked_add(chunk.len() as u64)
                 .filter(|total| *total <= artifact.size)
                 .ok_or_else(|| {
@@ -245,9 +307,10 @@ impl UpdateSource for GitHubReleaseSource {
                     "the update download could not be written",
                 )
             })?;
-            progress(downloaded, artifact.size);
+            already_downloaded = next;
+            progress(already_downloaded, artifact.size);
         }
-        if downloaded != artifact.size {
+        if already_downloaded != artifact.size {
             return Err(AppUpdateError::retryable(
                 "app_update_download_incomplete",
                 "the update download ended before it was complete",
@@ -265,6 +328,12 @@ impl UpdateSource for GitHubReleaseSource {
 
 /// Builds the HTTPS client every update request shares.
 ///
+/// The client carries a connect budget and a per-read stall budget, but no total
+/// deadline. A total deadline covers the response body as well, so it would cut
+/// off an artifact download that is transferring fine — a 100 MiB package can
+/// take longer than any wall-clock limit on a slow link. Discovery documents
+/// get their wall-clock bound at the call sites instead.
+///
 /// Android's platform verifier can reject otherwise valid public chains when a
 /// leaf omits an OCSP responder, so the Android build pins the bundled Mozilla
 /// WebPKI store — the same decision the remote client makes for its own HTTP
@@ -272,7 +341,8 @@ impl UpdateSource for GitHubReleaseSource {
 fn update_http_client() -> AppUpdateResult<Client> {
     let builder = Client::builder()
         .user_agent(format!("Vibex/{} updater", env!("CARGO_PKG_VERSION")))
-        .timeout(REQUEST_TIMEOUT)
+        .connect_timeout(CONNECT_TIMEOUT)
+        .read_timeout(READ_TIMEOUT)
         .redirect(reqwest::redirect::Policy::custom(|attempt| {
             if attempt.previous().len() >= 5 {
                 return attempt.error("too many update redirects");
@@ -405,6 +475,48 @@ fn redirect_host_allowed(url: &Url) -> bool {
         )
 }
 
+/// Runs one discovery request under a wall-clock deadline.
+///
+/// The shared client intentionally has no total timeout, so the small feed,
+/// manifest, and signature requests are bounded here instead. A stalled server
+/// still fails the check promptly rather than holding the operation open.
+async fn under_deadline<T>(
+    deadline: Duration,
+    future: impl std::future::Future<Output = AppUpdateResult<T>>,
+) -> AppUpdateResult<T> {
+    match tokio::time::timeout(deadline, future).await {
+        Ok(result) => result,
+        Err(_) => Err(AppUpdateError::retryable(
+            "app_update_network_failed",
+            "the update service did not answer in time",
+        )),
+    }
+}
+
+/// Bytes already on disk that a ranged request can resume from.
+///
+/// A missing, empty, or complete file, or one larger than the signed artifact,
+/// restarts from zero.
+pub(crate) async fn resumable_offset(destination: &Path, size: u64) -> u64 {
+    match tokio::fs::metadata(destination).await {
+        Ok(metadata) if metadata.is_file() && metadata.len() > 0 && metadata.len() < size => {
+            metadata.len()
+        }
+        _ => 0,
+    }
+}
+
+/// The first byte a `206 Partial Content` response carries, parsed from
+/// `Content-Range: bytes <start>-<end>/<total>`.
+fn content_range_start(headers: &header::HeaderMap) -> Option<u64> {
+    let value = headers.get(header::CONTENT_RANGE)?.to_str().ok()?;
+    let (unit, range) = value.split_once(' ')?;
+    if !unit.eq_ignore_ascii_case("bytes") {
+        return None;
+    }
+    range.split('-').next()?.trim().parse().ok()
+}
+
 fn require_success(
     response: reqwest::Response,
     code: &'static str,
@@ -446,8 +558,13 @@ async fn bounded_response(
 }
 
 fn network_error(error: reqwest::Error) -> AppUpdateError {
-    let retryable =
-        error.is_timeout() || error.is_connect() || error.is_request() || error.is_body();
+    if error.is_timeout() {
+        return AppUpdateError::retryable(
+            "app_update_network_failed",
+            "the update request timed out",
+        );
+    }
+    let retryable = error.is_connect() || error.is_request() || error.is_body();
     if retryable {
         AppUpdateError::retryable(
             "app_update_network_failed",
@@ -464,6 +581,7 @@ fn network_error(error: reqwest::Error) -> AppUpdateError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
 
     #[test]
     fn release_tags_cannot_escape_the_release_download_path() {
@@ -508,5 +626,207 @@ mod tests {
                 .0,
             "v0.3.0-preview.2"
         );
+    }
+
+    #[test]
+    fn content_range_parsing_reads_the_first_byte() {
+        let mut headers = header::HeaderMap::new();
+        headers.insert(
+            header::CONTENT_RANGE,
+            "bytes 2048-4095/8192".parse().unwrap(),
+        );
+        assert_eq!(content_range_start(&headers), Some(2048));
+
+        assert_eq!(content_range_start(&header::HeaderMap::new()), None);
+    }
+
+    #[tokio::test]
+    async fn under_deadline_rejects_a_stalled_discovery_request() {
+        let outcome = under_deadline(Duration::from_millis(20), async {
+            tokio::time::sleep(Duration::from_secs(5)).await;
+            Ok::<(), AppUpdateError>(())
+        })
+        .await;
+        let error = outcome.unwrap_err();
+        assert_eq!(error.code, "app_update_network_failed");
+        assert!(error.retryable);
+    }
+
+    /// Reads one HTTP request's headers from a freshly accepted socket.
+    async fn read_request_headers(socket: &mut tokio::net::TcpStream) -> String {
+        use tokio::io::AsyncReadExt as _;
+        let mut buffer = Vec::new();
+        let mut byte = [0u8; 1];
+        while !buffer.ends_with(b"\r\n\r\n") {
+            if socket.read(&mut byte).await.unwrap() == 0 {
+                break;
+            }
+            buffer.push(byte[0]);
+        }
+        String::from_utf8_lossy(&buffer).to_string()
+    }
+
+    fn test_artifact(url: Url, size: u64) -> UpdateArtifact {
+        UpdateArtifact {
+            os: "linux".to_string(),
+            arch: "x86_64".to_string(),
+            package: "deb".to_string(),
+            install_mode: crate::InstallMode::SystemInstaller,
+            url,
+            size,
+            sha256: String::new(),
+            sha512: None,
+        }
+    }
+
+    async fn download_from(
+        source: &GitHubReleaseSource,
+        artifact: &UpdateArtifact,
+        destination: &Path,
+    ) -> AppUpdateResult<()> {
+        source
+            .download_artifact(artifact, destination, Arc::new(|_, _| {}))
+            .await
+    }
+
+    #[tokio::test]
+    async fn download_artifact_resumes_from_bytes_already_on_disk() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let body: Vec<u8> = (0..48 * 1024u32).map(|index| (index % 256) as u8).collect();
+        let total = body.len() as u64;
+        let resumed = 20 * 1024u64;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let expected_range = format!("bytes={resumed}-");
+        let server_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut socket).await;
+            assert!(
+                request.contains(&expected_range),
+                "the resume attempt should ask for the missing bytes: {request}"
+            );
+            let head = format!(
+                "HTTP/1.1 206 Partial Content\r\nContent-Range: bytes {resumed}-{}/{total}\r\nContent-Length: {}\r\n\r\n",
+                total - 1,
+                total - resumed,
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket
+                .write_all(&server_body[resumed as usize..])
+                .await
+                .unwrap();
+        });
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("artifact.deb");
+        tokio::fs::write(&destination, &body[..resumed as usize])
+            .await
+            .unwrap();
+
+        let source = GitHubReleaseSource::official().unwrap();
+        let artifact = test_artifact(
+            Url::parse(&format!("http://{addr}/artifact.deb")).unwrap(),
+            total,
+        );
+        download_from(&source, &artifact, &destination)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_artifact_starts_over_when_the_server_ignores_the_range() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        let body: Vec<u8> = (0..16 * 1024u32).map(|index| (index % 256) as u8).collect();
+        let total = body.len() as u64;
+        let resumed = 4 * 1024u64;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let request = read_request_headers(&mut socket).await;
+            assert!(request.contains(&format!("bytes={resumed}-")), "{request}");
+            // The server answers with the whole artifact instead of a slice.
+            let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {total}\r\n\r\n");
+            socket.write_all(head.as_bytes()).await.unwrap();
+            socket.write_all(&server_body).await.unwrap();
+        });
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("artifact.deb");
+        tokio::fs::write(&destination, &body[..resumed as usize])
+            .await
+            .unwrap();
+
+        let source = GitHubReleaseSource::official().unwrap();
+        let artifact = test_artifact(
+            Url::parse(&format!("http://{addr}/artifact.deb")).unwrap(),
+            total,
+        );
+        download_from(&source, &artifact, &destination)
+            .await
+            .unwrap();
+        // The full artifact replaced the stale prefix instead of being appended
+        // to it.
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn download_artifact_survives_a_slow_but_progressing_body() {
+        use tokio::io::AsyncWriteExt as _;
+        use tokio::net::TcpListener;
+
+        // The body arrives in small chunks with pauses between them. A total
+        // request deadline would cancel a healthy transfer like this; only a
+        // stalled read should fail.
+        let body: Vec<u8> = (0..64 * 1024u32).map(|index| (index % 256) as u8).collect();
+        let chunks = 8usize;
+        let chunk = body.len() / chunks;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server_body = body.clone();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            read_request_headers(&mut socket).await;
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                server_body.len()
+            );
+            socket.write_all(head.as_bytes()).await.unwrap();
+            for index in 0..chunks {
+                let start = index * chunk;
+                let end = if index == chunks - 1 {
+                    server_body.len()
+                } else {
+                    start + chunk
+                };
+                socket.write_all(&server_body[start..end]).await.unwrap();
+                tokio::time::sleep(Duration::from_millis(200)).await;
+            }
+        });
+
+        let directory = tempdir().unwrap();
+        let destination = directory.path().join("artifact.deb");
+        let source = GitHubReleaseSource::official().unwrap();
+        let artifact = test_artifact(
+            Url::parse(&format!("http://{addr}/artifact.deb")).unwrap(),
+            body.len() as u64,
+        );
+        download_from(&source, &artifact, &destination)
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&destination).await.unwrap(), body);
+        server.await.unwrap();
     }
 }

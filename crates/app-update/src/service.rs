@@ -594,10 +594,13 @@ impl AppUpdateService {
             return Ok(());
         }
         let temporary = final_path.with_extension("part");
-        let _ = tokio::fs::remove_file(&temporary).await;
+        // A partial file from a failed attempt is kept: the next download resumes
+        // from it instead of restarting. Those bytes stay untrusted until the
+        // signed size and hash check below succeeds.
+        let resumed = crate::source::resumable_offset(&temporary, artifact.size).await;
         self.publish_state(UpdateState::Downloading {
             release: release.clone(),
-            downloaded_bytes: 0,
+            downloaded_bytes: resumed,
             total_bytes: artifact.size,
         });
         let service = self.clone();
@@ -627,7 +630,11 @@ impl AppUpdateService {
             .download_artifact(&artifact, &temporary, progress)
             .await
         {
-            let _ = tokio::fs::remove_file(&temporary).await;
+            if !error.retryable {
+                // A permanent failure leaves bytes the next attempt must not
+                // resume from; drop them so the next download starts over.
+                let _ = tokio::fs::remove_file(&temporary).await;
+            }
             return Err(error);
         }
         self.publish_state(UpdateState::Verifying {
@@ -922,6 +929,7 @@ mod tests {
     use ed25519_dalek::{Signer as _, SigningKey};
     use serde_json::json;
     use tempfile::tempdir;
+    use tokio::io::AsyncWriteExt as _;
 
     use super::*;
     use crate::{SignedManifest, UpdateDownloadProgress};
@@ -974,6 +982,21 @@ mod tests {
         current_version: &str,
         notes: AppUpdateResult<Option<String>>,
     ) -> (AppUpdateConfig, Arc<dyn UpdateSource>) {
+        let (config, signed, artifact_bytes) = fixture_parts(manifest_version, current_version);
+        let source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
+            signed,
+            artifact_bytes,
+            notes,
+        });
+        (config, source)
+    }
+
+    /// The config and signed release behind the fake source, without the source
+    /// itself, so a test can build a source with its own download behaviour.
+    fn fixture_parts(
+        manifest_version: &str,
+        current_version: &str,
+    ) -> (AppUpdateConfig, SignedManifest, Vec<u8>) {
         let directory = tempdir().unwrap().keep();
         let bytes = b"verified package".to_vec();
         let sha256 = hex_lower(&Sha256::digest(&bytes));
@@ -1013,16 +1036,12 @@ mod tests {
             public_key_base64: Some(BASE64_STANDARD.encode(key.verifying_key().to_bytes())),
             automatic_checks: false,
         };
-        let source: Arc<dyn UpdateSource> = Arc::new(FakeSource {
-            signed: SignedManifest {
-                tag,
-                manifest: raw,
-                signature_base64: signature,
-            },
-            artifact_bytes: bytes,
-            notes,
-        });
-        (config, source)
+        let signed = SignedManifest {
+            tag,
+            manifest: raw,
+            signature_base64: signature,
+        };
+        (config, signed, bytes)
     }
 
     fn release_of(state: &UpdateState) -> &UpdateRelease {
@@ -1233,5 +1252,200 @@ mod tests {
         let artifact = release.artifact.as_ref().expect("the APK artifact");
         assert_eq!(artifact.install_mode, InstallMode::SystemInstaller);
         assert!(artifact.url.as_str().ends_with("-android-arm64.apk"));
+    }
+
+    /// A source whose download stops after writing a prefix.
+    struct FailingDownloadSource {
+        signed: SignedManifest,
+        prefix: Vec<u8>,
+        error: AppUpdateError,
+    }
+
+    #[async_trait]
+    impl UpdateSource for FailingDownloadSource {
+        async fn latest_signed_manifest(
+            &self,
+            _channel: UpdateChannel,
+        ) -> AppUpdateResult<Option<SignedManifest>> {
+            Ok(Some(self.signed.clone()))
+        }
+
+        async fn release_notes(&self, _tag: &str) -> AppUpdateResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn download_artifact(
+            &self,
+            _artifact: &UpdateArtifact,
+            destination: &Path,
+            _progress: UpdateDownloadProgress,
+        ) -> AppUpdateResult<()> {
+            tokio::fs::write(destination, &self.prefix).await.unwrap();
+            Err(self.error.clone())
+        }
+    }
+
+    /// A source that fails the first download retryably and resumes on the next.
+    struct ResumingSource {
+        signed: SignedManifest,
+        artifact_bytes: Vec<u8>,
+        failed_once: Arc<Mutex<bool>>,
+    }
+
+    #[async_trait]
+    impl UpdateSource for ResumingSource {
+        async fn latest_signed_manifest(
+            &self,
+            _channel: UpdateChannel,
+        ) -> AppUpdateResult<Option<SignedManifest>> {
+            Ok(Some(self.signed.clone()))
+        }
+
+        async fn release_notes(&self, _tag: &str) -> AppUpdateResult<Option<String>> {
+            Ok(None)
+        }
+
+        async fn download_artifact(
+            &self,
+            artifact: &UpdateArtifact,
+            destination: &Path,
+            progress: UpdateDownloadProgress,
+        ) -> AppUpdateResult<()> {
+            let should_fail = {
+                let mut guard = self.failed_once.lock().unwrap();
+                if *guard {
+                    false
+                } else {
+                    *guard = true;
+                    true
+                }
+            };
+            if should_fail {
+                let prefix = &self.artifact_bytes[..artifact.size as usize / 2];
+                tokio::fs::write(destination, prefix).await.unwrap();
+                progress(prefix.len() as u64, artifact.size);
+                return Err(AppUpdateError::retryable(
+                    "app_update_download_failed",
+                    "the update request could not be completed",
+                ));
+            }
+            let existing = tokio::fs::metadata(destination)
+                .await
+                .map(|metadata| metadata.len())
+                .unwrap_or(0);
+            let mut file = tokio::fs::OpenOptions::new()
+                .append(true)
+                .open(destination)
+                .await
+                .unwrap();
+            file.write_all(&self.artifact_bytes[existing as usize..])
+                .await
+                .unwrap();
+            progress(artifact.size, artifact.size);
+            Ok(())
+        }
+    }
+
+    fn partial_path(updates_dir: &Path, version: &str, file_name: &str) -> PathBuf {
+        updates_dir
+            .join(version)
+            .join(file_name)
+            .with_extension("part")
+    }
+
+    fn artifact_path(updates_dir: &Path, version: &str, file_name: &str) -> PathBuf {
+        updates_dir.join(version).join(file_name)
+    }
+
+    #[tokio::test]
+    async fn a_retryable_download_failure_keeps_the_partial_file() {
+        let (config, signed, artifact_bytes) = fixture_parts("0.2.0", "0.1.0");
+        let updates_dir = config.updates_dir.clone();
+        let failing: Arc<dyn UpdateSource> = Arc::new(FailingDownloadSource {
+            signed,
+            prefix: artifact_bytes[..8].to_vec(),
+            error: AppUpdateError::retryable(
+                "app_update_download_failed",
+                "the update request could not be completed",
+            ),
+        });
+        let service = AppUpdateService::with_source(config, failing).unwrap();
+        service.check(CheckReason::Manual).await.unwrap();
+
+        let error = service.download().await.unwrap_err();
+        assert!(error.retryable);
+
+        let release = service.snapshot().state.release().unwrap().clone();
+        let artifact = release.artifact.unwrap();
+        let file_name = artifact_file_name(&artifact).unwrap().to_string();
+        let partial = partial_path(&updates_dir, "0.2.0", &file_name);
+        assert_eq!(
+            tokio::fs::read(&partial).await.unwrap(),
+            artifact_bytes[..8]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_permanent_download_failure_removes_the_partial_file() {
+        let (config, signed, artifact_bytes) = fixture_parts("0.2.0", "0.1.0");
+        let updates_dir = config.updates_dir.clone();
+        let failing: Arc<dyn UpdateSource> = Arc::new(FailingDownloadSource {
+            signed,
+            prefix: artifact_bytes[..8].to_vec(),
+            error: AppUpdateError::new(
+                "app_update_download_failed",
+                "the update server rejected the request",
+            ),
+        });
+        let service = AppUpdateService::with_source(config, failing).unwrap();
+        service.check(CheckReason::Manual).await.unwrap();
+
+        let error = service.download().await.unwrap_err();
+        assert!(!error.retryable);
+
+        let release = service.snapshot().state.release().unwrap().clone();
+        let artifact = release.artifact.unwrap();
+        let file_name = artifact_file_name(&artifact).unwrap().to_string();
+        let partial = partial_path(&updates_dir, "0.2.0", &file_name);
+        assert!(
+            !partial.exists(),
+            "a non-retryable failure must not leave a partial file behind"
+        );
+    }
+
+    #[tokio::test]
+    async fn download_resumes_from_a_partial_file_after_a_retryable_failure() {
+        let (config, signed, artifact_bytes) = fixture_parts("0.2.0", "0.1.0");
+        let updates_dir = config.updates_dir.clone();
+        let resuming: Arc<dyn UpdateSource> = Arc::new(ResumingSource {
+            signed,
+            artifact_bytes,
+            failed_once: Arc::new(Mutex::new(false)),
+        });
+        let service = AppUpdateService::with_source(config, resuming).unwrap();
+        service.check(CheckReason::Manual).await.unwrap();
+
+        // The first attempt stops partway and is retryable, so the partial
+        // bytes survive for the next attempt.
+        let error = service.download().await.unwrap_err();
+        assert!(error.retryable);
+
+        // The second attempt resumes and the service verifies the assembled file.
+        let staged = service.download().await.unwrap();
+        assert!(matches!(staged.state, UpdateState::Staged { .. }));
+
+        let release = service.snapshot().state.release().unwrap().clone();
+        let artifact = release.artifact.unwrap();
+        let file_name = artifact_file_name(&artifact).unwrap().to_string();
+        assert_eq!(
+            tokio::fs::read(artifact_path(&updates_dir, "0.2.0", &file_name))
+                .await
+                .unwrap(),
+            b"verified package"
+        );
+        assert!(
+            !partial_path(&updates_dir, "0.2.0", &file_name).exists(),
+            "the verified download should be renamed out of its .part file"
+        );
     }
 }
