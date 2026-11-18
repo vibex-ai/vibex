@@ -6187,6 +6187,14 @@ pub struct SessionView {
     /// rows stay on their boxes' tops while the extent catches up with them.
     /// See [`Self::timeline_rows_hang_from_bottom`].
     timeline_disclosure_holds_screen: bool,
+    /// This view's live-label frame gate: the gap since its last timeline frame
+    /// and whether a running label may keep its sweep.
+    ///
+    /// It belongs here rather than in a static because both halves of the
+    /// measurement are per view: the clock it subtracts from is the app's
+    /// executor clock, and the frames it times are this view's own. See
+    /// [`timeline_activity::LiveLabelFrameGate`].
+    live_label_frame_gate: timeline_activity::LiveLabelFrameGate,
     timeline_load_updates: std::rc::Weak<RefCell<timeline_loading::TimelineLoadUpdates>>,
     timeline_layout_width: Option<f32>,
     timeline_markdown_sources: BTreeMap<String, (i64, TimelineMarkdownSourceSnapshot)>,
@@ -6385,6 +6393,7 @@ impl SessionView {
             timeline_disclosure_animating: false,
             timeline_disclosure_settle_frames: 0,
             timeline_disclosure_holds_screen: false,
+            live_label_frame_gate: timeline_activity::LiveLabelFrameGate::default(),
             timeline_load_updates: Default::default(),
             timeline_layout_width: None,
             timeline_markdown_sources: BTreeMap::new(),
@@ -54226,7 +54235,7 @@ impl VibexWorkbench {
             // gate, so a late workbench stops every running label together
             // rather than keeping one surface at the display refresh.
             let title_element: AnyElement = if display_state == AgentSessionState::Running
-                && timeline_activity::live_labels_animate()
+                && self.live_label_frame_gate.animating()
             {
                 ShimmerText::new(title.clone())
                     .id(format!("session-group-tab-title-{session_id}"))
@@ -58338,16 +58347,20 @@ impl VibexWorkbench {
         // generating takes it; every other row keeps a static title that asks
         // for no frames. Like the tab title, the sweep yields to the timeline's
         // frame gate so every running label stops asking for frames together.
-        let row_title: AnyElement =
-            if session_generating && timeline_activity::live_labels_animate() {
-                ShimmerText::new(row_title)
-                    .id(format!("sidebar-session-title-{session_id_string}"))
-                    .duration(TIMELINE_SHIMMER_SWEEP)
-                    .spread(TIMELINE_SHIMMER_SPREAD)
-                    .into_any_element()
-            } else {
-                row_title.into_any_element()
-            };
+        // The row is built by a run that hands its builder a window, but the
+        // row itself is assembled here; the workbench already knows which
+        // window it is bound to, and that is the one whose frame budget the
+        // sweep has to respect.
+        let row_title: AnyElement = if session_generating && self.live_label_frame_gate.animating()
+        {
+            ShimmerText::new(row_title)
+                .id(format!("sidebar-session-title-{session_id_string}"))
+                .duration(TIMELINE_SHIMMER_SWEEP)
+                .spread(TIMELINE_SHIMMER_SPREAD)
+                .into_any_element()
+        } else {
+            row_title.into_any_element()
+        };
         let reorder_offset = active_session_drag
             .as_ref()
             .filter(|drag| drag.flat_preview_enabled)
@@ -63640,11 +63653,11 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Sample the window's frame cadence before this pass adds to it: a live
+        // Sample this view's frame cadence before the pass adds to it: a live
         // label's repeating sweep is only worth its frames while the timeline
-        // is drawing on time. See
-        // [`timeline_activity::observe_live_label_frame`].
-        timeline_activity::observe_live_label_frame(window, cx);
+        // is drawing on time. See [`timeline_activity::LiveLabelFrameGate`].
+        self.live_label_frame_gate
+            .observe(cx.background_executor().now(), window.refresh_interval(cx));
         #[cfg(test)]
         {
             self.markdown_surfaces_built = 0;
@@ -66688,6 +66701,7 @@ impl VibexWorkbench {
                         &pending_label,
                         Some(&pending_tooltip),
                         live,
+                        self.live_label_frame_gate.animating(),
                         cx,
                     ));
                 }
@@ -72486,7 +72500,14 @@ impl VibexWorkbench {
             Instant::now(),
         );
         let live = self.borrowed_session_turn_is_live();
-        let content = render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx);
+        let content = render_agent_thinking_indicator(
+            &row_id,
+            &summary.preview,
+            None,
+            live,
+            self.live_label_frame_gate.animating(),
+            cx,
+        );
         let toggle_id = row_id.clone();
         let mut container = h_flex()
             .id(row_id.clone())
@@ -72606,7 +72627,14 @@ impl VibexWorkbench {
         let disclosure_visible = summary.has_more;
         let content = if row.streaming {
             let live = self.borrowed_session_turn_is_live();
-            render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx)
+            render_agent_thinking_indicator(
+                &row_id,
+                &summary.preview,
+                None,
+                live,
+                self.live_label_frame_gate.animating(),
+                cx,
+            )
         } else {
             div()
                 .id(format!("reasoning-preview:{row_id}"))
@@ -72756,6 +72784,7 @@ impl VibexWorkbench {
             progress,
             rows.iter()
                 .any(|row| timeline_activity::is_running(row, turn_live)),
+            self.live_label_frame_gate.animating(),
             cx,
         )
         .tooltip(if expanded {
@@ -73119,6 +73148,7 @@ impl VibexWorkbench {
             has_details.then_some((expanded, progress)),
             target,
             duration,
+            self.live_label_frame_gate.animating(),
             cx,
         )
         .tab_stop(has_details)
@@ -73409,6 +73439,7 @@ impl VibexWorkbench {
             Some((expanded, progress)),
             target,
             statistics,
+            self.live_label_frame_gate.animating(),
             cx,
         )
         .on_click(cx.listener(move |this, _, _, cx| {
@@ -82186,6 +82217,7 @@ fn render_agent_thinking_indicator(
     label: &str,
     tooltip: Option<&str>,
     live: bool,
+    live_labels_animate: bool,
     cx: &App,
 ) -> AnyElement {
     let label: SharedString = truncate_agent_thinking_label(label).into();
@@ -82202,7 +82234,7 @@ fn render_agent_thinking_indicator(
     // label and drops the animation, and so does a workbench whose frames are
     // already over budget: the sweep asks for the next frame on every display
     // refresh, which only adds requests a late frame cannot answer.
-    let body: AnyElement = if live && timeline_activity::live_labels_animate() {
+    let body: AnyElement = if live && live_labels_animate {
         ShimmerText::new(label)
             .id(animation_id)
             .text_color(cx.theme().muted_foreground)
@@ -107589,10 +107621,13 @@ mod tests {
             .split_once("\n#[cfg(test)]\nmod tests {")
             .map(|(body, _)| body)
             .unwrap_or(source);
+        // Matched against whitespace-normalized source: the call is written
+        // across several lines, and rustfmt decides where the breaks fall.
+        let production_flat = production.split_whitespace().collect::<Vec<_>>().join(" ");
         assert_eq!(
-            production
-                .matches(
-                    "render_agent_thinking_indicator(&row_id, &summary.preview, None, live, cx)"
+            production_flat
+                .match_indices(
+                    "render_agent_thinking_indicator( &row_id, &summary.preview, None, live,"
                 )
                 .count(),
             2,
@@ -107605,9 +107640,7 @@ mod tests {
         // holding that session repainting at frame rate. The frame gate adds
         // the second reason: a sweep that keeps asking for frames a late
         // timeline cannot deliver on time.
-        assert!(renderer.contains(
-            "let body: AnyElement = if live && timeline_activity::live_labels_animate() {"
-        ));
+        assert!(renderer.contains("let body: AnyElement = if live && live_labels_animate {"));
         assert_eq!(
             production
                 .matches("let live = self.borrowed_session_turn_is_live();")
@@ -117749,9 +117782,11 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_new_session_runtime_choice("))
             .map(|(body, _)| body)
             .expect("sidebar session renderer should remain inspectable");
+        // Anchored on the gate, not on the line's wrapping: rustfmt reflows
+        // this `if` between one and two lines depending on the condition.
         let title = sidebar_session
-            .split_once("        let row_title: AnyElement =\n            if session_generating && timeline_activity::live_labels_animate() {")
-            .and_then(|(_, tail)| tail.split_once("            };\n"))
+            .split_once("let row_title: AnyElement = if session_generating")
+            .and_then(|(_, tail)| tail.split_once("\n        };\n"))
             .map(|(body, _)| body)
             .expect("the session title should keep its own running gate");
 

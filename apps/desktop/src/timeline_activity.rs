@@ -85,6 +85,12 @@ struct LiveLabelGate {
     on_time_frames: u32,
 }
 
+impl Default for LiveLabelGate {
+    fn default() -> Self {
+        Self::ANIMATING
+    }
+}
+
 impl LiveLabelGate {
     const ANIMATING: Self = Self {
         animate: true,
@@ -126,56 +132,60 @@ impl LiveLabelGate {
     }
 }
 
-static LIVE_LABEL_EPOCH: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
-static LIVE_LABEL_LAST_FRAME_MICROS: std::sync::atomic::AtomicU64 =
-    std::sync::atomic::AtomicU64::new(0);
-static LIVE_LABEL_GATE: std::sync::Mutex<LiveLabelGate> =
-    std::sync::Mutex::new(LiveLabelGate::ANIMATING);
-
-/// Samples the gap since the previous timeline frame and decides whether live
-/// labels may keep a repeating animation mounted.
+/// A window's frame cadence, and what its gate decided from it.
 ///
-/// The sweep is what makes a running row read as alive, and on a frame with
-/// headroom it costs nothing extra: that frame was going to be drawn anyway.
-/// On a frame that is already late it is the opposite. A repeating
-/// `with_animation` asks the window for a frame at its capped cadence for as
-/// long as it is mounted, so a workbench whose frames overrun the budget never
-/// idles — the main thread stays saturated by frames it cannot deliver on time,
-/// which is exactly the state an expanded, busy timeline lands in. This gate
-/// drops live labels back to static text while the timeline misses its frame
-/// budget and restores the sweep once it holds it again.
-pub(super) fn observe_live_label_frame(window: &Window, cx: &App) {
-    let now = Instant::now();
-    let epoch = *LIVE_LABEL_EPOCH.get_or_init(|| now);
-    let now_micros = now.saturating_duration_since(epoch).as_micros() as u64;
-    let previous = LIVE_LABEL_LAST_FRAME_MICROS.swap(now_micros, Ordering::Relaxed);
-    let gap = now_micros.saturating_sub(previous);
-    // The first frame has nothing to compare against; a second view drawing
-    // inside one frame is not a frame of its own; and a gap this wide means the
-    // timeline went quiet, which says nothing about the budget.
-    if previous == 0
-        || gap < LIVE_LABEL_SAME_FRAME_GAP.as_micros() as u64
-        || gap > LIVE_LABEL_IDLE_GAP.as_micros() as u64
-    {
-        return;
-    }
-    // Panels on a display that reports no interval keep animating: the gate
-    // exists to protect a budget, and without one there is nothing to protect.
-    let Some(refresh) = window.refresh_interval(cx) else {
-        return;
-    };
-    let mut gate = LIVE_LABEL_GATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    *gate = gate.observe(Duration::from_micros(gap), refresh);
+/// This belongs to the workbench, not to the process. A window id is unique
+/// only within one `App` — every `App` starts its slotmap at the same key — so a
+/// process-wide table keyed by window id made two tests share one entry. The
+/// state also needs an epoch to subtract from, and an epoch only means anything
+/// against the clock it was taken from: each `App` owns its executor clock, so a
+/// shared epoch made every gap a comparison of two unrelated time bases.
+///
+/// Both failures looked identical from outside — the shimmer probe passed alone
+/// and failed inside the suite — because both ended in a stale "stop
+/// animating" verdict. Keeping the state on the entity removes the question:
+/// one workbench, one clock, one gate.
+#[derive(Clone, Copy, Debug, Default)]
+pub(super) struct LiveLabelFrameGate {
+    epoch: Option<Instant>,
+    last_frame_micros: u64,
+    gate: LiveLabelGate,
 }
 
-/// Whether a live label may mount its repeating sweep this frame.
-pub(super) fn live_labels_animate() -> bool {
-    LIVE_LABEL_GATE
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .animate
+impl LiveLabelFrameGate {
+    /// Samples one frame and answers whether this frame's live labels may keep
+    /// their sweep.
+    ///
+    /// The first frame has nothing to compare against; a second view drawing
+    /// inside one frame is not a frame of its own; and a gap this wide means the
+    /// timeline went quiet, which says nothing about the budget.
+    pub(super) fn observe(&mut self, now: Instant, refresh: Option<Duration>) -> bool {
+        let epoch = *self.epoch.get_or_insert(now);
+        let now_micros = now.saturating_duration_since(epoch).as_micros() as u64;
+        let previous = std::mem::replace(&mut self.last_frame_micros, now_micros);
+        if previous == 0 {
+            return self.gate.animate;
+        }
+        let gap = now_micros.saturating_sub(previous);
+        if gap < LIVE_LABEL_SAME_FRAME_GAP.as_micros() as u64
+            || gap > LIVE_LABEL_IDLE_GAP.as_micros() as u64
+        {
+            return self.gate.animate;
+        }
+        // Panels on a display that reports no interval keep animating: the gate
+        // exists to protect a budget, and without one there is nothing to
+        // protect.
+        let Some(refresh) = refresh else {
+            return self.gate.animate;
+        };
+        self.gate = self.gate.observe(Duration::from_micros(gap), refresh);
+        self.gate.animate
+    }
+
+    /// Whether a live label may mount its repeating sweep right now.
+    pub(super) fn animating(&self) -> bool {
+        self.gate.animate
+    }
 }
 
 /// The same button geometry is used by tool, file and plan disclosures.
@@ -191,6 +201,11 @@ fn disclosure_chevron(progress: f32) -> Icon {
 }
 
 /// `disclosure` is whether the row is open and how far its body has travelled.
+///
+/// `live_labels_animate` is the owner's frame-gate answer for this frame. It is
+/// passed in rather than read here because the gate belongs to the view that
+/// draws, and a row does not know which view that is.
+#[allow(clippy::too_many_arguments)]
 pub(super) fn header(
     id: String,
     activity: &Activity,
@@ -198,6 +213,7 @@ pub(super) fn header(
     disclosure: Option<(bool, f32)>,
     highlighted_target: Option<AnyElement>,
     statistics: Option<AnyElement>,
+    live_labels_animate: bool,
     cx: &App,
 ) -> Button {
     let running = running && !activity.is_failed();
@@ -211,8 +227,14 @@ pub(super) fn header(
     } else {
         cx.theme().foreground
     };
-    let target = highlighted_target
-        .unwrap_or_else(|| activity_text("target-shimmer", activity.target(), running));
+    let target = highlighted_target.unwrap_or_else(|| {
+        activity_text(
+            "target-shimmer",
+            activity.target(),
+            running,
+            live_labels_animate,
+        )
+    });
     let target = h_flex()
         .id("target")
         .debug_selector(|| format!("activity-target:{id}"))
@@ -269,7 +291,12 @@ pub(super) fn header(
                         .flex_none()
                         .text_color(color)
                         .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
-                        .child(activity_text("action-shimmer", activity.action(), running)),
+                        .child(activity_text(
+                            "action-shimmer",
+                            activity.action(),
+                            running,
+                            live_labels_animate,
+                        )),
                 )
                 .child(target)
                 // A failed call says why while it is closed; open, its body
@@ -318,6 +345,7 @@ pub(super) fn summary_header(
     open: bool,
     progress: f32,
     running: bool,
+    live_labels_animate: bool,
     cx: &App,
 ) -> Button {
     let color = resting_color(cx);
@@ -356,12 +384,18 @@ pub(super) fn summary_header(
                     "summary-shimmer",
                     &label,
                     running,
+                    live_labels_animate,
                 ))),
         )
 }
 
-fn activity_text(id: &'static str, text: &str, running: bool) -> AnyElement {
-    if running && live_labels_animate() {
+fn activity_text(
+    id: &'static str,
+    text: &str,
+    running: bool,
+    live_labels_animate: bool,
+) -> AnyElement {
+    if running && live_labels_animate {
         ShimmerText::new(text.to_string())
             .id(id)
             .debug_selector(format!("activity-shimmer:{id}"))

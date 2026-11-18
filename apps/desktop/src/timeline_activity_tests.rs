@@ -472,6 +472,8 @@ struct ActivityProbe {
     rem: f32,
     width: f32,
     target_color: Option<Rc<Cell<Hsla>>>,
+    /// What the owning view's frame gate answered for this frame.
+    live_labels_animate: bool,
 }
 
 fn press(cx: &mut VisualTestContext, key: &'static str) {
@@ -509,6 +511,7 @@ impl Render for ActivityProbe {
             Some((self.expanded, f32::from(u8::from(self.expanded)))),
             target,
             None,
+            self.live_labels_animate,
             cx,
         )
         .on_click(cx.listener(|this, _, _, cx| {
@@ -553,6 +556,7 @@ impl Render for ActivityProbe {
                 Some((false, 0.0)),
                 None,
                 None,
+                self.live_labels_animate,
                 cx,
             )
             .into_any_element(),
@@ -565,6 +569,7 @@ impl Render for ActivityProbe {
             self.group_expanded,
             f32::from(u8::from(self.group_expanded)),
             self.running,
+            self.live_labels_animate,
             cx,
         )
         .on_click(cx.listener(|this, _, _, cx| {
@@ -603,6 +608,7 @@ fn activity_disclosures_keep_their_columns_and_keyboard_behavior_at_different_si
         rem: 16.0,
         width: 400.0,
         target_color: None,
+        live_labels_animate: true,
     });
     let (_, cx) =
         cx.add_window_view(|window, cx| gpui_component::Root::new(view.clone(), window, cx));
@@ -721,6 +727,7 @@ fn activity_hover_brightens_text_without_painting_a_row_background(cx: &mut Test
         rem: 16.0,
         width: 400.0,
         target_color: Some(color.clone()),
+        live_labels_animate: true,
     });
     let (_, cx) =
         cx.add_window_view(|window, cx| gpui_component::Root::new(view.clone(), window, cx));
@@ -808,6 +815,7 @@ impl Render for ActivityTextProbe {
                 "tool-target",
                 "cargo check --locked",
                 self.running,
+                true,
             ))
     }
 }
@@ -911,7 +919,29 @@ fn live_labels_keep_their_frame_gate_and_the_summary_reuses_its_projection() {
         .and_then(|(_, tail)| tail.split_once("\n}"))
         .map(|(body, _)| body)
         .expect("the activity label should remain inspectable");
-    assert!(label.contains("running && live_labels_animate()"));
+    assert!(label.contains("running && live_labels_animate"));
+
+    // The gate belongs to the view that draws. Keeping it in process statics
+    // let a late window stop every other window's sweep, let two `App`s share
+    // an entry because a window id is only unique inside one, and compared
+    // timestamps taken against two unrelated clocks — which is why this probe
+    // used to fail inside the suite and pass alone.
+    assert!(
+        activity.contains("pub(super) struct LiveLabelFrameGate"),
+        "the gate is view state"
+    );
+    assert!(
+        !activity.contains("static LIVE_LABEL_"),
+        "no process-wide gate state may come back"
+    );
+    assert!(
+        activity.contains("epoch: Option<Instant>"),
+        "the gate keeps the epoch of the clock it measures against"
+    );
+    assert!(
+        activity.contains("fn observe(&mut self, now: Instant, refresh: Option<Duration>) -> bool"),
+        "the gate is sampled with a caller-supplied clock"
+    );
 
     let source = include_str!("app.rs");
     let page = source
@@ -919,7 +949,17 @@ fn live_labels_keep_their_frame_gate_and_the_summary_reuses_its_projection() {
         .and_then(|(_, tail)| tail.split_once("\n    fn "))
         .map(|(body, _)| body)
         .expect("the workbench should remain inspectable");
-    assert!(page.contains("timeline_activity::observe_live_label_frame(window, cx);"));
+    // Anchored on the gate and the clock it is sampled with, not on the
+    // method's line wrapping: rustfmt splits this call when the arguments
+    // outgrow the line.
+    assert!(
+        page.contains("self.live_label_frame_gate"),
+        "the workbench samples its own gate"
+    );
+    assert!(
+        page.contains(".observe(cx.background_executor().now(), window.refresh_interval(cx))"),
+        "the gap is measured on the executor clock the app owns"
+    );
 
     let group = source
         .split_once("    fn render_process_activity_group(")
