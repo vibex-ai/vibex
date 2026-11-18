@@ -38,6 +38,12 @@ pub struct FilesHost {
     /// The file being read, when one is open.
     pub file: Signal<Option<FilePreview>>,
     pub error: Signal<Option<SharedString>>,
+    /// The open file's text, as edited.
+    pub content: Signal<String>,
+    /// Whether the text differs from what was read.
+    pub dirty: Signal<bool>,
+    pub saving: Signal<bool>,
+    pub on_save: Rc<dyn Fn()>,
     pub on_open_dir: Rc<dyn Fn(&str)>,
     pub on_open_file: Rc<dyn Fn(&str)>,
     pub on_back: Rc<dyn Fn()>,
@@ -66,6 +72,8 @@ pub fn files(host: FilesHost) -> impl IntoElement {
     let entries = host.entries;
     let file = host.file;
     let error = host.error;
+    let dirty = host.dirty;
+    let saving = host.saving;
     view()
         .flex_1()
         .bg(theme::background)
@@ -100,6 +108,19 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
                         )
+                        .child(when(move || file.get().is_some(), {
+                            let on_save = host.on_save.clone();
+                            move || {
+                                let on_save = on_save.clone();
+                                action::icon_button(
+                                    icon(include_str!("../../assets/icons/check.svg")),
+                                    copy::text("Save", "保存", "儲存"),
+                                    move || on_save(),
+                                )
+                                .disabled(move || !dirty.get() || saving.get())
+                                .disabled_style(|style| style.opacity(0.35))
+                            }
+                        }))
                         .child({
                             let on_close = on_close.clone();
                             action::icon_button(

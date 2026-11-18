@@ -86,8 +86,9 @@ A successful claim or a tapped saved runtime opens the session shell:
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY
   snapshot fills it, its frame stream keeps it live, and what the person types
   goes back to the PTY. Closing the surface leaves the terminal running;
-- the drawer opens a read-only file browser: one directory at a time from
-  `file_tree`, a file's text from `read_file`, with back through the
+- the drawer opens a file browser: one directory at a time from `file_tree`,
+  a file's text from `read_file` edited in place and written back with
+  `write_file` (guarded by the revision it was read at), with back through the
   directories and the preview;
 - the drawer opens the workspace's Git status: branch, changed paths with
   additions and deletions, and a path's diff from `git_diff`; each row stages

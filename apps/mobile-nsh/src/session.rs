@@ -86,6 +86,11 @@ pub struct SessionService {
     files_preview: Signal<Option<FilePreview>>,
     files_error: Signal<Option<SharedString>>,
     files_workspace: Rc<RefCell<Option<WorkspaceId>>>,
+    files_content: Signal<String>,
+    files_dirty: Signal<bool>,
+    files_saving: Signal<bool>,
+    files_revision: Rc<RefCell<Option<String>>>,
+    files_current: Rc<RefCell<Option<String>>>,
     git_open: Signal<bool>,
     git_branch: Signal<Option<SharedString>>,
     git_changes: Signal<Vec<GitChangeRow>>,
@@ -156,6 +161,11 @@ impl SessionService {
             files_preview: signal(None),
             files_error: signal(None),
             files_workspace: Rc::new(RefCell::new(None)),
+            files_content: signal(String::new()),
+            files_dirty: signal(false),
+            files_saving: signal(false),
+            files_revision: Rc::new(RefCell::new(None)),
+            files_current: Rc::new(RefCell::new(None)),
             git_open: signal(false),
             git_branch: signal(None),
             git_changes: signal(Vec::new()),
@@ -207,6 +217,13 @@ impl SessionService {
             files_entries: self.files_entries,
             files_preview: self.files_preview,
             files_error: self.files_error,
+            files_content: self.files_content,
+            files_dirty: self.files_dirty,
+            files_saving: self.files_saving,
+            on_save_file: {
+                let service = self.clone();
+                Rc::new(move || service.save_file())
+            },
             git_open: self.git_open,
             git_branch: self.git_branch,
             git_changes: self.git_changes,
@@ -1150,14 +1167,71 @@ impl SessionService {
             })
             .await;
             match result {
-                Ok(Ok(file)) => service.files_preview.set(Some(FilePreview {
-                    title: file.name,
-                    body: file.content.unwrap_or_default(),
-                    truncated: file.truncated,
-                })),
+                Ok(Ok(file)) => {
+                    *service.files_current.borrow_mut() = Some(file.path);
+                    *service.files_revision.borrow_mut() = Some(file.content_revision);
+                    service
+                        .files_content
+                        .set(file.content.clone().unwrap_or_default());
+                    service.files_dirty.set(false);
+                    service.files_preview.set(Some(FilePreview {
+                        title: file.name,
+                        body: file.content.unwrap_or_default(),
+                        truncated: file.truncated,
+                    }));
+                }
                 Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
                 Err(error) => service.files_error.set(Some(
                     format!("reading the file did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    /// Writes the edited text back, guarded by the revision it was read at.
+    fn save_file(&self) {
+        if self.files_saving.get_untracked() {
+            return;
+        }
+        let Some(path) = self.files_current.borrow().clone() else {
+            return;
+        };
+        let revision = self.files_revision.borrow().clone();
+        let content = self.files_content.get_untracked();
+        self.files_saving.set(true);
+        self.files_error.set(None);
+        let service = self.clone();
+        let file_backend = self.file_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.files_saving.set(false);
+                return;
+            };
+            let result = background(async move {
+                file_backend
+                    .write_file(MutationRequest::new(vibex_core::FileWriteRequest {
+                        workspace_id: workspace,
+                        path,
+                        content,
+                        create_if_missing: false,
+                        expected_revision: revision,
+                        encoding: None,
+                        line_ending: None,
+                    }))
+                    .await
+            })
+            .await;
+            service.files_saving.set(false);
+            match result {
+                Ok(Ok(file)) => {
+                    *service.files_revision.borrow_mut() = Some(file.content_revision);
+                    service.files_content.set(file.content.unwrap_or_default());
+                    service.files_dirty.set(false);
+                }
+                Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
+                Err(error) => service.files_error.set(Some(
+                    format!("saving the file did not finish: {error}").into(),
                 )),
             }
         });
@@ -1167,6 +1241,8 @@ impl SessionService {
     fn files_back(&self) {
         if self.files_preview.get_untracked().is_some() {
             self.files_preview.set(None);
+            self.files_dirty.set(false);
+            *self.files_current.borrow_mut() = None;
             return;
         }
         let path = self.files_path.get_untracked();

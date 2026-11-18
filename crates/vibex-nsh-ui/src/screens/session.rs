@@ -288,6 +288,10 @@ pub struct SessionHost {
     pub on_open_dir: OpenPath,
     pub on_open_file: OpenPath,
     pub on_files_back: Action,
+    pub files_content: Signal<String>,
+    pub files_dirty: Signal<bool>,
+    pub files_saving: Signal<bool>,
+    pub on_save_file: Action,
     /// The new-session sheet, and what it offers.
     pub new_session_open: Signal<bool>,
     pub new_workspaces: Signal<Vec<WorkspaceChoice>>,
@@ -342,6 +346,10 @@ pub fn session(host: SessionHost) -> impl IntoElement {
         on_open_file: host.on_open_file.clone(),
         on_back: host.on_files_back.clone(),
         on_close: host.on_close_files.clone(),
+        content: host.files_content,
+        dirty: host.files_dirty,
+        saving: host.files_saving,
+        on_save: host.on_save_file.clone(),
     };
     let git = crate::screens::git::GitHost {
         open: host.git_open,

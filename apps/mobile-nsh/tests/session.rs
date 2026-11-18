@@ -151,6 +151,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     ]);
     let files_preview = signal(None::<FilePreview>);
     let files_error = signal(None::<SharedString>);
+    let files_content = signal(String::new());
+    let files_dirty = signal(false);
+    let files_saving = signal(false);
     let on_open_dir = Rc::new(move |path: &str| {
         files_path.set(path.to_owned());
         files_entries.set(vec![FileEntry {
@@ -162,9 +165,15 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let on_open_file = Rc::new(move |path: &str| {
         files_preview.set(Some(FilePreview {
             title: path.rsplit('/').next().unwrap_or(path).to_owned(),
-            body: "fn main() {}".to_owned(),
+            body: String::new(),
             truncated: false,
         }));
+        files_content.set("edited".to_owned());
+        files_dirty.set(true);
+    });
+    let on_save_file = Rc::new(move || {
+        files_content.set("saved".to_owned());
+        files_dirty.set(false);
     });
     let on_files_back = Rc::new(move || files_preview.set(None));
     let git_open = signal(false);
@@ -330,6 +339,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_dir,
         on_open_file,
         on_files_back,
+        files_content,
+        files_dirty,
+        files_saving,
+        on_save_file,
         git_open,
         git_branch,
         git_changes,
@@ -529,7 +542,7 @@ fn the_files_surface_lists_a_directory_and_reads_a_file() {
     app.press("src").unwrap();
     app.wait_for("main.rs").unwrap();
     app.press("main.rs").unwrap();
-    app.wait_for("fn main() {}").unwrap();
+    app.wait_for("role:button[Save]").unwrap();
 }
 
 /// The shell with its Git surface open.
@@ -573,4 +586,17 @@ fn the_git_surface_commits_and_shows_history() {
     app.wait_for("text:Commit message").unwrap();
     app.press("role:button[History]").unwrap();
     app.wait_for("Initial commit").unwrap();
+}
+
+#[test]
+fn a_files_save_follows_the_edited_state() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("src").unwrap();
+    app.wait_for("main.rs").unwrap();
+    app.press("main.rs").unwrap();
+    app.wait_for("role:button[Save]").unwrap();
+    assert!(app.screen().enabled("role:button[Save]").unwrap());
 }
