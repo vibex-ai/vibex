@@ -196,8 +196,28 @@ requires that nothing but the scroll notified it. That is §7.3's second blocker
 the P0b work of narrowing notifications, and it now applies to the transcript
 exactly as it does to the sidebar.
 
-Two things were measured while narrowing it, and both matter to whoever picks
-this up:
+**Solved: the scrollbar's fade was the blocker.** Bisecting the surface found
+it. `pinned_scrollbar` draws `Scrollbar` as a child of the view holding the
+scroller, and the bar asks for an animation frame while its fade runs;
+`Window::request_animation_frame` attributes the request to
+`window.current_view()`, so it landed inside the list's own layer path and
+`eligible` refused the layer for as long as the fade ran — every scrolled frame.
+`ScrollbarOverlay` (in `apps/desktop/src/gpui_ext/mod.rs`) paints the bar in a
+view of its own, which moves the attribution off the surface. Measured on the
+transcript's surface with the same rows and state: **0 of 12 composited frames
+with the bar inline, 11 of 12 with it in its own view.** This is the same
+blocker §7.2 recorded for the sidebar; the sidebar also had a second one behind
+it, which is why the overlay did not help there, while the transcript had only
+this.
+
+How to bisect this class of problem, since reading the policy does not tell you
+which rule fired: build a minimal surface that returns the list alone and
+confirm it composites, then add the real surface's pieces back one at a time.
+The minimal list composited 11 of 12 immediately, which ruled out the element,
+the rows, the view boundary and the wrapper in one step and left the bar.
+
+Two more things were measured while narrowing it, and both matter to whoever
+picks this up:
 
 - **The rows are the cost, not the shell.** Stubbing the row builder's content
   takes a scrolled frame from thirteen rebuilt views to one. So the work below
