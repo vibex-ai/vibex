@@ -329,6 +329,8 @@ pub struct SessionHost {
     pub new_busy: Signal<bool>,
     pub new_error: Signal<Option<SharedString>>,
     pub on_create_session: Action,
+    pub new_worktree_branch: Signal<String>,
+    pub on_create_worktree_session: Action,
     pub on_close_new_session: Action,
     /// The id of the session whose actions are open, if any.
     pub session_actions: Signal<Option<String>>,
@@ -528,6 +530,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             error: host.new_error,
             on_close: host.on_close_new_session.clone(),
             on_create: host.on_create_session.clone(),
+            worktree_branch: host.new_worktree_branch,
+            on_create_worktree: host.on_create_worktree_session.clone(),
         }))
 }
 

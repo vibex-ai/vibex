@@ -326,6 +326,27 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let new_runtime = signal(Some("0".to_owned()));
     let new_busy = signal(false);
     let new_error = signal(None::<SharedString>);
+    let new_worktree_branch = signal(String::new());
+    let on_create_worktree_session = Rc::new(move || {
+        if new_worktree_branch.get_untracked().trim().is_empty() {
+            return;
+        }
+        sessions.update(|sessions| {
+            sessions.insert(
+                0,
+                SessionSummary {
+                    id: "s4".to_owned(),
+                    title: "Worktree session".to_owned(),
+                    agent: "Claude".to_owned(),
+                    meta: "now".to_owned(),
+                    state: SessionState::Idle,
+                },
+            );
+        });
+        active.set(Some("s4".to_owned()));
+        timeline.set(transcript("s4"));
+        new_session_open.set(false);
+    });
     let on_create_session = Rc::new(move || {
         sessions.update(|sessions| {
             sessions.insert(
@@ -485,6 +506,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_busy,
         new_error,
         on_create_session,
+        new_worktree_branch,
+        on_create_worktree_session,
         on_close_new_session: Rc::new(move || new_session_open.set(false)),
     }
 }
@@ -829,4 +852,15 @@ fn the_terminal_list_switches_between_terminals() {
         |screen| screen.texts().contains(&"Build"),
     )
     .unwrap();
+}
+
+#[test]
+fn a_new_worktree_session_can_be_started_from_the_sheet() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New session]").unwrap();
+    app.wait_for("text:Branch name").unwrap();
+    app.type_text("text:Branch name", "feat/mobile").unwrap();
+    app.press("role:button[Create worktree]").unwrap();
+    app.wait_for("Worktree session").unwrap();
 }

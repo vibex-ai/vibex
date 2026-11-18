@@ -87,7 +87,8 @@ A successful claim or a tapped saved runtime opens the session shell:
   materializes), shows them as removable chips, and sends them with the text;
   the drawer starts a new session through a sheet that lists the runtime's
   workspaces and its ready Agent/model options (`list_workspaces`,
-  `list_runtime_options`);
+  `list_runtime_options`), and that sheet also starts a session in a new
+  worktree (`git_worktree_create` from the chosen workspace's branch name);
 - a session's "⋯" opens its actions: Rename, Archive, and Delete (after the
   native confirmation); removing the active session opens the next one;
 - the drawer opens the workspace's terminal full-screen: the runtime's PTY

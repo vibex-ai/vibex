@@ -43,6 +43,9 @@ pub struct NewSessionHost {
     pub error: Signal<Option<SharedString>>,
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
+    /// A branch name for a new worktree.
+    pub worktree_branch: Signal<String>,
+    pub on_create_worktree: Rc<dyn Fn()>,
 }
 
 /// The sheet.
@@ -78,6 +81,31 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                     |choice| choice.id.clone(),
                     |choice| (choice.name.clone(), choice.detail.clone()),
                 ))
+                .child(section_label(copy::text(
+                    "New worktree",
+                    "新建 Worktree",
+                    "新增 Worktree",
+                )))
+                .child(
+                    view()
+                        .w_full()
+                        .flex_row()
+                        .items_end()
+                        .gap(px(theme::SPACING_SM))
+                        .child(crate::ui::field::text_field(
+                            host.worktree_branch,
+                            copy::text("Branch name", "分支名", "分支名稱"),
+                        ))
+                        .child({
+                            let on_create_worktree = host.on_create_worktree.clone();
+                            action::secondary(
+                                copy::text("Create worktree", "创建 Worktree", "建立 Worktree"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                move || on_create_worktree(),
+                            )
+                        }),
+                )
                 .child(section_label(copy::text(
                     "Agent and model",
                     "Agent 与模型",

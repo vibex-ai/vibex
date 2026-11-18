@@ -27,12 +27,13 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary,
-    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
-    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    GitWorktreeCreateRequest, MessageAttachment, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeOptionAvailability, SendAgentMessageRequest, SessionRuntimeOption,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
+    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -121,6 +122,7 @@ pub struct SessionService {
     new_runtimes: Signal<Vec<RuntimeChoice>>,
     new_workspace: Signal<Option<String>>,
     new_runtime: Signal<Option<String>>,
+    new_worktree_branch: Signal<String>,
     new_busy: Signal<bool>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Rc<RefCell<Vec<WorkspaceSummary>>>,
@@ -205,6 +207,7 @@ impl SessionService {
             new_runtimes: signal(Vec::new()),
             new_workspace: signal(None),
             new_runtime: signal(None),
+            new_worktree_branch: signal(String::new()),
             new_busy: signal(false),
             new_error: signal(None),
             workspace_records: Rc::new(RefCell::new(Vec::new())),
@@ -270,6 +273,7 @@ impl SessionService {
             new_runtimes: self.new_runtimes,
             new_workspace: self.new_workspace,
             new_runtime: self.new_runtime,
+            new_worktree_branch: self.new_worktree_branch,
             new_busy: self.new_busy,
             new_error: self.new_error,
             resolving: self.resolving,
@@ -356,6 +360,10 @@ impl SessionService {
             on_close_new_session: {
                 let service = self.clone();
                 Rc::new(move || service.new_session_open.set(false))
+            },
+            on_create_worktree_session: {
+                let service = self.clone();
+                Rc::new(move || service.create_worktree_session())
             },
             on_open_terminal: {
                 let service = self.clone();
@@ -1001,6 +1009,116 @@ impl SessionService {
                 Err(error) => service.fail(&BackendError::failed(
                     "session_interrupt_task_failed",
                     format!("stopping the turn did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Creates a worktree from the chosen workspace and opens a session in it.
+    fn create_worktree_session(&self) {
+        if self.new_busy.get_untracked() {
+            return;
+        }
+        let Some(workspace_id) = self.new_workspace.get_untracked() else {
+            return;
+        };
+        let branch = self.new_worktree_branch.get_untracked().trim().to_owned();
+        if branch.is_empty() {
+            self.new_error.set(Some(
+                copy::text(
+                    "Type a branch name for the new worktree.",
+                    "请为新 Worktree 输入分支名。",
+                    "請為新 Worktree 輸入分支名稱。",
+                )
+                .into(),
+            ));
+            return;
+        }
+        let Some(runtime_id) = self.new_runtime.get_untracked() else {
+            return;
+        };
+        let Ok(index) = runtime_id.parse::<usize>() else {
+            return;
+        };
+        let Some(base) = self
+            .workspace_records
+            .borrow()
+            .iter()
+            .find(|space| space.workspace.id.as_str() == workspace_id)
+            .map(|space| space.workspace.id.clone())
+        else {
+            return;
+        };
+        let Some(option) = self
+            .runtime_options
+            .borrow()
+            .iter()
+            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
+            .nth(index)
+            .cloned()
+        else {
+            return;
+        };
+        self.new_busy.set(true);
+        self.new_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let created = background(async move {
+                git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
+                    workspace_id: base,
+                    branch_name: branch,
+                    base_ref: None,
+                    name: None,
+                    worktree_path: None,
+                    target_workspace_id: None,
+                    target_branch: None,
+                }))
+                .await
+            })
+            .await;
+            let worktree = match created {
+                Ok(Ok(created)) => created,
+                Ok(Err(error)) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(error_text(&error)));
+                    return;
+                }
+                Err(error) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(
+                        format!("creating the worktree did not finish: {error}").into(),
+                    ));
+                    return;
+                }
+            };
+            let request = CreateAgentSessionRequest {
+                runtime: option.selection,
+                workspace_root: worktree.workspace.root_path,
+                workspace_mode: worktree.workspace.mode,
+                title: None,
+                safety: None,
+                session_id: Some(VibexSessionId::new()),
+                defer_runtime_materialization: false,
+                tools: Default::default(),
+            };
+            let result =
+                background(
+                    async move { backend.create_session(MutationRequest::new(request)).await },
+                )
+                .await;
+            service.new_busy.set(false);
+            match result {
+                Ok(Ok(session)) => {
+                    service.new_session_open.set(false);
+                    service.new_worktree_branch.set(String::new());
+                    service.refresh();
+                    service.open(session.id.as_str());
+                }
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("creating the session did not finish: {error}").into(),
                 )),
             }
         });
