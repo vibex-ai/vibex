@@ -292,6 +292,15 @@ undoing the hold the click asked for, one frame after the spring stopped.
 | --- | --- |
 | A disclosure that holds the screen (`timeline_disclosure_holds_screen`) never resumes the follow when it lands. | The hold *is* the reader's instruction; the landing frame must not reinterpret it. A closing row does not hold, so it still resumes at the bottom edge. |
 
+## 5b-quater. The reader's place is a row, kept current
+
+| Rule | Why |
+| --- | --- |
+| `capture_timeline_scroll_anchor` reads `ListState::logical_scroll_top()` — the row and the distance into it — instead of resolving a pixel offset against a copy of the row table. | That is the identity the list itself lays out with, and it costs nothing, so the render can refresh it on every frame. |
+| The render captures it every frame while the reader is not following the bottom. | A read that finishes a moment after the reader kept scrolling would otherwise restore the place they left — a jump in whichever direction they went since. |
+| `apply_timeline_scroll_anchor` places that row with `scroll_to(ListOffset)`, not with a pixel offset through `set_offset_from_scrollbar`. | The pixel mapping runs the offset back through the list's padding and its own item heights, and the padding stays in the result as a bias. |
+| A test fixture that parks the reader must park the list (row + offset), not a pixel offset derived from the table. | The list resolves a pixel offset through the heights it knows; before a row has been measured that is its hint, not the table's estimate, so the two disagree. |
+
 ## 5c. One transcript surface per session
 
 `TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
