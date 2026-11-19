@@ -519,6 +519,12 @@ impl PairingService {
                 name: bundle.host_label(),
                 address: bundle.record.server_url.clone(),
                 server_id: bundle.expected_server_id.clone(),
+                device_name: crate::host::device_name(),
+                last_connected: self
+                    .connected
+                    .get_untracked()
+                    .filter(|connected| connected.bundle.host_id() == host_id)
+                    .map(|_| copy::text("Now", "现在", "現在").to_owned()),
             }));
     }
 

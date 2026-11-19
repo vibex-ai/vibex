@@ -1697,6 +1697,18 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                         )
                         .child(
                             action::secondary(
+                                copy::text("Switch runtime", "切换运行时", "切換執行環境"),
+                                icon(include_str!("../../assets/icons/refresh.svg")),
+                                false,
+                                {
+                                    let on_disconnect = on_disconnect.clone();
+                                    move || on_disconnect()
+                                },
+                            )
+                            .w_full(),
+                        )
+                        .child(
+                            action::secondary(
                                 copy::text("Disconnect", "断开连接", "中斷連線"),
                                 icon(include_str!("../../assets/icons/plug-zap.svg")),
                                 false,

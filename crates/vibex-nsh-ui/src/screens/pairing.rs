@@ -74,6 +74,8 @@ pub struct HostDetails {
     pub name: String,
     pub address: String,
     pub server_id: String,
+    pub device_name: Option<String>,
+    pub last_connected: Option<String>,
 }
 
 /// A runtime the local network found and the user may pair with.
@@ -147,6 +149,7 @@ pub struct PairingHost {
 pub fn pairing(host: PairingHost) -> impl IntoElement {
     let manual_open = signal(false);
     let nearby_open = signal(false);
+    let settings_open = signal(false);
     let draft = signal(String::new());
     let server = signal(String::new());
 
@@ -194,6 +197,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
 
     view()
         .flex_1()
+        .relative()
         .items_center()
         .bg(theme::background)
         .px(px(theme::SPACING_XL))
@@ -203,6 +207,80 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .child(manual_sheet(host.clone(), manual_open, draft, server))
         .child(nearby_sheet(host.clone(), nearby_open))
         .child(details_sheet(host))
+        .child(
+            view()
+                .absolute()
+                .top(px(8.0))
+                .right(px(8.0))
+                .child(action::icon_button(
+                    icon(include_str!("../../assets/icons/settings.svg")),
+                    copy::text("Settings", "设置", "設定"),
+                    move || settings_open.set(true),
+                )),
+        )
+        .child(settings_sheet(settings_open))
+}
+
+/// The first screen's settings sheet: the facts this build can state today.
+fn settings_sheet(open: Signal<bool>) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event {
+                open.set(*next);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Settings", "设置", "設定"))
+                        .text_size(px(theme::FONT_HEADING))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(settings_row(
+                    copy::text("Appearance", "外观", "外觀"),
+                    copy::text("System", "跟随系统", "跟隨系統"),
+                ))
+                .child(settings_row(
+                    copy::text("Version", "版本", "版本"),
+                    "Vibex 0.1.8",
+                ))
+                .child(
+                    action::secondary(
+                        copy::text("Close", "关闭", "關閉"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || open.set(false),
+                    )
+                    .w_full(),
+                ),
+        )
+}
+
+fn settings_row(label: &'static str, value: &'static str) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::foreground),
+        )
+        .child(
+            text(value)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::text_muted),
+        )
 }
 
 /// A saved runtime's details, as a sheet.
@@ -303,6 +381,50 @@ fn details_sheet(host: PairingHost) -> impl IntoElement {
                 .child(details_field(
                     copy::text("Client identity", "客户端身份", "用戶端身分"),
                     || "vibex-mobile".to_owned(),
+                ))
+                .child(when(
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .is_some_and(|details| details.device_name.is_some())
+                        })
+                    },
+                    move || {
+                        details_field(
+                            copy::text("Device name", "设备名称", "裝置名稱"),
+                            move || {
+                                details.with(|details| {
+                                    details
+                                        .as_ref()
+                                        .and_then(|details| details.device_name.clone())
+                                        .unwrap_or_default()
+                                })
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .is_some_and(|details| details.last_connected.is_some())
+                        })
+                    },
+                    move || {
+                        details_field(
+                            copy::text("Last connected", "最近连接", "最近連線"),
+                            move || {
+                                details.with(|details| {
+                                    details
+                                        .as_ref()
+                                        .and_then(|details| details.last_connected.clone())
+                                        .unwrap_or_default()
+                                })
+                            },
+                        )
+                    },
                 ))
                 .child({
                     let on_remove = host.on_remove_saved.clone();
@@ -466,14 +588,27 @@ fn saved_row(
                 .gap(px(theme::SPACING_SM))
                 .active(|style| style.opacity(0.85))
                 .on_press(move || on_pick(&runtime.get_untracked().id))
-                .child(
-                    view()
-                        .w(px(8.0))
-                        .h(px(8.0))
-                        .flex_shrink_0()
-                        .rounded(px(4.0))
-                        .bg(move || runtime.get().status.dot()),
-                )
+                .child(when(
+                    move || runtime.get().status == RuntimeStatus::Probing,
+                    || {
+                        text("…")
+                            .w(px(8.0))
+                            .flex_shrink_0()
+                            .text_size(px(theme::FONT_MICRO))
+                            .text_color(theme::text_muted)
+                    },
+                ))
+                .child(when(
+                    move || runtime.get().status != RuntimeStatus::Probing,
+                    move || {
+                        view()
+                            .w(px(8.0))
+                            .h(px(8.0))
+                            .flex_shrink_0()
+                            .rounded(px(4.0))
+                            .bg(move || runtime.get().status.dot())
+                    },
+                ))
                 .child(
                     text(move || runtime.get().name)
                         .flex_1()
