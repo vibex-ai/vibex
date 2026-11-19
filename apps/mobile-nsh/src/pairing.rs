@@ -54,6 +54,7 @@ pub struct PairingService {
     bundles: Rc<RefCell<Vec<MobileCredentialBundle>>>,
     saved: Signal<Vec<SavedRuntime>>,
     nearby: Signal<Vec<NearbyRuntime>>,
+    details: Signal<Option<vibex_nsh_ui::screens::pairing::HostDetails>>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     connected: Signal<Option<ConnectedRuntime>>,
@@ -84,6 +85,8 @@ impl PairingService {
                     id: bundle.host_id().to_owned(),
                     name: bundle.host_label(),
                     status: RuntimeStatus::Unreachable,
+                    address: bundle.record.server_url.clone(),
+                    server_id: bundle.expected_server_id.clone(),
                 })
                 .collect::<Vec<_>>(),
         );
@@ -92,6 +95,7 @@ impl PairingService {
             bundles: Rc::new(RefCell::new(bundles)),
             saved,
             nearby: signal(Vec::new()),
+            details: signal(None),
             busy: signal(false),
             error: signal(error),
             connected: signal(None),
@@ -132,6 +136,19 @@ impl PairingService {
             on_paste: Rc::new(move |draft| paste.paste(draft)),
             on_find: Rc::new(move || find.start_nearby()),
             on_pick_saved: Rc::new(move |id| pick_saved.probe_runtime(id)),
+            details: self.details,
+            on_show_details: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.show_details(id))
+            },
+            on_remove_saved: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.remove_host(id))
+            },
+            on_close_details: {
+                let service = self.clone();
+                Rc::new(move || service.details.set(None))
+            },
             on_pick_nearby: Rc::new(move |key| pick_nearby.start_nearby_pair(key)),
             nearby_waiting: self.nearby_waiting,
             nearby_code: self.nearby_code,
@@ -477,6 +494,67 @@ impl PairingService {
         });
     }
 
+    /// Shows one saved runtime's details.
+    fn show_details(&self, host_id: &str) {
+        let Some(bundle) = self
+            .bundles
+            .borrow()
+            .iter()
+            .find(|bundle| bundle.host_id() == host_id)
+            .cloned()
+        else {
+            return;
+        };
+        self.details
+            .set(Some(vibex_nsh_ui::screens::pairing::HostDetails {
+                id: host_id.to_owned(),
+                name: bundle.host_label(),
+                address: bundle.record.server_url.clone(),
+                server_id: bundle.expected_server_id.clone(),
+            }));
+    }
+
+    /// Removes a saved runtime after the native confirmation.
+    fn remove_host(&self, host_id: &str) {
+        let host_id = host_id.to_owned();
+        let service = self.clone();
+        spawn(async move {
+            let answer = nsh_base::alert_dialog()
+                .title(copy::text(
+                    "Remove this runtime?",
+                    "移除这个运行时？",
+                    "移除這個執行環境？",
+                ))
+                .description(copy::text(
+                    "Its credential leaves this phone; pair again to reconnect.",
+                    "它的凭据会从这台手机上删除，需要重新配对才能连接。",
+                    "它的憑證會從這台手機上刪除，需要重新配對才能連線。",
+                ))
+                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                .destructive("remove", copy::text("Remove", "移除", "移除"))
+                .show()
+                .await;
+            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("remove")) {
+                return;
+            }
+            let result = service.store.remove(&host_id);
+            match result {
+                Ok(bundles) => {
+                    let was_connected = service
+                        .connected
+                        .get_untracked()
+                        .is_some_and(|connected| connected.bundle.host_id() == host_id);
+                    service.set_bundles(bundles);
+                    service.details.set(None);
+                    if was_connected {
+                        service.connected.set(None);
+                    }
+                }
+                Err(error) => service.fail(&error),
+            }
+        });
+    }
+
     /// Probes every saved runtime once, at startup.
     fn probe_saved(&self) {
         let bundles = self.bundles.borrow().clone();
@@ -560,6 +638,8 @@ impl PairingService {
                     id,
                     name: bundle.host_label(),
                     status,
+                    address: bundle.record.server_url.clone(),
+                    server_id: bundle.expected_server_id.clone(),
                 }
             })
             .collect::<Vec<_>>();

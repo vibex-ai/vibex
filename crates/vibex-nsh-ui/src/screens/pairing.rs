@@ -61,6 +61,19 @@ pub struct SavedRuntime {
     pub name: String,
     /// How it answers right now.
     pub status: RuntimeStatus,
+    /// The runtime's address, for its details.
+    pub address: String,
+    /// The runtime's server id, for its details.
+    pub server_id: String,
+}
+
+/// What a saved runtime's details page shows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HostDetails {
+    pub id: String,
+    pub name: String,
+    pub address: String,
+    pub server_id: String,
 }
 
 /// A runtime the local network found and the user may pair with.
@@ -113,6 +126,13 @@ pub struct PairingHost {
     pub on_find: Action,
     /// Connect to a saved runtime.
     pub on_pick_saved: Pick,
+    /// Open a saved runtime's details.
+    pub on_show_details: Pick,
+    /// Remove a saved runtime's credential.
+    pub on_remove_saved: Pick,
+    /// The details sheet's state.
+    pub details: Signal<Option<HostDetails>>,
+    pub on_close_details: Action,
     /// Pair with a runtime discovery found.
     pub on_pick_nearby: Pick,
 }
@@ -133,10 +153,11 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .max_w(px(CARD_WIDTH))
         .flex_1()
         .flex_col()
-        .child(brand::wordmark())
+        .child(view().w_full().items_center().child(brand::wordmark()))
         .child(when(move || saved.with(|saved| !saved.is_empty()), {
             let on_pick = host.on_pick_saved.clone();
-            move || saved_runtimes(saved, on_pick.clone())
+            let on_details = host.on_show_details.clone();
+            move || saved_runtimes(saved, on_pick.clone(), on_details.clone())
         }))
         .child(
             view()
@@ -174,7 +195,114 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .pb_safe_area_plus(px(theme::SPACING_LG))
         .child(page)
         .child(manual_sheet(host.clone(), manual_open, draft, server))
-        .child(nearby_sheet(host, nearby_open))
+        .child(nearby_sheet(host.clone(), nearby_open))
+        .child(details_sheet(host))
+}
+
+/// A saved runtime's details, as a sheet.
+fn details_sheet(host: PairingHost) -> impl IntoElement {
+    let details = host.details;
+    let open = computed(move || details.get().is_some());
+    let on_close = host.on_close_details.clone();
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Runtime details", "运行时详情", "執行環境詳情"))
+                        .text_size(px(theme::FONT_HEADING))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(details_field(
+                    copy::text("Type", "类型", "類型"),
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .map(|details| {
+                                    if details.address.starts_with("http") {
+                                        copy::text("Desktop runtime", "桌面运行时", "桌面執行環境")
+                                    } else {
+                                        copy::text("Runtime", "运行时", "執行環境")
+                                    }
+                                    .to_owned()
+                                })
+                                .unwrap_or_default()
+                        })
+                    },
+                ))
+                .child(details_field(
+                    copy::text("Address", "地址", "位址"),
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .map(|details| details.address.clone())
+                                .unwrap_or_default()
+                        })
+                    },
+                ))
+                .child(details_field(
+                    copy::text("Server ID", "服务器 ID", "伺服器 ID"),
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .map(|details| details.server_id.clone())
+                                .unwrap_or_default()
+                        })
+                    },
+                ))
+                .child(details_field(
+                    copy::text("Client identity", "客户端身份", "用戶端身分"),
+                    || "vibex-mobile".to_owned(),
+                ))
+                .child({
+                    let on_remove = host.on_remove_saved.clone();
+                    action::secondary(
+                        copy::text("Remove runtime", "移除运行时", "移除執行環境"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || {
+                            if let Some(details) = details.get_untracked() {
+                                on_remove(&details.id);
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
+        )
+}
+
+fn details_field(label: &'static str, value: impl Fn() -> String + 'static) -> impl IntoElement {
+    view()
+        .w_full()
+        .gap(px(2.0))
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_MICRO))
+                .text_color(theme::text_muted),
+        )
+        .child(
+            text(value)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::foreground),
+        )
 }
 
 /// The last action's failure, worded for the person holding the phone.
@@ -263,7 +391,11 @@ fn link_entry(busy: Signal<bool>, manual_open: Signal<bool>) -> ButtonElement {
 }
 
 /// The runtimes this phone saved, above the entries.
-fn saved_runtimes(saved: Signal<Vec<SavedRuntime>>, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
+fn saved_runtimes(
+    saved: Signal<Vec<SavedRuntime>>,
+    on_pick: Rc<dyn Fn(&str)>,
+    on_details: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
     view()
         .flex_col()
         .w_full()
@@ -272,14 +404,17 @@ fn saved_runtimes(saved: Signal<Vec<SavedRuntime>>, on_pick: Rc<dyn Fn(&str)>) -
         .child(each(
             move || saved.get(),
             |runtime| runtime.id.clone(),
-            move |runtime, _| saved_row(runtime, on_pick.clone()),
+            move |runtime, _| saved_row(runtime, on_pick.clone(), on_details.clone()),
         ))
 }
 
 /// One saved runtime: a status dot, its name, and the display it runs on.
-fn saved_row(runtime: ReadSignal<SavedRuntime>, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
-    button()
-        .on_press(move || on_pick(&runtime.get_untracked().id))
+fn saved_row(
+    runtime: ReadSignal<SavedRuntime>,
+    on_pick: Rc<dyn Fn(&str)>,
+    on_details: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    view()
         .w_full()
         .min_h(px(RUNTIME_ROW_HEIGHT))
         .rounded(px(theme::RADIUS_CONTROL))
@@ -288,33 +423,56 @@ fn saved_row(runtime: ReadSignal<SavedRuntime>, on_pick: Rc<dyn Fn(&str)>) -> im
         .bg(theme::background_dim)
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_SM))
-        .pl(px(theme::SPACING_MD))
-        .pr(px(theme::SPACING_SM))
-        .active(|style| style.opacity(0.85))
         .child(
-            view()
-                .w(px(8.0))
-                .h(px(8.0))
-                .flex_shrink_0()
-                .rounded(px(4.0))
-                .bg(move || runtime.get().status.dot()),
-        )
-        .child(
-            text(move || runtime.get().name)
+            button()
                 .flex_1()
-                .truncate()
-                .text_size(px(theme::FONT_BODY))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::text_secondary),
+                .min_h(px(RUNTIME_ROW_HEIGHT))
+                .pl(px(theme::SPACING_MD))
+                .pr(px(theme::SPACING_SM))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .active(|style| style.opacity(0.85))
+                .on_press(move || on_pick(&runtime.get_untracked().id))
+                .child(
+                    view()
+                        .w(px(8.0))
+                        .h(px(8.0))
+                        .flex_shrink_0()
+                        .rounded(px(4.0))
+                        .bg(move || runtime.get().status.dot()),
+                )
+                .child(
+                    text(move || runtime.get().name)
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(theme::FONT_BODY))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::text_secondary),
+                )
+                .child(
+                    svg(icon(include_str!("../../assets/icons/monitor.svg")))
+                        .w(px(theme::ICON_SM))
+                        .h(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted),
+                ),
         )
-        .child(
-            svg(icon(include_str!("../../assets/icons/monitor.svg")))
-                .w(px(theme::ICON_SM))
-                .h(px(theme::ICON_SM))
-                .flex_shrink_0()
-                .text_color(theme::text_muted),
-        )
+        .child({
+            button()
+                .min_h(px(theme::TOUCH_TARGET))
+                .min_w(px(theme::TOUCH_TARGET))
+                .items_center()
+                .justify_center()
+                .active(|style| style.opacity(0.7))
+                .accessibility_label(copy::text("Runtime actions", "运行时操作", "執行環境操作"))
+                .on_press(move || on_details(&runtime.get_untracked().id))
+                .child(
+                    text("⋯")
+                        .text_size(px(theme::FONT_HEADING))
+                        .text_color(theme::text_muted),
+                )
+        })
 }
 
 /// The manual entry sheet.
