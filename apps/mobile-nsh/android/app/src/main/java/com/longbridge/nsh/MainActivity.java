@@ -21,15 +21,21 @@ public final class MainActivity extends Activity {
     private static final int SCAN_REQUEST = 42;
 
     private NshView view;
+    private LanDiscovery lanDiscovery;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean scanning;
 
     private final Runnable poll = new Runnable() {
         @Override
         public void run() {
-            if (NshHost.nativeTakeHostRequest() == 1 && !scanning) {
+            int request = NshHost.nativeTakeHostRequest();
+            if (request == 1 && !scanning) {
                 scanning = true;
                 openScanner();
+            } else if (request == 2) {
+                lanDiscovery.start();
+            } else if (request == 3) {
+                lanDiscovery.stop();
             }
             handler.postDelayed(this, 200);
         }
@@ -41,6 +47,8 @@ public final class MainActivity extends Activity {
         DevActivity.edgeToEdge(this);
         NshHost.nativeSetDeviceName(android.os.Build.MODEL);
         NshHost.nativeSetScannerAvailable(true);
+        NshHost.nativeSetDiscoveryAvailable(true);
+        lanDiscovery = new LanDiscovery(this, NshHost::nativeDiscoveryEvent);
         view = new NshView(this);
         view.useStandaloneLimits();
         setContentView(view);
@@ -72,6 +80,12 @@ public final class MainActivity extends Activity {
     }
 
     @Override
+    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
+        super.onRequestPermissionsResult(requestCode, permissions, results);
+        lanDiscovery.onRequestPermissionsResult(requestCode, results);
+    }
+
+    @Override
     public void onConfigurationChanged(android.content.res.Configuration config) {
         super.onConfigurationChanged(config);
         DevActivity.systemBars(this);
@@ -96,6 +110,9 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(poll);
+        if (lanDiscovery != null) {
+            lanDiscovery.stop();
+        }
         if (view != null) {
             view.destroy();
         }

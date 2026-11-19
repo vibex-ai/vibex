@@ -157,3 +157,24 @@ pub fn accent_red() -> Hsla {
 pub fn line_height_for(size: f32) -> Points {
     px(size * LINE_HEIGHT_RATIO)
 }
+
+/// The pairing wordmark's mark geometry: the GPUI client's authored 42 pt
+/// lockup, scaled to the label's size. The mark is wider than the label is
+/// tall and its point lands on the baseline.
+pub struct WordmarkMark {
+    pub width: f32,
+    pub height: f32,
+    pub margin_top: f32,
+    pub top_offset: f32,
+}
+
+/// The mark's box at `font` points, from the 42 pt authored lockup.
+pub fn wordmark_mark(font: f32) -> WordmarkMark {
+    let scale = font / 42.0;
+    WordmarkMark {
+        width: 46.0 * scale,
+        height: 45.0 * scale,
+        margin_top: 2.0 * scale,
+        top_offset: -6.0 * scale,
+    }
+}

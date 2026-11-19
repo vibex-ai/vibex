@@ -35,8 +35,16 @@ use crate::pairing::PairingService;
 pub enum HostEvent {
     /// The camera read a pairing link or a server connection string.
     ScanResult(String),
-    /// Discovery found a runtime.
-    DiscoveryCandidate { key: String, name: String },
+    /// Discovery found a runtime. A zero-config runtime also carries the
+    /// origin and identity a pairing session needs; the simplified marker
+    /// (old hosts, tests) leaves them empty.
+    DiscoveryCandidate {
+        key: String,
+        name: String,
+        origin: Option<String>,
+        server_id: Option<String>,
+        server_key: Option<String>,
+    },
     /// A runtime left the network.
     DiscoveryRemoved { key: String },
     /// The user refused local-network access.
@@ -49,6 +57,10 @@ static SENDER: OnceLock<Mutex<Option<UnboundedSender<HostEvent>>>> = OnceLock::n
 
 /// Whether the host carries a live camera scanner (set by a custom host).
 static SCANNER_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Whether the host browses the local network itself (a custom host).
+static DISCOVERY_AVAILABLE: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
 /// Records that the host can scan a QR code with its camera. Called by the
 /// host before it mounts the app.
@@ -64,6 +76,20 @@ pub fn set_scanner_available(available: bool) {
 /// picker.
 pub fn scanner_available() -> bool {
     SCANNER_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records that the host runs discovery (NSD) itself.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host sets this")
+)]
+pub fn set_discovery_available(available: bool) {
+    DISCOVERY_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether Find should ask the host instead of browsing mDNS in Rust.
+pub fn discovery_available() -> bool {
+    DISCOVERY_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// The name the platform reports for this phone, once the host sets it.
@@ -215,10 +241,28 @@ pub fn send(event: HostEvent) -> bool {
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase", tag = "kind")]
 enum DiscoveryMessage {
-    Candidate { key: String, name: String },
-    Removed { key: String },
+    Candidate {
+        #[serde(default)]
+        key: String,
+        #[serde(default)]
+        name: String,
+        #[serde(default)]
+        service_instance: String,
+        #[serde(default)]
+        host: String,
+        #[serde(default)]
+        port: u16,
+        #[serde(default)]
+        txt: std::collections::BTreeMap<String, String>,
+    },
+    Removed {
+        #[serde(default)]
+        key: String,
+    },
     PermissionDenied,
-    Failed { message: String },
+    Failed {
+        message: String,
+    },
 }
 
 /// Parses a discovery message from the host.
@@ -227,8 +271,45 @@ enum DiscoveryMessage {
 /// a bridge sending the wrong shape should be visible on the page.
 pub fn parse_discovery(value: &str) -> HostEvent {
     match serde_json::from_str::<DiscoveryMessage>(value) {
-        Ok(DiscoveryMessage::Candidate { key, name }) => {
-            HostEvent::DiscoveryCandidate { key, name }
+        Ok(DiscoveryMessage::Candidate {
+            key,
+            name,
+            service_instance,
+            host,
+            port,
+            txt,
+        }) => {
+            let key = if key.is_empty() {
+                service_instance.clone()
+            } else {
+                key
+            };
+            let name = if name.is_empty() {
+                txt.get("display_name")
+                    .cloned()
+                    .unwrap_or_else(|| service_instance.clone())
+            } else {
+                name
+            };
+            let zero_config = txt.get("mode").map(String::as_str) == Some("zero_config")
+                && txt.get("version").map(String::as_str) == Some("1")
+                && txt.get("pairing").map(String::as_str) == Some("available")
+                && txt.get("protocol_min").map(String::as_str) == Some("2")
+                && txt.get("protocol_max").map(String::as_str) == Some("2");
+            let origin = zero_config
+                .then(|| format!("http://{host}:{port}"))
+                .filter(|_| !host.is_empty() && port != 0);
+            let server_id = zero_config.then(|| txt.get("server_id").cloned()).flatten();
+            let server_key = zero_config
+                .then(|| txt.get("server_identity_public_key").cloned())
+                .flatten();
+            HostEvent::DiscoveryCandidate {
+                key,
+                name,
+                origin,
+                server_id,
+                server_key,
+            }
         }
         Ok(DiscoveryMessage::Removed { key }) => HostEvent::DiscoveryRemoved { key },
         Ok(DiscoveryMessage::PermissionDenied) => HostEvent::DiscoveryPermissionDenied,
@@ -261,6 +342,9 @@ mod tests {
             HostEvent::DiscoveryCandidate {
                 key: "desktop-1".to_owned(),
                 name: "Studio".to_owned(),
+                origin: None,
+                server_id: None,
+                server_key: None,
             }
         );
     }

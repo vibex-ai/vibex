@@ -23,7 +23,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | --- | --- | --- | --- | --- |
 | Pairing page, link, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 4 headless page tests, 14 pairing-crate tests | headless + unit | paste, clipboard, real claim round-trip |
 | Scan a QR code | `android/ScannerActivity.java`, `screens/pairing.rs`, `scan_photo` | emulator: portrait scanner with viewfinder/close/hint, camera permission, gallery decode (a picked QR was decoded; a non-Vibex code was rejected in place), host→app JNI result exercised | emulator | scan a real desktop QR on a phone |
-| Find runtimes on the LAN | `apps/mobile-nsh/src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules | emulator: the sheet opens and reports Searching (no runtime on that network) | discovery and approval against a desktop on the same LAN |
+| Find runtimes on the LAN | `android/LanDiscovery.java`, `src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules; emulator: host NSD permission and Searching | emulator: permission + browsing start | discovery and approval against a desktop on the same LAN |
 | Session shell and switching | `screens/session.rs`, `apps/mobile-nsh/src/session.rs` | `the_shell_opens_on_the_first_session`, `the_drawer_lists_sessions_and_switching_one_swaps_the_transcript` | headless | long lists, scroll, safe areas |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
 | Composer send | `screens/session.rs` | `the_composer_appends_what_was_sent` | headless | IME composition, multiline, paste |

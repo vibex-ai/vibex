@@ -152,6 +152,12 @@ impl PairingService {
         self.nearby.set(Vec::new());
         self.candidates.borrow_mut().clear();
         self.error.set(None);
+        if crate::host::discovery_available() {
+            // The custom host browses with Android's NSD; it answers through
+            // the discovery events instead of the Rust mDNS daemon.
+            crate::host::request_discovery(true);
+            return;
+        }
         let (sender, mut events) = futures_channel::mpsc::unbounded();
         match crate::discovery::start(sender) {
             Some(discovery) => *self.discovery.borrow_mut() = Some(discovery),
@@ -209,6 +215,9 @@ impl PairingService {
 
     /// Stops browsing and abandons any nearby session.
     fn stop_nearby(&self) {
+        if crate::host::discovery_available() {
+            crate::host::request_discovery(false);
+        }
         if let Some(discovery) = self.discovery.borrow_mut().take() {
             discovery.stop();
         }
@@ -570,7 +579,27 @@ impl PairingService {
         use crate::host::HostEvent;
         match event {
             HostEvent::ScanResult(entry) => self.connect_entry(&entry, ""),
-            HostEvent::DiscoveryCandidate { key, name } => {
+            HostEvent::DiscoveryCandidate {
+                key,
+                name,
+                origin,
+                server_id,
+                server_key,
+            } => {
+                if let (Some(origin), Some(server_id), Some(server_key)) =
+                    (origin, server_id, server_key)
+                {
+                    self.candidates.borrow_mut().insert(
+                        key.clone(),
+                        crate::discovery::Candidate {
+                            key: key.clone(),
+                            name: name.clone(),
+                            origin,
+                            server_id,
+                            server_key,
+                        },
+                    );
+                }
                 self.nearby.update(|nearby| {
                     if let Some(candidate) = nearby.iter_mut().find(|nearby| nearby.key == key) {
                         candidate.name = name;

@@ -60,10 +60,12 @@ Scan and Find work in the app itself, without a Kotlin or Swift host:
   says so and keeps the scanner open). Without a host (or on iOS today) the
   app falls back to the system photo picker and `rqrr`; nsh 0.6.0 gives a Rust
   app's WebView no camera capability, which is why the host owns the camera.
-- **Find** browses `_vibex._tcp.local.` in Rust with `mdns-sd`, validates the
-  zero-config TXT record, lists the runtimes it resolves, and starts a
-  `ZeroConfigLanPairingSession` on tap. The desktop must approve the six-digit
-  code the sheet shows before the credential is stored.
+- **Find** uses the host's Android NSD when the custom host is present (with
+  the `NEARBY_WIFI_DEVICES` permission), and falls back to browsing
+  `_vibex._tcp.local.` in Rust with `mdns-sd`. Both validate the zero-config
+  TXT record, list the runtimes they resolve, and start a
+  `ZeroConfigLanPairingSession` on tap; the desktop must approve the six-digit
+  code the sheet shows.
 
 ### The session shell
 

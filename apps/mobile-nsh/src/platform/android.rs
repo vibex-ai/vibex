@@ -29,6 +29,16 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeRunRoot(
     run_root(handle, crate::android_root());
 }
 
+/// Records that the host runs local-network discovery itself.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetDiscoveryAvailable(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    available: jni::sys::jboolean,
+) {
+    crate::host::set_discovery_available(available);
+}
+
 /// Records that the host can scan QR codes with its camera.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetScannerAvailable(

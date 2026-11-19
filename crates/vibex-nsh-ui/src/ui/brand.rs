@@ -23,16 +23,25 @@ pub fn mark(size: f32) -> impl IntoElement {
 /// pairing and connecting pages show it.
 pub fn wordmark() -> impl IntoElement {
     let size = theme::FONT_WORDMARK;
+    let mark = theme::wordmark_mark(size);
     view()
         .flex_row()
         .items_center()
-        // The mark carries its own bearing in the SVG; the one-point gap is
-        // the spacing the phone's lockup keeps between the two shapes. The GPUI
-        // client also nudges the mark against the label's cap height, which
-        // depends on the text engine: the platform's metrics here are the ones
-        // a device shows, so the lockup is centered and left at that.
+        // The GPUI client's lockup: a one-point gap, the mark a little wider
+        // than the label is tall, its point on the label's baseline.
         .gap(px(1.0))
-        .child(mark(size))
+        .child(
+            svg(ImageSrc::svg_markup(include_str!(
+                "../../assets/icons/vibex-mark.svg"
+            )))
+            .w(px(mark.width))
+            .h(px(mark.height))
+            .mt(px(mark.margin_top))
+            .relative()
+            .top(px(mark.top_offset))
+            .flex_shrink_0()
+            .text_color(theme::foreground),
+        )
         .child(
             text("ibex")
                 .text_size(px(size))
