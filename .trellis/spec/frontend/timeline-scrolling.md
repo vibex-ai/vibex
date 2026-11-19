@@ -234,6 +234,53 @@ picks this up:
   element and its scroll state move into a view of their own, and a scroll then
   rebuilds that view alone.
 
+## 5b. A row-count change must not move the reader
+
+`gpui::list` keeps the reader's place in its scroll anchor, and the only way to
+tell it a row was added or removed is `reset` — which drops the anchor. A list
+without one starts at `ListOffset::default()`, i.e. row zero, so the next frame
+paints the top of the conversation. Both ways the row count moves are therefore
+still broken if the reset is taken as the whole job:
+
+| Change | What has to happen |
+| --- | --- |
+| A turn is appended (live event, a sent message) | the reader's offset is already the place they keep: nothing above the viewport moved. Read the offset before the reset and set it back afterwards. |
+| An older page is prepended (a history read) | the content above the viewport grew, so the offset has to follow the row the reader was in: `capture_timeline_scroll_anchor` before the merge, and the pending anchor after the reset. |
+
+Order is part of the rule, and it splits the two pending scrolls apart:
+
+- `apply_pending_timeline_scroll` (the bottom follow) runs **before**
+  `sync_timeline_list_rows`: `scroll_to_end` on a list that has not been told its
+  count yet is a no-op, so the count has to exist first — that is the order the
+  transcript already had.
+- `apply_pending_timeline_anchor` runs **after** it. Applying an anchor first and
+  resetting the count afterwards wiped the anchor it had just restored — the
+  reader landed at row zero with no pending work left to correct it — and the
+  restore was clamped against the previous table's extent.
+
+The two cannot share one call: a bottom follow must win over a stale anchor, and
+an anchor must land on the table the reset installed.
+
+## 5c. One transcript surface per session
+
+`TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
+transcript. It renders during the paint pass, after the pane loop has handed its
+borrowed views back, so a surface with no session of its own paints whichever
+view happens to be borrowed — the focused one. Shared across panes, that showed
+every pane the focused conversation over that pane's `ListState`: identical rows,
+identical offset, and a scroll in one moved them all. A pane looked right only
+once it was clicked, because clicking made its session the focused one.
+
+Rules that follow:
+
+- A surface is created per session (`timeline_surface_views`, keyed by session
+  id) and borrows that session for its render
+  (`with_session_view_for_render`), exactly as `ComposerView` does.
+- It is dropped with the session's view and cleared with the panes it is mounted
+  beside.
+- `notify_timeline_surfaces` has to notify the surfaces by name: a pane view
+  only mounts its surface, it does not notify it.
+
 ## 6. Tests Required
 
 - `cargo test -p vibex-desktop --locked timeline` covers anchor restore,
@@ -246,6 +293,12 @@ picks this up:
 - `cargo test -p vibex-desktop --locked child_agent_rail` covers the child
   Agent rail's virtualization and its separation from the parent's Markdown
   surfaces.
+- `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` and
+  `an_older_page_above_the_reader_keeps_their_place` pin §5b: both fail with the
+  reader at offset zero (an append) or parked on the wrong rows (a prepend) if
+  the reset is left to itself or the order is reversed.
+- `a_pane_gets_its_own_transcript_surface` pins §5c: two sessions must not share
+  one surface.
 
 ## 7. Sidebar list migration
 

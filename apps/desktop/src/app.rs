@@ -10455,15 +10455,30 @@ impl Render for ComposerView {
 /// render did.
 struct TimelineSurfaceView {
     workbench: WeakEntity<VibexWorkbench>,
+    /// The session whose transcript this surface draws.
+    ///
+    /// The surface renders the transcript of the view that is borrowed when it
+    /// draws, and it draws during the paint pass — after the pane loop has handed
+    /// its borrowed views back. One surface shared by every pane therefore
+    /// painted the *focused* pane's conversation into all of them, over that
+    /// pane's `ListState`: every pane showed the same rows at the same scroll
+    /// offset, and scrolling one moved them all. A surface per session is what
+    /// makes a pane's own transcript the one it paints.
+    session_id: Option<VibexSessionId>,
     #[cfg(test)]
     render_count: Cell<usize>,
 }
 
 impl TimelineSurfaceView {
-    fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
+    fn new(
+        workbench: &Entity<VibexWorkbench>,
+        session_id: Option<VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         cx.observe(workbench, |_, _, cx| cx.notify()).detach();
         Self {
             workbench: workbench.downgrade(),
+            session_id,
             #[cfg(test)]
             render_count: Cell::new(0),
         }
@@ -10478,6 +10493,7 @@ impl Render for TimelineSurfaceView {
             return Empty.into_any_element();
         };
         let owner = cx.entity_id();
+        let session_id = self.session_id.clone();
         // The element is wrapped so the view's own root is a sized container:
         // `cached` applies its style to the view, and a surface that sizes
         // itself through `flex_1` inside the pane needs the wrapper to take the
@@ -10489,7 +10505,11 @@ impl Render for TimelineSurfaceView {
             .flex()
             .flex_col()
             .child(motion::with_hover_owner(owner, || {
-                workbench.update(cx, |this, cx| this.render_timeline_surface(cx))
+                workbench.update(cx, |this, cx| {
+                    this.with_session_view_for_render(session_id.as_ref(), |this| {
+                        this.render_timeline_surface(cx)
+                    })
+                })
             }))
             .into_any_element()
     }
@@ -11868,7 +11888,13 @@ pub struct VibexWorkbench {
     /// The focused timeline's own render boundary, created on first render. See
     /// [`TimelineView`]; `None` only before the first frame.
     timeline_view: Option<Entity<TimelineView>>,
-    timeline_surface_view: Option<Entity<TimelineSurfaceView>>,
+    /// The transcript surface of each session, created on first use.
+    ///
+    /// A surface renders the transcript of the session it was made for, so it is
+    /// keyed by that session: one surface per pane, each painting its own
+    /// conversation. A single shared surface painted whichever view happened to
+    /// be borrowed at paint time into every pane; see [`TimelineSurfaceView`].
+    timeline_surface_views: BTreeMap<String, Entity<TimelineSurfaceView>>,
     /// The child Agent rail's own render boundary, created on first render. See
     /// [`ChildAgentRailView`]; `None` only before the first frame.
     child_agent_rail_view: Option<Entity<ChildAgentRailView>>,
@@ -13610,7 +13636,7 @@ impl VibexWorkbench {
             session_view_lru: VecDeque::new(),
             sidebar_view: None,
             timeline_view: None,
-            timeline_surface_view: None,
+            timeline_surface_views: BTreeMap::new(),
             child_agent_rail_view: None,
             timeline_painted_markdown_surfaces: BTreeSet::new(),
             #[cfg(test)]
@@ -29158,6 +29184,7 @@ impl VibexWorkbench {
         self.session_view_lru.retain(|cached| cached != session_id);
         self.pending_composer_geometries.remove(session_id);
         self.composer_views.remove(session_id);
+        self.timeline_surface_views.remove(session_id);
     }
 
     /// Parks a Composer measurement for the session it was taken for.
@@ -32653,12 +32680,27 @@ impl VibexWorkbench {
         // so a list that grows without a hint reports a zero-length document
         // until every row has been on screen once — the scrollbar has no thumb
         // and the transcript cannot be scrolled at all. `reset_with_uniform_height`
-        // is the one published entry point that seeds that hint. It also drops
-        // the scroll anchor, so it is used only when the row count moves, which
-        // is when the old anchor cannot describe the new table anyway.
+        // is the one published entry point that seeds that hint.
+        //
+        // The reset also drops the list's scroll anchor, and a list without one
+        // starts at its first row. A turn arriving while the reader is scrolled
+        // up grows the row count by one, so that reset alone threw them back to
+        // the top of the conversation — the "the timeline flashed to the first
+        // turn" report. An appended row moves nothing above the viewport, so the
+        // offset the reader already has is the place they keep. A table that
+        // really moved under them (an older page prepended) carries a pending
+        // anchor instead, and `apply_pending_timeline_anchor` applies it after
+        // this reset.
+        let held_offset = (!self.timeline_follow.following_bottom)
+            .then(|| self.timeline_scroll.scroll_px_offset_for_scrollbar().y)
+            .filter(|offset| *offset < px(0.0));
         let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
         self.timeline_scroll
             .reset_with_uniform_height(rows, hint.max(px(1.0)));
+        if let Some(offset) = held_offset {
+            self.timeline_scroll
+                .set_offset_from_scrollbar(point(px(0.0), offset));
+        }
     }
 
     fn rebuild_timeline_sizes(&mut self) -> bool {
@@ -33873,6 +33915,13 @@ impl VibexWorkbench {
         self.request_timeline_scroll_to_latest();
     }
 
+    /// Lands the transcript on the live edge when the reader asked to follow it.
+    ///
+    /// Resolved before [`Self::sync_timeline_list_rows`], because the list only
+    /// takes a row count through a reset and a reset drops the anchor
+    /// `scroll_timeline_to_latest` just set: `scroll_to_end` on an empty list is
+    /// a no-op, so the count has to be in place before the end can be named at
+    /// all.
     fn apply_pending_timeline_scroll(&mut self) {
         if std::mem::take(&mut self.timeline_scroll_to_latest_pending)
             && self.timeline_follow.following_bottom
@@ -33880,10 +33929,16 @@ impl VibexWorkbench {
             && !self.timeline_scrollbar_interaction_active
         {
             self.scroll_timeline_to_latest();
-            return;
         }
-        // A pending anchor resolves after the row table is current, so a
-        // switched-to session paints the anchored content in its first frame.
+    }
+
+    /// Puts a captured anchor back under the viewport top.
+    ///
+    /// Resolved *after* [`Self::sync_timeline_list_rows`], so the restore lands on
+    /// the table the reset installed and is clamped against its extent. A reader
+    /// who asked to follow the bottom already has their place, and
+    /// [`Self::apply_timeline_scroll_anchor`] refuses while following.
+    fn apply_pending_timeline_anchor(&mut self) {
         if std::mem::take(&mut self.timeline_scroll_anchor_pending) {
             self.apply_timeline_scroll_anchor();
         }
@@ -64712,6 +64767,11 @@ impl VibexWorkbench {
         // The list lays out the rows it was told about, so the table and its
         // count have to agree before the element is built.
         self.sync_timeline_list_rows();
+        // An anchor is applied *after* the sync, unlike the bottom scroll: a
+        // count change resets the list, and a reset drops the anchor the restore
+        // is about to set. Applying it first left the reader at row zero with
+        // nothing pending to correct it.
+        self.apply_pending_timeline_anchor();
         self.install_timeline_scroll_handler();
         self.prefetch_older_timeline_if_needed(cx);
         self.request_expanded_timeline_details(cx);
@@ -64760,7 +64820,7 @@ impl VibexWorkbench {
             None
         };
         let timeline_surface = self
-            .ensure_timeline_surface_view(cx)
+            .ensure_timeline_surface_view(live_session_id.as_ref(), cx)
             .cached(StyleRefinement::default().flex_1().min_h_0())
             .into_any_element();
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
@@ -79965,17 +80025,24 @@ impl VibexWorkbench {
         view
     }
 
-    /// The transcript surface's own render boundary, created on first use.
+    /// The transcript surface's own render boundary, created on first use for
+    /// the session it draws.
+    ///
+    /// Keyed by session — a surface renders the transcript of its own view — and
+    /// `__none__` stands for a workbench with no session, which is the only key
+    /// the composer's own map uses too.
     fn ensure_timeline_surface_view(
         &mut self,
+        session_id: Option<&VibexSessionId>,
         cx: &mut Context<Self>,
     ) -> Entity<TimelineSurfaceView> {
-        if let Some(view) = self.timeline_surface_view.as_ref() {
+        let key = session_id.map_or_else(|| "__none__".to_string(), |id| id.as_str().to_string());
+        if let Some(view) = self.timeline_surface_views.get(&key) {
             return view.clone();
         }
         let workbench = cx.entity();
-        let view = cx.new(|cx| TimelineSurfaceView::new(&workbench, cx));
-        self.timeline_surface_view = Some(view.clone());
+        let view = cx.new(|cx| TimelineSurfaceView::new(&workbench, session_id.cloned(), cx));
+        self.timeline_surface_views.insert(key, view.clone());
         view
     }
 
@@ -80028,6 +80095,12 @@ impl VibexWorkbench {
             view.update(cx, |_, cx| cx.notify());
         }
         for view in self.session_group_pane_views.values() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+        // A pane view only mounts its session's surface; it does not notify it.
+        // The surface is the view that owns the list, so the repaint has to
+        // reach it by name.
+        for view in self.timeline_surface_views.values() {
             view.update(cx, |_, cx| cx.notify());
         }
     }
@@ -80940,6 +81013,7 @@ impl VibexWorkbench {
                     if changed {
                         this.session_group_pane_views.clear();
                         this.composer_views.clear();
+                        this.timeline_surface_views.clear();
                         this.queue_ui_state();
                         this.publish_sidebar_invalidation();
                         cx.notify();
@@ -114156,7 +114230,33 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn timeline_row_heights("))
             .map(|(body, _)| body)
             .expect("pending timeline scroll should remain inspectable");
-        assert!(apply.contains("self.apply_timeline_scroll_anchor();"));
+        assert!(apply.contains("self.scroll_timeline_to_latest();"));
+        // An anchor is applied after the row-count sync, not with the bottom
+        // scroll: a reset drops the list's anchor, so a restore that ran first
+        // was wiped and the reader landed at row zero.
+        let anchor = apply
+            .split_once("    fn apply_pending_timeline_anchor(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Holds the timeline for a disclosure"))
+            .map(|(body, _)| body)
+            .expect("the pending anchor should remain inspectable");
+        assert!(anchor.contains("self.apply_timeline_scroll_anchor();"));
+        let render = source
+            .split_once("        self.apply_pending_timeline_scroll();")
+            .and_then(|(_, tail)| {
+                tail.split_once("        self.install_timeline_scroll_handler();")
+            })
+            .map(|(body, _)| body)
+            .expect("the render's scroll resolution should remain inspectable");
+        let sync_at = render
+            .find("self.sync_timeline_list_rows();")
+            .expect("the row count is synced in the render");
+        let anchor_at = render
+            .find("self.apply_pending_timeline_anchor();")
+            .expect("a pending anchor is resolved in the render");
+        assert!(
+            sync_at < anchor_at,
+            "the anchor has to land on the synced table"
+        );
 
         let capture = source
             .split_once("    fn capture_timeline_scroll_anchor(")
@@ -133478,6 +133578,15 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the transcript surface's view should remain inspectable");
         assert!(view.contains("cx.observe(workbench, |_, _, cx| cx.notify()).detach();"));
+        // The surface renders the transcript of its own session, not of whatever
+        // view happens to be borrowed when it paints: one shared surface painted
+        // the focused pane's conversation into every pane, at that pane's scroll
+        // offset. See `a_pane_gets_its_own_transcript_surface`.
+        assert!(
+            view.contains("session_id: Option<VibexSessionId>"),
+            "the surface has to know which session it draws"
+        );
+        assert!(view.contains("this.with_session_view_for_render(session_id.as_ref(),"));
         assert!(view.contains("this.render_timeline_surface(cx)"));
     }
 

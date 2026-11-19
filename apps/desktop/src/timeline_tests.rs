@@ -4380,6 +4380,268 @@ fn typing_in_the_find_bar_does_not_read_the_list_mid_prepaint(cx: &mut TestAppCo
     );
 }
 
+/// A turn that lands while the reader is scrolled up must not move them.
+///
+/// `gpui::list` keeps the reader's place in its scroll anchor, and a new row
+/// changes the row count, which the list can only be told about with `reset` —
+/// and `reset` drops the anchor. The list then starts at row zero, which is the
+/// top of the conversation: the reader is thrown out of what they were reading
+/// by whatever the Agent sends next.
+#[gpui::test]
+fn a_turn_arriving_while_scrolled_up_keeps_the_readers_place(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..30_usize {
+        let next = items.len() as i64 + 1;
+        items.push(live_timeline_item(
+            next,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            next + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                // Long enough that the twelve turns are taller than the
+                // fixture's viewport, so the transcript can actually scroll.
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(600.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (before, turns_before) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+        )
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    // A live turn arrives: a user message starts a new row, which the list can
+    // only learn about from a `reset`.
+    let end = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap()
+    });
+    apply_live_timeline_item(
+        &workbench,
+        cx,
+        live_timeline_item(
+            end + 1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "a question from somewhere else".into(),
+                ..Default::default()
+            }),
+        ),
+    );
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (after, turns_after) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+        )
+    });
+    assert_eq!(turns_after, turns_before + 1, "the live turn is a new row");
+    assert!(
+        (after - before).abs() <= px(1.0),
+        "the reader was moved by an appended turn: {before:?} -> {after:?}"
+    );
+}
+
+/// A page landing above the reader must not move them either.
+///
+/// Scrolling up reads an older page, which prepends rows: the same `reset` the
+/// list needs to learn the new count drops the anchor, and the pending anchor
+/// that restores the reader is applied after the reset. Applying it before was
+/// the same bug from the other end of the conversation.
+#[gpui::test]
+fn an_older_page_above_the_reader_keeps_their_place(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..24_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(400.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (before, top_turn, offset_in_turn) = workbench.read_with(cx, |workbench, _| {
+        let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        let heights = workbench.timeline_row_heights();
+        let (row, offset_in_turn) = timeline_scroll_anchor_from_offset(
+            &heights,
+            f32::from(offset),
+            workbench.timeline_list_padding_top_px,
+        )
+        .expect("the fixture is scrolled into a row");
+        (
+            offset,
+            workbench.conversation_turns_cache[row].id.clone(),
+            offset_in_turn,
+        )
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    // An older page arrives, all of it above the window the view holds.
+    let session_id = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.session_id.clone().unwrap()
+    });
+    let generation = workbench.read_with(cx, |workbench, _| workbench.session_generation);
+    let cursor = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.items.first().unwrap().sequence
+    });
+    let mut older = Vec::new();
+    for turn in 0..6_usize {
+        let base = 500 + turn as i64 * 4;
+        older.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("older question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        older.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("older answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let page = TimelinePage {
+        session_id: session_id.clone(),
+        start_sequence: older.first().map(|item| item.sequence),
+        end_sequence: older.last().map(|item| item.sequence),
+        items: older,
+        has_older: true,
+        has_newer: false,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+    let turns_before = workbench.read_with(cx, |workbench, _| workbench.timeline_row_sizes.len());
+    workbench.update(cx, |workbench, _| {
+        workbench.finish_older_timeline_load(&session_id, cursor, generation, Ok(page));
+    });
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    let (after, turns_after) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+        )
+    });
+    assert_eq!(
+        turns_after,
+        turns_before + 6,
+        "the older page is six more rows above the window"
+    );
+    let expected = workbench.read_with(cx, |workbench, _| {
+        let row = workbench
+            .conversation_turns_cache
+            .iter()
+            .position(|turn| turn.id == top_turn)
+            .expect("the older page must not rename the turn the reader was in");
+        timeline_scroll_offset_for_anchor(
+            &workbench.timeline_row_heights(),
+            row,
+            offset_in_turn,
+            workbench.timeline_list_padding_top_px,
+        )
+        .expect("the anchored row is in the new table")
+    });
+    assert!(
+        (after - px(expected)).abs() <= px(1.0),
+        "the turn the reader was in moved: {before:?} -> {after:?}, expected {expected:?}"
+    );
+}
+
+/// Every pane paints its own conversation.
+///
+/// The transcript surface renders the view that is borrowed when it draws, and
+/// it draws during the paint pass — after the pane loop has handed its borrowed
+/// views back. One surface shared by every pane therefore painted the *focused*
+/// pane's conversation into all of them, over that pane's `ListState`: every
+/// pane showed the same rows at the same offset, and scrolling one moved them
+/// all. A surface per session is what keeps a pane painting its own.
+#[gpui::test]
+fn a_pane_gets_its_own_transcript_surface(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, turn_of_units(40, true), None);
+    let session_a = VibexSessionId::parse("session_layout").unwrap();
+    let session_b = VibexSessionId::parse("session_group_neighbour").unwrap();
+    let (a, b, a_again, none) = workbench.update(cx, |workbench, cx| {
+        (
+            workbench.ensure_timeline_surface_view(Some(&session_a), cx),
+            workbench.ensure_timeline_surface_view(Some(&session_b), cx),
+            workbench.ensure_timeline_surface_view(Some(&session_a), cx),
+            workbench.ensure_timeline_surface_view(None, cx),
+        )
+    });
+    assert_ne!(
+        a.entity_id(),
+        b.entity_id(),
+        "two panes must not share one surface: it would paint one pane's transcript into both"
+    );
+    assert_eq!(
+        a.entity_id(),
+        a_again.entity_id(),
+        "a session's surface is kept across frames"
+    );
+    assert_eq!(
+        a.read_with(cx, |view, _| view.session_id.clone()),
+        Some(session_a)
+    );
+    assert_eq!(
+        b.read_with(cx, |view, _| view.session_id.clone()),
+        Some(session_b)
+    );
+    assert_eq!(none.read_with(cx, |view, _| view.session_id.clone()), None);
+}
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {
