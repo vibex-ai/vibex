@@ -834,19 +834,22 @@ const SESSION_GROUP_AVATAR_OVERLAP: f32 = 7.0;
 /// so a press can never cover one and not the other.
 const SESSION_GROUP_SPLIT_GUARD_WIDTH: f32 = 9.0;
 const SESSION_GROUP_SPLIT_GUARD_INSET: f32 = 4.0;
-/// How much of the theme's `border` hairline each state of a group pane's
-/// frame paints.
+/// How a group pane's frame is weighted in each state.
 ///
 /// A split stacks hairlines on one seam — every pane's own frame plus the
 /// resize handle's line between them — so the authored `border` weight reads
 /// as a hard divider rather than a card edge. The resting frame therefore
-/// paints a third of it and the seam lands near a single hairline. Focus is
-/// said by the pane's tab, so the focused frame stays just under the authored
-/// hairline; hover is the cue that answers "which pane would take a click"
-/// while the pointer travels, and it steps far past both.
+/// paints a third of it and the seam lands near a single hairline. Hover
+/// answers "which pane would take a click" while the pointer travels, and it
+/// brightens that same line; the focused pane answers with the theme's focus
+/// ring, because it is the one pane holding the keyboard and that is the ink a
+/// focused control already wears.
 const SESSION_GROUP_PANE_FRAME_REST_WEIGHT: f32 = 0.35;
-const SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT: f32 = 0.85;
 const SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT: f32 = 2.2;
+/// The focus ring is opaque in every bundled theme, so the frame paints a
+/// share of it. The share has to stay above the hovered hairline: a hovered
+/// pane must never look as chosen as the pane holding the keyboard.
+const SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA: f32 = 0.85;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -55748,9 +55751,10 @@ impl VibexWorkbench {
             // A folder `Tab` draws the plate and the separator; the tab keeps
             // its agent mark, its title and its status column, plus the drag
             // and drop that reorder the strip.
-            // The pane that holds the keyboard says so here: its active tab
-            // carries a quiet accent mark and the rest of the strip stays quiet.
-            // This is the mark the pane frame used to shout with a bright border.
+            // The active tab only brightens its label. The pane that holds the
+            // keyboard is marked by the frame around it — the way an active pane
+            // is drawn in a terminal multiplexer — and the strip keeps no accent
+            // bar of its own.
             let tab_holds_focus = focused && selected;
             let tab_element = Tab::new()
                 .selected(selected)
@@ -55766,16 +55770,6 @@ impl VibexWorkbench {
                         .items_center()
                         .gap_1()
                         .cursor_pointer()
-                        .when(tab_holds_focus, |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .w(px(2.0))
-                                    .h(px(12.0))
-                                    .rounded_full()
-                                    .bg(cx.theme().primary.opacity(0.75)),
-                            )
-                        })
                         .child(sidebar_agent_logo(&agent_id, selected, cx))
                         .child(div().min_w_0().truncate().child(title_element))
                         .child(status_mark)
@@ -56040,27 +56034,31 @@ impl VibexWorkbench {
             // three hairlines on one seam — this pane's border, its neighbour's
             // and the resize handle's line — so the resting weight is a third
             // of the authored `border` and the seam reads as one hairline. The
-            // focused pane is marked by its tab, and its frame only leans back
-            // toward the authored border; hover answers "which pane would take a
-            // click", so it lifts the line far enough above both that aiming
-            // at a pane is answered at a glance. Hover is refined after the
-            // focused style, so a hovered focused pane still shows hover.
+            // focused pane is the one holding the keyboard, so its frame
+            // answers in the theme's focus ring — the ink a focused control
+            // already wears, and the way an active pane is drawn in a terminal
+            // multiplexer. Hover only lifts the hairline of a pane that does not
+            // hold the keyboard: the ring is the stronger statement, and a
+            // hovered focused pane must not trade it for a dimmer line.
             .border_1()
             .border_color(session_group_pane_frame(
                 cx.theme().border,
                 SESSION_GROUP_PANE_FRAME_REST_WEIGHT,
             ))
-            .hover(|this| {
-                this.border_color(session_group_pane_frame(
-                    cx.theme().border,
-                    SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
-                ))
+            .when(!focused, |this| {
+                this.hover(|this| {
+                    this.border_color(session_group_pane_frame(
+                        cx.theme().border,
+                        SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+                    ))
+                })
             })
             .when(focused, |this| {
-                this.border_color(session_group_pane_frame(
-                    cx.theme().border,
-                    SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT,
-                ))
+                this.border_color(
+                    cx.theme()
+                        .ring
+                        .opacity(SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA),
+                )
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -135957,24 +135955,22 @@ mod tests {
     /// A group pane's frame is a card edge, not a second divider.
     ///
     /// A split stacks hairlines on its seam, so the resting frame stays well
-    /// under the authored `border` while hover clears it by a margin the eye
-    /// reads at a glance. Every weight is the same token: the frame brightens,
-    /// it never changes colour.
+    /// under the authored `border` and hover clears it by a margin the eye reads
+    /// at a glance without changing the token. The focused pane is the
+    /// exception: it wears the theme's focus ring, so "which pane has the
+    /// keyboard" is answered by the frame instead of by a mark inside its tab.
     #[test]
-    fn the_group_pane_frame_rests_quiet_and_answers_hover() {
+    fn the_group_pane_frame_rests_quiet_and_answers_hover_and_focus() {
         let border = gpui::hsla(0.58, 0.24, 0.62, 0.15);
         let rest = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_REST_WEIGHT);
-        let focused = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT);
         let hovered = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT);
 
-        // Rest, focus, hover is the order the pointer walks them in, and hover
-        // has to be a highlight rather than a step of a hair.
-        assert!(rest.a < focused.a);
-        assert!(focused.a < hovered.a);
+        // Hover has to be a highlight rather than a step of a hair, and it
+        // brightens the resting hairline instead of recolouring it.
         assert!(hovered.a >= rest.a * 4.0);
         assert!((rest.a - border.a * SESSION_GROUP_PANE_FRAME_REST_WEIGHT).abs() < 1e-6);
         assert!((hovered.a - border.a * SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT).abs() < 1e-6);
-        for frame in [rest, focused, hovered] {
+        for frame in [rest, hovered] {
             assert_eq!((frame.h, frame.s, frame.l), (border.h, border.s, border.l));
         }
 
@@ -135985,6 +135981,19 @@ mod tests {
             SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
         );
         assert_eq!(strong.a, 1.0);
+
+        // The focused frame speaks in the focus ring, and the strip no longer
+        // carries the accent bar that used to name the focused pane.
+        assert!(SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA > 0.5);
+        let source = include_str!("app.rs");
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+        assert!(pane.contains("SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA"));
+        assert!(pane.contains(".ring"));
+        assert!(!pane.contains("primary.opacity(0.75)"));
     }
 
     /// A group pane's strip is the preview strip's sibling: the same metrics,
