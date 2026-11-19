@@ -4890,6 +4890,89 @@ fn a_streaming_turn_below_does_not_move_a_reader_who_scrolled_up(cx: &mut TestAp
     }
 }
 
+/// A stream must not rock the live edge.
+///
+/// While the reader follows the bottom, a chunk can only add height below the
+/// viewport, so the offset may travel toward the end and nowhere else. A capture
+/// showed the offset alternating by a whole viewport on every frame — the list
+/// naming its end as an anchor past the last row one frame, and as a row anchor
+/// the next — which reads as the transcript bouncing. This pins the invariant:
+/// growth below never moves the viewport back up.
+#[gpui::test]
+fn a_streaming_turn_does_not_rock_the_live_edge(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..10_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(30)),
+                is_final: true,
+            }),
+        ));
+    }
+    items.push(live_timeline_item(
+        5000,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "a question that streams".into(),
+            ..Default::default()
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    let (mut last, viewport) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_scroll.viewport_bounds().size.height,
+        )
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .timeline_follow
+            .following_bottom),
+        "the fixture should be on the live edge"
+    );
+    let slack = viewport / 2.0;
+    for chunk in 0..40_u32 {
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap()
+        });
+        apply_live_timeline_item(
+            &workbench,
+            cx,
+            live_timeline_item(
+                sequence + 1,
+                TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                    text_delta: "streamed ".to_string(),
+                    chunk_index: chunk,
+                    phase: None,
+                }),
+            ),
+        );
+        for _ in 0..2 {
+            draw_disclosure_frame(cx);
+        }
+        let now = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+        });
+        assert!(
+            now <= last + slack,
+            "chunk {chunk} rocked the live edge: {last:?} -> {now:?} (viewport {viewport:?})"
+        );
+        last = now;
+    }
+}
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {

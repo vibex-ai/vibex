@@ -34207,7 +34207,11 @@ impl VibexWorkbench {
         }
         let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
         let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
-        if max_offset <= px(0.0) || -offset <= max_offset {
+        // The offset at the true bottom already runs past `max_offset` by the
+        // list's top padding, which scrolls with the content: comparing against
+        // the bare maximum calls every frame at the bottom a clamp.
+        let reach = max_offset + px(self.timeline_list_padding_top_px);
+        if max_offset <= px(0.0) || -offset <= reach {
             return;
         }
         self.apply_timeline_scroll_anchor();
@@ -34380,9 +34384,24 @@ impl VibexWorkbench {
         // current cannot restore a place the reader has already scrolled away
         // from, which is a jump in whichever direction they went.
         let top = self.timeline_scroll.logical_scroll_top();
-        let row_index = top
-            .item_ix
-            .min(self.conversation_turns_cache.len().saturating_sub(1));
+        let last_row = self.conversation_turns_cache.len().saturating_sub(1);
+        // An anchor past the last row is how the list names its end. It names no
+        // row and no distance into one, so reading `offset_in_item` off it would
+        // record the *top* of the last row as the reader's place — and a restore
+        // of that anchor lands a screen above the live edge, which is exactly a
+        // reader on the bottom being thrown up the conversation. The place that
+        // anchor paints is the bottom of the last row.
+        let (row_index, offset_in_row) = if top.item_ix > last_row {
+            let height = self
+                .timeline_row_sizes
+                .get(last_row)
+                .map(|row| row.height)
+                .unwrap_or(px(0.0));
+            let viewport = self.timeline_scroll.viewport_bounds().size.height;
+            (last_row, (height - viewport).max(px(0.0)))
+        } else {
+            (top.item_ix, top.offset_in_item)
+        };
         let Some(turn) = self.conversation_turns_cache.get(row_index) else {
             return;
         };
@@ -34393,7 +34412,7 @@ impl VibexWorkbench {
         self.timeline_follow.preserve_anchor_at(
             turn_id,
             span,
-            f32::from(top.offset_in_item).round() as i32,
+            f32::from(offset_in_row).round() as i32,
         );
     }
 
@@ -115018,7 +115037,11 @@ mod tests {
         );
         assert!(capture.contains("self.timeline_scroll.logical_scroll_top()"));
         assert!(capture.contains(".preserve_anchor_at("));
-        assert!(capture.contains("f32::from(top.offset_in_item)"));
+        assert!(capture.contains("f32::from(offset_in_row)"));
+        // An anchor past the last row carries no place of its own: it has to be
+        // read as the bottom of that row, or a restore lands a screen above it.
+        assert!(capture.contains("top.item_ix > last_row"));
+        assert!(capture.contains("(height - viewport).max(px(0.0))"));
         assert!(capture.contains("timeline_turn_anchor_span"));
 
         // The restore path resolves the turn by id first and falls back to the
