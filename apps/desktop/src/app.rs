@@ -9040,8 +9040,13 @@ fn agent_generation_token_rate(
         return None;
     };
     let elapsed_seconds = elapsed.as_secs_f32();
+    // `then`, not `then_some`: the difference is computed in the argument, and
+    // `then_some` evaluates its argument either way. A counter that went
+    // backwards — a re-read, a compacted context, a different source for the
+    // same turn — asks for a smaller-minus-larger subtraction, which the
+    // debug overflow check turns into a process abort.
     (current > previous && elapsed_seconds > 0.0)
-        .then_some((current - previous) as f32 / elapsed_seconds)
+        .then(|| (current - previous) as f32 / elapsed_seconds)
 }
 
 fn timeline_session_state_for_render(
