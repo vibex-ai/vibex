@@ -124716,10 +124716,14 @@ mod tests {
             capped,
             "past the cap the textarea scrolls inside a fixed surface"
         );
-        assert!(
-            COMPOSER_SLIM_SURFACE_HEIGHT < ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT,
-            "the bar must be shorter than the box, or the morph has nothing to glide"
-        );
+        // Both sides are constants, so this is a compile-time fact: the bar has
+        // to be shorter than the box, or the morph has nothing to glide.
+        const {
+            assert!(
+                COMPOSER_SLIM_SURFACE_HEIGHT < ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT,
+                "the bar must be shorter than the box, or the morph has nothing to glide"
+            )
+        };
     }
 
     /// The bar's input width comes from the pane's column and the controls
