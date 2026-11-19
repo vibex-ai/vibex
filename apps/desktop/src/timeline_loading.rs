@@ -8,7 +8,25 @@ use vibex_desktop_model::{
     ReasoningDisplayMode, TimelineConversationTurn, TimelineModel, TimelineRow,
 };
 
-use super::{ConversationTurnsSummary, VibexWorkbench, reset_pending_user_requests};
+use super::{
+    ConversationTurnsSummary, VibexWorkbench, reset_pending_user_requests,
+    timeline_turn_anchor_span,
+};
+
+/// Why an otherwise-valid prepared window was not installed.
+#[derive(Debug)]
+pub(super) enum TimelineInstall {
+    Installed,
+    /// The read raced a replacement or a non-live edit; re-read.
+    Stale,
+    /// The window skipped stored rows in the middle of its span; the caller
+    /// must re-read contiguously rather than install a conversation with a hole.
+    Omitted,
+    /// The window opens below the turn the reader's anchor names. Installing
+    /// it would throw the reader out of their place; the caller re-reads once
+    /// with the anchor covered, and installs the next answer regardless.
+    AnchorLost,
+}
 
 /// A history snapshot prepared away from the UI thread. The UI only installs
 /// the normalized model and retained turn handles once the request is current.
@@ -163,13 +181,33 @@ impl VibexWorkbench {
 
     pub(super) fn install_prepared_timeline(
         &mut self,
+        prepared: PreparedTimeline,
+        updates: &mut TimelineLoadUpdates,
+    ) -> TimelineInstall {
+        self.install_prepared_timeline_inner(prepared, updates, false)
+    }
+
+    /// The install a covering re-read lands through: the reader's place has
+    /// already been given its one recovery read, so the answer is installed
+    /// even when it still cannot reach the anchored turn.
+    pub(super) fn install_prepared_timeline_covering(
+        &mut self,
+        prepared: PreparedTimeline,
+        updates: &mut TimelineLoadUpdates,
+    ) -> TimelineInstall {
+        self.install_prepared_timeline_inner(prepared, updates, true)
+    }
+
+    fn install_prepared_timeline_inner(
+        &mut self,
         mut prepared: PreparedTimeline,
         updates: &mut TimelineLoadUpdates,
-    ) -> bool {
+        anchor_recovery_spent: bool,
+    ) -> TimelineInstall {
         // Edits/replacements outside the live stream invalidate the read. Live
         // events, including same-sequence revisions, are replayed over it.
         if updates.invalidated || self.timeline.revision != updates.revision {
-            return false;
+            return TimelineInstall::Stale;
         }
         // A window that skipped stored rows is not a projection of the
         // conversation, whatever its own end probes say: the hole is in the
@@ -178,11 +216,30 @@ impl VibexWorkbench {
         // caller through its authoritative reload, which reads a contiguous
         // window.
         if prepared.timeline_omitted.is_some_and(|gap| !gap.is_empty()) {
-            return false;
+            return TimelineInstall::Omitted;
         }
         let Some(session_id) = prepared.timeline.session_id.clone() else {
-            return false;
+            return TimelineInstall::Stale;
         };
+        // A replacement that opens below the turn the reader is holding would
+        // throw them out of their place: the anchor resolves to nothing, the
+        // old offset describes a taller window, and the list clamps it to the
+        // newest row. The read already walks back toward the anchor best
+        // effort; when that walk came up short (a failed page under load, the
+        // recovery budget), refuse this one answer and ask again with the
+        // anchor covered. One refusal only — the covering re-read installs
+        // whatever it answers, so a place that cannot be kept costs a single
+        // extra read, never a loop.
+        if !anchor_recovery_spent
+            && !self.timeline_follow.following_bottom
+            && self.timeline_follow.has_anchor()
+            && prepared.timeline_has_older
+            && self.timeline.session_id.as_ref() == Some(&session_id)
+            && !prepared.timeline.items.is_empty()
+            && self.prepared_window_loses_reader_anchor(&prepared)
+        {
+            return TimelineInstall::AnchorLost;
+        }
         prepared.replay_live_updates(updates);
         self.capture_timeline_scroll_anchor();
         reset_pending_user_requests(
@@ -230,7 +287,27 @@ impl VibexWorkbench {
         }
         self.timeline_has_older = prepared.timeline_has_older;
         self.reconcile_optimistic_user_message();
-        true
+        TimelineInstall::Installed
+    }
+
+    /// Whether installing this window would drop the turn the reader's anchor
+    /// names. The anchor's sequence range is the identity that survives a
+    /// window change — turn ids are renamed when a page lands above them — so
+    /// the range, not the id, is what the prepared turns are asked about.
+    fn prepared_window_loses_reader_anchor(&self, prepared: &PreparedTimeline) -> bool {
+        let Some(span) = self.timeline_follow.anchor_span else {
+            return false;
+        };
+        if let Some(turn_id) = self.timeline_follow.anchor_row_id.as_deref()
+            && prepared.turns.iter().any(|turn| turn.id == turn_id)
+        {
+            return false;
+        }
+        !prepared.turns.iter().any(|turn| {
+            timeline_turn_anchor_span(turn).is_some_and(|turn_span| {
+                span.overlap(turn_span.first_sequence, turn_span.last_sequence) > 0
+            })
+        })
     }
 
     /// A same-sequence tool update can replace its output without changing a

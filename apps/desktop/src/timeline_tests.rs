@@ -348,7 +348,10 @@ fn refreshed_tool_history_preserves_the_measured_timeline_extent(cx: &mut TestAp
             ))
             .unwrap();
         workbench.update(cx, |workbench, _| {
-            assert!(workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut()));
+            assert!(matches!(
+                workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut()),
+                timeline_loading::TimelineInstall::Installed
+            ));
             workbench.rebuild_timeline_sizes();
         });
         let frames = draw_live_timeline_frames(&workbench, cx, 8);
@@ -430,6 +433,66 @@ fn tool_progress_stays_stable_after_returning_to_a_cached_session(cx: &mut TestA
     assert!(
         frames.iter().all(|frame| *frame == before),
         "progress after restoring: {frames:?}"
+    );
+}
+
+/// A view whose projection moved while it was parked restores its measured
+/// geometry, not character-count estimates.
+///
+/// The parked view kept working (a detail read, a live revision), so its
+/// timeline revision ran ahead of the row table's stamp. The restore re-derives
+/// the table against the current projection, but the measured heights are the
+/// seed: wiping them routed the whole restored view through the estimator for
+/// a frame, which is a visible bounce on the bottom edge where the scroll
+/// offset is resolved from the table itself.
+#[gpui::test]
+fn a_parked_revision_bump_restores_measured_geometry(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let before = *draw_live_timeline_frames(&workbench, cx, 16)
+        .last()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let other_session = VibexSessionId::parse("session_other").unwrap();
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(other_session.clone());
+        workbench.borrow_session_view(&other_session);
+        workbench
+            .timeline
+            .replace_authoritative(other_session, Vec::new());
+        // The parked session's projection moved while nothing rendered it:
+        // the revision advanced, the row table's stamp did not.
+        let parked = workbench
+            .session_views
+            .get_mut(session_id.as_str())
+            .unwrap();
+        parked.timeline.revision = parked.timeline.revision.wrapping_add(1);
+    });
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let stale_stamp = workbench.read_with(cx, |workbench, _| {
+        let parked = workbench.session_views.get(session_id.as_str()).unwrap();
+        parked.timeline.revision != parked.timeline_row_sizes_revision
+    });
+    assert!(
+        stale_stamp,
+        "the fixture must park a view whose table is stale"
+    );
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(session_id.clone());
+        assert!(workbench.borrow_session_view(&session_id));
+        workbench.refresh_borrowed_view_geometry();
+        assert!(
+            !workbench.timeline_measured_turn_heights.is_empty(),
+            "the restore must keep the measured heights as the seed"
+        );
+    });
+    let restored = draw_live_timeline_frames(&workbench, cx, 4);
+    assert!(
+        restored.iter().all(|frame| *frame == before),
+        "restored geometry after a parked revision bump: {before:?} -> {restored:?}"
     );
 }
 
@@ -2006,7 +2069,7 @@ fn a_window_that_skipped_stored_rows_is_not_installed(cx: &mut TestAppContext) {
     });
 
     assert!(
-        !installed,
+        matches!(installed, timeline_loading::TimelineInstall::Omitted),
         "a page that skipped stored rows must not be installed as the projection"
     );
 }
@@ -2222,13 +2285,20 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
                 ReasoningDisplayMode::Timeline,
             ))
             .expect("the newest window prepares");
-        let installed = workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut());
+        // The covering re-read's landing: the reader's place has already been
+        // given its one recovery read, so this answer installs even though it
+        // still cannot reach the anchored turn.
+        let installed =
+            workbench.install_prepared_timeline_covering(prepared, &mut updates.borrow_mut());
         // The loader raises this after a replacement; the anchor is applied on
         // the next frame, against the row table the install just built.
         workbench.timeline_scroll_anchor_pending = true;
         installed
     });
-    assert!(installed, "the replacement window is a valid projection");
+    assert!(
+        matches!(installed, timeline_loading::TimelineInstall::Installed),
+        "the covering re-read's window is a valid projection"
+    );
     let oldest_turn_id = workbench.read_with(cx, |workbench, _| {
         workbench
             .conversation_turns_cache
@@ -2270,6 +2340,119 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     assert_eq!(
         settled, oldest_turn_id,
         "the anchor moves with the landing, so a later frame does not re-apply the lost turn"
+    );
+}
+
+/// A window that drops the reader's turn is refused once, and the covering
+/// re-read's answer installs.
+///
+/// This is the reopen-under-load bounce: the borrowed view paints the parked
+/// conversation, the lagged refetch answers with the newest window, and
+/// installing it throws the reader out of their place — the anchor resolves to
+/// nothing and the list clamps the old offset. The install refuses that one
+/// answer so the view keeps painting what the reader left, and the recovery
+/// read (contiguous, covering the anchor) is the only retry: its answer
+/// installs even when the place still cannot be kept, so a failed page under
+/// load cannot turn the refusal into a loop.
+#[gpui::test]
+fn a_window_that_drops_the_readers_turn_is_refused_once_then_installed_covering(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+
+    let mut items = Vec::new();
+    for turn in 0..20 {
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("Question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(progress_tool(items.len() as i64 + 1, turn));
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("Answer {turn}"),
+                is_final: true,
+            }),
+        ));
+    }
+    // The newest window the lagged refetch answers with: the last six turns,
+    // far above the turn the reader is holding.
+    let newest: Vec<TimelineItem> = items.iter().skip(14 * 3).cloned().collect();
+
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .timeline
+            .replace_authoritative(session_id.clone(), items);
+        workbench.rebuild_timeline_sizes();
+        workbench.timeline_follow.set_following_bottom(true);
+        workbench.request_timeline_scroll_to_latest();
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let parked_items = workbench.read_with(cx, |workbench, _| workbench.timeline.items.clone());
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: 9,
+            offset_in_item: px(20.0),
+        });
+        workbench.capture_timeline_scroll_anchor();
+    });
+    let anchored_turn = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_follow.anchor_row_id.clone().unwrap()
+    });
+
+    let prepare = |window_items: Vec<TimelineItem>| {
+        runtime
+            .block_on(PreparedTimeline::prepare_with_older(
+                session_id.clone(),
+                window_items,
+                true,
+                false,
+                None,
+                None,
+                None,
+                false,
+                ReasoningDisplayMode::Timeline,
+            ))
+            .expect("the fixture page prepares")
+    };
+
+    // The first answer drops the anchored turn: refused, and the view keeps
+    // painting the conversation the reader left.
+    let refused = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        workbench.install_prepared_timeline(prepare(newest.clone()), &mut updates.borrow_mut())
+    });
+    assert!(
+        matches!(refused, timeline_loading::TimelineInstall::AnchorLost),
+        "a window that opens below the reader's turn must be refused, got {refused:?}"
+    );
+    let (still_parked, still_anchored) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline.items == parked_items,
+            workbench.timeline_follow.anchor_row_id.clone(),
+        )
+    });
+    assert!(still_parked, "the refused window must not replace the view");
+    assert_eq!(still_anchored.as_deref(), Some(anchored_turn.as_str()));
+
+    // The covering re-read's answer installs even though it still cannot
+    // reach the anchored turn: one recovery read, never a loop.
+    let installed = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        workbench.install_prepared_timeline_covering(prepare(newest), &mut updates.borrow_mut())
+    });
+    assert!(
+        matches!(installed, timeline_loading::TimelineInstall::Installed),
+        "the covering re-read's answer must install, got {installed:?}"
     );
 }
 

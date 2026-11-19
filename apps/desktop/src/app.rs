@@ -101,7 +101,7 @@ use gpui_fps::FpsMonitor;
 use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
-use timeline_loading::PreparedTimeline;
+use timeline_loading::{PreparedTimeline, TimelineInstall};
 #[cfg(test)]
 #[path = "perf_probe_tests.rs"]
 mod perf_probe_tests;
@@ -3462,6 +3462,10 @@ struct TimelineWindowRead {
     /// put them back exactly where they were. `None` reads the newest window
     /// alone, which is every load that has nobody's place to keep.
     cover_sequence: Option<i64>,
+    /// This read is itself the one recovery re-read for a refused window that
+    /// dropped the reader's anchor. Its answer installs regardless, so a place
+    /// that cannot be kept costs a single extra read, never a loop.
+    anchor_recovery_spent: bool,
 }
 
 impl TimelineWindowRead {
@@ -3471,6 +3475,7 @@ impl TimelineWindowRead {
             resume,
             contiguous: false,
             cover_sequence: None,
+            anchor_recovery_spent: false,
         }
     }
 
@@ -3480,6 +3485,7 @@ impl TimelineWindowRead {
             resume: None,
             contiguous: true,
             cover_sequence: None,
+            anchor_recovery_spent: false,
         }
     }
 
@@ -3490,6 +3496,13 @@ impl TimelineWindowRead {
     /// naming a turn the view no longer has.
     fn covering(mut self, cover_sequence: Option<i64>) -> Self {
         self.cover_sequence = cover_sequence;
+        self
+    }
+
+    /// Marks this read as the one recovery re-read a refused anchor-dropping
+    /// window asked for. Its answer installs regardless of the anchor.
+    fn anchor_recovery_spent(mut self) -> Self {
+        self.anchor_recovery_spent = true;
         self
     }
 }
@@ -29569,21 +29582,27 @@ impl VibexWorkbench {
             != Some(&self.current_conversation_turns_cache_key());
         let geometry_changed = content_width_changed;
         if geometry_changed {
-            self.invalidate_timeline_layout_measurements();
+            // A new content-width cap re-wraps every body, so the memoized
+            // estimates describe the old box. The measured heights stay as the
+            // seed the next prepaint corrects — the same rule a pane resize
+            // follows — because an estimate in the row table for even one
+            // frame moves the restored view's scroll offset.
+            self.retarget_timeline_layout_width();
         }
         if geometry_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
         // A view parked while its session kept working comes back with a
         // projection its row table no longer describes: nothing measured the
-        // parked view while the replacement landed. The table is what the
-        // virtual list clamps the restored offset against before the frame
-        // measures anything, so extents that describe the parked projection have
-        // to go before the first frame resolves its rows. Dropping the turn
-        // heights keeps the process units, which still describe the units the
-        // replacement did not change; the estimator drops the ones it did.
+        // parked view while the replacement landed. Re-derive the table against
+        // the current projection, but keep the measured heights as its seed:
+        // `rebuild_timeline_sizes` retains the turns the projection still holds
+        // and estimates only the ones it does not, and the next prepaint
+        // corrects whatever the replacement changed. Dropping every measurement
+        // here routed the whole restored view through character-count estimates
+        // for a frame — a visible bounce on the bottom edge, where the scroll
+        // offset is resolved from the table itself.
         if self.timeline.revision != self.timeline_row_sizes_revision {
-            self.invalidate_timeline_layout_measurements();
             self.rebuild_timeline_sizes();
         }
         // Retain the last painted geometry while the live document catches up.
@@ -31129,6 +31148,7 @@ impl VibexWorkbench {
             resume,
             contiguous,
             cover_sequence,
+            anchor_recovery_spent,
         } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
@@ -31223,10 +31243,28 @@ impl VibexWorkbench {
                     this.timeline_load_updates = Default::default();
                     match outcome {
                         Ok(Ok(prepared)) => {
-                            if !this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
-                            {
-                                this.refresh_selected_agent_timeline(cx);
-                                return;
+                            let install = if anchor_recovery_spent {
+                                this.install_prepared_timeline_covering(
+                                    prepared,
+                                    &mut updates.borrow_mut(),
+                                )
+                            } else {
+                                this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
+                            };
+                            match install {
+                                TimelineInstall::Installed => {}
+                                TimelineInstall::AnchorLost => {
+                                    // The window opens below the turn the
+                                    // reader is holding. Keep the borrowed view
+                                    // on screen and re-read once with the anchor
+                                    // covered; that answer installs regardless.
+                                    this.reread_timeline_covering_reader_anchor(cx);
+                                    return;
+                                }
+                                TimelineInstall::Stale | TimelineInstall::Omitted => {
+                                    this.refresh_selected_agent_timeline(cx);
+                                    return;
+                                }
                             }
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
@@ -31299,6 +31337,7 @@ impl VibexWorkbench {
             resume,
             contiguous,
             cover_sequence,
+            anchor_recovery_spent,
         } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
@@ -31396,10 +31435,28 @@ impl VibexWorkbench {
                     this.timeline_load_updates = Default::default();
                     match outcome {
                         Ok(Ok(prepared)) => {
-                            if !this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
-                            {
-                                this.refresh_selected_agent_timeline(cx);
-                                return;
+                            let install = if anchor_recovery_spent {
+                                this.install_prepared_timeline_covering(
+                                    prepared,
+                                    &mut updates.borrow_mut(),
+                                )
+                            } else {
+                                this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
+                            };
+                            match install {
+                                TimelineInstall::Installed => {}
+                                TimelineInstall::AnchorLost => {
+                                    // The window opens below the turn the
+                                    // reader is holding. Keep the borrowed view
+                                    // on screen and re-read once with the anchor
+                                    // covered; that answer installs regardless.
+                                    this.reread_timeline_covering_reader_anchor(cx);
+                                    return;
+                                }
+                                TimelineInstall::Stale | TimelineInstall::Omitted => {
+                                    this.refresh_selected_agent_timeline(cx);
+                                    return;
+                                }
                             }
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
@@ -31637,6 +31694,44 @@ impl VibexWorkbench {
             self.ensure_child_agent_timeline(delegation.child_session_id.clone(), false, cx);
         }
         cx.notify();
+    }
+
+    /// Re-reads the selected session once after a prepared window was refused
+    /// for dropping the reader's anchored turn.
+    ///
+    /// The refused window never became the projection, so the borrowed view
+    /// still paints the conversation the reader left. The re-read is contiguous
+    /// and covers the anchor's oldest sequence; it is marked as the one recovery
+    /// read, so its answer installs even when the place still cannot be kept —
+    /// a failed page under load must not turn the refusal into a retry loop.
+    fn reread_timeline_covering_reader_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
+        let generation = self.session_generation;
+        let window = TimelineWindowRead::contiguous()
+            .covering(cover_sequence)
+            .anchor_recovery_spent();
+        if let Some(runtime) = self.local_authority() {
+            let workspace_id = self
+                .registered_session(session_id.as_str())
+                .map(|session| session.workspace_id.clone());
+            self.load_agent_session_timeline(
+                runtime,
+                session_id,
+                workspace_id,
+                generation,
+                window,
+                cx,
+            );
+        } else {
+            self.load_agent_session_timeline_remote(session_id, generation, window, cx);
+        }
     }
 
     fn refresh_selected_agent_timeline(&mut self, cx: &mut Context<Self>) {
@@ -115244,16 +115339,22 @@ mod tests {
         // with itself could never report a change, and the real report arrives
         // from prepaint through `sync_session_view_layout_width`.
         assert!(!geometry.contains("cached_timeline_layout_width"));
-        // Only a real layout change may drop the measured row extents: the
-        // turns cache key also moves for view-local session state, and
-        // re-estimating the whole table there would scroll the restored view.
+        // Only a real layout change may re-derive the row extents: the turns
+        // cache key also moves for view-local session state, and re-estimating
+        // the whole table there would scroll the restored view. Even a layout
+        // change keeps the measured heights as the seed — a restored view
+        // routed through character-count estimates bounces on the bottom edge.
         let layout_change = geometry
             .find("let geometry_changed = content_width_changed;")
             .expect("view geometry should separate layout changes from projection changes");
-        let invalidate = geometry
-            .find("self.invalidate_timeline_layout_measurements();")
-            .expect("a layout change should still invalidate the measurements");
-        assert!(layout_change < invalidate);
+        let retarget = geometry
+            .find("self.retarget_timeline_layout_width();")
+            .expect("a layout change should retarget the table, not wipe it");
+        assert!(layout_change < retarget);
+        assert!(
+            !geometry.contains("self.invalidate_timeline_layout_measurements();"),
+            "a restore must keep the measured heights as the seed the next prepaint corrects"
+        );
         assert!(geometry.contains("if geometry_changed || turns_cache_changed {"));
         assert!(geometry.contains("self.timeline_scroll_anchor_pending ="));
         assert!(geometry.contains("!self.timeline_follow.following_bottom"));

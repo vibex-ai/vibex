@@ -301,6 +301,19 @@ undoing the hold the click asked for, one frame after the spring stopped.
 | `apply_timeline_scroll_anchor` places that row with `scroll_to(ListOffset)`, not with a pixel offset through `set_offset_from_scrollbar`. | The pixel mapping runs the offset back through the list's padding and its own item heights, and the padding stays in the result as a bias. |
 | A test fixture that parks the reader must park the list (row + offset), not a pixel offset derived from the table. | The list resolves a pixel offset through the heights it knows; before a row has been measured that is its hint, not the table's estimate, so the two disagree. |
 
+## 5b-quinquies. A reopen under load must not bounce the reader
+
+Opening a session borrows its cached view and paints it synchronously, then
+re-reads the authority (a tail patch, or the newest window when the view fell
+behind the stream). Under load that read lands late, and two rules keep the
+interval between the borrowed frame and the landing from reading as a bounce:
+
+| Rule | Why |
+| --- | --- |
+| A prepared window that opens below the turn the reader's anchor names is refused once (`TimelineInstall::AnchorLost`), and the loader re-reads contiguously with the anchor covered (`reread_timeline_covering_reader_anchor`). The recovery read is marked `anchor_recovery_spent` and its answer installs regardless. | Installing the short window resolves the anchor to nothing and clamps the old offset — the reader is thrown out of their place while the borrowed view was still painting it. The cover walk is best effort (a page can fail on a saturated machine), so the install is the last line of defence. One refusal only: a place that cannot be kept costs a single extra read, never a retry loop. |
+| A restore keeps the measured turn heights as the seed (`refresh_borrowed_view_geometry`): a stale row-table stamp rebuilds the table against the current projection, and a content-width change retargets it (`retarget_timeline_layout_width`). Neither wipes the measurements. | Wiping them routes the whole restored view through character-count estimates for a frame. On the bottom edge the scroll offset is resolved from the table itself, so that frame is a visible jump; the next prepaint corrects whatever the replacement changed. |
+| The anchor's identity across a window change is its sequence range, not the turn id (`prepared_window_loses_reader_anchor`). | A page landing above the reader renames the leading turn; the range still overlaps the turn the reader was holding. |
+
 ## 5c. One transcript surface per session
 
 `TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
@@ -343,6 +356,11 @@ Rules that follow:
   the extent has to cover the whole table, and twenty 100px scroll steps have to
   move the offset by exactly 100px each. Without the re-seed it reports 556px of
   33,360px on the first step.
+- `a_window_that_drops_the_readers_turn_is_refused_once_then_installed_covering`
+  and `a_parked_revision_bump_restores_measured_geometry` pin §5b-quinquies:
+  the refused window leaves the borrowed view and the anchor untouched, the
+  covering answer installs, and a restore whose table stamp is stale keeps its
+  measured extents frame for frame.
 
 ## 7. Sidebar list migration
 
