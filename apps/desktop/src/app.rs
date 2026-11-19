@@ -6355,6 +6355,22 @@ pub struct SessionView {
     /// reading `ListState::viewport_bounds` there borrows the layout that
     /// prepaint already holds — a panic, not a stale value.
     timeline_viewport: Bounds<Pixels>,
+    /// The width the list last laid the transcript out at.
+    ///
+    /// `gpui::list` drops every item's height hint when its width or padding
+    /// changes — its first layout does exactly that — and a hint-less row
+    /// contributes no height. The list is then only as tall as the rows it has
+    /// measured, so the scrollbar, the anchor mapping and `scroll_to_end` all
+    /// describe a shorter document than the one on screen, and every row it
+    /// measured while the reader scrolled made the extent jump by that row's
+    /// height. Tracking the width is what tells [`Self::sync_timeline_list_rows`]
+    /// that the hints have to be seeded again, once the layout has settled.
+    timeline_list_seen_width: Pixels,
+    /// The width the list's row hints were last seeded at.
+    ///
+    /// `None` while the width is still moving, which is also what marks the
+    /// hints as lost and asks for the next seed.
+    timeline_list_hint_width: Option<Pixels>,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     /// The timeline revision [`Self::timeline_row_sizes`] was built for.
     ///
@@ -6606,6 +6622,8 @@ impl SessionView {
             timeline_duration_tick_task: None,
             timeline_scrollbar_interaction_active: false,
             timeline_viewport: Bounds::default(),
+            timeline_list_seen_width: px(0.0),
+            timeline_list_hint_width: None,
             pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_row_sizes_revision: 0,
@@ -32705,17 +32723,6 @@ impl VibexWorkbench {
         }
     }
 
-    /// Keeps the list's row count and height hints in step with the table.
-    ///
-    /// `gpui::list` owns the rows it lays out, so a table it does not know
-    /// about renders nothing. The count is spliced rather than reset: a reset
-    /// drops the scroll anchor, and the transcript's anchor is the reader's
-    /// place in a conversation that keeps growing.
-    ///
-    /// Heights go in as a uniform hint from the table's own rows. The list
-    /// measures what it draws and replaces the hint as rows come into view, so
-    /// the hint only has to be good enough for the scrollbar and for placing
-    /// rows above the viewport, which is what the estimate already was.
     /// Teaches the transcript's list to announce its scrolls.
     ///
     /// `gpui::list` notifies the view that painted it from inside its own wheel
@@ -32742,36 +32749,57 @@ impl VibexWorkbench {
         self.timeline_scroll.scroll_by(-delta);
     }
 
+    /// Keeps the list's row count and height hints in step with the table.
+    ///
+    /// `gpui::list` owns the rows it lays out, so a table it does not know about
+    /// renders nothing, and a row it was given no hint for contributes no height
+    /// to the document. The count and the hints therefore both come from the
+    /// table; what the list measures while it draws replaces the hint row by row.
     fn sync_timeline_list_rows(&mut self) {
         let rows = self.timeline_row_sizes.len();
         let count = self.timeline_scroll.item_count();
-        if rows == count {
+        let width = self.timeline_scroll.viewport_bounds().size.width;
+        // `gpui::list` throws every item's height hint away when its width or
+        // padding changes, and its first layout always finds one of them
+        // changed. Seeding on that same frame only feeds the wipe, and a pane
+        // being dragged narrower moves the width on every frame, so the width
+        // is taken as settled first and the hints are seeded after it.
+        let width_changed = width != self.timeline_list_seen_width;
+        if width_changed {
+            self.timeline_list_seen_width = width;
+            self.timeline_list_hint_width = None;
+        }
+        let hints_missing = width > px(0.0) && self.timeline_list_hint_width != Some(width);
+        if rows == count && !hints_missing {
             return;
         }
         // A row the list has never measured contributes nothing to the extent,
-        // so a list that grows without a hint reports a zero-length document
-        // until every row has been on screen once — the scrollbar has no thumb
-        // and the transcript cannot be scrolled at all. `reset_with_uniform_height`
-        // is the one published entry point that seeds that hint.
+        // so a list without hints reports a document only as tall as the rows it
+        // has measured — the scrollbar has no thumb, `scroll_to_end` stops at the
+        // last measured row, and the extent jumps by a row's height every time
+        // the reader scrolls one into view. `reset_with_uniform_height` is the
+        // one published entry point that seeds a hint for every row.
         //
         // The reset also drops the list's scroll anchor, and a list without one
-        // starts at its first row. A turn arriving while the reader is scrolled
-        // up grows the row count by one, so that reset alone threw them back to
-        // the top of the conversation — the "the timeline flashed to the first
-        // turn" report. An appended row moves nothing above the viewport, so the
-        // offset the reader already has is the place they keep. A table that
-        // really moved under them (an older page prepended) carries a pending
-        // anchor instead, and `apply_pending_timeline_anchor` applies it after
-        // this reset.
-        let held_offset = (!self.timeline_follow.following_bottom)
-            .then(|| self.timeline_scroll.scroll_px_offset_for_scrollbar().y)
-            .filter(|offset| *offset < px(0.0));
+        // starts at its first row. The anchor is a row index plus the offset
+        // inside it, so it is both exact across the reset and the only thing
+        // that survives it: a reader further up keeps the row they were reading
+        // instead of being thrown to the top of the conversation, and a reader
+        // on the live edge is sent back to the end.
+        let held_anchor = (!self.timeline_follow.following_bottom)
+            .then(|| self.timeline_scroll.logical_scroll_top());
         let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
         self.timeline_scroll
             .reset_with_uniform_height(rows, hint.max(px(1.0)));
-        if let Some(offset) = held_offset {
-            self.timeline_scroll
-                .set_offset_from_scrollbar(point(px(0.0), offset));
+        match held_anchor {
+            Some(anchor) => self.timeline_scroll.scroll_to(anchor),
+            None => self.timeline_scroll.scroll_to_end(),
+        }
+        // The hints only survive a layout that sees the same width as the last
+        // one, which is why a width this frame changed is not recorded: the next
+        // frame seeds again and its layout keeps the result.
+        if width > px(0.0) && !width_changed {
+            self.timeline_list_hint_width = Some(width);
         }
     }
 
@@ -34112,7 +34140,13 @@ impl VibexWorkbench {
     /// settled: a row that opened in one frame would otherwise read as landing
     /// where it started.
     fn resume_timeline_follow_after_disclosure(&mut self) {
-        self.timeline_disclosure_holds_screen = false;
+        // A disclosure that holds the screen has done exactly what the reader
+        // asked for: the row opened below a still viewport. Resuming the follow
+        // here would scroll the new content into view and undo the hold, and the
+        // landing frame is where that used to happen.
+        if std::mem::take(&mut self.timeline_disclosure_holds_screen) {
+            return;
+        }
         if self.timeline_follow.following_bottom
             || self.timeline_scroll_wheel_idle_task.is_some()
             || self.timeline_scrollbar_interaction_active

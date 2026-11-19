@@ -4642,6 +4642,80 @@ fn a_pane_gets_its_own_transcript_surface(cx: &mut TestAppContext) {
     assert_eq!(none.read_with(cx, |view, _| view.session_id.clone()), None);
 }
 
+/// Scrolling a long transcript moves the reader by what they asked for.
+///
+/// `gpui::list` drops every row's height hint when its width or padding changes,
+/// and its first layout always does. A hint-less row adds no height, so the list
+/// then believes the transcript is only as tall as the rows it happens to have
+/// measured: the extent grew — and the offset lurched — by a row's height every
+/// time one came into view. The sync re-seeds the table's hints once the layout
+/// has settled, so the extent is the table's from the first frame.
+#[gpui::test]
+fn scrolling_a_long_transcript_moves_by_the_requested_distance(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..120_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        cx.notify();
+    });
+    let mut offset = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    for step in 0..20 {
+        workbench.update(cx, |workbench, cx| {
+            workbench.timeline_scroll.scroll_by(px(-100.0));
+            cx.notify();
+        });
+        draw_disclosure_frame(cx);
+        draw_disclosure_frame(cx);
+        let (now, extent, table) = workbench.read_with(cx, |workbench, _| {
+            let viewport = workbench.timeline_scroll.viewport_bounds().size.height;
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y + viewport,
+                // `max_offset_for_scrollbar` reports the content without the
+                // list's padding, so the table is summed without it too.
+                workbench
+                    .timeline_row_sizes
+                    .iter()
+                    .map(|row| row.height)
+                    .sum::<Pixels>(),
+            )
+        });
+        assert!(
+            extent >= table - px(1.0),
+            "step {step}: the list forgot the rows it has not measured: {extent:?} of {table:?}"
+        );
+        assert_eq!(
+            now - offset,
+            px(100.0),
+            "step {step}: the transcript jumped by something other than the scroll ({offset:?} -> {now:?})"
+        );
+        offset = now;
+    }
+}
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {
