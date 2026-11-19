@@ -9040,8 +9040,13 @@ fn agent_generation_token_rate(
         return None;
     };
     let elapsed_seconds = elapsed.as_secs_f32();
+    // `then`, not `then_some`: the difference is computed in the argument, and
+    // `then_some` evaluates its argument either way. A counter that went
+    // backwards — a re-read, a compacted context, a different source for the
+    // same turn — asks for a smaller-minus-larger subtraction, which the
+    // debug overflow check turns into a process abort.
     (current > previous && elapsed_seconds > 0.0)
-        .then_some((current - previous) as f32 / elapsed_seconds)
+        .then(|| (current - previous) as f32 / elapsed_seconds)
 }
 
 fn timeline_session_state_for_render(
@@ -120656,6 +120661,17 @@ mod tests {
         );
         assert_eq!(
             agent_generation_token_rate(Some(30), Some(30), Duration::from_secs(2)),
+            None
+        );
+        // A counter that went backwards is not a rate, and asking for one must
+        // stay a `None`: the subtraction that would underflow while the guard
+        // is false is exactly what aborted the app on a debug build.
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(10), Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(10), Duration::ZERO),
             None
         );
     }
