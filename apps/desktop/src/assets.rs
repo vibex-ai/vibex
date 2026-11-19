@@ -248,16 +248,6 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
         )),
     ),
     (
-        // Iconify's `coolicons:more-grid-small`: four dots in a 2×2 grid. The
-        // one-line bar folds its four surface actions into it, so it reads as
-        // "more actions" rather than the horizontal ellipsis the menus use.
-        "icons/vibex/more-grid-small.svg",
-        include_bytes!(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/assets/icons/more-grid-small.svg"
-        )),
-    ),
-    (
         "icons/vibex/list-checks.svg",
         include_bytes!(concat!(
             env!("CARGO_MANIFEST_DIR"),

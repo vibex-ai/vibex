@@ -1349,15 +1349,13 @@ const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
 #[cfg(test)]
 const ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT: f32 = COMPOSER_SURFACE_MIN_HEIGHT + 24.0;
 const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
-/// The full box stacks its three surface controls (expand, schedule, terminal)
-/// in the trailing corner instead of laying them along the row, so the input
-/// keeps the width the row used to give them. The column owns a height of its
-/// own, and the box has to reserve it: three 30px buttons with the cluster's
-/// 4px gaps.
+/// The full box seats one surface control — the expand toggle — in the
+/// trailing corner instead of laying it along the row, so the input keeps the
+/// width the row used to give it. The clock and the terminal moved to the line
+/// under the surface, so the corner owns a single button.
 const COMPOSER_TRAILING_CONTROL_SIZE: f32 = 30.0;
-const COMPOSER_TRAILING_CONTROL_GAP: f32 = 4.0;
-const COMPOSER_TRAILING_STACK_HEIGHT: f32 =
-    3.0 * COMPOSER_TRAILING_CONTROL_SIZE + 2.0 * COMPOSER_TRAILING_CONTROL_GAP;
+/// The height the trailing corner asks the input row to reserve: one button.
+const COMPOSER_TRAILING_STACK_HEIGHT: f32 = COMPOSER_TRAILING_CONTROL_SIZE;
 /// The surface's own border, top and bottom. A surface height is a border-box
 /// figure, so this much of it never reaches the rows inside.
 const COMPOSER_SURFACE_HAIRLINE: f32 = 2.0;
@@ -1365,17 +1363,23 @@ const COMPOSER_SURFACE_HAIRLINE: f32 = 2.0;
 /// `pb_1` insets and the control row's 32px action plus its `pb_3`.
 const COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING: f32 = 16.0;
 const COMPOSER_FULL_CONTROL_ROW_HEIGHT: f32 = 44.0;
-/// The input row of the full box: at least tall enough for the trailing column
-/// and the row's own insets. The textarea stretches to the same figure, so the
-/// band the column leaves beside a short draft is input rather than padding.
+/// The input row of the full box: the editor's own minimum band plus the row's
+/// insets. The textarea stretches to the same figure, so the band under a short
+/// draft is input rather than padding.
 const COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT: f32 =
-    COMPOSER_TRAILING_STACK_HEIGHT + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING;
-/// The shortest the full box can be: the trailing column plus that chrome.
-/// It is taller than the old two-row box because the column is taller than two
-/// text rows, and the input row stretches to meet it.
+    ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING;
+/// The shortest the full box can be: the input's minimum band plus that chrome.
+/// The corner's single button is shorter than the band now, so the editor — not
+/// the control column — sets the floor.
 const COMPOSER_FULL_SURFACE_MIN_HEIGHT: f32 = COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT
     + COMPOSER_FULL_CONTROL_ROW_HEIGHT
     + COMPOSER_SURFACE_HAIRLINE;
+/// The line under the Composer's surface: the session on the left, the
+/// surface's instruments on the right. Their controls are smaller than the
+/// bar's so the line reads as a caption rather than a second toolbar.
+const COMPOSER_FOOTER_CONTROL_SIZE: f32 = 24.0;
+const COMPOSER_FOOTER_GAP: f32 = 4.0;
+const COMPOSER_FOOTER_TOP_PADDING: f32 = 6.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 /// The one-line composer is a single row: the input line and its controls
 /// share it, so the surface is one control's height plus the row's insets
@@ -4292,12 +4296,12 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
 /// The width the one-line bar would give its input, from the pane's own
 /// column — never from the density this frame is about to choose.
 ///
-/// Every control the slim row seats beside the text has a fixed width: the
-/// more menu 30, the usage ring 30, the send action 28, four 8px gaps, the
-/// row's 10px insets and the surface's hairlines. Only the run-configuration
-/// trigger varies, and its label truncates at 240px, so the bar's input is
-/// never wider than this figure. Estimating on the narrow side is deliberate:
-/// a draft the estimate calls one line is one line on the real bar too, so the
+/// Every control the slim row seats beside the text has a fixed width: attach
+/// and expand 28 each, the send action 28, four 8px gaps, the row's 10px
+/// insets and the surface's hairlines. The run-configuration trigger varies —
+/// 32px when compact, up to 240px otherwise — so the bar's input is never
+/// wider than this figure. Estimating on the narrow side is deliberate: a
+/// draft the estimate calls one line is one line on the real bar too, so the
 /// bar cannot bounce back to the box on the next frame.
 fn composer_slim_input_width(
     pane_width: f32,
@@ -4318,8 +4322,8 @@ fn composer_slim_input_width(
         - 2.0 * COMPOSER_SLIM_HORIZONTAL_PADDING
         - 2.0
         - 4.0 * 8.0
-        - COMPOSER_TRAILING_CONTROL_SIZE
-        - 30.0
+        - 28.0
+        - 28.0
         - 28.0
         - trigger)
         .max(120.0)
@@ -66896,127 +66900,17 @@ impl VibexWorkbench {
         }
     }
 
-    fn render_composer_terminal_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer_terminal_menu(&mut self, size: f32, cx: &mut Context<Self>) -> AnyElement {
         Button::new("composer-terminal-menu")
             .ghost()
             .compact()
-            .size(px(COMPOSER_TRAILING_CONTROL_SIZE))
+            .size(px(size))
             .icon(IconName::SquareTerminal)
             .tooltip(self.composer_terminal_action_label())
             .disabled(self.agent_action_pending || self.view_session_id.is_none())
             .on_click(cx.listener(|this, _, window, cx| {
                 this.toggle_composer_terminal(window.window_handle(), window, cx)
             }))
-            .into_any_element()
-    }
-
-    /// The one-line bar's score of surface actions, behind one square.
-    ///
-    /// Attach, expand, schedule and the terminal toggle are all occasional; the
-    /// bar has room for a single control beside the run configuration, so they
-    /// become a menu. The full box has the room and keeps them as themselves.
-    fn render_composer_more_menu(&mut self, enabled: bool, cx: &mut Context<Self>) -> AnyElement {
-        let expanded = self.composer_expanded;
-        let expand_label = if expanded {
-            locale::text("Collapse input", "收起输入框", "收合輸入框")
-        } else {
-            locale::text("Expand input", "展开输入框", "展開輸入框")
-        };
-        let attachments_enabled = !self.agent_action_pending;
-        let schedule_target = self
-            .view_session_id
-            .clone()
-            .filter(|_| enabled && !self.agent_action_pending);
-        let terminal_enabled =
-            enabled && !self.agent_action_pending && self.view_session_id.is_some();
-        let terminal_label = self.composer_terminal_action_label();
-        // One menu per pane: a group workspace draws a Composer per session,
-        // and the menu's state is keyed by the trigger's element id. Sharing
-        // one id would open every pane's menu from any pane's press.
-        let scope = self.composer_menu_scope();
-        let entity = cx.entity();
-        Button::new(format!("composer-more-menu{scope}"))
-            .xsmall()
-            .ghost()
-            .compact()
-            .size(px(COMPOSER_TRAILING_CONTROL_SIZE))
-            .icon(Icon::default().path("icons/vibex/more-grid-small.svg"))
-            .tooltip(locale::text(
-                "More composer actions",
-                "更多输入框操作",
-                "更多輸入框操作",
-            ))
-            // The bar sits on the window's bottom edge, so the menu opens
-            // above the trigger, right-aligned with it.
-            .dropdown_menu_with_anchor(Anchor::BottomRight, move |menu, _, _| {
-                let attach_entity = entity.clone();
-                let expand_entity = entity.clone();
-                let schedule_entity = entity.clone();
-                let terminal_entity = entity.clone();
-                let schedule_target = schedule_target.clone();
-                let terminal_label = terminal_label.to_string();
-                menu.min_w(px(196.0))
-                    .max_w(px(220.0))
-                    .item(
-                        PopupMenuItem::new(locale::text("Add attachments", "添加附件", "新增附件"))
-                            .icon(Icon::new(IconName::Plus))
-                            .disabled(!attachments_enabled)
-                            .on_click(move |_, window, cx| {
-                                attach_entity.update(cx, |this, cx| {
-                                    this.choose_composer_attachments(window, cx)
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(expand_label)
-                            .icon(Icon::new(if expanded {
-                                IconName::Minimize
-                            } else {
-                                IconName::Maximize
-                            }))
-                            .on_click(move |_, _, cx| {
-                                expand_entity.update(cx, |this, cx| {
-                                    this.composer_expanded = !this.composer_expanded;
-                                    cx.notify();
-                                });
-                            }),
-                    )
-                    .item(
-                        PopupMenuItem::new(locale::text(
-                            "Schedule message",
-                            "定时发送",
-                            "定時傳送",
-                        ))
-                        .icon(sidebar_icon("icons/vibex/clock.svg"))
-                        .disabled(schedule_target.is_none())
-                        .on_click(move |_, window, cx| {
-                            let Some(target) = schedule_target.clone() else {
-                                return;
-                            };
-                            schedule_entity.update(cx, |this, cx| {
-                                this.open_message_schedule_for(
-                                    MessageScheduleTarget::Session(target),
-                                    window,
-                                    cx,
-                                )
-                            });
-                        }),
-                    )
-                    .item(
-                        PopupMenuItem::new(terminal_label)
-                            .icon(Icon::new(IconName::SquareTerminal))
-                            .disabled(!terminal_enabled)
-                            .on_click(move |_, window, cx| {
-                                terminal_entity.update(cx, |this, cx| {
-                                    this.toggle_composer_terminal(
-                                        window.window_handle(),
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            }),
-                    )
-            })
             .into_any_element()
     }
 
@@ -79195,6 +79089,108 @@ impl VibexWorkbench {
         Some(queue.into_any_element())
     }
 
+    /// The line under the Composer's surface.
+    ///
+    /// The surface is for composing; the line under it answers for the session
+    /// as a whole. On the left sit the Agent and the project the reader is
+    /// talking to; on the right sit the instruments that act on the whole
+    /// session — the message schedule, the terminal, and the context-usage
+    /// ring, in that order. The clock and the terminal used to be surface
+    /// controls; they moved here because neither of them edits the draft, so
+    /// neither belongs inside the box the reader types into.
+    fn render_composer_footer(
+        &mut self,
+        enabled: bool,
+        inset: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let locale = self.resolved_locale();
+        // Both halves read the borrowed view — a group pane composes for its
+        // own session, so the line names that session's Agent and project even
+        // while the sidebar highlights another pane.
+        let (agent_identity, project_name) = match self.view_session() {
+            Some(session) => {
+                let agent = self
+                    .session_desired_agent_id(session.id.as_str())
+                    .unwrap_or(&session.agent_id)
+                    .to_string();
+                let project = self
+                    .workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == session.project_id)
+                    .map_or_else(
+                        || project_name_from_root(locale, &session.workspace_root),
+                        |(project, _)| project_display_name(locale, project),
+                    );
+                (Some(agent), Some(project))
+            }
+            None => (None, None),
+        };
+        let session_id = self.view_session_id.clone();
+        let controls_enabled = enabled && !self.agent_action_pending;
+        let mut leading = h_flex().min_w_0().items_center().gap_1p5();
+        if let Some(identity) = agent_identity {
+            leading = leading.child(agent_brand_icon(
+                &identity,
+                px(14.0),
+                Some(cx.theme().foreground.opacity(0.62)),
+            ));
+        }
+        if let Some(name) = project_name {
+            leading = leading.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .text_color(cx.theme().foreground.opacity(0.62))
+                    .child(name),
+            );
+        }
+        let mut trailing = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(COMPOSER_FOOTER_GAP));
+        if let Some(session_id) = session_id {
+            trailing = trailing
+                .child(self.render_message_schedule_button_sized(
+                    MessageScheduleTarget::Session(session_id),
+                    controls_enabled,
+                    COMPOSER_FOOTER_CONTROL_SIZE,
+                    cx,
+                ))
+                .child(self.render_composer_terminal_menu(COMPOSER_FOOTER_CONTROL_SIZE, cx))
+                .child(button_with_aria_label(
+                    Button::new("open-session-usage")
+                        .ghost()
+                        .compact()
+                        .size(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let session_filter = this.selected_session_id.clone();
+                            this.open_usage(session_filter, cx);
+                        }))
+                        .child(render_cache_token_ring(
+                            self.token_usage.as_ref(),
+                            COMPOSER_FOOTER_CONTROL_SIZE,
+                            cx,
+                        )),
+                    locale::text("Open usage statistics", "打开用量统计", "開啟用量統計"),
+                ));
+        }
+        h_flex()
+            .id("composer-footer")
+            .debug_selector(|| "composer-footer".to_string())
+            .w_full()
+            .min_w_0()
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px(px(inset))
+            .pt(px(COMPOSER_FOOTER_TOP_PADDING))
+            .child(leading)
+            .child(trailing)
+            .into_any_element()
+    }
+
     /// Renders the composer of the borrowed view.
     ///
     /// `enabled` is false for a group pane that does not hold the keyboard: the
@@ -80159,127 +80155,102 @@ impl VibexWorkbench {
                                                     )),
                                             )
                                     )
-                                    // The two densities seat the surface controls
-                                    // differently. The slim bar folds its four
-                                    // actions (attach, expand, schedule, terminal)
-                                    // into one "more" menu and reads, left to
-                                    // right: more → usage ring → run configuration
-                                    // → send. The full box has the room to keep
-                                    // them as themselves: attach on the control
-                                    // row below, the other three stacked in the
-                                    // trailing corner. Nothing is dropped from
-                                    // either density.
+                                    // The two densities seat their controls
+                                    // differently, and neither carries the
+                                    // schedule or the terminal any more: those
+                                    // moved to the line under the surface, where
+                                    // they answer for the session as a whole.
+                                    // The slim bar keeps attach and expand beside
+                                    // the text; the full box seats expand in the
+                                    // trailing corner and attach on the control
+                                    // row below. Nothing is dropped from either
+                                    // density.
                                     .map(|this| {
                                         if composer_is_slim {
-                                            // The "more" menu owns the bar's four
-                                            // surface actions. The clock's editor
-                                            // is not one of them to render: when
-                                            // the menu asks for it, this zero-sized
-                                            // anchor opens the same panel in the
-                                            // menu button's corner.
                                             this.child(
-                                                div()
-                                                    .relative()
-                                                    .flex_none()
-                                                    .child(self.render_composer_more_menu(
-                                                        enabled, cx,
-                                                    ))
-                                                    .when_some(
-                                                        self.view_session_id.clone(),
-                                                        |this, session_id| {
-                                                            this.child(
-                                                                div()
-                                                                    .absolute()
-                                                                    .top_0()
-                                                                    .right_0()
-                                                                    .child(
-                                                                        self.render_message_schedule_anchor(
-                                                                            MessageScheduleTarget::Session(
-                                                                                session_id,
-                                                                            ),
-                                                                            cx,
-                                                                        ),
-                                                                    ),
-                                                            )
-                                                        },
-                                                    ),
-                                            )
-                                            .child(button_with_aria_label(
-                                                Button::new("open-session-usage")
+                                                Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(30.0))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        let session_filter =
-                                                            this.selected_session_id.clone();
-                                                        this.open_usage(session_filter, cx);
-                                                    }))
-                                                    .child(render_cache_token_ring(
-                                                        self.token_usage.as_ref(),
-                                                        cx,
+                                                    .size(px(primary_action_size))
+                                                    .icon(IconName::Plus)
+                                                    .tooltip(locale::text(
+                                                        "Add attachments",
+                                                        "添加附件",
+                                                        "新增附件",
+                                                    ))
+                                                    .disabled(self.agent_action_pending)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.choose_composer_attachments(
+                                                                window, cx,
+                                                            )
+                                                        },
                                                     )),
-                                                locale::text(
-                                                    "Open usage statistics",
-                                                    "打开用量统计",
-                                                    "開啟用量統計",
-                                                ),
-                                            ))
+                                            )
+                                            .child(
+                                                Button::new("toggle-composer-expanded")
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(primary_action_size))
+                                                    .icon(if self.composer_expanded {
+                                                        IconName::Minimize
+                                                    } else {
+                                                        IconName::Maximize
+                                                    })
+                                                    .tooltip(if self.composer_expanded {
+                                                        locale::text(
+                                                            "Collapse input",
+                                                            "收起输入框",
+                                                            "收合輸入框",
+                                                        )
+                                                    } else {
+                                                        locale::text(
+                                                            "Expand input",
+                                                            "展开输入框",
+                                                            "展開輸入框",
+                                                        )
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.composer_expanded =
+                                                            !this.composer_expanded;
+                                                        cx.notify();
+                                                    })),
+                                            )
                                             .children(runtime_controls_cascade.take())
                                             .children(primary_action.take())
                                         } else {
+                                            // One button in the corner: the clock
+                                            // and the terminal live on the line
+                                            // under the box now.
                                             this.child(
-                                                v_flex()
-                                                    .flex_none()
-                                                    .items_center()
-                                                    .gap(px(COMPOSER_TRAILING_CONTROL_GAP))
-                                                    .child(
-                                                        Button::new("toggle-composer-expanded")
-                                                            .xsmall()
-                                                            .ghost()
-                                                            .compact()
-                                                            .size(px(
-                                                                COMPOSER_TRAILING_CONTROL_SIZE,
-                                                            ))
-                                                            .icon(if self.composer_expanded {
-                                                                IconName::Minimize
-                                                            } else {
-                                                                IconName::Maximize
-                                                            })
-                                                            .tooltip(if self.composer_expanded {
-                                                                locale::text(
-                                                                    "Collapse input",
-                                                                    "收起输入框",
-                                                                    "收合輸入框",
-                                                                )
-                                                            } else {
-                                                                locale::text(
-                                                                    "Expand input",
-                                                                    "展开输入框",
-                                                                    "展開輸入框",
-                                                                )
-                                                            })
-                                                            .on_click(cx.listener(|this, _, _, cx| {
-                                                                this.composer_expanded =
-                                                                    !this.composer_expanded;
-                                                                cx.notify();
-                                                            })),
-                                                    )
-                                                    .when_some(
-                                                        self.view_session_id.clone(),
-                                                        |this, session_id| {
-                                                            this.child(
-                                                                self.render_message_schedule_button_sized(
-                                                                    MessageScheduleTarget::Session(
-                                                                        session_id,
-                                                                    ),
-                                                                    enabled,
-                                                                    COMPOSER_TRAILING_CONTROL_SIZE,
-                                                                    cx,
-                                                                ),
-                                                            )
-                                                        },
-                                                    )
-                                                    .child(self.render_composer_terminal_menu(cx)),
+                                                Button::new("toggle-composer-expanded")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(COMPOSER_TRAILING_CONTROL_SIZE))
+                                                    .icon(if self.composer_expanded {
+                                                        IconName::Minimize
+                                                    } else {
+                                                        IconName::Maximize
+                                                    })
+                                                    .tooltip(if self.composer_expanded {
+                                                        locale::text(
+                                                            "Collapse input",
+                                                            "收起输入框",
+                                                            "收合輸入框",
+                                                        )
+                                                    } else {
+                                                        locale::text(
+                                                            "Expand input",
+                                                            "展开输入框",
+                                                            "展開輸入框",
+                                                        )
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.composer_expanded =
+                                                            !this.composer_expanded;
+                                                        cx.notify();
+                                                    })),
                                             )
                                         }
                                     }),
@@ -80288,10 +80259,12 @@ impl VibexWorkbench {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
                             })
                             // The full box keeps its control row under the
-                            // text: attachments on the left, the runtime
+                            // text: attachments on the left, the run-configuration
                             // cascade and the send action on the right. The
                             // slim bar has already seated every one of these
-                            // on its single row above.
+                            // on its single row above. The usage ring and the
+                            // schedule/terminal controls live on the footer
+                            // line below, so neither density repeats them here.
                             .when(!composer_is_slim, |this| {
                                 this.child(
                                 h_flex()
@@ -80304,7 +80277,7 @@ impl VibexWorkbench {
                                     .pb_3()
                                     .child(
                                         h_flex()
-                                            .id("composer-runtime-controls-scroll")
+                                            .id("composer-runtime-controls-left")
                                             .min_w_0()
                                             .flex_1()
                                             .items_center()
@@ -80334,30 +80307,10 @@ impl VibexWorkbench {
                                     )
                                     .child(
                                         h_flex()
-                                            .id("composer-runtime-controls-cascade")
+                                            .id("composer-runtime-controls-right")
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(button_with_aria_label(
-                                                Button::new("open-session-usage")
-                                                    .ghost()
-                                                    .compact()
-                                                    .size(px(32.0))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        let session_filter =
-                                                            this.selected_session_id.clone();
-                                                        this.open_usage(session_filter, cx);
-                                                    }))
-                                                    .child(render_cache_token_ring(
-                                                        self.token_usage.as_ref(),
-                                                        cx,
-                                                    )),
-                                                locale::text(
-                                                    "Open usage statistics",
-                                                    "打开用量统计",
-                                                    "開啟用量統計",
-                                                ),
-                                            ))
                                             .when_some(
                                                 delegation_subject.as_ref().and_then(|mention| {
                                                     mention.agent_id.as_ref().map(|agent_id| {
@@ -80399,7 +80352,16 @@ impl VibexWorkbench {
                                     ),
                                 )
                             }),
-                    ),
+                    )
+                    .child(self.render_composer_footer(
+                        enabled,
+                        if composer_is_slim {
+                            COMPOSER_SLIM_HORIZONTAL_PADDING
+                        } else {
+                            12.0
+                        },
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -90775,7 +90737,7 @@ fn tabular_numerals() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
 }
 
-fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> AnyElement {
+fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, size: f32, cx: &mut App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let context_fraction = usage.and_then(context_window_usage_fraction);
     // `ProgressCircle` paints its track from the progress color at reduced
@@ -90886,7 +90848,7 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> Any
     div()
         .id("composer-cache-token-ring")
         .flex_none()
-        .size(px(28.0))
+        .size(px(size))
         .flex()
         .items_center()
         .justify_center()
@@ -111821,10 +111783,10 @@ mod tests {
         }
     }
 
-    /// Mirrors the full box's height chain: the surface reserves the trailing
-    /// control column, the input row stretches to meet it, and the textarea
-    /// fills the band. The slot is measured because a band left as padding
-    /// under a short draft is exactly the regression this pins.
+    /// Mirrors the full box's height chain: the surface reserves the input's
+    /// minimum band, the input row stretches to meet it, and the textarea fills
+    /// it. The slot is measured because a band left as padding under a short
+    /// draft is exactly the regression this pins.
     struct ComposerFullBoxLayoutProbe {
         input: Entity<TextareaState>,
         surface_height: Rc<Cell<f32>>,
@@ -111892,9 +111854,6 @@ mod tests {
                                         v_flex()
                                             .flex_none()
                                             .items_center()
-                                            .gap(px(4.0))
-                                            .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE)))
-                                            .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE)))
                                             .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE))),
                                     ),
                             )
@@ -113979,10 +113938,15 @@ mod tests {
         assert!(route.contains("\"usage\" => \"usage\".to_string()"));
         assert!(route.contains("usage.activate(session_filter, cx)"));
 
+        // The live indicator rides the footer now, so the opener lives there.
         let composer = source
-            .split_once("Button::new(\"open-session-usage\")")
-            .expect("the live usage indicator should open Usage")
-            .1;
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        assert!(composer.contains("Button::new(\"open-session-usage\")"));
         assert!(composer.contains("this.open_usage(session_filter, cx);"));
     }
 
@@ -113996,30 +113960,40 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
-        let usage = composer
-            .rfind("Button::new(\"open-session-usage\")")
-            .expect("token usage action should exist");
         let fullscreen = composer
-            .find("Button::new(\"toggle-composer-expanded\")")
+            .rfind("Button::new(\"toggle-composer-expanded\")")
             .expect("composer fullscreen action should exist");
-        let terminal = composer
-            .find("self.render_composer_terminal_menu(cx)")
-            .expect("terminal mode action should exist");
         let control_row = composer
-            .find("id(\"composer-runtime-controls-scroll\")")
+            .find("id(\"composer-runtime-controls-left\")")
             .expect("the full box's control row should exist");
         let primary_action = composer
             .rfind(".children(primary_action.take())")
             .expect("send or stop action should exist");
-
-        // The full box's trailing column reads expand, schedule, terminal —
-        // top to bottom — and sits above the control row.
-        assert!(fullscreen < terminal);
-        assert!(terminal < control_row);
-        // The control row keeps usage beside the run configuration and the
-        // send action, to the left of the send.
-        assert!(control_row < usage);
-        assert!(usage < primary_action);
+        // The corner carries the expand toggle only, above the control row:
+        // the clock, the terminal and the usage ring moved to the footer.
+        assert!(fullscreen < control_row);
+        assert!(control_row < primary_action);
+        assert!(!composer.contains("render_composer_terminal_menu("));
+        assert!(!composer.contains("render_message_schedule_button_sized("));
+        assert!(!composer.contains("open-session-usage"));
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        let clock = footer
+            .find("render_message_schedule_button_sized(")
+            .expect("the footer should carry the message schedule");
+        let terminal = footer
+            .find("render_composer_terminal_menu(")
+            .expect("the footer should carry the terminal toggle");
+        let usage = footer
+            .find("Button::new(\"open-session-usage\")")
+            .expect("the footer should carry the usage ring");
+        assert!(clock < terminal);
+        assert!(terminal < usage);
     }
 
     #[test]
@@ -123889,6 +123863,34 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_switch_banner_shows_the_agents_own_refusal() {
+        // The failed row used to print only the product sentence, so an
+        // unknown model id, a rejected option and a broken endpoint all read
+        // as "configuration unavailable". The banner carries the recorded
+        // refusal — and wraps, because a reason truncated to one short line
+        // explains nothing.
+        let source = include_str!("app.rs");
+        let controls = source
+            .split_once("    fn render_runtime_controls(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pane a session Composer"))
+            .map(|(body, _)| body)
+            .expect("runtime controls should remain inspectable");
+        assert!(
+            controls.contains("and_then(|error| error.detail.as_deref())"),
+            "the banner must read the actionable error's detail"
+        );
+        assert!(
+            controls.contains(".text_color(cx.theme().danger)")
+                && controls.contains(".whitespace_normal()"),
+            "the refusal is drawn in the danger colour and is allowed to wrap"
+        );
+        assert!(
+            !controls.contains(".child(div().truncate().text_xs().font_medium().child(title))"),
+            "the failed row may no longer truncate its only explanation"
+        );
+    }
+
+    #[test]
     fn composer_surfaces_match_the_connected_two_surface_visual_contract() {
         for is_dark in [false, true] {
             let composer = composer_surface_background(is_dark);
@@ -123919,12 +123921,16 @@ mod tests {
         assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 112.0);
         assert_eq!(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT, 136.0);
         assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 80.0);
-        // The full box's floor is its trailing column (3 × 30px buttons and
-        // two 4px gaps), the row's 16px insets, the 44px control row and the
-        // surface's 2px hairline.
-        assert_eq!(COMPOSER_TRAILING_STACK_HEIGHT, 98.0);
-        assert_eq!(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT, 114.0);
-        assert_eq!(COMPOSER_FULL_SURFACE_MIN_HEIGHT, 160.0);
+        // The full box's floor is the editor's 80px band, the row's 16px
+        // insets, the 44px control row and the surface's 2px hairline. The
+        // trailing corner keeps one 30px button, shorter than that band.
+        assert_eq!(COMPOSER_TRAILING_STACK_HEIGHT, 30.0);
+        assert_eq!(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT, 96.0);
+        assert_eq!(COMPOSER_FULL_SURFACE_MIN_HEIGHT, 142.0);
+        // The line under the surface keeps its own controls and insets.
+        assert_eq!(COMPOSER_FOOTER_CONTROL_SIZE, 24.0);
+        assert_eq!(COMPOSER_FOOTER_GAP, 4.0);
+        assert_eq!(COMPOSER_FOOTER_TOP_PADDING, 6.0);
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
@@ -123990,23 +123996,16 @@ mod tests {
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
             .expect("composer fullscreen control should remain present");
-        let terminal_button = composer
-            .find("self.render_composer_terminal_menu(cx)")
-            .expect("composer terminal control should remain present");
-        assert!(fullscreen_button < terminal_button);
-        // The full box seats its three surface controls in one trailing column:
-        // expand, schedule, terminal — top to bottom. The control row stays
-        // under the text, and the slim bar has already folded every one of
-        // these into its "more" menu.
-        let stack_gap = composer
-            .find(".gap(px(COMPOSER_TRAILING_CONTROL_GAP))")
-            .expect("the trailing controls should be stacked with the column's gap");
-        assert!(stack_gap < fullscreen_button);
-        assert!(composer.contains("render_message_schedule_button_sized("));
+        // The full box seats its one remaining surface control — expand — in
+        // the trailing corner; the control row stays under the text. The
+        // clock, the terminal and the usage ring live on the footer instead.
         let control_row = composer
-            .find("id(\"composer-runtime-controls-scroll\")")
+            .find("id(\"composer-runtime-controls-left\")")
             .expect("the control row should remain inspectable");
-        assert!(terminal_button < control_row);
+        assert!(fullscreen_button < control_row);
+        assert!(!composer.contains("render_message_schedule_button_sized("));
+        assert!(!composer.contains("render_composer_terminal_menu("));
+        assert!(!composer.contains("open-session-usage"));
         assert!(composer.contains(".when(!composer_is_slim, |this| {"));
         assert!(composer.contains(".pb_1()"));
         assert!(composer.contains(".when(composer_extension_visible, |this|"));
@@ -124231,37 +124230,40 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("session composer should remain inspectable");
-        // One attachment control: the full box seats it on its control row.
-        // The slim bar has folded it — with expand, schedule and the terminal
-        // toggle — into its "more" menu, which is rendered beside the composer.
-        assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
+        // Both densities render the attachment control once — on the slim
+        // row, or on the full box's control row — and the schedule, the
+        // terminal and the usage ring are not surface controls any more.
+        assert_eq!(composer.matches("choose-composer-attachments").count(), 2);
         assert!(!composer.contains("choose-composer-images"));
-        assert!(composer.contains("composer-runtime-controls-cascade"));
+        assert!(composer.contains("composer-runtime-controls-right"));
         assert!(composer.contains(".children(runtime_controls_cascade.take())"));
         assert!(composer.contains("children(runtime_controls_other)"));
+        // Built at runtime so this test does not match its own text.
+        let retired_menu = format!("render_composer_{}(", "more_menu");
+        assert!(!composer.contains(&retired_menu));
 
-        let more = composer
-            .find("self.render_composer_more_menu(")
-            .expect("the slim bar should fold its surface actions into one menu");
-        let token_usage = composer
-            .find("open-session-usage")
-            .expect("composer token usage control should be present");
+        let slim_attach = composer
+            .find("Button::new(\"choose-composer-attachments\")")
+            .expect("the slim row should seat attach");
+        let slim_expand = composer
+            .find("Button::new(\"toggle-composer-expanded\")")
+            .expect("the slim row should seat expand");
         let slim_cascade = composer
             .find(".children(runtime_controls_cascade.take())")
             .expect("the slim bar should seat the run-configuration control");
         let submit = composer
             .find(".children(primary_action.take())")
             .expect("composer submit control should remain present");
-        // The slim row reads left to right: more, usage, run configuration,
+        // The slim row reads left to right: attach, expand, run configuration,
         // send — the input takes everything else.
-        assert!(more < token_usage);
-        assert!(token_usage < slim_cascade);
+        assert!(slim_attach < slim_expand);
+        assert!(slim_expand < slim_cascade);
         assert!(slim_cascade < submit);
         let other_runtime_controls = composer
             .find("children(runtime_controls_other)")
             .expect("composer secondary runtime controls should stay beside attachments");
         let cascade_runtime_controls = composer
-            .find("composer-runtime-controls-cascade")
+            .find("composer-runtime-controls-right")
             .expect("composer cascade should stay beside the submit control");
         assert!(other_runtime_controls < cascade_runtime_controls);
         // Thinking depth, conversation mode and the feature toggles are no
@@ -124393,10 +124395,10 @@ mod tests {
         assert!(composer.contains("this.h_full()"));
     }
 
-    /// The full box's input row stretches to the trailing column, and the
-    /// editor fills it: the band under a short draft is input, not padding.
+    /// The full box's input row stretches to its reserved band, and the editor
+    /// fills it: the space under a short draft is input, not padding.
     #[gpui::test]
-    fn full_composer_input_fills_the_trailing_column_band(cx: &mut TestAppContext) {
+    fn full_composer_input_fills_its_reserved_band(cx: &mut TestAppContext) {
         cx.update(gpui_component::init);
         let surface_height = Rc::new(Cell::new(0.0));
         let input_row_height = Rc::new(Cell::new(0.0));
@@ -124447,11 +124449,11 @@ mod tests {
         });
         assert!(
             (row - COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT).abs() <= 0.5,
-            "the input row should stretch to the column: {row}"
+            "the input row should stretch to its band: {row}"
         );
         assert!(
-            (slot - COMPOSER_TRAILING_STACK_HEIGHT).abs() <= 0.5,
-            "the input slot should be the column's band: {slot}"
+            (slot - ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT).abs() <= 0.5,
+            "the input slot should be the editor's band: {slot}"
         );
         // The text sits at the top of the band, within one line advance of its
         // first row, and the editor covers the band instead of shrinking to
@@ -124470,7 +124472,7 @@ mod tests {
         );
         // The prepaint bounds are the surface's content box; the border is
         // outside them. What matters is that the rows fill that box exactly,
-        // and that the box is the floor the column asks for.
+        // and that the box is the floor the editor's band asks for.
         assert!(
             (surface + COMPOSER_SURFACE_HAIRLINE - COMPOSER_FULL_SURFACE_MIN_HEIGHT).abs() <= 0.5,
             "the surface should ask for the column's floor: surface {surface}"
@@ -126160,9 +126162,9 @@ mod tests {
             composer_surface_height(ComposerDensity::Slim, 1),
             COMPOSER_SLIM_SURFACE_HEIGHT
         );
-        // The full box's floor is the trailing control column, not two text
-        // rows: the box must fit the column it seats in the corner. A draft
-        // that is shorter than the column still fills that height with input.
+        // The full box's floor is the editor's own minimum band, not two text
+        // rows: the box must fit the rows it reserves, and the trailing corner
+        // is shorter than that band now.
         assert_eq!(
             composer_surface_height(ComposerDensity::Full, 1),
             COMPOSER_FULL_SURFACE_MIN_HEIGHT
@@ -126174,19 +126176,19 @@ mod tests {
         assert_eq!(
             composer_surface_height(ComposerDensity::Full, 3),
             COMPOSER_FULL_SURFACE_MIN_HEIGHT,
-            "three rows still fit beside the trailing column"
+            "three rows still fit inside the input's band"
         );
-        assert_eq!(
-            composer_surface_height(ComposerDensity::Full, 4),
-            COMPOSER_FULL_SURFACE_MIN_HEIGHT,
-            "four short rows still fit inside the column's band"
-        );
-        // Past the column, the box is exactly the text plus the row's chrome:
-        // a row adds one line advance, never a reserved blank line.
+        // Four rows reach past the band, so the box is exactly the text plus
+        // the row's chrome from here on: a row adds one line advance, never a
+        // reserved blank line.
         let chrome = COMPOSER_INPUT_VERTICAL_PADDING
             + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING
             + COMPOSER_FULL_CONTROL_ROW_HEIGHT
             + COMPOSER_SURFACE_HAIRLINE;
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 4),
+            4.0 * COMPOSER_INPUT_LINE_HEIGHT + chrome
+        );
         assert_eq!(
             composer_surface_height(ComposerDensity::Full, 5),
             5.0 * COMPOSER_INPUT_LINE_HEIGHT + chrome
@@ -126225,9 +126227,10 @@ mod tests {
     #[test]
     fn composer_slim_input_width_is_a_property_of_the_pane_not_the_density() {
         let wide = composer_slim_input_width(1200.0, None, 24.0, false, true);
-        // 1200 - 48 inset = 1152 surface; minus insets/hairlines/gaps and the
-        // fixed controls (more 30 + usage 30 + send 28) and the 240px trigger.
-        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 88.0 - 240.0);
+        // 1200 - 48 inset = 1152 surface; minus insets/hairlines/four 8px
+        // gaps and the fixed controls (attach 28 + expand 28 + send 28) and
+        // the 240px trigger.
+        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 84.0 - 240.0);
         // The compact trigger frees the label's width for the draft.
         let compact = composer_slim_input_width(1200.0, None, 24.0, true, true);
         assert_eq!(compact, wide + 240.0 - 32.0);
@@ -126237,7 +126240,7 @@ mod tests {
         // The session content cap bounds the surface, and a sliver of a pane
         // still leaves the probe a usable width instead of a negative one.
         let capped = composer_slim_input_width(4000.0, Some(1024.0), 24.0, false, true);
-        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 88.0 - 240.0);
+        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 84.0 - 240.0);
         assert!(composer_slim_input_width(200.0, None, 0.0, false, true) >= 120.0);
     }
 
@@ -126426,59 +126429,66 @@ mod tests {
         assert!(!source.contains(&trimming));
     }
 
-    /// The one-line bar's four surface actions are one menu, and the bar is
-    /// read left to right as more, usage, run configuration, send.
+    /// The line under the surface carries the session's instruments.
+    ///
+    /// Neither density keeps the clock, the terminal or the usage ring inside
+    /// the box: the slim bar seats attach and expand beside the text, the full
+    /// box seats expand in the corner and attach on its control row, and the
+    /// three session instruments read left to right on the footer — schedule,
+    /// terminal, usage.
     #[test]
-    fn the_one_line_bar_folds_its_surface_actions_into_one_menu() {
+    fn the_footer_carries_the_session_instruments() {
         let source = include_str!("app.rs");
-        let menu = source
-            .split_once("    fn render_composer_more_menu(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_tab("))
-            .map(|(body, _)| body)
-            .expect("the more menu should remain inspectable");
-        assert!(menu.contains("icons/vibex/more-grid-small.svg"));
-        assert!(menu.contains("dropdown_menu_with_anchor(Anchor::BottomRight"));
-        assert_eq!(
-            menu.matches(".item(").count(),
-            4,
-            "attach, expand, schedule and terminal share the menu"
-        );
-        // Each entry selects one of the four controls the slim bar used to
-        // render as icons.
-        assert!(menu.contains("this.choose_composer_attachments(window, cx)"));
-        assert!(menu.contains("this.composer_expanded = !this.composer_expanded;"));
-        assert!(menu.contains("this.open_message_schedule_for("));
-        assert!(menu.contains("this.toggle_composer_terminal("));
-        // Every entry is an icon plus a title; the trigger carries the grid
-        // mark that opens them.
-        assert_eq!(menu.matches(".icon(").count(), 5);
-
-        // The bar seats the menu on the right, before the usage ring, the run
-        // configuration and the send action.
         let composer = source
             .split_once("    fn render_composer(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
-        let more = composer
-            .find("self.render_composer_more_menu(")
-            .expect("the bar should render the more menu");
-        let schedule_anchor = composer
-            .find("self.render_message_schedule_anchor(")
-            .expect("the schedule panel needs an anchor in the bar");
-        let usage = composer
-            .find("Button::new(\"open-session-usage\")")
-            .expect("the usage ring should stay in the bar");
+        let attach = composer
+            .find("Button::new(\"choose-composer-attachments\")")
+            .expect("the slim row should seat attach");
+        let expand = composer
+            .find("Button::new(\"toggle-composer-expanded\")")
+            .expect("the slim row should seat expand");
         let cascade = composer
             .find(".children(runtime_controls_cascade.take())")
             .expect("the run configuration should stay in the bar");
         let send = composer
             .find(".children(primary_action.take())")
             .expect("the send action should stay in the bar");
-        assert!(more < schedule_anchor);
-        assert!(schedule_anchor < usage);
-        assert!(usage < cascade);
+        // The slim row reads left to right: attach, expand, run configuration,
+        // send — the input takes everything else.
+        assert!(attach < expand);
+        assert!(expand < cascade);
         assert!(cascade < send);
+        // The old fold-menu and its schedule anchor are gone. The needles are
+        // built at runtime so this test does not match its own text.
+        let retired_menu = format!("render_composer_{}(", "more_menu");
+        let retired_anchor = format!("render_message_schedule_{}(", "anchor");
+        assert!(!source.contains(&retired_menu));
+        assert!(!source.contains(&retired_anchor));
+
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("the footer should remain inspectable");
+        let clock = footer
+            .find("render_message_schedule_button_sized(")
+            .expect("the footer should carry the schedule");
+        let terminal = footer
+            .find("render_composer_terminal_menu(")
+            .expect("the footer should carry the terminal");
+        let usage = footer
+            .find("Button::new(\"open-session-usage\")")
+            .expect("the footer should carry the usage ring");
+        assert!(clock < terminal);
+        assert!(terminal < usage);
+        // The left half names the session: the Agent's mark, then the project.
+        assert!(footer.contains("agent_brand_icon("));
+        assert!(footer.contains("project_display_name(locale, project)"));
     }
 
     /// The clock's tooltip loses its dangling ellipsis, and the terminal's

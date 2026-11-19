@@ -894,30 +894,41 @@ draft of newlines has rows, and the bar cannot show a second row, so Enter in
 the slim bar has to move the surface to the full box instead of pushing the
 bar's controls down inside a 46px surface.
 
-The two densities seat the same four occasional surface actions differently:
+The surface itself carries only what edits the draft:
 
-| Density | Attach | Expand / schedule / terminal |
+| Density | Attach | Expand |
 | --- | --- | --- |
-| Slim | inside the "more" menu | inside the "more" menu |
-| Full | control row, bottom-left | one vertical column, top-right |
+| Slim | row, left of the text | row, left of the text |
+| Full | control row, bottom-left | trailing corner, top-right |
 
-The slim bar has room for one control beside the run configuration, so the four
-fold into a `DropdownMenu` on the more mark (`coolicons:more-grid-small`), each
-entry an icon plus a localized title. The bar then reads, left to right: more →
-usage ring → run configuration → send. Opening the schedule editor from that
-menu needs no clock trigger, so the popover's open state lives on the
-workbench (`message_schedule_open`) and a zero-sized anchor in the menu button's
-corner mounts the same panel; a menu item cannot press a trigger.
+The schedule, the terminal and the context-usage ring are not surface controls:
+none of them edits the draft, so they answer for the session as a whole and
+live on the line under the surface (`render_composer_footer`). That line keeps
+the surface's own horizontal inset and reads, left to right: the session's
+Agent mark and project name, then the schedule, the terminal and the usage
+ring. Keep the two halves on one line — the left half names the target, the
+right half holds the instruments — and do not add a second floating row above
+the box for them: the session's instruments belong to the same baseline as the
+session it names.
 
-The full box's trailing column is taller than two text rows. Its height is a
-constant the surface reserves (`COMPOSER_FULL_SURFACE_MIN_HEIGHT`), and the
-textarea fills the same height (`h_full`, never just a minimum: a minimum
-leaves the editor content-sized and the frame's centring floats a short draft
-in the middle of the band). Past the column the surface is derived from the
-draft itself — rows × the input's line advance plus its own padding, then the
-row's insets, the control row and the surface hairline. Do not grow a fixed
-base instead: the old `base + (rows - 2) × advance` reserved a blank band under
-the last line, and that band is what the reader sees as wasted input space.
+The slim row then reads attach → expand → run configuration → send, with no
+fold-menu: four separate controls fit because the row only seats two of them
+plus the cascade and the action. The row's fixed widths are what
+`composer_slim_input_width` subtracts, so a new control there must be added to
+that figure as well, or the density probe wraps a line later than the painted
+bar does.
+
+The trailing corner seats one button (expand), shorter than the input's own
+minimum band. The surface's floor is therefore the editor
+(`COMPOSER_FULL_SURFACE_MIN_HEIGHT` = the 80px text band + the row's 16px
+insets + the 44px control row + the 2px hairline), and the textarea fills the
+same height (`h_full`, never just a minimum: a minimum leaves the editor
+content-sized and the frame's centring floats a short draft in the middle of
+the band). Past the floor the surface is derived from the draft itself — rows ×
+the input's line advance plus its own padding, then the row's insets, the
+control row and the surface hairline. Do not grow a fixed base instead: the
+old `base + (rows - 2) × advance` reserved a blank band under the last line,
+and that band is what the reader sees as wasted input space.
 
 ### Session activity indicators
 

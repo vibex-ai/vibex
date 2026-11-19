@@ -684,23 +684,6 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    /// Opens the schedule editor for `target` without a press on its trigger.
-    ///
-    /// The one-line Composer folds the clock into its "more" menu, and a menu
-    /// closes as soon as an item is chosen, so the popover cannot be opened by
-    /// its own trigger there. The open flag is the popover's own state: setting
-    /// it mounts the editor and the surface in the same frame.
-    pub(super) fn open_message_schedule_for(
-        &mut self,
-        target: MessageScheduleTarget,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) {
-        self.message_schedule_open = Some(target.clone());
-        self.open_message_schedule_editor(target, window, cx);
-        cx.notify();
-    }
-
     /// Releases the editor the popover was showing. Dismissal is not a decision:
     /// the value the target already holds is left untouched.
     fn close_message_schedule_editor(
@@ -786,25 +769,6 @@ impl VibexWorkbench {
                 .disabled(!enabled),
             label,
         );
-        self.render_message_schedule_popover(target, trigger, cx)
-    }
-
-    /// The clock popover with no visible trigger of its own.
-    ///
-    /// The one-line Composer folds the clock into its "more" menu, so there is
-    /// no clock button to hang the panel from. The anchor is a zero-sized ghost
-    /// trigger placed in the menu button's corner: the panel opens in the same
-    /// place the menu did, and the shape, the editor and the close paths are the
-    /// ones the visible clock uses.
-    pub(super) fn render_message_schedule_anchor(
-        &self,
-        target: MessageScheduleTarget,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let trigger = Button::new(self.message_schedule_popover_id(&target))
-            .ghost()
-            .compact()
-            .size(px(0.0));
         self.render_message_schedule_popover(target, trigger, cx)
     }
 
