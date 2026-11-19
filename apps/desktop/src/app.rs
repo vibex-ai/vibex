@@ -32858,7 +32858,7 @@ impl VibexWorkbench {
             .map(|row| row.height)
             .sum::<Pixels>();
         let line = format!(
-            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} top={}:{} tail={} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} top={}:{} tail={} layers={} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
             self.timeline_trace.frames,
             self.timeline_follow.following_bottom,
             self.timeline_row_sizes.len(),
@@ -32867,6 +32867,7 @@ impl VibexWorkbench {
             self.timeline_scroll.logical_scroll_top().item_ix,
             self.timeline_scroll.logical_scroll_top().offset_in_item,
             self.timeline_scroll.is_following_tail(),
+            std::env::var("GPUI_SCROLL_LAYERS").unwrap_or_else(|_| "1".into()),
             self.timeline_trace.seeds,
             self.timeline_list_hint_width.is_some(),
             self.timeline_disclosure_settle_frames,
