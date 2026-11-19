@@ -1017,7 +1017,13 @@ const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
 /// past this much of what the reader already had, re-reading the page costs
 /// more than the jump it prevents, so the view lands on the oldest row it does
 /// hold rather than on the newest one.
-const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = AGENT_TIMELINE_RESUME_MAX_ITEMS;
+///
+/// Deliberately not [`AGENT_TIMELINE_RESUME_MAX_ITEMS`]: that cap bounds what
+/// patching a tail is worth on a routine refresh, while this one bounds how
+/// far a one-off recovery may reach before it gives up on the turn the reader
+/// was reading. Long sessions ran past 2,000 items and lost their place anyway,
+/// so the recovery cap stands on its own with headroom of its own.
+const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = 8_000;
 /// How many older pages may be outstanding at once.
 ///
 /// Prefetch keeps the next page on the way while the reader is still moving
@@ -3191,8 +3197,20 @@ where
         {
             break;
         }
-        let Ok(older) = fetch_before(start_sequence).await else {
-            break;
+        let older = match fetch_before(start_sequence).await {
+            Ok(older) => older,
+            Err(_) => {
+                // A page read can fail transiently — a saturated machine, a
+                // busy store — and giving up on the first hiccup abandons the
+                // turn the reader is reading, which is the jump this walk
+                // exists to prevent. One retry stays within the best-effort
+                // contract: a read that fails twice leaves the window exactly
+                // as it arrived.
+                match fetch_before(start_sequence).await {
+                    Ok(older) => older,
+                    Err(_) => break,
+                }
+            }
         };
         if !prepend_older_timeline_page(&mut page, older) {
             break;
@@ -12509,18 +12527,29 @@ impl VibexWorkbench {
         let added_history = !page.items.is_empty();
         let leading_turn_start = page.leading_turn_start;
         self.capture_timeline_scroll_anchor();
-        let mut merged = page
-            .items
-            .into_iter()
-            .chain(self.timeline.items.iter().cloned())
-            .collect::<Vec<_>>();
-        merged.sort_by_key(|item| item.sequence);
-        merged.dedup_by_key(|item| item.sequence);
-        self.timeline.replace_authoritative_with_leading_turn_start(
-            session_id.clone(),
-            merged,
-            leading_turn_start,
-        );
+        if !self
+            .timeline
+            .prepend_authoritative_page(session_id, &page.items, leading_turn_start)
+        {
+            // The page cannot be proven contiguous below the window — two
+            // in-flight older pages may share the cursor they were asked for —
+            // so the full replacement re-derives the order instead of assuming
+            // it. This is the slow path: it rebuilds every row the window
+            // holds, which is why the proven-contiguous page above is worth
+            // keeping off it.
+            let mut merged = page
+                .items
+                .into_iter()
+                .chain(self.timeline.items.iter().cloned())
+                .collect::<Vec<_>>();
+            merged.sort_by_key(|item| item.sequence);
+            merged.dedup_by_key(|item| item.sequence);
+            self.timeline.replace_authoritative_with_leading_turn_start(
+                session_id.clone(),
+                merged,
+                leading_turn_start,
+            );
+        }
         self.timeline_has_older = page.has_older && added_history;
         self.timeline_starts_mid_turn = !page.starts_at_turn_start;
         self.timeline_item_index.get_mut().invalidate();
@@ -137537,6 +137566,69 @@ mod tests {
         page.session_id = VibexSessionId::parse("session_other").unwrap();
         let error = next_authoritative_timeline_cursor(&session_id, 0, &page).unwrap_err();
         assert_eq!(error, TimelineRestoreError::PageSessionMismatch);
+    }
+
+    #[tokio::test]
+    async fn anchor_recovery_walk_retries_a_failed_page_once() {
+        let session_id = VibexSessionId::parse("session_recovery").unwrap();
+        let page = |start_sequence: i64, end_sequence: i64, has_older: bool| TimelinePage {
+            session_id: session_id.clone(),
+            items: (start_sequence..=end_sequence)
+                .map(|sequence| indexed_timeline_item(&session_id, sequence, "row"))
+                .collect(),
+            start_sequence: Some(start_sequence),
+            end_sequence: Some(end_sequence),
+            has_older,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: None,
+        };
+
+        // The first read of the page below the window fails — a saturated
+        // machine, a busy store — and the walk survives it: the retry lands
+        // the page, so the window still covers the turn the reader holds.
+        let attempts = Rc::new(std::cell::Cell::new(0_usize));
+        let retry_attempts = attempts.clone();
+        let window =
+            extend_timeline_window_back_to(page(40, 60, true), Some(10), move |before_sequence| {
+                let attempts = retry_attempts.clone();
+                async move {
+                    let attempt = attempts.get();
+                    attempts.set(attempt + 1);
+                    if attempt == 0 {
+                        Err(vibex_core::VibexError::storage(
+                            "timeline_page_read_failed",
+                            "the page read failed once",
+                        ))
+                    } else if before_sequence == 40 {
+                        Ok(page(10, 39, false))
+                    } else {
+                        Ok(page(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(window.start_sequence, Some(10));
+
+        // A read that fails twice is still the end of the walk: the window is
+        // left exactly as it arrived, which is the best-effort contract.
+        let attempts = Rc::new(std::cell::Cell::new(0_usize));
+        let failed_attempts = attempts.clone();
+        let window = extend_timeline_window_back_to(page(40, 60, true), Some(10), move |_| {
+            let attempts = failed_attempts.clone();
+            async move {
+                attempts.set(attempts.get() + 1);
+                Err(vibex_core::VibexError::storage(
+                    "timeline_page_read_failed",
+                    "the page read keeps failing",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(window.start_sequence, Some(40));
     }
 
     #[test]

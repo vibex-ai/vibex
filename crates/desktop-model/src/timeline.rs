@@ -74,6 +74,67 @@ impl TimelineModel {
         }
     }
 
+    /// Splices a validated older page in front of the window without
+    /// rebuilding the rows the window already holds.
+    ///
+    /// [`Self::replace_authoritative_with_leading_turn_start`] normalizes the
+    /// whole window through a sequence map, so every older page costs every
+    /// held item a clone and an insert — and the window only grows as the
+    /// reader walks back through the history. A page that provably sits
+    /// contiguously below the window needs none of that: the page is
+    /// normalized on its own, the small end of the merge, and spliced in
+    /// front of the held rows untouched. The tail keeps its meaning, so
+    /// `authoritative_end_sequence` is recomputed but
+    /// `needs_authoritative_refetch` is left alone.
+    ///
+    /// Returns whether the page was spliced in. `false` means contiguity
+    /// cannot be proven — a page for another session, a page that overlaps
+    /// the rows the window already holds, or nothing left after the session
+    /// filter — and the caller must fall back to the full replacement, which
+    /// re-derives the order this method refuses to assume.
+    pub fn prepend_authoritative_page(
+        &mut self,
+        session_id: &VibexSessionId,
+        items: &[TimelineItem],
+        leading_turn_start: Option<TimelineTurnStart>,
+    ) -> bool {
+        if self.session_id.as_ref() != Some(session_id) {
+            return false;
+        }
+        // The page is normalized on its own: the same session filter and the
+        // same last-writer-wins rule a full replacement applies, but over the
+        // page's rows instead of the whole window. The map also sorts, so the
+        // splice below hands the projection ascending rows whatever order the
+        // caller held them in.
+        let mut page = BTreeMap::new();
+        for item in items {
+            if item.session_id == *session_id && item.sequence >= 0 {
+                page.insert(item.sequence, item.clone());
+            }
+        }
+        let Some(page_start) = page.values().next().map(|item| item.sequence) else {
+            return false;
+        };
+        if self
+            .items
+            .first()
+            .is_some_and(|oldest_held| page_start >= oldest_held.sequence)
+        {
+            // The page runs into rows the window already holds — two in-flight
+            // older pages can share the cursor they were asked for, so the
+            // later merge cannot prove it is below what the earlier one left.
+            return false;
+        }
+        let mut spliced: Vec<TimelineItem> = page.into_values().collect();
+        spliced.reserve(self.items.len());
+        spliced.append(&mut self.items);
+        self.items = spliced;
+        self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
+        self.leading_turn_start = leading_turn_start;
+        self.revision = self.revision.wrapping_add(1);
+        true
+    }
+
     pub fn apply_live(&mut self, event: TimelineLiveEvent) -> bool {
         self.apply_live_batch(std::iter::once(event)) > 0
     }
@@ -517,6 +578,108 @@ mod tests {
             model.turns()[0].conclusion_item_id.as_deref(),
             Some("timeline_2")
         );
+    }
+
+    #[test]
+    fn prepend_authoritative_page_splices_a_contiguous_page_without_a_rebuild() {
+        let session = VibexSessionId::parse("session_prepend").unwrap();
+        let payload = |text: &str| {
+            TimelinePayload::AgentMessage(AgentMessagePayload {
+                text: text.into(),
+                is_final: false,
+            })
+        };
+        let mut model = TimelineModel::default();
+        model.replace_authoritative(
+            session.clone(),
+            [
+                item(&session, 40, payload("held")),
+                item(&session, 41, payload("held")),
+            ],
+        );
+        let end_sequence = model.authoritative_end_sequence;
+
+        // A page that sits below the window splices in front of the held rows:
+        // the tail keeps its identity, the window opens where the page opens,
+        // and the projection revision moves so derived caches re-read.
+        let turn_start = TimelineTurnStart {
+            sequence: 39,
+            timestamp_ms: 39,
+        };
+        let revision_before = model.revision;
+        assert!(model.prepend_authoritative_page(
+            &session,
+            &[
+                item(&session, 39, payload("page")),
+                item(&session, 38, payload("page")),
+            ],
+            Some(turn_start),
+        ));
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![38, 39, 40, 41]
+        );
+        assert_eq!(model.authoritative_end_sequence, end_sequence);
+        assert_eq!(model.leading_turn_start, Some(turn_start));
+        assert_eq!(model.revision, revision_before + 1);
+
+        // A page that runs into the rows the window already holds — two
+        // in-flight pages sharing the cursor they asked for — is refused, and
+        // the caller falls back to the full replacement that re-derives order.
+        let revision = model.revision;
+        assert!(!model.prepend_authoritative_page(
+            &session,
+            &[item(&session, 39, payload("overlap"))],
+            None,
+        ));
+        assert_eq!(
+            model
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![38, 39, 40, 41]
+        );
+        assert_eq!(model.revision, revision);
+
+        // A page for another session is refused the same way, as is a page
+        // the session filter empties out.
+        let other = VibexSessionId::parse("session_other").unwrap();
+        assert!(!model.prepend_authoritative_page(
+            &other,
+            &[item(&other, 10, payload("other"))],
+            None,
+        ));
+        assert!(!model.prepend_authoritative_page(
+            &session,
+            &[item(&other, 10, payload("x"))],
+            None
+        ));
+
+        // A window with no rows takes any page: the splice installs it whole.
+        let mut empty = TimelineModel::default();
+        empty.replace_authoritative(session.clone(), []);
+        assert!(empty.prepend_authoritative_page(
+            &session,
+            &[
+                item(&session, 2, payload("first")),
+                item(&session, 1, payload("first"))
+            ],
+            None,
+        ));
+        assert_eq!(
+            empty
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2]
+        );
+        assert_eq!(empty.authoritative_end_sequence, Some(2));
     }
 
     #[test]
