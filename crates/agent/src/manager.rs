@@ -579,7 +579,9 @@ enum ContextBridgeTurnBehavior {
 /// the timeline as a user message (and allowed to seed the session title
 /// while it still carries the default fallback). `apply_provider_session_title`
 /// controls whether provider-pushed session titles may update the session
-/// while the turn runs.
+/// while the turn runs; even then a title that echoes the authority
+/// instructions opening the prompt is refused, because
+/// [`ProviderSessionTitlePolicy`] keeps such a title from naming the row.
 ///
 /// Internal prompts — turn continuations in particular — keep both disabled:
 /// the provider sees the synthetic retry instruction as (typically) the first
@@ -4755,6 +4757,14 @@ impl AgentManager {
             && !prepared_context_bridge
                 .as_ref()
                 .is_some_and(PreparedContextBridge::has_prompt_content);
+        // The authority instructions that open this prompt are the same hazard.
+        // A provider names a session from the prompt it was sent, so the name
+        // it reports can echo those instructions instead of the message the
+        // reader wrote. The policy refuses the echo, and the title seeded from
+        // the message above stays: a session without a provider-supplied name
+        // shows the reader's own words.
+        let session_title_policy =
+            ProviderSessionTitlePolicy::new(apply_provider_session_title, prompt_context);
         let attempt = self
             .run_provider_turn_attempt(
                 &session,
@@ -4768,7 +4778,7 @@ impl AgentManager {
                 Some(required_runtime.clone()),
                 Some(expected_execution_identity.clone()),
                 coalesce_after_sequence,
-                apply_provider_session_title,
+                session_title_policy.clone(),
                 &runner,
             )
             .await;
@@ -4846,7 +4856,7 @@ impl AgentManager {
             .collect::<HashMap<_, _>>();
         for event in turn_result.events {
             if let Some(title) = event.session_title.as_deref() {
-                if apply_provider_session_title {
+                if session_title_policy.accepts(title) {
                     let _ = self.apply_auto_session_title(&session.id, title);
                 }
                 continue;
@@ -5033,7 +5043,7 @@ impl AgentManager {
         required_runtime: Option<SessionRuntimeSelection>,
         expected_execution_identity: Option<ProviderTurnExecutionIdentity>,
         coalesce_after_sequence: i64,
-        apply_provider_session_title: bool,
+        session_title_policy: ProviderSessionTitlePolicy,
         runner: &F,
     ) -> ProviderTurnAttemptOutcome
     where
@@ -5170,7 +5180,7 @@ impl AgentManager {
                     event = event_receiver.recv(), if event_receiver_open => {
                         if let Some(event) = event {
                             if let Some(title) = event.session_title.as_deref() {
-                                if apply_provider_session_title {
+                                if session_title_policy.accepts(title) {
                                     let _ = self.apply_auto_session_title(&session.id, title);
                                 }
                                 continue;
@@ -5220,7 +5230,7 @@ impl AgentManager {
 
         while let Ok(event) = event_receiver.try_recv() {
             if let Some(title) = event.session_title.as_deref() {
-                if apply_provider_session_title {
+                if session_title_policy.accepts(title) {
                     let _ = self.apply_auto_session_title(&session.id, title);
                 }
                 continue;
@@ -8194,6 +8204,70 @@ fn compose_prompt_context(
     (!parts.is_empty()).then(|| parts.join("\n\n"))
 }
 
+/// Per-turn rules for the session title a provider reports.
+///
+/// A provider derives the name it reports from the prompt it was sent, and
+/// [`compose_prompt_context`] opens that prompt with authority instructions the
+/// reader never wrote. The name therefore sometimes comes back as an echo of
+/// those instructions — "Runtime instruction: a short emoji reaction is
+/// welcome …" in a sidebar row — instead of a name for the conversation. The
+/// seed written from the reader's message is the better label, so an echoing
+/// title is dropped: a session without a provider-supplied name shows the
+/// message the reader typed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ProviderSessionTitlePolicy {
+    /// Whether any provider-reported title may update the session at all.
+    apply: bool,
+    /// The authority-composed text that opened the turn's prompt, if any.
+    injected: Option<String>,
+}
+
+impl ProviderSessionTitlePolicy {
+    fn new(apply: bool, injected: Option<String>) -> Self {
+        Self { apply, injected }
+    }
+
+    /// Whether `title` may replace the session's current title.
+    fn accepts(&self, title: &str) -> bool {
+        self.apply
+            && !self
+                .injected
+                .as_deref()
+                .is_some_and(|injected| title_echoes_injected_context(title, injected))
+    }
+}
+
+/// Whether a provider-reported title names the authority instructions that
+/// opened its prompt rather than the reader's message.
+///
+/// Two shapes are covered: a provider that truncates the prompt it was sent
+/// hands back an opening fragment of those instructions, and a provider that
+/// summarizes them can hand back a phrase lifted from anywhere in them. The
+/// floor on the lifted check keeps an ordinary short title — one the reader
+/// would recognize as their own words — from matching by coincidence.
+fn title_echoes_injected_context(title: &str, injected: &str) -> bool {
+    fn fold(value: &str) -> String {
+        value
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ")
+            .trim_end_matches(|character: char| {
+                character.is_ascii_punctuation() || character == '…'
+            })
+            .to_lowercase()
+    }
+    let title = fold(title);
+    let injected = fold(injected);
+    if title.is_empty() {
+        return false;
+    }
+    if injected.starts_with(&title) {
+        return true;
+    }
+    const MIN_LIFTED_CHARS: usize = 16;
+    title.chars().count() >= MIN_LIFTED_CHARS && injected.contains(&title)
+}
+
 /// Builds the credential-free runtime summary shown for one task.
 ///
 /// Nothing here is a secret: the auth source is reported by kind, and a
@@ -8795,6 +8869,54 @@ mod tests {
             Some("team".to_string())
         );
         assert_eq!(compose_prompt_context(None, None, None), None);
+    }
+
+    #[test]
+    fn provider_session_titles_that_echo_authority_context_are_not_names() {
+        let composed = compose_prompt_context(
+            Some(VIBEX_USE_REACTION_PROMPT),
+            Some("This session has delegated work running in child Agent sessions."),
+            Some("requested"),
+        )
+        .unwrap();
+        let policy = ProviderSessionTitlePolicy::new(true, Some(composed.clone()));
+
+        // The shapes a provider reports when it names a session after the
+        // prompt instead of after the message: the opening of the prompt,
+        // truncated or with its own trailing period, and a phrase lifted out
+        // of it by a summarizing provider.
+        for echo in [
+            "Runtime instruction",
+            "Runtime instruction: a short emoji reaction is welcome on most turns.",
+            "Runtime instruction: a short emoji reaction is welcome on most turns. When one would \
+             naturally acknowledge what the user said",
+            "This session has delegated work running in child Agent sessions.",
+            "never let a reaction replace your answer",
+        ] {
+            assert!(
+                !policy.accepts(echo),
+                "an echo of the injected context is not a session name: {echo}"
+            );
+        }
+
+        // The reader's own words, and a provider's summary of them, are what
+        // the title is supposed to show.
+        for name in [
+            "Fix the emoji reaction title",
+            "Session titles should use the user's input",
+            "Agent session",
+        ] {
+            assert!(policy.accepts(name), "a real name must apply: {name}");
+        }
+
+        // Nothing applies when the turn suppresses provider titles outright.
+        let suppressed = ProviderSessionTitlePolicy::new(false, Some(composed));
+        assert!(!suppressed.accepts("Fix the emoji reaction title"));
+        // A turn whose prompt carried no authority context judges names on
+        // their own.
+        assert!(
+            ProviderSessionTitlePolicy::new(true, None).accepts("Fix the emoji reaction title")
+        );
     }
 
     #[test]
@@ -9737,7 +9859,7 @@ mod tests {
                 AgentTurnRequest {
                     mentions: Vec::new(),
                     session_id: session.id.clone(),
-                    required_runtime: Some(selection),
+                    required_runtime: Some(selection.clone()),
                     text: "hello there".to_string(),
                     attachments: Vec::new(),
                     reasoning_effort: None,
@@ -9765,6 +9887,50 @@ mod tests {
             "provider generated title"
         );
         drop(conn);
+
+        // A user-authored prompt opens with the authority instructions, so a
+        // provider that names the session after its prompt hands back those
+        // instructions instead of a name. The echo is dropped and the title
+        // the reader's message seeded stays, which is also what a session
+        // without any provider-supplied name shows.
+        for echo in [
+            VIBEX_USE_REACTION_PROMPT.to_string(),
+            "Do not limit reactions to greetings, confirmations, or thanks".to_string(),
+        ] {
+            *provider.title.lock().unwrap() = echo;
+            manager
+                .run_agent_turn(
+                    AgentTurnRequest {
+                        mentions: Vec::new(),
+                        session_id: session.id.clone(),
+                        required_runtime: Some(selection.clone()),
+                        text: "did the title change".to_string(),
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
+                    },
+                    AgentTurnDisplayPolicy::USER_AUTHORED,
+                    ContextBridgeTurnBehavior::ConsumePending,
+                    None,
+                    |provider, handle, turn_request| async move {
+                        provider.send_turn(handle, turn_request).await
+                    },
+                )
+                .await
+                .unwrap();
+            let conn = manager.open_migrated().unwrap();
+            assert_eq!(
+                SessionRepository::get(&conn, &session.id)
+                    .unwrap()
+                    .unwrap()
+                    .title,
+                "provider generated title"
+            );
+        }
 
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
@@ -11510,7 +11676,7 @@ mod tests {
                     None,
                     Some(identity.clone()),
                     0,
-                    true,
+                    ProviderSessionTitlePolicy::new(true, None),
                     &runner,
                 )
                 .await;
