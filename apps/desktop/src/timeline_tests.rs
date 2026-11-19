@@ -4716,6 +4716,89 @@ fn scrolling_a_long_transcript_moves_by_the_requested_distance(cx: &mut TestAppC
     }
 }
 
+/// A stream below the reader must not move the reader.
+///
+/// The last turn keeps growing while the agent works, and every chunk changes
+/// the row table. A reader who scrolled up to read earlier turns should not see
+/// the transcript move for it: the growth is below the viewport, and the anchor
+/// is the row they are in.
+#[gpui::test]
+fn a_streaming_turn_below_does_not_move_a_reader_who_scrolled_up(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..24_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(30)),
+                is_final: true,
+            }),
+        ));
+    }
+    items.push(live_timeline_item(
+        5000,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "a question that streams".into(),
+            ..Default::default()
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(-600.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let before = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    for chunk in 0..24_u32 {
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap()
+        });
+        apply_live_timeline_item(
+            &workbench,
+            cx,
+            live_timeline_item(
+                sequence + 1,
+                TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                    text_delta: "streamed ".to_string(),
+                    chunk_index: chunk,
+                    phase: None,
+                }),
+            ),
+        );
+        for _ in 0..2 {
+            draw_disclosure_frame(cx);
+        }
+        let after = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+        });
+        assert_eq!(
+            after, before,
+            "chunk {chunk} moved a reader who did not scroll: {before:?} -> {after:?}"
+        );
+    }
+}
+
 /// The tool rows of the last turn, in order, whatever separates them.
 fn tool_row_ids(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Vec<String> {
     workbench.read_with(cx, |workbench, _| {
