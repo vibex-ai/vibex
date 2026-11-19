@@ -448,6 +448,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_terminal_resize: Rc::new(|_, _| {}),
         on_terminal_title: Rc::new(|_| {}),
         on_interrupt,
+        on_switch_runtime: Rc::new(|| {}),
         terminal_choices,
         terminal_menu,
         on_terminal_menu: Rc::new(move || terminal_menu.set(true)),

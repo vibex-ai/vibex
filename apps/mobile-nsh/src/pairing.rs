@@ -70,6 +70,7 @@ pub struct PairingService {
     rename_draft: Signal<String>,
     meta: Rc<RefCell<std::collections::BTreeMap<String, HostMeta>>>,
     meta_path: PathBuf,
+    switcher: Signal<bool>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     connected: Signal<Option<ConnectedRuntime>>,
@@ -119,6 +120,7 @@ impl PairingService {
                     .unwrap_or_default(),
             )),
             meta_path: data_dir.join(META_FILE),
+            switcher: signal(false),
             busy: signal(false),
             error: signal(error),
             connected: signal(None),
@@ -173,6 +175,11 @@ impl PairingService {
                 Rc::new(move |id: &str, name: &str| service.rename_host(id, name))
             },
             rename_draft: self.rename_draft,
+            switcher: self.switcher,
+            on_close_switcher: {
+                let service = self.clone();
+                Rc::new(move || service.close_switcher())
+            },
             on_close_details: {
                 let service = self.clone();
                 Rc::new(move || service.details.set(None))
@@ -410,6 +417,21 @@ impl PairingService {
         self.nearby_waiting.set(false);
         self.nearby_code.set(None);
         self.busy.set(false);
+    }
+
+    /// Whether the pairing page is showing as the runtime switcher.
+    pub fn switcher(&self) -> Signal<bool> {
+        self.switcher
+    }
+
+    /// Opens the switcher over the live session.
+    pub fn open_switcher(&self) {
+        self.switcher.set(true);
+    }
+
+    /// Closes the switcher, back to the session it opened over.
+    pub fn close_switcher(&self) {
+        self.switcher.set(false);
     }
 
     /// The runtime the page is connected to.
@@ -736,6 +758,7 @@ impl PairingService {
             drop(meta);
             self.save_meta();
         }
+        self.switcher.set(false);
         self.connected.set(Some(ConnectedRuntime {
             label: bundle.host_label(),
             bundle,

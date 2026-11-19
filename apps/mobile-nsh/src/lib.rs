@@ -69,11 +69,14 @@ pub fn App() -> impl IntoElement {
     let service = PairingService::new(data);
     host::start(service.clone());
     let connected = service.connected();
+    let switcher = service.switcher();
     let pairing_service = service.clone();
+    let switcher_service = service.clone();
     let shell_service = service;
 
     view()
         .flex_1()
+        .relative()
         .bg(move || nsh_base::theme().background)
         .child(when(
             move || connected.get().is_none(),
@@ -92,13 +95,31 @@ pub fn App() -> impl IntoElement {
                     let service = shell_service.clone();
                     Rc::new(move || service.disconnect())
                 };
-                match SessionService::new(&runtime.bundle, disconnect) {
+                let switch_runtime: Rc<dyn Fn()> = {
+                    let service = shell_service.clone();
+                    Rc::new(move || service.open_switcher())
+                };
+                match SessionService::new(&runtime.bundle, disconnect, switch_runtime) {
                     Ok(sessions) => view()
                         .flex_1()
                         .child(session_screen::session(sessions.host()))
                         .into_element(),
                     Err(error) => disconnected_error(&error).into_element(),
                 }
+            },
+        ))
+        .child(when(
+            move || switcher.get() && connected.get().is_some(),
+            move || {
+                view()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w_full()
+                    .h_full()
+                    .bg(nsh_base::theme().background)
+                    .child(pairing_screen::pairing(switcher_service.host()))
+                    .into_element()
             },
         ))
 }

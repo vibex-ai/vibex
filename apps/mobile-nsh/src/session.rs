@@ -131,6 +131,7 @@ pub struct SessionService {
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
     on_disconnect: Rc<dyn Fn()>,
+    on_switch_runtime: Rc<dyn Fn()>,
 }
 
 impl SessionService {
@@ -138,6 +139,7 @@ impl SessionService {
     pub fn new(
         bundle: &MobileCredentialBundle,
         on_disconnect: Rc<dyn Fn()>,
+        on_switch_runtime: Rc<dyn Fn()>,
     ) -> BackendResult<Self> {
         let backend = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
@@ -215,6 +217,7 @@ impl SessionService {
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             on_disconnect,
+            on_switch_runtime,
         };
         service.refresh();
         service.subscribe();
@@ -381,6 +384,7 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
             },
+            on_switch_runtime: self.on_switch_runtime.clone(),
             on_interrupt: {
                 let service = self.clone();
                 Rc::new(move || service.interrupt_active())

@@ -305,6 +305,8 @@ pub struct SessionHost {
     pub on_new_terminal: Action,
     /// Stops the active session's turn.
     pub on_interrupt: Action,
+    /// Opens the runtime switcher over the live session.
+    pub on_switch_runtime: Action,
     /// The files surface, when it is open over the shell.
     pub files_open: Signal<bool>,
     pub files_path: Signal<String>,
@@ -1579,6 +1581,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
     let on_new_session = host.on_new_session.clone();
+    let on_switch_runtime = host.on_switch_runtime.clone();
     let on_open_terminal = host.on_open_terminal.clone();
     let on_open_files = host.on_open_files.clone();
     let on_open_git = host.on_open_git.clone();
@@ -1701,8 +1704,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 icon(include_str!("../../assets/icons/refresh.svg")),
                                 false,
                                 {
-                                    let on_disconnect = on_disconnect.clone();
-                                    move || on_disconnect()
+                                    let on_switch = on_switch_runtime.clone();
+                                    move || on_switch()
                                 },
                             )
                             .w_full(),

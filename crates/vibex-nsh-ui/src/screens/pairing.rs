@@ -139,6 +139,10 @@ pub struct PairingHost {
     pub on_rename_saved: Rename,
     /// The name field in the details sheet.
     pub rename_draft: Signal<String>,
+    /// The page is the switcher over a live session: no wordmark, a back
+    /// button, and the Switch/Network/Clipboard footer.
+    pub switcher: Signal<bool>,
+    pub on_close_switcher: Action,
     /// The details sheet's state.
     pub details: Signal<Option<HostDetails>>,
     pub on_close_details: Action,
@@ -151,6 +155,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     let manual_open = signal(false);
     let nearby_open = signal(false);
     let settings_open = signal(false);
+    let switcher = host.switcher;
     let draft = signal(String::new());
     let server = signal(String::new());
 
@@ -193,7 +198,13 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         )
         .child(when(move || saved.with(|saved| !saved.is_empty()), {
             let host = host.clone();
-            move || entries_row(host.clone(), manual_open, nearby_open)
+            move || {
+                if switcher.get() {
+                    switcher_footer(host.clone(), manual_open, nearby_open).into_element()
+                } else {
+                    entries_row(host.clone(), manual_open, nearby_open).into_element()
+                }
+            }
         }));
 
     view()
@@ -207,7 +218,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .child(page)
         .child(manual_sheet(host.clone(), manual_open, draft, server))
         .child(nearby_sheet(host.clone(), nearby_open))
-        .child(details_sheet(host))
+        .child(details_sheet(host.clone()))
         .child(
             view()
                 .absolute()
@@ -220,6 +231,62 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                 )),
         )
         .child(settings_sheet(settings_open))
+        .child(when(move || switcher.get(), {
+            let on_close = host.on_close_switcher.clone();
+            move || {
+                let on_close = on_close.clone();
+                view()
+                    .absolute()
+                    .top_0()
+                    .left(px(8.0))
+                    .child(action::icon_button(
+                        icon(include_str!("../../assets/icons/chevron-left.svg")),
+                        copy::text("Back", "返回", "返回"),
+                        move || on_close(),
+                    ))
+            }
+        }))
+}
+
+/// The switcher's footer: back to the session, the network search, or the
+/// clipboard fallback.
+fn switcher_footer(
+    host: PairingHost,
+    manual_open: Signal<bool>,
+    nearby_open: Signal<bool>,
+) -> impl IntoElement {
+    let on_close = host.on_close_switcher.clone();
+    view()
+        .flex_row()
+        .w_full()
+        .gap(px(theme::SPACING_SM))
+        .py(px(theme::SPACING_MD))
+        .child(
+            action::primary(
+                copy::text("Switch", "切换", "切換"),
+                icon(include_str!("../../assets/icons/refresh.svg")),
+                move || on_close(),
+            )
+            .flex_1(),
+        )
+        .child(
+            action::secondary(
+                copy::text("Network", "网络", "網路"),
+                icon(include_str!("../../assets/icons/wifi-outlined.svg")),
+                false,
+                move || nearby_open.set(true),
+            )
+            .flex_1(),
+        )
+        .child(
+            action::secondary(
+                copy::text("Clipboard", "剪贴板", "剪貼簿"),
+                icon(include_str!("../../assets/icons/clipboard-paste.svg")),
+                false,
+                move || manual_open.set(true),
+            )
+            .flex_1(),
+        )
 }
 
 /// The first screen's settings sheet: the facts this build can state today.
@@ -250,6 +317,50 @@ fn settings_sheet(open: Signal<bool>) -> impl IntoElement {
                     copy::text("Appearance", "外观", "外觀"),
                     copy::text("System", "跟随系统", "跟隨系統"),
                 ))
+                .child(
+                    view()
+                        .flex_row()
+                        .gap(px(theme::SPACING_SM))
+                        .child(
+                            action::secondary(
+                                copy::text("System", "系统", "系統"),
+                                icon(include_str!("../../assets/icons/monitor.svg")),
+                                false,
+                                || {
+                                    nsh_core::element::set_color_scheme(
+                                        nsh_core::platform::Appearance::System,
+                                    )
+                                },
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Light", "浅色", "淺色"),
+                                icon(include_str!("../../assets/icons/image.svg")),
+                                false,
+                                || {
+                                    nsh_core::element::set_color_scheme(
+                                        nsh_core::platform::Appearance::Light,
+                                    )
+                                },
+                            )
+                            .flex_1(),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Dark", "深色", "深色"),
+                                icon(include_str!("../../assets/icons/image.svg")),
+                                false,
+                                || {
+                                    nsh_core::element::set_color_scheme(
+                                        nsh_core::platform::Appearance::Dark,
+                                    )
+                                },
+                            )
+                            .flex_1(),
+                        ),
+                )
                 .child(settings_row(
                     copy::text("Version", "版本", "版本"),
                     "Vibex 0.1.8",
