@@ -834,6 +834,19 @@ const SESSION_GROUP_AVATAR_OVERLAP: f32 = 7.0;
 /// so a press can never cover one and not the other.
 const SESSION_GROUP_SPLIT_GUARD_WIDTH: f32 = 9.0;
 const SESSION_GROUP_SPLIT_GUARD_INSET: f32 = 4.0;
+/// How much of the theme's `border` hairline each state of a group pane's
+/// frame paints.
+///
+/// A split stacks hairlines on one seam — every pane's own frame plus the
+/// resize handle's line between them — so the authored `border` weight reads
+/// as a hard divider rather than a card edge. The resting frame therefore
+/// paints a third of it and the seam lands near a single hairline. Focus is
+/// said by the pane's tab, so the focused frame stays just under the authored
+/// hairline; hover is the cue that answers "which pane would take a click"
+/// while the pointer travels, and it steps far past both.
+const SESSION_GROUP_PANE_FRAME_REST_WEIGHT: f32 = 0.35;
+const SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT: f32 = 0.85;
+const SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT: f32 = 2.2;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -55802,22 +55815,31 @@ impl VibexWorkbench {
             .min_h_0()
             .overflow_hidden()
             .bg(cx.theme().background)
-            // The focused pane is marked by its tab, not by a bright frame
-            // around the whole pane. A near-white border on the seam between two
-            // panes read as a second divider — the loudest line on the screen —
-            // while the thing it meant to say was already in the tab. So the
-            // frame stays the ordinary border for every pane, the hovered pane
-            // lifts it slightly, and the focused pane only carries a quiet
-            // emphasis, which is where the tab it belongs to sits.
+            // The frame is a card edge, not a second divider. A split stacks
+            // three hairlines on one seam — this pane's border, its neighbour's
+            // and the resize handle's line — so the resting weight is a third
+            // of the authored `border` and the seam reads as one hairline. The
+            // focused pane is marked by its tab, and its frame only leans back
+            // toward the authored border; hover answers "which pane would take a
+            // click", so it lifts the line far enough above both that aiming
+            // at a pane is answered at a glance. Hover is refined after the
+            // focused style, so a hovered focused pane still shows hover.
             .border_1()
-            .border_color(cx.theme().border)
-            // Hover answers "which pane would take a click", so it lifts the
-            // frame one step. Focus answers "which pane has the keyboard", and it
-            // is said by the tab; the frame only gains a touch more weight than
-            // hover so a hovered pane never outshines the focused one.
-            .hover(|this| this.border_color(cx.theme().foreground.opacity(0.10)))
+            .border_color(session_group_pane_frame(
+                cx.theme().border,
+                SESSION_GROUP_PANE_FRAME_REST_WEIGHT,
+            ))
+            .hover(|this| {
+                this.border_color(session_group_pane_frame(
+                    cx.theme().border,
+                    SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+                ))
+            })
             .when(focused, |this| {
-                this.border_color(cx.theme().foreground.opacity(0.18))
+                this.border_color(session_group_pane_frame(
+                    cx.theme().border,
+                    SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT,
+                ))
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -89382,6 +89404,19 @@ fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &st
         _ => {
             format!("Delete \"{title}\"? This action cannot be undone.")
         }
+    }
+}
+
+/// Paints one state of a group pane's frame off the theme's `border` hairline.
+///
+/// The weight multiplies the token's alpha directly: `Hsla::opacity` clamps its
+/// factor below 1, so a hover weight through it would silently hand back the
+/// resting hairline. Hue and lightness stay the token's, which is what keeps
+/// hover a brightening of the same line rather than a second colour on screen.
+fn session_group_pane_frame(border: Hsla, weight: f32) -> Hsla {
+    Hsla {
+        a: (border.a * weight).min(1.0),
+        ..border
     }
 }
 
@@ -135482,6 +135517,39 @@ mod tests {
             .expect("group pane renderer should remain inspectable");
         assert!(pane.contains("active_session_id.as_deref() == Some(selected.as_str())"));
         assert!(!pane.contains("pane.session_ids\n                .iter()\n                .any"));
+    }
+
+    /// A group pane's frame is a card edge, not a second divider.
+    ///
+    /// A split stacks hairlines on its seam, so the resting frame stays well
+    /// under the authored `border` while hover clears it by a margin the eye
+    /// reads at a glance. Every weight is the same token: the frame brightens,
+    /// it never changes colour.
+    #[test]
+    fn the_group_pane_frame_rests_quiet_and_answers_hover() {
+        let border = gpui::hsla(0.58, 0.24, 0.62, 0.15);
+        let rest = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_REST_WEIGHT);
+        let focused = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_FOCUS_WEIGHT);
+        let hovered = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT);
+
+        // Rest, focus, hover is the order the pointer walks them in, and hover
+        // has to be a highlight rather than a step of a hair.
+        assert!(rest.a < focused.a);
+        assert!(focused.a < hovered.a);
+        assert!(hovered.a >= rest.a * 4.0);
+        assert!((rest.a - border.a * SESSION_GROUP_PANE_FRAME_REST_WEIGHT).abs() < 1e-6);
+        assert!((hovered.a - border.a * SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT).abs() < 1e-6);
+        for frame in [rest, focused, hovered] {
+            assert_eq!((frame.h, frame.s, frame.l), (border.h, border.s, border.l));
+        }
+
+        // A high-contrast border is already near the ceiling, so the weight has
+        // to clamp to a valid alpha instead of asking for more than opaque.
+        let strong = session_group_pane_frame(
+            gpui::hsla(0.0, 0.0, 1.0, 0.9),
+            SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+        );
+        assert_eq!(strong.a, 1.0);
     }
 
     /// A group pane's strip is the preview strip's sibling: the same metrics,
