@@ -9040,13 +9040,8 @@ fn agent_generation_token_rate(
         return None;
     };
     let elapsed_seconds = elapsed.as_secs_f32();
-    // `then`, not `then_some`: the difference is computed in the argument, and
-    // `then_some` evaluates its argument either way. A counter that went
-    // backwards — a re-read, a compacted context, a different source for the
-    // same turn — asks for a smaller-minus-larger subtraction, which the
-    // debug overflow check turns into a process abort.
     (current > previous && elapsed_seconds > 0.0)
-        .then(|| (current - previous) as f32 / elapsed_seconds)
+        .then_some((current - previous) as f32 / elapsed_seconds)
 }
 
 fn timeline_session_state_for_render(
@@ -36749,9 +36744,13 @@ impl VibexWorkbench {
                         }
                     }
                 }
-                let steering = this
-                    .composer_queue_steering_session_ids
-                    .remove(submitted_session_id.as_str());
+                // The steering intent is not this submission's answer. It
+                // belongs to the turn a send-now interrupted, and the settled
+                // queue re-evaluation spends it once that turn is truly over.
+                // Spending it here would hand whatever completion came next the
+                // explicit bypass the gesture armed — past the fence, the send
+                // mode and the busy check — and one send-now click would walk
+                // the whole queue out while a turn still held its session.
                 let interrupted = this
                     .composer_queue_interrupted_session_ids
                     .remove(submitted_session_id.as_str());
@@ -36762,12 +36761,10 @@ impl VibexWorkbench {
                 if !completed || is_command {
                     this.release_composer_queue_fence(message_id);
                 }
-                if completed || steering || interrupted {
+                if completed || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
                         Some(&submitted_session_id),
-                        if steering {
-                            ComposerQueueDispatchBehavior::AfterInterrupt
-                        } else if completed {
+                        if completed {
                             // The submission has durably completed, but the
                             // sidebar session snapshot may still say Running
                             // until its next refresh. The local pending flag
@@ -36996,6 +36993,23 @@ impl VibexWorkbench {
         )
     }
 
+    /// Whether a hand-over into `session_id` still has to wait: a locally armed
+    /// dispatch, or a session state the authority has not reported as settled.
+    ///
+    /// This is the same judgment the dispatch fence makes, and a steering
+    /// hand-over obeys it too. An explicit send may jump the queue's order, but
+    /// it may not jump into a turn that still occupies its session: dispatching
+    /// into the turn it just asked to stop only parks the message behind that
+    /// turn, and the reader's next stop would release it again as a turn of its
+    /// own.
+    fn composer_queue_handover_must_wait(&self, session_id: &VibexSessionId) -> bool {
+        composer_queue_fence_waits(
+            self.session_turn_pending(session_id),
+            self.registered_session(session_id.as_str())
+                .map(|session| session.state),
+        )
+    }
+
     /// Drops the fence of the handed-over message `message_id`.
     ///
     /// Keyed by message rather than by session: a completion may arrive after a
@@ -37018,6 +37032,30 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A send-now that had to interrupt a busy session leaves its hand-over
+        // armed until the interrupted turn is truly over. This wake is where
+        // that evidence arrives — a settle that reached the workbench — so the
+        // intent is spent here, once, with the session's own state proving the
+        // turn has ended. Spending it anywhere else would let an unrelated
+        // completion inherit the explicit bypass the gesture armed.
+        let steering_session_id =
+            self.composer_queue_steering_session_ids
+                .iter()
+                .find_map(|session_id| {
+                    VibexSessionId::parse(session_id.clone())
+                        .ok()
+                        .filter(|parsed| !self.composer_queue_handover_must_wait(parsed))
+                });
+        if let Some(session_id) = steering_session_id {
+            self.composer_queue_steering_session_ids
+                .remove(session_id.as_str());
+            self.maybe_dispatch_next_composer_queue_message(
+                Some(&session_id),
+                ComposerQueueDispatchBehavior::AfterInterrupt,
+                window,
+                cx,
+            );
+        }
         let session_ids =
             std::mem::take(&mut self.composer_queue_ready_after_continuation_session_ids);
         if session_ids.is_empty() {
@@ -41466,8 +41504,17 @@ impl VibexWorkbench {
                     }
                     match &outcome {
                         Ok(Ok(_)) => {
+                            // The interrupt's own open-session snapshot is the
+                            // evidence the turn is really over. While the
+                            // session still holds a turn — locally armed or not
+                            // settled yet — the send-now hand-over waits:
+                            // dispatching into that turn would only park the
+                            // message behind it, and the reader's next stop
+                            // would release it again as a turn of its own. The
+                            // intent stays armed and the settled queue
+                            // re-evaluation spends it.
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer
-                                && !this.session_turn_pending(&interrupted_session_id)
+                                && !this.composer_queue_handover_must_wait(&interrupted_session_id)
                             {
                                 this.composer_queue_steering_session_ids
                                     .remove(interrupted_session_id.as_str());
@@ -41477,6 +41524,8 @@ impl VibexWorkbench {
                                     window,
                                     cx,
                                 );
+                            } else if queue_behavior == ComposerQueueInterruptBehavior::Steer {
+                                this.mark_composer_queue_for_recheck(&interrupted_session_id);
                             }
                         }
                         Ok(Err(error)) => {
@@ -44186,18 +44235,17 @@ impl VibexWorkbench {
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
                         this.refresh_workspace_contexts(cx);
-                        let steering = this
-                            .composer_queue_steering_session_ids
-                            .remove(session_id.as_str());
+                        // The steering intent is not this completion's answer
+                        // either: a send-now's explicit bypass is spent by the
+                        // settled queue re-evaluation, never by whatever
+                        // submission happened to finish next.
                         let interrupted = this
                             .composer_queue_interrupted_session_ids
                             .remove(session_id.as_str());
-                        if initial_message_completed || steering || interrupted {
+                        if initial_message_completed || interrupted {
                             this.maybe_dispatch_next_composer_queue_message(
                                 Some(&session_id),
-                                if steering {
-                                    ComposerQueueDispatchBehavior::AfterInterrupt
-                                } else if initial_message_completed {
+                                if initial_message_completed {
                                     ComposerQueueDispatchBehavior::AfterCompletion
                                 } else {
                                     ComposerQueueDispatchBehavior::Automatic
@@ -124548,9 +124596,12 @@ mod tests {
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("initial_message_completed"));
         assert!(completion.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
-        assert!(completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
-        assert!(completion.contains("composer_queue_steering_session_ids"));
         assert!(completion.contains("composer_queue_interrupted_session_ids"));
+        // A completion is never a steering answer: the explicit bypass a
+        // send-now armed is spent by the settled queue re-evaluation, not by
+        // whatever submission happened to finish next.
+        assert!(!completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+        assert!(!completion.contains("composer_queue_steering_session_ids"));
         // A failed or cancelled initial turn only skips this dispatch. Pausing
         // the queue is reserved for an explicit user interrupt.
         assert!(!completion.contains("composer_queue_paused_session_ids"));
@@ -124613,6 +124664,44 @@ mod tests {
         assert!(paused_guard < dispatch_call);
         assert!(!flush.contains("composer_queue_paused_session_ids.remove"));
         assert!(flush.contains("self.maybe_dispatch_next_composer_queue_message("));
+    }
+
+    #[test]
+    fn a_steer_interrupt_leaves_no_explicit_bypass_for_later_completions() {
+        let source = include_str!("app.rs");
+        let completion = source
+            .split_once("    fn dispatch_admitted_composer_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_composer_queue_turn_status("))
+            .map(|(body, _)| body)
+            .expect("submission completion should remain inspectable");
+        let flush = source
+            .split_once("    fn flush_composer_queue_dispatches_after_continuation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_composer_queue_edit("))
+            .map(|(body, _)| body)
+            .expect("queue re-evaluation should remain inspectable");
+        let interrupt = source
+            .split_once("    fn interrupt_session_with_queue_behavior(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Sends a queued message"))
+            .map(|(body, _)| body)
+            .expect("session interrupt should remain inspectable");
+
+        // A submission completion advances the queue with the behavior the
+        // submission itself implies. The steering intent is not its answer:
+        // spending it there handed whatever finished next the explicit bypass
+        // the send-now gesture armed, and one click walked the whole queue out
+        // while a turn still held its session.
+        assert!(!completion.contains("composer_queue_steering_session_ids"));
+
+        // The intent is spent once, by the settled queue re-evaluation, and
+        // only after the interrupted session has actually settled.
+        assert!(flush.contains("composer_queue_steering_session_ids"));
+        assert!(flush.contains("composer_queue_handover_must_wait"));
+        assert!(flush.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+
+        // The interrupt's own hand-over waits for the same evidence: its fresh
+        // snapshot must not show a turn still occupying the session.
+        assert!(interrupt.contains("composer_queue_handover_must_wait"));
+        assert!(interrupt.contains("mark_composer_queue_for_recheck"));
     }
 
     #[test]
