@@ -1361,7 +1361,13 @@ const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 46.0;
 /// One text line plus the row's own breathing room.
 const COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT: f32 = 26.0;
-const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 16.0;
+/// The one-line bar's corner radius.
+///
+/// It is larger than half the bar's height, so the two ends close into full
+/// semicircles and the bar reads as a pill rather than a rounded rectangle.
+/// The radius morphs from [`COMPOSER_SURFACE_RADIUS`] as the bar settles into
+/// its one-line shape, so the corners round off as the box becomes the bar.
+const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 26.0;
 /// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
 /// a one-line bar reads as a pill, so its padding is tighter.
 const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
@@ -123018,6 +123024,16 @@ mod tests {
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
+        // The one-line bar is a pill: its radius is larger than half its
+        // height, so both ends close into full semicircles.
+        assert_eq!(COMPOSER_SLIM_SURFACE_RADIUS, 26.0);
+        assert_eq!(COMPOSER_SLIM_SURFACE_HEIGHT, 46.0);
+        const {
+            assert!(
+                COMPOSER_SLIM_SURFACE_RADIUS >= COMPOSER_SLIM_SURFACE_HEIGHT / 2.0,
+                "the bar's ends have to close into semicircles"
+            )
+        };
 
         let source = include_str!("app.rs");
         let input_setup = source
