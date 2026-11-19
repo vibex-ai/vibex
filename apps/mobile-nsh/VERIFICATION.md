@@ -21,7 +21,9 @@ anything that needs a runtime or a phone are listed at the bottom.
 
 | Area | Where it lives | Automated coverage | Verified on this machine | Confirm on device |
 | --- | --- | --- | --- | --- |
-| Pairing page, link, nearby, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 4 headless page tests, 14 pairing-crate tests, 2 host parse tests | headless + unit | camera scan, nearby discovery, real claim round-trip |
+| Pairing page, link, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 4 headless page tests, 14 pairing-crate tests | headless + unit | paste, clipboard, real claim round-trip |
+| Scan a QR code | `screens/pairing.rs`, `assets/scanner.html` | scanner opens in the headless page? no — emulator check only | emulator: camera preview and Close | decode a real QR, camera permission on a phone |
+| Find runtimes on the LAN | `apps/mobile-nsh/src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules | emulator: the sheet opens and reports Searching (no runtime on that network) | discovery and approval against a desktop on the same LAN |
 | Session shell and switching | `screens/session.rs`, `apps/mobile-nsh/src/session.rs` | `the_shell_opens_on_the_first_session`, `the_drawer_lists_sessions_and_switching_one_swaps_the_transcript` | headless | long lists, scroll, safe areas |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
 | Composer send | `screens/session.rs` | `the_composer_appends_what_was_sent` | headless | IME composition, multiline, paste |
@@ -43,15 +45,16 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Git commit/history/detail/revert | `screens/git.rs` | `the_git_surface_commits_and_shows_history`, `a_history_row_opens_the_commit_detail`; revert is compile-verified only | headless | commit with hooks/signing, revert confirmation |
 | Theme | `theme.json`, `theme_gen` | 3 theme tests + 2 unit tests | headless | light/dark switching, dynamic color |
 | Host inbound events | `src/host.rs` | 5 unit tests | unit | real scan/discovery JSON from a shell |
-| Host outbound requests | `src/host.rs`, `src/platform/*` | `host_requests_are_taken_once_in_order` | unit | shell polling loop, request codes |
+| Host request queue (legacy) | `src/host.rs`, `src/platform/*` | `host_requests_are_taken_once_in_order` | unit | no longer used by the app; kept for a shell that supplies its own scan/discovery |
 | Device name | `src/host.rs`, platform entry points | `a_platform_device_name_is_kept_when_usable` | unit | name shown in the runtime's paired-device list |
 | Platform embedding | `src/platform/{ios,android}.rs`, README | compile-gated only | **not compiled** (no SDK/NDK/Xcode) | attach/detach, scan result, discovery event |
 | Packaging | `scripts/build-{android,ios}.sh` | `bash -n` | syntax only | `nsh package`, signing, store upload |
 
 ## Device pass, in order
 
-1. **Pair** with a link and with a code; kill and reopen the app (the saved
-   runtime stays); disconnect and pair again.
+1. **Pair** with a link, with a code, by scanning the desktop's QR (Scan),
+   and through Find on the same LAN (approve the six-digit code on the
+   desktop); kill and reopen the app (the saved runtime stays).
 2. **Send** a prompt and watch it stream; scroll up while it streams; press
    Stop mid-turn.
 3. **Attach** a photo and a file, remove one chip, send with and without text.
@@ -71,9 +74,12 @@ anything that needs a runtime or a phone are listed at the bottom.
 ## Environment limits of this checkout
 
 - Android was built here: `nsh` 0.6.0, SDK platform/build-tools 35, NDK 27.2,
-  and a debug-signed universal APK. The x86_64 build installed and showed the
-  pairing page and its Link sheet on an API 35 emulator; the universal APK
-  (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too.
+  and a debug-signed universal APK. On an API 35 emulator the pairing page,
+  the Link sheet, the in-app camera scanner (preview and close) and the Find
+  sheet (browsing started) were exercised; the universal APK
+  (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too. A real QR
+  decode and a desktop approving the zero-config code still need a phone and a
+  desktop on one LAN.
 - iOS still has no Xcode, so the iOS platform crate and `build-ios.sh` remain
   uncompiled and unrun.
 - No reachable runtime: pairing, sending, terminal frames, Git and file writes

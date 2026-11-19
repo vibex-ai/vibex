@@ -5,5 +5,15 @@
   "appearance": "system",
   "rust": ".",
   "root": "App",
-  "theme": "theme.json"
+  "theme": "theme.json",
+  "capabilities": {
+    "webview": {
+      "hosts": [
+        "*"
+      ],
+      "media": [
+        "camera"
+      ]
+    }
+  }
 }

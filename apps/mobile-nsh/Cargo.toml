@@ -18,7 +18,9 @@ vibex-backend = { path = "../../crates/vibex-backend" }
 vibex-core = { path = "../../crates/core" }
 vibex-desktop-model = { path = "../../crates/desktop-model" }
 vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
+vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 base64.workspace = true
+mdns-sd.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 futures-channel.workspace = true

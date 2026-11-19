@@ -18,6 +18,7 @@
 //! camera and local-network discovery are platform seams the host fills in
 //! next.
 
+mod discovery;
 mod host;
 mod pairing;
 mod platform;

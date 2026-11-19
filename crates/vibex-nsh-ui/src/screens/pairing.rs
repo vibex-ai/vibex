@@ -16,7 +16,10 @@
 use std::rc::Rc;
 
 use nsh_base::{ButtonElement, SheetEvent, button, sheet};
-use nsh_core::{element::ImageSrc, prelude::*};
+use nsh_core::{
+    element::{ImageSrc, web_view_html},
+    prelude::*,
+};
 
 use crate::{
     copy, theme,
@@ -91,12 +94,21 @@ pub struct PairingHost {
     pub saved: Signal<Vec<SavedRuntime>>,
     /// The runtimes nearby discovery has found so far.
     pub nearby: Signal<Vec<NearbyRuntime>>,
+    /// A nearby session waits for the desktop's approval.
+    pub nearby_waiting: Signal<bool>,
+    /// The code the desktop shows while it waits.
+    pub nearby_code: Signal<Option<SharedString>>,
+    pub on_cancel_nearby: Action,
+    /// The nearby sheet closed: stop browsing.
+    pub on_stop_nearby: Action,
     /// A pairing action is in flight (the buttons rest and say so).
     pub busy: Signal<bool>,
     /// What the last action failed with, shown under the entries.
     pub error: Signal<Option<SharedString>>,
     /// Open the camera to scan the desktop's QR code.
     pub on_scan: Action,
+    /// A pairing link the scanner decoded.
+    pub on_scanned: Rc<dyn Fn(&str)>,
     /// Claim the typed or pasted entry; the second argument is the server
     /// address a bare code needs.
     pub on_connect: Connect,
@@ -112,6 +124,15 @@ pub struct PairingHost {
 
 /// The pairing page.
 pub fn pairing(host: PairingHost) -> impl IntoElement {
+    let scanning = signal(false);
+    let start_scan = host.on_scan.clone();
+    let host = PairingHost {
+        on_scan: Rc::new(move || {
+            start_scan();
+            scanning.set(true);
+        }),
+        ..host.clone()
+    };
     let manual_open = signal(false);
     let nearby_open = signal(false);
     let draft = signal(String::new());
@@ -167,7 +188,64 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .pb_safe_area_plus(px(theme::SPACING_LG))
         .child(page)
         .child(manual_sheet(host.clone(), manual_open, draft, server))
-        .child(nearby_sheet(host, nearby_open))
+        .child(nearby_sheet(host.clone(), nearby_open))
+        .child(when(
+            move || scanning.get(),
+            move || scanner(host.clone(), scanning),
+        ))
+}
+
+/// The camera scanner, over the page. It closes on the header's X.
+fn scanner(host: PairingHost, scanning: Signal<bool>) -> impl IntoElement {
+    let on_scanned = host.on_scanned.clone();
+    let error = host.error;
+    view()
+        .absolute()
+        .top_0()
+        .left_0()
+        .w_full()
+        .h_full()
+        .bg(theme::background)
+        .flex_col()
+        .child(
+            view()
+                .w_full()
+                .pt_safe_area()
+                .border_b_1()
+                .border_b_color(theme::border_subtle)
+                .child(
+                    view()
+                        .w_full()
+                        .h(px(48.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .px(px(theme::SPACING_SM))
+                        .child(
+                            text(copy::text("Scan a QR code", "扫描二维码", "掃描 QR Code"))
+                                .flex_1()
+                                .text_size(px(theme::FONT_HEADING))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::foreground),
+                        )
+                        .child(action::icon_button(
+                            icon(include_str!("../../assets/icons/x.svg")),
+                            copy::text("Close", "关闭", "關閉"),
+                            move || scanning.set(false),
+                        )),
+                ),
+        )
+        .child(
+            web_view_html(include_str!("../../assets/scanner.html"), None)
+                .on_message(move |message: &str| {
+                    scanning.set(false);
+                    match message.strip_prefix("error:") {
+                        Some(message) => error.set(Some(message.trim().to_owned().into())),
+                        None => on_scanned(message),
+                    }
+                })
+                .flex_1(),
+        )
 }
 
 /// The last action's failure, worded for the person holding the phone.
@@ -420,14 +498,21 @@ fn manual_sheet(
 /// The nearby discovery sheet.
 fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
     let nearby = host.nearby;
+    let waiting = host.nearby_waiting;
+    let code = host.nearby_code;
     let on_find = host.on_find.clone();
     let on_pick = host.on_pick_nearby.clone();
+    let on_cancel = host.on_cancel_nearby.clone();
+    let on_stop = host.on_stop_nearby.clone();
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
                 open.set(*next);
+                if !next {
+                    on_stop();
+                }
             }
         })
         .on_open(move || on_find())
@@ -446,7 +531,41 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                         .text_color(theme::foreground),
                 )
                 .child(when(
-                    move || nearby.with(|nearby| nearby.is_empty()),
+                    move || waiting.get(),
+                    move || {
+                        view()
+                            .w_full()
+                            .gap(px(theme::SPACING_SM))
+                            .items_center()
+                            .child(
+                                text(copy::text(
+                                    "Confirm this code on your computer",
+                                    "请在电脑上确认这组代码",
+                                    "請在電腦上確認這組代碼",
+                                ))
+                                .text_size(px(theme::FONT_CAPTION))
+                                .text_color(theme::text_muted),
+                            )
+                            .child(
+                                text(move || code.get().unwrap_or_default())
+                                    .text_size(px(32.0))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::foreground),
+                            )
+                            .child({
+                                let on_cancel = on_cancel.clone();
+                                action::secondary(
+                                    copy::text("Cancel", "取消", "取消"),
+                                    icon(include_str!("../../assets/icons/x.svg")),
+                                    false,
+                                    move || on_cancel(),
+                                )
+                                .w_full()
+                            })
+                    },
+                ))
+                .child(when(
+                    move || !waiting.get() && nearby.with(|nearby| nearby.is_empty()),
                     || {
                         view().h(px(56.0)).items_center().justify_center().child(
                             text(copy::text("Searching...", "正在搜索…", "正在搜尋…"))
@@ -455,9 +574,14 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                         )
                     },
                 ))
-                .child(each(move || nearby.get(), |runtime| runtime.key.clone(), {
+                .child(when(move || !waiting.get(), {
                     let on_pick = on_pick.clone();
-                    move |runtime, _| nearby_row(runtime, on_pick.clone(), open)
+                    move || {
+                        each(move || nearby.get(), |runtime| runtime.key.clone(), {
+                            let on_pick = on_pick.clone();
+                            move |runtime, _| nearby_row(runtime, on_pick.clone(), open)
+                        })
+                    }
                 })),
         )
 }

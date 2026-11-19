@@ -78,6 +78,10 @@ pub fn device_name() -> Option<String> {
 
 /// Something the app asks the platform host to do.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[allow(
+    dead_code,
+    reason = "an embedding host may still poll this queue; the standalone app scans and discovers in Rust"
+)]
 pub enum HostRequest {
     /// Open the camera and scan a pairing link.
     Scan,
@@ -108,6 +112,10 @@ fn requests() -> &'static Mutex<VecDeque<HostRequest>> {
 }
 
 /// Asks the shell for the camera.
+#[allow(
+    dead_code,
+    reason = "an embedding host may still poll this queue; the standalone app scans in Rust"
+)]
 pub fn request_scan() {
     requests()
         .lock()
@@ -116,6 +124,10 @@ pub fn request_scan() {
 }
 
 /// Asks the shell to start or stop local-network discovery.
+#[allow(
+    dead_code,
+    reason = "an embedding host may still poll this queue; the standalone app discovers in Rust"
+)]
 pub fn request_discovery(start: bool) {
     requests()
         .lock()

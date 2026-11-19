@@ -50,9 +50,16 @@ The page is backed by a real pairing service:
   each runtime's reachability;
 - paste reads the system clipboard through `nsh`.
 
-The camera and local-network discovery are still host seams: they say so on
-the page instead of pretending to work. The host integration fills them in
-with the scanner activity and the discovery bridge.
+Scan and Find work in the app itself, without a Kotlin or Swift host:
+
+- **Scan** opens an in-app scanner: `nsh`'s web view shows the camera (declared
+  through `capabilities.webview.media` in `nsh.json`) and jsQR decodes every
+  frame; a decoded link goes back to the page with `window.nsh.postMessage`
+  and is claimed like a pasted one.
+- **Find** browses `_vibex._tcp.local.` in Rust with `mdns-sd`, validates the
+  zero-config TXT record, lists the runtimes it resolves, and starts a
+  `ZeroConfigLanPairingSession` on tap. The desktop must approve the six-digit
+  code the sheet shows before the credential is stored.
 
 ### The session shell
 
@@ -256,19 +263,10 @@ default: break
 }
 ```
 
-The camera and the network browser stay in the host. Their observations come
-back through the two event calls; discovery uses this JSON contract:
-
-```json
-{"kind":"candidate","key":"desktop-1","name":"Studio"}
-{"kind":"removed","key":"desktop-1"}
-{"kind":"permission_denied"}
-{"kind":"failed","message":"…"}
-```
-
-The shells' camera and discovery implementations are theirs to write against
-the request queue and event contract above; the device name is reported
-through `nativeSetDeviceName` / `vibex_mobile_nsh_set_device_name`.
+Scanning and discovery live in the app (see "What is there today"), so an
+embedding host only mounts the app and reports the platform's device name. The
+`nativeScanResult` / `nativeDiscoveryEvent` entry points remain for a shell that
+wants to supply its own scanner or browser; the app does not require them.
 
 ## Theme
 

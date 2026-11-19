@@ -11179,6 +11179,7 @@ dependencies = [
  "futures-channel",
  "futures-util",
  "jni 0.22.4",
+ "mdns-sd",
  "nsh-base",
  "nsh-core",
  "nsh-engine",
@@ -11195,6 +11196,7 @@ dependencies = [
  "vibex-desktop-model",
  "vibex-mobile-pairing",
  "vibex-nsh-ui",
+ "vibex-remote-client",
 ]
 
 [[package]]
