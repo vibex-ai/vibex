@@ -9685,22 +9685,6 @@ fn reorder_composer_queue_message(
     true
 }
 
-fn promote_composer_queue_message(
-    queue: &mut Vec<ComposerQueueMessage>,
-    message_id: u64,
-) -> Option<VibexSessionId> {
-    let source_index = queue.iter().position(|message| message.id == message_id)?;
-    let mut message = queue.remove(source_index);
-    // Promoting a message is the explicit send-now action. The queue is one
-    // ordered list, so the message the reader sent now becomes its head instead
-    // of the first row of its own session: an explicit send is the one thing
-    // that is allowed to jump the order, and it has to jump all of it.
-    message.scheduled_at_ms = None;
-    let session_id = message.session_id.clone();
-    queue.insert(0, message);
-    Some(session_id)
-}
-
 fn composer_queue_auto_send_enabled(
     manual_session_ids: &BTreeSet<String>,
     session_id: &VibexSessionId,
@@ -12194,7 +12178,7 @@ pub struct VibexWorkbench {
     composer_queue_paused_session_ids: BTreeSet<String>,
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
-    composer_queue_steering_session_ids: BTreeSet<String>,
+    composer_queue_steering_dispatches: BTreeMap<String, u64>,
     /// One fence per session whose handed-over message the queue is still
     /// waiting on. See [`ComposerQueueDispatchFence`].
     ///
@@ -13853,7 +13837,7 @@ impl VibexWorkbench {
             composer_queue_paused_session_ids: BTreeSet::new(),
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
-            composer_queue_steering_session_ids: BTreeSet::new(),
+            composer_queue_steering_dispatches: BTreeMap::new(),
             composer_queue_dispatch_fences: BTreeMap::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
@@ -22516,8 +22500,8 @@ impl VibexWorkbench {
             .retain(|id| valid_session_ids.contains(id));
         self.composer_queue_interrupted_session_ids
             .retain(|id| valid_session_ids.contains(id));
-        self.composer_queue_steering_session_ids
-            .retain(|id| valid_session_ids.contains(id));
+        self.composer_queue_steering_dispatches
+            .retain(|id, _| valid_session_ids.contains(id));
         if self.composer_queue_editing_id.is_some_and(|editing_id| {
             !self
                 .composer_queue
@@ -37074,8 +37058,33 @@ impl VibexWorkbench {
         {
             return false;
         }
+        let message_id = self.composer_queue[index].id;
+        self.dispatch_explicit_queue_message(message_id, behavior, window, cx)
+    }
+
+    /// Removes `message_id` from the queue — wherever it sits — and hands it to
+    /// the submission path as the admission the caller already decided.
+    ///
+    /// The rest of the queue keeps its exact order: the entries a send jumped
+    /// stay where they were, waiting for the queue's own rhythm. This is what
+    /// makes an explicit send about one message — the head a re-evaluation
+    /// admitted, or a row the reader sent now — rather than a reorder of
+    /// everything in front of it.
+    fn dispatch_explicit_queue_message(
+        &mut self,
+        message_id: u64,
+        behavior: ComposerQueueDispatchBehavior,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self
+            .composer_queue
+            .iter()
+            .position(|queued| queued.id == message_id)
+        else {
+            return false;
+        };
         let message = self.composer_queue.remove(index);
-        let message_id = message.id;
         self.composer_queue_dispatch_fences.insert(
             message.session_id.as_str().to_string(),
             ComposerQueueDispatchFence {
@@ -37087,19 +37096,18 @@ impl VibexWorkbench {
         self.publish_sidebar_invalidation();
         self.dispatch_admitted_composer_message(message, behavior, window, cx);
         // The one hand-over the submission path still refuses — a local runtime
-        // that is not ready — puts the message back and pauses its session. The
-        // queue must not report that as a dispatch: its caller drops the
-        // session's re-evaluation on a `true`, and the message would then wait
-        // for an event that no longer comes.
+        // that is not ready — puts the message back where it was and pauses its
+        // session. The queue must not report that as a dispatch: its caller
+        // drops the session's re-evaluation on a `true`, and the message would
+        // then wait for an event that no longer comes.
         let bounced = self
             .composer_queue
             .iter()
             .position(|queued| queued.id == message_id);
         if let Some(bounced) = bounced {
-            if bounced > 0 {
-                let message = self.composer_queue.remove(bounced);
-                self.composer_queue.insert(0, message);
-            }
+            let message = self.composer_queue.remove(bounced);
+            self.composer_queue
+                .insert(index.min(self.composer_queue.len()), message);
             self.release_composer_queue_fence(message_id);
         }
         // The send left the queue, so its name no longer stands and the
@@ -37180,21 +37188,24 @@ impl VibexWorkbench {
         // armed until the interrupted turn is truly over. This wake is where
         // that evidence arrives — a settle that reached the workbench — so the
         // intent is spent here, once, with the session's own state proving the
-        // turn has ended. Spending it anywhere else would let an unrelated
-        // completion inherit the explicit bypass the gesture armed.
-        let steering_session_id =
-            self.composer_queue_steering_session_ids
+        // turn has ended, and with the message the reader actually sent. The
+        // rest of the queue keeps its order and its hold: spending the intent
+        // anywhere else would let an unrelated completion inherit the explicit
+        // bypass the gesture armed.
+        let steering_target =
+            self.composer_queue_steering_dispatches
                 .iter()
-                .find_map(|session_id| {
+                .find_map(|(session_id, message_id)| {
                     VibexSessionId::parse(session_id.clone())
                         .ok()
                         .filter(|parsed| !self.composer_queue_handover_must_wait(parsed))
+                        .map(|parsed| (parsed, *message_id))
                 });
-        if let Some(session_id) = steering_session_id {
-            self.composer_queue_steering_session_ids
+        if let Some((session_id, message_id)) = steering_target {
+            self.composer_queue_steering_dispatches
                 .remove(session_id.as_str());
-            self.maybe_dispatch_next_composer_queue_message(
-                Some(&session_id),
+            self.dispatch_explicit_queue_message(
+                message_id,
                 ComposerQueueDispatchBehavior::AfterInterrupt,
                 window,
                 cx,
@@ -37639,13 +37650,6 @@ impl VibexWorkbench {
         }
     }
 
-    fn move_composer_queue_message_to_front(&mut self, message_id: u64) -> Option<VibexSessionId> {
-        let session_id = promote_composer_queue_message(&mut self.composer_queue, message_id);
-        self.publish_sidebar_invalidation();
-        self.composer_queue_changed();
-        session_id
-    }
-
     fn resume_composer_queue(
         &mut self,
         session_id: VibexSessionId,
@@ -37663,20 +37667,47 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Sends one queued message now, wherever it sits in the queue.
+    ///
+    /// Only this message leaves. The entries in front of it keep their order
+    /// and keep waiting — a queued row is the reader's instruction about what
+    /// to send next, so an explicit send of one entry must not release the
+    /// entries it jumped, reorder the queue around it, or lift the hold the
+    /// rest of it waits under.
     fn steer_composer_queue_message(
         &mut self,
         message_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.move_composer_queue_message_to_front(message_id) else {
+        let Some(session_id) = self
+            .composer_queue
+            .iter()
+            .find(|message| message.id == message_id)
+            .map(|message| message.session_id.clone())
+        else {
             return;
         };
-        self.composer_queue_paused_session_ids
-            .remove(session_id.as_str());
+        // An explicit per-message send clears the deadline: the reader asked
+        // for this message now, and the entry must not re-arm its old moment —
+        // whether the send lands here or after the busy turn it interrupts
+        // settles.
+        if let Some(message) = self
+            .composer_queue
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.scheduled_at_ms = None;
+        }
         if self.agent_session_is_active(&session_id) {
             if !self.agent_action_pending && self.selected_session_id.as_ref() == Some(&session_id)
             {
+                // The turn in the way has to stop first. The intent remembers
+                // WHICH message the reader sent, so the settled queue
+                // re-evaluation dispatches that one — not whatever sits at the
+                // head by then.
+                self.composer_queue_steering_dispatches
+                    .insert(session_id.as_str().to_string(), message_id);
                 self.interrupt_session_with_queue_behavior(
                     ComposerQueueInterruptBehavior::Steer,
                     window,
@@ -37684,8 +37715,8 @@ impl VibexWorkbench {
                 );
             }
         } else {
-            self.maybe_dispatch_next_composer_queue_message(
-                Some(&session_id),
+            self.dispatch_explicit_queue_message(
+                message_id,
                 ComposerQueueDispatchBehavior::ForceNext,
                 window,
                 cx,
@@ -37747,7 +37778,7 @@ impl VibexWorkbench {
             .remove(session_id.as_str());
         self.composer_queue_interrupted_session_ids
             .remove(session_id.as_str());
-        self.composer_queue_steering_session_ids
+        self.composer_queue_steering_dispatches
             .remove(session_id.as_str());
         cx.notify();
     }
@@ -41589,10 +41620,10 @@ impl VibexWorkbench {
                 }
             }
             ComposerQueueInterruptBehavior::Steer => {
-                self.composer_queue_paused_session_ids
-                    .remove(session_id.as_str());
-                self.composer_queue_steering_session_ids
-                    .insert(session_id.as_str().to_string());
+                // The send-now gesture armed the steering intent itself, and
+                // the hold the rest of the queue waits under stays untouched:
+                // an explicit send is about one message, not about releasing
+                // the entries it jumped.
             }
             ComposerQueueInterruptBehavior::Pause => {}
         }
@@ -41660,14 +41691,17 @@ impl VibexWorkbench {
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer
                                 && !this.composer_queue_handover_must_wait(&interrupted_session_id)
                             {
-                                this.composer_queue_steering_session_ids
-                                    .remove(interrupted_session_id.as_str());
-                                this.maybe_dispatch_next_composer_queue_message(
-                                    Some(&interrupted_session_id),
-                                    ComposerQueueDispatchBehavior::AfterInterrupt,
-                                    window,
-                                    cx,
-                                );
+                                if let Some(message_id) = this
+                                    .composer_queue_steering_dispatches
+                                    .remove(interrupted_session_id.as_str())
+                                {
+                                    this.dispatch_explicit_queue_message(
+                                        message_id,
+                                        ComposerQueueDispatchBehavior::AfterInterrupt,
+                                        window,
+                                        cx,
+                                    );
+                                }
                             } else if queue_behavior == ComposerQueueInterruptBehavior::Steer {
                                 this.mark_composer_queue_for_recheck(&interrupted_session_id);
                             }
@@ -41679,10 +41713,10 @@ impl VibexWorkbench {
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
-                                this.composer_queue_steering_session_ids
+                                // The send never happened: drop the intent and
+                                // leave the queue's own hold as it was.
+                                this.composer_queue_steering_dispatches
                                     .remove(interrupted_session_id.as_str());
-                                this.composer_queue_paused_session_ids
-                                    .insert(interrupted_session_id.as_str().to_string());
                             }
                         }
                         Err(error) => {
@@ -41692,10 +41726,8 @@ impl VibexWorkbench {
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
-                                this.composer_queue_steering_session_ids
+                                this.composer_queue_steering_dispatches
                                     .remove(interrupted_session_id.as_str());
-                                this.composer_queue_paused_session_ids
-                                    .insert(interrupted_session_id.as_str().to_string());
                             }
                         }
                     }
@@ -41714,13 +41746,6 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.move_composer_queue_message_to_front(message_id) else {
-            return;
-        };
-        let Some(backend) = self.backend.clone() else {
-            self.steer_composer_queue_message(message_id, window, cx);
-            return;
-        };
         let Some(message) = self
             .composer_queue
             .iter()
@@ -41729,12 +41754,18 @@ impl VibexWorkbench {
         else {
             return;
         };
+        let session_id = message.session_id.clone();
+        let Some(backend) = self.backend.clone() else {
+            self.steer_composer_queue_message(message_id, window, cx);
+            return;
+        };
         if !message.mentions.is_empty() || !self.agent_session_is_active(&session_id) {
             self.steer_composer_queue_message(message_id, window, cx);
             return;
         }
-        self.composer_queue_paused_session_ids
-            .remove(session_id.as_str());
+        // Steering one message into the running turn says nothing about the
+        // queue's own hold: the pause the reader installed keeps holding the
+        // entries behind this one.
         let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
             mentions: message.mentions.clone(),
@@ -65168,10 +65199,6 @@ impl VibexWorkbench {
         // Traced after the moves above, so the frame that moved the transcript
         // is the frame the trace names.
         self.trace_timeline_scroll();
-        // Keep the reader's place current for whatever lands later — a page
-        // above the window, a replacement, a switch — so it restores where they
-        // are now and not where they were when the read began.
-        self.capture_timeline_scroll_anchor();
         self.install_timeline_scroll_handler();
         self.prefetch_older_timeline_if_needed(cx);
         self.request_expanded_timeline_details(cx);
@@ -124764,7 +124791,7 @@ mod tests {
         // send-now armed is spent by the settled queue re-evaluation, not by
         // whatever submission happened to finish next.
         assert!(!completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
-        assert!(!completion.contains("composer_queue_steering_session_ids"));
+        assert!(!completion.contains("composer_queue_steering_dispatches"));
         // A failed or cancelled initial turn only skips this dispatch. Pausing
         // the queue is reserved for an explicit user interrupt.
         assert!(!completion.contains("composer_queue_paused_session_ids"));
@@ -124853,18 +124880,53 @@ mod tests {
         // spending it there handed whatever finished next the explicit bypass
         // the send-now gesture armed, and one click walked the whole queue out
         // while a turn still held its session.
+        assert!(!completion.contains("composer_queue_steering_dispatches"));
         assert!(!completion.contains("composer_queue_steering_session_ids"));
 
         // The intent is spent once, by the settled queue re-evaluation, and
-        // only after the interrupted session has actually settled.
-        assert!(flush.contains("composer_queue_steering_session_ids"));
+        // only after the interrupted session has actually settled — and it is
+        // spent on the message the reader sent, not on whatever rose to the
+        // head by then.
+        assert!(flush.contains("composer_queue_steering_dispatches"));
         assert!(flush.contains("composer_queue_handover_must_wait"));
+        assert!(flush.contains("dispatch_explicit_queue_message"));
         assert!(flush.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
 
         // The interrupt's own hand-over waits for the same evidence: its fresh
         // snapshot must not show a turn still occupying the session.
         assert!(interrupt.contains("composer_queue_handover_must_wait"));
         assert!(interrupt.contains("mark_composer_queue_for_recheck"));
+    }
+
+    #[test]
+    fn a_send_now_dispatches_only_the_message_the_reader_sent() {
+        let source = include_str!("app.rs");
+        let steer = source
+            .split_once("    fn steer_composer_queue_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_composer_queue_send_mode("))
+            .map(|(body, _)| body)
+            .expect("send-now gesture should remain inspectable");
+        let explicit = source
+            .split_once("    fn dispatch_explicit_queue_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether the pre-send queue is still"))
+            .map(|(body, _)| body)
+            .expect("explicit dispatch should remain inspectable");
+
+        // The gesture no longer promotes the clicked message to the head: a
+        // send of one middle row released every entry in front of it — the
+        // queue lost its order, and the jumped-over messages went out with the
+        // click instead of waiting their turn.
+        assert!(!steer.contains("move_composer_queue_message_to_front"));
+        assert!(!steer.contains("promote_composer_queue_message"));
+        // The anchor carries a newline so these asserts cannot match their own
+        // text in this source.
+        assert!(!source.contains("fn promote_composer_queue_message(\n"));
+        assert!(!source.contains("fn move_composer_queue_message_to_front(\n"));
+
+        // The clicked message is lifted out at its own position; everything
+        // around it stays exactly where it was.
+        assert!(explicit.contains(".position(|queued| queued.id == message_id)"));
+        assert!(steer.contains("dispatch_explicit_queue_message"));
     }
 
     #[test]
@@ -125370,7 +125432,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_queue_reorders_only_within_a_session_and_steer_promotes_the_message() {
+    fn composer_queue_reorders_only_within_a_session() {
         let selection = SessionRuntimeSelection::provider(
             AgentId::parse("agent-queue").unwrap(),
             ProviderProfileId::parse("provider_queue").unwrap(),
@@ -125404,19 +125466,16 @@ mod tests {
             [3, 1, 2]
         );
         assert!(!reorder_composer_queue_message(&mut queue, 1, 4, true));
-        assert_eq!(
-            promote_composer_queue_message(&mut queue, 2)
-                .expect("queued message should be promoted")
-                .as_str(),
-            "session_queue_a"
-        );
+        // Reordering keeps the messages of other sessions where they are; it
+        // never promotes one entry past them. A send-now is not a reorder: it
+        // lifts one message out of the queue and leaves this order standing.
         assert_eq!(
             queue
                 .iter()
                 .filter(|message| message.session_id.as_str() == "session_queue_a")
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
-            [2, 3, 1]
+            [3, 1, 2]
         );
     }
 
@@ -125481,7 +125540,11 @@ mod tests {
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Pause"));
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Steer"));
         assert!(interrupt.contains("turn_was_locally_pending"));
-        assert!(interrupt.contains("composer_queue_steering_session_ids"));
+        // The steering arm no longer lifts the hold the rest of the queue
+        // waits under, and its hand-over spends the intent the gesture armed.
+        assert!(!interrupt.contains("composer_queue_paused_session_ids\n            .remove"));
+        assert!(interrupt.contains("composer_queue_steering_dispatches"));
+        assert!(interrupt.contains("dispatch_explicit_queue_message"));
         assert!(interrupt.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
     }
 

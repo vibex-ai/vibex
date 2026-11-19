@@ -1197,21 +1197,26 @@ session's own state whether the turn still holds the queue.
   a superseded revision, or whose settled revision is still unjudged; the
   next-frame re-evaluation probes the revision the list actually shows.
 - Explicit sends are the one gesture allowed to overtake the queue: the row's
-  send-now/steer action promotes the message to the head and its behavior may
-  leave the fence behind. A head that carries a deadline is always dispatched as
-  `Scheduled`, so a schedule can never inherit that bypass and always waits for
-  the entries in front of it.
+  send-now/steer action dispatches that one message wherever it sits, and its
+  behavior may leave the fence behind. It is not a reorder — the entries in
+  front of the sent message keep their order and keep whatever hold they wait
+  under (pause, fence, send mode), because a send of one middle row that
+  promoted the message to the head released every entry it jumped with the
+  click. A head that carries a deadline is always dispatched as `Scheduled`, so
+  a schedule can never inherit that bypass and always waits for the entries in
+  front of it.
 - The explicit bypass is scoped to the gesture that armed it, and to the turn it
   interrupted. A send-now that has to interrupt a busy session arms a steering
-  intent for that session; that intent is spent exactly once, by the queue's
-  settled re-evaluation, and only once the session's own state proves the
-  interrupted turn is over — no locally armed dispatch and no `Running` /
-  `NeedsInput` / `Initializing` snapshot. A submission completion must never
-  spend it: the interrupted turn unwinding, the promoted message's own turn
-  ending, and any later send all complete the same future, and a completion that
-  inherits the explicit bypass walks the rest of the queue out past the fence
-  and the send mode while a turn still holds the session. The runtime parks
-  those messages behind its live turn, the queue panel empties, and the
+  intent that remembers WHICH message the reader sent; that intent is spent
+  exactly once, by the queue's settled re-evaluation, dispatching that message —
+  not whatever rose to the head by then — and only once the session's own state
+  proves the interrupted turn is over (no locally armed dispatch and no
+  `Running` / `NeedsInput` / `Initializing` snapshot). A submission completion
+  must never spend it: the interrupted turn unwinding, the sent message's own
+  turn ending, and any later send all complete the same future, and a completion
+  that inherits the explicit bypass walks the rest of the queue out past the
+  fence and the send mode while a turn still holds the session. The runtime
+  parks those messages behind its live turn, the queue panel empties, and the
   reader's next stop releases them as turns of their own.
 - Reordering preserves deadlines; an explicit per-message send clears the
   deadline. Reordering re-evaluates the head, so a message the reader moved in
