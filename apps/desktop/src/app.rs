@@ -8422,21 +8422,28 @@ fn transcript_scroll_notifies(cx: &App) -> u64 {
 /// distance. At the bottom edge the two cancel to zero.
 /// A single height to seed an unmeasured row with.
 ///
-/// `ListState` gives every row it has not measured the same hint, so the best
-/// available answer is the median of the rows the table does know: it is the
-/// height an unmeasured turn is most likely to land near, and unlike a mean it
-/// is not dragged off by one very long turn.
+/// `ListState` gives every row it has not measured the same hint, so the
+/// document it reports is `rows * hint`, and the seed's job is to make that
+/// product match the row table. That makes the *mean* the right number: it is
+/// the one value whose product with the row count is the table's own total.
+///
+/// The median reads as the more typical row, but a document seeded with it is
+/// shorter than the real one as soon as long and short rows are mixed — and a
+/// transcript is nothing but mixed. Every reseed (a new turn, a width change, a
+/// lost hint) then resolves the reader's place against that shorter document,
+/// which is why a turn arriving while the reader is on the live edge threw the
+/// viewport hundreds of pixels up the conversation: nineteen rows seeded at
+/// their median left the bottom that far short of where it really is.
 fn timeline_row_height_hint(rows: &[Size<Pixels>]) -> Option<Pixels> {
-    let mut heights = rows
-        .iter()
-        .map(|row| row.height)
-        .filter(|height| *height > px(0.0))
-        .collect::<Vec<_>>();
-    if heights.is_empty() {
-        return None;
+    let mut total = px(0.0);
+    let mut measured = 0usize;
+    for row in rows {
+        if row.height > px(0.0) {
+            total += row.height;
+            measured += 1;
+        }
     }
-    heights.sort_by(|left, right| left.partial_cmp(right).unwrap_or(std::cmp::Ordering::Equal));
-    Some(heights[heights.len() / 2])
+    (measured > 0).then(|| total / measured as f32)
 }
 
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
@@ -34420,11 +34427,18 @@ impl VibexWorkbench {
             .preserve_anchor_at(turn_id, span, offset_in_row);
     }
 
-    fn handle_timeline_scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
-        let delta_y = match event.delta {
-            ScrollDelta::Lines(point) => point.y,
-            ScrollDelta::Pixels(point) => f32::from(point.y),
-        };
+    fn handle_timeline_scroll_wheel(
+        &mut self,
+        event: &ScrollEvent,
+        line_height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        // The wheel reports lines for a mouse and pixels for a trackpad, and the
+        // list scrolls by pixels. `pixel_delta` is the list's own conversion, so
+        // the trace compares like with like; reading the raw line count made
+        // every frame look like it moved twenty times further than the wheel
+        // asked, which is noise exactly where the answer should be.
+        let delta_y = f32::from(event.delta.pixel_delta(line_height).y);
         if delta_y == 0.0 || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0) {
             return;
         }
@@ -64864,10 +64878,13 @@ impl VibexWorkbench {
                             // scrolled pane still following its own stream, and
                             // it snapped back to the bottom on the next chunk.
                             let scroll_session_id = timeline_render_session_id.clone();
-                            move |this, event: &ScrollEvent, _, cx| {
+                            move |this, event: &ScrollEvent, window, cx| {
+                                let line_height = window.line_height();
                                 this.with_session_view_for_render(
                                     scroll_session_id.as_ref(),
-                                    |this| this.handle_timeline_scroll_wheel(event, cx),
+                                    |this| {
+                                        this.handle_timeline_scroll_wheel(event, line_height, cx)
+                                    },
                                 );
                             }
                         }))
@@ -65075,7 +65092,6 @@ impl VibexWorkbench {
         if disclosure_landed {
             self.resume_timeline_follow_after_disclosure();
         }
-        self.trace_timeline_scroll();
         // Resolve a pending bottom scroll only after the row extent is rebuilt:
         // an invalidated size table would otherwise swallow the request because
         // `scroll_timeline_to_latest` skips an empty table.
@@ -65088,6 +65104,9 @@ impl VibexWorkbench {
         // is about to set. Applying it first left the reader at row zero with
         // nothing pending to correct it.
         self.apply_pending_timeline_anchor();
+        // Traced after the moves above, so the frame that moved the transcript
+        // is the frame the trace names.
+        self.trace_timeline_scroll();
         // Keep the reader's place current for whatever lands later — a page
         // above the window, a replacement, a switch — so it restores where they
         // are now and not where they were when the read began.

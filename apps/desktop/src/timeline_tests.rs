@@ -4714,6 +4714,79 @@ fn scrolling_a_long_transcript_moves_by_the_requested_distance(cx: &mut TestAppC
     }
 }
 
+/// A reseed must leave the document as tall as the row table.
+///
+/// `gpui::list` lays a row it has not measured out at the single hint it was
+/// given, so a reseed's document is `rows * hint` no matter how the real heights
+/// are distributed. Seeding the median of a mixed transcript left that document
+/// hundreds of pixels short, and a reseed — a new turn, a settled width — then
+/// resolved the reader's place against it, which is the viewport landing a
+/// screen up the conversation when a turn arrived.
+#[gpui::test]
+fn a_reseeded_transcript_is_as_tall_as_its_rows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..40_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        // A real transcript is short rows with a few very long ones, which is
+        // exactly the shape a median seed gets wrong: the mean carries the
+        // height the table actually has, the median does not.
+        let body = if turn % 8 == 0 {
+            format!("long answer {turn}: {}", "detail ".repeat(80))
+        } else {
+            format!("short answer {turn}")
+        };
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: body,
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    // The list throws the hints away whenever the width settles; asking for the
+    // seed again is exactly what a new row does.
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_list_hint_width = None;
+        cx.notify();
+    });
+    for _ in 0..2 {
+        draw_disclosure_frame(cx);
+    }
+    let (extent, table) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.max_offset_for_scrollbar().y
+                + workbench.timeline_scroll.viewport_bounds().size.height,
+            workbench
+                .timeline_row_sizes
+                .iter()
+                .map(|row| row.height)
+                .sum::<Pixels>(),
+        )
+    });
+    assert!(
+        extent >= table - px(32.0),
+        "the reseed left the document {:?} short of the table it seeded",
+        table - extent
+    );
+    assert!(
+        extent <= table + px(32.0),
+        "the reseed made the document {:?} taller than the table it seeded",
+        extent - table
+    );
+}
+
 /// A stream below the reader must not move the reader.
 ///
 /// The last turn keeps growing while the agent works, and every chunk changes
