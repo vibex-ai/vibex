@@ -841,15 +841,10 @@ const SESSION_GROUP_SPLIT_GUARD_INSET: f32 = 4.0;
 /// as a hard divider rather than a card edge. The resting frame therefore
 /// paints a third of it and the seam lands near a single hairline. Hover
 /// answers "which pane would take a click" while the pointer travels, and it
-/// brightens that same line; the focused pane answers with the theme's focus
-/// ring, because it is the one pane holding the keyboard and that is the ink a
-/// focused control already wears.
+/// brightens that same line. The selected pane is deliberately not marked
+/// here: it says so inside its own content, where the keyboard actually goes.
 const SESSION_GROUP_PANE_FRAME_REST_WEIGHT: f32 = 0.35;
 const SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT: f32 = 2.2;
-/// The focus ring is opaque in every bundled theme, so the frame paints a
-/// share of it. The share has to stay above the hovered hairline: a hovered
-/// pane must never look as chosen as the pane holding the keyboard.
-const SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA: f32 = 0.85;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -10546,6 +10541,12 @@ struct ComposerView {
     workbench: WeakEntity<VibexWorkbench>,
     session_id: Option<VibexSessionId>,
     enabled: bool,
+    /// Whether this composer belongs to the focused pane of a split.
+    ///
+    /// The composer is where a selected pane says so: its box wears the focus
+    /// ring, and the pane frame around it stays a quiet card edge. The
+    /// single-session column has no pane to mark, so it stays false there.
+    pane_focused: bool,
     /// The workbench's transcript-scroll count when this view last rendered.
     ///
     /// A workbench notify that only moved the transcript is skipped: the
@@ -10561,6 +10562,7 @@ impl ComposerView {
         workbench: &Entity<VibexWorkbench>,
         session_id: Option<VibexSessionId>,
         enabled: bool,
+        pane_focused: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         // The composer renders workbench state, so a workbench notify has to
@@ -10592,6 +10594,7 @@ impl ComposerView {
             workbench: workbench.downgrade(),
             session_id,
             enabled,
+            pane_focused,
             last_seen_scroll_notifies,
             #[cfg(test)]
             render_count: Cell::new(0),
@@ -10608,9 +10611,10 @@ impl Render for ComposerView {
         };
         let session_id = self.session_id.clone();
         let enabled = self.enabled;
+        let pane_focused = self.pane_focused;
         workbench.update(cx, |this, cx| {
             this.with_session_view_for_render(session_id.as_ref(), |this| {
-                this.render_composer(window, cx, enabled)
+                this.render_composer(window, cx, enabled, pane_focused)
             })
         })
     }
@@ -56155,31 +56159,19 @@ impl VibexWorkbench {
             // three hairlines on one seam — this pane's border, its neighbour's
             // and the resize handle's line — so the resting weight is a third
             // of the authored `border` and the seam reads as one hairline. The
-            // focused pane is the one holding the keyboard, so its frame
-            // answers in the theme's focus ring — the ink a focused control
-            // already wears, and the way an active pane is drawn in a terminal
-            // multiplexer. Hover only lifts the hairline of a pane that does not
-            // hold the keyboard: the ring is the stronger statement, and a
-            // hovered focused pane must not trade it for a dimmer line.
+            // selected pane is marked inside its content, where the keyboard
+            // goes — a composer wears the focus ring, a terminal its own
+            // window's frame — so this frame only answers the pointer.
             .border_1()
             .border_color(session_group_pane_frame(
                 cx.theme().border,
                 SESSION_GROUP_PANE_FRAME_REST_WEIGHT,
             ))
-            .when(!focused, |this| {
-                this.hover(|this| {
-                    this.border_color(session_group_pane_frame(
-                        cx.theme().border,
-                        SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
-                    ))
-                })
-            })
-            .when(focused, |this| {
-                this.border_color(
-                    cx.theme()
-                        .ring
-                        .opacity(SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA),
-                )
+            .hover(|this| {
+                this.border_color(session_group_pane_frame(
+                    cx.theme().border,
+                    SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+                ))
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -56303,6 +56295,9 @@ impl VibexWorkbench {
                 .child(self.render_session_terminal_page_for_session(
                     pane_session,
                     focused,
+                    // A pane draws its selection in the terminal's own frame;
+                    // the single-session page has no pane to mark.
+                    focused,
                     window,
                     cx,
                 ))
@@ -56372,7 +56367,7 @@ impl VibexWorkbench {
         // primary between panes would store and reload a view per pane for
         // nothing.
         let composer = self
-            .ensure_composer_view(Some(&pane_session_id), focused, cx)
+            .ensure_composer_view(Some(&pane_session_id), focused, focused, cx)
             .into_any_element();
         self.session_group_pane_with_composer(conversation, conversation_find, composer, window, cx)
     }
@@ -65772,7 +65767,7 @@ impl VibexWorkbench {
             .then(|| self.render_conversation_find(cx))
             .flatten();
         let composer = include_composer.then(|| {
-            self.ensure_composer_view(live_session_id.as_ref(), true, cx)
+            self.ensure_composer_view(live_session_id.as_ref(), true, false, cx)
                 .into_any_element()
         });
         // Terminal mode routes its own near-fullscreen expansion through the
@@ -79298,6 +79293,7 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
         enabled: bool,
+        pane_focused: bool,
     ) -> AnyElement {
         let composer_input = self.ensure_composer_input(window, cx);
         if self.composer_terminal_mode {
@@ -79945,7 +79941,16 @@ impl VibexWorkbench {
                             })
                             .rounded(px(composer_surface_radius))
                             .border_1()
-                            .border_color(cx.theme().border)
+                            // The focused pane's composer is where that pane
+                            // says it holds the keyboard: the box wears the
+                            // focus ring every focused control wears, while the
+                            // pane frame stays quiet. The single-session column
+                            // has no pane to mark and keeps the hairline.
+                            .border_color(if pane_focused {
+                                cx.theme().ring
+                            } else {
+                                cx.theme().border
+                            })
                             .bg(composer_background)
                             .when(composer_extension_visible, |this| {
                                 this.shadow(vec![
@@ -80481,7 +80486,7 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return empty_center_content();
         };
-        self.render_session_terminal_page_for_session(session, true, window, cx)
+        self.render_session_terminal_page_for_session(session, true, false, window, cx)
     }
 
     /// The terminal page for one session.
@@ -80494,6 +80499,7 @@ impl VibexWorkbench {
         &mut self,
         session: AgentSession,
         focused: bool,
+        pane_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -80522,7 +80528,15 @@ impl VibexWorkbench {
                     // the radius cuts away.
                     .bg(window_fill)
                     .border_1()
-                    .border_color(cx.theme().border)
+                    // A selected pane is marked by its content: a terminal
+                    // lights its own rounded window, the way the active pane is
+                    // drawn in a terminal multiplexer. The single-session page
+                    // has no pane to mark and keeps the hairline.
+                    .border_color(if pane_focused {
+                        cx.theme().ring
+                    } else {
+                        cx.theme().border
+                    })
                     .child(body),
             )
             .into_any_element()
@@ -81175,21 +81189,25 @@ impl VibexWorkbench {
         &mut self,
         session_id: Option<&VibexSessionId>,
         enabled: bool,
+        pane_focused: bool,
         cx: &mut Context<Self>,
     ) -> Entity<ComposerView> {
         let key = session_id.map_or_else(|| "__none__".to_string(), |id| id.as_str().to_string());
         if let Some(view) = self.composer_views.get(&key) {
             let view = view.clone();
-            if view.read(cx).enabled != enabled {
+            if view.read(cx).enabled != enabled || view.read(cx).pane_focused != pane_focused {
                 view.update(cx, |this, cx| {
                     this.enabled = enabled;
+                    this.pane_focused = pane_focused;
                     cx.notify();
                 });
             }
             return view;
         }
         let workbench = cx.entity();
-        let view = cx.new(|cx| ComposerView::new(&workbench, session_id.cloned(), enabled, cx));
+        let view = cx.new(|cx| {
+            ComposerView::new(&workbench, session_id.cloned(), enabled, pane_focused, cx)
+        });
         self.composer_views.insert(key, view.clone());
         view
     }
@@ -113265,7 +113283,7 @@ mod tests {
         // The session composer wires both keys to the shared handler.
         let composer = source
             .split_once(
-                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
@@ -114050,7 +114068,7 @@ mod tests {
         let source = include_str!("app.rs");
         let composer = source
             .split_once(
-                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
@@ -135858,7 +135876,9 @@ mod tests {
         // The composer is built while the pane's own view is borrowed.
         // Re-borrowing the primary between panes made a split store and reload a
         // view twice for every pane, every frame.
-        assert!(content.contains(".ensure_composer_view(Some(&pane_session_id), focused, cx)"));
+        assert!(
+            content.contains(".ensure_composer_view(Some(&pane_session_id), focused, focused, cx)")
+        );
         // The find bar is built in the same borrow, and only for the focused
         // pane: it searches that pane's conversation, so a bar in every pane
         // would put two live inputs on one query.
@@ -136118,11 +136138,9 @@ mod tests {
     ///
     /// A split stacks hairlines on its seam, so the resting frame stays well
     /// under the authored `border` and hover clears it by a margin the eye reads
-    /// at a glance without changing the token. The focused pane is the
-    /// exception: it wears the theme's focus ring, so "which pane has the
-    /// keyboard" is answered by the frame instead of by a mark inside its tab.
+    /// at a glance without changing the token.
     #[test]
-    fn the_group_pane_frame_rests_quiet_and_answers_hover_and_focus() {
+    fn the_group_pane_frame_rests_quiet_and_answers_hover() {
         let border = gpui::hsla(0.58, 0.24, 0.62, 0.15);
         let rest = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_REST_WEIGHT);
         let hovered = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT);
@@ -136143,19 +136161,65 @@ mod tests {
             SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
         );
         assert_eq!(strong.a, 1.0);
+    }
 
-        // The focused frame speaks in the focus ring, and the strip no longer
-        // carries the accent bar that used to name the focused pane.
-        assert!(SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA > 0.5);
+    /// A selected pane is marked inside its content, not by its frame.
+    ///
+    /// The frame stays a quiet card edge and the strip carries no accent bar:
+    /// the composer the pane owns wears the focus ring, and a terminal pane
+    /// lights its own rounded window, the way an active pane is drawn in a
+    /// terminal multiplexer. The single-session column has no pane to mark, so
+    /// neither surface rings there.
+    #[test]
+    fn a_selected_group_pane_is_marked_by_its_content() {
         let source = include_str!("app.rs");
         let pane = source
             .split_once("    fn render_session_group_pane(")
             .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
             .map(|(body, _)| body)
             .expect("group pane renderer should remain inspectable");
-        assert!(pane.contains("SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA"));
-        assert!(pane.contains(".ring"));
+        // The frame answers the pointer only; the tab strip keeps no accent bar.
+        assert!(!pane.contains(".ring"));
+        assert!(!pane.contains("SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA"));
         assert!(!pane.contains("primary.opacity(0.75)"));
+
+        // A pane hands its focus to the composer it builds, which rings its box.
+        let content = source
+            .split_once("    fn render_session_group_pane_content(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
+            })
+            .map(|(body, _)| body)
+            .expect("group pane content should remain inspectable");
+        assert!(
+            content.contains(".ensure_composer_view(Some(&pane_session_id), focused, focused, cx)")
+        );
+        let composer = source
+            .split_once("    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should keep the pane-focus argument");
+        let composer_ring = composer
+            .find("if pane_focused {")
+            .expect("the composer must ask whether its pane holds the keyboard");
+        assert!(composer[composer_ring..].contains("cx.theme().ring"));
+
+        // A terminal pane lights its own window frame instead.
+        let terminal = source
+            .split_once("    fn render_session_terminal_page_for_session(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The surface the page frames, or the stand-in")
+            })
+            .map(|(body, _)| body)
+            .expect("the per-session terminal page should remain inspectable");
+        let terminal_ring = terminal
+            .find("if pane_focused {")
+            .expect("the terminal page must ask whether its pane holds the keyboard");
+        assert!(terminal[terminal_ring..].contains("cx.theme().ring"));
+        // The single-session page has no pane to mark.
+        assert!(source.contains(
+            "self.render_session_terminal_page_for_session(session, true, false, window, cx)"
+        ));
     }
 
     /// A group pane's strip is the preview strip's sibling: the same metrics,
