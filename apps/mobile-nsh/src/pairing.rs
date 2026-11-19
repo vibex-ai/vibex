@@ -18,6 +18,7 @@ use std::{
 };
 
 use futures_util::StreamExt as _;
+use nsh_core::picker::PickRequest;
 use nsh_core::prelude::*;
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::RemoteLanPairingRequestState;
@@ -111,19 +112,15 @@ impl PairingService {
         let find = self.clone();
         let pick_saved = self.clone();
         let pick_nearby = self.clone();
-        let scan = self.clone();
         PairingHost {
             saved: self.saved,
             nearby: self.nearby,
             busy: self.busy,
             error: self.error,
-            on_scanned: {
+            on_scan: {
                 let service = self.clone();
-                Rc::new(move |link: &str| service.scan_link(link))
+                Rc::new(move || service.scan_photo())
             },
-            on_scan: Rc::new(move || {
-                scan.error.set(None);
-            }),
             on_connect: Rc::new(move |entry, server| connect.connect_entry(entry, server)),
             on_paste: Rc::new(move |draft| paste.paste(draft)),
             on_find: Rc::new(move || find.start_nearby()),
@@ -371,6 +368,31 @@ impl PairingService {
         self.connect_entry(link, "");
     }
 
+    /// Reads a QR code from a picked photo, for when the camera cannot start.
+    fn scan_photo(&self) {
+        self.error.set(None);
+        let service = self.clone();
+        spawn(async move {
+            let files = pick_images(PickRequest::new(false, 1)).await;
+            let Some(file) = files.into_iter().next() else {
+                return;
+            };
+            let bytes = file.data.bytes().to_vec();
+            let decoded = background(async move { decode_qr_photo(&bytes) }).await;
+            match decoded {
+                Ok(Some(link)) => service.scan_link(&link),
+                Ok(None) => service.fail_text(copy::text(
+                    "No QR code was found in that photo.",
+                    "这张照片里没有识别到二维码。",
+                    "這張照片裡沒有辨識到 QR Code。",
+                )),
+                Err(error) => {
+                    service.fail_text(format!("reading the photo did not finish: {error}"))
+                }
+            }
+        });
+    }
+
     fn connect_entry(&self, entry: &str, server: &str) {
         if self.busy.get_untracked() {
             return;
@@ -582,6 +604,18 @@ impl PairingService {
 ///
 /// The transport's messages describe the protocol; the page says what the
 /// person can do next. An unmapped code falls back to the message, bounded.
+/// Reads the first QR code in an image, for the photo fallback.
+fn decode_qr_photo(bytes: &[u8]) -> Option<String> {
+    let picture = image::load_from_memory(bytes).ok()?.to_luma8();
+    let mut prepared = rqrr::PreparedImage::prepare(picture);
+    for grid in prepared.detect_grids() {
+        if let Ok((_, content)) = grid.decode() {
+            return Some(content);
+        }
+    }
+    None
+}
+
 /// Groups a six-digit verification code for reading aloud.
 fn format_code(code: &str) -> SharedString {
     let code = code.trim();

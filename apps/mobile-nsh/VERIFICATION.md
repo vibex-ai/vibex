@@ -22,7 +22,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Area | Where it lives | Automated coverage | Verified on this machine | Confirm on device |
 | --- | --- | --- | --- | --- |
 | Pairing page, link, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 4 headless page tests, 14 pairing-crate tests | headless + unit | paste, clipboard, real claim round-trip |
-| Scan a QR code | `screens/pairing.rs`, `assets/scanner.html` | scanner opens in the headless page? no — emulator check only | emulator: camera preview and Close | decode a real QR, camera permission on a phone |
+| Scan a QR code | `screens/pairing.rs`, `scan_photo` in `src/pairing.rs` | unit: `rqrr` decode path; emulator: picker and a pushed QR photo decode | emulator: selecting a QR photo claims its link | photograph the desktop QR and pick it; live camera needs a host |
 | Find runtimes on the LAN | `apps/mobile-nsh/src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules | emulator: the sheet opens and reports Searching (no runtime on that network) | discovery and approval against a desktop on the same LAN |
 | Session shell and switching | `screens/session.rs`, `apps/mobile-nsh/src/session.rs` | `the_shell_opens_on_the_first_session`, `the_drawer_lists_sessions_and_switching_one_swaps_the_transcript` | headless | long lists, scroll, safe areas |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
@@ -75,8 +75,8 @@ anything that needs a runtime or a phone are listed at the bottom.
 
 - Android was built here: `nsh` 0.6.0, SDK platform/build-tools 35, NDK 27.2,
   and a debug-signed universal APK. On an API 35 emulator the pairing page,
-  the Link sheet, the in-app camera scanner (preview and close) and the Find
-  sheet (browsing started) were exercised; the universal APK
+  the Link sheet, the photo picker's QR decode (a pushed QR photo was read and
+  claimed) and the Find sheet (browsing started) were exercised; the universal APK
   (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too. A real QR
   decode and a desktop approving the zero-config code still need a phone and a
   desktop on one LAN.

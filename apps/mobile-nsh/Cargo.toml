@@ -21,6 +21,8 @@ vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 base64.workspace = true
 mdns-sd.workspace = true
+image = { workspace = true, features = ["png", "jpeg"] }
+rqrr = "0.9"
 serde.workspace = true
 serde_json.workspace = true
 futures-channel.workspace = true

@@ -16,10 +16,7 @@
 use std::rc::Rc;
 
 use nsh_base::{ButtonElement, SheetEvent, button, sheet};
-use nsh_core::{
-    element::{ImageSrc, web_view_html},
-    prelude::*,
-};
+use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{
     copy, theme,
@@ -107,8 +104,6 @@ pub struct PairingHost {
     pub error: Signal<Option<SharedString>>,
     /// Open the camera to scan the desktop's QR code.
     pub on_scan: Action,
-    /// A pairing link the scanner decoded.
-    pub on_scanned: Rc<dyn Fn(&str)>,
     /// Claim the typed or pasted entry; the second argument is the server
     /// address a bare code needs.
     pub on_connect: Connect,
@@ -124,15 +119,6 @@ pub struct PairingHost {
 
 /// The pairing page.
 pub fn pairing(host: PairingHost) -> impl IntoElement {
-    let scanning = signal(false);
-    let start_scan = host.on_scan.clone();
-    let host = PairingHost {
-        on_scan: Rc::new(move || {
-            start_scan();
-            scanning.set(true);
-        }),
-        ..host.clone()
-    };
     let manual_open = signal(false);
     let nearby_open = signal(false);
     let draft = signal(String::new());
@@ -188,64 +174,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .pb_safe_area_plus(px(theme::SPACING_LG))
         .child(page)
         .child(manual_sheet(host.clone(), manual_open, draft, server))
-        .child(nearby_sheet(host.clone(), nearby_open))
-        .child(when(
-            move || scanning.get(),
-            move || scanner(host.clone(), scanning),
-        ))
-}
-
-/// The camera scanner, over the page. It closes on the header's X.
-fn scanner(host: PairingHost, scanning: Signal<bool>) -> impl IntoElement {
-    let on_scanned = host.on_scanned.clone();
-    let error = host.error;
-    view()
-        .absolute()
-        .top_0()
-        .left_0()
-        .w_full()
-        .h_full()
-        .bg(theme::background)
-        .flex_col()
-        .child(
-            view()
-                .w_full()
-                .pt_safe_area()
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
-                .child(
-                    view()
-                        .w_full()
-                        .h(px(48.0))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .px(px(theme::SPACING_SM))
-                        .child(
-                            text(copy::text("Scan a QR code", "扫描二维码", "掃描 QR Code"))
-                                .flex_1()
-                                .text_size(px(theme::FONT_HEADING))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::foreground),
-                        )
-                        .child(action::icon_button(
-                            icon(include_str!("../../assets/icons/x.svg")),
-                            copy::text("Close", "关闭", "關閉"),
-                            move || scanning.set(false),
-                        )),
-                ),
-        )
-        .child(
-            web_view_html(include_str!("../../assets/scanner.html"), None)
-                .on_message(move |message: &str| {
-                    scanning.set(false);
-                    match message.strip_prefix("error:") {
-                        Some(message) => error.set(Some(message.trim().to_owned().into())),
-                        None => on_scanned(message),
-                    }
-                })
-                .flex_1(),
-        )
+        .child(nearby_sheet(host, nearby_open))
 }
 
 /// The last action's failure, worded for the person holding the phone.
