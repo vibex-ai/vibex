@@ -2493,17 +2493,39 @@ impl SearchableListItem for NewSessionBaseRefChoice {
     }
 }
 
-/// One folder the new-session page can file its draft under.
+/// One filing destination the new-session page can put its draft under.
 ///
 /// The choice carries the label the menu draws and the id the placement tree
-/// files by, so the control never has to look a folder up again by name. The
-/// depth indents a nested folder under its parent, which is what makes the menu
-/// read as the tree the sidebar draws.
+/// files by, so the control never has to look a destination up again by name.
+/// The depth indents a nested folder under its parent, which is what makes the
+/// menu read as the tree the sidebar draws. A session group is a destination
+/// like a folder, with its own glyph so the two never read as one kind.
 #[derive(Clone)]
 struct NewSessionFolderChoice {
-    folder_id: String,
+    target: NewSessionFilingTarget,
     label: String,
     depth: usize,
+}
+
+/// Where the new-session page files the session it creates: under a sidebar
+/// folder, or inside a session group. A draft answers one or the other, never
+/// both.
+#[derive(Clone, PartialEq, Eq)]
+enum NewSessionFilingTarget {
+    Folder(String),
+    Group(String),
+}
+
+impl NewSessionFilingTarget {
+    fn id(&self) -> &str {
+        match self {
+            Self::Folder(id) | Self::Group(id) => id,
+        }
+    }
+
+    fn is_group(&self) -> bool {
+        matches!(self, Self::Group(_))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -11925,6 +11947,11 @@ pub struct VibexWorkbench {
     /// user asked for it with a folder row's new-chat action. The session the
     /// draft creates is filed under that folder instead of the project root.
     new_session_folder_id: Option<String>,
+    /// The session group the open new-session draft was started from, when the
+    /// user asked for it with a group row's new-chat action. The session the
+    /// draft creates joins that group. A draft is filed under a folder or a
+    /// group, never both: the two setters clear each other.
+    new_session_group_id: Option<String>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
@@ -13750,6 +13777,7 @@ impl VibexWorkbench {
             pending_new_session_titles: HashMap::new(),
             pending_initial_turn_interrupts: BTreeMap::new(),
             new_session_folder_id: None,
+            new_session_group_id: None,
             new_session_open: false,
             new_session_draft_initialized: false,
             new_session_project_menu_open: false,
@@ -42494,9 +42522,11 @@ impl VibexWorkbench {
         // arrives in its compact shape rather than in the reading shape the
         // previous draft left behind.
         self.new_session_expanded = false;
-        // A draft that is re-opened starts unowned again; only a folder row's
-        // new-chat action re-aims it, and it does so after this call.
+        // A draft that is re-opened starts unowned again; only a folder or
+        // group row's new-chat action re-aims it, and it does so after this
+        // call.
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.sync_agent_streaming_surface_visibility();
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
@@ -42576,6 +42606,7 @@ impl VibexWorkbench {
         self.clear_new_session_message_draft(window, cx);
         self.new_session_draft_initialized = false;
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.new_session_workspace.reset_after_success();
     }
 
@@ -42638,6 +42669,7 @@ impl VibexWorkbench {
                 .insert(session_id.as_str().to_string());
         }
         self.file_new_session_in_folder(&session_id);
+        self.file_new_session_in_group(&session_id, cx);
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
         self.optimistic_runtime_selections
@@ -42915,6 +42947,7 @@ impl VibexWorkbench {
         // the whole cleanup.
         self.new_session_eligibility_task = None;
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.new_session_error = None;
         self.new_session_eligibility_error = None;
         self.sync_new_session_worktree_inputs(window, cx);
@@ -42949,14 +42982,69 @@ impl VibexWorkbench {
             self.new_session_folder_id = next;
             cx.notify();
         }
+        // A draft is filed under a folder or a group, never both: choosing a
+        // folder releases the group the draft may have been aimed at.
+        if self.new_session_folder_id.is_some() && self.new_session_group_id.take().is_some() {
+            cx.notify();
+        }
     }
 
-    /// The folders the draft's project offers, in sidebar order.
+    /// Aims the draft at `group_id`, or at no group for `None`.
+    ///
+    /// The page's filing control and a group row's new-chat action are the only
+    /// writers. A group that has since been dissolved, or that belongs to
+    /// another project or Worktree than the draft runs in, is ignored rather
+    /// than written, so a stale id can never promise a membership the sidebar
+    /// would not show.
+    fn set_new_session_group(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        let draft_project_id = self
+            .new_session_workspace
+            .project_id
+            .as_ref()
+            .map(|project_id| project_id.as_str().to_string());
+        let draft_workspace_id = self
+            .new_session_workspace
+            .fixed_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.as_str().to_string())
+            .or_else(|| {
+                self.new_session_workspace
+                    .origin_workspace_id
+                    .as_ref()
+                    .map(|workspace_id| workspace_id.as_str().to_string())
+            });
+        let next = group_id.filter(|group_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .group(group_id)
+                .is_some_and(|group| {
+                    Some(group.project_id.clone()) == draft_project_id
+                        && draft_workspace_id
+                            .as_ref()
+                            .is_none_or(|workspace_id| *workspace_id == group.workspace_id)
+                })
+        });
+        if self.new_session_group_id != next {
+            self.new_session_group_id = next;
+            cx.notify();
+        }
+        // A group is single-Worktree, so joining one is a stronger placement
+        // than a folder: the folder answer is released with it.
+        if self.new_session_group_id.is_some() && self.new_session_folder_id.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The folders and session groups the draft's project offers, in sidebar
+    /// order.
     ///
     /// A folder scoped to another Worktree is left out: the sidebar would never
     /// show the session under it, and [`Self::file_new_session_in_folder`] would
-    /// decline the placement after the fact. A project with no folders yields an
-    /// empty list, which is what hides the control.
+    /// decline the placement after the fact. A group is single-Worktree, so it
+    /// is offered only for the Worktree the draft runs in. A project with
+    /// neither folders nor groups yields an empty list, which is what hides the
+    /// control.
     fn new_session_folder_choices(&self) -> Vec<NewSessionFolderChoice> {
         let Some(project_id) = self
             .new_session_workspace
@@ -42997,7 +43085,7 @@ impl VibexWorkbench {
                 .map_or(0, |depth| depth + 1);
             depths.insert(folder_id.clone(), depth);
         }
-        folders
+        let mut choices = folders
             .into_iter()
             .filter(|(_, folder)| {
                 folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id
@@ -43005,9 +43093,42 @@ impl VibexWorkbench {
             .map(|(folder_id, folder)| NewSessionFolderChoice {
                 label: folder.name.clone(),
                 depth: depths.get(&folder_id).copied().unwrap_or(0),
-                folder_id,
+                target: NewSessionFilingTarget::Folder(folder_id),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // A group is a filing answer like a folder, so it is offered in the
+        // same control with its own glyph. Groups follow the folders in
+        // sidebar order; a group filed inside a folder is indented under it
+        // the way a nested folder is.
+        let groups = self
+            .ui_state
+            .sidebar
+            .organization
+            .groups_for_project(&project_id);
+        choices.extend(
+            groups
+                .into_iter()
+                .filter(|(_, group)| {
+                    session_workspace_id
+                        .as_ref()
+                        .is_some_and(|workspace_id| *workspace_id == group.workspace_id)
+                })
+                .map(|(group_id, group)| {
+                    let depth = self
+                        .ui_state
+                        .sidebar
+                        .organization
+                        .parent_of(&SidebarOrganizationItem::Group(group_id.clone()))
+                        .and_then(|parent| depths.get(&parent).copied())
+                        .map_or(0, |depth| depth + 1);
+                    NewSessionFolderChoice {
+                        label: group.name.clone(),
+                        depth,
+                        target: NewSessionFilingTarget::Group(group_id),
+                    }
+                }),
+        );
+        choices
     }
 
     /// Opens the new-session page on the project or Worktree `folder_id`
@@ -43035,6 +43156,53 @@ impl VibexWorkbench {
         // session is filed under are the same answer.
         self.set_new_session_folder(Some(folder_id.clone()), cx);
         self.reveal_sidebar_folder(&folder_id);
+        cx.notify();
+    }
+
+    /// Opens the new-session page on the Worktree `group_id` is anchored to,
+    /// and remembers the group so the session the page creates joins it.
+    ///
+    /// A group is always single-Worktree, so its Worktree is the draft's target
+    /// while it is still known and its project is the fallback, the same way a
+    /// folder row resolves its own target.
+    fn open_new_session_in_group(
+        &mut self,
+        group_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.ui_state.sidebar.organization.group(&group_id).cloned() else {
+            return;
+        };
+        if !self
+            .workspaces
+            .iter()
+            .any(|(project, _)| project.id.as_str() == group.project_id)
+        {
+            return;
+        }
+        let target = vibex_core::WorkspaceId::parse(&group.workspace_id)
+            .ok()
+            .filter(|workspace_id| {
+                self.workspaces
+                    .iter()
+                    .any(|(_, workspace)| workspace.id == *workspace_id)
+            })
+            .map(NewSessionOpenTarget::Workspace)
+            .or_else(|| {
+                ProjectId::parse(&group.project_id)
+                    .ok()
+                    .map(NewSessionOpenTarget::Project)
+            });
+        let Some(target) = target else {
+            return;
+        };
+        // Opening the page clears the filing answers, so the group that owns
+        // this draft is recorded after it, through the same setter the page's
+        // control writes with.
+        self.open_new_session(Some(target), window, cx);
+        self.set_new_session_group(Some(group_id.clone()), cx);
+        self.reveal_sidebar_group(&group_id);
         cx.notify();
     }
 
@@ -43101,6 +43269,30 @@ impl VibexWorkbench {
         self.publish_sidebar_invalidation();
     }
 
+    /// Opens the sidebar down to `group_id`, the way a folder row's new-chat
+    /// action reveals its folder. A session started from a group row has to be
+    /// visible inside that group once it exists.
+    fn reveal_sidebar_group(&mut self, group_id: &str) {
+        let Some(group) = self.ui_state.sidebar.organization.group(group_id).cloned() else {
+            return;
+        };
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_group_ids
+            .remove(group_id);
+        self.reveal_sidebar_organization_ancestors(SidebarOrganizationItem::Group(
+            group_id.to_string(),
+        ));
+        self.sidebar_state.collapsed_ids.remove(&group.project_id);
+        self.ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .remove(&group.workspace_id);
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+    }
+
     /// Files a session created from a folder row's new-chat action under that
     /// folder. The placement is written before the sidebar reconciles, so the
     /// session never spends a frame at the project root.
@@ -43145,6 +43337,35 @@ impl VibexWorkbench {
             .collapsed_folder_ids
             .remove(&folder_id);
         self.queue_ui_state();
+    }
+
+    /// Files a session created from a group row's new-chat action — or from
+    /// the page's filing control aimed at a group — into that group. The join
+    /// is written before the sidebar reconciles, so the session never spends a
+    /// frame at the project root.
+    fn file_new_session_in_group(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        let Some(group_id) = self.new_session_group_id.clone() else {
+            return;
+        };
+        // A group that was dissolved while the draft was open has nothing to
+        // join; the session stays where the sidebar would naturally place it.
+        if self
+            .ui_state
+            .sidebar
+            .organization
+            .group(&group_id)
+            .is_none()
+        {
+            return;
+        }
+        // The join enforces the group's own Worktree, so a draft that moved to
+        // another Worktree simply does not join. The shared menu path also
+        // syncs the group's workspace and reveals the row.
+        self.add_sessions_to_group_from_menu(
+            &group_id,
+            std::slice::from_ref(&session_id.as_str().to_string()),
+            cx,
+        );
     }
 
     fn probe_new_session_eligibility(
@@ -56619,6 +56840,11 @@ impl VibexWorkbench {
             self.sidebar_rename_target == Some(SidebarRenameTarget::Group(group_id.clone()));
         let group_name = group.name.clone();
         let member_count = group.member_count();
+        // While this row's context menu is open the row keeps the hover wash,
+        // the way a session row does, so the reader can see which group the
+        // menu's commands act on while the pointer sits on the menu.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Group(group_id.clone()));
         // A collapsed group stands in for its members, so it reports their
         // status; an expanded one lets each member row speak for itself.
         let collapsed_status = collapsed
@@ -56659,6 +56885,20 @@ impl VibexWorkbench {
         let release_out_group_id = group_id.clone();
         let session_drop_group_id = group_id.clone();
         let group_drag_target_group_id = group_id.clone();
+        let toggle_group_id = group_id.clone();
+        let menu_button_group_id = group_id.clone();
+        let menu_button_group_name = group_name.clone();
+        let menu_button_entity = cx.weak_entity();
+        let new_session_group_id = group_id.clone();
+        let group_toggle_label = if collapsed {
+            locale::text("Expand group", "展开会话组", "展開會話組")
+        } else {
+            locale::text("Collapse group", "折叠会话组", "摺疊會話組")
+        };
+        let group_actions_label =
+            sidebar_session_group_actions_label(self.resolved_locale(), &group_name);
+        let group_new_session_label =
+            sidebar_new_session_for_group_label(self.resolved_locale(), &group_name);
         let drag_payload = SidebarGroupDrag {
             group_id: group_id.clone(),
             label: group_name.clone().into(),
@@ -56688,6 +56928,8 @@ impl VibexWorkbench {
             .aria_label(group_name.clone())
             .bg(if drop_active {
                 cx.theme().tokens.drop_target.into()
+            } else if context_menu_hovered {
+                theme::hover_wash(cx.theme().is_dark())
             } else {
                 cx.theme().transparent
             })
@@ -56884,11 +57126,101 @@ impl VibexWorkbench {
                                     cx,
                                 ))
                             })
-                            .when(collapsed_status.is_none(), |this| {
-                                this.child(
-                                    div().flex_none().text_xs().child(format!("{member_count}")),
-                                )
-                            })
+                            .when(
+                                collapsed_status.is_none() && !renaming && reorder_enabled,
+                                |this| {
+                                    this.child(
+                                        // The row no longer reports its member
+                                        // count: the avatars already say who is
+                                        // inside. The slot instead carries the
+                                        // hover action cluster, shaped like the
+                                        // project row's — collapse, more, new
+                                        // session — so a group offers the same
+                                        // three answers on hover.
+                                        h_flex()
+                                            .id(format!("sidebar-group-actions-{group_id}"))
+                                            .flex_none()
+                                            .h(px(24.0))
+                                            .items_center()
+                                            .gap(px(2.0))
+                                            .invisible()
+                                            .group_hover(&hover_group, |style| style.visible())
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_click(|_, _, cx| cx.stop_propagation())
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-toggle-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(if collapsed {
+                                                    IconName::ChevronRight
+                                                } else {
+                                                    IconName::ChevronDown
+                                                })
+                                                .tooltip(group_toggle_label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_sidebar_group(&toggle_group_id, cx);
+                                                })),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-menu-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(IconName::Ellipsis)
+                                                .tooltip(group_actions_label)
+                                                .dropdown_menu(move |menu, window, cx| {
+                                                    Self::build_sidebar_group_menu(
+                                                        menu,
+                                                        menu_button_group_id.clone(),
+                                                        menu_button_group_name.clone(),
+                                                        auto_continue,
+                                                        menu_button_entity.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .anchor(gpui::Anchor::TopRight),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-new-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(IconName::Plus)
+                                                .accessibility_label(
+                                                    group_new_session_label.clone(),
+                                                )
+                                                .tooltip(group_new_session_label)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_new_session_in_group(
+                                                            new_session_group_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            ),
+                                    )
+                                },
+                            )
                             .when(pinned, |this| {
                                 this.child(
                                     sidebar_icon("icons/vibex/pin.svg")
@@ -57055,6 +57387,11 @@ impl VibexWorkbench {
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Folder(folder_id.clone()));
         let hover_group: SharedString = format!("sidebar-folder-{folder_id}").into();
+        // While this row's context menu is open the row keeps the hover wash,
+        // the way a session row does, so the menu never leaves its own row
+        // unmarked while the pointer sits on the menu.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Folder(folder_id.clone()));
         let click_folder_id = folder_id.clone();
         let context_folder_id = folder_id.clone();
         let context_folder_name = folder_name.clone();
@@ -57145,6 +57482,8 @@ impl VibexWorkbench {
             .bg(
                 if drop_position == Some(SidebarOrganizationDropPosition::Into) {
                     cx.theme().tokens.drop_target.into()
+                } else if context_menu_hovered {
+                    theme::hover_wash(cx.theme().is_dark())
                 } else {
                     cx.theme().transparent
                 },
@@ -57956,6 +58295,11 @@ impl VibexWorkbench {
         });
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
+        // While this row's context menu is open the row keeps the hover wash,
+        // even after the pointer travels onto the menu: the highlight is what
+        // tells the reader which row the menu's commands act on.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
         let drag_target_project_id = project_id_string.clone();
         let folder_drag_target_project_id = project_id_string.clone();
         let session_root_target_project_id = project_id_string.clone();
@@ -57978,6 +58322,8 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .bg(if project_scope_drop_active {
                 cx.theme().tokens.drop_target.into()
+            } else if context_menu_hovered {
+                theme::hover_wash(cx.theme().is_dark())
             } else {
                 cx.theme().transparent
             })
@@ -63296,39 +63642,55 @@ impl VibexWorkbench {
                 }
             });
         }
-        // The folder control speaks for where the draft will be filed. Its
+        // The filing control speaks for where the draft will be filed. Its
         // choices belong to the draft's project, so a project switch reloads
-        // them, and a project without folders simply offers none — which is
-        // what hides the control entirely.
+        // them, and a project without folders or groups simply offers none —
+        // which is what hides the control entirely.
         let folder_choices = self.new_session_folder_choices();
-        let folder_choice_ids = folder_choices
+        let folder_choice_targets = folder_choices
             .iter()
-            .map(|choice| choice.folder_id.clone())
+            .map(|choice| choice.target.clone())
             .collect::<Vec<_>>();
-        // A folder row's new-chat action pre-selects a folder that the project
-        // may already have offered, so the remembered folder is read from the
-        // draft rather than cached: the trigger simply shows what the draft
-        // will be filed under.
-        let active_folder_id = self
-            .new_session_folder_id
+        // A folder or group row's new-chat action pre-selects a destination the
+        // project may already have offered, so the remembered answer is read
+        // from the draft rather than cached: the trigger simply shows what the
+        // draft will be filed under.
+        let active_filing_target = self
+            .new_session_group_id
             .clone()
-            .filter(|folder_id| folder_choice_ids.contains(folder_id));
-        let folder_has_choices = !folder_choice_ids.is_empty();
-        // The remembered folder can name a folder the draft's project does not
-        // offer — the reader switched projects while a folder row's draft was
+            .map(NewSessionFilingTarget::Group)
+            .or_else(|| {
+                self.new_session_folder_id
+                    .clone()
+                    .map(NewSessionFilingTarget::Folder)
+            })
+            .filter(|target| folder_choice_targets.contains(target));
+        let folder_has_choices = !folder_choice_targets.is_empty();
+        // The remembered destination can name one the draft's project does not
+        // offer — the reader switched projects while a row-started draft was
         // open. Filing nowhere is the honest answer, and the trigger already
         // reads as the project root for it.
-        let folder_trigger_label = active_folder_id
+        let folder_trigger_label = active_filing_target
             .as_ref()
-            .and_then(|folder_id| {
+            .and_then(|target| {
                 folder_choices
                     .iter()
-                    .find(|choice| &choice.folder_id == folder_id)
+                    .find(|choice| &choice.target == target)
             })
             .map(|choice| choice.label.clone())
             .unwrap_or_else(|| {
                 locale::text("Project root", "项目根目录", "專案根目錄").to_string()
             });
+        // A group wears the layers glyph the sidebar's group rows and menus
+        // use, so the two kinds of destination never read as one.
+        let folder_trigger_icon = if active_filing_target
+            .as_ref()
+            .is_some_and(NewSessionFilingTarget::is_group)
+        {
+            sidebar_icon("icons/vibex/layers.svg").size(px(14.0))
+        } else {
+            Icon::new(IconName::Folder).size(px(14.0))
+        };
         // The trigger is a ghost button like the project and location triggers
         // beside it: this row answers "where does this session run and where is
         // it filed", and three bordered selects there read as three forms. The
@@ -63341,9 +63703,9 @@ impl VibexWorkbench {
             .selected(self.new_session_folder_menu_open)
             .text_color(muted_foreground)
             .tooltip(locale::text(
-                "Folder this session is filed under",
-                "会话所属文件夹",
-                "會話所屬資料夾",
+                "Folder or group this session is filed under",
+                "会话所属文件夹或会话组",
+                "會話所屬資料夾或會話組",
             ))
             .child(
                 h_flex()
@@ -63351,7 +63713,7 @@ impl VibexWorkbench {
                     // The project trigger leads with the same folder glyph and
                     // chevron, so the two triggers read as one column of
                     // "where" answers rather than two unrelated menus.
-                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                    .child(folder_trigger_icon)
                     .child(
                         div()
                             .max_w(px(140.0))
@@ -63365,9 +63727,15 @@ impl VibexWorkbench {
         let folder_rows = folder_choices
             .iter()
             .map(|choice| {
-                let selected = active_folder_id.as_ref() == Some(&choice.folder_id);
-                let folder_id = choice.folder_id.clone();
-                Button::new(format!("new-session-folder-{folder_id}"))
+                let selected = active_filing_target.as_ref() == Some(&choice.target);
+                let target = choice.target.clone();
+                let target_id = target.id().to_string();
+                let row_icon = if target.is_group() {
+                    sidebar_icon("icons/vibex/layers.svg").size(px(14.0))
+                } else {
+                    Icon::new(IconName::Folder).size(px(14.0))
+                };
+                Button::new(format!("new-session-folder-{target_id}"))
                     .small()
                     .ghost()
                     .w_full()
@@ -63389,7 +63757,7 @@ impl VibexWorkbench {
                                     // so the menu reads as the tree the sidebar
                                     // draws rather than a flat list of names.
                                     .pl(px(choice.depth as f32 * 12.0))
-                                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                                    .child(row_icon)
                                     .child(div().min_w_0().truncate().child(choice.label.clone())),
                             )
                             .when(selected, |this| {
@@ -63397,7 +63765,14 @@ impl VibexWorkbench {
                             }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_new_session_folder(Some(folder_id.clone()), cx);
+                        match target.clone() {
+                            NewSessionFilingTarget::Folder(folder_id) => {
+                                this.set_new_session_folder(Some(folder_id), cx);
+                            }
+                            NewSessionFilingTarget::Group(group_id) => {
+                                this.set_new_session_group(Some(group_id), cx);
+                            }
+                        }
                         this.new_session_folder_menu_open = false;
                         this.new_session_input
                             .update(cx, |input, cx| input.focus(window, cx));
@@ -63406,10 +63781,10 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         // Filing at the project root is a real answer — it is what a draft gets
-        // when the reader never picks a folder — so it is offered as its own
-        // row instead of being reachable only by clearing a selection.
+        // when the reader never picks a destination — so it is offered as its
+        // own row instead of being reachable only by clearing a selection.
         let folder_root_row = {
-            let selected = active_folder_id.is_none();
+            let selected = active_filing_target.is_none();
             Button::new("new-session-folder-root")
                 .small()
                 .ghost()
@@ -63441,6 +63816,7 @@ impl VibexWorkbench {
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.set_new_session_folder(None, cx);
+                    this.set_new_session_group(None, cx);
                     this.new_session_folder_menu_open = false;
                     this.new_session_input
                         .update(cx, |input, cx| input.focus(window, cx));
@@ -89394,6 +89770,24 @@ fn sidebar_new_session_for_folder_label(
     }
 }
 
+fn sidebar_session_group_actions_label(locale: locale::ResolvedLocale, group_name: &str) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("Actions for group {group_name}"),
+        locale::ResolvedLocale::ZhCn => format!("「{group_name}」会话组操作"),
+        locale::ResolvedLocale::ZhTw => format!("「{group_name}」會話組操作"),
+        _ => format!("Actions for group {group_name}"),
+    }
+}
+
+fn sidebar_new_session_for_group_label(locale: locale::ResolvedLocale, group_name: &str) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("New chat in group {group_name}"),
+        locale::ResolvedLocale::ZhCn => format!("在「{group_name}」会话组中新建会话"),
+        locale::ResolvedLocale::ZhTw => format!("在「{group_name}」會話組中建立會話"),
+        _ => format!("New chat in group {group_name}"),
+    }
+}
+
 fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &str) -> String {
     match locale {
         locale::ResolvedLocale::En => {
@@ -113840,6 +114234,25 @@ mod tests {
         assert!(project.contains("workspace.agent_summary.total"));
         assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
+        // While the row's context menu is open the row keeps the hover wash,
+        // so the reader can see which project the menu's commands act on.
+        assert!(
+            project
+                .contains("== Some(SidebarContextMenuTarget::Project(project_id_string.clone()))")
+        );
+        assert!(project.contains("theme::hover_wash(cx.theme().is_dark())"));
+
+        // A folder row keeps the same wash while its own menu is open.
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_sidebar_project_appearance_popover(")
+            })
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(folder.contains(".context_menu(move |menu, window, cx|"));
+        assert!(folder.contains("== Some(SidebarContextMenuTarget::Folder(folder_id.clone()))"));
+        assert!(folder.contains("theme::hover_wash(cx.theme().is_dark())"));
     }
 
     /// The project row's trailing mark counts only live work, and a project
@@ -118179,7 +118592,11 @@ mod tests {
 
         let filing = source
             .split_once("    fn file_new_session_in_folder(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn probe_new_session_eligibility("))
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Files a session created from a group row's new-chat action",
+                )
+            })
             .map(|(body, _)| body)
             .expect("folder filing should remain inspectable");
         assert!(filing.contains("organization.place_into_folder("));
@@ -118188,7 +118605,7 @@ mod tests {
         );
         assert!(filing.contains("is_none_or(|workspace_id| workspace_id == session_workspace_id)"));
         assert!(filing.contains("collapsed_folder_ids"));
-        assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_workspace.reset_after_success();"));
+        assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_group_id = None;\n        self.new_session_workspace.reset_after_success();"));
     }
 
     /// A folder's batch checkbox speaks for everything the folder shows: the
@@ -134950,8 +135367,9 @@ mod tests {
     }
 
     /// A collapsed group reports its members' status in the same trailing
-    /// column a session row keeps for its own, and shows the count only when
-    /// there is no status to report.
+    /// column a session row keeps for its own. With no status to report the
+    /// column carries the hover action cluster instead of a member count: the
+    /// avatars already say who is inside, so a number would repeat them.
     #[test]
     fn a_collapsed_group_reports_member_status_in_the_session_status_column() {
         let source = include_str!("app.rs");
@@ -134976,18 +135394,35 @@ mod tests {
         // Collapsed is what decides whether the row speaks for its members.
         assert!(group_row.contains("let collapsed_status = collapsed"));
         assert!(group_row.contains("self.session_group_status(&group)"));
-        // The count and the status share one fixed-width trailing column, the
-        // same one a session row uses.
+        // The status and the action cluster share one fixed-width trailing
+        // column, the same one a session row uses.
         assert!(group_row.contains(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))"));
         let status_slot = group_row
             .find("sidebar_aggregate_status_indicator(")
             .expect("the group row should render the aggregate status");
-        let count_slot = group_row
-            .find("format!(\"{member_count}\")")
-            .expect("the group row should render the member count");
-        assert!(status_slot < count_slot);
+        let actions_slot = group_row
+            .find("sidebar-group-actions-{group_id}")
+            .expect("the group row should carry the hover action cluster");
+        assert!(status_slot < actions_slot);
         assert!(group_row.contains(".when_some(collapsed_status, |this, status| {"));
-        assert!(group_row.contains(".when(collapsed_status.is_none(), |this| {"));
+        assert!(group_row.contains("collapsed_status.is_none() && !renaming && reorder_enabled,"));
+        // The member count is no longer painted; the cluster takes its slot.
+        assert!(!group_row.contains("format!(\"{member_count}\")"));
+        // The cluster is hover-only and shaped like the project row's:
+        // collapse, more, new session — and the new-chat action aims the
+        // new-session page at this group.
+        assert!(group_row.contains(".invisible()"));
+        assert!(group_row.contains(".group_hover(&hover_group, |style| style.visible())"));
+        assert!(group_row.contains("sidebar-group-toggle-{group_id}"));
+        assert!(group_row.contains("this.toggle_sidebar_group(&toggle_group_id, cx);"));
+        assert!(group_row.contains("sidebar-group-menu-{group_id}"));
+        assert!(group_row.contains("sidebar-group-new-{group_id}"));
+        assert!(group_row.contains("this.open_new_session_in_group("));
+        assert!(group_row.contains("sidebar_new_session_for_group_label("));
+        // While the row's own context menu is open the row keeps the hover
+        // wash, the way a session row does.
+        assert!(group_row.contains("SidebarContextMenuTarget::Group(group_id.clone())"));
+        assert!(group_row.contains("theme::hover_wash(cx.theme().is_dark())"));
         // The group's auto-continue rides the ring's color instead of a second
         // glyph in the trailing column, which keeps the column holding one mark
         // at a time. A group that never chose follows its project default, so
@@ -135918,9 +136353,7 @@ mod tests {
 
         let setter = source
             .split_once("    fn set_new_session_folder(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// The folders the draft's project offers")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Aims the draft at `group_id`"))
             .map(|(body, _)| body)
             .expect("the folder setter should remain inspectable");
         // A stale or foreign folder is refused rather than written. The guard
@@ -135958,9 +136391,50 @@ mod tests {
             .expect("the workspace control row should remain inspectable");
         assert!(control_row.contains(".when_some(folder_control, |this, folder_control| {"));
         assert!(control_row.contains("child(location_control)"));
-        assert!(source.contains("this.set_new_session_folder(folder_id.clone(), cx);"));
+        assert!(source.contains("this.set_new_session_folder(Some(folder_id), cx);"));
         assert!(source.contains("this.set_new_session_folder(None, cx);"));
         assert!(source.contains("self.set_new_session_folder(Some(folder_id.clone()), cx);"));
+        // A session group is a filing destination like a folder: offered in
+        // the same control with the layers glyph the sidebar's group rows
+        // use, written through its own setter, and joined by the session the
+        // draft creates.
+        assert!(choices.contains("groups_for_project(&project_id)"));
+        assert!(choices.contains("NewSessionFilingTarget::Group(group_id)"));
+        assert!(page.contains("this.set_new_session_group(Some(group_id), cx);"));
+        assert!(page.contains("this.set_new_session_group(None, cx);"));
+        assert!(page.contains("sidebar_icon(\"icons/vibex/layers.svg\").size(px(14.0))"));
+        let group_setter = source
+            .split_once("    fn set_new_session_group(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// The folders and session groups the draft's project offers",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the group setter should remain inspectable");
+        assert!(group_setter.contains(".group(group_id)"));
+        assert!(group_setter.contains("Some(group.project_id.clone()) == draft_project_id"));
+        // A draft is filed under a folder or a group, never both.
+        assert!(setter.contains("self.new_session_group_id.take().is_some()"));
+        assert!(group_setter.contains("self.new_session_folder_id.take().is_some()"));
+        let group_filing = source
+            .split_once("    fn file_new_session_in_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_new_session_eligibility("))
+            .map(|(body, _)| body)
+            .expect("group filing should remain inspectable");
+        assert!(group_filing.contains("self.add_sessions_to_group_from_menu("));
+        let registration = source
+            .split_once("    fn open_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
+            .map(|(body, _)| body)
+            .expect("pending new-session registration should remain inspectable");
+        let file_group = registration
+            .find("self.file_new_session_in_group(&session_id, cx);")
+            .expect("a group-aimed draft should join its session");
+        let reconcile = registration
+            .find("self.reconcile_sidebar_state();")
+            .expect("the sidebar should reconcile after the row exists");
+        assert!(file_group < reconcile);
     }
 
     /// An expanded group draws a tree connector beside each member row.
