@@ -6298,6 +6298,10 @@ struct TimelineScrollTrace {
     /// Trace lines written so far, so a captured file can be read in order even
     /// though several frames may describe the same offset.
     frames: u64,
+    /// How many times the rows have been re-seeded. A document whose extent
+    /// moves every frame is one thing when the table changed and another when
+    /// nothing did, and only this count tells them apart.
+    seeds: u64,
 }
 
 /// Every piece of state that belongs to one session's conversation view.
@@ -32847,12 +32851,17 @@ impl VibexWorkbench {
         }
         self.timeline_trace.frames += 1;
         let line = format!(
-            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
             self.timeline_trace.frames,
             self.timeline_follow.following_bottom,
             self.timeline_row_sizes.len(),
             self.timeline_scroll.item_count(),
             self.timeline_list_seen_width,
+            self.timeline_trace.seeds,
+            self.timeline_list_hint_width.is_some(),
+            self.timeline_disclosure_settle_frames,
+            self.timeline_disclosure_animating,
+            self.timeline_rows_hang_from_bottom(),
             self.timeline_scroll_anchor_pending,
             self.timeline_scroll_to_latest_pending,
             self.pending_timeline_reveal_delta,
@@ -32915,6 +32924,7 @@ impl VibexWorkbench {
         let held_anchor = (!self.timeline_follow.following_bottom)
             .then(|| self.timeline_scroll.logical_scroll_top());
         let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
+        self.timeline_trace.seeds += 1;
         self.timeline_scroll
             .reset_with_uniform_height(rows, hint.max(px(1.0)));
         match held_anchor {
