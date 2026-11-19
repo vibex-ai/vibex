@@ -162,6 +162,18 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     let nearby_open = signal(false);
     let settings_open = signal(false);
     let switcher = host.switcher;
+    let spinner = signal(SharedString::from("◐"));
+    {
+        spawn(async move {
+            let frames = ["◐", "◓", "◑", "◒"];
+            let mut index = 0;
+            loop {
+                nsh_core::element::timer(std::time::Duration::from_millis(120)).await;
+                index = (index + 1) % frames.len();
+                spinner.set(SharedString::from(frames[index]));
+            }
+        });
+    }
     let draft = signal(String::new());
     let server = signal(String::new());
 
@@ -178,7 +190,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .child(when(move || saved.with(|saved| !saved.is_empty()), {
             let on_pick = host.on_pick_saved.clone();
             let on_details = host.on_show_details.clone();
-            move || saved_runtimes(saved, on_pick.clone(), on_details.clone())
+            move || saved_runtimes(saved, on_pick.clone(), on_details.clone(), spinner)
         }))
         .child(
             view()
@@ -735,6 +747,7 @@ fn saved_runtimes(
     saved: Signal<Vec<SavedRuntime>>,
     on_pick: Rc<dyn Fn(&str)>,
     on_details: Rc<dyn Fn(&str)>,
+    spinner: Signal<SharedString>,
 ) -> impl IntoElement {
     view()
         .flex_col()
@@ -744,7 +757,7 @@ fn saved_runtimes(
         .child(each(
             move || saved.get(),
             |runtime| runtime.id.clone(),
-            move |runtime, _| saved_row(runtime, on_pick.clone(), on_details.clone()),
+            move |runtime, _| saved_row(runtime, on_pick.clone(), on_details.clone(), spinner),
         ))
 }
 
@@ -753,6 +766,7 @@ fn saved_row(
     runtime: ReadSignal<SavedRuntime>,
     on_pick: Rc<dyn Fn(&str)>,
     on_details: Rc<dyn Fn(&str)>,
+    spinner: Signal<SharedString>,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -776,8 +790,8 @@ fn saved_row(
                 .on_press(move || on_pick(&runtime.get_untracked().id))
                 .child(when(
                     move || runtime.get().status == RuntimeStatus::Probing,
-                    || {
-                        text("…")
+                    move || {
+                        text(move || spinner.get())
                             .w(px(8.0))
                             .flex_shrink_0()
                             .text_size(px(theme::FONT_MICRO))
