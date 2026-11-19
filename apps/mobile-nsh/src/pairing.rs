@@ -21,7 +21,7 @@ use futures_util::StreamExt as _;
 use nsh_core::picker::PickRequest;
 use nsh_core::prelude::*;
 use vibex_backend::{BackendError, BackendResult};
-use vibex_core::RemoteLanPairingRequestState;
+use vibex_core::{RemoteLanPairingRequestState, unix_timestamp_ms};
 use vibex_mobile_pairing::{
     MobileCredentialBundle, MobilePairedRuntime, PairingStore, claim_entry,
     claim_zero_config_lan_pairing, classify_entry,
@@ -37,6 +37,18 @@ const DEVICE_NAME: &str = "Vibex Mobile";
 
 /// The file the credentials live in, inside the app's data directory.
 const STORE_FILE: &str = "pairing.json";
+/// The phone's own notes about saved runtimes (added and last connected).
+const META_FILE: &str = "hosts.json";
+
+#[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
+struct HostMeta {
+    #[serde(default)]
+    added_at_ms: i64,
+    #[serde(default)]
+    last_connected_at_ms: i64,
+    #[serde(default)]
+    device_name: Option<String>,
+}
 
 /// The runtime the page is connected to, once a claim or a probe succeeds.
 #[derive(Clone, PartialEq)]
@@ -56,6 +68,8 @@ pub struct PairingService {
     nearby: Signal<Vec<NearbyRuntime>>,
     details: Signal<Option<vibex_nsh_ui::screens::pairing::HostDetails>>,
     rename_draft: Signal<String>,
+    meta: Rc<RefCell<std::collections::BTreeMap<String, HostMeta>>>,
+    meta_path: PathBuf,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     connected: Signal<Option<ConnectedRuntime>>,
@@ -98,6 +112,13 @@ impl PairingService {
             nearby: signal(Vec::new()),
             details: signal(None),
             rename_draft: signal(String::new()),
+            meta: Rc::new(RefCell::new(
+                std::fs::read_to_string(data_dir.join(META_FILE))
+                    .ok()
+                    .and_then(|text| serde_json::from_str(&text).ok())
+                    .unwrap_or_default(),
+            )),
+            meta_path: data_dir.join(META_FILE),
             busy: signal(false),
             error: signal(error),
             connected: signal(None),
@@ -470,6 +491,9 @@ impl PairingService {
         match result {
             Ok(paired) => match self.store.upsert(paired.bundle.clone()) {
                 Ok(bundles) => {
+                    let id = paired.bundle.host_id().to_owned();
+                    self.meta.borrow_mut().entry(id).or_default().added_at_ms = unix_timestamp_ms();
+                    self.save_meta();
                     self.set_bundles(bundles);
                     self.busy.set(false);
                     self.connect(paired.bundle);
@@ -512,6 +536,7 @@ impl PairingService {
         else {
             return;
         };
+        let meta = self.meta.borrow().get(host_id).cloned().unwrap_or_default();
         self.rename_draft.set(bundle.host_label());
         self.details
             .set(Some(vibex_nsh_ui::screens::pairing::HostDetails {
@@ -519,12 +544,10 @@ impl PairingService {
                 name: bundle.host_label(),
                 address: bundle.record.server_url.clone(),
                 server_id: bundle.expected_server_id.clone(),
-                device_name: crate::host::device_name(),
-                last_connected: self
-                    .connected
-                    .get_untracked()
-                    .filter(|connected| connected.bundle.host_id() == host_id)
-                    .map(|_| copy::text("Now", "现在", "現在").to_owned()),
+                device_name: meta.device_name.clone().or_else(crate::host::device_name),
+                last_connected: (meta.last_connected_at_ms > 0)
+                    .then(|| format_when(meta.last_connected_at_ms)),
+                added: (meta.added_at_ms > 0).then(|| format_when(meta.added_at_ms)),
             }));
     }
 
@@ -704,10 +727,25 @@ impl PairingService {
     }
 
     fn connect(&self, bundle: MobileCredentialBundle) {
+        {
+            let id = bundle.host_id().to_owned();
+            let mut meta = self.meta.borrow_mut();
+            let entry = meta.entry(id).or_default();
+            entry.last_connected_at_ms = unix_timestamp_ms();
+            entry.device_name = crate::host::device_name();
+            drop(meta);
+            self.save_meta();
+        }
         self.connected.set(Some(ConnectedRuntime {
             label: bundle.host_label(),
             bundle,
         }));
+    }
+
+    fn save_meta(&self) {
+        if let Ok(text) = serde_json::to_string(&*self.meta.borrow()) {
+            let _ = std::fs::write(&self.meta_path, text);
+        }
     }
 
     /// Applies something a platform host observed (a scan, discovery).
@@ -786,6 +824,17 @@ fn decode_qr_photo(bytes: &[u8]) -> Option<String> {
         }
     }
     None
+}
+
+/// A short, local reading of a millisecond timestamp.
+fn format_when(at_ms: i64) -> String {
+    let seconds = (unix_timestamp_ms() - at_ms).max(0) / 1000;
+    match seconds {
+        0..=59 => copy::text("Just now", "刚刚", "剛剛").to_owned(),
+        60..=3599 => format!("{}m", seconds / 60),
+        3600..=86399 => format!("{}h", seconds / 3600),
+        _ => format!("{}d", seconds / 86400),
+    }
 }
 
 /// Groups a six-digit verification code for reading aloud.

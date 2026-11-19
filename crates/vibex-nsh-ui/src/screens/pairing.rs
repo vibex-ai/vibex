@@ -76,6 +76,7 @@ pub struct HostDetails {
     pub server_id: String,
     pub device_name: Option<String>,
     pub last_connected: Option<String>,
+    pub added: Option<String>,
 }
 
 /// A runtime the local network found and the user may pair with.
@@ -398,6 +399,28 @@ fn details_sheet(host: PairingHost) -> impl IntoElement {
                                     details
                                         .as_ref()
                                         .and_then(|details| details.device_name.clone())
+                                        .unwrap_or_default()
+                                })
+                            },
+                        )
+                    },
+                ))
+                .child(when(
+                    move || {
+                        details.with(|details| {
+                            details
+                                .as_ref()
+                                .is_some_and(|details| details.added.is_some())
+                        })
+                    },
+                    move || {
+                        details_field(
+                            copy::text("Added", "添加时间", "加入時間"),
+                            move || {
+                                details.with(|details| {
+                                    details
+                                        .as_ref()
+                                        .and_then(|details| details.added.clone())
                                         .unwrap_or_default()
                                 })
                             },
