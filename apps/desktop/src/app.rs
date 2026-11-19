@@ -8497,6 +8497,7 @@ fn timeline_should_auto_follow_content(
 /// the first row. Capturing this anchor lets a session switch or an
 /// authoritative replacement put the same conversation content back under the
 /// viewport after the virtual row extents changed.
+#[cfg(test)]
 fn timeline_scroll_anchor_from_offset(
     row_heights: &[f32],
     offset_y: f32,
@@ -8557,6 +8558,7 @@ fn timeline_visible_row_range(
 /// Scroll offset that puts `row_index`'s top `offset_in_row` below the viewport
 /// top. The inverse of [`timeline_scroll_anchor_from_offset`], so an unchanged
 /// row table maps an offset back to itself.
+#[cfg(test)]
 fn timeline_scroll_offset_for_anchor(
     row_heights: &[f32],
     row_index: usize,
@@ -34227,6 +34229,7 @@ impl VibexWorkbench {
         }
     }
 
+    #[cfg(test)]
     fn timeline_row_heights(&self) -> Vec<f32> {
         self.timeline_row_sizes
             .iter()
@@ -34248,24 +34251,28 @@ impl VibexWorkbench {
         {
             return;
         }
-        let row_heights = self.timeline_row_heights();
-        let Some((row_index, offset_in_row)) = timeline_scroll_anchor_from_offset(
-            &row_heights,
-            f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
-            self.timeline_list_padding_top_px,
-        ) else {
+        // The list's own anchor is the reader's place: a row and the distance
+        // into it. Reading it costs nothing, where the old pixel offset had to
+        // be resolved against a copy of every row's height, so the render can
+        // keep this current on every frame — and an anchor that is always
+        // current cannot restore a place the reader has already scrolled away
+        // from, which is a jump in whichever direction they went.
+        let top = self.timeline_scroll.logical_scroll_top();
+        let row_index = top
+            .item_ix
+            .min(self.conversation_turns_cache.len().saturating_sub(1));
+        let Some(turn) = self.conversation_turns_cache.get(row_index) else {
             return;
         };
-        let Some(span) = self
-            .conversation_turns_cache
-            .get(row_index)
-            .and_then(|turn| timeline_turn_anchor_span(turn))
-        else {
+        let Some(span) = timeline_turn_anchor_span(turn) else {
             return;
         };
-        let turn_id = self.conversation_turns_cache[row_index].id.clone();
-        self.timeline_follow
-            .preserve_anchor_at(turn_id, span, offset_in_row.round() as i32);
+        let turn_id = turn.id.clone();
+        self.timeline_follow.preserve_anchor_at(
+            turn_id,
+            span,
+            f32::from(top.offset_in_item).round() as i32,
+        );
     }
 
     /// The row the captured anchor names, in the row table that is current now.
@@ -34305,18 +34312,14 @@ impl VibexWorkbench {
         if self.timeline_follow.following_bottom {
             return false;
         }
-        let offset_in_row = self.timeline_follow.anchor_offset_px as f32;
-        let offset_y = self.timeline_anchor_row_index().and_then(|row_index| {
-            timeline_scroll_offset_for_anchor(
-                &self.timeline_row_heights(),
-                row_index,
-                offset_in_row,
-                self.timeline_list_padding_top_px,
-            )
-        });
-        if let Some(offset_y) = offset_y {
-            self.timeline_scroll
-                .set_offset_from_scrollbar(point(px(0.0), px(offset_y)));
+        // The anchor is a row and a distance into it, so it is placed as one:
+        // a pixel offset would be mapped back through the list's own heights and
+        // its padding, and the padding is exactly the bias that mapping adds.
+        if let Some(row_index) = self.timeline_anchor_row_index() {
+            self.timeline_scroll.scroll_to(gpui::ListOffset {
+                item_ix: row_index,
+                offset_in_item: px(self.timeline_follow.anchor_offset_px as f32),
+            });
             return true;
         }
         // An anchor that resolved to nothing means the row table no longer holds
@@ -64947,6 +64950,10 @@ impl VibexWorkbench {
         // is about to set. Applying it first left the reader at row zero with
         // nothing pending to correct it.
         self.apply_pending_timeline_anchor();
+        // Keep the reader's place current for whatever lands later — a page
+        // above the window, a replacement, a switch — so it restores where they
+        // are now and not where they were when the read began.
+        self.capture_timeline_scroll_anchor();
         self.install_timeline_scroll_handler();
         self.prefetch_older_timeline_if_needed(cx);
         self.request_expanded_timeline_details(cx);
@@ -114731,7 +114738,9 @@ mod tests {
             capture
                 .contains("self.timeline_row_sizes.len() != self.conversation_turns_cache.len()")
         );
-        assert!(capture.contains(".preserve_anchor_at(turn_id, span,"));
+        assert!(capture.contains("self.timeline_scroll.logical_scroll_top()"));
+        assert!(capture.contains(".preserve_anchor_at("));
+        assert!(capture.contains("f32::from(top.offset_in_item)"));
         assert!(capture.contains("timeline_turn_anchor_span"));
 
         // The restore path resolves the turn by id first and falls back to the
@@ -114751,6 +114760,10 @@ mod tests {
         assert!(restore.contains("self.timeline_follow.has_anchor()"));
         assert!(restore.contains("self.settle_timeline_anchor_on_oldest_row()"));
         assert!(restore.contains("self.timeline_scroll"));
+        assert!(
+            restore.contains("self.timeline_scroll.scroll_to(gpui::ListOffset {"),
+            "the anchor is placed as a row, not mapped back through a pixel offset"
+        );
         assert!(restore.contains(".set_offset_from_scrollbar(point(px(0.0), px(0.0)))"));
 
         let resolve = source

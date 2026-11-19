@@ -2186,17 +2186,15 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     let (stale_offset, anchored) = workbench.update(cx, |workbench, _| {
         workbench.timeline_follow.set_following_bottom(false);
         // Just inside the tenth turn, which the replacement window does not
-        // reach, and far past what that window's own content can show.
-        let above: Pixels = workbench
-            .timeline_row_sizes
-            .iter()
-            .take(9)
-            .map(|row| row.height)
-            .sum();
-        let stale_offset = -(above + px(20.0));
-        workbench
-            .timeline_scroll
-            .set_offset_from_scrollbar(point(px(0.0), stale_offset));
+        // reach, and far past what that window's own content can show. The
+        // reader's place is the list's own anchor, so the fixture parks it
+        // there instead of at a pixel position the list would have to resolve
+        // through heights it may not have measured yet.
+        workbench.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: 9,
+            offset_in_item: px(20.0),
+        });
+        let stale_offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y;
         workbench.capture_timeline_scroll_anchor();
         (
             stale_offset,
