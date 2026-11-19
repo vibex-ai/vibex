@@ -694,7 +694,7 @@ fn the_schedule_surface_is_a_popover_sized_to_its_calendar() {
         !source.contains(".open_dialog("),
         "the schedule editor must not own a modal surface"
     );
-    assert!(source.contains("Popover::new(id)"));
+    assert!(source.contains("Popover::new(self.message_schedule_popover_id(&target))"));
     assert!(source.contains("const MESSAGE_SCHEDULE_PANEL_REM: f32 = 13.0;"));
     assert!(source.contains(".w(gpui::rems(MESSAGE_SCHEDULE_PANEL_REM))"));
     assert!(

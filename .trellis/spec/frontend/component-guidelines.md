@@ -879,6 +879,46 @@ as does anything typed by hand and never picked from the menu. Do not paint a
 tint behind typed `/`, `@` or `$` text to imitate a chip: two visuals for one
 idea is what the atomic token replaced.
 
+### Composer densities
+
+The session and home Composers draw two densities from one renderer: a
+one-line bar and the full box. Keep the decision a pure function of what lives
+*inside* the surface — the draft's wrapped rows at the bar's own input width,
+whether attachments exist, and whether the input is expanded. The rows that
+ride *above* the box (continuation prompt, generation status, plan, goal,
+collaboration bar, queued messages) are siblings of the surface, not rows of
+it, and must never choose its density: a blank draft under an active plan is
+still the one-line bar, and rendering the full box there left an empty
+textarea with a reserved band under it. "Empty" means no characters at all: a
+draft of newlines has rows, and the bar cannot show a second row, so Enter in
+the slim bar has to move the surface to the full box instead of pushing the
+bar's controls down inside a 46px surface.
+
+The two densities seat the same four occasional surface actions differently:
+
+| Density | Attach | Expand / schedule / terminal |
+| --- | --- | --- |
+| Slim | inside the "more" menu | inside the "more" menu |
+| Full | control row, bottom-left | one vertical column, top-right |
+
+The slim bar has room for one control beside the run configuration, so the four
+fold into a `DropdownMenu` on the more mark (`coolicons:more-grid-small`), each
+entry an icon plus a localized title. The bar then reads, left to right: more →
+usage ring → run configuration → send. Opening the schedule editor from that
+menu needs no clock trigger, so the popover's open state lives on the
+workbench (`message_schedule_open`) and a zero-sized anchor in the menu button's
+corner mounts the same panel; a menu item cannot press a trigger.
+
+The full box's trailing column is taller than two text rows. Its height is a
+constant the surface reserves (`COMPOSER_FULL_SURFACE_MIN_HEIGHT`), and the
+textarea fills the same height (`h_full`, never just a minimum: a minimum
+leaves the editor content-sized and the frame's centring floats a short draft
+in the middle of the band). Past the column the surface is derived from the
+draft itself — rows × the input's line advance plus its own padding, then the
+row's insets, the control row and the surface hairline. Do not grow a fixed
+base instead: the old `base + (rows - 2) × advance` reserved a blank band under
+the last line, and that band is what the reader sees as wasted input space.
+
 ### Session activity indicators
 
 Live thinking labels use `activity_indicator::ActivityIndicator`, a seven-cell

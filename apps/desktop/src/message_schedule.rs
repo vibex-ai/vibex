@@ -684,6 +684,23 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Opens the schedule editor for `target` without a press on its trigger.
+    ///
+    /// The one-line Composer folds the clock into its "more" menu, and a menu
+    /// closes as soon as an item is chosen, so the popover cannot be opened by
+    /// its own trigger there. The open flag is the popover's own state: setting
+    /// it mounts the editor and the surface in the same frame.
+    pub(super) fn open_message_schedule_for(
+        &mut self,
+        target: MessageScheduleTarget,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.message_schedule_open = Some(target.clone());
+        self.open_message_schedule_editor(target, window, cx);
+        cx.notify();
+    }
+
     /// Releases the editor the popover was showing. Dismissal is not a decision:
     /// the value the target already holds is left untouched.
     fn close_message_schedule_editor(
@@ -724,22 +741,43 @@ impl VibexWorkbench {
         enabled: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let id = match &target {
-            MessageScheduleTarget::NewSession => "new-session-schedule".to_string(),
-            MessageScheduleTarget::Session(id) => format!("composer-schedule-{id}"),
-            MessageScheduleTarget::Queued(id) => format!("schedule-composer-queue-{id}"),
-        };
+        self.render_message_schedule_button_at(target, enabled, None, cx)
+    }
+
+    /// The same control at a caller-chosen square size.
+    ///
+    /// The full Composer stacks it in the 30px trailing column beside the
+    /// expand and terminal controls, where the default `small` icon button
+    /// (24px) would read a size smaller than its neighbours.
+    pub(super) fn render_message_schedule_button_sized(
+        &self,
+        target: MessageScheduleTarget,
+        enabled: bool,
+        size: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        self.render_message_schedule_button_at(target, enabled, Some(size), cx)
+    }
+
+    fn render_message_schedule_button_at(
+        &self,
+        target: MessageScheduleTarget,
+        enabled: bool,
+        size: Option<f32>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         let schedule = self.schedule_for_target(&target);
-        let label = locale::text("Schedule message…", "定时发送…", "定時傳送…");
+        let label = locale::text("Schedule message", "定时发送", "定時傳送");
         let tooltip = schedule.map_or_else(
             || label.to_string(),
             |schedule| format!("{label} {}", schedule.summary()),
         );
         let trigger = button_with_aria_label(
-            Button::new(id.clone())
+            Button::new(self.message_schedule_popover_id(&target))
                 .small()
                 .ghost()
                 .compact()
+                .when_some(size, |button, size| button.size(px(size)))
                 .icon(sidebar_icon(CLOCK_ICON))
                 // Open is the popover's own state, and a target that carries a
                 // schedule stays marked while its panel is closed.
@@ -748,6 +786,47 @@ impl VibexWorkbench {
                 .disabled(!enabled),
             label,
         );
+        self.render_message_schedule_popover(target, trigger, cx)
+    }
+
+    /// The clock popover with no visible trigger of its own.
+    ///
+    /// The one-line Composer folds the clock into its "more" menu, so there is
+    /// no clock button to hang the panel from. The anchor is a zero-sized ghost
+    /// trigger placed in the menu button's corner: the panel opens in the same
+    /// place the menu did, and the shape, the editor and the close paths are the
+    /// ones the visible clock uses.
+    pub(super) fn render_message_schedule_anchor(
+        &self,
+        target: MessageScheduleTarget,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let trigger = Button::new(self.message_schedule_popover_id(&target))
+            .ghost()
+            .compact()
+            .size(px(0.0));
+        self.render_message_schedule_popover(target, trigger, cx)
+    }
+
+    /// The element id the popover and its trigger share, per target.
+    fn message_schedule_popover_id(&self, target: &MessageScheduleTarget) -> String {
+        match target {
+            MessageScheduleTarget::NewSession => "new-session-schedule".to_string(),
+            MessageScheduleTarget::Session(id) => format!("composer-schedule-{id}"),
+            MessageScheduleTarget::Queued(id) => format!("schedule-composer-queue-{id}"),
+        }
+    }
+
+    fn render_message_schedule_popover<T>(
+        &self,
+        target: MessageScheduleTarget,
+        trigger: T,
+        cx: &mut Context<Self>,
+    ) -> AnyElement
+    where
+        T: gpui_base::Selectable + IntoElement + 'static,
+    {
+        let schedule = self.schedule_for_target(&target);
         let open_target = target.clone();
         let submit_workbench = cx.weak_entity();
         let apply: MessageScheduleApply = Rc::new(move |schedule, window, cx| {
@@ -763,19 +842,35 @@ impl VibexWorkbench {
             .as_ref()
             .filter(|editor| editor.target() == &target)
             .map(|editor| editor.view.clone());
+        // The open state is owned by the workbench, not the popover, so the
+        // one-line bar's "more" menu can open this editor without a press on
+        // the clock itself. A trigger press still reports through
+        // `on_open_change`, and that is what keeps the two in step.
+        // Both halves have to agree: the flag says which target asked for the
+        // panel, the editor says the panel has something to show. A stale flag
+        // left by a composer that has since left the screen would otherwise
+        // reopen the panel when that target is drawn again.
+        let open = self.message_schedule_open.as_ref() == Some(&target)
+            && self
+                .message_schedule_editor
+                .as_ref()
+                .is_some_and(|editor| editor.target() == &target);
         let content_target = target.clone();
         let content_apply = apply.clone();
-        Popover::new(id)
+        Popover::new(self.message_schedule_popover_id(&target))
             .anchor(Anchor::BottomRight)
             .offset(px(8.0))
             .overlay_closable(true)
             .trigger(trigger)
+            .open(open)
             .on_open_change(cx.listener(move |this, open: &bool, window, cx| {
+                this.message_schedule_open = open.then(|| content_target.clone());
                 if *open {
                     this.open_message_schedule_editor(content_target.clone(), window, cx);
                 } else {
                     this.close_message_schedule_editor(&content_target, cx);
                 }
+                cx.notify();
             }))
             .content(move |_state, _window, cx| {
                 let Some(view) = editor.clone() else {
