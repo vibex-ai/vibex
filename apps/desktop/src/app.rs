@@ -812,8 +812,6 @@ const RIGHT_ACTIVITY_BAR_VERTICAL_PADDING: f32 = 8.0;
 const SESSION_TERMINAL_FRAME_INSET: f32 = 8.0;
 /// The embedded terminal window's corner radius.
 const SESSION_TERMINAL_WINDOW_RADIUS: f32 = 10.0;
-/// The tab strip's height in a session-group pane.
-const SESSION_GROUP_TAB_STRIP_HEIGHT: f32 = 36.0;
 const SIDEBAR_INLINE_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_FLOATING_TRANSITION_DURATION: Duration = Duration::from_millis(200);
 const SIDEBAR_REORDER_TRANSITION_DURATION: Duration = Duration::from_millis(160);
@@ -55290,14 +55288,6 @@ impl VibexWorkbench {
             .as_ref()
             .is_some_and(|selected| active_session_id.as_deref() == Some(selected.as_str()));
         let pane_id = pane.id.clone();
-        // A native-terminal pane extends its tab strip down to the terminal
-        // card: the strip's plate then owns the band above the window, and the
-        // page and the window drop their top gutter, border and radius so the
-        // strip and the card read as one surface.
-        let active_terminal = active_session_id
-            .as_deref()
-            .and_then(|id| self.registered_session(id))
-            .is_some_and(|session| session.is_terminal());
         let drop_region = cx
             .has_active_drag()
             .then_some(self.session_group_pane_drop_target.as_ref())
@@ -55373,21 +55363,11 @@ impl VibexWorkbench {
         // A pane always offers a split: a pane with more than one tab moves the
         // tab into the new pane, and a pane with one tab opens an empty pane
         // beside it. That is what lets a workspace grow past two panes.
-        //
-        // A native-terminal pane extends the strip down by the terminal page's
-        // own top gutter. The strip's plate then owns that band and the page
-        // drops it, so the strip reaches the card and the two read as one
-        // surface rather than a strip stacked above a bordered frame.
-        let strip_height = if active_terminal {
-            SESSION_GROUP_TAB_STRIP_HEIGHT + SESSION_TERMINAL_FRAME_INSET
-        } else {
-            SESSION_GROUP_TAB_STRIP_HEIGHT
-        };
         let strip_pane_id = pane_id.clone();
         let tab_strip = h_flex()
             .id(format!("session-group-tabs-{pane_id}"))
             .flex_none()
-            .h(px(strip_height))
+            .h(px(36.0))
             .min_w_0()
             .items_center()
             .overflow_hidden()
@@ -55921,12 +55901,6 @@ impl VibexWorkbench {
         // single-session column draws — instead of an empty conversation and a
         // composer over it. This branch owns the whole pane, so it returns
         // before the timeline borrow the conversation path needs.
-        //
-        // In a group pane the page is asked to fuse with the tab strip above it:
-        // the strip's plate owns the band above the window, and the page and
-        // window drop their top gutter, border and radius so the two read as one
-        // surface. The standalone column passes `false` and keeps the full
-        // embedded-window frame.
         if pane_session.is_terminal() {
             return div()
                 .flex_1()
@@ -55938,7 +55912,6 @@ impl VibexWorkbench {
                     focused,
                     window,
                     cx,
-                    true,
                 ))
                 .into_any_element();
         }
@@ -79977,7 +79950,7 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return empty_center_content();
         };
-        self.render_session_terminal_page_for_session(session, true, window, cx, false)
+        self.render_session_terminal_page_for_session(session, true, window, cx)
     }
 
     /// The terminal page for one session.
@@ -79986,20 +79959,12 @@ impl VibexWorkbench {
     /// draw the same page. `focused` says whether this page is the one the
     /// keyboard belongs to; a visible pane that does not hold it still streams
     /// its Agent's output, it just does not consume the focus hand-off.
-    ///
-    /// `fuse_with_tab_strip` says the page sits directly under a session-group
-    /// tab strip. The strip's plate then owns the band above the window: the
-    /// page drops its top gutter and the window drops its top border and top
-    /// radius, so the strip and the card read as one surface instead of two
-    /// stacked frames. The standalone column keeps the full embedded-window
-    /// frame.
     fn render_session_terminal_page_for_session(
         &mut self,
         session: AgentSession,
         focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
-        fuse_with_tab_strip: bool,
     ) -> AnyElement {
         let body = self.render_session_terminal_body(session, focused, window, cx);
         let window_fill = cx.theme().background;
@@ -80010,11 +79975,8 @@ impl VibexWorkbench {
             .min_w_0()
             .min_h_0()
             // The gutter is the sidebar's tone, so the window reads as a panel
-            // set into the workbench rather than as the workbench itself. A
-            // fused page drops only the top gutter: the tab strip's plate owns
-            // that band, and the window's top edge meets it as one line.
+            // set into the workbench rather than as the workbench itself.
             .p(px(SESSION_TERMINAL_FRAME_INSET))
-            .when(fuse_with_tab_strip, |this| this.pt_0())
             .bg(cx.theme().sidebar)
             .child(
                 div()
@@ -80023,22 +79985,12 @@ impl VibexWorkbench {
                     .min_w_0()
                     .min_h_0()
                     .overflow_hidden()
-                    // A fused window keeps its bottom radius and drops the top
-                    // one, so its top edge meets the strip as a straight line
-                    // and the strip and the card read as one surface.
-                    .when(!fuse_with_tab_strip, |this| {
-                        this.rounded(px(SESSION_TERMINAL_WINDOW_RADIUS))
-                    })
-                    .when(fuse_with_tab_strip, |this| {
-                        this.rounded_bl(px(SESSION_TERMINAL_WINDOW_RADIUS))
-                            .rounded_br(px(SESSION_TERMINAL_WINDOW_RADIUS))
-                    })
+                    .rounded(px(SESSION_TERMINAL_WINDOW_RADIUS))
                     // The window owns the fill the grid would otherwise paint:
                     // a square surface background would spill into the corners
                     // the radius cuts away.
                     .bg(window_fill)
                     .border_1()
-                    .border_t_0()
                     .border_color(cx.theme().border)
                     .child(body),
             )
@@ -135109,53 +135061,6 @@ mod tests {
             .expect("the terminal body should remain inspectable");
         assert!(body.contains("session: AgentSession"));
         assert!(!body.contains("self.selected_session()"));
-    }
-
-    /// A native-terminal group pane fuses its tab strip with the terminal card.
-    ///
-    /// The strip and the card are separate frames: a strip stacked above a
-    /// bordered, rounded window reads as two surfaces. A fused pane extends the
-    /// strip down by the terminal page's own top gutter, and the page drops its
-    /// top gutter while the window drops its top border and top radius, so the
-    /// strip's plate and the card read as one surface.
-    #[test]
-    fn a_terminal_group_pane_fuses_its_tab_strip_with_the_card() {
-        let source = include_str!("app.rs");
-        let pane = source
-            .split_once("    fn render_session_group_pane(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
-            .map(|(body, _)| body)
-            .expect("the group pane builder should remain inspectable");
-        // The strip only grows for a terminal pane: a conversation pane keeps
-        // the plain strip height.
-        assert!(pane.contains("let active_terminal = active_session_id"));
-        assert!(pane.contains("SESSION_GROUP_TAB_STRIP_HEIGHT + SESSION_TERMINAL_FRAME_INSET",));
-        let page = source
-            .split_once("    fn render_session_terminal_page_for_session(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// The surface the page frames, or the stand-in")
-            })
-            .map(|(body, _)| body)
-            .expect("the per-session terminal page should remain inspectable");
-        // The fused page drops its top gutter so the strip's plate owns the
-        // band above the window.
-        assert!(page.contains("fuse_with_tab_strip: bool"));
-        assert!(page.contains(".when(fuse_with_tab_strip, |this| this.pt_0())"));
-        // The fused window drops its top border and top radius so its top edge
-        // meets the strip as one line; the bottom keeps the card's rounding.
-        assert!(page.contains(".border_t_0()"));
-        let fused_rounding_mark = ".when(fuse_with_tab_strip, |this| {\n                        this.rounded_bl(px(SESSION_TERMINAL_WINDOW_RADIUS))";
-        let fused_rounding = page
-            .split_once(fused_rounding_mark)
-            .and_then(|(_, tail)| tail.split_once("})"))
-            .map(|(body, _)| body)
-            .expect("the fused window rounding should remain inspectable");
-        assert!(fused_rounding.contains(".rounded_br(px(SESSION_TERMINAL_WINDOW_RADIUS))"));
-        assert!(!fused_rounding.contains(".rounded_tl("));
-        // The standalone column passes `false` and keeps the full frame.
-        assert!(source.contains(
-            "render_session_terminal_page_for_session(session, true, window, cx, false)"
-        ));
     }
 
     /// Adopting a composer's parked geometry must not leave the prepaint
