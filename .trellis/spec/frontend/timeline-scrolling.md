@@ -366,6 +366,34 @@ against the real sidebar and it changes nothing, because the panel behind the
 container is already opaque. Painting the container solid would only be needed
 if it were ever hosted over a translucent surface.
 
+**The first of those two is now solved**, by the same change that let the
+transcript composite: `pinned_scrollbar` paints the bar in a view of its own
+(see §5), so the sidebar's column now composites eight of sixteen scrolled
+frames instead of none. The second is measured precisely and is the remaining
+work:
+
+- With the row builder's content stubbed, the column composites **fifteen of
+  sixteen** frames and its prepaint drops from ~6.5 ms to ~47 µs. The rows are
+  the whole of what remains.
+- The cause is not what a row reads. It is that the row builder must reach the
+  workbench through `Entity::update`, and an update is a write: the access log
+  bumps its write generation even when the closure does nothing, which
+  `owner_change` reports as `Changed` and `scroll_only` refuses. An *empty*
+  `update` reproduces the demotion on its own, so no amount of making the row
+  read less will fix it.
+- `&mut self` is needed because the row resolves `sidebar_selection_index`,
+  which `render_agent_sidebar` rebuilds each pass, and because
+  `sidebar_workspace_groups` calls `reconcile_legacy_sidebar_folder_worktree_owners`
+  and then `queue_ui_state`. Both early-return on unchanged inputs, but they are
+  `&mut`, and so the whole chain is.
+
+So the work is: make the sidebar's render chain take `&self`. The two caches it
+writes (`sidebar_selection_index`, `sidebar_projection_cache`) can move behind
+`RefCell`; the reconcile step cannot, because `queue_ui_state` is a real write
+to the UI-state writer. That step belongs before the render, next to the other
+per-pass work in `render_agent_sidebar`, which is where the rest of this
+section's blockers have been cleared from.
+
 Until both hold, neither `MessageScroller` nor an overlay scrollbar changes what
 the reader pays *for the sidebar*, and the existing `SidebarSessionRun` is the
 right shape. Both were measured, not inferred: removing the bar alone lifts
