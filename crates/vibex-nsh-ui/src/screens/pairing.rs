@@ -93,6 +93,8 @@ type Connect = Rc<dyn Fn(&str, &str)>;
 type Paste = Rc<dyn Fn(Signal<String>)>;
 /// An action on a runtime the page names by id or discovery key.
 type Pick = Rc<dyn Fn(&str)>;
+/// A rename of a runtime, by id and the new name.
+type Rename = Rc<dyn Fn(&str, &str)>;
 
 /// What the page may do, and the state it shows.
 ///
@@ -130,6 +132,10 @@ pub struct PairingHost {
     pub on_show_details: Pick,
     /// Remove a saved runtime's credential.
     pub on_remove_saved: Pick,
+    /// Rename a saved runtime.
+    pub on_rename_saved: Rename,
+    /// The name field in the details sheet.
+    pub rename_draft: Signal<String>,
     /// The details sheet's state.
     pub details: Signal<Option<HostDetails>>,
     pub on_close_details: Action,
@@ -202,6 +208,8 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
 /// A saved runtime's details, as a sheet.
 fn details_sheet(host: PairingHost) -> impl IntoElement {
     let details = host.details;
+    let rename_draft = host.rename_draft;
+    let on_rename = host.on_rename_saved.clone();
     let open = computed(move || details.get().is_some());
     let on_close = host.on_close_details.clone();
     sheet()
@@ -227,6 +235,30 @@ fn details_sheet(host: PairingHost) -> impl IntoElement {
                         .text_size(px(theme::FONT_HEADING))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .flex_row()
+                        .items_end()
+                        .gap(px(theme::SPACING_SM))
+                        .child(field::text_field(
+                            rename_draft,
+                            copy::text("Name", "名称", "名稱"),
+                        ))
+                        .child({
+                            let on_rename = on_rename.clone();
+                            action::secondary(
+                                copy::text("Save", "保存", "儲存"),
+                                icon(include_str!("../../assets/icons/check.svg")),
+                                false,
+                                move || {
+                                    if let Some(details) = details.get_untracked() {
+                                        on_rename(&details.id, &rename_draft.get_untracked());
+                                    }
+                                },
+                            )
+                        }),
                 )
                 .child(details_field(
                     copy::text("Type", "类型", "類型"),

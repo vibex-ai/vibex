@@ -55,6 +55,7 @@ pub struct PairingService {
     saved: Signal<Vec<SavedRuntime>>,
     nearby: Signal<Vec<NearbyRuntime>>,
     details: Signal<Option<vibex_nsh_ui::screens::pairing::HostDetails>>,
+    rename_draft: Signal<String>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     connected: Signal<Option<ConnectedRuntime>>,
@@ -96,6 +97,7 @@ impl PairingService {
             saved,
             nearby: signal(Vec::new()),
             details: signal(None),
+            rename_draft: signal(String::new()),
             busy: signal(false),
             error: signal(error),
             connected: signal(None),
@@ -145,6 +147,11 @@ impl PairingService {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.remove_host(id))
             },
+            on_rename_saved: {
+                let service = self.clone();
+                Rc::new(move |id: &str, name: &str| service.rename_host(id, name))
+            },
+            rename_draft: self.rename_draft,
             on_close_details: {
                 let service = self.clone();
                 Rc::new(move || service.details.set(None))
@@ -505,6 +512,7 @@ impl PairingService {
         else {
             return;
         };
+        self.rename_draft.set(bundle.host_label());
         self.details
             .set(Some(vibex_nsh_ui::screens::pairing::HostDetails {
                 id: host_id.to_owned(),
@@ -512,6 +520,48 @@ impl PairingService {
                 address: bundle.record.server_url.clone(),
                 server_id: bundle.expected_server_id.clone(),
             }));
+    }
+
+    /// Renames a saved runtime locally (the credential keeps the authority's
+    /// name until the runtime is reached again).
+    fn rename_host(&self, host_id: &str, name: &str) {
+        let name = name.trim();
+        let mut bundle = self
+            .bundles
+            .borrow()
+            .iter()
+            .find(|bundle| bundle.host_id() == host_id)
+            .cloned()
+            .map(|bundle| {
+                let mut bundle = bundle;
+                bundle.display_name = if name.is_empty() {
+                    None
+                } else {
+                    Some(name.to_owned())
+                };
+                bundle
+            });
+        let Some(bundle) = bundle.take() else {
+            return;
+        };
+        match self.store.upsert(bundle) {
+            Ok(bundles) => {
+                let saved_name = bundles
+                    .iter()
+                    .find(|bundle| bundle.host_id() == host_id)
+                    .map(|bundle| bundle.host_label())
+                    .unwrap_or_default();
+                self.set_bundles(bundles);
+                self.rename_draft.set(saved_name.clone());
+                if let Some(mut details) = self.details.get_untracked()
+                    && details.id == host_id
+                {
+                    details.name = saved_name;
+                    self.details.set(Some(details));
+                }
+            }
+            Err(error) => self.fail(&error),
+        }
     }
 
     /// Removes a saved runtime after the native confirmation.
