@@ -6269,6 +6269,14 @@ struct PendingPermissionRevealTarget {
     item_id: String,
 }
 
+/// What the transcript's scroll trace remembers between frames.
+#[derive(Default)]
+struct TimelineScrollTrace {
+    last_offset: Pixels,
+    /// How far the wheel asked the list to move since the last trace.
+    expected: Pixels,
+}
+
 /// Every piece of state that belongs to one session's conversation view.
 ///
 /// A session view is a *complete*, independently owned unit: the timeline and
@@ -6371,6 +6379,14 @@ pub struct SessionView {
     /// `None` while the width is still moving, which is also what marks the
     /// hints as lost and asks for the next seed.
     timeline_list_hint_width: Option<Pixels>,
+    /// What the last transcript frame left the list at, and how far the wheel
+    /// has asked it to move since.
+    ///
+    /// Only read when `VIBEX_TIMELINE_TRACE` is set, and only built in debug
+    /// builds: [`Self::trace_timeline_scroll`] compares the two to name a frame
+    /// that moved the transcript by something the reader did not ask for, and
+    /// prints the state around it.
+    timeline_trace: TimelineScrollTrace,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     /// The timeline revision [`Self::timeline_row_sizes`] was built for.
     ///
@@ -6624,6 +6640,7 @@ impl SessionView {
             timeline_viewport: Bounds::default(),
             timeline_list_seen_width: px(0.0),
             timeline_list_hint_width: None,
+            timeline_trace: TimelineScrollTrace::default(),
             pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_row_sizes_revision: 0,
@@ -32749,6 +32766,46 @@ impl VibexWorkbench {
         self.timeline_scroll.scroll_by(-delta);
     }
 
+    /// Prints a frame's scroll move when `VIBEX_TIMELINE_TRACE` is set.
+    ///
+    /// A reader should only ever see the distance their wheel asked for. Every
+    /// other move — an anchor restore, a seed, a follow resumed late — is named
+    /// here with the state that explains it, so a report of "the transcript
+    /// jumped" can point at the code that did it instead of the list's layout.
+    #[cfg(debug_assertions)]
+    fn trace_timeline_scroll(&mut self) {
+        if std::env::var_os("VIBEX_TIMELINE_TRACE").is_none() {
+            return;
+        }
+        let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        let expected = std::mem::take(&mut self.timeline_trace.expected);
+        let last = std::mem::replace(&mut self.timeline_trace.last_offset, offset);
+        let observed = offset - last;
+        let unexplained = observed - expected;
+        let viewport = self.timeline_scroll.viewport_bounds().size.height;
+        let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
+        let at_edge = offset >= px(0.0)
+            || (max_offset > px(0.0)
+                && offset <= -(max_offset + px(self.timeline_list_padding_top_px)));
+        if expected == px(0.0) && unexplained.abs() <= px(2.0) {
+            self.timeline_trace.last_offset = offset;
+            return;
+        }
+        eprintln!(
+            "TLSCROLL offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            self.timeline_follow.following_bottom,
+            self.timeline_row_sizes.len(),
+            self.timeline_scroll.item_count(),
+            self.timeline_list_seen_width,
+            self.timeline_scroll_anchor_pending,
+            self.timeline_scroll_to_latest_pending,
+            self.pending_timeline_reveal_delta,
+        );
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn trace_timeline_scroll(&mut self) {}
+
     /// Keeps the list's row count and height hints in step with the table.
     ///
     /// `gpui::list` owns the rows it lays out, so a table it does not know about
@@ -34307,6 +34364,13 @@ impl VibexWorkbench {
         };
         if delta_y == 0.0 || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0) {
             return;
+        }
+        #[cfg(debug_assertions)]
+        {
+            // The offset moves by this much in the direction the wheel asked;
+            // `trace_timeline_scroll` tells that apart from anything else that
+            // moved the list.
+            self.timeline_trace.expected += px(delta_y);
         }
 
         self.timeline_scroll_wheel_idle_task = None;
@@ -64870,6 +64934,7 @@ impl VibexWorkbench {
         if disclosure_landed {
             self.resume_timeline_follow_after_disclosure();
         }
+        self.trace_timeline_scroll();
         // Resolve a pending bottom scroll only after the row extent is rebuilt:
         // an invalidated size table would otherwise swallow the request because
         // `scroll_timeline_to_latest` skips an empty table.
