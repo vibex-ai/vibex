@@ -35,6 +35,21 @@ or to gpui-fast.
   `ChildAgentRailView`, `SessionTerminalView`) observe the workbench, so a
   workbench notify rebuilds all of them. A hot path that reaches
   `cx.notify()` on the workbench has to be worth rebuilding the shell.
+- **A view's notification also rebuilds every view above it.**
+  `Window::mark_view_dirty` walks `view_path_reversed` and inserts each
+  ancestor into `dirty_views`, so notifying a leaf rebuilds its whole chain.
+  There is no opt-out. This is why a scroll of the transcript still rebuilds
+  `TimelineView`, and with it the workbench shell: the list notifies the view
+  that painted it (`TimelineSurfaceView`), and `TimelineView` sits above it.
+  An `observe` callback cannot refuse it either — `App::notify` delivers to the
+  view's invalidator directly, not through the observer list, so recording a
+  scroll count and skipping the notify changes nothing. Measured: the transcript
+  composites eleven of twelve scrolled frames through the shell, but a scrolled
+  frame still builds fifteen views. The shell's own share of that is ~0.9 ms of
+  a ~2.1 ms prepaint, against ~1.2 ms for the surface alone.
+  Narrowing it further means the scrolling element has to stop being a
+  descendant of the shell view — a restructure of `render_column_page`, not a
+  subscription change.
 - A list row that can be recycled or shifted carries an `ElementId` built from
   its domain id, not its position, so prepending keeps its layout node and
   element state. The timeline keys a row by session and turn.
