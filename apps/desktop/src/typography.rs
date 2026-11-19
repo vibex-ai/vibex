@@ -97,6 +97,15 @@ pub const MENU_ROW: f32 = 12.5;
 pub const MENU_SUBLINE: f32 = 11.0;
 pub const MENU_HEADING: f32 = 10.0;
 pub const MENU_BODY: f32 = 13.0;
+/// A section title that sits beside a 16px icon — the docked run-options
+/// column's "Thinking depth", "Conversation mode" and feature headers.
+///
+/// The micro-heading above is smaller than a row on purpose, for uppercase
+/// caption labels. These titles are not captions: they name a section next to
+/// a 16px glyph, so their glyphs have to read as tall as that glyph. A
+/// 14px CJK character fills close to its em box, which makes the title and the
+/// icon look like one pair instead of a word with a badge.
+pub const MENU_SECTION_TITLE: f32 = 14.0;
 
 /// `size` in logical pixels expressed as rems against the default 16px root.
 pub fn ui_rems(size: f32) -> Rems {
@@ -116,6 +125,11 @@ pub fn menu_subline() -> Rems {
 /// An uppercase section heading.
 pub fn menu_heading() -> Rems {
     ui_rems(MENU_HEADING)
+}
+
+/// A section title paired with a 16px icon.
+pub fn menu_section_title() -> Rems {
+    ui_rems(MENU_SECTION_TITLE)
 }
 
 /// Free-standing body copy inside a menu (empty states, status lines).
@@ -145,6 +159,17 @@ mod tests {
         assert_eq!(clamp_terminal_opacity(0), 60);
         assert_eq!(clamp_terminal_opacity(80), 80);
         assert_eq!(clamp_terminal_opacity(250), 100);
+    }
+
+    /// A section title reads at the size of the icon beside it, not below the
+    /// rows it groups.
+    #[test]
+    fn section_title_matches_its_icon_and_steps_above_row_text() {
+        const {
+            assert!(MENU_SECTION_TITLE > MENU_ROW);
+            assert!(MENU_SECTION_TITLE <= 16.0)
+        };
+        assert!((menu_section_title().0 - rems(MENU_SECTION_TITLE / 16.0).0).abs() < f32::EPSILON);
     }
 
     #[test]

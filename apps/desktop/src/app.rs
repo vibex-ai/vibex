@@ -65814,7 +65814,7 @@ impl VibexWorkbench {
                 .px(px(10.0))
                 .pt(px(8.0))
                 .pb(px(4.0))
-                .text_size(type_scale::menu_heading())
+                .text_size(type_scale::menu_section_title())
                 .font_semibold()
                 .text_color(cx.theme().muted_foreground)
                 .child(icon)
@@ -123423,6 +123423,9 @@ mod tests {
         // Each section wears the icon its chip carried on the composer, in
         // the same chart hue: brain for thinking depth, shield for the
         // conversation mode, zap for the feature rows.
+        // The section titles are sized to read as tall as the 16px icon
+        // beside them, not as a caption below the rows they group.
+        assert!(options.contains("type_scale::menu_section_title()"));
         assert!(options.contains("effort_heading_icon()"));
         assert!(options.contains("mode_heading_icon()"));
         assert!(options.contains("icons/vibex/brain.svg"));
