@@ -34194,6 +34194,14 @@ impl VibexWorkbench {
         {
             return;
         }
+        // An anchor named past the last row is the list's own "at the end", not
+        // a position that was clamped: its offset is the whole document, which
+        // is a viewport beyond the last offset it can actually travel. Treating
+        // that as a clamp would restore the reader to their row on the first
+        // frame after they left the live edge — a jump of exactly one screen.
+        if self.timeline_scroll.logical_scroll_top().item_ix >= self.timeline_scroll.item_count() {
+            return;
+        }
         let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
         let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
         if max_offset <= px(0.0) || -offset <= max_offset {
