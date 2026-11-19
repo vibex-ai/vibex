@@ -143,6 +143,12 @@ pub struct PairingHost {
     /// button, and the Switch/Network/Clipboard footer.
     pub switcher: Signal<bool>,
     pub on_close_switcher: Action,
+    /// The connected runtime's name, when there is one.
+    pub connected_label: Signal<Option<SharedString>>,
+    /// Leave the connected runtime.
+    pub on_disconnect: Action,
+    /// Remove every saved runtime's credential.
+    pub on_clear_runtimes: Action,
     /// The details sheet's state.
     pub details: Signal<Option<HostDetails>>,
     pub on_close_details: Action,
@@ -230,7 +236,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     move || settings_open.set(true),
                 )),
         )
-        .child(settings_sheet(settings_open))
+        .child(settings_sheet(settings_open, host.clone()))
         .child(when(move || switcher.get(), {
             let on_close = host.on_close_switcher.clone();
             move || {
@@ -290,7 +296,10 @@ fn switcher_footer(
 }
 
 /// The first screen's settings sheet: the facts this build can state today.
-fn settings_sheet(open: Signal<bool>) -> impl IntoElement {
+fn settings_sheet(open: Signal<bool>, host: PairingHost) -> impl IntoElement {
+    let connected = host.connected_label;
+    let on_disconnect = host.on_disconnect.clone();
+    let on_clear = host.on_clear_runtimes.clone();
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -313,6 +322,27 @@ fn settings_sheet(open: Signal<bool>) -> impl IntoElement {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
+                .child(when(move || connected.get().is_some(), {
+                    move || {
+                        let on_disconnect = on_disconnect.clone();
+                        view()
+                            .w_full()
+                            .gap(px(theme::SPACING_XS))
+                            .child(settings_row(
+                                copy::text("Runtime", "运行时", "執行環境"),
+                                copy::text("Connected", "已连接", "已連線"),
+                            ))
+                            .child(
+                                action::secondary(
+                                    copy::text("Disconnect", "断开连接", "中斷連線"),
+                                    icon(include_str!("../../assets/icons/plug-zap.svg")),
+                                    false,
+                                    move || on_disconnect(),
+                                )
+                                .w_full(),
+                            )
+                    }
+                }))
                 .child(settings_row(
                     copy::text("Appearance", "外观", "外觀"),
                     copy::text("System", "跟随系统", "跟隨系統"),
@@ -362,9 +392,31 @@ fn settings_sheet(open: Signal<bool>) -> impl IntoElement {
                         ),
                 )
                 .child(settings_row(
+                    copy::text("Language", "语言", "語言"),
+                    copy::text("System", "跟随系统", "跟隨系統"),
+                ))
+                .child(settings_row(
                     copy::text("Version", "版本", "版本"),
                     "Vibex 0.1.8",
                 ))
+                .child(settings_row(
+                    copy::text("License", "许可", "授權"),
+                    "AGPL-3.0-or-later",
+                ))
+                .child({
+                    let on_clear = on_clear.clone();
+                    action::secondary(
+                        copy::text(
+                            "Remove saved runtimes",
+                            "移除已保存的运行时",
+                            "移除已儲存的執行環境",
+                        ),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || on_clear(),
+                    )
+                    .w_full()
+                })
                 .child(
                     action::secondary(
                         copy::text("Close", "关闭", "關閉"),

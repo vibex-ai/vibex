@@ -71,6 +71,7 @@ pub struct PairingService {
     meta: Rc<RefCell<std::collections::BTreeMap<String, HostMeta>>>,
     meta_path: PathBuf,
     switcher: Signal<bool>,
+    connected_label: Signal<Option<SharedString>>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     connected: Signal<Option<ConnectedRuntime>>,
@@ -121,6 +122,7 @@ impl PairingService {
             )),
             meta_path: data_dir.join(META_FILE),
             switcher: signal(false),
+            connected_label: signal(None),
             busy: signal(false),
             error: signal(error),
             connected: signal(None),
@@ -179,6 +181,15 @@ impl PairingService {
             on_close_switcher: {
                 let service = self.clone();
                 Rc::new(move || service.close_switcher())
+            },
+            connected_label: self.connected_label,
+            on_disconnect: {
+                let service = self.clone();
+                Rc::new(move || service.disconnect())
+            },
+            on_clear_runtimes: {
+                let service = self.clone();
+                Rc::new(move || service.clear_runtimes())
             },
             on_close_details: {
                 let service = self.clone();
@@ -442,7 +453,48 @@ impl PairingService {
     /// Leaves the connected runtime; the credential stays saved.
     pub fn disconnect(&self) {
         self.connected.set(None);
+        self.connected_label.set(None);
         self.error.set(None);
+    }
+
+    /// Removes every saved credential, after the native confirmation.
+    fn clear_runtimes(&self) {
+        let service = self.clone();
+        spawn(async move {
+            let answer = nsh_base::alert_dialog()
+                .title(copy::text(
+                    "Remove all saved runtimes?",
+                    "移除所有已保存的运行时？",
+                    "移除所有已儲存的執行環境？",
+                ))
+                .description(copy::text(
+                    "Every credential leaves this phone; pair again to reconnect.",
+                    "所有凭据都会从这台手机上删除，需要重新配对才能连接。",
+                    "所有憑證都會從這台手機上刪除，需要重新配對才能連線。",
+                ))
+                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                .destructive("remove", copy::text("Remove", "移除", "移除"))
+                .show()
+                .await;
+            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("remove")) {
+                return;
+            }
+            let ids = service
+                .bundles
+                .borrow()
+                .iter()
+                .map(|bundle| bundle.host_id().to_owned())
+                .collect::<Vec<_>>();
+            let mut remaining = service.bundles.borrow().clone();
+            for id in ids {
+                if let Ok(bundles) = service.store.remove(&id) {
+                    remaining = bundles;
+                }
+            }
+            service.set_bundles(remaining);
+            service.details.set(None);
+            service.disconnect();
+        });
     }
 
     /// Claims `entry` (a link, or a code with `server`) on a background task.
@@ -759,6 +811,7 @@ impl PairingService {
             self.save_meta();
         }
         self.switcher.set(false);
+        self.connected_label.set(Some(bundle.host_label().into()));
         self.connected.set(Some(ConnectedRuntime {
             label: bundle.host_label(),
             bundle,
