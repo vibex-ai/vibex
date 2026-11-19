@@ -261,6 +261,37 @@ Order is part of the rule, and it splits the two pending scrolls apart:
 The two cannot share one call: a bottom follow must win over a stale anchor, and
 an anchor must land on the table the reset installed.
 
+## 5b-bis. The list drops every hint when its width changes
+
+`gpui::list` invalidates all cached item heights whenever its width or padding
+differs from the last layout — its **first** layout always does — and it rewrites
+every item as `Unmeasured { size_hint: None }`. A hint-less row contributes no
+height, so the transcript's extent becomes "the rows that have been measured",
+not the conversation. Measured on a 120-turn fixture: the list reported 556px
+where the row table said 33,360px, and the figure grew by a row's height every
+time the reader scrolled one into view — the scrollbar thumb, the anchor mapping
+and `scroll_to_end` all described the shorter document, and the offset lurched
+with it.
+
+| Rule | Why |
+| --- | --- |
+| `sync_timeline_list_rows` seeds `reset_with_uniform_height` again after the width has settled, not on the frame it changed. | Seeding on the changed frame only feeds the wipe; a pane being dragged narrower changes the width on every frame, so the seed waits for it to stop. |
+| The seed restores `logical_scroll_top()` (row index + offset inside the row), not an absolute pixel offset. | The anchor is exact across the reset and describes the reader's place; a pixel offset is only an approximation of it, and is wrong the moment any row above changes height. |
+| A reader on the live edge is sent back with `scroll_to_end()` after the reset. | Without an anchor the list starts at its first row, which is the top of the conversation. |
+| The scroll position is read back the way the list itself means it. | `scroll_px_offset_for_scrollbar` includes the list's padding and `max_offset_for_scrollbar` does not; `timeline_max_scroll_offset`/`timeline_scroll_offset` put both in one coordinate system, and a test must use that pair rather than the raw ones. |
+
+## 5b-ter. Holding the screen survives the landing frame
+
+`resume_timeline_follow_after_disclosure` resumed the follow whenever the
+viewport was within 2px of the bottom. An opening row that held the screen left
+the viewport exactly at the *pre-growth* bottom, so the landing frame read that
+as "the reader never scrolled" and scrolled the newly opened row into view —
+undoing the hold the click asked for, one frame after the spring stopped.
+
+| Rule | Why |
+| --- | --- |
+| A disclosure that holds the screen (`timeline_disclosure_holds_screen`) never resumes the follow when it lands. | The hold *is* the reader's instruction; the landing frame must not reinterpret it. A closing row does not hold, so it still resumes at the bottom edge. |
+
 ## 5c. One transcript surface per session
 
 `TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
@@ -299,6 +330,10 @@ Rules that follow:
   the reset is left to itself or the order is reversed.
 - `a_pane_gets_its_own_transcript_surface` pins §5c: two sessions must not share
   one surface.
+- `scrolling_a_long_transcript_moves_by_the_requested_distance` pins §5b-bis:
+  the extent has to cover the whole table, and twenty 100px scroll steps have to
+  move the offset by exactly 100px each. Without the re-seed it reports 556px of
+  33,360px on the first step.
 
 ## 7. Sidebar list migration
 
