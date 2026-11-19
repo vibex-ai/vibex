@@ -34176,6 +34176,32 @@ impl VibexWorkbench {
         }
     }
 
+    /// Puts the reader back on their row when the document shrank under them.
+    ///
+    /// A row above the viewport that measures shorter than the hint it was
+    /// seeded with takes height out of the document. An offset that no longer
+    /// fits is resolved by the list clamping it to the new end, and that moves
+    /// the viewport by however much the document lost — a screen, when the row
+    /// that shrank is a long turn. While the reader is scrolled up, their place
+    /// is the row they were reading, so it is restored by row instead of being
+    /// left to the clamp.
+    fn keep_the_reader_out_of_the_clamp(&mut self) {
+        if self.timeline_follow.following_bottom
+            || self.timeline_scroll_wheel_idle_task.is_some()
+            || self.timeline_scrollbar_interaction_active
+            || self.timeline_scroll_anchor_pending
+            || self.pending_timeline_reveal_delta != px(0.0)
+        {
+            return;
+        }
+        let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
+        let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        if max_offset <= px(0.0) || -offset <= max_offset {
+            return;
+        }
+        self.apply_timeline_scroll_anchor();
+    }
+
     /// Puts a captured anchor back under the viewport top.
     ///
     /// Resolved *after* [`Self::sync_timeline_list_rows`], so the restore lands on
@@ -65082,6 +65108,16 @@ impl VibexWorkbench {
         // size rebuild on every frame.
         self.flush_deferred_timeline_turn_heights(cx);
         self.apply_pending_timeline_row_heights();
+        // The reader's place is sampled before this frame lays anything out, so
+        // an extent that shrinks under them has the row they were reading to
+        // come back to. Reading it costs one borrow of the list's anchor.
+        //
+        // Not while a restore is pending: that restore was captured before the
+        // window it belongs to was replaced, and sampling again here would
+        // overwrite it with the position the replacement already produced.
+        if !self.timeline_scroll_anchor_pending && !self.timeline_scroll_to_latest_pending {
+            self.capture_timeline_scroll_anchor();
+        }
         let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
         self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
             AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
@@ -65122,6 +65158,10 @@ impl VibexWorkbench {
         // is about to set. Applying it first left the reader at row zero with
         // nothing pending to correct it.
         self.apply_pending_timeline_anchor();
+        // After the anchor, because restoring one can leave the offset past the
+        // end of a document that has not been measured yet; before the trace, so
+        // a correction this frame is named by it.
+        self.keep_the_reader_out_of_the_clamp();
         // Traced after the moves above, so the frame that moved the transcript
         // is the frame the trace names.
         self.trace_timeline_scroll();
