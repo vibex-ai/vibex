@@ -7,6 +7,8 @@
 //! call-out pointed at — and the thumbnail opens the full-window preview a
 //! transcript image uses, so the read line stays the same height it measured.
 
+use std::path::Component;
+
 use super::*;
 
 #[cfg(test)]
@@ -27,15 +29,15 @@ const THUMBNAIL_HEIGHT_REMS: f32 = 1.75;
 /// only stops a panorama from pushing the file name out of the row.
 const THUMBNAIL_WIDTH_REMS: f32 = 2.5;
 
-/// The picture a read activity points at, when it names one in this workspace.
+/// The picture a read activity points at.
 ///
 /// Only reads qualify: an edit or a write line already says what changed, and a
 /// thumbnail there would suggest the row can be looked at rather than read. The
-/// path goes through the same workspace resolver the file card's open action
-/// uses, so a relative path, an absolute one under the root and a `file://` URI
-/// all land on the file the read touched. A path outside the workspace, a
-/// non-file scheme or a name that is not an image yields none, and the row
-/// keeps its file-type mark.
+/// destination may live outside the session workspace — a capture in the home
+/// directory or the system temp directory is still the picture the Agent looked
+/// at — so an absolute path and a `file://` URI are used as written. A relative
+/// path is made absolute against the workspace root. A non-file scheme or a
+/// name that is not an image yields none, and the row keeps its file-type mark.
 pub(super) fn image_read_path(
     activity: &timeline_activity::Activity,
     workspace_root: Option<&str>,
@@ -43,17 +45,66 @@ pub(super) fn image_read_path(
     if activity.icon() != vibex_ui::timeline::ActivityKind::FileRead {
         return None;
     }
-    let workspace_root = workspace_root?.trim();
-    if workspace_root.is_empty() {
-        return None;
-    }
-    let relative = agent_file_operation_preview_path(activity.path()?, Some(workspace_root))?;
-    let path = Path::new(&local_file_path(workspace_root)).join(relative);
+    let path = read_image_path(activity.path()?, workspace_root)?;
     // The extension (or a MIME type, when one is known) decides whether the
     // preview can decode it. This runs per row per frame, so it must stay a
     // string check — the bytes are read by the asset loader, not here.
     attachment_preview_image_format(&path, None)?;
     Some(path)
+}
+
+/// Resolve a read's destination to the file it names.
+///
+/// An absolute path is already the file, wherever it lives. A relative path is
+/// joined to the workspace root and normalised lexically, so `../shots/a.png`
+/// names the sibling directory the read meant instead of failing the containment
+/// check the file card's open action applies. A relative path with no workspace
+/// has nothing to resolve against.
+fn read_image_path(raw: &str, workspace_root: Option<&str>) -> Option<PathBuf> {
+    let raw = raw.trim();
+    if raw.is_empty() {
+        return None;
+    }
+    let path = match url::Url::parse(raw) {
+        Ok(url) if url.scheme() == "file" => url.to_file_path().ok()?,
+        // A Windows path parses as a one-letter scheme; it is a path, not a URL.
+        Ok(_) if Path::new(raw).is_absolute() => PathBuf::from(raw),
+        // A non-file scheme (`https:`, `asset:`, ...) names no local file.
+        Ok(_) => return None,
+        Err(_) => PathBuf::from(local_file_path(raw)),
+    };
+    let path = if path.is_absolute() {
+        path
+    } else {
+        let root = workspace_root?.trim();
+        if root.is_empty() {
+            return None;
+        }
+        Path::new(&local_file_path(root)).join(path)
+    };
+    Some(normalize_path(path))
+}
+
+/// Fold `.` and `..` without touching the filesystem.
+///
+/// The asset loader opens the path it is given, so a lexical normalisation is
+/// only about identity: the same file reached as `shots/../a.png` and `a.png`
+/// must produce one cache key, and a `..` above a workspace root means what it
+/// says rather than silently naming the root.
+fn normalize_path(path: PathBuf) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }
 
 /// The thumbnail a read line draws in place of its file-type mark.

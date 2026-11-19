@@ -41,7 +41,7 @@ fn activity(operation: FileOperationKind, path: &str) -> timeline_activity::Acti
 }
 
 #[test]
-fn a_read_of_a_workspace_picture_resolves_to_the_file() {
+fn a_read_resolves_workspace_and_external_pictures() {
     let workspace = "/work/vibex";
     assert_eq!(
         image_read_path(
@@ -68,28 +68,72 @@ fn a_read_of_a_workspace_picture_resolves_to_the_file() {
         ),
         Some(PathBuf::from("/work/vibex/docs/final-scan.png"))
     );
+    // A picture outside the workspace is still the one the Agent looked at, so
+    // an absolute path and a `file://` URI are used as written.
+    assert_eq!(
+        image_read_path(
+            &activity(FileOperationKind::Read, "/home/peat/shots/find1.png"),
+            Some(workspace),
+        ),
+        Some(PathBuf::from("/home/peat/shots/find1.png"))
+    );
+    assert_eq!(
+        image_read_path(
+            &activity(FileOperationKind::Read, "file:///tmp/vibex-capture.png"),
+            Some(workspace),
+        ),
+        Some(PathBuf::from("/tmp/vibex-capture.png"))
+    );
+    // An absolute path needs no workspace at all.
+    assert_eq!(
+        image_read_path(
+            &activity(FileOperationKind::Read, "/tmp/vibex-capture.png"),
+            None,
+        ),
+        Some(PathBuf::from("/tmp/vibex-capture.png"))
+    );
 }
 
 #[test]
-fn only_pictures_inside_the_workspace_get_a_thumbnail() {
+fn relative_reads_are_normalised_against_the_workspace() {
+    let workspace = Some("/work/vibex");
+    // A read that steps out of the workspace means the sibling it names, not
+    // the root, so both spellings land on the same file.
+    assert_eq!(
+        image_read_path(
+            &activity(FileOperationKind::Read, "../shots/a.png"),
+            workspace
+        ),
+        Some(PathBuf::from("/work/shots/a.png"))
+    );
+    assert_eq!(
+        image_read_path(
+            &activity(FileOperationKind::Read, "./docs/../shots/a.png"),
+            workspace,
+        ),
+        Some(PathBuf::from("/work/vibex/shots/a.png"))
+    );
+}
+
+#[test]
+fn only_image_reads_of_local_files_get_a_thumbnail() {
     let workspace = Some("/work/vibex");
     // A text read keeps its file-type mark.
     assert_eq!(
         image_read_path(&activity(FileOperationKind::Read, "src/lib.rs"), workspace),
         None
     );
-    // A picture outside the workspace has no path the preview can promise.
+    // A non-file scheme names no local picture.
     assert_eq!(
         image_read_path(
-            &activity(FileOperationKind::Read, "/work/other/private.png"),
+            &activity(FileOperationKind::Read, "https://example.com/shot.png"),
             workspace,
         ),
         None
     );
-    // A relative escape is rejected the same way.
     assert_eq!(
         image_read_path(
-            &activity(FileOperationKind::Read, "../private.png"),
+            &activity(FileOperationKind::Read, "asset://shots/shot.png"),
             workspace,
         ),
         None
@@ -109,7 +153,7 @@ fn only_pictures_inside_the_workspace_get_a_thumbnail() {
         ),
         None
     );
-    // A session without a workspace cannot resolve a path at all.
+    // A relative path with no workspace has nothing to resolve against.
     assert_eq!(
         image_read_path(&activity(FileOperationKind::Read, "docs/pic.png"), None),
         None
@@ -119,6 +163,10 @@ fn only_pictures_inside_the_workspace_get_a_thumbnail() {
             &activity(FileOperationKind::Read, "docs/pic.png"),
             Some("  ")
         ),
+        None
+    );
+    assert_eq!(
+        image_read_path(&activity(FileOperationKind::Read, ""), workspace),
         None
     );
 }
