@@ -22,7 +22,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Area | Where it lives | Automated coverage | Verified on this machine | Confirm on device |
 | --- | --- | --- | --- | --- |
 | Pairing page, link, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 4 headless page tests, 14 pairing-crate tests | headless + unit | paste, clipboard, real claim round-trip |
-| Scan a QR code | `screens/pairing.rs`, `scan_photo` in `src/pairing.rs` | unit: `rqrr` decode path; emulator: picker and a pushed QR photo decode | emulator: selecting a QR photo claims its link | photograph the desktop QR and pick it; live camera needs a host |
+| Scan a QR code | `android/` host, `screens/pairing.rs`, `scan_photo` | emulator: host launches ZXing CaptureActivity, camera permission asked; host→app JNI result exercised with a probe; photo path decodes a pushed QR | emulator | scan a real desktop QR on a phone |
 | Find runtimes on the LAN | `apps/mobile-nsh/src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules | emulator: the sheet opens and reports Searching (no runtime on that network) | discovery and approval against a desktop on the same LAN |
 | Session shell and switching | `screens/session.rs`, `apps/mobile-nsh/src/session.rs` | `the_shell_opens_on_the_first_session`, `the_drawer_lists_sessions_and_switching_one_swaps_the_transcript` | headless | long lists, scroll, safe areas |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
@@ -47,7 +47,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Host inbound events | `src/host.rs` | 5 unit tests | unit | real scan/discovery JSON from a shell |
 | Host request queue (legacy) | `src/host.rs`, `src/platform/*` | `host_requests_are_taken_once_in_order` | unit | no longer used by the app; kept for a shell that supplies its own scan/discovery |
 | Device name | `src/host.rs`, platform entry points | `a_platform_device_name_is_kept_when_usable` | unit | name shown in the runtime's paired-device list |
-| Platform embedding | `src/platform/{ios,android}.rs`, README | compile-gated only | **not compiled** (no SDK/NDK/Xcode) | attach/detach, scan result, discovery event |
+| Platform embedding | `android/` host, `src/platform/android.rs` | compiled and run on the emulator | Android host mounts the app | iOS host (no Xcode) |
 | Packaging | `scripts/build-{android,ios}.sh` | `bash -n` | syntax only | `nsh package`, signing, store upload |
 
 ## Device pass, in order
@@ -75,8 +75,9 @@ anything that needs a runtime or a phone are listed at the bottom.
 
 - Android was built here: `nsh` 0.6.0, SDK platform/build-tools 35, NDK 27.2,
   and a debug-signed universal APK. On an API 35 emulator the pairing page,
-  the Link sheet, the photo picker's QR decode (a pushed QR photo was read and
-  claimed) and the Find sheet (browsing started) were exercised; the universal APK
+  the Link sheet, the custom host's ZXing scanner (opened from Scan, with the
+  camera permission dialog), the host→app scan result, the photo picker's QR
+  decode and the Find sheet (browsing started) were exercised; the universal APK
   (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too. A real QR
   decode and a desktop approving the zero-config code still need a phone and a
   desktop on one LAN.

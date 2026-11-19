@@ -112,15 +112,22 @@ impl PairingService {
         let find = self.clone();
         let pick_saved = self.clone();
         let pick_nearby = self.clone();
+        let scan = self.clone();
         PairingHost {
             saved: self.saved,
             nearby: self.nearby,
             busy: self.busy,
             error: self.error,
-            on_scan: {
-                let service = self.clone();
-                Rc::new(move || service.scan_photo())
-            },
+            on_scan: Rc::new(move || {
+                if crate::host::scanner_available() {
+                    // A custom host owns the camera; it polls the request
+                    // queue and answers through the scan event.
+                    crate::host::request_scan();
+                    scan.error.set(None);
+                } else {
+                    scan.scan_photo();
+                }
+            }),
             on_connect: Rc::new(move |entry, server| connect.connect_entry(entry, server)),
             on_paste: Rc::new(move |draft| paste.paste(draft)),
             on_find: Rc::new(move || find.start_nearby()),

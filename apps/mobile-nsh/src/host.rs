@@ -47,6 +47,25 @@ pub enum HostEvent {
 
 static SENDER: OnceLock<Mutex<Option<UnboundedSender<HostEvent>>>> = OnceLock::new();
 
+/// Whether the host carries a live camera scanner (set by a custom host).
+static SCANNER_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Records that the host can scan a QR code with its camera. Called by the
+/// host before it mounts the app.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host sets this")
+)]
+pub fn set_scanner_available(available: bool) {
+    SCANNER_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether Scan should ask the host for the camera instead of the photo
+/// picker.
+pub fn scanner_available() -> bool {
+    SCANNER_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 /// The name the platform reports for this phone, once the host sets it.
 static DEVICE_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 

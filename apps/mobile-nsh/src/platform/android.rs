@@ -12,7 +12,7 @@
 
 use std::ffi::c_void;
 
-use nsh_android::{Root, run_root};
+use nsh_android::run_root;
 
 /// Mounts the app into the `NshView` whose native handle is `handle`.
 ///
@@ -26,7 +26,17 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeRunRoot(
     _class: *mut c_void,
     handle: i64,
 ) {
-    run_root(handle, Root::of::<crate::App>());
+    run_root(handle, crate::android_root());
+}
+
+/// Records that the host can scan QR codes with its camera.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetScannerAvailable(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    available: jni::sys::jboolean,
+) {
+    crate::host::set_scanner_available(available);
 }
 
 use jni::{

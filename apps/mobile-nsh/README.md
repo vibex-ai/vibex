@@ -52,11 +52,12 @@ The page is backed by a real pairing service:
 
 Scan and Find work in the app itself, without a Kotlin or Swift host:
 
-- **Scan** opens the system photo picker; the chosen photo is decoded in Rust
-  with `rqrr` and its pairing link is claimed like a pasted one. This is the
-  path `nsh` 0.6.0 allows a Rust app: its WebView never receives the camera
-  capability (`runRust` loads the root without the app's declared
-  capabilities), so a live camera preview needs a host or an nsh change.
+- **Scan** uses the camera in the custom Android host (`android/`): the host
+  polls the app's request queue, runs a ZXing scanner and reports the code
+  back over JNI. Without a host (or on iOS today) it falls back to the system
+  photo picker and decodes the chosen image in Rust with `rqrr`; nsh 0.6.0
+  gives a Rust app's WebView no camera capability, which is why the host owns
+  the camera.
 - **Find** browses `_vibex._tcp.local.` in Rust with `mdns-sd`, validates the
   zero-config TXT record, lists the runtimes it resolves, and starts a
   `ZeroConfigLanPairingSession` on tap. The desktop must approve the six-digit
@@ -264,10 +265,10 @@ default: break
 }
 ```
 
-Photo scanning and discovery live in the app (see "What is there today"), so an
-embedding host only mounts the app and reports the platform's device name. A
-host that wants to supply a live camera can do so through the
-`nativeScanResult` entry point; the app does not require it.
+The custom host in `android/` is the reference: it mounts the app, reports the
+device name, and answers Scan with its camera through `nativeScanResult`. A
+host that supplies no camera leaves Scan on the photo picker; the app does not
+require one.
 
 ## Theme
 
