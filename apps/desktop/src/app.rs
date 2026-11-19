@@ -6277,6 +6277,9 @@ struct TimelineScrollTrace {
     last_offset: Pixels,
     /// How far the wheel asked the list to move since the last trace.
     expected: Pixels,
+    /// Trace lines written so far, so a captured file can be read in order even
+    /// though several frames may describe the same offset.
+    frames: u64,
 }
 
 /// Every piece of state that belongs to one session's conversation view.
@@ -32781,11 +32784,17 @@ impl VibexWorkbench {
     /// other move — an anchor restore, a seed, a follow resumed late — is named
     /// here with the state that explains it, so a report of "the transcript
     /// jumped" can point at the code that did it instead of the list's layout.
+    ///
+    /// The variable is either `1` (the terminal, the original behaviour) or a
+    /// path. A file is the only way a report can be gathered from a build that
+    /// runs in someone else's terminal — or from a run that ends in a panic,
+    /// where the terminal scrollback goes with the process — so the trace is
+    /// appended to it, one flushed line per reported frame.
     #[cfg(debug_assertions)]
     fn trace_timeline_scroll(&mut self) {
-        if std::env::var_os("VIBEX_TIMELINE_TRACE").is_none() {
+        let Some(sink) = std::env::var_os("VIBEX_TIMELINE_TRACE") else {
             return;
-        }
+        };
         let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
         let expected = std::mem::take(&mut self.timeline_trace.expected);
         let last = std::mem::replace(&mut self.timeline_trace.last_offset, offset);
@@ -32800,8 +32809,10 @@ impl VibexWorkbench {
             self.timeline_trace.last_offset = offset;
             return;
         }
-        eprintln!(
-            "TLSCROLL offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} pending_anchor={} pending_latest={} pending_reveal={:?}",
+        self.timeline_trace.frames += 1;
+        let line = format!(
+            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            self.timeline_trace.frames,
             self.timeline_follow.following_bottom,
             self.timeline_row_sizes.len(),
             self.timeline_scroll.item_count(),
@@ -32810,6 +32821,19 @@ impl VibexWorkbench {
             self.timeline_scroll_to_latest_pending,
             self.pending_timeline_reveal_delta,
         );
+        if sink == std::ffi::OsStr::new("1") {
+            eprintln!("{line}");
+            return;
+        }
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink)
+            && let Err(error) = writeln!(file, "{line}")
+        {
+            eprintln!("VIBEX_TIMELINE_TRACE cannot append to the trace file: {error}");
+        }
     }
 
     #[cfg(not(debug_assertions))]
