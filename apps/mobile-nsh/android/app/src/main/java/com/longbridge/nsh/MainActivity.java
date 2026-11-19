@@ -1,16 +1,12 @@
 package com.longbridge.nsh;
 
-import android.Manifest;
 import android.app.Activity;
 import android.content.Intent;
-import android.content.pm.PackageManager;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 
 import ai.vibex.mobile.nsh.NshHost;
-import com.google.zxing.integration.android.IntentIntegrator;
-import com.google.zxing.integration.android.IntentResult;
 
 /**
  * The Vibex host: mounts the Rust app into an {@link NshView} and lends it the
@@ -22,7 +18,7 @@ import com.google.zxing.integration.android.IntentResult;
  * shell, discovery and the photo fallback — lives in the Rust app.
  */
 public final class MainActivity extends Activity {
-    private static final int CAMERA_REQUEST = 41;
+    private static final int SCAN_REQUEST = 42;
 
     private NshView view;
     private final Handler handler = new Handler(Looper.getMainLooper());
@@ -57,41 +53,21 @@ public final class MainActivity extends Activity {
     }
 
     private void openScanner() {
-        if (checkSelfPermission(Manifest.permission.CAMERA) != PackageManager.PERMISSION_GRANTED) {
-            requestPermissions(new String[] {Manifest.permission.CAMERA}, CAMERA_REQUEST);
-            return;
-        }
-        IntentIntegrator integrator = new IntentIntegrator(this);
-        integrator.setDesiredBarcodeFormats(IntentIntegrator.QR_CODE);
-        integrator.setPrompt("扫描电脑上的配对二维码");
-        integrator.setBeepEnabled(false);
-        integrator.setOrientationLocked(false);
-        integrator.initiateScan();
-    }
-
-    @Override
-    public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
-        super.onRequestPermissionsResult(requestCode, permissions, results);
-        if (requestCode != CAMERA_REQUEST) {
-            return;
-        }
-        if (results.length > 0 && results[0] == PackageManager.PERMISSION_GRANTED) {
-            openScanner();
-        } else {
-            scanning = false;
-        }
+        startActivityForResult(new Intent(this, ScannerActivity.class), SCAN_REQUEST);
     }
 
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
-        IntentResult result = IntentIntegrator.parseActivityResult(requestCode, resultCode, data);
-        if (result == null) {
+        if (requestCode != SCAN_REQUEST) {
             return;
         }
         scanning = false;
-        if (result.getContents() != null) {
-            NshHost.nativeScanResult(result.getContents());
+        if (resultCode == RESULT_OK && data != null) {
+            String value = data.getStringExtra(ScannerActivity.EXTRA_RESULT);
+            if (value != null) {
+                NshHost.nativeScanResult(value);
+            }
         }
     }
 

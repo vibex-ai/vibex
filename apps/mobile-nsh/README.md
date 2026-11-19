@@ -53,11 +53,13 @@ The page is backed by a real pairing service:
 Scan and Find work in the app itself, without a Kotlin or Swift host:
 
 - **Scan** uses the camera in the custom Android host (`android/`): the host
-  polls the app's request queue, runs a ZXing scanner and reports the code
-  back over JNI. Without a host (or on iOS today) it falls back to the system
-  photo picker and decodes the chosen image in Rust with `rqrr`; nsh 0.6.0
-  gives a Rust app's WebView no camera capability, which is why the host owns
-  the camera.
+  polls the app's request queue, opens the scanner and reports the code back
+  over JNI. The scanner matches the GPUI client's: portrait, a scrimmed
+  viewfinder with corner brackets, close, the pairing hint, and "Choose from
+  photos" for a screenshot (a picked image without a `vibex://` pairing entry
+  says so and keeps the scanner open). Without a host (or on iOS today) the
+  app falls back to the system photo picker and `rqrr`; nsh 0.6.0 gives a Rust
+  app's WebView no camera capability, which is why the host owns the camera.
 - **Find** browses `_vibex._tcp.local.` in Rust with `mdns-sd`, validates the
   zero-config TXT record, lists the runtimes it resolves, and starts a
   `ZeroConfigLanPairingSession` on tap. The desktop must approve the six-digit
