@@ -69,11 +69,11 @@ use gpui_component::{
     },
     h_flex,
     input::{
-        Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
-        Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
+        Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, DisplayMap,
+        Enter as InputEnter, Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
         InlineTokenClickEvent, InlineTokenContext, InlineTokenSpan, Input, InputContent,
         InputEvent, InputState, InputToken, MoveDown as InputMoveDown, MoveLeft as InputMoveLeft,
-        MoveRight as InputMoveRight, MoveUp as InputMoveUp, Paste as InputPaste, Textarea,
+        MoveRight as InputMoveRight, MoveUp as InputMoveUp, Paste as InputPaste, Rope, Textarea,
         TextareaState,
     },
     kbd::Kbd,
@@ -1333,6 +1333,11 @@ const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 16.0;
 /// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
 /// a one-line bar reads as a pill, so its padding is tighter.
 const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
+/// The textarea's own editor paddings (`Size::Medium`: 10px each side) plus
+/// its 10px right margin — what the element's prepaint subtracts from its
+/// bounds before it wraps. The density probe wraps at the same figure so its
+/// row count agrees with what the input will actually draw.
+const COMPOSER_INPUT_TEXT_INSET: f32 = 30.0;
 /// The multi-row box grows with its draft: each wrapped line adds one line
 /// advance to the surface, from the two-row floor it always reserved up to
 /// the input's own row cap, past which the textarea scrolls inside.
@@ -4140,13 +4145,14 @@ enum ComposerDensity {
 
 /// The density one composer frame draws.
 ///
-/// `wrapped_rows` is how many rows the input's own display map reports for the
-/// draft, which is the only count that answers the question the two densities
-/// exist for: does this draft fit on one line? `draft_empty` keeps a blank draft
-/// slim even before the map has been prepared. `extra_rows` folds in everything
-/// else that already asks for the box — the extension surfaces, the notice rows,
-/// the plan, the goal and the collaboration rows. An expanded composer is always
-/// full: it is a fullscreen editor.
+/// `wrapped_rows` is how many rows the draft needs at the width the one-line
+/// bar gives its input (see [`composer_draft_wrapped_rows`]) — a width that
+/// does not depend on the density, so the answer cannot flip because of the
+/// layout the answer itself chose. `draft_empty` keeps a blank draft slim
+/// even before the map has been prepared. `extra_rows` folds in everything
+/// else that already asks for the box — the extension surfaces, the notice
+/// rows, the plan, the goal and the collaboration rows. An expanded composer
+/// is always full: it is a fullscreen editor.
 fn composer_density(
     wrapped_rows: usize,
     draft_empty: bool,
@@ -4163,7 +4169,7 @@ fn composer_density(
     }
 }
 
-/// The rows a draft occupies in its own input, for the density decision.
+/// The rows a draft occupies in its own input, for the surface's height.
 ///
 /// The display map is refreshed by layout, so it is exact for every frame after
 /// the first. Before the first layout it can report zero rows for non-empty
@@ -4175,6 +4181,96 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
         return wrapped;
     }
     text.lines().count().max(1)
+}
+
+/// The width the one-line bar would give its input, from the pane's own
+/// column — never from the density this frame is about to choose.
+///
+/// Every control the slim row seats beside the text has a fixed width: attach
+/// 32, the trailing cluster 3×30, the usage ring 30, the send action 28, five
+/// 8px gaps, the row's 10px insets and the surface's hairlines. Only the
+/// run-configuration trigger varies, and its label truncates at 240px, so the
+/// bar's input is never wider than this figure. Estimating on the narrow side
+/// is deliberate: a draft the estimate calls one line is one line on the real
+/// bar too, so the bar cannot bounce back to the box on the next frame.
+fn composer_slim_input_width(
+    pane_width: f32,
+    content_max_width: Option<f32>,
+    content_inset: f32,
+    compact_runtime_controls: bool,
+    has_runtime_selection: bool,
+) -> f32 {
+    let surface_width = timeline_content_width(Some(pane_width), content_max_width, content_inset);
+    let trigger = if !has_runtime_selection {
+        0.0
+    } else if compact_runtime_controls {
+        32.0
+    } else {
+        240.0
+    };
+    (surface_width
+        - 2.0 * COMPOSER_SLIM_HORIZONTAL_PADDING
+        - 2.0
+        - 5.0 * 8.0
+        - 32.0
+        - 3.0 * 30.0
+        - 30.0
+        - 28.0
+        - trigger)
+        .max(120.0)
+}
+
+/// How many rows the draft needs on the one-line bar's own input width.
+///
+/// The density decision must not read the live input's wrapped rows: the two
+/// densities give the input different widths (the slim bar seats its controls
+/// beside the text, the full box moves them out of the row), so a draft near
+/// the wrap boundary reads two rows in one density and one in the other, and
+/// the composer oscillates between them on every frame. This probe wraps the
+/// draft through its own display map at the width the SLIM row gives the
+/// input — a figure derived from the pane, not from the density being chosen —
+/// so the decision is a fixed point: a draft that fits the bar keeps the bar,
+/// and a draft that does not keeps the box, whose input is wider still.
+///
+/// A draft carrying inline tokens (agent chips, attachment markers) falls
+/// back to the input's own count: the tokens' element widths live in the
+/// input's layout cache where a probe cannot measure them, and the live count
+/// errs toward the box rather than hiding a chip's row inside the bar. The
+/// probe map is rebuilt only when the draft, the width or the font moves, so
+/// a resting composer pays one comparison per frame.
+fn composer_draft_wrapped_rows(
+    probe: &mut Option<(String, f32, gpui::Font, f32, DisplayMap)>,
+    input: &Entity<TextareaState>,
+    draft: &str,
+    input_width: f32,
+    font: gpui::Font,
+    font_size: f32,
+    cx: &mut App,
+) -> usize {
+    if !input.read(cx).tokens().is_empty() {
+        return composer_wrapped_rows(input.read(cx), draft);
+    }
+    let reusable = probe
+        .as_ref()
+        .is_some_and(|(text, width, probe_font, size, _)| {
+            text == draft
+                && (*width - input_width).abs() <= 0.5
+                && *probe_font == font
+                && (*size - font_size).abs() <= 0.01
+        });
+    if !reusable {
+        let mut map = DisplayMap::new(
+            font.clone(),
+            px(font_size),
+            Some(px((input_width - COMPOSER_INPUT_TEXT_INSET).max(1.0))),
+        );
+        map.set_text(&Rope::from(draft), cx);
+        *probe = Some((draft.to_string(), input_width, font, font_size, map));
+    }
+    probe
+        .as_ref()
+        .map(|(_, _, _, _, map)| map.wrap_row_count().max(1))
+        .unwrap_or_else(|| draft.lines().count().max(1))
 }
 
 /// The height the composer surface asks for, before the morph glides to it.
@@ -6347,6 +6443,10 @@ pub struct SessionView {
     /// borrow that moved to another session snaps the morph instead of
     /// gliding between two sessions' heights.
     composer_surface_session: Option<VibexSessionId>,
+    /// The density probe's wrapped draft (text, input width, font, size, map).
+    /// Kept per session view so a group's panes never share one probe, and
+    /// rebuilt only when the draft or its measuring width moves.
+    composer_density_probe: Option<(String, f32, gpui::Font, f32, DisplayMap)>,
     composer_goal_editing: bool,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
@@ -6508,6 +6608,7 @@ impl SessionView {
             composer_history: ComposerHistoryState::default(),
             composer_expanded: false,
             composer_surface_session: None,
+            composer_density_probe: None,
             composer_goal_editing: false,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
@@ -65522,17 +65623,42 @@ impl VibexWorkbench {
         let selected_background = runtime_menu_selected_background(cx);
         let controls_pending = self.active_runtime_controls_pending();
         let scope = self.composer_menu_scope();
-        let heading = |label: String| {
-            div()
+        // Each section wears the icon its chip carried on the composer, in
+        // the same chart hue, so the run configuration reads the same here as
+        // it did on the bar: thinking depth, conversation mode, then features.
+        let is_dark = cx.theme().is_dark();
+        let heading = |icon: AnyElement, label: String| {
+            h_flex()
                 .w_full()
                 .flex_none()
+                .items_center()
+                .gap(px(6.0))
                 .px(px(10.0))
                 .pt(px(8.0))
                 .pb(px(4.0))
                 .text_size(type_scale::menu_heading())
                 .font_semibold()
                 .text_color(cx.theme().muted_foreground)
+                .child(icon)
                 .child(label)
+        };
+        let effort_heading_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/brain.svg",
+                theme::semantic_color("chart-3", is_dark),
+            )
+        };
+        let mode_heading_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/shield-alert.svg",
+                theme::semantic_color("chart-4", is_dark),
+            )
+        };
+        let feature_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/zap.svg",
+                theme::semantic_color("chart-5", is_dark),
+            )
         };
         let mut column = v_flex()
             .id(format!("composer-runtime-options{scope}"))
@@ -65547,6 +65673,7 @@ impl VibexWorkbench {
             let default_effort = runtime_default_reasoning_effort(&projection.reasoning_efforts);
             let selected_value = runtime_reasoning_effort_value(Some(desired));
             column = column.child(heading(
+                effort_heading_icon(),
                 locale::text("Thinking depth", "思考深度", "思考深度").to_string(),
             ));
             for choice in projection.reasoning_efforts.iter().cloned() {
@@ -65602,6 +65729,7 @@ impl VibexWorkbench {
         if !projection.modes.is_empty() {
             let selected_value = desired.mode_id.clone().unwrap_or_default();
             column = column.child(heading(
+                mode_heading_icon(),
                 locale::text("Conversation mode", "对话模式", "對話模式").to_string(),
             ));
             for choice in projection.modes.iter().cloned() {
@@ -65661,6 +65789,7 @@ impl VibexWorkbench {
                                 .px_2()
                                 .items_center()
                                 .gap_2()
+                                .child(feature_icon())
                                 .child(
                                     div()
                                         .min_w_0()
@@ -65695,7 +65824,7 @@ impl VibexWorkbench {
                         .as_ref()
                         .map(|value| value.value.clone())
                         .unwrap_or_default();
-                    column = column.child(heading(feature.label.clone()));
+                    column = column.child(heading(feature_icon(), feature.label.clone()));
                     for value in values {
                         let selected = value.value == selected_value;
                         let row_id = format!(
@@ -65778,6 +65907,7 @@ impl VibexWorkbench {
                                     cx,
                                 )
                             }))
+                            .child(feature_icon())
                             .child(div().min_w_0().flex_1().truncate().child(feature_label))
                             .child(
                                 div()
@@ -78135,12 +78265,38 @@ impl VibexWorkbench {
         // on a one-line bar.
         let composer_draft = composer_input.read(cx).value();
         let composer_draft_is_empty = composer_draft.trim().is_empty();
+        // The density reads the draft at the width the ONE-LINE bar would give
+        // it, measured from the pane's column rather than from either density's
+        // layout: reading the live input made a draft at the wrap boundary
+        // count two rows in the bar and one in the box, and the surface
+        // bounced between the densities on every frame.
+        let composer_slim_width = composer_slim_input_width(
+            composer_width,
+            content_max_width,
+            content_insets.horizontal,
+            compact_runtime_controls,
+            runtime_projection.is_some(),
+        );
+        // The textarea draws at the component's Medium input size: 0.875rem.
+        let composer_probe_font = window.text_style().font();
+        let composer_probe_font_size = f32::from(window.rem_size()) * 0.875;
+        let composer_density_rows = composer_draft_wrapped_rows(
+            &mut self.composer_density_probe,
+            &composer_input,
+            composer_draft.as_str(),
+            composer_slim_width,
+            composer_probe_font,
+            composer_probe_font_size,
+            cx,
+        );
+        // The surface's height still follows the input's own wrapped rows: the
+        // box it reserves has to fit the rows the painted input actually draws.
         let composer_rows = {
             let input = composer_input.read(cx);
             composer_wrapped_rows(input, composer_draft.as_str())
         };
         let composer_density = composer_density(
-            composer_rows,
+            composer_density_rows,
             composer_draft_is_empty,
             self.composer_attachments.is_empty(),
             composer_extension_visible,
@@ -122428,6 +122584,13 @@ mod tests {
         // Both densities are drawn by the same renderer, chosen from the draft,
         // and the surface's height glides to the height the content asks for.
         assert!(composer.contains("let composer_density = composer_density("));
+        // The density reads the draft at the one-line bar's own input width,
+        // never at the live input's: the two densities give the input
+        // different widths, and a decision that reads its own layout's answer
+        // oscillates at the wrap boundary.
+        assert!(composer.contains("let composer_density_rows = composer_draft_wrapped_rows("));
+        assert!(composer.contains("let composer_slim_width = composer_slim_input_width("));
+        assert!(composer.contains("            composer_density_rows,"));
         assert!(composer.contains("COMPOSER_SLIM_SURFACE_HEIGHT"));
         assert!(composer.contains("COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT"));
         assert!(composer.contains("let composer_surface_target = composer_surface_height("));
@@ -122727,6 +122890,17 @@ mod tests {
         assert!(options.contains("choose_runtime_selection("));
         assert!(options.contains("set_runtime_feature_value("));
         assert!(options.contains("prompt_runtime_feature_value("));
+        // Each section wears the icon its chip carried on the composer, in
+        // the same chart hue: brain for thinking depth, shield for the
+        // conversation mode, zap for the feature rows.
+        assert!(options.contains("effort_heading_icon()"));
+        assert!(options.contains("mode_heading_icon()"));
+        assert!(options.contains("icons/vibex/brain.svg"));
+        assert!(options.contains("icons/vibex/shield-alert.svg"));
+        assert!(options.contains("icons/vibex/zap.svg"));
+        assert!(options.contains(r#"theme::semantic_color("chart-3", is_dark)"#));
+        assert!(options.contains(r#"theme::semantic_color("chart-4", is_dark)"#));
+        assert!(options.contains(r#"theme::semantic_color("chart-5", is_dark)"#));
     }
 
     /// The fullscreen composer is an input box, not just a taller surface: the
@@ -124445,6 +124619,141 @@ mod tests {
         assert!(
             COMPOSER_SLIM_SURFACE_HEIGHT < ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT,
             "the bar must be shorter than the box, or the morph has nothing to glide"
+        );
+    }
+
+    /// The bar's input width comes from the pane's column and the controls
+    /// the bar seats beside the text — never from the density being chosen.
+    #[test]
+    fn composer_slim_input_width_is_a_property_of_the_pane_not_the_density() {
+        let wide = composer_slim_input_width(1200.0, None, 24.0, false, true);
+        // 1200 - 48 inset = 1152 surface; minus insets/hairlines/gaps and the
+        // fixed controls (32 + 90 + 30 + 28) and the 240px trigger.
+        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 40.0 - 180.0 - 240.0);
+        // The compact trigger frees the label's width for the draft.
+        let compact = composer_slim_input_width(1200.0, None, 24.0, true, true);
+        assert_eq!(compact, wide + 240.0 - 32.0);
+        // No runtime selection, no trigger at all.
+        let bare = composer_slim_input_width(1200.0, None, 24.0, false, false);
+        assert_eq!(bare, wide + 240.0);
+        // The session content cap bounds the surface, and a sliver of a pane
+        // still leaves the probe a usable width instead of a negative one.
+        let capped = composer_slim_input_width(4000.0, Some(1024.0), 24.0, false, true);
+        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 40.0 - 180.0 - 240.0);
+        assert!(composer_slim_input_width(200.0, None, 0.0, false, true) >= 120.0);
+    }
+
+    /// The reported failure: a draft that wraps to two rows on the slim bar's
+    /// input but fits one row on the full box's wider input made the density
+    /// flip on every frame. The probe answers at the bar's width regardless of
+    /// which density is painted, so the decision is a fixed point.
+    #[gpui::test]
+    fn composer_density_does_not_oscillate_at_the_wrap_boundary(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot: Rc<RefCell<Option<Entity<TextareaState>>>> = Rc::new(RefCell::new(None));
+        let stored = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 8));
+            *stored.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerTokenProbe {
+                input,
+                agent_identity: None,
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("the probe owns its input");
+        // The probe window lays the textarea out at 160px; a draft of this
+        // length wraps there but fits the wider box the full density gives.
+        let draft = "a draft that sits right at the wrap boundary of the bar";
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.set_value(draft, window, cx));
+            let _ = window.draw(cx);
+        });
+        let (font, font_size) = cx.update(|window, _| {
+            (
+                window.text_style().font(),
+                f32::from(window.rem_size()) * 0.875,
+            )
+        });
+        // The bar's input is narrow (the probe window's own 160px column);
+        // the full box's input is much wider. The live map wraps at 160px.
+        let slim_width = 160.0;
+        let full_width = 600.0;
+        let mut probe = None;
+        let rows_at_bar_width = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                slim_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert!(
+            rows_at_bar_width >= 2,
+            "the fixture draft must wrap on the bar's width: {rows_at_bar_width}"
+        );
+        // Whatever density is painted next — even one whose own input fits the
+        // draft on a single row — the probe keeps answering at the bar's width.
+        let rows_again = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                slim_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(rows_again, rows_at_bar_width);
+        assert_eq!(
+            composer_density(rows_again, false, true, false, false, false),
+            ComposerDensity::Full,
+            "a draft that wraps on the bar stays in the box"
+        );
+        // The full box's own width would call it one line — reading THAT is
+        // what used to flip the density back to the bar.
+        let rows_at_box_width = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                full_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(rows_at_box_width, 1);
+        // And back at the bar's width the answer returns to two: the probe
+        // tracks the width it is asked about, never the painted layout.
+        let rows_back = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(&mut probe, &input, draft, slim_width, font, font_size, cx)
+        });
+        assert_eq!(rows_back, rows_at_bar_width);
+        // A short draft is one row at the bar's width and keeps the bar.
+        let short = "hi";
+        let short_rows = cx.update(|window, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                short,
+                slim_width,
+                window.text_style().font(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(short_rows, 1);
+        assert_eq!(
+            composer_density(short_rows, false, true, false, false, false),
+            ComposerDensity::Slim
         );
     }
 
