@@ -511,6 +511,7 @@ impl Render for ActivityProbe {
             Some((self.expanded, f32::from(u8::from(self.expanded)))),
             target,
             None,
+            None,
             self.live_labels_animate,
             cx,
         )
@@ -554,6 +555,7 @@ impl Render for ActivityProbe {
                 &self.activity,
                 false,
                 Some((false, 0.0)),
+                None,
                 None,
                 None,
                 self.live_labels_animate,

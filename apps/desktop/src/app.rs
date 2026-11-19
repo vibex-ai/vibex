@@ -27,6 +27,8 @@ mod timeline_activity;
 mod timeline_disclosure;
 #[path = "timeline_group_body.rs"]
 mod timeline_group_body;
+#[path = "timeline_image.rs"]
+mod timeline_image;
 #[path = "timeline_loading.rs"]
 mod timeline_loading;
 #[path = "timeline_tool_detail.rs"]
@@ -32850,6 +32852,11 @@ impl VibexWorkbench {
             return;
         }
         self.timeline_trace.frames += 1;
+        let table = self
+            .timeline_row_sizes
+            .iter()
+            .map(|row| row.height)
+            .sum::<Pixels>();
         let line = format!(
             "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
             self.timeline_trace.frames,
@@ -74726,6 +74733,31 @@ impl VibexWorkbench {
         }
     }
 
+    /// The picture a read activity points at, drawn as its row's mark.
+    ///
+    /// Resolving here keeps the workspace root in the one place that already
+    /// knows it, and lets the card's click open the same full-window preview a
+    /// transcript image uses. Every other read row — a text file, a path
+    /// outside the workspace, a write or an edit — gets `None` and keeps its
+    /// file-type mark.
+    fn timeline_read_image_thumbnail(
+        &self,
+        row: &TimelineRow,
+        activity: &timeline_activity::Activity,
+        entity: WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let workspace_root = self.view_session()?.workspace_root.clone();
+        let path = timeline_image::image_read_path(activity, Some(workspace_root.as_str()))?;
+        Some(timeline_image::thumbnail(
+            &row.id,
+            &path,
+            activity.target(),
+            entity,
+            cx,
+        ))
+    }
+
     fn render_process_activity_line(
         &mut self,
         row: &TimelineRow,
@@ -74774,6 +74806,8 @@ impl VibexWorkbench {
             &self.active_timeline().items,
             cx,
         );
+        let thumbnail =
+            self.timeline_read_image_thumbnail(row, &projection.activity, cx.weak_entity(), cx);
         let header = timeline_activity::header(
             format!("activity:{}", row.id),
             &projection.activity,
@@ -74781,6 +74815,7 @@ impl VibexWorkbench {
             has_details.then_some((expanded, progress)),
             target,
             duration,
+            thumbnail,
             self.live_label_frame_gate.animating(),
             cx,
         )
@@ -75065,6 +75100,8 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
             });
+        let thumbnail =
+            self.timeline_read_image_thumbnail(row, &projection.activity, cx.weak_entity(), cx);
         let header = timeline_activity::header(
             format!("file-card-header:{}", row.id),
             &projection.activity,
@@ -75072,6 +75109,7 @@ impl VibexWorkbench {
             Some((expanded, progress)),
             target,
             statistics,
+            thumbnail,
             self.live_label_frame_gate.animating(),
             cx,
         )
@@ -119950,7 +119988,7 @@ mod tests {
             .find("this.with_session_view_for_render(")
             .expect("the wheel handler should borrow the pane's view");
         let call = timeline[wheel..]
-            .find("this.handle_timeline_scroll_wheel(event, cx)")
+            .find("this.handle_timeline_scroll_wheel(event, line_height, cx)")
             .expect("the wheel handler should run the follow-state update");
         assert!(borrow < call);
     }
