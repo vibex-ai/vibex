@@ -7,9 +7,10 @@ use async_trait::async_trait;
 use tokio::time::sleep;
 use vibex_core::{
     AgentSessionRuntimeSelectionState, GetMessageSubmissionRequest, MessageSubmissionId,
-    MessageSubmissionState, MessageSubmissionStatus, RuntimeLeaseRole, RuntimeSelectionInteraction,
-    RuntimeSwitchId, RuntimeSwitchPolicy, RuntimeSwitchStatus, SendAgentMessageRequest,
-    SessionRuntimeSelection, SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
+    MessageSubmissionState, MessageSubmissionStatus, RuntimeLeaseRole,
+    RuntimeSelectionActionableError, RuntimeSelectionInteraction, RuntimeSwitchId,
+    RuntimeSwitchPolicy, RuntimeSwitchStatus, SendAgentMessageRequest, SessionRuntimeSelection,
+    SessionRuntimeSelectionStatus, SetDesiredAgentSessionRuntimeRequest,
     SwitchAgentSessionRuntimeRequest, SwitchAgentSessionRuntimeResponse, TimelineItem,
     TimelinePayload, VibexError, VibexResult, VibexSessionId, unix_timestamp_ms,
 };
@@ -820,18 +821,24 @@ impl MessageSubmissionCoordinator {
                     .as_ref()
                     .map(|error| error.code.as_str())
                     .unwrap_or("message_submission_runtime_unavailable");
+                // The product sentence alone ("configuration unavailable")
+                // tells the reader nothing about which model or option the
+                // Agent refused, so a recorded refusal travels with it.
                 let error_detail = state
                     .actionable_error
                     .as_ref()
-                    .map(|error| error.message.as_str())
-                    .unwrap_or("required runtime did not become effective");
+                    .map(|error| match error.detail.as_deref() {
+                        Some(detail) => format!("{} {detail}", error.message),
+                        None => error.message.clone(),
+                    })
+                    .unwrap_or_else(|| "required runtime did not become effective".to_string());
                 let conn = self.open_connection()?;
                 MessageSubmissionRepository::fail(
                     &conn,
                     &current.submission_id,
                     MessageSubmissionStatus::AwaitingRuntime,
                     &safe_error_code(error_code),
-                    Some(&safe_error_detail(error_detail)),
+                    Some(&safe_error_detail(&error_detail)),
                 )?;
                 self.record_queue_wait(&current, RuntimeMetricResult::Failure);
                 return Ok(());
@@ -913,17 +920,25 @@ impl MessageSubmissionCoordinator {
             RuntimeSwitchStatus::Failed
             | RuntimeSwitchStatus::Superseded
             | RuntimeSwitchStatus::AmbiguousExternalEffect => {
+                let error_code = safe_error_code(
+                    runtime_switch
+                        .error_code
+                        .as_deref()
+                        .unwrap_or("message_submission_runtime_unavailable"),
+                );
+                // The journal writes `<code>:<cause>`; the code travels as the
+                // failure's own identity, so only the cause is worth keeping.
+                let error_detail = RuntimeSelectionActionableError::refusal_detail(
+                    &error_code,
+                    runtime_switch.error_detail_redacted.as_deref(),
+                )
+                .unwrap_or_else(|| "required runtime did not become effective".to_string());
                 MessageSubmissionRepository::fail(
                     &conn,
                     &record.submission_id,
                     MessageSubmissionStatus::AwaitingRuntime,
-                    &safe_error_code(
-                        runtime_switch
-                            .error_code
-                            .as_deref()
-                            .unwrap_or("message_submission_runtime_unavailable"),
-                    ),
-                    Some("required runtime did not become effective"),
+                    &error_code,
+                    Some(&error_detail),
                 )?;
                 self.record_queue_wait(
                     record,
@@ -2615,6 +2630,83 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error.code, "runtime_switch_configuration_unavailable");
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn a_failed_switch_reports_the_agents_own_refusal() {
+        let db_path = temp_db_path("runtime-failed-with-reason");
+        let initial = selection("gpt-5");
+        let desired = selection("gpt-5.2");
+        let session_id = seed_session(&db_path, "runtime-failed-with-reason", initial.clone());
+        let (coordinator, runtime, dispatcher) =
+            harness(&db_path, &session_id, initial.clone(), false);
+        let (submission, switch_id) = enqueue_with_committed_switch(
+            &db_path,
+            &session_id,
+            "runtime-failed-with-reason",
+            &desired,
+        );
+        {
+            let conn = open_database(&db_path).unwrap();
+            conn.execute(
+                "UPDATE runtime_switches
+                 SET status = 'failed', error_code = 'runtime_switch_configuration_unavailable',
+                     error_detail_redacted = ?2
+                 WHERE switch_id = ?1",
+                rusqlite::params![
+                    switch_id.as_str(),
+                    "runtime_switch_configuration_unavailable:acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)"
+                ],
+            )
+            .unwrap();
+        }
+        runtime.states.lock().unwrap().insert(
+            session_id.clone(),
+            AgentSessionRuntimeSelectionState {
+                desired: desired.clone(),
+                effective: initial,
+                status: SessionRuntimeSelectionStatus::FailedUsingPrevious,
+                session_revision: 0,
+                selection_revision: 1,
+                current_binding_id: None,
+                activation_generation: 0,
+                pending_switch_id: None,
+                actionable_error: Some(
+                    RuntimeSelectionActionableError::new(
+                        "runtime_switch_configuration_unavailable",
+                        "The selected Agent runtime configuration is unavailable.",
+                        None,
+                    )
+                    .unwrap(),
+                ),
+            },
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.drive_submission(&submission),
+        )
+        .await
+        .expect("a failed switch must settle its submission")
+        .unwrap();
+        let record = coordinator
+            .required_submission(&submission.submission_id)
+            .unwrap();
+        assert_eq!(record.status, MessageSubmissionStatus::Failed);
+        assert_eq!(
+            record.error_code.as_deref(),
+            Some("runtime_switch_configuration_unavailable")
+        );
+        // "Message was not sent" is the same row for every cause; the Agent's
+        // refusal is what names the model the Harness could not resolve.
+        assert_eq!(
+            record.error_detail_redacted.as_deref(),
+            Some(
+                "acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)"
+            )
+        );
         assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
         cleanup_db(db_path);
     }

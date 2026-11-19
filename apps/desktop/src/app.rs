@@ -38110,6 +38110,20 @@ impl VibexWorkbench {
                         _ => locale::text("Message was not sent", "消息未发送", "訊息未傳送")
                             .to_string(),
                     };
+                    // "Message was not sent" is the same row for every cause:
+                    // a missing workspace, a rejected model id, an Agent that
+                    // never started. The durable submission kept the Agent's
+                    // own bounded refusal, so show it under that sentence
+                    // instead of leaving the reader to guess.
+                    let failure_reason = (state.status == MessageSubmissionStatus::Failed)
+                        .then(|| {
+                            vibex_core::RuntimeSelectionActionableError::refusal_detail(
+                                state.error_code.as_deref().unwrap_or_default(),
+                                state.error_detail_redacted.as_deref(),
+                            )
+                        })
+                        .flatten()
+                        .map(|detail| locale::localize_ui_message(&detail));
                     let dismiss_key = state.message_idempotency_key.clone();
                     let dismiss_session = state.session_id.clone();
                     // A row that only reports "not sent" leaves the reader with
@@ -38154,11 +38168,19 @@ impl VibexWorkbench {
                                 .into_any_element()
                         })
                         .child(
-                            div()
+                            v_flex()
                                 .min_w_0()
                                 .flex_1()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(label),
+                                .child(div().text_color(cx.theme().muted_foreground).child(label))
+                                .when_some(failure_reason, |this, reason| {
+                                    this.child(
+                                        div()
+                                            .whitespace_normal()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .opacity(0.85)
+                                            .child(reason),
+                                    )
+                                }),
                         )
                         .when(terminal, |this| {
                             this.when(recoverable, |this| {
@@ -65965,6 +65987,20 @@ impl VibexWorkbench {
                     }),
             ),
         };
+        // The Agent's refusal is the only explanation of *why* the switch did
+        // not take. The product sentence says "configuration unavailable",
+        // which names no cause and reads the same for an unknown model id, a
+        // rejected option and a broken endpoint. Show the recorded reason, and
+        // make the row grow instead of truncating it away: a reason cut at 30
+        // characters explains nothing.
+        let failure_detail = state
+            .actionable_error
+            .as_ref()
+            .and_then(|error| error.detail.as_deref())
+            // The Agent's refusal is evidence, not product copy: translate it
+            // only when it is one of the runtime sentences this client owns,
+            // and otherwise show it exactly as the Agent wrote it.
+            .map(locale::localize_ui_message);
         let recovery_hint = state
             .actionable_error
             .as_ref()
@@ -65990,7 +66026,7 @@ impl VibexWorkbench {
                         this.max_w(px(max_width))
                     })
                     .min_h(px(36.0))
-                    .items_center()
+                    .when(failure_detail.is_some(), |this| this.items_start())
                     .gap_2()
                     .rounded_lg()
                     .border_1()
@@ -66007,7 +66043,22 @@ impl VibexWorkbench {
                         v_flex()
                             .min_w_0()
                             .flex_1()
-                            .child(div().truncate().text_xs().font_medium().child(title))
+                            .child(
+                                div()
+                                    .whitespace_normal()
+                                    .text_xs()
+                                    .font_medium()
+                                    .child(title),
+                            )
+                            .when_some(failure_detail, |this, detail| {
+                                this.child(
+                                    div()
+                                        .whitespace_normal()
+                                        .text_xs()
+                                        .text_color(cx.theme().danger)
+                                        .child(detail),
+                                )
+                            })
                             .when_some(recovery_hint, |this, hint| {
                                 this.child(
                                     div()
@@ -111841,7 +111892,7 @@ mod tests {
                                         v_flex()
                                             .flex_none()
                                             .items_center()
-                                            .gap(px(COMPOSER_TRAILING_CONTROL_GAP))
+                                            .gap(px(4.0))
                                             .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE)))
                                             .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE)))
                                             .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE))),

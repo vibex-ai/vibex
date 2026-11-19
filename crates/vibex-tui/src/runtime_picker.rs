@@ -443,6 +443,26 @@ impl App {
             .map(|state| state.status)
     }
 
+    /// Why the last switch onto the page's own entry did not take.
+    ///
+    /// The row says "Switch failed — still using the previous Agent", which is
+    /// the same sentence for an unknown model, a rejected option and a broken
+    /// endpoint. The Agent's bounded refusal is the only part that names the
+    /// cause, so the preview row carries it.
+    pub fn runtime_selection_failure_detail(&self) -> Option<&str> {
+        if !self.page_shows_session() {
+            return None;
+        }
+        let state = self.agent.state.runtime_selection.value.as_ref()?;
+        if state.status != SessionRuntimeSelectionStatus::FailedUsingPrevious {
+            return None;
+        }
+        state
+            .actionable_error
+            .as_ref()
+            .and_then(|error| error.detail.as_deref())
+    }
+
     /// Whether the switcher is the modal on screen.
     pub fn runtime_picker_is_open(&self) -> bool {
         matches!(

@@ -1236,6 +1236,12 @@ pub struct RuntimeSelectionActionableError {
     pub code: String,
     pub message: String,
     pub recovery_hint: Option<String>,
+    /// The Agent's own bounded refusal, when it gave one. `message` names the
+    /// product-level failure ("configuration unavailable"); this is the reason
+    /// ("unknown model: qwenwork/deepseek-flash"), so a reader can fix the
+    /// selection without reading source code.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
 }
 
 impl RuntimeSelectionActionableError {
@@ -1267,7 +1273,44 @@ impl RuntimeSelectionActionableError {
             code,
             message,
             recovery_hint,
+            detail: None,
         })
+    }
+
+    /// Attach the Agent's bounded refusal to this failure.
+    ///
+    /// An empty or control-character-bearing value is dropped rather than
+    /// rejected: the failure itself is already durable, and losing the reason
+    /// must not lose the failure.
+    pub fn with_detail(mut self, detail: Option<&str>) -> Self {
+        self.detail = Self::refusal_detail(&self.code, detail);
+        self
+    }
+
+    /// The part of a journaled failure detail that explains anything.
+    ///
+    /// The switch and submission journals keep a failure as
+    /// `<code>:<cause> (<agent refusal>)`. `code` is already the failure's
+    /// identity and every surface prints it, so the prefix would read twice and
+    /// the remaining tail is the only part that names a model, an option or a
+    /// rejected value.
+    ///
+    /// Returns `None` for an absent, empty or control-character-bearing value:
+    /// losing the explanation must never cost the failure record itself.
+    pub fn refusal_detail(code: &str, detail: Option<&str>) -> Option<String> {
+        let prefix = format!("{code}:");
+        detail
+            .map(str::trim)
+            .filter(|detail| !detail.is_empty())
+            .filter(|detail| !detail.chars().any(char::is_control))
+            .map(|detail| detail.strip_prefix(&prefix).unwrap_or(detail).trim())
+            .filter(|detail| !detail.is_empty())
+            .map(|detail| {
+                detail
+                    .chars()
+                    .take(MAX_RUNTIME_SELECTION_ERROR_MESSAGE_LEN)
+                    .collect()
+            })
     }
 }
 
@@ -2513,6 +2556,40 @@ mod tests {
         )
         .unwrap_err();
         assert_eq!(invalid.code, "runtime_selection_error_message_invalid");
+
+        // The journal writes `<code>:<cause>`; the code is already printed as
+        // the failure's identity, so the detail carries only the cause.
+        let with_detail = RuntimeSelectionActionableError::new(
+            "runtime_switch_configuration_unavailable",
+            "The selected Agent runtime configuration is unavailable.",
+            None,
+        )
+        .unwrap()
+        .with_detail(Some(
+            "runtime_switch_configuration_unavailable:acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)",
+        ));
+        assert_eq!(
+            with_detail.detail.as_deref(),
+            Some(
+                "acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)"
+            )
+        );
+        // A detail that would be empty, or that carries a control character,
+        // is dropped rather than refusing the failure it belongs to.
+        assert!(
+            RuntimeSelectionActionableError::new("runtime_switch_wait_timeout", "m", None)
+                .unwrap()
+                .with_detail(Some("   "))
+                .detail
+                .is_none()
+        );
+        assert!(
+            RuntimeSelectionActionableError::new("runtime_switch_wait_timeout", "m", None)
+                .unwrap()
+                .with_detail(Some("line one\nline two"))
+                .detail
+                .is_none()
+        );
     }
 
     #[test]
