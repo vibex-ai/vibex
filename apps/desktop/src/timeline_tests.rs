@@ -4420,10 +4420,11 @@ fn a_turn_arriving_while_scrolled_up_keeps_the_readers_place(cx: &mut TestAppCon
     for _ in 0..4 {
         draw_disclosure_frame(cx);
     }
-    let (before, turns_before) = workbench.read_with(cx, |workbench, _| {
+    let (before, turns_before, anchor_before) = workbench.read_with(cx, |workbench, _| {
         (
             workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
             workbench.timeline_row_sizes.len(),
+            workbench.timeline_scroll.logical_scroll_top(),
         )
     });
     assert!(
@@ -4450,16 +4451,29 @@ fn a_turn_arriving_while_scrolled_up_keeps_the_readers_place(cx: &mut TestAppCon
     for _ in 0..4 {
         draw_disclosure_frame(cx);
     }
-    let (after, turns_after) = workbench.read_with(cx, |workbench, _| {
+    let (after, turns_after, anchor_after) = workbench.read_with(cx, |workbench, _| {
         (
             workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
             workbench.timeline_row_sizes.len(),
+            workbench.timeline_scroll.logical_scroll_top(),
         )
     });
     assert_eq!(turns_after, turns_before + 1, "the live turn is a new row");
+    // The reader's place is a row and the distance into it. The pixel offset is
+    // resolved against the document the reset seeded, so it can move by the
+    // seed's own error — what must not move is the row under the viewport top,
+    // which is what the reader is actually looking at.
+    assert_eq!(
+        anchor_after.item_ix, anchor_before.item_ix,
+        "an appended turn moved the row the reader was reading"
+    );
+    assert_eq!(
+        anchor_after.offset_in_item, anchor_before.offset_in_item,
+        "an appended turn moved the reader inside their row"
+    );
     assert!(
-        (after - before).abs() <= px(1.0),
-        "the reader was moved by an appended turn: {before:?} -> {after:?}"
+        (after - before).abs() <= px(200.0),
+        "the seeded document moved the reader by more than a row: {before:?} -> {after:?}"
     );
 }
 
