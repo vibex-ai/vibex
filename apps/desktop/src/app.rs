@@ -6186,6 +6186,18 @@ pub struct SessionView {
     timeline_bottom_control_close_task: Option<Task<()>>,
     timeline_duration_tick_task: Option<Task<()>>,
     timeline_scrollbar_interaction_active: bool,
+    /// How far the next render should nudge the transcript to reveal a row.
+    ///
+    /// Accumulated because the reveal runs inside the list's own prepaint,
+    /// where every `ListState` accessor borrows a layout that prepaint already
+    /// holds. Applied by [`Self::apply_pending_timeline_reveal`].
+    pending_timeline_reveal_delta: Pixels,
+    /// The transcript's viewport as the last frame laid it out.
+    ///
+    /// Cached because the reveal below runs inside the list's own prepaint, and
+    /// reading `ListState::viewport_bounds` there borrows the layout that
+    /// prepaint already holds — a panic, not a stale value.
+    timeline_viewport: Bounds<Pixels>,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     /// The timeline revision [`Self::timeline_row_sizes`] was built for.
     ///
@@ -6432,6 +6444,8 @@ impl SessionView {
             timeline_bottom_control_close_task: None,
             timeline_duration_tick_task: None,
             timeline_scrollbar_interaction_active: false,
+            timeline_viewport: Bounds::default(),
+            pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_row_sizes_revision: 0,
             timeline_measured_turn_heights: BTreeMap::new(),
@@ -32513,6 +32527,19 @@ impl VibexWorkbench {
         self.timeline_scroll.set_scroll_handler(|_, _, cx| {
             note_transcript_scroll(cx);
         });
+    }
+
+    /// Applies a reveal the last prepaint could not, and clears it.
+    ///
+    /// A `ListState` cannot be moved from inside its own prepaint, so the reveal
+    /// parks the distance there and this applies it on the next render, before
+    /// the element is built.
+    fn apply_pending_timeline_reveal(&mut self) {
+        let delta = std::mem::replace(&mut self.pending_timeline_reveal_delta, px(0.0));
+        if delta == px(0.0) {
+            return;
+        }
+        self.timeline_scroll.scroll_by(-delta);
     }
 
     fn sync_timeline_list_rows(&mut self) {
@@ -64594,6 +64621,10 @@ impl VibexWorkbench {
         // the scroll position is whether the turn hangs from the bottom edge,
         // and that is resolved before the element is built.
         self.resolve_timeline_rows_hang_from_bottom();
+        // Both are taken here, outside the list's layout: the reveal runs inside
+        // the list's prepaint and cannot read either of them there.
+        self.timeline_viewport = self.timeline_scroll.viewport_bounds();
+        self.apply_pending_timeline_reveal();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         // The same insets keep the timeline, the composer and the banners
         // between them on one spine: the pane's gutter, widened on both sides
@@ -69331,7 +69362,11 @@ impl VibexWorkbench {
         // are directly comparable with the viewport. A viewport with no height
         // has nothing to reveal inside, and the turn-level scroll the caller
         // already asked for still stands.
-        let viewport = self.timeline_scroll.viewport_bounds();
+        //
+        // The viewport is the one recorded before the element was built, not a
+        // read of the list now: this runs inside the list's own prepaint, and
+        // `viewport_bounds` borrows the layout that prepaint already holds.
+        let viewport = self.timeline_viewport;
         if viewport.size.height <= px(0.0) {
             return;
         }
@@ -69339,10 +69374,12 @@ impl VibexWorkbench {
         if delta_y == px(0.0) {
             return;
         }
-        // `scroll_by` takes a distance rather than an absolute offset, so it
-        // needs no read of the current position — which is what a prepaint
-        // cannot do. The list resolves it when it next lays out.
-        self.timeline_scroll.scroll_by(-delta_y);
+        // The shift cannot be applied here. Every way to move a `ListState`
+        // reads its current position first — `scroll_by` calls
+        // `logical_scroll_top`, `viewport_bounds` borrows the layout — and this
+        // runs inside the list's own prepaint, which already holds that borrow.
+        // Park the distance and let the next render apply it.
+        self.pending_timeline_reveal_delta += delta_y;
         cx.notify();
     }
 

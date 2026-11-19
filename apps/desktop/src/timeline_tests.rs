@@ -4337,62 +4337,47 @@ fn auto_collapse_draws_a_live_run_as_its_summary_until_the_reader_opens_it(
     );
 }
 
-/// The surface alone, with no workbench view above it: if this composites,
-/// the ancestor chain is what stops it.
-struct BareSurfaceHost {
-    view: Entity<TimelineSurfaceView>,
-}
-
-impl Render for BareSurfaceHost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(600.0)).h(px(400.0)).child(
-            self.view
-                .clone()
-                .cached(StyleRefinement::default().size_full()),
-        )
+/// Typing in the find bar must not read the transcript's layout while the list
+/// is laying it out: `reveal_session_search_row` runs inside the list's own
+/// prepaint, and `viewport_bounds` borrows the layout prepaint already holds.
+#[gpui::test]
+fn typing_in_the_find_bar_does_not_read_the_list_mid_prepaint(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    // A long transcript whose match sits far above the live edge, so the
+    // reveal has to scroll to it and resolve on a later prepaint.
+    let mut items = turn_of_units(40, true);
+    items.push(live_timeline_item(
+        99,
+        TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+            text: "needle".into(),
+            is_final: true,
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    // The bar's own change handler: a query with matches parks a reveal, and
+    // the next prepaint resolves it.
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.conversation_find_open = true;
+            let find = workbench.conversation_find.clone();
+            find.update(cx, |input, cx| input.set_value("needle", window, cx));
+            workbench.conversation_find_query = "needle".to_string();
+            workbench.conversation_find_active_index = 0;
+            workbench.reveal_active_conversation_find_match(cx);
+            cx.notify();
+        });
+    });
+    // The reveal parks a pending target; the draws below lay it out and land
+    // it. Reaching them at all is the assertion: the panic fired here.
+    for _ in 0..8 {
+        draw_disclosure_frame(cx);
     }
-}
-
-/// The workbench's own list state and rows, but drawn *inside* a view that
-/// is mounted through `cached`, exactly like the surface is.
-struct CachedListHost {
-    state: gpui::ListState,
-    workbench: Entity<VibexWorkbench>,
-}
-
-impl Render for CachedListHost {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let state = self.state.clone();
-        let workbench = self.workbench.clone();
-        gpui::list(state, move |index, window, cx| {
-            let turn =
-                workbench.read_with(cx, |w, _| w.conversation_turns_cache.get(index).cloned());
-            let Some(turn) = turn else {
-                return div().into_any_element();
-            };
-            let mut built = div().into_any_element();
-            let _ = workbench.update(cx, |w, cx| {
-                built = w.render_timeline_turn(&turn, index, true, true, window, cx);
-            });
-            built
-        })
-        .w(px(600.0))
-        .h(px(400.0))
-    }
-}
-
-struct CachedListWrapper {
-    inner: Entity<CachedListHost>,
-}
-
-impl Render for CachedListWrapper {
-    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        div().w(px(600.0)).h(px(400.0)).child(
-            self.inner
-                .clone()
-                .cached(StyleRefinement::default().size_full()),
-        )
-    }
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .pending_session_search_reveal_item_id
+            .is_none()),
+        "the reveal should have landed instead of panicking"
+    );
 }
 
 /// The tool rows of the last turn, in order, whatever separates them.
