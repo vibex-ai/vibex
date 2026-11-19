@@ -4775,13 +4775,19 @@ fn a_reseeded_transcript_is_as_tall_as_its_rows(cx: &mut TestAppContext) {
                 .sum::<Pixels>(),
         )
     });
+    // The table's heights are estimates until each row is drawn, so a seed can
+    // land a little off the total. What it must not do is miss by a fraction of
+    // the document, which is what a median seed does on exactly this shape: a
+    // handful of long turns among short ones leaves the median far below the
+    // mean, and the seeded document far below the table.
+    let tolerance = table * 0.05;
     assert!(
-        extent >= table - px(32.0),
+        extent >= table - tolerance,
         "the reseed left the document {:?} short of the table it seeded",
         table - extent
     );
     assert!(
-        extent <= table + px(32.0),
+        extent <= table + tolerance,
         "the reseed made the document {:?} taller than the table it seeded",
         extent - table
     );
