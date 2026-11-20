@@ -8983,6 +8983,32 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn sidebar_queue_mutations_ride_the_agent_operation() {
+        let transport = Arc::new(MockTransport::with_responses([]));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+        let error = backend
+            .mutate_sidebar_organization(
+                vibex_core::RemoteSidebarOrganizationMutation::SetQueuePaused {
+                    session_id: "session".to_owned(),
+                    paused: true,
+                },
+                Some(7),
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "mock_unavailable");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_ne!(requests[0].operation, "unsupported");
+    }
+
+    #[tokio::test]
     async fn remote_provider_projection_keeps_entities_and_secret_mutation_private() {
         let transport = Arc::new(MockTransport::new([]));
         let backend = WebRemoteBackend::new(
