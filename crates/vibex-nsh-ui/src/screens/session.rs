@@ -91,6 +91,10 @@ pub enum EntryKind {
     Notice,
     /// A failure.
     Error,
+    /// A permission request or its resolution.
+    Permission,
+    /// A question request or its resolution.
+    Question,
     /// The fold above one turn's working rows.
     ProcessHeader,
 }
@@ -1205,6 +1209,12 @@ fn entry_element(
             move || kind.with(|kind| *kind == Some(EntryKind::Error)),
             move || error_card(body),
         ))
+        .child(when(
+            move || {
+                kind.with(|kind| matches!(kind, Some(EntryKind::Permission | EntryKind::Question)))
+            },
+            move || decision_card(title, body, meta),
+        ))
 }
 
 fn user_bubble(
@@ -1530,6 +1540,42 @@ fn tool_card(
                             )
                     },
                 )),
+        )
+        .child(
+            text(move || body.get())
+                .text_size(px(theme::font_caption()))
+                .line_height(theme::line_height_for(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
+}
+
+fn decision_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> impl IntoElement {
+    view()
+        .w_full()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_default)
+        .bg(theme::background_card)
+        .p(px(theme::SPACING_MD))
+        .gap(px(theme::SPACING_XS))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    text(move || title.get())
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(theme::font_detail()))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::foreground),
+                )
+                .child(
+                    text(move || meta.get())
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                ),
         )
         .child(
             text(move || body.get())

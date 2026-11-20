@@ -162,10 +162,18 @@ fn TurnShell() -> impl IntoElement {
     host.editable_sequence = signal(24);
     let mut tool = entry("t1", EntryKind::Tool, "cargo test", "Running");
     tool.expandable = true;
+    let mut permission = entry(
+        "p1",
+        EntryKind::Permission,
+        "Run cargo test?",
+        "Command: cargo test",
+    );
+    permission.meta = "Allowed".to_owned();
     host.timeline = signal(vec![
         user,
         header,
         tool,
+        permission,
         entry("a1", EntryKind::Agent, "Claude", "Done"),
     ]);
     session::session(host)
@@ -894,6 +902,8 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     app.wait_for("Worked for 2s").unwrap();
     assert!(app.screen().shows("cargo test"));
     assert!(app.screen().shows("Detail"));
+    assert!(app.screen().shows("Run cargo test?"));
+    assert!(app.screen().shows("Allowed"));
     assert!(app.screen().shows("photo.jpg"));
     assert!(app.screen().shows("Edit"));
     assert!(app.screen().shows("Copy"));

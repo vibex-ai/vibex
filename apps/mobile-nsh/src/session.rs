@@ -2249,7 +2249,7 @@ impl SessionService {
             kind: entry_kind(row.kind),
             title: row.title.clone(),
             body,
-            meta: String::new(),
+            meta: row_meta(row, items),
             streaming: row.streaming,
             turn_id: turn.id.clone(),
             process_count: turn.process_rows.len(),
@@ -4589,6 +4589,65 @@ fn token_usage_view(usage: AgentTokenUsage) -> TokenUsageView {
     }
 }
 
+/// The one-line status a permission or question row carries.
+fn row_meta(row: &TimelineRow, items: &[vibex_core::TimelineItem]) -> String {
+    for id in row.item_ids.iter().rev() {
+        let Some(item) = items.iter().find(|item| item.id.as_str() == id) else {
+            continue;
+        };
+        return match &item.payload {
+            TimelinePayload::PermissionRequest(request) => match request.status {
+                PermissionRequestStatus::Pending => {
+                    copy::text("Pending", "待确认", "待確認").to_owned()
+                }
+                PermissionRequestStatus::Approved => {
+                    copy::text("Allowed", "已允许", "已允許").to_owned()
+                }
+                PermissionRequestStatus::Denied => {
+                    copy::text("Denied", "已拒绝", "已拒絕").to_owned()
+                }
+                PermissionRequestStatus::Expired => {
+                    copy::text("Expired", "已过期", "已過期").to_owned()
+                }
+            },
+            TimelinePayload::PermissionResolution(resolution) => match resolution.response {
+                PermissionResponseKind::Approve => {
+                    copy::text("Allowed", "已允许", "已允許").to_owned()
+                }
+                PermissionResponseKind::AlwaysAllowForSession => {
+                    copy::text("Allowed for session", "本会话允许", "本工作階段允許").to_owned()
+                }
+                PermissionResponseKind::Deny => copy::text("Denied", "已拒绝", "已拒絕").to_owned(),
+            },
+            TimelinePayload::ElicitationRequest(request) => match request.status {
+                ElicitationRequestStatus::Pending => {
+                    copy::text("Pending", "待回答", "待回答").to_owned()
+                }
+                ElicitationRequestStatus::Accepted => {
+                    copy::text("Answered", "已回答", "已回答").to_owned()
+                }
+                ElicitationRequestStatus::Declined => {
+                    copy::text("Declined", "已拒绝", "已拒絕").to_owned()
+                }
+                ElicitationRequestStatus::Cancelled => {
+                    copy::text("Cancelled", "已取消", "已取消").to_owned()
+                }
+            },
+            TimelinePayload::ElicitationResolution(resolution) => match resolution.action {
+                ElicitationResolutionAction::Accept => {
+                    copy::text("Answered", "已回答", "已回答").to_owned()
+                }
+                ElicitationResolutionAction::Decline => {
+                    copy::text("Declined", "已拒绝", "已拒絕").to_owned()
+                }
+                _ => String::new(),
+            },
+            _ => String::new(),
+        };
+    }
+    String::new()
+}
+
 /// The attachments a user row carried, from the items behind it.
 fn row_attachments(row: &TimelineRow, items: &[vibex_core::TimelineItem]) -> Vec<AttachmentItem> {
     for id in &row.item_ids {
@@ -4690,12 +4749,9 @@ fn entry_kind(kind: vibex_desktop_model::TimelineRowKind) -> EntryKind {
         | Row::Plan
         | Row::Collaboration
         | Row::ImageGeneration => EntryKind::Tool,
-        Row::GitNotice
-        | Row::SystemNotice
-        | Row::PermissionRequest
-        | Row::PermissionResolution
-        | Row::ElicitationRequest
-        | Row::ElicitationResolution => EntryKind::Notice,
+        Row::PermissionRequest | Row::PermissionResolution => EntryKind::Permission,
+        Row::ElicitationRequest | Row::ElicitationResolution => EntryKind::Question,
+        Row::GitNotice | Row::SystemNotice => EntryKind::Notice,
     }
 }
 
