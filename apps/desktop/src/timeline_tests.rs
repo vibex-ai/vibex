@@ -4777,23 +4777,36 @@ fn an_older_page_above_the_reader_keeps_their_place(cx: &mut TestAppContext) {
         turns_before + 6,
         "the older page is six more rows above the window"
     );
-    let expected = workbench.read_with(cx, |workbench, _| {
-        let row = workbench
-            .conversation_turns_cache
-            .iter()
-            .position(|turn| turn.id == top_turn)
-            .expect("the older page must not rename the turn the reader was in");
-        timeline_scroll_offset_for_anchor(
-            &workbench.timeline_row_heights(),
-            row,
-            offset_in_turn,
-            workbench.timeline_list_padding_top_px,
-        )
-        .expect("the anchored row is in the new table")
-    });
+    // The page is *spliced* above the reader, not rebuilt into the list: the row
+    // they were in keeps its index shift and its distance into it, and the page's
+    // rows enter the document as they are measured on the way up. A reset would
+    // put the whole page into the document at once and rebuild every measured
+    // height from one hint, which is a jump the size of the page — the bounce a
+    // reader reports the first time they scroll up into history in a session.
     assert!(
-        (after - px(expected)).abs() <= px(1.0),
-        "the turn the reader was in moved: {before:?} -> {after:?}, expected {expected:?}"
+        (after - before).abs() <= px(1.0),
+        "a page above moved the reader: {before:?} -> {after:?}"
+    );
+    let (row_after, offset_after) = workbench.read_with(cx, |workbench, _| {
+        let top = workbench.timeline_scroll.logical_scroll_top();
+        (top.item_ix, top.offset_in_item)
+    });
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.conversation_turns_cache
+            [row_after]
+            .id
+            .clone()),
+        top_turn,
+        "the older page must not rename the turn the reader was in"
+    );
+    // One padding band is the list's own bookkeeping: the rows it now holds above
+    // the reader have no height yet, so its fill branch counts the list's padding
+    // where the spliced anchor does not. It is bounded by the padding and does not
+    // grow with the page, which is what made the rebuild too expensive to keep.
+    let slack = px(workbench.read_with(cx, |workbench, _| workbench.timeline_list_padding_top_px));
+    assert!(
+        (offset_after - px(offset_in_turn as f32)).abs() <= slack,
+        "the reader's distance into their row moved: {offset_in_turn:?} -> {offset_after:?}"
     );
 }
 
@@ -4910,6 +4923,88 @@ fn scrolling_a_long_transcript_moves_by_the_requested_distance(cx: &mut TestAppC
             px(100.0),
             "step {step}: the transcript jumped by something other than the scroll ({offset:?} -> {now:?})"
         );
+        offset = now;
+    }
+}
+
+/// A fresh transcript scrolls up by what the wheel asked, row by row.
+///
+/// The scroll test above measures every row before it scrolls, which is the
+/// state a transcript reaches after one pass over it. A session that was just
+/// opened is the other state: every row above the viewport is still carrying the
+/// height hint the list seeds, so each step up measures a row for the first time
+/// and its real height replaces the hint. A reader reports the bounce exactly
+/// there — going up in a fresh session, never coming down — so the invariant is
+/// pinned from that state too.
+#[gpui::test]
+fn a_fresh_transcript_scrolls_up_by_what_the_wheel_asked(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..120_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                // Uneven bodies, so a seeded hint is never the real height.
+                text: format!("answer {turn}: {}", "detail ".repeat(20 + turn % 40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    // One frame: the rows the viewport shows, and nothing above them.
+    draw_disclosure_frame(cx);
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        cx.notify();
+    });
+    let mut offset = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    let mut watching: Option<(usize, Pixels)> = None;
+    for step in 0..20 {
+        workbench.update(cx, |workbench, cx| {
+            workbench.timeline_scroll.scroll_by(px(-100.0));
+            cx.notify();
+        });
+        draw_disclosure_frame(cx);
+        draw_disclosure_frame(cx);
+        let (now, anchor, painted) = workbench.read_with(cx, |workbench, _| {
+            let top = workbench.timeline_scroll.logical_scroll_top();
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                top.item_ix,
+                workbench
+                    .timeline_scroll
+                    .bounds_for_item(top.item_ix)
+                    .map(|bounds| bounds.origin.y),
+            )
+        });
+        assert!(
+            (now - offset - px(100.0)).abs() <= px(0.5),
+            "step {step}: a fresh transcript jumped by something other than the scroll ({offset:?} -> {now:?})"
+        );
+        // The row under the viewport top must travel up by exactly the scroll.
+        // A row above it that measures shorter than the hint it was seeded with
+        // takes height out of everything below, and that is a jump the reader
+        // sees while the offset still looks right.
+        if let (Some((watched, before)), Some(painted)) = (watching, painted)
+            && watched == anchor
+        {
+            assert!(
+                (painted - before - px(100.0)).abs() <= px(0.5),
+                "step {step}: the row under the viewport moved by {:?}, not by the scroll",
+                painted - before
+            );
+        }
+        watching = painted.map(|y| (anchor, y));
         offset = now;
     }
 }

@@ -6932,8 +6932,7 @@ impl SessionView {
                 // The list follows its own tail while the reader is on it: that is
                 // the only state in which it paints from the end anchor instead of
                 // re-deriving a row anchor one padding band lower every frame.
-                self.timeline_scroll
-                    .set_follow_mode(gpui::FollowMode::Tail);
+                self.timeline_scroll.set_follow_mode(gpui::FollowMode::Tail);
                 self.timeline_scroll.scroll_to_end();
             }
         }
@@ -33248,6 +33247,24 @@ impl VibexWorkbench {
             // The spliced rows carry no hint yet. Mark the hints lost so the
             // next frame runs; it finds the count agreeing and the ids
             // unchanged, and records the width without re-seeding (above).
+            self.timeline_list_hint_width = None;
+            return;
+        }
+        // A page that landed *above* the reader takes the same treatment from the
+        // other end: `splice(0..0, added)` inserts its rows and shifts every
+        // anchor by their count, so the reader keeps the row they were on and
+        // every measurement survives. A reset here would put the whole page into
+        // the document at once and rebuild the measured rows above and below the
+        // reader from one mean hint — the jump a reader reports the first time
+        // they scroll up into history in a session, and never again once every
+        // row has been measured.
+        let splice_head = !hints_missing && count > 0 && rows > count && {
+            let previous = &self.timeline_list_synced_turn_ids;
+            previous.len() == count && turn_ids[rows - count..] == previous[..]
+        };
+        if splice_head {
+            self.timeline_scroll.splice(0..0, rows - count);
+            self.timeline_list_synced_turn_ids = turn_ids;
             self.timeline_list_hint_width = None;
             return;
         }
