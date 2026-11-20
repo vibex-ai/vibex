@@ -516,6 +516,10 @@ pub struct SessionHost {
     /// Whether the last turn needs an explicit continue, and the action for it.
     pub needs_continue: Signal<bool>,
     pub on_continue_turn: Action,
+    /// Whether the optional conversation chrome is shown.
+    pub show_token_usage: Signal<bool>,
+    pub show_plan_goal: Signal<bool>,
+    pub show_generation_status: Signal<bool>,
     pub team_open: Signal<bool>,
     pub team_tasks: Signal<Vec<crate::screens::team::TeamTaskView>>,
     pub team_busy: Signal<bool>,
@@ -2191,6 +2195,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let runtime_modes = host.runtime_modes;
     let runtime_features = host.runtime_features;
     let token_usage = host.token_usage;
+    let show_token_usage = host.show_token_usage;
+    let show_plan_goal = host.show_plan_goal;
     let plan = host.plan;
     let goal = host.goal;
     let queued = host.queued;
@@ -2327,13 +2333,17 @@ fn composer(host: SessionHost) -> impl IntoElement {
                 )
             }
         }))
-        .child(when(move || goal.get().is_some(), {
-            let on_goal_control = on_goal_control.clone();
-            move || goal_bar(goal, on_goal_control.clone())
-        }))
-        .child(when(move || plan.get().is_some(), {
-            move || plan_bar(plan, plan_open)
-        }))
+        .child(when(
+            move || show_plan_goal.get() && goal.get().is_some(),
+            {
+                let on_goal_control = on_goal_control.clone();
+                move || goal_bar(goal, on_goal_control.clone())
+            },
+        ))
+        .child(when(
+            move || show_plan_goal.get() && plan.get().is_some(),
+            move || plan_bar(plan, plan_open),
+        ))
         .child(when(move || runtime_summary.get().is_some(), {
             let on_open_runtime = on_open_runtime.clone();
             move || {
@@ -2343,6 +2353,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     runtime_modes,
                     runtime_features,
                     token_usage,
+                    show_token_usage,
                     on_open_runtime.clone(),
                 )
             }
@@ -2759,6 +2770,7 @@ fn runtime_chip_row(
     modes: Signal<Vec<RuntimeChoiceView>>,
     features: Signal<Vec<RuntimeFeatureView>>,
     token_usage: Signal<Option<TokenUsageView>>,
+    show_token: Signal<bool>,
     on_open: Action,
 ) -> impl IntoElement {
     view()
@@ -2836,7 +2848,7 @@ fn runtime_chip_row(
             },
         ))
         .child(when(
-            move || token_usage.get().is_some(),
+            move || show_token.get() && token_usage.get().is_some(),
             move || token_chip(token_usage),
         ))
 }

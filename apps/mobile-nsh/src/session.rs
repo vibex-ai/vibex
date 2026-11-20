@@ -268,6 +268,9 @@ pub struct SessionService {
     team_error: Signal<Option<SharedString>>,
     team_revisions: Rc<RefCell<BTreeMap<String, u64>>>,
     attachment_preview: Signal<Option<AttachmentItem>>,
+    show_token_usage: Signal<bool>,
+    show_plan_goal: Signal<bool>,
+    show_generation_status: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
@@ -419,6 +422,9 @@ impl SessionService {
             team_error: signal(None),
             team_revisions: Rc::new(RefCell::new(BTreeMap::new())),
             attachment_preview: signal(None),
+            show_token_usage: signal(crate::settings::show_token_usage()),
+            show_plan_goal: signal(crate::settings::show_plan_goal()),
+            show_generation_status: signal(crate::settings::show_generation_status()),
             plan: signal(None),
             goal: signal(None),
             history: signal(Vec::new()),
@@ -701,6 +707,9 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.attachment_preview.set(None))
             },
+            show_token_usage: self.show_token_usage,
+            show_plan_goal: self.show_plan_goal,
+            show_generation_status: self.show_generation_status,
             plan: self.plan,
             goal: self.goal,
             history: self.history,
@@ -1847,6 +1856,19 @@ impl SessionService {
         self.apply_selection(selection);
     }
 
+    pub fn set_show_token_usage(&self, enabled: bool) {
+        self.show_token_usage.set(enabled);
+    }
+
+    pub fn set_show_plan_goal(&self, enabled: bool) {
+        self.show_plan_goal.set(enabled);
+    }
+
+    pub fn set_show_generation_status(&self, enabled: bool) {
+        self.show_generation_status.set(enabled);
+        self.publish();
+    }
+
     fn open_team(&self) {
         self.team_open.set(true);
         self.refresh_team();
@@ -2627,7 +2649,9 @@ impl SessionService {
             }
             if let Some(row) = turn.conclusion_row.as_ref() {
                 entries.push(self.entry_from_row(row, turn, &model.items));
-            } else if !turn.complete || turn.superseded {
+            } else if (!turn.complete || turn.superseded)
+                && self.show_generation_status.get_untracked()
+            {
                 entries.push(live_turn_entry(turn));
             }
         }

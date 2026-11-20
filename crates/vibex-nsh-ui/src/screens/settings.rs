@@ -35,6 +35,10 @@ pub struct SettingsHost {
     pub notify_completed: Signal<bool>,
     pub notify_needs_input: Signal<bool>,
     pub notify_failed: Signal<bool>,
+    /// The conversation chrome the reader wants to see.
+    pub show_token_usage: Signal<bool>,
+    pub show_plan_goal: Signal<bool>,
+    pub show_generation_status: Signal<bool>,
     /// The connected runtime's label, when there is one.
     pub runtime: Signal<Option<SharedString>>,
     /// The runtimes this phone saved, for the runtime actions.
@@ -49,6 +53,9 @@ pub struct SettingsHost {
     pub on_notify_completed: Rc<dyn Fn(bool)>,
     pub on_notify_needs_input: Rc<dyn Fn(bool)>,
     pub on_notify_failed: Rc<dyn Fn(bool)>,
+    pub on_show_token_usage: Rc<dyn Fn(bool)>,
+    pub on_show_plan_goal: Rc<dyn Fn(bool)>,
+    pub on_show_generation_status: Rc<dyn Fn(bool)>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_reconnect: Rc<dyn Fn()>,
     pub on_switch_runtime: Rc<dyn Fn()>,
@@ -124,6 +131,40 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                                 copy::text("Failed", "执行失败", "執行失敗"),
                                 host.notify_failed,
                                 host.on_notify_failed.clone(),
+                            )),
+                    ))
+                    .child(section(
+                        copy::text("Conversation", "会话", "工作階段"),
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_XS))
+                            .child(toggle_row(
+                                copy::text(
+                                    "Show token usage",
+                                    "显示 Token 使用量",
+                                    "顯示 Token 使用量",
+                                ),
+                                host.show_token_usage,
+                                host.on_show_token_usage.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text(
+                                    "Show plan and goal",
+                                    "显示计划与目标",
+                                    "顯示計畫與目標",
+                                ),
+                                host.show_plan_goal,
+                                host.on_show_plan_goal.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text(
+                                    "Show generation status",
+                                    "显示生成状态",
+                                    "顯示生成狀態",
+                                ),
+                                host.show_generation_status,
+                                host.on_show_generation_status.clone(),
                             )),
                     ))
                     .child(section(

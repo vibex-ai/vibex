@@ -233,6 +233,9 @@ fn settings_host(
     let notify_completed = settings.notify_completed;
     let notify_needs_input = settings.notify_needs_input;
     let notify_failed = settings.notify_failed;
+    let show_token_usage = settings.show_token_usage;
+    let show_plan_goal = settings.show_plan_goal;
+    let show_generation_status = settings.show_generation_status;
     let settings_for_appearance = settings.clone();
     let settings_for_language = settings.clone();
     let settings_for_haptics = settings.clone();
@@ -243,6 +246,12 @@ fn settings_host(
     let settings_for_completed = settings.clone();
     let settings_for_needs_input = settings.clone();
     let settings_for_failed = settings.clone();
+    let settings_for_token = settings.clone();
+    let settings_for_plan = settings.clone();
+    let settings_for_generation = settings.clone();
+    let services_for_token = services;
+    let services_for_plan = services;
+    let services_for_generation = services;
     let pairing_for_disconnect = pairing.clone();
     let pairing_for_clear = pairing.clone();
     SettingsHost {
@@ -257,6 +266,9 @@ fn settings_host(
         notify_completed,
         notify_needs_input,
         notify_failed,
+        show_token_usage,
+        show_plan_goal,
+        show_generation_status,
         runtime: pairing.connected_label(),
         saved: pairing.saved(),
         on_appearance: Rc::new(move |appearance| {
@@ -288,6 +300,24 @@ fn settings_host(
         }),
         on_notify_failed: Rc::new(move |enabled| {
             settings_for_failed.set_notify_failed(enabled);
+        }),
+        on_show_token_usage: Rc::new(move |enabled| {
+            settings_for_token.set_show_token_usage(enabled);
+            if let Some(service) = services_for_token.get_untracked() {
+                service.set_show_token_usage(enabled);
+            }
+        }),
+        on_show_plan_goal: Rc::new(move |enabled| {
+            settings_for_plan.set_show_plan_goal(enabled);
+            if let Some(service) = services_for_plan.get_untracked() {
+                service.set_show_plan_goal(enabled);
+            }
+        }),
+        on_show_generation_status: Rc::new(move |enabled| {
+            settings_for_generation.set_show_generation_status(enabled);
+            if let Some(service) = services_for_generation.get_untracked() {
+                service.set_show_generation_status(enabled);
+            }
         }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
         on_reconnect: Rc::new(move || {

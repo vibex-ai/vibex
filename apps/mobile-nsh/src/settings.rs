@@ -24,6 +24,13 @@ static HAPTICS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Whether an active turn or the terminal holds the display awake.
 static KEEP_SCREEN_ON: AtomicBool = AtomicBool::new(false);
 
+/// Whether the composer shows the session's token use.
+static SHOW_TOKEN_USAGE: AtomicBool = AtomicBool::new(true);
+/// Whether the composer shows the plan and goal bars.
+static SHOW_PLAN_GOAL: AtomicBool = AtomicBool::new(true);
+/// Whether the transcript shows the live generation row.
+static SHOW_GENERATION_STATUS: AtomicBool = AtomicBool::new(true);
+
 /// The notification categories the reader wants; master, completed, needs
 /// input and failure are bits of one byte, read on the event path.
 static NOTIFICATION_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0b1111);
@@ -57,6 +64,18 @@ fn notification_policy(
         | (u8::from(completed) << 1)
         | (u8::from(needs_input) << 2)
         | (u8::from(failed) << 3)
+}
+
+pub fn show_token_usage() -> bool {
+    SHOW_TOKEN_USAGE.load(Ordering::Relaxed)
+}
+
+pub fn show_plan_goal() -> bool {
+    SHOW_PLAN_GOAL.load(Ordering::Relaxed)
+}
+
+pub fn show_generation_status() -> bool {
+    SHOW_GENERATION_STATUS.load(Ordering::Relaxed)
 }
 
 /// Plays `haptic` when the reader left feedback on.
@@ -106,6 +125,12 @@ struct StoredSettings {
     notify_needs_input: bool,
     #[serde(default = "default_true")]
     notify_failed: bool,
+    #[serde(default = "default_true")]
+    show_token_usage: bool,
+    #[serde(default = "default_true")]
+    show_plan_goal: bool,
+    #[serde(default = "default_true")]
+    show_generation_status: bool,
 }
 
 impl Default for StoredSettings {
@@ -121,6 +146,9 @@ impl Default for StoredSettings {
             notify_completed: true,
             notify_needs_input: true,
             notify_failed: true,
+            show_token_usage: true,
+            show_plan_goal: true,
+            show_generation_status: true,
         }
     }
 }
@@ -145,6 +173,10 @@ pub struct SettingsState {
     pub notify_completed: Signal<bool>,
     pub notify_needs_input: Signal<bool>,
     pub notify_failed: Signal<bool>,
+    /// Whether the composer and transcript show their optional chrome.
+    pub show_token_usage: Signal<bool>,
+    pub show_plan_goal: Signal<bool>,
+    pub show_generation_status: Signal<bool>,
     /// Bumped on every language change: the root rebuilds the copy in place.
     pub revision: Signal<u64>,
 }
@@ -176,6 +208,9 @@ impl SettingsState {
             notify_completed: signal(stored.notify_completed),
             notify_needs_input: signal(stored.notify_needs_input),
             notify_failed: signal(stored.notify_failed),
+            show_token_usage: signal(stored.show_token_usage),
+            show_plan_goal: signal(stored.show_plan_goal),
+            show_generation_status: signal(stored.show_generation_status),
             revision: signal(0),
         };
         if imported {
@@ -192,6 +227,12 @@ impl SettingsState {
         copy::set_preference(self.language.get_untracked());
         HAPTICS_ENABLED.store(self.haptics.get_untracked(), Ordering::Relaxed);
         KEEP_SCREEN_ON.store(self.keep_screen_on.get_untracked(), Ordering::Relaxed);
+        SHOW_TOKEN_USAGE.store(self.show_token_usage.get_untracked(), Ordering::Relaxed);
+        SHOW_PLAN_GOAL.store(self.show_plan_goal.get_untracked(), Ordering::Relaxed);
+        SHOW_GENERATION_STATUS.store(
+            self.show_generation_status.get_untracked(),
+            Ordering::Relaxed,
+        );
         vibex_nsh_ui::theme::set_font_scale_percent(self.font_scale.get_untracked());
         self.refresh_notifications();
         vibex_nsh_ui::motion::set_reduce_motion(self.reduce_motion.get_untracked());
@@ -284,6 +325,24 @@ impl SettingsState {
         self.persist();
     }
 
+    pub fn set_show_token_usage(&self, enabled: bool) {
+        self.show_token_usage.set(enabled);
+        SHOW_TOKEN_USAGE.store(enabled, Ordering::Relaxed);
+        self.persist();
+    }
+
+    pub fn set_show_plan_goal(&self, enabled: bool) {
+        self.show_plan_goal.set(enabled);
+        SHOW_PLAN_GOAL.store(enabled, Ordering::Relaxed);
+        self.persist();
+    }
+
+    pub fn set_show_generation_status(&self, enabled: bool) {
+        self.show_generation_status.set(enabled);
+        SHOW_GENERATION_STATUS.store(enabled, Ordering::Relaxed);
+        self.persist();
+    }
+
     pub fn set_notify_failed(&self, enabled: bool) {
         self.notify_failed.set(enabled);
         self.refresh_notifications();
@@ -314,6 +373,9 @@ impl SettingsState {
             notify_completed: self.notify_completed.get_untracked(),
             notify_needs_input: self.notify_needs_input.get_untracked(),
             notify_failed: self.notify_failed.get_untracked(),
+            show_token_usage: self.show_token_usage.get_untracked(),
+            show_plan_goal: self.show_plan_goal.get_untracked(),
+            show_generation_status: self.show_generation_status.get_untracked(),
         };
         if let Ok(text) = serde_json::to_string(&stored) {
             let _ = Storage::set_item(SETTINGS_KEY, text);
@@ -336,6 +398,9 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
             notify_completed: true,
             notify_needs_input: true,
             notify_failed: true,
+            show_token_usage: true,
+            show_plan_goal: true,
+            show_generation_status: true,
         }
     }
 }
@@ -366,6 +431,14 @@ fn appearance_to_storage(appearance: Appearance) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conversation_chrome_defaults_to_on() {
+        let stored = StoredSettings::default();
+        assert!(stored.show_token_usage);
+        assert!(stored.show_plan_goal);
+        assert!(stored.show_generation_status);
+    }
 
     #[test]
     fn appearance_names_round_trip() {
