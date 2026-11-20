@@ -16,10 +16,10 @@ use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
-    self, AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
-    PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, RuntimeChoiceView,
-    RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    TimelineEntry, TokenUsageView,
+    self, AttachmentItem, CommandEntry, EntryKind, GoalPhaseView, GoalView, PendingPermission,
+    PendingQuestion, PermissionChoice, PermissionOption, PlanStepState, PlanStepView, PlanView,
+    QuestionField, QuestionFieldKind, RuntimeChoiceView, RuntimeOptionView, RuntimeSummaryView,
+    SessionHost, SessionState, SessionSummary, TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
@@ -199,6 +199,23 @@ fn RuntimeShell() -> impl IntoElement {
         input: 10_000,
         output: 2_000,
     }));
+    host.plan = signal(Some(PlanView {
+        title: "Current plan".to_owned(),
+        steps: vec![PlanStepView {
+            title: "Inspect".to_owned(),
+            state: PlanStepState::Running,
+        }],
+        completed: 0,
+        current: 0,
+    }));
+    host.goal = signal(Some(GoalView {
+        objective: "Ship P1".to_owned(),
+        phase: GoalPhaseView::Active,
+        progress: Some("2 rounds".to_owned()),
+        can_pause: true,
+        can_resume: false,
+        can_clear: true,
+    }));
     let runtime_open = signal(false);
     let close = runtime_open;
     host.runtime_open = runtime_open;
@@ -256,6 +273,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
     let token_usage = signal(None);
+    let plan = signal(None);
+    let goal = signal(None);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -567,6 +586,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         runtime_open,
         runtime_busy,
         token_usage,
+        plan,
+        goal,
+        on_goal_control: Rc::new(|_| {}),
         on_open_runtime: Rc::new(|| {}),
         on_close_runtime: Rc::new(|| {}),
         on_choose_runtime: Rc::new(|_| {}),
@@ -721,6 +743,9 @@ fn the_composer_opens_the_runtime_choices() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Claude 4").unwrap();
     app.wait_for("42%").unwrap();
+    assert!(app.screen().shows("Ship P1"));
+    assert!(app.screen().shows("Current plan"));
+    assert!(app.screen().shows("Pause"));
     app.press("Claude 4").unwrap();
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();

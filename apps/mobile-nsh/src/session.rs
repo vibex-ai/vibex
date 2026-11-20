@@ -25,22 +25,22 @@ use vibex_backend::{
     GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind,
-    AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage, ApprovalResponder,
-    CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
-    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentGoalControlRequest,
+    AgentNotificationKind, AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage,
+    ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
     ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
     ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
     GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
-    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
-    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
+    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -51,9 +51,10 @@ use vibex_nsh_ui::{
     screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
-        AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
-        PermissionChoice, PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind,
-        QuestionOption, QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
+        AttachmentItem, CommandEntry, EntryKind, GoalControl, GoalPhaseView, GoalView,
+        PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
+        PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
+        QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
         RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry,
         TokenUsageView,
     },
@@ -179,6 +180,8 @@ pub struct SessionService {
     runtime_open: Signal<bool>,
     runtime_busy: Signal<bool>,
     token_usage: Signal<Option<TokenUsageView>>,
+    plan: Signal<Option<PlanView>>,
+    goal: Signal<Option<GoalView>>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -296,6 +299,8 @@ impl SessionService {
             runtime_open: signal(false),
             runtime_busy: signal(false),
             token_usage: signal(None),
+            plan: signal(None),
+            goal: signal(None),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -472,6 +477,12 @@ impl SessionService {
             runtime_open: self.runtime_open,
             runtime_busy: self.runtime_busy,
             token_usage: self.token_usage,
+            plan: self.plan,
+            goal: self.goal,
+            on_goal_control: {
+                let service = self.clone();
+                Rc::new(move |control: GoalControl| service.control_goal(control))
+            },
             on_open_runtime: {
                 let service = self.clone();
                 Rc::new(move || service.open_runtime())
@@ -1402,6 +1413,51 @@ impl SessionService {
         self.apply_selection(selection);
     }
 
+    /// Pauses, resumes or clears the session's goal.
+    fn control_goal(&self, control: GoalControl) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let action = match control {
+            GoalControl::Pause => GoalAction::Pause,
+            GoalControl::Resume => GoalAction::Resume,
+            GoalControl::Clear => GoalAction::Clear,
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let target = session_id.clone();
+            let result = background(async move {
+                backend
+                    .control_goal(MutationRequest::new(AgentGoalControlRequest {
+                        session_id: target,
+                        action,
+                        objective: None,
+                        expected_revision: None,
+                        correlation_id: None,
+                    }))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(result)) => {
+                    if let Some(goal) = result.goal {
+                        service.goal.set(goal_view_from_snapshot(&goal));
+                    }
+                    service.reload(&session_id);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("controlling the goal did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
     fn current_selection(&self) -> Option<SessionRuntimeSelection> {
         self.runtime_state
             .borrow()
@@ -1620,8 +1676,12 @@ impl SessionService {
                 entries.push(live_turn_entry(turn));
             }
         }
+        let plan = plan_view(&model.items);
+        let goal = goal_view(&model.items);
         drop(model);
         self.timeline.set(entries);
+        self.plan.set(plan);
+        self.goal.set(goal);
         self.refresh_pending();
     }
 
@@ -3639,6 +3699,86 @@ fn load_drafts() -> BTreeMap<String, String> {
     Storage::get_item(DRAFTS_KEY)
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+fn plan_view(items: &[vibex_core::TimelineItem]) -> Option<PlanView> {
+    let plan = items.iter().rev().find_map(|item| match &item.payload {
+        TimelinePayload::Plan(plan) => Some(plan),
+        _ => None,
+    })?;
+    let steps = plan
+        .steps
+        .iter()
+        .map(|step| PlanStepView {
+            title: step.title.clone(),
+            state: match step.status {
+                PlanStepStatus::Pending => PlanStepState::Pending,
+                PlanStepStatus::Running => PlanStepState::Running,
+                PlanStepStatus::Completed => PlanStepState::Completed,
+                PlanStepStatus::Failed => PlanStepState::Failed,
+            },
+        })
+        .collect::<Vec<_>>();
+    let completed = steps
+        .iter()
+        .filter(|step| step.state == PlanStepState::Completed)
+        .count();
+    let current = steps
+        .iter()
+        .position(|step| step.state == PlanStepState::Running)
+        .unwrap_or(completed)
+        .min(steps.len().saturating_sub(1));
+    Some(PlanView {
+        title: plan.title.clone(),
+        steps,
+        completed,
+        current,
+    })
+}
+
+fn goal_view(items: &[vibex_core::TimelineItem]) -> Option<GoalView> {
+    let payload = items.iter().rev().find_map(|item| match &item.payload {
+        TimelinePayload::Goal(payload) => Some(payload),
+        _ => None,
+    })?;
+    payload
+        .goal
+        .as_ref()
+        .map(|goal| goal_view_from_snapshot_with_actions(goal, &payload.actions))
+}
+
+fn goal_view_from_snapshot(goal: &vibex_core::GoalSnapshot) -> Option<GoalView> {
+    Some(goal_view_from_snapshot_with_actions(goal, &[]))
+}
+
+fn goal_view_from_snapshot_with_actions(
+    goal: &vibex_core::GoalSnapshot,
+    actions: &[GoalAction],
+) -> GoalView {
+    let can_clear = actions.contains(&GoalAction::Clear);
+    let progress = match (goal.tokens_used, goal.token_budget) {
+        (Some(used), Some(budget)) if budget > 0 => Some(format!("{used} / {budget} tokens")),
+        (Some(used), _) => Some(format!("{used} tokens")),
+        _ => goal
+            .time_used_seconds
+            .map(|seconds| format!("{}m", seconds / 60)),
+    };
+    GoalView {
+        objective: goal.objective.clone(),
+        phase: match goal.phase {
+            GoalPhase::Active => GoalPhaseView::Active,
+            GoalPhase::Paused => GoalPhaseView::Paused,
+            GoalPhase::Blocked => GoalPhaseView::Blocked,
+            GoalPhase::UsageLimited => GoalPhaseView::UsageLimited,
+            GoalPhase::BudgetLimited => GoalPhaseView::BudgetLimited,
+            GoalPhase::Complete => GoalPhaseView::Complete,
+            GoalPhase::Unknown => GoalPhaseView::Unknown,
+        },
+        progress,
+        can_pause: goal.phase == GoalPhase::Active && actions.contains(&GoalAction::Pause),
+        can_resume: goal.phase == GoalPhase::Paused && actions.contains(&GoalAction::Resume),
+        can_clear,
+    }
 }
 
 fn token_usage_view(usage: AgentTokenUsage) -> TokenUsageView {

@@ -172,6 +172,62 @@ pub struct TokenUsageView {
     pub output: u64,
 }
 
+/// What one step of the Agent's plan is doing.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum PlanStepState {
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+/// One step of the Agent's current plan.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanStepView {
+    pub title: String,
+    pub state: PlanStepState,
+}
+
+/// The Agent's current plan, for the bar above the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PlanView {
+    pub title: String,
+    pub steps: Vec<PlanStepView>,
+    pub completed: usize,
+    pub current: usize,
+}
+
+/// The phase of the session's goal.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalPhaseView {
+    Active,
+    Paused,
+    Blocked,
+    UsageLimited,
+    BudgetLimited,
+    Complete,
+    Unknown,
+}
+
+/// The session's standing goal, for the bar above the composer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct GoalView {
+    pub objective: String,
+    pub phase: GoalPhaseView,
+    pub progress: Option<String>,
+    pub can_pause: bool,
+    pub can_resume: bool,
+    pub can_clear: bool,
+}
+
+/// What the reader asked the goal to do.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GoalControl {
+    Pause,
+    Resume,
+    Clear,
+}
+
 /// The answer a permission card offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionChoice {
@@ -381,6 +437,10 @@ pub struct SessionHost {
     pub runtime_features: Signal<Vec<RuntimeFeatureView>>,
     /// The session's token use, when the runtime reports it.
     pub token_usage: Signal<Option<TokenUsageView>>,
+    /// The Agent's current plan and the session's goal.
+    pub plan: Signal<Option<PlanView>>,
+    pub goal: Signal<Option<GoalView>>,
+    pub on_goal_control: Rc<dyn Fn(GoalControl)>,
     pub runtime_open: Signal<bool>,
     pub runtime_busy: Signal<bool>,
     pub on_open_runtime: Action,
@@ -1798,6 +1858,10 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let runtime_modes = host.runtime_modes;
     let runtime_features = host.runtime_features;
     let token_usage = host.token_usage;
+    let plan = host.plan;
+    let goal = host.goal;
+    let on_goal_control = host.on_goal_control.clone();
+    let plan_open = signal(false);
     let on_open_runtime = host.on_open_runtime.clone();
     let running = computed(move || {
         let Some(active) = active.get() else {
@@ -1842,6 +1906,13 @@ fn composer(host: SessionHost) -> impl IntoElement {
             move || !attachments.with(|attachments| attachments.is_empty()),
             move || attachment_chips(attachments, on_remove_attachment.clone()),
         ))
+        .child(when(move || goal.get().is_some(), {
+            let on_goal_control = on_goal_control.clone();
+            move || goal_bar(goal, on_goal_control.clone())
+        }))
+        .child(when(move || plan.get().is_some(), {
+            move || plan_bar(plan, plan_open)
+        }))
         .child(when(move || runtime_summary.get().is_some(), {
             let on_open_runtime = on_open_runtime.clone();
             move || {
@@ -1930,6 +2001,234 @@ fn composer(host: SessionHost) -> impl IntoElement {
         .child(when(
             move || keyboard_height().0 == 0.0,
             || view().h(safe_area().bottom),
+        ))
+}
+
+/// The session's standing objective, above the plan it is worked through.
+fn goal_bar(
+    goal: Signal<Option<GoalView>>,
+    on_control: Rc<dyn Fn(GoalControl)>,
+) -> impl IntoElement {
+    let pause = on_control.clone();
+    let resume = on_control.clone();
+    let clear = on_control;
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .p(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    text(move || {
+                        goal.with(|goal| {
+                            goal.as_ref()
+                                .map(|goal| goal.objective.clone())
+                                .unwrap_or_default()
+                        })
+                    })
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(theme::font_detail()))
+                    .text_color(theme::foreground),
+                )
+                .child(
+                    text(move || {
+                        goal.with(|goal| goal.as_ref().map(goal_phase_label).unwrap_or_default())
+                    })
+                    .text_size(px(theme::font_micro()))
+                    .text_color(move || {
+                        goal.with(|goal| {
+                            goal.as_ref()
+                                .map(goal_phase_color)
+                                .unwrap_or_else(theme::text_muted)
+                        })
+                    }),
+                )
+                .child(small_action(
+                    copy::text("Clear", "清除", "清除"),
+                    move || clear(GoalControl::Clear),
+                )),
+        )
+        .child(when(
+            move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.progress.is_some())),
+            move || {
+                text(move || {
+                    goal.with(|goal| {
+                        goal.as_ref()
+                            .and_then(|goal| goal.progress.clone())
+                            .unwrap_or_default()
+                    })
+                })
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted)
+            },
+        ))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(when(
+                    move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.can_pause)),
+                    {
+                        let pause = pause.clone();
+                        move || {
+                            let pause = pause.clone();
+                            small_action(copy::text("Pause", "暂停", "暫停"), move || {
+                                pause(GoalControl::Pause)
+                            })
+                        }
+                    },
+                ))
+                .child(when(
+                    move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.can_resume)),
+                    {
+                        let resume = resume.clone();
+                        move || {
+                            let resume = resume.clone();
+                            small_action(copy::text("Resume", "继续", "繼續"), move || {
+                                resume(GoalControl::Resume)
+                            })
+                        }
+                    },
+                )),
+        )
+}
+
+fn goal_phase_label(goal: &GoalView) -> String {
+    match goal.phase {
+        GoalPhaseView::Active => copy::text("Active", "进行中", "進行中"),
+        GoalPhaseView::Paused => copy::text("Paused", "已暂停", "已暫停"),
+        GoalPhaseView::Blocked => copy::text("Blocked", "受阻", "受阻"),
+        GoalPhaseView::UsageLimited => copy::text("Limit reached", "已达限额", "已達限額"),
+        GoalPhaseView::BudgetLimited => copy::text("Budget reached", "已达预算", "已達預算"),
+        GoalPhaseView::Complete => copy::text("Complete", "已完成", "已完成"),
+        GoalPhaseView::Unknown => copy::text("Unknown", "未知", "未知"),
+    }
+    .to_owned()
+}
+
+fn goal_phase_color(goal: &GoalView) -> Hsla {
+    match goal.phase {
+        GoalPhaseView::Active => theme::color_token("chart-1"),
+        GoalPhaseView::Paused | GoalPhaseView::Blocked => theme::color_token("warning"),
+        GoalPhaseView::UsageLimited | GoalPhaseView::BudgetLimited => theme::accent_red(),
+        GoalPhaseView::Complete => theme::color_token("chart-2"),
+        GoalPhaseView::Unknown => theme::text_muted(),
+    }
+}
+
+/// The Agent's current plan, with its steps one tap away.
+fn plan_bar(plan: Signal<Option<PlanView>>, open: Signal<bool>) -> impl IntoElement {
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .p(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    text(move || {
+                        plan.with(|plan| {
+                            plan.as_ref()
+                                .map(|plan| plan.title.clone())
+                                .filter(|title| !title.trim().is_empty())
+                                .unwrap_or_else(|| {
+                                    copy::text("Current plan", "当前计划", "目前計劃").to_owned()
+                                })
+                        })
+                    })
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(theme::font_detail()))
+                    .text_color(theme::foreground),
+                )
+                .child(
+                    text(move || {
+                        plan.with(|plan| {
+                            plan.as_ref()
+                                .map(|plan| format!("{}/{}", plan.completed, plan.steps.len()))
+                                .unwrap_or_default()
+                        })
+                    })
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted),
+                )
+                .child(small_action(
+                    copy::text("Steps", "步骤", "步驟"),
+                    move || open.update(|open| *open = !*open),
+                )),
+        )
+        .child(
+            text(move || {
+                plan.with(|plan| {
+                    plan.as_ref()
+                        .and_then(|plan| plan.steps.get(plan.current))
+                        .map(|step| step.title.clone())
+                        .unwrap_or_default()
+                })
+            })
+            .truncate()
+            .text_size(px(theme::font_micro()))
+            .text_color(theme::text_muted),
+        )
+        .child(when(
+            move || open.get(),
+            move || {
+                view().w_full().flex_col().gap(px(2.0)).child(each(
+                    move || {
+                        plan.with(|plan| {
+                            plan.as_ref()
+                                .map(|plan| plan.steps.clone())
+                                .unwrap_or_default()
+                        })
+                    },
+                    |step| step.title.clone(),
+                    move |step, _| {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .child(
+                                text(move || match step.with(|step| step.state) {
+                                    PlanStepState::Completed => "✓",
+                                    PlanStepState::Running => "◐",
+                                    PlanStepState::Failed => "×",
+                                    PlanStepState::Pending => "·",
+                                })
+                                .text_size(px(theme::font_micro()))
+                                .text_color(move || {
+                                    match step.with(|step| step.state) {
+                                        PlanStepState::Completed => theme::color_token("chart-1"),
+                                        PlanStepState::Running => theme::color_token("warning"),
+                                        PlanStepState::Failed => theme::accent_red(),
+                                        PlanStepState::Pending => theme::text_muted(),
+                                    }
+                                }),
+                            )
+                            .child(
+                                text(move || step.with(|step| step.title.clone()))
+                                    .flex_1()
+                                    .truncate()
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_secondary),
+                            )
+                    },
+                ))
+            },
         ))
 }
 
