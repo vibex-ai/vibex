@@ -85,8 +85,6 @@ const TIMELINE_LIMIT: u32 = 200;
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 /// Where the newest transcript window of the last few sessions is kept.
 const TIMELINE_CACHE_KEY: &str = "vibex.mobile.timeline.v1";
-/// Where the prompts written ahead of a running turn are kept.
-const QUEUE_KEY: &str = "vibex.mobile.queue.v1";
 /// Where the sessions the reader pinned are kept.
 const PINS_KEY: &str = "vibex.mobile.pins.v1";
 /// At most this many conversations are cached.
@@ -110,43 +108,6 @@ const RECONNECT_MAX_MS: u64 = 15_000;
 struct EditState {
     user_sequence: i64,
     expected_end_sequence: i64,
-}
-
-/// A prompt held behind the running turn.
-#[derive(Clone, Debug)]
-struct QueuedMessage {
-    id: u64,
-    text: String,
-    attachments: Vec<AttachmentItem>,
-    mentions: Vec<VibexUseMention>,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredAttachment {
-    label: String,
-    mime_type: String,
-    uri: String,
-}
-
-#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredQueued {
-    id: u64,
-    text: String,
-    #[serde(default)]
-    attachments: Vec<StoredAttachment>,
-    #[serde(default)]
-    mentions: Vec<VibexUseMention>,
-}
-
-#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct StoredQueues {
-    #[serde(default)]
-    sessions: BTreeMap<String, Vec<StoredQueued>>,
-    #[serde(default)]
-    paused: Vec<String>,
 }
 
 /// The session shell's state and actions.
@@ -320,9 +281,6 @@ pub struct SessionService {
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
     history_open: Signal<bool>,
-    queue: Rc<RefCell<BTreeMap<String, Vec<QueuedMessage>>>>,
-    queue_seq: Rc<Cell<u64>>,
-    queue_paused_sessions: Rc<RefCell<std::collections::BTreeSet<String>>>,
     queued: Signal<Vec<QueuedMessageView>>,
     queue_paused: Signal<bool>,
     schedule_open: Signal<bool>,
@@ -360,7 +318,6 @@ impl SessionService {
         let sidebar_backend: Arc<dyn SidebarBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
-        let loaded = load_queues();
         let service = Self {
             bundle_host_id: Rc::new(bundle.host_id().to_owned()),
             backend,
@@ -512,9 +469,6 @@ impl SessionService {
             goal: signal(None),
             history: signal(Vec::new()),
             history_open: signal(false),
-            queue: Rc::new(RefCell::new(loaded.0)),
-            queue_seq: Rc::new(Cell::new(loaded.2)),
-            queue_paused_sessions: Rc::new(RefCell::new(loaded.1)),
             queued: signal(Vec::new()),
             queue_paused: signal(false),
             schedule_open: signal(false),
@@ -1676,8 +1630,6 @@ impl SessionService {
                     .borrow_mut()
                     .retain(|id, _| !ids.contains(id));
                 self.drafts.borrow_mut().retain(|id, _| !ids.contains(id));
-                self.queue.borrow_mut().retain(|id, _| !ids.contains(id));
-                self.persist_queues();
                 self.persist_drafts();
                 let active = self.active.get_untracked();
                 if active.as_ref().is_some_and(|active| ids.contains(active)) {
@@ -1804,7 +1756,7 @@ impl SessionService {
         self.editable_sequence.set(0);
         self.editing.set(false);
         *self.edit_state.borrow_mut() = None;
-        self.publish_queue();
+        self.sync_queue();
         self.load_cached_timeline(&session_id);
         self.refresh_runtime(&session_id);
         self.refresh_token_usage(&session_id);
@@ -2695,211 +2647,113 @@ impl SessionService {
         attachments: Vec<AttachmentItem>,
         mentions: Vec<VibexUseMention>,
     ) {
-        let id = self.queue_seq.get().wrapping_add(1);
-        self.queue_seq.set(id);
-        self.queue
-            .borrow_mut()
-            .entry(session.clone())
-            .or_default()
-            .push(QueuedMessage {
-                id,
-                text: text.clone(),
-                attachments,
-                mentions,
-            });
         self.draft.set(String::new());
         self.attachments.set(Vec::new());
-        self.publish_queue();
-        self.persist_queues();
-        crate::settings::haptic(nsh_core::Haptic::Selection);
+        self.armed_mentions.borrow_mut().clear();
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+            session_id: session,
+            text,
+            attachments: attachments
+                .iter()
+                .map(|attachment| MessageAttachment {
+                    label: attachment.label.clone(),
+                    mime_type: Some(attachment.mime_type.clone()),
+                    uri: Some(attachment.uri.clone()),
+                    inline_text_offset: None,
+                })
+                .collect(),
+            mentions,
+        });
     }
 
-    fn publish_queue(&self) {
+    fn sync_queue(&self) {
         let Some(active) = self.active.get_untracked() else {
             self.queued.set(Vec::new());
             self.queue_paused.set(false);
             return;
         };
+        let snapshot = self.sidebar_snapshot.borrow();
         self.queued.set(
-            self.queue
-                .borrow()
-                .get(&active)
-                .map(|queue| {
-                    queue
-                        .iter()
-                        .map(|message| QueuedMessageView {
-                            id: message.id,
-                            text: message.text.clone(),
-                            attachment_count: message.attachments.len(),
-                        })
-                        .collect()
+            snapshot
+                .queued_sends
+                .iter()
+                .filter(|message| message.session_id == active)
+                .map(|message| QueuedMessageView {
+                    id: message.message_id,
+                    text: message.text.clone(),
+                    attachment_count: message.attachments.len(),
                 })
-                .unwrap_or_default(),
+                .collect(),
         );
         self.queue_paused
-            .set(self.queue_paused_sessions.borrow().contains(&active));
-    }
-
-    fn persist_queues(&self) {
-        let sessions = self
-            .queue
-            .borrow()
-            .iter()
-            .map(|(session, messages)| {
-                (
-                    session.clone(),
-                    messages
-                        .iter()
-                        .map(|message| StoredQueued {
-                            id: message.id,
-                            text: message.text.clone(),
-                            attachments: message
-                                .attachments
-                                .iter()
-                                .map(|attachment| StoredAttachment {
-                                    label: attachment.label.clone(),
-                                    mime_type: attachment.mime_type.clone(),
-                                    uri: attachment.uri.clone(),
-                                })
-                                .collect(),
-                            mentions: message.mentions.clone(),
-                        })
-                        .collect(),
-                )
-            })
-            .collect();
-        let stored = StoredQueues {
-            sessions,
-            paused: self
-                .queue_paused_sessions
-                .borrow()
-                .iter()
-                .cloned()
-                .collect(),
-        };
-        if let Ok(text) = serde_json::to_string(&stored) {
-            let _ = Storage::set_item(QUEUE_KEY, text);
-        }
+            .set(snapshot.paused_queue_session_ids.contains(&active));
     }
 
     fn send_queued(&self, id: u64) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
-        let message = {
-            let mut queue = self.queue.borrow_mut();
-            let Some(queue) = queue.get_mut(&active) else {
-                return;
-            };
-            let Some(index) = queue.iter().position(|message| message.id == id) else {
-                return;
-            };
-            queue.remove(index)
-        };
-        self.publish_queue();
-        self.persist_queues();
-        self.deliver(message.text, message.attachments, message.mentions, false);
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SendQueuedSendNow {
+            session_id: active,
+            message_id: id,
+        });
     }
 
     fn move_queued(&self, id: u64, delta: isize) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
-        let mut queues = self.queue.borrow_mut();
-        let Some(queue) = queues.get_mut(&active) else {
-            return;
-        };
-        let Some(index) = queue.iter().position(|message| message.id == id) else {
+        let queued = self.queued.get_untracked();
+        let Some(index) = queued.iter().position(|message| message.id == id) else {
             return;
         };
         let target = index as isize + delta;
-        if target < 0 || target >= queue.len() as isize {
+        if target < 0 || target >= queued.len() as isize {
             return;
         }
-        queue.swap(index, target as usize);
-        drop(queues);
-        self.publish_queue();
-        self.persist_queues();
+        let before = queued.get(target as usize).map(|message| message.id);
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveQueuedSend {
+            session_id: active,
+            message_id: id,
+            before_message_id: before,
+        });
     }
 
     fn remove_queued(&self, id: u64) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
-        if let Some(queue) = self.queue.borrow_mut().get_mut(&active) {
-            queue.retain(|message| message.id != id);
-        }
-        self.publish_queue();
-        self.persist_queues();
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+            session_id: active,
+            message_id: id,
+        });
     }
 
     fn clear_queue(&self) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
-        self.queue.borrow_mut().remove(&active);
-        self.publish_queue();
-        self.persist_queues();
+        for message in self.queued.get_untracked() {
+            self.sidebar_mutation(RemoteSidebarOrganizationMutation::RemoveQueuedSend {
+                session_id: active.clone(),
+                message_id: message.id,
+            });
+        }
     }
 
     fn toggle_queue_paused(&self) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
-        let mut paused = self.queue_paused_sessions.borrow_mut();
-        if !paused.remove(&active) {
-            paused.insert(active);
-        }
-        drop(paused);
-        self.publish_queue();
-        self.persist_queues();
+        let paused = !self.queue_paused.get_untracked();
+        self.queue_paused.set(paused);
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetQueuePaused {
+            session_id: active,
+            paused,
+        });
     }
 
-    fn flush_queue(&self) {
-        if self.queue_paused.get_untracked() || self.turn_live() || self.sending.get_untracked() {
-            return;
-        }
-        let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let message = {
-            let mut queue = self.queue.borrow_mut();
-            let Some(queue) = queue.get_mut(&active) else {
-                return;
-            };
-            if queue.is_empty() {
-                return;
-            }
-            queue.remove(0)
-        };
-        self.publish_queue();
-        self.persist_queues();
-        self.deliver(message.text, message.attachments, message.mentions, false);
-    }
-
-    fn requeue(
-        &self,
-        text: String,
-        attachments: Vec<AttachmentItem>,
-        mentions: Vec<VibexUseMention>,
-    ) {
-        let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let id = self.queue_seq.get().wrapping_add(1);
-        self.queue_seq.set(id);
-        self.queue.borrow_mut().entry(active).or_default().insert(
-            0,
-            QueuedMessage {
-                id,
-                text,
-                attachments,
-                mentions,
-            },
-        );
-        self.publish_queue();
-        self.persist_queues();
-    }
+    fn flush_queue(&self) {}
 
     fn deliver(
         &self,
@@ -2917,9 +2771,6 @@ impl SessionService {
         self.sending.set(true);
         self.error.set(None);
         let sent_text = text.clone();
-        let retry_text = text.clone();
-        let retry_attachments = attachments.clone();
-        let retry_mentions = mentions.clone();
         let sent_attachment_ids = attachments
             .iter()
             .map(|item| item.id.clone())
@@ -2963,23 +2814,12 @@ impl SessionService {
                     crate::settings::haptic(nsh_core::Haptic::Notification(
                         nsh_core::HapticNotification::Success,
                     ));
-                    service.flush_queue();
                 }
-                Ok(Err(error)) => {
-                    if !from_composer {
-                        service.requeue(retry_text, retry_attachments, retry_mentions.clone());
-                    }
-                    service.fail(&error);
-                }
-                Err(error) => {
-                    if !from_composer {
-                        service.requeue(retry_text, retry_attachments, retry_mentions.clone());
-                    }
-                    service.fail(&BackendError::failed(
-                        "session_task_failed",
-                        format!("sending the message did not finish: {error}"),
-                    ));
-                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("sending the message did not finish: {error}"),
+                )),
             }
         });
     }
@@ -4279,6 +4119,7 @@ impl SessionService {
         }
         self.sidebar_sections.set(sections);
         *self.sidebar_snapshot.borrow_mut() = snapshot;
+        self.sync_queue();
         self.persist_pins();
     }
 
@@ -4571,8 +4412,6 @@ impl SessionService {
         if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
             let _ = Storage::set_item(PINS_KEY, text);
         }
-        self.queue.borrow_mut().remove(id);
-        self.persist_queues();
         if self.active.get_untracked().as_deref() != Some(id) {
             return;
         }
@@ -6967,46 +6806,6 @@ fn load_pins() -> Vec<String> {
     Storage::get_item(PINS_KEY)
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
-}
-
-fn load_queues() -> (
-    BTreeMap<String, Vec<QueuedMessage>>,
-    std::collections::BTreeSet<String>,
-    u64,
-) {
-    let stored = Storage::get_item(QUEUE_KEY)
-        .and_then(|text| serde_json::from_str::<StoredQueues>(&text).ok())
-        .unwrap_or_default();
-    let mut next = 0;
-    let sessions = stored
-        .sessions
-        .into_iter()
-        .map(|(session, messages)| {
-            let messages = messages
-                .into_iter()
-                .map(|message| {
-                    next = next.max(message.id.saturating_add(1));
-                    QueuedMessage {
-                        id: message.id,
-                        text: message.text,
-                        attachments: message
-                            .attachments
-                            .into_iter()
-                            .map(|attachment| AttachmentItem {
-                                id: format!("queued:{}", message.id),
-                                label: attachment.label,
-                                mime_type: attachment.mime_type,
-                                uri: attachment.uri,
-                            })
-                            .collect(),
-                        mentions: message.mentions,
-                    }
-                })
-                .collect::<Vec<_>>();
-            (session, messages)
-        })
-        .collect();
-    (sessions, stored.paused.into_iter().collect(), next)
 }
 
 /// The cached transcript windows kept on this phone.
