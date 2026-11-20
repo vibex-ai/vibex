@@ -400,6 +400,7 @@ type EditMessage = Rc<dyn Fn(i64, &str)>;
 type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 type BatchAction = Rc<dyn Fn(&[String])>;
 type FolderNameAction = Rc<dyn Fn(&str, &str)>;
+type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -441,6 +442,7 @@ pub struct SessionHost {
     pub on_create_folder: Action,
     pub on_rename_folder: FolderNameAction,
     pub on_delete_folder: Rc<dyn Fn(&str)>,
+    pub on_create_group: CreateGroupAction,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
     pub timeline: Signal<Vec<TimelineEntry>>,
@@ -4021,6 +4023,9 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_delete_folder = host.on_delete_folder.clone();
     let folder_actions = signal(None::<String>);
     let folder_rename = signal(String::new());
+    let group_open = signal(false);
+    let group_name = signal(String::new());
+    let on_create_group = host.on_create_group.clone();
     let hidden_sessions = computed(move || {
         sidebar_sections.with(|sections| {
             sections
@@ -4119,6 +4124,13 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 .text_size(px(theme::font_micro()))
                                 .text_color(theme::text_muted),
                             )
+                            .child(small_action(copy::text("Group", "分组", "分組"), {
+                                move || {
+                                    if !selected.with(|selected| selected.is_empty()) {
+                                        group_open.set(true);
+                                    }
+                                }
+                            }))
                             .child(small_action(copy::text("Archive", "归档", "封存"), {
                                 let on_archive_sessions = on_archive_sessions.clone();
                                 move || {
@@ -4147,6 +4159,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             }))
                     }
                 }))
+                .child(group_sheet(
+                    group_open,
+                    group_name,
+                    on_create_group.clone(),
+                    selected,
+                ))
                 .child(folder_actions_sheet(
                     folder_actions,
                     folder_rename,
@@ -4443,6 +4461,58 @@ fn drawer_groups(
         }
         groups
     })
+}
+
+fn group_sheet(
+    open: Signal<bool>,
+    name: Signal<String>,
+    on_create: CreateGroupAction,
+    members: Signal<Vec<String>>,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                open.set(false);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("New group", "新建分组", "新增分組"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(field::text_field(
+                    name,
+                    copy::text("Group name", "分组名称", "分組名稱"),
+                ))
+                .child({
+                    let on_create = on_create.clone();
+                    action::primary(
+                        copy::text("Create", "创建", "建立"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || {
+                            let ids = members.get_untracked();
+                            let group = name.get_untracked();
+                            if !ids.is_empty() && !group.trim().is_empty() {
+                                on_create(&group, &ids);
+                                name.set(String::new());
+                                open.set(false);
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
+        )
 }
 
 fn folder_actions_sheet(

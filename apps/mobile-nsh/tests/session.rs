@@ -775,6 +775,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_create_folder: Rc::new(|| {}),
         on_rename_folder: Rc::new(|_, _| {}),
         on_delete_folder: Rc::new(|_| {}),
+        on_create_group: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,
@@ -1148,6 +1149,18 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         std::time::Duration::from_secs(5),
     )
     .unwrap();
+}
+
+#[test]
+fn selected_sessions_can_become_a_group() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Select sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
+    app.press("Fix the tests").unwrap();
+    app.wait_for("1 selected").unwrap();
+    app.press("Group").unwrap();
+    app.wait_for("Group name").unwrap();
 }
 
 #[test]

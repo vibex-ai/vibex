@@ -614,6 +614,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.delete_folder(id))
             },
+            on_create_group: {
+                let service = self.clone();
+                Rc::new(move |name: &str, members: &[String]| service.create_group(name, members))
+            },
             on_toggle_pin: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.toggle_pin(id))
@@ -3942,6 +3946,31 @@ impl SessionService {
     fn delete_folder(&self, id: &str) {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::DeleteFolder {
             folder_id: id.to_owned(),
+        });
+    }
+
+    fn create_group(&self, name: &str, members: &[String]) {
+        let name = name.trim().to_owned();
+        if name.is_empty() || members.is_empty() {
+            return;
+        }
+        let first = self.sessions.with(|sessions| {
+            members.iter().find_map(|id| {
+                sessions
+                    .iter()
+                    .find(|session| &session.id == id)
+                    .map(|session| (session.project_id.clone(), session.workspace_id.clone()))
+            })
+        });
+        let Some((project_id, workspace_id)) = first else {
+            return;
+        };
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::CreateGroup {
+            name,
+            project_id,
+            workspace_id,
+            member_session_ids: members.to_vec(),
+            parent_folder_id: None,
         });
     }
 
