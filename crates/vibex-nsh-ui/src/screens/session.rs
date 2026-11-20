@@ -549,6 +549,8 @@ pub struct SessionHost {
     /// Prompts written ahead of a running turn.
     pub queued: Signal<Vec<QueuedMessageView>>,
     pub queue_paused: Signal<bool>,
+    pub queue_manual: Signal<bool>,
+    pub on_toggle_queue_manual: Action,
     /// The sequence of the latest user message that can be edited, and whether
     /// the composer is replacing it.
     pub editable_sequence: Signal<i64>,
@@ -2581,6 +2583,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let goal = host.goal;
     let queued = host.queued;
     let queue_paused = host.queue_paused;
+    let queue_manual = host.queue_manual;
+    let on_toggle_queue_manual = host.on_toggle_queue_manual.clone();
     let on_send_queued = host.on_send_queued.clone();
     let on_remove_queued = host.on_remove_queued.clone();
     let on_move_queued = host.on_move_queued.clone();
@@ -2742,6 +2746,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
                 queue_card(
                     queued,
                     queue_paused,
+                    queue_manual,
+                    on_toggle_queue_manual.clone(),
                     on_send_queued.clone(),
                     on_remove_queued.clone(),
                     on_move_queued.clone(),
@@ -2926,9 +2932,12 @@ fn schedule_picker(on_close: Action, on_schedule: Rc<dyn Fn(u64)>) -> impl IntoE
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn queue_card(
     queued: Signal<Vec<QueuedMessageView>>,
     paused: Signal<bool>,
+    manual: Signal<bool>,
+    on_toggle_manual: Action,
     on_send: Rc<dyn Fn(u64)>,
     on_remove: Rc<dyn Fn(u64)>,
     on_move: Rc<dyn Fn(u64, isize)>,
@@ -2961,6 +2970,16 @@ fn queue_card(
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_secondary),
                 )
+                .child(small_action_reactive(
+                    move || {
+                        if manual.get_untracked() {
+                            copy::text("Auto", "自动", "自動")
+                        } else {
+                            copy::text("Manual", "手动", "手動")
+                        }
+                    },
+                    move || on_toggle_manual(),
+                ))
                 .child(small_action_reactive(
                     move || {
                         if paused.get_untracked() {

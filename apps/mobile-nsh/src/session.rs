@@ -283,6 +283,7 @@ pub struct SessionService {
     history_open: Signal<bool>,
     queued: Signal<Vec<QueuedMessageView>>,
     queue_paused: Signal<bool>,
+    queue_manual: Signal<bool>,
     schedule_open: Signal<bool>,
     scheduled: Signal<bool>,
     scheduled_message_id: Rc<RefCell<Option<u64>>>,
@@ -471,6 +472,7 @@ impl SessionService {
             history_open: signal(false),
             queued: signal(Vec::new()),
             queue_paused: signal(false),
+            queue_manual: signal(false),
             schedule_open: signal(false),
             scheduled: signal(false),
             scheduled_message_id: Rc::new(RefCell::new(None)),
@@ -958,6 +960,11 @@ impl SessionService {
             history_open: self.history_open,
             queued: self.queued,
             queue_paused: self.queue_paused,
+            queue_manual: self.queue_manual,
+            on_toggle_queue_manual: {
+                let service = self.clone();
+                Rc::new(move || service.toggle_queue_manual())
+            },
             editable_sequence: self.editable_sequence,
             editing: self.editing,
             on_edit_message: {
@@ -2676,6 +2683,8 @@ impl SessionService {
         self.queued.set(queued_views(&snapshot, &active));
         self.queue_paused
             .set(snapshot.paused_queue_session_ids.contains(&active));
+        self.queue_manual
+            .set(snapshot.manual_queue_session_ids.contains(&active));
     }
 
     fn send_queued(&self, id: u64) {
@@ -2728,6 +2737,18 @@ impl SessionService {
                 message_id: message.id,
             });
         }
+    }
+
+    fn toggle_queue_manual(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let manual = !self.queue_manual.get_untracked();
+        self.queue_manual.set(manual);
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetQueueManual {
+            session_id: active,
+            manual,
+        });
     }
 
     fn toggle_queue_paused(&self) {

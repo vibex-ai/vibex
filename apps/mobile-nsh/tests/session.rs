@@ -489,6 +489,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let history_open = signal(false);
     let queued = signal(Vec::new());
     let queue_paused = signal(false);
+    let queue_manual = signal(false);
     let editable_sequence = signal(0);
     let schedule_open = signal(false);
     let scheduled = signal(false);
@@ -905,6 +906,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         history_open,
         queued,
         queue_paused,
+        queue_manual,
+        on_toggle_queue_manual: Rc::new(|| {}),
         editable_sequence,
         editing,
         on_edit_message: Rc::new(|_, _| {}),
@@ -1136,6 +1139,7 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("Continue"));
     assert!(app.screen().shows("Current plan"));
     assert!(app.screen().shows("Pause"));
+    assert!(app.screen().shows("Manual"));
     assert!(app.screen().shows("Queued · 1"));
     assert!(app.screen().shows("Hold this (+1)"));
     assert!(app.screen().shows("↑"));
