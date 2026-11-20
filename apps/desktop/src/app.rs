@@ -33202,6 +33202,23 @@ impl VibexWorkbench {
         if width_changed {
             self.timeline_list_seen_width = width;
             self.timeline_list_hint_width = None;
+            // A pane animating its width — a session opening, a split sliding in —
+            // moves it on every frame, and this is where that costs the reader
+            // their place: a seed rebuilds the whole document from one hint and
+            // re-derives the anchor from it, once per animation frame. The count
+            // is still kept in step, by splicing, which leaves every measured row
+            // alone; the hints are seeded once the width holds still.
+            if rows > count {
+                let prepended =
+                    count > 0 && self.timeline_leading_turn_id.as_deref() != leading.as_deref();
+                if prepended {
+                    self.timeline_scroll.splice(0..0, rows - count);
+                } else {
+                    self.timeline_scroll.splice(count..count, rows - count);
+                }
+            }
+            self.timeline_leading_turn_id = leading;
+            return;
         }
         let hints_missing = width > px(0.0) && self.timeline_list_hint_width != Some(width);
         let turn_ids: Vec<String> = self
