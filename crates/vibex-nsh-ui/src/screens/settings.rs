@@ -71,6 +71,7 @@ pub struct SettingsHost {
 pub fn settings(host: SettingsHost) -> impl IntoElement {
     let open = host.open;
     let about_open = signal(false);
+    let notifications_open = signal(false);
     let on_close = host.on_close.clone();
     let on_close_sheet = on_close.clone();
     sheet()
@@ -136,7 +137,16 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                                 copy::text("Failed", "执行失败", "執行失敗"),
                                 host.notify_failed,
                                 host.on_notify_failed.clone(),
-                            )),
+                            ))
+                            .child({
+                                action::secondary(
+                                    copy::text("Notification details", "通知详情", "通知詳情"),
+                                    icon(include_str!("../../assets/icons/check.svg")),
+                                    false,
+                                    move || notifications_open.set(true),
+                                )
+                                .w_full()
+                            }),
                     ))
                     .child(section(
                         copy::text("Conversation", "会话", "工作階段"),
@@ -241,6 +251,7 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                             .w_full()
                         }
                     }))
+                    .child(notifications_sheet(notifications_open, host.clone()))
                     .child(about_sheet(about_open))
                     .child({
                         let on_close = on_close.clone();
@@ -435,6 +446,62 @@ fn toggle_row(
                 move || on_toggle(!enabled.get_untracked()),
             )
             .accessibility_label(label),
+        )
+}
+
+fn notifications_sheet(open: Signal<bool>, host: SettingsHost) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event {
+                open.set(*next);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Notifications", "通知", "通知"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(
+                    text(copy::text(
+                        "Choose which moments the phone should tell you about while Vibex is in the background.",
+                        "选择 Vibex 在后台时哪些时刻需要提醒你。",
+                        "選擇 Vibex 在背景時哪些時刻需要提醒你。",
+                    ))
+                    .text_size(px(theme::font_caption()))
+                    .line_height(theme::line_height_for(theme::font_caption()))
+                    .text_color(theme::text_secondary),
+                )
+                .child(toggle_row(
+                    copy::text("Enable notifications", "启用通知", "啟用通知"),
+                    host.notifications,
+                    host.on_notifications.clone(),
+                ))
+                .child(toggle_row(
+                    copy::text("Agent completed", "Agent 已完成", "Agent 已完成"),
+                    host.notify_completed,
+                    host.on_notify_completed.clone(),
+                ))
+                .child(toggle_row(
+                    copy::text("Needs input", "需要输入", "需要輸入"),
+                    host.notify_needs_input,
+                    host.on_notify_needs_input.clone(),
+                ))
+                .child(toggle_row(
+                    copy::text("Failed", "执行失败", "執行失敗"),
+                    host.notify_failed,
+                    host.on_notify_failed.clone(),
+                )),
         )
 }
 
