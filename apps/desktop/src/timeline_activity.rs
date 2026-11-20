@@ -205,6 +205,10 @@ fn disclosure_chevron(progress: f32) -> Icon {
 /// `live_labels_animate` is the owner's frame-gate answer for this frame. It is
 /// passed in rather than read here because the gate belongs to the view that
 /// draws, and a row does not know which view that is.
+///
+/// `thumbnail` replaces the file-type mark when the row's read named a picture:
+/// the caller resolves the picture and builds the card, so a header never reads
+/// the workspace by itself.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn header(
     id: String,
@@ -213,6 +217,7 @@ pub(super) fn header(
     disclosure: Option<(bool, f32)>,
     highlighted_target: Option<AnyElement>,
     statistics: Option<AnyElement>,
+    thumbnail: Option<AnyElement>,
     live_labels_animate: bool,
     cx: &App,
 ) -> Button {
@@ -243,23 +248,28 @@ pub(super) fn header(
         .text_color(color)
         .group_hover(HOVER_GROUP, |style| style.text_color(hover_color))
         .when(activity.path().is_some(), |this| {
-            let kind = vibex_desktop_model::file_icon_descriptor(
-                activity.target(),
-                vibex_core::FileEntryKind::File,
-            )
-            .kind;
+            let mark = thumbnail.unwrap_or_else(|| {
+                let kind = vibex_desktop_model::file_icon_descriptor(
+                    activity.target(),
+                    vibex_core::FileEntryKind::File,
+                )
+                .kind;
+                div()
+                    .id("file-icon")
+                    .flex_none()
+                    .opacity(0.75)
+                    .group_hover(HOVER_GROUP, |style| style.opacity(1.0))
+                    .child(crate::assets::file_icon(kind, cx).size_3p5())
+                    .into_any_element()
+            });
+            // The chip keeps its plate behind either mark, so a picture and a
+            // file-type icon occupy the same slot and the target never shifts
+            // between rows.
             this.rounded(cx.theme().radius * 0.5)
                 .bg(cx.theme().muted.opacity(0.35))
                 .px_1p5()
                 .py_0p5()
-                .child(
-                    div()
-                        .id("file-icon")
-                        .flex_none()
-                        .opacity(0.75)
-                        .group_hover(HOVER_GROUP, |style| style.opacity(1.0))
-                        .child(crate::assets::file_icon(kind, cx).size_3p5()),
-                )
+                .child(mark)
         })
         .child(div().min_w_0().truncate().child(target));
     Button::new(id.clone())

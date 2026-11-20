@@ -1,7 +1,7 @@
 use gpui::{
-    AnyElement, App, BorderStyle, Element, Hsla, InteractiveElement, Interactivity, IntoElement,
-    ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement, StyleRefinement,
-    Styled, Window, WindowAppearance, div, px,
+    AnyElement, App, BorderStyle, Context, Element, Hsla, InteractiveElement, Interactivity,
+    IntoElement, ParentElement, Pixels, RenderOnce, SharedString, StatefulInteractiveElement,
+    StyleRefinement, Styled, Window, WindowAppearance, div, px,
 };
 use gpui_base::Selectable;
 use gpui_component::{
@@ -250,23 +250,50 @@ impl<E> RenderOnce for PinnedScrollbarBox<E>
 where
     E: InteractiveElement + Styled + ParentElement + Element + 'static,
 {
-    fn render(mut self, _window: &mut Window, _cx: &mut App) -> impl IntoElement {
+    fn render(mut self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let scroller = self.scroller;
         let mut outer = self.outer.child(scroller);
         if let Some(bar) = self.bar.take() {
-            // The overlay is a sibling placed after the scroller, so it paints
-            // over the rows. `inset_0` pins it to the viewport while
-            // `viewport_from_layout` makes it measure against the same box,
-            // which is what keeps the thumb fixed as the content moves.
+            // The bar gets a view of its own: see [`ScrollbarOverlay`]. It is a
+            // sibling placed after the scroller, so it paints over the rows,
+            // and `inset_0` pins it to the viewport while
+            // `viewport_from_layout` makes it measure against the same box.
+            let overlay =
+                window.use_keyed_state("scrollbar-overlay", cx, |_, _| ScrollbarOverlay { bar });
             outer = outer.child(
                 div()
                     .absolute()
                     .inset_0()
-                    .debug_selector(|| "scrollbar-overlay".to_string())
-                    .child(bar),
+                    .child(overlay.cached(StyleRefinement::default().size_full())),
             );
         }
         outer
+    }
+}
+
+/// The bar's own render boundary.
+///
+/// `Scrollbar` asks for an animation frame while its fade runs, and
+/// `Window::request_animation_frame` attributes the request to
+/// `window.current_view()`. Painted as a child of the view that holds the
+/// scroller, that view is the one a list's layer belongs to, and the layer is
+/// refused for as long as the fade runs — every scrolled frame. A view of its
+/// own moves the attribution off the scroller's owner.
+struct ScrollbarOverlay {
+    bar: gpui_base::Scrollbar,
+}
+
+impl gpui::Render for ScrollbarOverlay {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let bar = std::mem::replace(
+            &mut self.bar,
+            gpui_base::Scrollbar::new(&gpui::ScrollHandle::new()),
+        );
+        div()
+            .absolute()
+            .inset_0()
+            .debug_selector(|| "scrollbar-overlay".to_string())
+            .child(bar)
     }
 }
 
@@ -370,6 +397,56 @@ pub fn docs_help_button(
             let _ = validate_external_open_url(url)
                 .and_then(|validated| open_external_url(&validated.url));
         })
+}
+
+/// [`gpui_base::ScrollbarHandle`] over a [`gpui::ListState`].
+///
+/// A `list` owns its scroll position rather than exposing a `ScrollHandle`, so
+/// `pinned_scrollbar` cannot be handed one. This is the bridge: the bar reads
+/// the list's own offsets and writes back through the list's own scrollbar
+/// entry points, which is the same contract a `ScrollHandle` keeps.
+///
+/// The two directions are not symmetric. `ListState` reports where the
+/// viewport starts as an item and an offset into it, so the pixel offset is
+/// recovered from `scroll_px_offset_for_scrollbar`; writing takes a pixel
+/// offset directly through `set_offset_from_scrollbar`. Both are what the
+/// list's own bar does internally, so a drag here moves the list exactly as a
+/// drag on its built-in bar would.
+#[derive(Clone)]
+pub struct ListScrollbarHandle {
+    state: gpui::ListState,
+}
+
+impl ListScrollbarHandle {
+    pub fn new(state: gpui::ListState) -> Self {
+        Self { state }
+    }
+}
+
+impl gpui_base::ScrollbarHandle for ListScrollbarHandle {
+    fn viewport_bounds(&self) -> gpui::Bounds<gpui::Pixels> {
+        self.state.viewport_bounds()
+    }
+
+    fn offset(&self) -> gpui::Point<gpui::Pixels> {
+        self.state.scroll_px_offset_for_scrollbar()
+    }
+
+    fn set_offset(&self, offset: gpui::Point<gpui::Pixels>) {
+        self.state.set_offset_from_scrollbar(offset);
+    }
+
+    fn content_size(&self) -> gpui::Size<gpui::Pixels> {
+        (self.state.max_offset_for_scrollbar() + self.state.viewport_bounds().size.into()).into()
+    }
+
+    fn start_drag(&self) {
+        self.state.scrollbar_drag_started();
+    }
+
+    fn end_drag(&self) {
+        self.state.scrollbar_drag_ended();
+    }
 }
 
 #[cfg(test)]

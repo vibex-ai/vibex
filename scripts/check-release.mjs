@@ -348,6 +348,16 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
   }
+  // Mobile packaging is opt-in while the phone client is ported to gpui-fast.
+  // The switch and the publish job's tolerance for a skipped mobile job are one
+  // mechanism: dropping either half from the workflow would silently publish
+  // without testing it, or withhold the whole release again.
+  assert(
+    releaseWorkflow.includes("VIBEX_MOBILE_RELEASES_ENABLED") &&
+      releaseWorkflow.includes("needs.mobile-android.result == 'skipped'") &&
+      releaseWorkflow.includes("needs.mobile-ios.result == 'skipped'"),
+    "publish workflow lost the mobile-release switch or its skipped-job handling"
+  );
   // The desktop About page resolves the changelog from a per-release notes
   // asset, so the publish workflow must stage the tagged document under the
   // exact name the updater requests.

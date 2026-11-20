@@ -79,12 +79,12 @@ pub const SESSION_GROUP_MEMBER_LIMIT: usize = 64;
 pub const SESSION_GROUP_NAME_MAX_CHARS: usize = 160;
 /// How many panes one group workspace may split into.
 pub const SESSION_GROUP_PANE_LIMIT: usize = 8;
-/// How many panes of a group render a full live conversation.
+/// How many live panes an automatic layout may ask for.
 ///
-/// Panes above this bound keep their place in the layout and still follow
-/// authoritative session state, but they render a static projection instead of
-/// holding a live timeline, composer and scroll state. The bound is what keeps
-/// a wide split from multiplying the per-session resident cost without limit.
+/// A hand-split workspace is not bounded by this: every pane it paints owns a
+/// live conversation, up to [`SESSION_GROUP_PANE_LIMIT`]. The bound is what an
+/// Agent-requested presentation may open at once, so a wide split it creates
+/// cannot multiply the per-session resident cost without limit.
 pub const SESSION_GROUP_LIVE_PANE_LIMIT: usize = 4;
 /// Split shares are stored as integer per-mille so the whole group stays
 /// `Eq + Hash` and no persisted document can carry a NaN share.
@@ -1221,12 +1221,52 @@ impl SessionGroupUiState {
         move_strings_relative(&mut self.member_session_ids, moving_ids, target_id, after)
     }
 
-    /// Sessions the group should render with a live view: every session in the
-    /// focused pane first, then the remaining panes in tree order.
+    /// Sessions every pane the workspace paints is showing: the active tab of
+    /// each painted pane, in pane order.
     ///
-    /// The list is bounded by [`SESSION_GROUP_LIVE_PANE_LIMIT`] panes, so the
-    /// caller can hold one live conversation per returned pane without letting a
-    /// wide split multiply resident memory without limit.
+    /// This is the set the renderer owns views for. It is deliberately
+    /// *independent of keyboard focus*: a pane the layout paints keeps a live
+    /// conversation for as long as it is painted, so moving the keyboard to a
+    /// sibling can never replace one pane's conversation with the
+    /// "select this pane" placeholder. A maximized workspace paints one pane,
+    /// so exactly that pane's session is returned.
+    ///
+    /// Every pane is bounded by [`SESSION_GROUP_PANE_LIMIT`], which is what
+    /// keeps a hand-split workspace finite; the four-pane
+    /// [`SESSION_GROUP_LIVE_PANE_LIMIT`] bounds what an automatic layout may
+    /// open, not what the user already split by hand.
+    pub fn painted_session_ids(&self) -> Vec<String> {
+        let mut sessions = Vec::new();
+        for pane_id in self.layout.pane_ids() {
+            if self
+                .maximized_pane_id
+                .as_deref()
+                .is_some_and(|maximized| maximized != pane_id)
+            {
+                continue;
+            }
+            let Some(active) = self
+                .layout
+                .find_pane(&pane_id)
+                .and_then(|pane| pane.active_session_id.clone())
+            else {
+                continue;
+            };
+            if !sessions.contains(&active) {
+                sessions.push(active);
+            }
+        }
+        sessions
+    }
+
+    /// Sessions an automatic presentation reports as live: the focused pane
+    /// first, then the remaining panes in tree order, bounded by
+    /// [`SESSION_GROUP_LIVE_PANE_LIMIT`].
+    ///
+    /// The ordering and the bound describe what an Agent-requested layout asks
+    /// for, so a presentation report stays comparable across requests. They are
+    /// deliberately not what decides a hand-split pane's content — that is
+    /// [`Self::painted_session_ids`], which cannot change when focus moves.
     pub fn live_session_ids(&self) -> Vec<String> {
         let pane_ids = self.layout.pane_ids();
         let mut ordered = Vec::with_capacity(pane_ids.len());
@@ -1759,6 +1799,60 @@ mod tests {
         let live = group.live_session_ids();
         assert_eq!(live.len(), SESSION_GROUP_LIVE_PANE_LIMIT);
         assert_eq!(live.first().map(String::as_str), Some("a"));
+    }
+
+    /// A painted pane keeps its conversation when another pane takes the
+    /// keyboard.
+    ///
+    /// The live budget orders what an automatic presentation asks for; it must
+    /// not decide what a hand-split workspace paints. Eight panes all paint,
+    /// so the painted set is every one of them, in pane order, and moving the
+    /// keyboard between panes leaves it exactly as it was. A maximized
+    /// workspace paints one pane, and only that pane's session stays live.
+    #[test]
+    fn painted_sessions_cover_every_pane_no_matter_where_focus_is() {
+        let mut group = SessionGroupUiState::new(
+            "会话组 1",
+            "project",
+            "workspace",
+            members(&["a", "b", "c", "d", "e", "f", "g", "h"]),
+        );
+        for (index, session) in ["b", "c", "d", "e", "f", "g", "h"].iter().enumerate() {
+            let pane_id = group.layout.first_pane_id().expect("a pane");
+            if group
+                .layout
+                .split_with_session(
+                    &pane_id,
+                    session,
+                    SplitDirection::Horizontal,
+                    format!("pane-{index}"),
+                    format!("split-{index}"),
+                    SessionGroupSplitPosition::After,
+                )
+                .is_none()
+            {
+                break;
+            }
+        }
+        assert_eq!(group.layout.pane_count(), group.member_count());
+        let painted = |group: &SessionGroupUiState| {
+            group
+                .painted_session_ids()
+                .into_iter()
+                .collect::<BTreeSet<_>>()
+        };
+        let every_member = members(&["a", "b", "c", "d", "e", "f", "g", "h"])
+            .into_iter()
+            .collect::<BTreeSet<_>>();
+        assert_eq!(painted(&group), every_member);
+        // Focus is the keyboard, not visibility: every pane that is painted
+        // stays painted after the keyboard moves to the last one.
+        assert!(group.focus_pane("pane-6"));
+        assert_eq!(painted(&group), every_member);
+        assert_eq!(group.focused_session_id().as_deref(), Some("h"));
+        // The maximized workspace paints one pane, so its set narrows to it.
+        assert!(group.toggle_maximized_pane("pane-2"));
+        assert_eq!(group.painted_session_ids(), members(&["d"]));
     }
 
     #[test]

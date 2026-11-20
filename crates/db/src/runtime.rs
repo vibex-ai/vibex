@@ -1265,6 +1265,12 @@ pub struct RuntimeSwitchRecord {
     pub requested_session_config: Option<serde_json::Value>,
     pub status: RuntimeSwitchStatus,
     pub error_code: Option<String>,
+    /// Bounded, secret-free explanation of the failure, written when the switch
+    /// reaches a terminal error state. The product-facing message for
+    /// `runtime_switch_configuration_unavailable` used to be the only thing a
+    /// reader saw, so a rejected model id arrived as "configuration
+    /// unavailable" with no reason; this is the Agent's own refusal.
+    pub error_detail_redacted: Option<String>,
     pub restore_compatibility_result: Option<AgentSessionRestoreResult>,
     pub worker_lease_owner: Option<String>,
     pub worker_lease_deadline_ms: Option<i64>,
@@ -1295,6 +1301,7 @@ impl fmt::Debug for RuntimeSwitchRecord {
             )
             .field("status", &self.status)
             .field("error_code", &self.error_code)
+            .field("error_detail_redacted", &self.error_detail_redacted)
             .field(
                 "has_restore_compatibility_result",
                 &self.restore_compatibility_result.is_some(),
@@ -1567,6 +1574,7 @@ impl RuntimeSwitchRepository {
             requested_session_config: request.requested_session_config.clone(),
             status: RuntimeSwitchStatus::Reserved,
             error_code: None,
+            error_detail_redacted: None,
             restore_compatibility_result: None,
             worker_lease_owner: None,
             worker_lease_deadline_ms: None,
@@ -3072,7 +3080,7 @@ impl RuntimeSwitchRepository {
         target_agent_id, target_adapter_id, target_profile_id,
         target_auth_source_kind, target_auth_source_id, target_auth_source_revision,
         requested_policy_json, active_work_policy_json,
-        requested_session_config_json, status, error_code,
+        requested_session_config_json, status, error_code, error_detail_redacted,
         restore_compatibility_result_json, worker_lease_owner,
         worker_lease_deadline_ms, created_at_ms, updated_at_ms, committed_at_ms
     ";
@@ -3097,12 +3105,13 @@ impl RuntimeSwitchRepository {
             requested_session_config_json: row.get(15)?,
             status: row.get(16)?,
             error_code: row.get(17)?,
-            restore_compatibility_result_json: row.get(18)?,
-            worker_lease_owner: row.get(19)?,
-            worker_lease_deadline_ms: row.get(20)?,
-            created_at_ms: row.get(21)?,
-            updated_at_ms: row.get(22)?,
-            committed_at_ms: row.get(23)?,
+            error_detail_redacted: row.get(18)?,
+            restore_compatibility_result_json: row.get(19)?,
+            worker_lease_owner: row.get(20)?,
+            worker_lease_deadline_ms: row.get(21)?,
+            created_at_ms: row.get(22)?,
+            updated_at_ms: row.get(23)?,
+            committed_at_ms: row.get(24)?,
         })
     }
 
@@ -3140,6 +3149,7 @@ impl RuntimeSwitchRepository {
                 .transpose()?,
             status: enum_from_db(raw.status)?,
             error_code: raw.error_code,
+            error_detail_redacted: raw.error_detail_redacted,
             restore_compatibility_result: raw
                 .restore_compatibility_result_json
                 .map(json_from_db)
@@ -3172,6 +3182,7 @@ struct RawSwitchRow {
     requested_session_config_json: Option<String>,
     status: String,
     error_code: Option<String>,
+    error_detail_redacted: Option<String>,
     restore_compatibility_result_json: Option<String>,
     worker_lease_owner: Option<String>,
     worker_lease_deadline_ms: Option<i64>,
@@ -5970,6 +5981,7 @@ impl AgentSessionRuntimeRepository {
             requested_session_config: Some(request.requested_session_config.clone()),
             status: RuntimeSwitchStatus::Requested,
             error_code: None,
+            error_detail_redacted: None,
             restore_compatibility_result: None,
             worker_lease_owner: None,
             worker_lease_deadline_ms: None,
@@ -6220,6 +6232,7 @@ impl AgentSessionRuntimeRepository {
                 requested_session_config: Some(request.requested_session_config.clone()),
                 status: RuntimeSwitchStatus::Requested,
                 error_code: None,
+                error_detail_redacted: None,
                 restore_compatibility_result: None,
                 worker_lease_owner: None,
                 worker_lease_deadline_ms: None,
@@ -7428,6 +7441,16 @@ mod tests {
         assert_eq!(
             state.runtime_selection_error_code.as_deref(),
             Some("runtime_switch_configuration_unavailable")
+        );
+        // The failure reason is durable beside the code: the product sentence
+        // names no cause, so the Agent's refusal is the only actionable part.
+        assert_eq!(
+            RuntimeSwitchRepository::get(&conn, &record.switch_id)
+                .unwrap()
+                .unwrap()
+                .error_detail_redacted
+                .as_deref(),
+            Some("redacted configuration failure")
         );
         cleanup_db(temp);
     }

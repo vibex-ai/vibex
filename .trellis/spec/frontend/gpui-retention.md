@@ -35,6 +35,21 @@ or to gpui-fast.
   `ChildAgentRailView`, `SessionTerminalView`) observe the workbench, so a
   workbench notify rebuilds all of them. A hot path that reaches
   `cx.notify()` on the workbench has to be worth rebuilding the shell.
+- **A view's notification also rebuilds every view above it.**
+  `Window::mark_view_dirty` walks `view_path_reversed` and inserts each
+  ancestor into `dirty_views`, so notifying a leaf rebuilds its whole chain.
+  There is no opt-out. This is why a scroll of the transcript still rebuilds
+  `TimelineView`, and with it the workbench shell: the list notifies the view
+  that painted it (`TimelineSurfaceView`), and `TimelineView` sits above it.
+  An `observe` callback cannot refuse it either — `App::notify` delivers to the
+  view's invalidator directly, not through the observer list, so recording a
+  scroll count and skipping the notify changes nothing. Measured: the transcript
+  composites eleven of twelve scrolled frames through the shell, but a scrolled
+  frame still builds fifteen views. The shell's own share of that is ~0.9 ms of
+  a ~2.1 ms prepaint, against ~1.2 ms for the surface alone.
+  Narrowing it further means the scrolling element has to stop being a
+  descendant of the shell view — a restructure of `render_column_page`, not a
+  subscription change.
 - A list row that can be recycled or shifted carries an `ElementId` built from
   its domain id, not its position, so prepending keeps its layout node and
   element state. The timeline keys a row by session and turn.
@@ -81,11 +96,11 @@ The general rule: never key a cadence decision, or anything timed, on process
 state. The clock a measurement subtracts from belongs to the same `App` as the
 frames it times.
 
-### The windowed-run disclosure family is a layout defect, not retention
+### The windowed-run disclosure family was a layout defect, not retention
 
-These still fail when run on their own
-(`cargo test -p vibex-desktop --lib <name>`), and they also fail with
-`GPUI_VIEW_RETENTION=0`, so view retention is not the cause:
+These failed when run on their own (`cargo test -p vibex-desktop --lib <name>`)
+and also failed with `GPUI_VIEW_RETENTION=0`, so view retention was not the
+cause:
 
 - `a_row_that_lands_in_one_frame_keeps_the_rows_under_it_still`
 - `a_windowed_run_keeps_the_rows_under_a_closing_row_still_on_the_bottom_edge`
@@ -99,20 +114,26 @@ Measured, on the first frame after a toggle:
 | `max_offset` | 2017 | 1995 |
 | row below the toggle | 263.5 | 285.5 |
 
-The row below moves by exactly the 22px the row table loses, and it moves
+The row below moved by exactly the 22px the row table lost, and it moved
 because the viewport is bottom-anchored: the offset is `-max_offset`, so a
 smaller extent pulls the content down.
 
-The 22px is stale streaming slack, not the disclosure's own delta. While a turn
+The 22px was stale streaming slack, not the disclosure's own delta. While a turn
 streams, `record_timeline_turn_height` holds the larger previous extent
-(`stable_streaming_timeline_height`), so the table keeps 2385 while the laid-out
-box is 2363. `preserve_streaming_extent` is gated on
-`!self.timeline_disclosure_animating`, so the click releases that hold in the
-same frame it opens the row, the table takes the true 2363, and the release
-lands as a jump before the disclosure's growth arrives.
+(`stable_streaming_timeline_height`), so the table kept 2385 while the laid-out
+box was 2363. `preserve_streaming_extent` was gated only on
+`!self.timeline_disclosure_animating`, so the click released that hold in the
+same frame it opened the row, the table took the true 2363, and the release
+landed as a jump before the disclosure's growth arrived.
 
-Two candidate fixes were tried and both left the family red, so neither was
-committed:
+The fix is to scope the hold to where it earns its keep: it now also requires
+`!self.timeline_follow.following_bottom`. At the live edge the held band is the
+last thing on screen, so holding it bought nothing and the release was a visible
+slide; scrolled up, the band sits below the fold, which is exactly where it
+absorbs a transient reparse. All three probes pass, alone and in the suite.
+
+Two earlier candidate fixes were tried and both left the family red, so neither
+was committed:
 
 - Keeping the hold while `timeline_disclosure_animating` (or while settle
   frames remain) fixes the first test but leaves the closing-row and live-edge
@@ -121,20 +142,31 @@ committed:
 - Clamping the recorded extent to the previous height during the settle window
   changes which frame jumps rather than removing the jump.
 
-The remaining work is to make the hang window end on the table catching up
-rather than on a fixed frame count, and to keep the streaming hold from being
-released by a disclosure at all. Both touch the bottom-edge anchoring that
-`timeline_rows_hang_from_bottom` documents, so they need their own change with
-the probes as the gate.
+The settle window also now reads `cx.background_executor().now()` instead of
+`Instant::now()`. That is not cosmetic: a probe advances the frame clock to
+draw, so a process-clock reading made the window depend on how long the fixture
+took, which is why the same probe failed alone and passed in the suite.
 
 ## 5. Timeline list layer
 
-[Session Timeline Scrolling](./timeline-scrolling.md) names the `MessageScroller`
-API the main transcript needs before it can move off `v_virtual_list`. As of
-gpui-component 0.10.0 the published state still does not expose
-`scroll_by`, `viewport_bounds`, `offset`, `max_offset`, per-row size hints, or a
-row renderer that receives the owning view, so the transcript stays on its own
-virtual list and the child Agent rail stays on `MessageScroller`.
+The transcript gets no list layer today, and the reason is the element, not the
+app: `v_virtual_list` is `gpui_base::VirtualList`, which contains no
+`fast::layers` code at all, while `gpui::list` carries the full one.
+
+The transcript now renders through `gpui::list` with a view-owned `ListState`,
+with no crate change and no fork: everything the migration needed was already
+on `ListState`, which `MessageScrollerState` wraps and does not re-export. See
+[Session Timeline Scrolling](./timeline-scrolling.md) §4–§5 for the capability
+table and for the five things the rewrite had to solve (the borrow the row
+renderer runs inside, the missing row-height hint, the padding split between
+the two offset getters, and the end anchor).
+
+**The layer still does not engage, and the element is no longer why.** Measured
+after the migration, the same `ListState` drawn through a bare `gpui::list`
+composites eleven of twelve scrolled frames while the workbench's own path
+composites zero. A wheel over the transcript notifies the workbench, and
+`owner_scrolled_only` wants the scroll to be the only thing that did — §7.3's
+second blocker, which the transcript now shares with the sidebar.
 
 ## 6. The composer boundary
 

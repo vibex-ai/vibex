@@ -35,7 +35,7 @@ use std::rc::Rc;
 
 use gpui::{
     App, Bounds, DispatchPhase, Element, ElementId, Entity, GlobalElementId, InspectorElementId,
-    IntoElement, LayoutId, MouseButton, MouseUpEvent, Pixels, Style, Subscription, Window,
+    LayoutId, MouseButton, MouseUpEvent, Pixels, Style, Subscription, Window,
 };
 use gpui_base::{TextSelection, TouchSelectionSnapshot};
 use gpui_component::input::TextareaState;
@@ -113,14 +113,6 @@ pub fn watch(composer: Entity<TextareaState>) -> SelectionWatch {
 /// See [`watch`].
 pub struct SelectionWatch {
     composer: Entity<TextareaState>,
-}
-
-impl IntoElement for SelectionWatch {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
 }
 
 impl Element for SelectionWatch {

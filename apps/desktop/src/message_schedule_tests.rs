@@ -331,11 +331,22 @@ fn moving_a_scheduled_message_keeps_its_deadline_but_send_now_clears_it() {
         queued(2, &session, Some(2_000)),
     ];
     assert!(reorder_composer_queue_message(&mut queue, 2, 1, false));
+    // Reordering preserves every deadline: a message the reader moved in
+    // front of another one still waits for its own moment.
     assert_eq!(queue[0].scheduled_at_ms, Some(2_000));
-    assert_eq!(promote_composer_queue_message(&mut queue, 1), Some(session));
-    assert_eq!(queue[0].id, 1);
-    assert_eq!(queue[0].scheduled_at_ms, None);
-    assert_eq!(queue[1].scheduled_at_ms, Some(2_000));
+    assert_eq!(queue[1].scheduled_at_ms, Some(1_000));
+    // Send-now is not a reorder: it sends one message now and clears that
+    // message's deadline, leaving the other entries' moments untouched. The
+    // gesture owns the clear, because the send may land only after the busy
+    // turn it interrupts has settled.
+    let source = include_str!("app.rs");
+    let steer = source
+        .split_once("    fn steer_composer_queue_message(")
+        .and_then(|(_, tail)| tail.split_once("\n    fn toggle_composer_queue_send_mode("))
+        .map(|(body, _)| body)
+        .expect("send-now gesture should remain inspectable");
+    assert!(steer.contains("message.scheduled_at_ms = None;"));
+    assert!(!steer.contains("promote_composer_queue_message"));
 }
 
 #[test]
@@ -694,7 +705,7 @@ fn the_schedule_surface_is_a_popover_sized_to_its_calendar() {
         !source.contains(".open_dialog("),
         "the schedule editor must not own a modal surface"
     );
-    assert!(source.contains("Popover::new(id)"));
+    assert!(source.contains("Popover::new(self.message_schedule_popover_id(&target))"));
     assert!(source.contains("const MESSAGE_SCHEDULE_PANEL_REM: f32 = 13.0;"));
     assert!(source.contains(".w(gpui::rems(MESSAGE_SCHEDULE_PANEL_REM))"));
     assert!(

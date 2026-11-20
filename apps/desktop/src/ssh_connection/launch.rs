@@ -92,6 +92,20 @@ impl LaunchConfig {
         self
     }
 
+    /// Points the runtime at an existing home instead of the managed one.
+    ///
+    /// The constructor derives `{install_root}/home` because provisioning owns
+    /// that directory. Adopting another one — the host's own desktop data, say
+    /// — is a per-connection choice, and the profile has already rejected
+    /// relative and `..` paths before a launch sees them.
+    pub fn with_runtime_home(mut self, runtime_home: impl Into<String>) -> Self {
+        let runtime_home = runtime_home.into();
+        if !runtime_home.trim().is_empty() {
+            self.runtime_home = runtime_home;
+        }
+        self
+    }
+
     pub fn env_pairs(&self) -> Vec<(&'static str, String)> {
         let mut pairs = vec![
             ("VIBEX_HOME", self.runtime_home.clone()),
@@ -359,6 +373,29 @@ mod tests {
             port,
         )
         .unwrap()
+    }
+
+    /// An adopted home is what the remote runtime opens; the binary and the
+    /// launch state files stay with the managed install, so switching data
+    /// directories never mixes two install trees.
+    #[test]
+    fn an_adopted_home_reaches_the_remote_env_and_keeps_the_install_paths() {
+        let config = config(8765).with_runtime_home("/home/dev/.vibex/desktop-stable");
+        assert_eq!(config.runtime_home, "/home/dev/.vibex/desktop-stable");
+        assert_eq!(
+            config.binary,
+            "/home/dev/.local/share/vibex/server/current/vibex-server"
+        );
+        assert_eq!(
+            config.env_file,
+            "/home/dev/.local/state/vibex/server/runtime.env"
+        );
+        let env = config.env_pairs();
+        assert!(env.contains(&("VIBEX_HOME", "/home/dev/.vibex/desktop-stable".to_string())));
+        assert!(env.contains(&(
+            "VIBEX_DB_PATH",
+            "/home/dev/.vibex/desktop-stable/vibex.db".to_string()
+        )));
     }
 
     #[test]

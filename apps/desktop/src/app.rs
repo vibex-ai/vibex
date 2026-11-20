@@ -27,6 +27,8 @@ mod timeline_activity;
 mod timeline_disclosure;
 #[path = "timeline_group_body.rs"]
 mod timeline_group_body;
+#[path = "timeline_image.rs"]
+mod timeline_image;
 #[path = "timeline_loading.rs"]
 mod timeline_loading;
 #[path = "timeline_tool_detail.rs"]
@@ -39,18 +41,18 @@ use gpui::{
     Global, GlobalElementId, HighlightStyle, Hsla, Image, ImageFormat, InspectorElementId,
     IntoElement, KeyBinding, KeyDownEvent, Keystroke, LayoutId, MouseButton, MouseDownEvent,
     MouseMoveEvent, ObjectFit, Orientation, ParentElement as _, Pixels, Point, Render, RenderImage,
-    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, ScrollStrategy, SharedString,
-    Size, Stateful, StatefulInteractiveElement as _, StyleRefinement, Styled as _,
-    StyledImage as _, StyledText, Subscription, SystemNotification, Task, TitlebarOptions, Unbind,
-    WeakEntity, Window, WindowBackgroundAppearance, WindowBounds, WindowControlArea,
-    WindowControls, WindowDecorations, WindowId, WindowKind, WindowOptions, deferred, div, img,
-    linear_color_stop, linear_gradient, point, prelude::*, px, relative, rgb, size,
+    Rgba, Role, ScrollAnchor, ScrollDelta, ScrollEvent, ScrollHandle, SharedString, Size, Stateful,
+    StatefulInteractiveElement as _, StyleRefinement, Styled as _, StyledImage as _, StyledText,
+    Subscription, SystemNotification, Task, TitlebarOptions, Unbind, WeakEntity, Window,
+    WindowBackgroundAppearance, WindowBounds, WindowControlArea, WindowControls, WindowDecorations,
+    WindowId, WindowKind, WindowOptions, deferred, div, img, linear_color_stop, linear_gradient,
+    point, prelude::*, px, relative, rgb, size,
 };
 use gpui_base::{TextSelection, text::MarkdownExtensions};
 use gpui_component::{
     ActiveTheme as _, ColorName, Colorize as _, Disableable as _, ElementExt as _, Icon, IconName,
     IndexPath, InteractiveElementExt as _, Root, Selectable as _, Sizable as _, StyledExt as _,
-    Theme, ThemeStyled as _, VirtualListScrollHandle, WindowExt as _,
+    Theme, ThemeStyled as _, WindowExt as _,
     accordion::Accordion,
     animation::EffectTransition as Transition,
     attachment::{
@@ -69,11 +71,11 @@ use gpui_component::{
     },
     h_flex,
     input::{
-        Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, Enter as InputEnter,
-        Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
+        Backspace as InputBackspace, Copy as InputCopy, Delete as InputDelete, DisplayMap,
+        Enter as InputEnter, Escape as InputEscape, IndentInline as InputIndentInline, InlineToken,
         InlineTokenClickEvent, InlineTokenContext, InlineTokenSpan, Input, InputContent,
         InputEvent, InputState, InputToken, MoveDown as InputMoveDown, MoveLeft as InputMoveLeft,
-        MoveRight as InputMoveRight, MoveUp as InputMoveUp, Paste as InputPaste, Textarea,
+        MoveRight as InputMoveRight, MoveUp as InputMoveUp, Paste as InputPaste, Rope, Textarea,
         TextareaState,
     },
     kbd::Kbd,
@@ -93,13 +95,13 @@ use gpui_component::{
     tab::{Tab, TabBar},
     tag::Tag,
     tooltip::Tooltip,
-    v_flex, v_virtual_list,
+    v_flex,
 };
 use gpui_fps::FpsMonitor;
 use image::ImageDecoder as _;
 use sha2::{Digest as _, Sha256};
 use similar::{ChangeTag, TextDiff};
-use timeline_loading::PreparedTimeline;
+use timeline_loading::{PreparedTimeline, TimelineInstall};
 #[cfg(test)]
 #[path = "perf_probe_tests.rs"]
 mod perf_probe_tests;
@@ -832,6 +834,17 @@ const SESSION_GROUP_AVATAR_OVERLAP: f32 = 7.0;
 /// so a press can never cover one and not the other.
 const SESSION_GROUP_SPLIT_GUARD_WIDTH: f32 = 9.0;
 const SESSION_GROUP_SPLIT_GUARD_INSET: f32 = 4.0;
+/// How a group pane's frame is weighted in each state.
+///
+/// A split stacks hairlines on one seam — every pane's own frame plus the
+/// resize handle's line between them — so the authored `border` weight reads
+/// as a hard divider rather than a card edge. The resting frame therefore
+/// paints a third of it and the seam lands near a single hairline. Hover
+/// answers "which pane would take a click" while the pointer travels, and it
+/// brightens that same line. The selected pane is deliberately not marked
+/// here: it says so inside its own content, where the keyboard actually goes.
+const SESSION_GROUP_PANE_FRAME_REST_WEIGHT: f32 = 0.35;
+const SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT: f32 = 2.2;
 const SIDEBAR_PROJECT_GROUP_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_REORDER_GAP: f32 = 12.0;
 const SIDEBAR_PROJECT_CONTENT_GAP: f32 = 4.0;
@@ -1001,6 +1014,14 @@ const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
 const AGENT_TIMELINE_TURN_WINDOW: u32 = 8;
 /// Upper bound on the payload cost of one window or history page.
 const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
+/// How many pages a window may read before it starts on a turn boundary.
+///
+/// A page is capped by item count, and one running turn can exceed that cap on
+/// its own — a run with hundreds of tool calls is thousands of items. A window
+/// taken from the top then opens in the *middle* of the live turn, and a session
+/// with a long run behind it opens as a single partial turn until history loads
+/// under it. Reaching back to a turn boundary costs at most this many pages.
+const AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 8;
 /// How much a resumed load may pull before re-opening beats patching.
 ///
 /// Resuming from a view a long background run left far behind would make the
@@ -1015,7 +1036,13 @@ const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
 /// past this much of what the reader already had, re-reading the page costs
 /// more than the jump it prevents, so the view lands on the oldest row it does
 /// hold rather than on the newest one.
-const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = AGENT_TIMELINE_RESUME_MAX_ITEMS;
+///
+/// Deliberately not [`AGENT_TIMELINE_RESUME_MAX_ITEMS`]: that cap bounds what
+/// patching a tail is worth on a routine refresh, while this one bounds how
+/// far a one-off recovery may reach before it gives up on the turn the reader
+/// was reading. Long sessions ran past 2,000 items and lost their place anyway,
+/// so the recovery cap stands on its own with headroom of its own.
+const AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS: usize = 8_000;
 /// How many older pages may be outstanding at once.
 ///
 /// Prefetch keeps the next page on the way while the reader is still moving
@@ -1130,6 +1157,13 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
+/// How many rows a window may have and still be measured in one pass.
+///
+/// Below this the whole window is laid out once, so every row's height is exact
+/// before the reader scrolls into it; above it the list keeps measuring only what
+/// it paints, because laying out a long transcript at once is the cost a virtual
+/// list exists to avoid.
+const TIMELINE_MEASURE_ALL_MAX_ROWS: usize = 128;
 /// How far short of the bottom a closing disclosure may land and still hand the
 /// live edge back. A spring stops inside its tolerance, and measured heights
 /// are rounded up, so the last frame can sit a pixel or two off.
@@ -1317,22 +1351,175 @@ const COMPOSER_PLAN_TOOLTIP_WIDTH: f32 = 360.0;
 const COMPOSER_PLAN_TOOLTIP_MAX_HEIGHT: f32 = 420.0;
 const COMPOSER_PLAN_EXPANDED_MAX_HEIGHT: f32 = 320.0;
 const COMPOSER_PLAN_TOOLTIP_DELAY: Duration = Duration::from_secs(2);
+/// The surface heights the layout probes use as a stand-in for an active
+/// Composer. The live surface derives its own height from the draft (see
+/// [`composer_surface_height`]), so these are not consulted at runtime.
+#[cfg(test)]
 const COMPOSER_SURFACE_MIN_HEIGHT: f32 = 112.0;
+#[cfg(test)]
 const ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT: f32 = COMPOSER_SURFACE_MIN_HEIGHT + 24.0;
 const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
+/// The full box seats one surface control — the expand toggle — in the
+/// trailing corner instead of laying it along the row, so the input keeps the
+/// width the row used to give it. The clock and the terminal moved to the line
+/// under the surface, so the corner owns a single button.
+const COMPOSER_TRAILING_CONTROL_SIZE: f32 = 30.0;
+/// The mark the Composer's own controls draw inside their seat.
+///
+/// The utility buttons are 30px and their marks 15: at a full-size mark a quiet
+/// control read as a third action competing with the send disc. The trailing
+/// corner seats the same 30px button as the slim row does, so it draws the same
+/// mark — the kit's `.icon(...)` had sized it at three quarters of the seat,
+/// which is what made the one full-box control read larger than its slim twin.
+const COMPOSER_SURFACE_GLYPH_SIZE: f32 = 15.0;
+/// The height the trailing corner asks the input row to reserve: one button.
+const COMPOSER_TRAILING_STACK_HEIGHT: f32 = COMPOSER_TRAILING_CONTROL_SIZE;
+/// The surface's own border, top and bottom. A surface height is a border-box
+/// figure, so this much of it never reaches the rows inside.
+const COMPOSER_SURFACE_HAIRLINE: f32 = 2.0;
+/// The full box's vertical chrome around the input: the input row's `pt_3` /
+/// `pb_1` insets and the control row's 32px action plus its `pb_3`.
+const COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING: f32 = 16.0;
+const COMPOSER_FULL_CONTROL_ROW_HEIGHT: f32 = 44.0;
+/// The input row of the full box: the editor's own minimum band plus the row's
+/// insets. The textarea stretches to the same figure, so the band under a short
+/// draft is input rather than padding.
+const COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT: f32 =
+    ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING;
+/// The shortest the full box can be: the input's minimum band plus that chrome.
+/// The corner's single button is shorter than the band now, so the editor — not
+/// the control column — sets the floor.
+const COMPOSER_FULL_SURFACE_MIN_HEIGHT: f32 = COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT
+    + COMPOSER_FULL_CONTROL_ROW_HEIGHT
+    + COMPOSER_SURFACE_HAIRLINE;
+/// The line under the Composer's surface: the session on the left, the
+/// surface's instruments on the right. Their controls are smaller than the
+/// bar's so the line reads as a caption rather than a second toolbar.
+const COMPOSER_FOOTER_CONTROL_SIZE: f32 = 22.0;
+const COMPOSER_FOOTER_GAP: f32 = 6.0;
+const COMPOSER_FOOTER_TOP_PADDING: f32 = 8.0;
+/// The Agent mark on the footer.
+///
+/// A caption's mark: a point under the instruments' own glyphs, so the line
+/// reads as one annotation rather than a toolbar of its own.
+const COMPOSER_FOOTER_MARK_SIZE: f32 = 13.0;
+/// The glyph each footer instrument draws.
+///
+/// The kit sizes an icon at three quarters of its button, which at 22px lands
+/// an 16px mark — half the bar's own. These draw a point under that instead, so
+/// the row stays a caption and the surface above keeps the heavier marks.
+const COMPOSER_FOOTER_GLYPH_SIZE: f32 = 14.0;
+/// The diameter the footer's usage ring paints at.
+///
+/// The ring is the third instrument on the same baseline, and it used to be the
+/// largest mark on it: the kit's circle was handed the control's own square and
+/// painted at three quarters of it, a 16.5px disc beside two 14px glyphs. A
+/// stroke reads heavier than a solid mark of the same width, so the ring keeps a
+/// point under the glyphs rather than level with them.
+const COMPOSER_FOOTER_RING_SIZE: f32 = 13.0;
+/// The ink every Composer instrument rests at, and the ink it rises to under
+/// the pointer.
+///
+/// The footer's pair and the surface's own controls are all quiet marks: at full
+/// muted ink they held the eye on controls a step below the box. They rest under
+/// that ink and come up to the foreground's own near-white under the pointer, so
+/// the pair answers the pointer without ever pulling focus when nobody is on it.
+/// The footer's pair rests darker than the surface's — they are rare actions a
+/// step below the box, and the surface owns the frequent ones.
+const COMPOSER_FOOTER_INSTRUMENT_REST_INK: f32 = 0.70;
+const COMPOSER_ROW_INSTRUMENT_REST_INK: f32 = 0.78;
+const COMPOSER_INSTRUMENT_HOVER_INK: f32 = 0.92;
+/// The hover-fade keys the Composer's own controls answer to.
+///
+/// Every one of these buttons carries a tooltip, and the kit's tooltip already
+/// owns that button's one `on_hover` — a second one panics at paint. So the fade
+/// lives on a wrapper div around the button, which is a plain element with no
+/// tooltip of its own. The keys are literals because both densities of one
+/// control must share a key: a draft that flips density rebuilds the button
+/// under the pointer, and a renamed key would drop the highlight at the moment
+/// the reader is watching the row.
+const COMPOSER_ATTACH_HOVER_KEY: &str = "composer:attach";
+const COMPOSER_EXPAND_HOVER_KEY: &str = "composer:expand";
+const COMPOSER_TERMINAL_HOVER_KEY: &str = "composer:terminal";
+/// How much of the square it is given `ProgressCircle` actually paints.
+///
+/// The kit draws its ring at three quarters of the size it is handed, so a
+/// caller that thinks in diameters has to ask for the square that produces the
+/// one it wants. Naming the ratio keeps that division in one place instead of
+/// spelling `0.75` at the call site.
+const PROGRESS_CIRCLE_DRAWN_SCALE: f32 = 0.75;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
-/// The slim composer's height: the input line plus one tight control row. The
-/// full box reserves two text rows, a stacked trailing column and a padded
-/// control row under them, which is what made it tower over a split pane.
-const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 64.0;
+/// How far the surface's resting edge moves toward the ring while the input
+/// holds the caret.
+///
+/// Past the halfway mark the edge stops reading as a hairline and the box
+/// starts reading as a second focus ring; under it the highlight is only
+/// visible to a reader who is already looking. This is the point where the
+/// change is unmistakable beside the resting box and still quieter than the
+/// ring a focused pane draws.
+const COMPOSER_FOCUSED_INPUT_RING_MIX: f32 = 0.6;
+/// The one-line composer is a single row: the input line and its controls
+/// share it, so the surface is the row's tallest control plus the row's inset
+/// above and below it and the surface's hairline. The multi-row box keeps the
+/// taller chrome it always had; the difference between the two is what the
+/// height morph glides across.
+const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 48.0;
 /// One text line plus the row's own breathing room.
 const COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT: f32 = 26.0;
-const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 16.0;
+/// The one-line row's vertical inset.
+///
+/// The bar is a pill, so its height is the row's tallest control plus this
+/// inset above and below it and the surface's hairline: 7 + 32 + 7 + 2.
+/// The inset is deliberately looser than the box's own, because a single row
+/// of text with a full-height control beside it needs the extra air to stop
+/// reading as a cropped box.
+const COMPOSER_SLIM_ROW_VERTICAL_PADDING: f32 = 7.0;
+/// The square the slim row seats its two utility controls in.
+///
+/// Attach and expand share one seat, so their centres land on one line and
+/// their glyphs draw at the same optical size. A couple of points under the
+/// send disc: they are the row's quiet marks, and the disc is the one control
+/// that closes it.
+const COMPOSER_SLIM_ROW_CONTROL_SIZE: f32 = 30.0;
+/// The filled disc that sends from the slim bar.
+///
+/// The row's tallest control, and the only saturated mark on the surface, so
+/// it is the figure the bar's height is built around.
+const COMPOSER_SLIM_PRIMARY_ACTION_SIZE: f32 = 32.0;
+/// The one-line bar's corner radius.
+///
+/// Half the bar's height, so both ends close into full semicircles and the
+/// bar reads as a pill rather than a rounded rectangle. The radius morphs from
+/// [`COMPOSER_SURFACE_RADIUS`] as the bar settles into its one-line shape, so
+/// the corners round off as the box becomes the bar.
+const COMPOSER_SLIM_SURFACE_RADIUS: f32 = COMPOSER_SLIM_SURFACE_HEIGHT / 2.0;
 /// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
 /// a one-line bar reads as a pill, so its padding is tighter.
 const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
+/// The textarea's own editor paddings (`Size::Medium`: 10px each side) plus
+/// its 10px right margin — what the element's prepaint subtracts from its
+/// bounds before it wraps. The density probe wraps at the same figure so its
+/// row count agrees with what the input will actually draw.
+const COMPOSER_INPUT_TEXT_INSET: f32 = 30.0;
+/// One line advance in the composer's input.
+///
+/// The textarea's frame sets `line-height: 1.25rem` (20px at the root size),
+/// and the text itself draws at 0.875rem inside it, so the advance is the
+/// frame's rem figure rather than a multiple of the text size. The surface
+/// height is derived from this figure, so it has to be the figure the input
+/// actually draws at.
+const COMPOSER_INPUT_LINE_HEIGHT: f32 = 20.0;
+/// The textarea's own vertical padding at the component's Medium size (8px
+/// above and below). The editor element sits inside it, so a row of text is
+/// one advance plus this.
+const COMPOSER_INPUT_VERTICAL_PADDING: f32 = 16.0;
+const COMPOSER_INPUT_MAX_ROWS: usize = 8;
 const COMPOSER_RUNTIME_MENU_WIDTH: f32 = 320.0;
 const COMPOSER_RUNTIME_MENU_MAX_HEIGHT: f32 = 448.0;
+/// The run-options column docked beside the model list: reasoning levels,
+/// conversation modes and feature toggles live here instead of as separate
+/// chips on the composer, so one panel owns the whole run configuration.
+const COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH: f32 = 200.0;
 /// One sign-in method row in the runtime authentication submenu. The loading
 /// placeholder reads the same figure, so the list does not resize under it.
 const RUNTIME_AUTH_METHOD_ROW_HEIGHT: f32 = 48.0;
@@ -2362,7 +2549,6 @@ struct SessionToolState {
 #[derive(Debug, Clone)]
 enum RuntimeChoiceMenuAction {
     NewSession(SessionRuntimeSelection),
-    ActiveSession(SessionRuntimeSelection),
     Feature {
         target: RuntimeFeatureTarget,
         feature_id: String,
@@ -2411,17 +2597,39 @@ impl SearchableListItem for NewSessionBaseRefChoice {
     }
 }
 
-/// One folder the new-session page can file its draft under.
+/// One filing destination the new-session page can put its draft under.
 ///
 /// The choice carries the label the menu draws and the id the placement tree
-/// files by, so the control never has to look a folder up again by name. The
-/// depth indents a nested folder under its parent, which is what makes the menu
-/// read as the tree the sidebar draws.
+/// files by, so the control never has to look a destination up again by name.
+/// The depth indents a nested folder under its parent, which is what makes the
+/// menu read as the tree the sidebar draws. A session group is a destination
+/// like a folder, with its own glyph so the two never read as one kind.
 #[derive(Clone)]
 struct NewSessionFolderChoice {
-    folder_id: String,
+    target: NewSessionFilingTarget,
     label: String,
     depth: usize,
+}
+
+/// Where the new-session page files the session it creates: under a sidebar
+/// folder, or inside a session group. A draft answers one or the other, never
+/// both.
+#[derive(Clone, PartialEq, Eq)]
+enum NewSessionFilingTarget {
+    Folder(String),
+    Group(String),
+}
+
+impl NewSessionFilingTarget {
+    fn id(&self) -> &str {
+        match self {
+            Self::Folder(id) | Self::Group(id) => id,
+        }
+    }
+
+    fn is_group(&self) -> bool {
+        matches!(self, Self::Group(_))
+    }
 }
 
 #[derive(Debug, Default)]
@@ -3052,6 +3260,10 @@ async fn fetch_timeline_window_or_contiguous(
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await?;
+    let page = align_timeline_window_to_turn_start(page, |before_sequence| {
+        fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
+    })
+    .await;
     Ok(
         extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
             fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
@@ -3079,6 +3291,15 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
         })
         .await
         .map_err(remote_error_into_vibex)?;
+    let page = align_timeline_window_to_turn_start(page, |before_sequence| {
+        fetch_timeline_page_before_via_backend(
+            backend.clone(),
+            session_id.clone(),
+            before_sequence,
+            true,
+        )
+    })
+    .await;
     Ok(
         extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
             fetch_timeline_page_before_via_backend(
@@ -3090,6 +3311,49 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
         })
         .await,
     )
+}
+
+/// Reaches a window back until it starts on a turn boundary.
+///
+/// The newest page is capped by item count, and one running turn can be larger
+/// than that cap by itself. Such a page begins inside the live turn, so the view
+/// it installs holds one partial turn of a long conversation: the whole history
+/// is missing until pages load under it. Walking back to the boundary makes the
+/// window a whole number of turns, which is what the row table and the anchor
+/// both assume. Best effort and bounded: a failed page, a window that already
+/// starts at a boundary, or the page budget ends the walk with whatever the
+/// window holds.
+async fn align_timeline_window_to_turn_start<F, Fut>(
+    mut page: vibex_core::TimelinePage,
+    mut fetch_before: F,
+) -> vibex_core::TimelinePage
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = vibex_core::VibexResult<vibex_core::TimelinePage>>,
+{
+    let mut pages = 0;
+    while !page.starts_at_turn_start
+        && page.has_older
+        && pages < AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES
+    {
+        let Some(start_sequence) = page.start_sequence else {
+            break;
+        };
+        let older = match fetch_before(start_sequence).await {
+            Ok(older) => older,
+            // One retry, for the same reason the anchor walk takes one: a
+            // transient read must not leave the view on a partial turn.
+            Err(_) => match fetch_before(start_sequence).await {
+                Ok(older) => older,
+                Err(_) => break,
+            },
+        };
+        if !prepend_older_timeline_page(&mut page, older) {
+            break;
+        }
+        pages += 1;
+    }
+    page
 }
 
 /// Reaches a replaced window back to the oldest sequence a reader still holds.
@@ -3128,8 +3392,20 @@ where
         {
             break;
         }
-        let Ok(older) = fetch_before(start_sequence).await else {
-            break;
+        let older = match fetch_before(start_sequence).await {
+            Ok(older) => older,
+            Err(_) => {
+                // A page read can fail transiently — a saturated machine, a
+                // busy store — and giving up on the first hiccup abandons the
+                // turn the reader is reading, which is the jump this walk
+                // exists to prevent. One retry stays within the best-effort
+                // contract: a read that fails twice leaves the window exactly
+                // as it arrived.
+                match fetch_before(start_sequence).await {
+                    Ok(older) => older,
+                    Err(_) => break,
+                }
+            }
         };
         if !prepend_older_timeline_page(&mut page, older) {
             break;
@@ -3339,6 +3615,10 @@ struct TimelineWindowRead {
     /// put them back exactly where they were. `None` reads the newest window
     /// alone, which is every load that has nobody's place to keep.
     cover_sequence: Option<i64>,
+    /// This read is itself the one recovery re-read for a refused window that
+    /// dropped the reader's anchor. Its answer installs regardless, so a place
+    /// that cannot be kept costs a single extra read, never a loop.
+    anchor_recovery_spent: bool,
 }
 
 impl TimelineWindowRead {
@@ -3348,6 +3628,7 @@ impl TimelineWindowRead {
             resume,
             contiguous: false,
             cover_sequence: None,
+            anchor_recovery_spent: false,
         }
     }
 
@@ -3357,6 +3638,7 @@ impl TimelineWindowRead {
             resume: None,
             contiguous: true,
             cover_sequence: None,
+            anchor_recovery_spent: false,
         }
     }
 
@@ -3367,6 +3649,13 @@ impl TimelineWindowRead {
     /// naming a turn the view no longer has.
     fn covering(mut self, cover_sequence: Option<i64>) -> Self {
         self.cover_sequence = cover_sequence;
+        self
+    }
+
+    /// Marks this read as the one recovery re-read a refused anchor-dropping
+    /// window asked for. Its answer installs regardless of the anchor.
+    fn anchor_recovery_spent(mut self) -> Self {
+        self.anchor_recovery_spent = true;
         self
     }
 }
@@ -4114,6 +4403,111 @@ fn composer_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-surface", is_dark)
 }
 
+/// The fill the Composer's own surface paints.
+///
+/// The authored plate sits just a few points above the page, which is right
+/// for a card that a hairline and a shadow already separate. The Composer is
+/// the one surface the reader types into, and on a dark page that faint a
+/// step left the box reading as a hole with a caret in it. Lifting the plate
+/// toward the foreground by a few points gives the box a body of its own
+/// without turning it into a second card. A light appearance already fades
+/// its raised plates over the wallpaper, and the authored white is already
+/// the page, so it keeps the authored color and leans on the hairline.
+fn composer_surface_fill(is_dark: bool) -> Hsla {
+    let surface = composer_surface_background(is_dark);
+    if is_dark {
+        motion::mix(surface, theme::semantic_color("foreground", is_dark), 0.055)
+    } else {
+        surface
+    }
+}
+
+/// The ink a Composer instrument draws at `hover` progress (0..1).
+///
+/// One control, two inks: the caller's `rest` step while the pointer is
+/// elsewhere, and the foreground's near-white under it. The fade between them
+/// runs on the app's standard `HOVER_FADE` curve, which is what the wrapper in
+/// [`composer_instrument_hover_target`] drives; the footer's pair rests darker
+/// than the surface's own controls because they are rare actions a step below
+/// the box.
+fn composer_instrument_ink(hover: f32, rest: f32, cx: &App) -> Hsla {
+    motion::mix(
+        cx.theme().muted_foreground.opacity(rest),
+        cx.theme().foreground.opacity(COMPOSER_INSTRUMENT_HOVER_INK),
+        hover,
+    )
+}
+
+/// A glyph on one of the Composer's own controls.
+///
+/// The utility controls seat two quiet marks and one filled disc, so their
+/// glyphs draw a couple of points under the button's own size and in muted ink
+/// rather than the foreground: at a full 30px frame a 16px mark read as a third
+/// action competing with the send disc. The kit's `.icon(...)` API sizes its
+/// glyph at three quarters of the button and tints it with the button's own
+/// foreground — which a ghost button keeps unchanged under the pointer — so the
+/// mark is a child that carries the fade's ink itself.
+fn composer_instrument_glyph(icon: Icon, size: f32, ink: Hsla) -> AnyElement {
+    icon.size(px(size)).text_color(ink).into_any_element()
+}
+
+/// Wraps one Composer instrument in the element that carries its hover fade.
+///
+/// The wrapper, not the button, listens for the pointer: every one of these
+/// buttons carries a tooltip, and the kit's tooltip already owns that button's
+/// single `on_hover` — a second one panics at paint. A plain div around the seat
+/// has its own hitbox on the same bounds, so the fade starts and ends where the
+/// button does. `key` is the control's fade key and the same string on both
+/// densities; the caller reads the same key with [`motion::hover_t`] to pick the
+/// ink for this frame.
+fn composer_instrument_hover_target<E>(key: &str, owner: EntityId, child: E) -> AnyElement
+where
+    E: IntoElement,
+{
+    div()
+        .id(SharedString::from(format!("{key}:hover")))
+        .flex_none()
+        .on_hover(motion::hover_listener(owner, key.to_string()))
+        .child(child)
+        .into_any_element()
+}
+
+/// The hairline around the Composer's surface.
+///
+/// The theme's `border` is a ten-percent rule, which is the right weight
+/// between two plates and too quiet for the one edge that has to say where the
+/// box begins. The Composer draws its own edge a little stronger on a dark
+/// page; a light page keeps the theme's line, which already has more contrast
+/// against the white plate.
+///
+/// The edge also has to answer for the two different ways a composer holds the
+/// keyboard. A focused *pane* takes the theme's ring outright: it is a statement
+/// about which pane the keys reach, and it has to read from across the window.
+/// A focused *input* — a caret sitting in the box, which in the single-session
+/// column is the only focus there is — takes a blend of the resting hairline and
+/// that ring instead. The box has to say it is the thing being typed into, but
+/// at the full ring it shouted as loudly as a pane boundary for a state the
+/// reader entered by clicking one line of text.
+fn composer_surface_border(
+    is_dark: bool,
+    pane_focused: bool,
+    input_focused: bool,
+    cx: &App,
+) -> Hsla {
+    if pane_focused {
+        return cx.theme().ring;
+    }
+    let rest = if is_dark {
+        cx.theme().foreground.opacity(0.14)
+    } else {
+        cx.theme().border
+    };
+    if input_focused {
+        return motion::mix(rest, cx.theme().ring, COMPOSER_FOCUSED_INPUT_RING_MIX);
+    }
+    rest
+}
+
 /// How much room a composer gives itself.
 ///
 /// The two densities are the same composer at two heights, not two widgets: the
@@ -4130,30 +4524,33 @@ enum ComposerDensity {
 
 /// The density one composer frame draws.
 ///
-/// `wrapped_rows` is how many rows the input's own display map reports for the
-/// draft, which is the only count that answers the question the two densities
-/// exist for: does this draft fit on one line? `draft_empty` keeps a blank draft
-/// slim even before the map has been prepared. `extra_rows` folds in everything
-/// else that already asks for the box — the extension surfaces, the notice rows,
-/// the plan, the goal and the collaboration rows. An expanded composer is always
-/// full: it is a fullscreen editor.
+/// `wrapped_rows` is how many rows the draft needs at the width the one-line
+/// bar gives its input (see [`composer_draft_wrapped_rows`]) — a width that
+/// does not depend on the density, so the answer cannot flip because of the
+/// layout the answer itself chose. `draft_empty` keeps a blank draft slim
+/// even before the map has been prepared. An expanded composer is always full:
+/// it is a fullscreen editor.
+///
+/// Only what lives *inside* the surface decides the density. The notice rows
+/// that ride above it — the continuation prompt, the generation status, the
+/// plan, the goal, the collaboration bar, the queued messages — are siblings
+/// of the box, not rows of it: a blank draft under an active plan is still a
+/// one-line bar, and the rows above it keep their own height.
 fn composer_density(
     wrapped_rows: usize,
     draft_empty: bool,
     attachments_empty: bool,
-    extension_visible: bool,
-    extra_rows: bool,
     expanded: bool,
 ) -> ComposerDensity {
     let one_line = draft_empty || wrapped_rows <= 1;
-    if !expanded && one_line && attachments_empty && !extension_visible && !extra_rows {
+    if !expanded && one_line && attachments_empty {
         ComposerDensity::Slim
     } else {
         ComposerDensity::Full
     }
 }
 
-/// The rows a draft occupies in its own input, for the density decision.
+/// The rows a draft occupies in its own input, for the surface's height.
 ///
 /// The display map is refreshed by layout, so it is exact for every frame after
 /// the first. Before the first layout it can report zero rows for non-empty
@@ -4167,8 +4564,155 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
     text.lines().count().max(1)
 }
 
+/// The width the one-line bar would give its input, from the pane's own
+/// column — never from the density this frame is about to choose.
+///
+/// Every control the slim row seats beside the text has a fixed width: attach
+/// and expand are [`COMPOSER_SLIM_ROW_CONTROL_SIZE`] each, the send action is
+/// [`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`], the gaps and the insets are the
+/// row's own. The run-configuration trigger varies — 32px when compact, up to
+/// 240px otherwise — so the bar's input is never wider than this figure.
+/// Estimating on the narrow side is deliberate: a draft the estimate calls one
+/// line is one line on the real bar too, so the bar cannot bounce back to the
+/// box on the next frame.
+fn composer_slim_input_width(
+    pane_width: f32,
+    content_max_width: Option<f32>,
+    content_inset: f32,
+    compact_runtime_controls: bool,
+    has_runtime_selection: bool,
+) -> f32 {
+    let surface_width = timeline_content_width(Some(pane_width), content_max_width, content_inset);
+    let trigger = if !has_runtime_selection {
+        0.0
+    } else if compact_runtime_controls {
+        32.0
+    } else {
+        240.0
+    };
+    (surface_width
+        - 2.0 * COMPOSER_SLIM_HORIZONTAL_PADDING
+        - 2.0
+        - 4.0 * 8.0
+        - COMPOSER_SLIM_ROW_CONTROL_SIZE
+        - COMPOSER_SLIM_ROW_CONTROL_SIZE
+        - COMPOSER_SLIM_PRIMARY_ACTION_SIZE
+        - trigger)
+        .max(120.0)
+}
+
+/// How many rows the draft needs on the one-line bar's own input width.
+///
+/// The density decision must not read the live input's wrapped rows: the two
+/// densities give the input different widths (the slim bar seats its controls
+/// beside the text, the full box moves them out of the row), so a draft near
+/// the wrap boundary reads two rows in one density and one in the other, and
+/// the composer oscillates between them on every frame. This probe wraps the
+/// draft through its own display map at the width the SLIM row gives the
+/// input — a figure derived from the pane, not from the density being chosen —
+/// so the decision is a fixed point: a draft that fits the bar keeps the bar,
+/// and a draft that does not keeps the box, whose input is wider still.
+///
+/// A draft carrying inline tokens (agent chips, attachment markers) falls
+/// back to the input's own count: the tokens' element widths live in the
+/// input's layout cache where a probe cannot measure them, and the live count
+/// errs toward the box rather than hiding a chip's row inside the bar. The
+/// probe map is rebuilt only when the draft, the width or the font moves, so
+/// a resting composer pays one comparison per frame.
+fn composer_draft_wrapped_rows(
+    probe: &mut Option<(String, f32, gpui::Font, f32, DisplayMap)>,
+    input: &Entity<TextareaState>,
+    draft: &str,
+    input_width: f32,
+    font: gpui::Font,
+    font_size: f32,
+    cx: &mut App,
+) -> usize {
+    if !input.read(cx).tokens().is_empty() {
+        return composer_wrapped_rows(input.read(cx), draft);
+    }
+    let reusable = probe
+        .as_ref()
+        .is_some_and(|(text, width, probe_font, size, _)| {
+            text == draft
+                && (*width - input_width).abs() <= 0.5
+                && *probe_font == font
+                && (*size - font_size).abs() <= 0.01
+        });
+    if !reusable {
+        let mut map = DisplayMap::new(
+            font.clone(),
+            px(font_size),
+            Some(px((input_width - COMPOSER_INPUT_TEXT_INSET).max(1.0))),
+        );
+        map.set_text(&Rope::from(draft), cx);
+        *probe = Some((draft.to_string(), input_width, font, font_size, map));
+    }
+    probe
+        .as_ref()
+        .map(|(_, _, _, _, map)| map.wrap_row_count().max(1))
+        .unwrap_or_else(|| draft.lines().count().max(1))
+}
+
+/// The height the composer surface asks for, before the morph glides to it.
+///
+/// A one-line draft is a single-row bar. Past one line the box is exactly what
+/// the draft draws — one advance per wrapped row plus the input's own padding —
+/// inside the row's insets, the control row and the surface's hairline. It
+/// stops growing at the input's own row cap, where the textarea scrolls inside
+/// a fixed surface. The trailing control column sets a taller floor
+/// ([`COMPOSER_FULL_SURFACE_MIN_HEIGHT`]): the box must fit the stack it seats
+/// in the corner, and until the draft is taller than that stack the column is
+/// what keeps the box open. An expanded composer fills its parent instead and
+/// asks for no height of its own.
+fn composer_surface_height(density: ComposerDensity, wrapped_rows: usize) -> f32 {
+    match density {
+        ComposerDensity::Slim => COMPOSER_SLIM_SURFACE_HEIGHT,
+        ComposerDensity::Full => {
+            let rows = wrapped_rows.clamp(2, COMPOSER_INPUT_MAX_ROWS);
+            // The text the input has to draw, then the row's insets, the
+            // control row and the surface's hairline. Deriving the height
+            // from the text — rather than growing a fixed base — is what
+            // keeps the band under the last line from being reserved twice.
+            let text = rows as f32 * COMPOSER_INPUT_LINE_HEIGHT + COMPOSER_INPUT_VERTICAL_PADDING;
+            let content = text.max(COMPOSER_TRAILING_STACK_HEIGHT);
+            (content
+                + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING
+                + COMPOSER_FULL_CONTROL_ROW_HEIGHT
+                + COMPOSER_SURFACE_HAIRLINE)
+                .max(COMPOSER_FULL_SURFACE_MIN_HEIGHT)
+        }
+    }
+}
+
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-queue", is_dark).opacity(COMPOSER_EXTENSION_SURFACE_OPACITY)
+}
+
+/// The height morph's key for one session's composer.
+///
+/// The renderer resolves the glide under this key, and the measurement the
+/// surface parks under the same pane asks whether a glide is running before it
+/// wakes anything. One spelling keeps the two halves talking about the same
+/// entry; a second `format!` at the call site is how they drift apart.
+fn composer_surface_morph_key(session_id: Option<&str>) -> String {
+    session_id.map_or_else(
+        || "composer-surface@primary".to_string(),
+        |id| format!("composer-surface@{id}"),
+    )
+}
+
+/// Whether a parked Composer measurement has to ask for a repaint.
+///
+/// The bounds move on every frame of a height glide, so a surface that was
+/// merely growing asked the workbench to repaint for each step as well. The
+/// glide already drives the Composer's own frames, and that view reads the
+/// parked measurement at the start of the render it makes — the extra request
+/// only woke the sidebar, every pane and the transcript beside it, once per
+/// step, for a change the frames in flight had already painted. The request is
+/// held back while the glide runs and lands on the settled bounds.
+fn composer_measurement_wants_repaint(changed: bool, morph_key: &str) -> bool {
+    changed && !motion::height_morph_in_flight(morph_key)
 }
 
 fn composer_plan_progress_label(
@@ -6085,6 +6629,21 @@ struct PendingPermissionRevealTarget {
     item_id: String,
 }
 
+/// What the transcript's scroll trace remembers between frames.
+#[derive(Default)]
+struct TimelineScrollTrace {
+    last_offset: Pixels,
+    /// How far the wheel asked the list to move since the last trace.
+    expected: Pixels,
+    /// Trace lines written so far, so a captured file can be read in order even
+    /// though several frames may describe the same offset.
+    frames: u64,
+    /// How many times the rows have been re-seeded. A document whose extent
+    /// moves every frame is one thing when the table changed and another when
+    /// nothing did, and only this count tells them apart.
+    seeds: u64,
+}
+
 /// Every piece of state that belongs to one session's conversation view.
 ///
 /// A session view is a *complete*, independently owned unit: the timeline and
@@ -6120,7 +6679,14 @@ pub struct SessionView {
     turn_preview_active_index: Option<usize>,
     timeline_item_index: RefCell<TimelineItemIndex>,
     timeline_follow: TimelineFollowState,
-    timeline_scroll: VirtualListScrollHandle,
+    /// The transcript's own scroll position and row layout.
+    ///
+    /// A `gpui::list` owns both, and it is the element that carries gpui-fast's
+    /// list layer: rows are replayed from the layer rather than rebuilt on every
+    /// scrolled frame. `v_virtual_list` had no layer path at all, so the
+    /// transcript composited nothing while it scrolled. See
+    /// `.trellis/spec/frontend/timeline-scrolling.md`.
+    timeline_scroll: gpui::ListState,
     /// Whether the backend reported history below this view's oldest item.
     ///
     /// Per view, because it describes the window that view holds rather than
@@ -6152,6 +6718,58 @@ pub struct SessionView {
     timeline_bottom_control_close_task: Option<Task<()>>,
     timeline_duration_tick_task: Option<Task<()>>,
     timeline_scrollbar_interaction_active: bool,
+    /// How far the next render should nudge the transcript to reveal a row.
+    ///
+    /// Accumulated because the reveal runs inside the list's own prepaint,
+    /// where every `ListState` accessor borrows a layout that prepaint already
+    /// holds. Applied by [`Self::apply_pending_timeline_reveal`].
+    pending_timeline_reveal_delta: Pixels,
+    /// The transcript's viewport as the last frame laid it out.
+    ///
+    /// Cached because the reveal below runs inside the list's own prepaint, and
+    /// reading `ListState::viewport_bounds` there borrows the layout that
+    /// prepaint already holds — a panic, not a stale value.
+    timeline_viewport: Bounds<Pixels>,
+    /// The width the list last laid the transcript out at.
+    ///
+    /// `gpui::list` drops every item's height hint when its width or padding
+    /// changes — its first layout does exactly that — and a hint-less row
+    /// contributes no height. The list is then only as tall as the rows it has
+    /// measured, so the scrollbar, the anchor mapping and `scroll_to_end` all
+    /// describe a shorter document than the one on screen, and every row it
+    /// measured while the reader scrolled made the extent jump by that row's
+    /// height. Tracking the width is what tells [`Self::sync_timeline_list_rows`]
+    /// that the hints have to be seeded again, once the layout has settled.
+    timeline_list_seen_width: Pixels,
+    /// The width the list's row hints were last seeded at.
+    ///
+    /// `None` while the width is still moving, which is also what marks the
+    /// hints as lost and asks for the next seed.
+    timeline_list_hint_width: Option<Pixels>,
+    /// The turn ids the list's rows were last synced against, in row order.
+    ///
+    /// A count change alone cannot say *which* rows moved: an append keeps every
+    /// row above it, a prepend shifts them all. Comparing the ids tells the sync
+    /// whether it may splice the ends — keeping the measured heights of the rows
+    /// the reader is holding — or has to re-seed the whole table.
+    timeline_list_synced_turn_ids: Vec<String>,
+    /// Whether a seed is owed once the width holds still.
+    ///
+    /// A pane animating its width must not seed on every frame of the animation,
+    /// but the seed cannot simply be skipped either: the list drops its hints on
+    /// each width change, and a list without hints reports a document only as tall
+    /// as the rows it has measured. This says the wipe still has to be answered
+    /// once the width settles, so the frame that follows an animation is not
+    /// mistaken for the frame after a splice.
+    timeline_list_seed_pending: bool,
+    /// What the last transcript frame left the list at, and how far the wheel
+    /// has asked it to move since.
+    ///
+    /// Only read when `VIBEX_TIMELINE_TRACE` is set, and only built in debug
+    /// builds: [`Self::trace_timeline_scroll`] compares the two to name a frame
+    /// that moved the transcript by something the reader did not ask for, and
+    /// prints the state around it.
+    timeline_trace: TimelineScrollTrace,
     timeline_row_sizes: Rc<Vec<Size<gpui::Pixels>>>,
     /// The timeline revision [`Self::timeline_row_sizes`] was built for.
     ///
@@ -6190,6 +6808,12 @@ pub struct SessionView {
     #[cfg(test)]
     timeline_group_rows_built: Vec<usize>,
     timeline_disclosure_animating: bool,
+    /// This frame's answer to [`Self::timeline_rows_hang_from_bottom`].
+    ///
+    /// Resolved before the transcript element is built, because the row
+    /// builders run inside `gpui::list`'s own layout borrow and cannot read the
+    /// list's scroll state.
+    timeline_rows_hang_from_bottom_cached: bool,
     /// Frames until the row table has caught up with the last disclosure that
     /// moved. A virtual row's box is the height an earlier frame measured, so a
     /// disclosure that has stopped moving still draws against a stale box.
@@ -6291,6 +6915,14 @@ pub struct SessionView {
     suggestion_request_serial: u64,
     composer_history: ComposerHistoryState,
     composer_expanded: bool,
+    /// The session whose draft the surface's height morph last painted. A
+    /// borrow that moved to another session snaps the morph instead of
+    /// gliding between two sessions' heights.
+    composer_surface_session: Option<VibexSessionId>,
+    /// The density probe's wrapped draft (text, input width, font, size, map).
+    /// Kept per session view so a group's panes never share one probe, and
+    /// rebuilt only when the draft or its measuring width moves.
+    composer_density_probe: Option<(String, f32, gpui::Font, f32, DisplayMap)>,
     composer_goal_editing: bool,
     composer_plan_expanded: Option<ComposerPlanIdentity>,
     dismissed_composer_plans: BTreeSet<ComposerPlanIdentity>,
@@ -6374,7 +7006,7 @@ impl SessionView {
             turn_preview_active_index: None,
             timeline_item_index: RefCell::new(TimelineItemIndex::default()),
             timeline_follow: TimelineFollowState::default(),
-            timeline_scroll: VirtualListScrollHandle::new(),
+            timeline_scroll: gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)),
             timeline_has_older: false,
             timeline_starts_mid_turn: false,
             timeline_older_in_flight: 0,
@@ -6388,6 +7020,13 @@ impl SessionView {
             timeline_bottom_control_close_task: None,
             timeline_duration_tick_task: None,
             timeline_scrollbar_interaction_active: false,
+            timeline_viewport: Bounds::default(),
+            timeline_list_seen_width: px(0.0),
+            timeline_list_hint_width: None,
+            timeline_list_synced_turn_ids: Vec::new(),
+            timeline_list_seed_pending: false,
+            timeline_trace: TimelineScrollTrace::default(),
+            pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
             timeline_row_sizes_revision: 0,
             timeline_measured_turn_heights: BTreeMap::new(),
@@ -6402,6 +7041,7 @@ impl SessionView {
             #[cfg(test)]
             timeline_group_rows_built: Vec::new(),
             timeline_disclosure_animating: false,
+            timeline_rows_hang_from_bottom_cached: false,
             timeline_disclosure_settle_frames: 0,
             timeline_disclosure_holds_screen: false,
             live_label_frame_gate: timeline_activity::LiveLabelFrameGate::default(),
@@ -6448,6 +7088,8 @@ impl SessionView {
             suggestion_task: None,
             composer_history: ComposerHistoryState::default(),
             composer_expanded: false,
+            composer_surface_session: None,
+            composer_density_probe: None,
             composer_goal_editing: false,
             composer_plan_expanded: None,
             dismissed_composer_plans: BTreeSet::new(),
@@ -6479,17 +7121,47 @@ impl SessionView {
 
     fn scroll_timeline_to_latest(&self) {
         if !self.timeline_row_sizes.is_empty() {
-            // VirtualList clamps this offset to its freshly laid-out viewport
-            // before placing rows. The base handle's deferred scroll_to_bottom
-            // runs after the list snapshots its offset, painting one frame at
-            // the old position while the scrollbar already shows the new one.
-            let content_height = self
-                .timeline_row_sizes
-                .iter()
-                .map(|row| row.height)
-                .sum::<Pixels>();
-            self.timeline_scroll
-                .set_offset(point(px(0.0), -content_height));
+            // `scroll_to_end` anchors past the last row and lets the list clamp
+            // the offset to the extent it lays out in this same frame. Naming a
+            // pixel position instead needs the content height before the list
+            // has laid it out, and a turn that grew this frame would be missed.
+            //
+            // A transcript that fits its viewport has nowhere to go: the anchor
+            // is dropped rather than placed past the last row, which would park
+            // the viewport on a padding band below content that already shows.
+            let content: Pixels = self.timeline_row_sizes.iter().map(|row| row.height).sum();
+            let viewport = self.timeline_scroll.viewport_bounds().size.height;
+            if content <= viewport {
+                self.timeline_scroll.scroll_to(gpui::ListOffset::default());
+            } else {
+                // The list follows its own tail while the reader is on it: that is
+                // the only state in which it paints from the end anchor instead of
+                // re-deriving a row anchor one padding band lower every frame.
+                self.timeline_scroll.set_follow_mode(gpui::FollowMode::Tail);
+                self.timeline_scroll.scroll_to_end();
+            }
+        }
+    }
+
+    /// Keeps the live edge on the list's own end anchor.
+    ///
+    /// `scroll_to_end` anchors past the last row, which the list paints by
+    /// walking back from the end; a layout that instead resolves that into a row
+    /// anchor places the same content one padding band lower, because its fill
+    /// counts the list's padding and the end anchor does not. A capture shows
+    /// exactly that pair alternating once a frame — the offset switching between
+    /// the document's height and the maximum plus one padding — which is a
+    /// padding-sized bounce painted sixty times a second. Re-stating the end
+    /// anchor every frame keeps one of the two out of the picture.
+    fn hold_the_live_edge_anchor(&mut self) {
+        if !self.timeline_follow.following_bottom
+            || self.timeline_scrollbar_interaction_active
+            || self.pending_timeline_reveal_delta != px(0.0)
+        {
+            return;
+        }
+        if self.timeline_scroll.logical_scroll_top().item_ix < self.timeline_scroll.item_count() {
+            self.timeline_scroll.scroll_to_end();
         }
     }
 
@@ -8101,6 +8773,67 @@ fn user_message_edit_action_state(
     }
 }
 
+/// How many times the transcript's list has notified its workbench for a scroll.
+///
+/// `gpui::list` notifies the view holding it from inside its own wheel handler,
+/// and every shell view observing that workbench rebuilds with it — the
+/// composer, the sidebar, the rails. None of them reads what a scroll changes,
+/// and a composer rebuilt beside the transcript is what makes the transcript's
+/// list fail `scroll_only`: the layer asks whether the scroll was the only thing
+/// that happened, and a sibling rebuilt in the same frame answers no.
+///
+/// The count lives in the app's globals rather than on the workbench because a
+/// notify callback is handed the entity that is being updated and cannot read
+/// it. A view records the count it last rendered at and skips a notify that
+/// moved nothing else.
+#[derive(Default)]
+struct TranscriptScrollNotifies(u64);
+
+impl Global for TranscriptScrollNotifies {}
+
+fn note_transcript_scroll(cx: &mut App) {
+    let count = cx
+        .try_global::<TranscriptScrollNotifies>()
+        .map_or(0, |notifies| notifies.0);
+    cx.set_global(TranscriptScrollNotifies(count.wrapping_add(1)));
+}
+
+fn transcript_scroll_notifies(cx: &App) -> u64 {
+    cx.try_global::<TranscriptScrollNotifies>()
+        .map_or(0, |notifies| notifies.0)
+}
+
+/// How far the viewport's bottom is above the content's bottom.
+///
+/// `offset_y` is where the viewport starts (zero at the top, negative as it
+/// moves down) and `max_offset_y` is how far it can travel, as a positive
+/// distance. At the bottom edge the two cancel to zero.
+/// A single height to seed an unmeasured row with.
+///
+/// `ListState` gives every row it has not measured the same hint, so the
+/// document it reports is `rows * hint`, and the seed's job is to make that
+/// product match the row table. That makes the *mean* the right number: it is
+/// the one value whose product with the row count is the table's own total.
+///
+/// The median reads as the more typical row, but a document seeded with it is
+/// shorter than the real one as soon as long and short rows are mixed — and a
+/// transcript is nothing but mixed. Every reseed (a new turn, a width change, a
+/// lost hint) then resolves the reader's place against that shorter document,
+/// which is why a turn arriving while the reader is on the live edge threw the
+/// viewport hundreds of pixels up the conversation: nineteen rows seeded at
+/// their median left the bottom that far short of where it really is.
+fn timeline_row_height_hint(rows: &[Size<Pixels>]) -> Option<Pixels> {
+    let mut total = px(0.0);
+    let mut measured = 0usize;
+    for row in rows {
+        if row.height > px(0.0) {
+            total += row.height;
+            measured += 1;
+        }
+    }
+    (measured > 0).then(|| total / measured as f32)
+}
+
 fn timeline_distance_to_bottom(offset_y: f32, max_offset_y: f32) -> f32 {
     (max_offset_y + offset_y).max(0.0)
 }
@@ -8182,6 +8915,7 @@ fn timeline_should_auto_follow_content(
 /// the first row. Capturing this anchor lets a session switch or an
 /// authoritative replacement put the same conversation content back under the
 /// viewport after the virtual row extents changed.
+#[cfg(test)]
 fn timeline_scroll_anchor_from_offset(
     row_heights: &[f32],
     offset_y: f32,
@@ -8242,6 +8976,7 @@ fn timeline_visible_row_range(
 /// Scroll offset that puts `row_index`'s top `offset_in_row` below the viewport
 /// top. The inverse of [`timeline_scroll_anchor_from_offset`], so an unchanged
 /// row table maps an offset back to itself.
+#[cfg(test)]
 fn timeline_scroll_offset_for_anchor(
     row_heights: &[f32],
     row_index: usize,
@@ -8721,8 +9456,13 @@ fn agent_generation_token_rate(
         return None;
     };
     let elapsed_seconds = elapsed.as_secs_f32();
+    // `then`, not `then_some`: the difference is computed in the argument, and
+    // `then_some` evaluates its argument either way. A counter that went
+    // backwards — a re-read, a compacted context, a different source for the
+    // same turn — asks for a smaller-minus-larger subtraction, which the
+    // debug overflow check turns into a process abort.
     (current > previous && elapsed_seconds > 0.0)
-        .then_some((current - previous) as f32 / elapsed_seconds)
+        .then(|| (current - previous) as f32 / elapsed_seconds)
 }
 
 fn timeline_session_state_for_render(
@@ -9327,22 +10067,6 @@ fn reorder_composer_queue_message(
     };
     queue.insert(target_index + usize::from(after), message);
     true
-}
-
-fn promote_composer_queue_message(
-    queue: &mut Vec<ComposerQueueMessage>,
-    message_id: u64,
-) -> Option<VibexSessionId> {
-    let source_index = queue.iter().position(|message| message.id == message_id)?;
-    let mut message = queue.remove(source_index);
-    // Promoting a message is the explicit send-now action. The queue is one
-    // ordered list, so the message the reader sent now becomes its head instead
-    // of the first row of its own session: an explicit send is the one thing
-    // that is allowed to jump the order, and it has to jump all of it.
-    message.scheduled_at_ms = None;
-    let session_id = message.session_id.clone();
-    queue.insert(0, message);
-    Some(session_id)
 }
 
 fn composer_queue_auto_send_enabled(
@@ -10086,15 +10810,36 @@ impl Render for SessionTerminalView {
 /// workbench center uses this one.
 struct TimelineView {
     workbench: WeakEntity<VibexWorkbench>,
+    /// The transcript-scroll count this view last rendered at.
+    ///
+    /// A workbench notify that only moved the transcript's list is skipped: the
+    /// list repaints itself, and rebuilding the view around it is exactly what
+    /// keeps the list from being composited.
+    last_seen_scroll_notifies: u64,
     #[cfg(test)]
     render_count: Cell<usize>,
 }
 
 impl TimelineView {
     fn new(workbench: &Entity<VibexWorkbench>, cx: &mut Context<Self>) -> Self {
-        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        // The transcript's list notifies the view that painted it from inside
+        // its own wheel handler, which is this one. Rebuilding here is what
+        // stops the list from compositing: `scroll_only` asks whether the
+        // scroll was the only thing that happened, and a view rebuilt by the
+        // scroll itself answers no. The count of those notifies lets this
+        // subscription tell them apart from every other workbench change.
+        cx.observe(workbench, |view, _, cx| {
+            let notifies = transcript_scroll_notifies(cx);
+            if notifies != view.last_seen_scroll_notifies {
+                view.last_seen_scroll_notifies = notifies;
+                return;
+            }
+            cx.notify();
+        })
+        .detach();
         Self {
             workbench: workbench.downgrade(),
+            last_seen_scroll_notifies: transcript_scroll_notifies(cx),
             #[cfg(test)]
             render_count: Cell::new(0),
         }
@@ -10130,6 +10875,18 @@ struct ComposerView {
     workbench: WeakEntity<VibexWorkbench>,
     session_id: Option<VibexSessionId>,
     enabled: bool,
+    /// Whether this composer belongs to the focused pane of a split.
+    ///
+    /// The composer is where a selected pane says so: its box wears the focus
+    /// ring, and the pane frame around it stays a quiet card edge. The
+    /// single-session column has no pane to mark, so it stays false there.
+    pane_focused: bool,
+    /// The workbench's transcript-scroll count when this view last rendered.
+    ///
+    /// A workbench notify that only moved the transcript is skipped: the
+    /// composer reads nothing a scroll changes, and rebuilding it there is what
+    /// stops the transcript's list from compositing.
+    last_seen_scroll_notifies: u64,
     #[cfg(test)]
     render_count: Cell<usize>,
 }
@@ -10139,15 +10896,40 @@ impl ComposerView {
         workbench: &Entity<VibexWorkbench>,
         session_id: Option<VibexSessionId>,
         enabled: bool,
+        pane_focused: bool,
         cx: &mut Context<Self>,
     ) -> Self {
         // The composer renders workbench state, so a workbench notify has to
         // refresh it. Dropping the subscription would freeze it on frame one.
-        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        //
+        // It does not read any of what a transcript scroll changes, though, and
+        // the list notifies the workbench from inside its own scroll handler.
+        // Rebuilding the composer there costs a frame's work and, worse, makes
+        // the transcript's layer see content that changed: `scroll_only` asks
+        // whether the scroll was the only thing that happened, and a composer
+        // rebuilt beside it answers no. The scroll count lets this subscription
+        // skip exactly those notifies.
+        cx.observe(workbench, |composer, _, cx| {
+            // A notify callback cannot read the entity being updated, so the
+            // count of transcript scrolls lives in the app's globals. A notify
+            // that only moved the transcript leaves the composer retained: it
+            // reads nothing a scroll changes, and rebuilding it there is what
+            // stops the transcript's list from compositing.
+            let notifies = transcript_scroll_notifies(cx);
+            if notifies != composer.last_seen_scroll_notifies {
+                composer.last_seen_scroll_notifies = notifies;
+                return;
+            }
+            cx.notify();
+        })
+        .detach();
+        let last_seen_scroll_notifies = transcript_scroll_notifies(cx);
         Self {
             workbench: workbench.downgrade(),
             session_id,
             enabled,
+            pane_focused,
+            last_seen_scroll_notifies,
             #[cfg(test)]
             render_count: Cell::new(0),
         }
@@ -10163,11 +10945,100 @@ impl Render for ComposerView {
         };
         let session_id = self.session_id.clone();
         let enabled = self.enabled;
-        workbench.update(cx, |this, cx| {
-            this.with_session_view_for_render(session_id.as_ref(), |this| {
-                this.render_composer(window, cx, enabled)
+        let pane_focused = self.pane_focused;
+        // The surface's height morph belongs to this view, not to the
+        // workbench: a glide runs across a dozen frames, and every frame it
+        // asks for is a frame this boundary can paint on its own. Notified as
+        // the workbench, each step rebuilt the sidebar, every pane and the
+        // transcript beside the composer, and the glide arrived at the screen
+        // in steps — the shape of an animation that is too expensive to run.
+        let owner = cx.entity_id();
+        let element = workbench.update(cx, |this, cx| {
+            motion::with_height_owner(owner, || {
+                this.with_session_view_for_render(session_id.as_ref(), |this| {
+                    this.render_composer(window, cx, enabled, pane_focused)
+                })
             })
-        })
+        });
+        // The tick has to run after the render that armed the morph, or the
+        // first step of a fresh glide waits for somebody else's frame.
+        motion::schedule_height_morph_frames(window);
+        element
+    }
+}
+
+/// The transcript's own render boundary.
+///
+/// The surface mounts everything a live conversation mounts: the list, its row
+/// measurements, the disclosure springs and the bottom control. `gpui::list`
+/// notifies the view that painted it from inside its own wheel handler, and that
+/// notify goes straight to the view's invalidator — an `observe` callback cannot
+/// refuse it. Built inline in the workbench's render, every scrolled frame
+/// therefore rebuilt the workbench, and with it the sidebar, the composer and
+/// every group pane.
+///
+/// A surface that owns its element tree re-renders alone. It observes the
+/// workbench, so a workbench notify still refreshes it exactly as the inline
+/// render did.
+struct TimelineSurfaceView {
+    workbench: WeakEntity<VibexWorkbench>,
+    /// The session whose transcript this surface draws.
+    ///
+    /// The surface renders the transcript of the view that is borrowed when it
+    /// draws, and it draws during the paint pass — after the pane loop has handed
+    /// its borrowed views back. One surface shared by every pane therefore
+    /// painted the *focused* pane's conversation into all of them, over that
+    /// pane's `ListState`: every pane showed the same rows at the same scroll
+    /// offset, and scrolling one moved them all. A surface per session is what
+    /// makes a pane's own transcript the one it paints.
+    session_id: Option<VibexSessionId>,
+    #[cfg(test)]
+    render_count: Cell<usize>,
+}
+
+impl TimelineSurfaceView {
+    fn new(
+        workbench: &Entity<VibexWorkbench>,
+        session_id: Option<VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        cx.observe(workbench, |_, _, cx| cx.notify()).detach();
+        Self {
+            workbench: workbench.downgrade(),
+            session_id,
+            #[cfg(test)]
+            render_count: Cell::new(0),
+        }
+    }
+}
+
+impl Render for TimelineSurfaceView {
+    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        #[cfg(test)]
+        self.render_count.set(self.render_count.get() + 1);
+        let Some(workbench) = self.workbench.upgrade() else {
+            return Empty.into_any_element();
+        };
+        let owner = cx.entity_id();
+        let session_id = self.session_id.clone();
+        // The element is wrapped so the view's own root is a sized container:
+        // `cached` applies its style to the view, and a surface that sizes
+        // itself through `flex_1` inside the pane needs the wrapper to take the
+        // pane's height first.
+        div()
+            .size_full()
+            .min_h_0()
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .child(motion::with_hover_owner(owner, || {
+                workbench.update(cx, |this, cx| {
+                    this.with_session_view_for_render(session_id.as_ref(), |this| {
+                        this.render_timeline_surface(cx)
+                    })
+                })
+            }))
+            .into_any_element()
     }
 }
 
@@ -10859,6 +11730,16 @@ pub struct VibexWorkbench {
     /// consumed by the terminal page on the frame it renders, after the
     /// surface has registered its focus handle.
     session_terminal_focus_request: Option<String>,
+    /// The conversation whose composer should take the keyboard once its pane
+    /// renders.
+    ///
+    /// Selecting a pane is a selection of the session inside it, so the caret
+    /// has to follow the pane: without this the click moved the focus ring and
+    /// stopped there, and typing needed a second click on the textarea. The
+    /// request names the session because the composer that has to adopt the
+    /// caret is built one render after the click, while that session's view is
+    /// borrowed.
+    session_group_composer_focus_request: Option<String>,
     /// The session page's terminal render boundary, created on first use.
     session_terminal_view: Option<Entity<SessionTerminalView>>,
     /// The terminal session whose restart is in flight, so its button can say so.
@@ -11100,6 +11981,13 @@ pub struct VibexWorkbench {
     runtime_edit_workspaces_input: Entity<InputState>,
     runtime_edit_local_port_input: Entity<InputState>,
     runtime_edit_error: Option<String>,
+    /// The data directory the remote runtime opens, typed or adopted from the
+    /// scan. Empty means the managed `{install_root}/home`.
+    runtime_edit_home_input: Entity<InputState>,
+    runtime_edit_homes: Vec<crate::ssh_connection::homes::RemoteRuntimeHome>,
+    runtime_edit_homes_scanning: bool,
+    runtime_edit_homes_error: Option<String>,
+    runtime_edit_homes_task: Option<Task<()>>,
     /// The runtime id a switch is connecting to; blocks a second switch.
     runtime_switch_pending: Option<String>,
     /// A pairing link or code is being claimed; blocks a second claim while
@@ -11440,6 +12328,11 @@ pub struct VibexWorkbench {
     /// user asked for it with a folder row's new-chat action. The session the
     /// draft creates is filed under that folder instead of the project root.
     new_session_folder_id: Option<String>,
+    /// The session group the open new-session draft was started from, when the
+    /// user asked for it with a group row's new-chat action. The session the
+    /// draft creates joins that group. A draft is filed under a folder or a
+    /// group, never both: the two setters clear each other.
+    new_session_group_id: Option<String>,
     new_session_open: bool,
     new_session_draft_initialized: bool,
     new_session_project_menu_open: bool,
@@ -11537,6 +12430,13 @@ pub struct VibexWorkbench {
     /// The focused timeline's own render boundary, created on first render. See
     /// [`TimelineView`]; `None` only before the first frame.
     timeline_view: Option<Entity<TimelineView>>,
+    /// The transcript surface of each session, created on first use.
+    ///
+    /// A surface renders the transcript of the session it was made for, so it is
+    /// keyed by that session: one surface per pane, each painting its own
+    /// conversation. A single shared surface painted whichever view happened to
+    /// be borrowed at paint time into every pane; see [`TimelineSurfaceView`].
+    timeline_surface_views: BTreeMap<String, Entity<TimelineSurfaceView>>,
     /// The child Agent rail's own render boundary, created on first render. See
     /// [`ChildAgentRailView`]; `None` only before the first frame.
     child_agent_rail_view: Option<Entity<ChildAgentRailView>>,
@@ -11678,6 +12578,12 @@ pub struct VibexWorkbench {
     /// editor lives here, not in the popover's element state, so the picker's
     /// calendar and countdown inputs survive the surface's own re-renders.
     message_schedule_editor: Option<MessageScheduleEditor>,
+    /// The target whose schedule popover is open, if any.
+    ///
+    /// The popover is controlled by this field rather than by its trigger's
+    /// press: the one-line bar's "more" menu can open the very same editor for
+    /// the same target, and a menu item has no trigger to press.
+    message_schedule_open: Option<MessageScheduleTarget>,
     message_schedule_task: Option<Task<()>>,
     composer_queue: Vec<ComposerQueueMessage>,
     composer_queue_serial: u64,
@@ -11693,7 +12599,7 @@ pub struct VibexWorkbench {
     composer_queue_paused_session_ids: BTreeSet<String>,
     composer_queue_ready_after_continuation_session_ids: BTreeSet<String>,
     composer_queue_interrupted_session_ids: BTreeSet<String>,
-    composer_queue_steering_session_ids: BTreeSet<String>,
+    composer_queue_steering_dispatches: BTreeMap<String, u64>,
     /// One fence per session whose handed-over message the queue is still
     /// waiting on. See [`ComposerQueueDispatchFence`].
     ///
@@ -11897,6 +12803,14 @@ fn subscribe_composer_input(
             InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
             InputEvent::PressEnter { shift: false, .. } => {}
         }
+        // A caret entering or leaving the box changes none of the state this
+        // subscription owns, but it does change what the surface's edge says:
+        // the box lights its ring while it is the thing being typed into. Ask
+        // for that frame — a focus change is a one-off, not a per-keystroke
+        // cost.
+        if matches!(event, InputEvent::Focus | InputEvent::Blur) {
+            cx.notify();
+        }
         if switched {
             this.release_session_view();
         }
@@ -12037,18 +12951,29 @@ impl VibexWorkbench {
         let added_history = !page.items.is_empty();
         let leading_turn_start = page.leading_turn_start;
         self.capture_timeline_scroll_anchor();
-        let mut merged = page
-            .items
-            .into_iter()
-            .chain(self.timeline.items.iter().cloned())
-            .collect::<Vec<_>>();
-        merged.sort_by_key(|item| item.sequence);
-        merged.dedup_by_key(|item| item.sequence);
-        self.timeline.replace_authoritative_with_leading_turn_start(
-            session_id.clone(),
-            merged,
-            leading_turn_start,
-        );
+        if !self
+            .timeline
+            .prepend_authoritative_page(session_id, &page.items, leading_turn_start)
+        {
+            // The page cannot be proven contiguous below the window — two
+            // in-flight older pages may share the cursor they were asked for —
+            // so the full replacement re-derives the order instead of assuming
+            // it. This is the slow path: it rebuilds every row the window
+            // holds, which is why the proven-contiguous page above is worth
+            // keeping off it.
+            let mut merged = page
+                .items
+                .into_iter()
+                .chain(self.timeline.items.iter().cloned())
+                .collect::<Vec<_>>();
+            merged.sort_by_key(|item| item.sequence);
+            merged.dedup_by_key(|item| item.sequence);
+            self.timeline.replace_authoritative_with_leading_turn_start(
+                session_id.clone(),
+                merged,
+                leading_turn_start,
+            );
+        }
         self.timeline_has_older = page.has_older && added_history;
         self.timeline_starts_mid_turn = !page.starts_at_turn_start;
         self.timeline_item_index.get_mut().invalidate();
@@ -12078,14 +13003,14 @@ impl VibexWorkbench {
     /// travelled, so the prefetch starts about a screen and a half early and
     /// keeps up to two pages in flight.
     fn prefetch_older_timeline_if_needed(&mut self, cx: &mut Context<Self>) {
-        let viewport = f32::from(self.timeline_scroll.bounds().size.height);
+        let viewport = f32::from(self.timeline_scroll.viewport_bounds().size.height);
         if !timeline_should_prefetch_older(TimelineOlderPrefetch {
             distance_to_top: self.timeline_distance_to_top(),
             viewport_height: viewport,
             has_older: self.timeline_has_older,
             in_flight: self.timeline_older_in_flight,
             following_bottom: self.timeline_follow.following_bottom,
-            scrollable: self.timeline_scroll.max_offset().y > px(0.0),
+            scrollable: self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
             // A restored view keeps the content it already holds on screen while
             // the window that replaces it travels, so `agent_loading` is false
             // there. The load's own buffer is what says a read is still coming:
@@ -12311,7 +13236,7 @@ impl VibexWorkbench {
 
     /// How far the viewport is from the top of the transcript.
     fn timeline_distance_to_top(&self) -> f32 {
-        (-f32::from(self.timeline_scroll.offset().y)).max(0.0)
+        (-f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)).max(0.0)
     }
 }
 
@@ -12491,6 +13416,13 @@ impl VibexWorkbench {
                 "Local tunnel port",
                 "本地隧道端口",
                 "本機通道連接埠",
+            ))
+        });
+        let runtime_edit_home_input = cx.new(|cx| {
+            InputState::new(window, cx).placeholder(locale::text(
+                "Runtime data directory (empty = independent)",
+                "运行时数据目录（留空为独立数据）",
+                "執行階段資料目錄（留空為獨立資料）",
             ))
         });
         // The registry is read once at boot: it names every runtime the manager
@@ -12972,6 +13904,7 @@ impl VibexWorkbench {
             session_terminal_surfaces: BTreeMap::new(),
             active_session_terminal_ids: BTreeSet::new(),
             session_terminal_focus_request: None,
+            session_group_composer_focus_request: None,
             session_terminal_view: None,
             terminal_session_restart_pending: None,
             session_terminal_error: None,
@@ -13083,6 +14016,11 @@ impl VibexWorkbench {
             runtime_edit_workspaces_input,
             runtime_edit_local_port_input,
             runtime_edit_error: None,
+            runtime_edit_home_input,
+            runtime_edit_homes: Vec::new(),
+            runtime_edit_homes_scanning: false,
+            runtime_edit_homes_error: None,
+            runtime_edit_homes_task: None,
             runtime_switch_pending: None,
             remote_pairing_pending: false,
             runtime_remove_pending: None,
@@ -13229,6 +14167,7 @@ impl VibexWorkbench {
             pending_new_session_titles: HashMap::new(),
             pending_initial_turn_interrupts: BTreeMap::new(),
             new_session_folder_id: None,
+            new_session_group_id: None,
             new_session_open: false,
             new_session_draft_initialized: false,
             new_session_project_menu_open: false,
@@ -13266,6 +14205,7 @@ impl VibexWorkbench {
             session_view_lru: VecDeque::new(),
             sidebar_view: None,
             timeline_view: None,
+            timeline_surface_views: BTreeMap::new(),
             child_agent_rail_view: None,
             timeline_painted_markdown_surfaces: BTreeSet::new(),
             #[cfg(test)]
@@ -13317,6 +14257,7 @@ impl VibexWorkbench {
             new_session_command_entry: None,
             new_session_schedule: None,
             message_schedule_editor: None,
+            message_schedule_open: None,
             message_schedule_task: None,
             composer_queue: Vec::new(),
             composer_queue_serial: 0,
@@ -13327,7 +14268,7 @@ impl VibexWorkbench {
             composer_queue_paused_session_ids: BTreeSet::new(),
             composer_queue_ready_after_continuation_session_ids: BTreeSet::new(),
             composer_queue_interrupted_session_ids: BTreeSet::new(),
-            composer_queue_steering_session_ids: BTreeSet::new(),
+            composer_queue_steering_dispatches: BTreeMap::new(),
             composer_queue_dispatch_fences: BTreeMap::new(),
             native_steering_supported_session_ids: BTreeSet::new(),
             native_steering_probed_generations: BTreeMap::new(),
@@ -15887,12 +16828,92 @@ impl VibexWorkbench {
                 &self.runtime_edit_local_port_input,
                 profile.local_tunnel_port.to_string(),
             ),
+            (
+                &self.runtime_edit_home_input,
+                profile.runtime_home.clone().unwrap_or_default(),
+            ),
         ];
+        self.runtime_edit_homes.clear();
+        self.runtime_edit_homes_error = None;
+        self.runtime_edit_homes_scanning = false;
         for (input, value) in values {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
         self.runtime_edit_name_input
             .update(cx, |input, cx| input.focus(window, cx));
+        cx.notify();
+    }
+
+    /// Lists the Vibex data directories that already exist on the host.
+    ///
+    /// The scan is an SSH round trip, so it runs off the UI thread and lands as
+    /// candidates the dialog renders. Its failure stays in the dialog body: the
+    /// reader asked a question about this host and is still looking at it.
+    fn scan_ssh_profile_homes(&mut self, cx: &mut Context<Self>) {
+        if self.runtime_edit_homes_scanning {
+            return;
+        }
+        let Some(profile_id) = self.runtime_edit_pending.clone() else {
+            return;
+        };
+        let Some(config) = self.config.as_ref() else {
+            self.runtime_edit_homes_error =
+                Some("the runtime configuration is unavailable".to_string());
+            cx.notify();
+            return;
+        };
+        let profiles = SshProfileStore::at_home(&config.home_dir)
+            .load()
+            .unwrap_or_default();
+        let Some(profile) = profiles
+            .into_iter()
+            .find(|profile| profile.id == profile_id)
+        else {
+            self.runtime_edit_homes_error = Some("the SSH profile was not found".to_string());
+            cx.notify();
+            return;
+        };
+        self.runtime_edit_homes_scanning = true;
+        self.runtime_edit_homes_error = None;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let program = profile
+                .ssh_client_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("ssh"));
+            let destination = SshDestination {
+                host: profile.host.clone(),
+                user: profile.user.clone(),
+                port: profile.port,
+            };
+            let command = SshCommand::for_destination(
+                program,
+                &destination,
+                profile.ssh_config_path.as_deref(),
+            )
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            crate::ssh_connection::homes::scan(&command, &profile.remote_install_root)
+                .map_err(|error| error.to_string())
+        });
+        self.runtime_edit_homes_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let result = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.runtime_edit_homes_scanning = false;
+                    match result {
+                        Ok(Ok(homes)) => {
+                            this.runtime_edit_homes = homes;
+                            this.runtime_edit_homes_error = None;
+                        }
+                        Ok(Err(error)) => this.runtime_edit_homes_error = Some(error),
+                        Err(_) => {
+                            this.runtime_edit_homes_error =
+                                Some("the data directory scan stopped unexpectedly".to_string());
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        ));
         cx.notify();
     }
 
@@ -15950,6 +16971,14 @@ impl VibexWorkbench {
             .trim()
             .parse::<u16>()
             .unwrap_or(0);
+        let runtime_home = self
+            .runtime_edit_home_input
+            .read(cx)
+            .value()
+            .trim()
+            .to_string();
+        let runtime_home = (!runtime_home.is_empty()).then_some(runtime_home);
+        let adopted_home_changed = runtime_home != profile.runtime_home;
         if display_name.is_empty() {
             self.runtime_edit_error = Some("the display name must not be empty".to_string());
             cx.notify();
@@ -15980,10 +17009,26 @@ impl VibexWorkbench {
         profile.ssh_config_path = (!config_path.is_empty()).then(|| PathBuf::from(config_path));
         profile.workspace_roots = workspaces;
         profile.local_tunnel_port = port;
+        profile.runtime_home = runtime_home;
         if let Err(error) = profile.validate() {
             self.runtime_edit_error = Some(format!("{}: {}", error.code, error.message));
             cx.notify();
             return;
+        }
+        // The runtime identity lives in the database the home holds, so another
+        // directory is another server. Dropping the binding makes the next
+        // connect provision against the adopted home and pair again instead of
+        // failing against a pinned identity that no longer answers.
+        if adopted_home_changed && runtime_id.is_some() {
+            profile.registered_runtime_id = None;
+            if let Some(previous) = runtime_id.as_deref()
+                && self.runtime_registry.active_runtime_id() != previous
+            {
+                self.runtime_registry
+                    .runtimes
+                    .retain(|runtime| runtime.id != previous);
+                self.persist_runtime_registry(cx);
+            }
         }
         let active = profile.registered_runtime_id.as_deref()
             == Some(self.runtime_registry.active_runtime_id());
@@ -16803,7 +17848,8 @@ impl VibexWorkbench {
                 &profile.workspace_roots,
                 profile.remote_port,
             )
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            .map_err(|error| format!("{}: {}", error.code, error.message))?
+            .with_runtime_home(profile.runtime_home_path());
             let channel = profile
                 .runtime_version
                 .as_deref()
@@ -16956,6 +18002,9 @@ impl VibexWorkbench {
                 return;
             }
         };
+        // An adopted directory lives outside the install root, so even a
+        // remove-everything uninstall cannot reach the reader's own data.
+        let launch = launch.with_runtime_home(profile.runtime_home_path());
         let runtime_id = profile.registered_runtime_id.clone();
         let profile_id = profile.id;
         self.ssh_uninstall_error = None;
@@ -17217,7 +18266,8 @@ impl VibexWorkbench {
                 &profile.workspace_roots,
                 profile.remote_port,
             )
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            .map_err(|error| format!("{}: {}", error.code, error.message))?
+            .with_runtime_home(profile.runtime_home_path());
             let launch = if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent {
                 launch.with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
                     &profile.id,
@@ -18489,6 +19539,7 @@ impl VibexWorkbench {
                 return;
             }
         };
+        let launch = launch.with_runtime_home(profile.runtime_home_path());
         let spec = match TunnelSpec::new(
             command.program.clone(),
             destination,
@@ -20330,6 +21381,113 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
+    /// The data-directory section of the SSH edit dialog.
+    ///
+    /// A remote runtime normally owns `{install_root}/home`. When the host
+    /// already runs Vibex — usually its own desktop build — the reader can
+    /// point this connection at that directory instead, and this section is how
+    /// they find it: one scan, one click, and the sessions in that database are
+    /// the sessions this connection opens.
+    fn render_ssh_runtime_home_field(&self, cx: &mut Context<Self>) -> AnyElement {
+        let scanning = self.runtime_edit_homes_scanning;
+        let candidates = self.runtime_edit_homes.clone();
+        let error = self.runtime_edit_homes_error.clone();
+        let input = self.runtime_edit_home_input.clone();
+        let clear_input = self.runtime_edit_home_input.clone();
+        v_flex()
+            .w_full()
+            .gap_1()
+            .px_2()
+            .py_1()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .child(locale::text(
+                        "Runtime data directory",
+                        "运行时数据目录",
+                        "執行階段資料目錄",
+                    )),
+            )
+            .child(Input::new(&self.runtime_edit_home_input).small())
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(cx.theme().muted_foreground)
+                    .whitespace_normal()
+                    .child(locale::text(
+                        "Leave it empty to use this connection's own data directory. Choosing one that already exists on the host reuses its sessions and installed Agents; the connection then pairs again, and provider credentials may have to be entered once more because the desktop keeps them in its own keychain.",
+                        "留空则使用这条连接自己的数据目录。选择主机上已有的目录会复用它里面的会话和已装 Agent；之后这条连接需要重新配对，provider 凭据可能需要再录一次（桌面端把它们放在自己的 keychain 里）。",
+                        "留空則使用這條連線自己的資料目錄。選擇主機上已有的目錄會沿用其中的工作階段與已裝 Agent；之後這條連線需要重新配對，provider 憑據可能需要再輸入一次（桌面端將它們放在自己的 keychain 裡）。",
+                    )),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .flex_wrap()
+                    .gap_1()
+                    .child(
+                        Button::new("runtime-edit-home-scan")
+                            .small()
+                            .ghost()
+                            .label(if scanning {
+                                locale::text("Scanning…", "正在检测…", "正在偵測…")
+                            } else {
+                                locale::text("Detect existing data", "检测已有数据", "偵測現有資料")
+                            })
+                            .disabled(scanning)
+                            .on_click(cx.listener(|this, _, _, cx| this.scan_ssh_profile_homes(cx))),
+                    )
+                    .child(
+                        Button::new("runtime-edit-home-clear")
+                            .small()
+                            .ghost()
+                            .label(locale::text(
+                                "Independent data",
+                                "独立数据",
+                                "獨立資料",
+                            ))
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                clear_input.update(cx, |input, cx| input.set_value("", window, cx));
+                                cx.notify();
+                            })),
+                    )
+                    .children(candidates.into_iter().enumerate().map(|(index, home)| {
+                        let (english, chinese, traditional) = runtime_home_kind_labels(home.kind);
+                        let label = format!(
+                            "{}{} — {}",
+                            locale::text(english, chinese, traditional),
+                            if home.adoptable() {
+                                ""
+                            } else if home.has_database {
+                                locale::text(" (in use)", "（正在使用）", "（使用中）")
+                            } else {
+                                locale::text(" (no data)", "（无数据）", "（無資料）")
+                            },
+                            home.path
+                        );
+                        let value = home.path.clone();
+                        let adoptable = home.adoptable();
+                        let input = input.clone();
+                        Button::new(SharedString::from(format!("runtime-edit-home-{index}")))
+                            .small()
+                            .ghost()
+                            .disabled(!adoptable)
+                            .label(label)
+                            .on_click(cx.listener(move |_, _, window, cx| {
+                                input.update(cx, |input, cx| {
+                                    input.set_value(value.clone(), window, cx)
+                                });
+                                cx.notify();
+                            }))
+                    })),
+            )
+            .when_some(error, |this, error| {
+                this.child(div().text_xs().text_color(cx.theme().danger).child(error))
+            })
+            .into_any_element()
+    }
+
     fn render_ssh_profile_edit(
         &self,
         _profile: &SshConnectionProfile,
@@ -20354,6 +21512,7 @@ impl VibexWorkbench {
                 self.runtime_edit_error.clone(),
                 cx,
             ))
+            .child(self.render_ssh_runtime_home_field(cx))
             .child(
                 h_flex()
                     .gap_1()
@@ -21772,8 +22931,8 @@ impl VibexWorkbench {
             .retain(|id| valid_session_ids.contains(id));
         self.composer_queue_interrupted_session_ids
             .retain(|id| valid_session_ids.contains(id));
-        self.composer_queue_steering_session_ids
-            .retain(|id| valid_session_ids.contains(id));
+        self.composer_queue_steering_dispatches
+            .retain(|id, _| valid_session_ids.contains(id));
         if self.composer_queue_editing_id.is_some_and(|editing_id| {
             !self
                 .composer_queue
@@ -28573,7 +29732,12 @@ impl VibexWorkbench {
     }
 
     /// Sessions whose view must survive eviction: the selected session and
-    /// every session a group workspace is currently showing.
+    /// every session a group workspace is currently painting.
+    ///
+    /// A painted pane owns its view whether or not it holds the keyboard, so
+    /// the set comes from the painted panes rather than from the presentation
+    /// budget: evicting the view of a pane that just lost focus would blank the
+    /// conversation the reader is still looking at.
     fn pinned_session_view_ids(&self) -> BTreeSet<String> {
         let mut pinned = BTreeSet::new();
         if let Some(selected) = self.selected_session_id.as_ref() {
@@ -28583,7 +29747,7 @@ impl VibexWorkbench {
             pinned.insert(live.as_str().to_string());
         }
         if let Some((_, group)) = self.active_session_group() {
-            pinned.extend(group.live_session_ids());
+            pinned.extend(group.painted_session_ids());
         }
         pinned
     }
@@ -28595,6 +29759,7 @@ impl VibexWorkbench {
         self.session_view_lru.retain(|cached| cached != session_id);
         self.pending_composer_geometries.remove(session_id);
         self.composer_views.remove(session_id);
+        self.timeline_surface_views.remove(session_id);
     }
 
     /// Parks a Composer measurement for the session it was taken for.
@@ -28792,21 +29957,27 @@ impl VibexWorkbench {
             != Some(&self.current_conversation_turns_cache_key());
         let geometry_changed = content_width_changed;
         if geometry_changed {
-            self.invalidate_timeline_layout_measurements();
+            // A new content-width cap re-wraps every body, so the memoized
+            // estimates describe the old box. The measured heights stay as the
+            // seed the next prepaint corrects — the same rule a pane resize
+            // follows — because an estimate in the row table for even one
+            // frame moves the restored view's scroll offset.
+            self.retarget_timeline_layout_width();
         }
         if geometry_changed || turns_cache_changed {
             self.rebuild_timeline_sizes();
         }
         // A view parked while its session kept working comes back with a
         // projection its row table no longer describes: nothing measured the
-        // parked view while the replacement landed. The table is what the
-        // virtual list clamps the restored offset against before the frame
-        // measures anything, so extents that describe the parked projection have
-        // to go before the first frame resolves its rows. Dropping the turn
-        // heights keeps the process units, which still describe the units the
-        // replacement did not change; the estimator drops the ones it did.
+        // parked view while the replacement landed. Re-derive the table against
+        // the current projection, but keep the measured heights as its seed:
+        // `rebuild_timeline_sizes` retains the turns the projection still holds
+        // and estimates only the ones it does not, and the next prepaint
+        // corrects whatever the replacement changed. Dropping every measurement
+        // here routed the whole restored view through character-count estimates
+        // for a frame — a visible bounce on the bottom edge, where the scroll
+        // offset is resolved from the table itself.
         if self.timeline.revision != self.timeline_row_sizes_revision {
-            self.invalidate_timeline_layout_measurements();
             self.rebuild_timeline_sizes();
         }
         // Retain the last painted geometry while the live document catches up.
@@ -30099,6 +31270,10 @@ impl VibexWorkbench {
         if navigation_changed {
             // The inline goal editor belongs to the session it was opened on.
             self.composer_goal_editing = false;
+            // So does the schedule popover: its target is a session id, and
+            // carrying the open flag across would open the next session's clock.
+            self.message_schedule_open = None;
+            self.message_schedule_editor = None;
         }
         let runtime_initializing = self
             .registered_session(session_id.as_str())
@@ -30348,6 +31523,7 @@ impl VibexWorkbench {
             resume,
             contiguous,
             cover_sequence,
+            anchor_recovery_spent,
         } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
@@ -30442,10 +31618,28 @@ impl VibexWorkbench {
                     this.timeline_load_updates = Default::default();
                     match outcome {
                         Ok(Ok(prepared)) => {
-                            if !this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
-                            {
-                                this.refresh_selected_agent_timeline(cx);
-                                return;
+                            let install = if anchor_recovery_spent {
+                                this.install_prepared_timeline_covering(
+                                    prepared,
+                                    &mut updates.borrow_mut(),
+                                )
+                            } else {
+                                this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
+                            };
+                            match install {
+                                TimelineInstall::Installed => {}
+                                TimelineInstall::AnchorLost => {
+                                    // The window opens below the turn the
+                                    // reader is holding. Keep the borrowed view
+                                    // on screen and re-read once with the anchor
+                                    // covered; that answer installs regardless.
+                                    this.reread_timeline_covering_reader_anchor(cx);
+                                    return;
+                                }
+                                TimelineInstall::Stale | TimelineInstall::Omitted => {
+                                    this.refresh_selected_agent_timeline(cx);
+                                    return;
+                                }
                             }
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
@@ -30518,6 +31712,7 @@ impl VibexWorkbench {
             resume,
             contiguous,
             cover_sequence,
+            anchor_recovery_spent,
         } = window;
         // A resumed load keeps the prefix the view already holds, so its leading
         // end — and whether that end sits inside a turn — is whatever the view
@@ -30615,10 +31810,28 @@ impl VibexWorkbench {
                     this.timeline_load_updates = Default::default();
                     match outcome {
                         Ok(Ok(prepared)) => {
-                            if !this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
-                            {
-                                this.refresh_selected_agent_timeline(cx);
-                                return;
+                            let install = if anchor_recovery_spent {
+                                this.install_prepared_timeline_covering(
+                                    prepared,
+                                    &mut updates.borrow_mut(),
+                                )
+                            } else {
+                                this.install_prepared_timeline(prepared, &mut updates.borrow_mut())
+                            };
+                            match install {
+                                TimelineInstall::Installed => {}
+                                TimelineInstall::AnchorLost => {
+                                    // The window opens below the turn the
+                                    // reader is holding. Keep the borrowed view
+                                    // on screen and re-read once with the anchor
+                                    // covered; that answer installs regardless.
+                                    this.reread_timeline_covering_reader_anchor(cx);
+                                    return;
+                                }
+                                TimelineInstall::Stale | TimelineInstall::Omitted => {
+                                    this.refresh_selected_agent_timeline(cx);
+                                    return;
+                                }
                             }
                             if this.timeline.needs_authoritative_refetch {
                                 this.refresh_selected_agent_timeline(cx);
@@ -30856,6 +32069,44 @@ impl VibexWorkbench {
             self.ensure_child_agent_timeline(delegation.child_session_id.clone(), false, cx);
         }
         cx.notify();
+    }
+
+    /// Re-reads the selected session once after a prepared window was refused
+    /// for dropping the reader's anchored turn.
+    ///
+    /// The refused window never became the projection, so the borrowed view
+    /// still paints the conversation the reader left. The re-read is contiguous
+    /// and covers the anchor's oldest sequence; it is marked as the one recovery
+    /// read, so its answer installs even when the place still cannot be kept —
+    /// a failed page under load must not turn the refusal into a retry loop.
+    fn reread_timeline_covering_reader_anchor(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        self.capture_timeline_scroll_anchor();
+        let cover_sequence = self
+            .timeline_follow
+            .anchor_span
+            .map(|span| span.first_sequence);
+        let generation = self.session_generation;
+        let window = TimelineWindowRead::contiguous()
+            .covering(cover_sequence)
+            .anchor_recovery_spent();
+        if let Some(runtime) = self.local_authority() {
+            let workspace_id = self
+                .registered_session(session_id.as_str())
+                .map(|session| session.workspace_id.clone());
+            self.load_agent_session_timeline(
+                runtime,
+                session_id,
+                workspace_id,
+                generation,
+                window,
+                cx,
+            );
+        } else {
+            self.load_agent_session_timeline_remote(session_id, generation, window, cx);
+        }
     }
 
     fn refresh_selected_agent_timeline(&mut self, cx: &mut Context<Self>) {
@@ -31897,7 +33148,8 @@ impl VibexWorkbench {
                     self.clear_child_agent_context();
                     self.selected_session_id = None;
                     self.timeline = TimelineModel::default();
-                    self.timeline_scroll = VirtualListScrollHandle::new();
+                    self.timeline_scroll =
+                        gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0));
                     self.runtime_selection = None;
                     self.token_usage = None;
                 }
@@ -32042,6 +33294,291 @@ impl VibexWorkbench {
         }
     }
 
+    /// Teaches the transcript's list to announce its scrolls.
+    ///
+    /// `gpui::list` notifies the view that painted it from inside its own wheel
+    /// handler, and every shell view observing the workbench rebuilds with it.
+    /// The handler runs just before that notify, so counting here is what lets
+    /// the views that read nothing a scroll changes stay retained; see
+    /// [`transcript_scroll_notifies`].
+    fn install_timeline_scroll_handler(&self) {
+        self.timeline_scroll.set_scroll_handler(|_, _, cx| {
+            note_transcript_scroll(cx);
+        });
+    }
+
+    /// Applies a reveal the last prepaint could not, and clears it.
+    ///
+    /// A `ListState` cannot be moved from inside its own prepaint, so the reveal
+    /// parks the distance there and this applies it on the next render, before
+    /// the element is built.
+    fn apply_pending_timeline_reveal(&mut self) {
+        let delta = std::mem::replace(&mut self.pending_timeline_reveal_delta, px(0.0));
+        if delta == px(0.0) {
+            return;
+        }
+        self.timeline_scroll.scroll_by(-delta);
+    }
+
+    /// Prints a frame's scroll move when `VIBEX_TIMELINE_TRACE` is set.
+    ///
+    /// A reader should only ever see the distance their wheel asked for. Every
+    /// other move — an anchor restore, a seed, a follow resumed late — is named
+    /// here with the state that explains it, so a report of "the transcript
+    /// jumped" can point at the code that did it instead of the list's layout.
+    ///
+    /// The variable is either `1` (the terminal, the original behaviour) or a
+    /// path. A file is the only way a report can be gathered from a build that
+    /// runs in someone else's terminal — or from a run that ends in a panic,
+    /// where the terminal scrollback goes with the process — so the trace is
+    /// appended to it, one flushed line per reported frame.
+    #[cfg(debug_assertions)]
+    fn trace_timeline_scroll(&mut self) {
+        let Some(sink) = std::env::var_os("VIBEX_TIMELINE_TRACE") else {
+            return;
+        };
+        let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        let expected = std::mem::take(&mut self.timeline_trace.expected);
+        let last = std::mem::replace(&mut self.timeline_trace.last_offset, offset);
+        let observed = offset - last;
+        let unexplained = observed - expected;
+        let viewport = self.timeline_scroll.viewport_bounds().size.height;
+        let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
+        let at_edge = offset >= px(0.0)
+            || (max_offset > px(0.0)
+                && offset <= -(max_offset + px(self.timeline_list_padding_top_px)));
+        if expected == px(0.0) && unexplained.abs() <= px(2.0) {
+            self.timeline_trace.last_offset = offset;
+            return;
+        }
+        self.timeline_trace.frames += 1;
+        let table = self
+            .timeline_row_sizes
+            .iter()
+            .map(|row| row.height)
+            .sum::<Pixels>();
+        // Where the painted rows disagree with the table, name them: the table
+        // decides what this view asks the list for, and the list decides what can
+        // be scrolled to, so a row they disagree about is a document whose end is
+        // not where either of them says it is.
+        let mut mismatched = String::new();
+        if (table - (max_offset + viewport)).abs() > table * 0.05 {
+            for (ix, row) in self.timeline_row_sizes.iter().enumerate() {
+                if let Some(painted) = self
+                    .timeline_scroll
+                    .bounds_for_item(ix)
+                    .map(|bounds| bounds.size.height)
+                    && (painted - row.height).abs() > px(4.0)
+                {
+                    mismatched.push_str(&format!(
+                        "{ix}:{:.0}/{:.0} ",
+                        f32::from(row.height),
+                        f32::from(painted)
+                    ));
+                }
+            }
+        }
+        let line = format!(
+            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} mism=[{mismatched}] top={}:{} ay={:?} tail={} layers={} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            self.timeline_trace.frames,
+            self.timeline_follow.following_bottom,
+            self.timeline_row_sizes.len(),
+            self.timeline_scroll.item_count(),
+            self.timeline_list_seen_width,
+            self.timeline_scroll.logical_scroll_top().item_ix,
+            self.timeline_scroll.logical_scroll_top().offset_in_item,
+            self.timeline_scroll
+                .bounds_for_item(self.timeline_scroll.logical_scroll_top().item_ix)
+                .map(|bounds| bounds.origin.y),
+            self.timeline_scroll.is_following_tail(),
+            std::env::var("GPUI_SCROLL_LAYERS").unwrap_or_else(|_| "1".into()),
+            self.timeline_trace.seeds,
+            self.timeline_list_hint_width.is_some(),
+            self.timeline_disclosure_settle_frames,
+            self.timeline_disclosure_animating,
+            self.timeline_rows_hang_from_bottom(),
+            self.timeline_scroll_anchor_pending,
+            self.timeline_scroll_to_latest_pending,
+            self.pending_timeline_reveal_delta,
+        );
+        if sink == std::ffi::OsStr::new("1") {
+            eprintln!("{line}");
+            return;
+        }
+        use std::io::Write as _;
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&sink)
+            && let Err(error) = writeln!(file, "{line}")
+        {
+            eprintln!("VIBEX_TIMELINE_TRACE cannot append to the trace file: {error}");
+        }
+    }
+
+    #[cfg(not(debug_assertions))]
+    fn trace_timeline_scroll(&mut self) {}
+
+    /// Keeps the list's row count and height hints in step with the table.
+    ///
+    /// `gpui::list` owns the rows it lays out, so a table it does not know about
+    /// renders nothing, and a row it was given no hint for contributes no height
+    /// to the document. The count and the hints therefore both come from the
+    /// table; what the list measures while it draws replaces the hint row by row.
+    fn sync_timeline_list_rows(&mut self) {
+        // Following is the list's decision as much as this view's: a list still in
+        // tail mode re-pins itself to the end on the next layout, which is a jump
+        // back to the bottom however the wheel got there.
+        if !self.timeline_follow.following_bottom && self.timeline_scroll.is_following_tail() {
+            self.timeline_scroll.pause_following_tail();
+        }
+        let rows = self.timeline_row_sizes.len();
+        let count = self.timeline_scroll.item_count();
+        let turn_ids: Vec<String> = self
+            .conversation_turns_cache
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect();
+        let width = self.timeline_scroll.viewport_bounds().size.width;
+        // `gpui::list` throws every item's height hint away when its width or
+        // padding changes, and its first layout always finds one of them
+        // changed. Seeding on that same frame only feeds the wipe, and a pane
+        // being dragged narrower moves the width on every frame, so the width
+        // is taken as settled first and the hints are seeded after it.
+        let width_changed = width != self.timeline_list_seen_width;
+        if width_changed {
+            self.timeline_list_seen_width = width;
+            self.timeline_list_hint_width = None;
+            self.timeline_list_seed_pending = true;
+            // A pane animating its width — a session opening, a split sliding in —
+            // moves it on every frame, and this is where that costs the reader
+            // their place: a seed rebuilds the whole document from one hint and
+            // re-derives the anchor from it, once per animation frame. The count
+            // is still kept in step, by splicing, which leaves every measured row
+            // alone; the hints are seeded once the width holds still.
+            if rows > count {
+                let previous = &self.timeline_list_synced_turn_ids;
+                let prepended = count > 0
+                    && previous.len() == count
+                    && turn_ids[rows - count..] == previous[..];
+                if prepended {
+                    self.timeline_scroll.splice(0..0, rows - count);
+                } else {
+                    self.timeline_scroll.splice(count..count, rows - count);
+                }
+            }
+            self.timeline_list_synced_turn_ids = turn_ids;
+            return;
+        }
+        let hints_missing = width > px(0.0) && self.timeline_list_hint_width != Some(width);
+        let ids_changed = turn_ids != self.timeline_list_synced_turn_ids;
+        if rows == count && !hints_missing && !ids_changed {
+            return;
+        }
+        // A splice appended rows the list has not measured, so the hints are
+        // marked lost. But the count now agrees and the ids are unchanged: the
+        // rows above the reader still hold their measured heights, and the new
+        // rows sit below the fold. Re-seeding the whole table here would re-hint
+        // those measured rows with the mean and move the reader's place a second
+        // time. Leave the list alone — the appended rows measure themselves when
+        // they scroll into view — and record the width so the next frame does
+        // not reset either. A genuine width wipe still goes through the reset
+        // below, because there the list has already dropped every hint itself.
+        if hints_missing
+            && !width_changed
+            && !self.timeline_list_seed_pending
+            && rows == count
+            && rows > 0
+            && !ids_changed
+        {
+            self.timeline_list_hint_width = Some(width);
+            return;
+        }
+        // A pure append splices the new rows onto the end instead of resetting
+        // the whole table. `reset_with_uniform_height` re-hints *every* row with
+        // the mean height, including the measured ones above the reader: the
+        // list resolves their offset through those hints, so a turn arriving
+        // below the fold moved the reader's place by the difference between the
+        // mean and what those rows really measure — a jump on every live turn
+        // while the session runs. A splice keeps the untouched rows' measured
+        // heights and leaves the anchor alone (the append is below it), so the
+        // reader stays exactly on the row they were reading. A prepend or a
+        // mid-window replacement still resets: those shift the indices the
+        // measured heights sit at, and the captured anchor is the tool for them.
+        let splice_ends = !hints_missing && rows != count && count > 0 && rows > 0 && {
+            let previous = &self.timeline_list_synced_turn_ids;
+            previous.len() == count && rows > count && turn_ids[..count] == previous[..]
+        };
+        if splice_ends {
+            self.timeline_scroll.splice(count..count, rows - count);
+            self.timeline_list_synced_turn_ids = turn_ids;
+            // The spliced rows carry no hint yet. Mark the hints lost so the
+            // next frame runs; it finds the count agreeing and the ids
+            // unchanged, and records the width without re-seeding (above).
+            self.timeline_list_hint_width = None;
+            return;
+        }
+        // A page that landed *above* the reader takes the same treatment from the
+        // other end: `splice(0..0, added)` inserts its rows and shifts every
+        // anchor by their count, so the reader keeps the row they were on and
+        // every measurement survives. A reset here would put the whole page into
+        // the document at once and rebuild the measured rows above and below the
+        // reader from one mean hint — the jump a reader reports the first time
+        // they scroll up into history in a session, and never again once every
+        // row has been measured.
+        let splice_head = !hints_missing && count > 0 && rows > count && {
+            let previous = &self.timeline_list_synced_turn_ids;
+            previous.len() == count && turn_ids[rows - count..] == previous[..]
+        };
+        if splice_head {
+            self.timeline_scroll.splice(0..0, rows - count);
+            self.timeline_list_synced_turn_ids = turn_ids;
+            self.timeline_list_hint_width = None;
+            return;
+        }
+        // A row the list has never measured contributes nothing to the extent,
+        // so a list without hints reports a document only as tall as the rows it
+        // has measured — the scrollbar has no thumb, `scroll_to_end` stops at the
+        // last measured row, and the extent jumps by a row's height every time
+        // the reader scrolls one into view. `reset_with_uniform_height` is the
+        // one published entry point that seeds a hint for every row.
+        //
+        // The reset also drops the list's scroll anchor, and a list without one
+        // starts at its first row. The anchor is a row index plus the offset
+        // inside it, so it is both exact across the reset and the only thing
+        // that survives it: a reader further up keeps the row they were reading
+        // instead of being thrown to the top of the conversation, and a reader
+        // on the live edge is sent back to the end.
+        let held_anchor = (!self.timeline_follow.following_bottom)
+            .then(|| self.timeline_scroll.logical_scroll_top());
+        let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
+        self.timeline_list_seed_pending = false;
+        self.timeline_trace.seeds += 1;
+        self.timeline_scroll
+            .reset_with_uniform_height(rows, hint.max(px(1.0)));
+        match held_anchor {
+            Some(anchor) => self.timeline_scroll.scroll_to(anchor),
+            None => self.timeline_scroll.scroll_to_end(),
+        }
+        self.timeline_list_synced_turn_ids = turn_ids;
+        // The hints only survive a layout that sees the same width as the last
+        // one, which is why a width this frame changed is not recorded: the next
+        // frame seeds again and its layout keeps the result.
+        if width > px(0.0) && !width_changed {
+            self.timeline_list_hint_width = Some(width);
+        }
+        // One hint for every row is only a stand-in, and the first time a row is
+        // laid out its real height replaces it. For the row under the reader that
+        // is a move: the anchor sits a distance into a box that just changed size.
+        // A window small enough to lay out in one pass is measured that way, so
+        // the rows are exact before the reader scrolls into them. Long windows
+        // keep the visible-only layout, where the cost of exactness is the whole
+        // transcript.
+        if rows <= TIMELINE_MEASURE_ALL_MAX_ROWS {
+            let _ = self.timeline_scroll.clone().measure_all();
+        }
+    }
+
     fn rebuild_timeline_sizes(&mut self) -> bool {
         self.timeline_pending_turn_heights.clear();
         let revision = self.timeline.revision;
@@ -32066,13 +33603,28 @@ impl VibexWorkbench {
         let content_width = session_content_max_width(self.ui_state.session.content_width)
             .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
         let mut row_sizes = Vec::with_capacity(turns.len());
-        for turn in turns.iter() {
+        let last_index = turns.len().saturating_sub(1);
+        let same_shape = self.timeline_row_sizes.len() == turns.len();
+        for (index, turn) in turns.iter().enumerate() {
             // Measured turns already know their real extent; re-estimating them
             // would rescan every row body for nothing.
-            let height = match self.timeline_measured_turn_heights.get(&turn.id).copied() {
+            let mut height = match self.timeline_measured_turn_heights.get(&turn.id).copied() {
                 Some(measured) => measured,
                 None => self.estimated_timeline_turn_height_cached(turn),
             };
+            // The turn that is still streaming only grows. An estimate replaced by
+            // a measurement can be shorter, and taking that drop moves everything
+            // below it up by the difference — on a long turn, a third of a screen
+            // in the middle of a read. The row keeps its height until the turn is
+            // over, which is also the only point its extent can legitimately
+            // settle.
+            if index == last_index
+                && same_shape
+                && !timeline_turn_finished(turn)
+                && let Some(previous) = self.timeline_row_sizes.get(index)
+            {
+                height = height.max(f32::from(previous.height));
+            }
             row_sizes.push(size(px(content_width), px(height)));
         }
         // The table is current for this projection whichever way the comparison
@@ -32976,7 +34528,14 @@ impl VibexWorkbench {
             .timeline_measured_turn_layout_signatures
             .get(&turn_id)
             .copied();
+        // A held extent is a blank band under the last row, and the viewport
+        // is anchored to that extent: releasing it slides the last row down by
+        // the band's height. While the reader is at the live edge the band is
+        // the last thing on screen, so the hold buys nothing there and costs
+        // that slide. Hold only while they are scrolled up, where the band sits
+        // below the fold and a transient reparse would otherwise bounce.
         let preserve_streaming_extent = !self.timeline_disclosure_animating
+            && !self.timeline_follow.following_bottom
             && self.streaming_row_state.as_ref().is_some_and(|state| {
                 state.turn_id == turn_id
                     && self
@@ -33009,7 +34568,13 @@ impl VibexWorkbench {
             self.timeline_streaming_shrink_candidates
                 .get(&turn_id)
                 .copied(),
-            Instant::now(),
+            // The settle window runs on the clock that drives this view's
+            // frames, not on the process clock. A test advances the frame clock
+            // to draw, so reading `Instant::now()` here made the window depend
+            // on how long the fixture happened to take: the same probe failed
+            // on its own and passed in the suite, because wall time was what
+            // settled the hold.
+            cx.background_executor().now(),
         );
         if let Some(candidate) = shrink_candidate {
             self.timeline_streaming_shrink_candidates
@@ -33107,10 +34672,38 @@ impl VibexWorkbench {
         changed
     }
 
+    /// The transcript's scroll position, in the list's own content coordinates.
+    ///
+    /// `ListState` reports the offset with the list's padding folded in and the
+    /// maximum without it, so subtracting the two raw values leaves a band
+    /// equal to the padding: the transcript then reads as never reaching its
+    /// bottom edge. Both are taken through one accessor so every caller shares
+    /// the same coordinates.
+    fn timeline_scroll_offset(&self) -> Pixels {
+        // Measured on a 600px row in a 400px viewport with `py_4`: the maximum
+        // is 200 — content less viewport, padding excluded — while the offset
+        // at the bottom edge is -232. The difference is the list's top *and*
+        // bottom padding: its scroll arithmetic adds both, and the maximum
+        // getter reports neither. The offset is already in the coordinates the
+        // bottom edge is defined in, so it is returned as reported.
+        self.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    }
+
+    /// How far the transcript can travel, as a positive distance.
+    ///
+    /// `ListState` reports the offset with the list's top *and* bottom padding
+    /// folded in and this maximum with neither, so the padding band is added
+    /// back here. That is what puts a viewport on the bottom edge at
+    /// `offset == -max`, which is how the rest of this file reads it.
+    fn timeline_max_scroll_offset(&self) -> Pixels {
+        self.timeline_scroll.max_offset_for_scrollbar().y
+            + px(2.0 * self.timeline_list_padding_top_px)
+    }
+
     fn timeline_distance_to_bottom(&self) -> f32 {
         timeline_distance_to_bottom(
-            f32::from(self.timeline_scroll.offset().y),
-            f32::from(self.timeline_scroll.max_offset().y),
+            f32::from(self.timeline_scroll_offset()),
+            f32::from(self.timeline_max_scroll_offset()),
         )
     }
 
@@ -33213,6 +34806,13 @@ impl VibexWorkbench {
         self.request_timeline_scroll_to_latest();
     }
 
+    /// Lands the transcript on the live edge when the reader asked to follow it.
+    ///
+    /// Resolved before [`Self::sync_timeline_list_rows`], because the list only
+    /// takes a row count through a reset and a reset drops the anchor
+    /// `scroll_timeline_to_latest` just set: `scroll_to_end` on an empty list is
+    /// a no-op, so the count has to be in place before the end can be named at
+    /// all.
     fn apply_pending_timeline_scroll(&mut self) {
         if std::mem::take(&mut self.timeline_scroll_to_latest_pending)
             && self.timeline_follow.following_bottom
@@ -33220,10 +34820,54 @@ impl VibexWorkbench {
             && !self.timeline_scrollbar_interaction_active
         {
             self.scroll_timeline_to_latest();
+        }
+    }
+
+    /// Puts the reader back on their row when the document shrank under them.
+    ///
+    /// A row above the viewport that measures shorter than the hint it was
+    /// seeded with takes height out of the document. An offset that no longer
+    /// fits is resolved by the list clamping it to the new end, and that moves
+    /// the viewport by however much the document lost — a screen, when the row
+    /// that shrank is a long turn. While the reader is scrolled up, their place
+    /// is the row they were reading, so it is restored by row instead of being
+    /// left to the clamp.
+    fn keep_the_reader_out_of_the_clamp(&mut self) {
+        if self.timeline_follow.following_bottom
+            || self.timeline_scroll_wheel_idle_task.is_some()
+            || self.timeline_scrollbar_interaction_active
+            || self.timeline_scroll_anchor_pending
+            || self.pending_timeline_reveal_delta != px(0.0)
+        {
             return;
         }
-        // A pending anchor resolves after the row table is current, so a
-        // switched-to session paints the anchored content in its first frame.
+        // An anchor named past the last row is the list's own "at the end", not
+        // a position that was clamped: its offset is the whole document, which
+        // is a viewport beyond the last offset it can actually travel. Treating
+        // that as a clamp would restore the reader to their row on the first
+        // frame after they left the live edge — a jump of exactly one screen.
+        if self.timeline_scroll.logical_scroll_top().item_ix >= self.timeline_scroll.item_count() {
+            return;
+        }
+        let max_offset = self.timeline_scroll.max_offset_for_scrollbar().y;
+        let offset = self.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        // The offset at the true bottom already runs past `max_offset` by the
+        // list's top padding, which scrolls with the content: comparing against
+        // the bare maximum calls every frame at the bottom a clamp.
+        let reach = max_offset + px(self.timeline_list_padding_top_px);
+        if max_offset <= px(0.0) || -offset <= reach {
+            return;
+        }
+        self.apply_timeline_scroll_anchor();
+    }
+
+    /// Puts a captured anchor back under the viewport top.
+    ///
+    /// Resolved *after* [`Self::sync_timeline_list_rows`], so the restore lands on
+    /// the table the reset installed and is clamped against its extent. A reader
+    /// who asked to follow the bottom already has their place, and
+    /// [`Self::apply_timeline_scroll_anchor`] refuses while following.
+    fn apply_pending_timeline_anchor(&mut self) {
         if std::mem::take(&mut self.timeline_scroll_anchor_pending) {
             self.apply_timeline_scroll_anchor();
         }
@@ -33299,11 +34943,21 @@ impl VibexWorkbench {
     /// Only a disclosure may do this. A stream's shorter reparse is held in
     /// place by the same slack, and hanging it would bounce the whole turn.
     fn timeline_rows_hang_from_bottom(&self) -> bool {
-        self.timeline_disclosure_settle_frames > 0
+        self.timeline_rows_hang_from_bottom_cached
+    }
+
+    /// Resolves [`Self::timeline_rows_hang_from_bottom`] for this frame.
+    ///
+    /// The row builders run while `gpui::list` holds its own layout borrow, and
+    /// reading the list's scroll state from inside that borrow panics. The
+    /// decision is therefore taken once, before the element is built, and every
+    /// row builder in the frame reads the cached answer.
+    fn resolve_timeline_rows_hang_from_bottom(&mut self) {
+        self.timeline_rows_hang_from_bottom_cached = self.timeline_disclosure_settle_frames > 0
             && !self.timeline_disclosure_holds_screen
             && !self.rendering_child_agent_timeline()
-            && self.timeline_scroll.max_offset().y > px(0.0)
-            && self.timeline_distance_to_bottom() < 1.0
+            && self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0)
+            && self.timeline_distance_to_bottom() < 1.0;
     }
 
     /// Picks the follow back up when a disclosure lands on the bottom edge.
@@ -33315,7 +34969,13 @@ impl VibexWorkbench {
     /// settled: a row that opened in one frame would otherwise read as landing
     /// where it started.
     fn resume_timeline_follow_after_disclosure(&mut self) {
-        self.timeline_disclosure_holds_screen = false;
+        // A disclosure that holds the screen has done exactly what the reader
+        // asked for: the row opened below a still viewport. Resuming the follow
+        // here would scroll the new content into view and undo the hold, and the
+        // landing frame is where that used to happen.
+        if std::mem::take(&mut self.timeline_disclosure_holds_screen) {
+            return;
+        }
         if self.timeline_follow.following_bottom
             || self.timeline_scroll_wheel_idle_task.is_some()
             || self.timeline_scrollbar_interaction_active
@@ -33328,9 +34988,9 @@ impl VibexWorkbench {
             .map(|row| row.height)
             .sum::<Pixels>()
             + px(self.timeline_list_padding_top_px * 2.0);
-        let max_offset = content - self.timeline_scroll.bounds().size.height;
+        let max_offset = content - self.timeline_scroll.viewport_bounds().size.height;
         let distance = timeline_distance_to_bottom(
-            f32::from(self.timeline_scroll.offset().y),
+            f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
             f32::from(max_offset).max(0.0),
         );
         if distance <= AGENT_TIMELINE_DISCLOSURE_LANDING_SLACK_PX {
@@ -33339,6 +34999,7 @@ impl VibexWorkbench {
         }
     }
 
+    #[cfg(test)]
     fn timeline_row_heights(&self) -> Vec<f32> {
         self.timeline_row_sizes
             .iter()
@@ -33360,24 +35021,43 @@ impl VibexWorkbench {
         {
             return;
         }
-        let row_heights = self.timeline_row_heights();
-        let Some((row_index, offset_in_row)) = timeline_scroll_anchor_from_offset(
-            &row_heights,
-            f32::from(self.timeline_scroll.offset().y),
-            self.timeline_list_padding_top_px,
-        ) else {
+        // The list's own anchor is the reader's place: a row and the distance
+        // into it. Reading it costs nothing, where the old pixel offset had to
+        // be resolved against a copy of every row's height, so the render can
+        // keep this current on every frame — and an anchor that is always
+        // current cannot restore a place the reader has already scrolled away
+        // from, which is a jump in whichever direction they went.
+        let top = self.timeline_scroll.logical_scroll_top();
+        let last_row = self.conversation_turns_cache.len().saturating_sub(1);
+        // An anchor past the last row is how the list names its end. It names no
+        // row and no distance into one, so reading `offset_in_item` off it would
+        // record the *top* of the last row as the reader's place — and a restore
+        // of that anchor lands a screen above the live edge, which is exactly a
+        // reader on the bottom being thrown up the conversation. The place that
+        // anchor paints is the bottom of the last row.
+        let (row_index, offset_in_row) = if top.item_ix > last_row {
+            let height = self
+                .timeline_row_sizes
+                .get(last_row)
+                .map(|row| row.height)
+                .unwrap_or(px(0.0));
+            let viewport = self.timeline_scroll.viewport_bounds().size.height;
+            (last_row, (height - viewport).max(px(0.0)))
+        } else {
+            (top.item_ix, top.offset_in_item)
+        };
+        let Some(turn) = self.conversation_turns_cache.get(row_index) else {
             return;
         };
-        let Some(span) = self
-            .conversation_turns_cache
-            .get(row_index)
-            .and_then(|turn| timeline_turn_anchor_span(turn))
-        else {
+        let Some(span) = timeline_turn_anchor_span(turn) else {
             return;
         };
-        let turn_id = self.conversation_turns_cache[row_index].id.clone();
-        self.timeline_follow
-            .preserve_anchor_at(turn_id, span, offset_in_row.round() as i32);
+        let turn_id = turn.id.clone();
+        self.timeline_follow.preserve_anchor_at(
+            turn_id,
+            span,
+            f32::from(offset_in_row).round() as i32,
+        );
     }
 
     /// The row the captured anchor names, in the row table that is current now.
@@ -33417,18 +35097,14 @@ impl VibexWorkbench {
         if self.timeline_follow.following_bottom {
             return false;
         }
-        let offset_in_row = self.timeline_follow.anchor_offset_px as f32;
-        let offset_y = self.timeline_anchor_row_index().and_then(|row_index| {
-            timeline_scroll_offset_for_anchor(
-                &self.timeline_row_heights(),
-                row_index,
-                offset_in_row,
-                self.timeline_list_padding_top_px,
-            )
-        });
-        if let Some(offset_y) = offset_y {
-            self.timeline_scroll
-                .set_offset(point(px(0.0), px(offset_y)));
+        // The anchor is a row and a distance into it, so it is placed as one:
+        // a pixel offset would be mapped back through the list's own heights and
+        // its padding, and the padding is exactly the bias that mapping adds.
+        if let Some(row_index) = self.timeline_anchor_row_index() {
+            self.timeline_scroll.scroll_to(gpui::ListOffset {
+                item_ix: row_index,
+                offset_in_item: px(self.timeline_follow.anchor_offset_px as f32),
+            });
             return true;
         }
         // An anchor that resolved to nothing means the row table no longer holds
@@ -33453,7 +35129,8 @@ impl VibexWorkbench {
     /// describes a window with more content above it than this one has, and the
     /// virtual list resolves that by clamping to the newest row.
     fn settle_timeline_anchor_on_oldest_row(&mut self) {
-        self.timeline_scroll.set_offset(point(px(0.0), px(0.0)));
+        self.timeline_scroll
+            .set_offset_from_scrollbar(point(px(0.0), px(0.0)));
         let Some((turn_id, span)) = self
             .conversation_turns_cache
             .first()
@@ -33468,13 +35145,27 @@ impl VibexWorkbench {
             .preserve_anchor_at(turn_id, span, offset_in_row);
     }
 
-    fn handle_timeline_scroll_wheel(&mut self, event: &ScrollEvent, cx: &mut Context<Self>) {
-        let delta_y = match event.delta {
-            ScrollDelta::Lines(point) => point.y,
-            ScrollDelta::Pixels(point) => f32::from(point.y),
-        };
-        if delta_y == 0.0 || self.timeline_scroll.max_offset().y <= px(0.0) {
+    fn handle_timeline_scroll_wheel(
+        &mut self,
+        event: &ScrollEvent,
+        line_height: Pixels,
+        cx: &mut Context<Self>,
+    ) {
+        // The wheel reports lines for a mouse and pixels for a trackpad, and the
+        // list scrolls by pixels. `pixel_delta` is the list's own conversion, so
+        // the trace compares like with like; reading the raw line count made
+        // every frame look like it moved twenty times further than the wheel
+        // asked, which is noise exactly where the answer should be.
+        let delta_y = f32::from(event.delta.pixel_delta(line_height).y);
+        if delta_y == 0.0 || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0) {
             return;
+        }
+        #[cfg(debug_assertions)]
+        {
+            // The offset moves by this much in the direction the wheel asked;
+            // `trace_timeline_scroll` tells that apart from anything else that
+            // moved the list.
+            self.timeline_trace.expected += px(delta_y);
         }
 
         self.timeline_scroll_wheel_idle_task = None;
@@ -33521,9 +35212,9 @@ impl VibexWorkbench {
         event: &MouseDownEvent,
         cx: &mut Context<Self>,
     ) {
-        let bounds = self.timeline_scroll.bounds();
+        let bounds = self.timeline_scroll.viewport_bounds();
         if event.button != MouseButton::Left
-            || self.timeline_scroll.max_offset().y <= px(0.0)
+            || self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0)
             || !bounds.contains(&event.position)
             || event.position.x < bounds.right() - px(AGENT_TIMELINE_SCROLLBAR_HIT_WIDTH_PX)
         {
@@ -33566,8 +35257,10 @@ impl VibexWorkbench {
         self.timeline_follow.set_following_bottom(false);
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
-        self.timeline_scroll
-            .scroll_to_item(turn_index, ScrollStrategy::Top);
+        self.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: turn_index,
+            offset_in_item: px(0.0),
+        });
         cx.notify();
     }
 
@@ -33592,7 +35285,7 @@ impl VibexWorkbench {
         self.rebuild_timeline_sizes();
         self.pending_permission_reveal_item_id = Some(target.item_id);
         self.timeline_scroll
-            .scroll_to_item(target.turn_index, ScrollStrategy::Center);
+            .scroll_to_reveal_item(target.turn_index);
         cx.notify();
     }
 
@@ -35841,9 +37534,13 @@ impl VibexWorkbench {
                         }
                     }
                 }
-                let steering = this
-                    .composer_queue_steering_session_ids
-                    .remove(submitted_session_id.as_str());
+                // The steering intent is not this submission's answer. It
+                // belongs to the turn a send-now interrupted, and the settled
+                // queue re-evaluation spends it once that turn is truly over.
+                // Spending it here would hand whatever completion came next the
+                // explicit bypass the gesture armed — past the fence, the send
+                // mode and the busy check — and one send-now click would walk
+                // the whole queue out while a turn still held its session.
                 let interrupted = this
                     .composer_queue_interrupted_session_ids
                     .remove(submitted_session_id.as_str());
@@ -35854,12 +37551,10 @@ impl VibexWorkbench {
                 if !completed || is_command {
                     this.release_composer_queue_fence(message_id);
                 }
-                if completed || steering || interrupted {
+                if completed || interrupted {
                     this.maybe_dispatch_next_composer_queue_message(
                         Some(&submitted_session_id),
-                        if steering {
-                            ComposerQueueDispatchBehavior::AfterInterrupt
-                        } else if completed {
+                        if completed {
                             // The submission has durably completed, but the
                             // sidebar session snapshot may still say Running
                             // until its next refresh. The local pending flag
@@ -36025,8 +37720,33 @@ impl VibexWorkbench {
         {
             return false;
         }
+        let message_id = self.composer_queue[index].id;
+        self.dispatch_explicit_queue_message(message_id, behavior, window, cx)
+    }
+
+    /// Removes `message_id` from the queue — wherever it sits — and hands it to
+    /// the submission path as the admission the caller already decided.
+    ///
+    /// The rest of the queue keeps its exact order: the entries a send jumped
+    /// stay where they were, waiting for the queue's own rhythm. This is what
+    /// makes an explicit send about one message — the head a re-evaluation
+    /// admitted, or a row the reader sent now — rather than a reorder of
+    /// everything in front of it.
+    fn dispatch_explicit_queue_message(
+        &mut self,
+        message_id: u64,
+        behavior: ComposerQueueDispatchBehavior,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(index) = self
+            .composer_queue
+            .iter()
+            .position(|queued| queued.id == message_id)
+        else {
+            return false;
+        };
         let message = self.composer_queue.remove(index);
-        let message_id = message.id;
         self.composer_queue_dispatch_fences.insert(
             message.session_id.as_str().to_string(),
             ComposerQueueDispatchFence {
@@ -36038,19 +37758,18 @@ impl VibexWorkbench {
         self.publish_sidebar_invalidation();
         self.dispatch_admitted_composer_message(message, behavior, window, cx);
         // The one hand-over the submission path still refuses — a local runtime
-        // that is not ready — puts the message back and pauses its session. The
-        // queue must not report that as a dispatch: its caller drops the
-        // session's re-evaluation on a `true`, and the message would then wait
-        // for an event that no longer comes.
+        // that is not ready — puts the message back where it was and pauses its
+        // session. The queue must not report that as a dispatch: its caller
+        // drops the session's re-evaluation on a `true`, and the message would
+        // then wait for an event that no longer comes.
         let bounced = self
             .composer_queue
             .iter()
             .position(|queued| queued.id == message_id);
         if let Some(bounced) = bounced {
-            if bounced > 0 {
-                let message = self.composer_queue.remove(bounced);
-                self.composer_queue.insert(0, message);
-            }
+            let message = self.composer_queue.remove(bounced);
+            self.composer_queue
+                .insert(index.min(self.composer_queue.len()), message);
             self.release_composer_queue_fence(message_id);
         }
         // The send left the queue, so its name no longer stands and the
@@ -36088,6 +37807,23 @@ impl VibexWorkbench {
         )
     }
 
+    /// Whether a hand-over into `session_id` still has to wait: a locally armed
+    /// dispatch, or a session state the authority has not reported as settled.
+    ///
+    /// This is the same judgment the dispatch fence makes, and a steering
+    /// hand-over obeys it too. An explicit send may jump the queue's order, but
+    /// it may not jump into a turn that still occupies its session: dispatching
+    /// into the turn it just asked to stop only parks the message behind that
+    /// turn, and the reader's next stop would release it again as a turn of its
+    /// own.
+    fn composer_queue_handover_must_wait(&self, session_id: &VibexSessionId) -> bool {
+        composer_queue_fence_waits(
+            self.session_turn_pending(session_id),
+            self.registered_session(session_id.as_str())
+                .map(|session| session.state),
+        )
+    }
+
     /// Drops the fence of the handed-over message `message_id`.
     ///
     /// Keyed by message rather than by session: a completion may arrive after a
@@ -36110,6 +37846,33 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        // A send-now that had to interrupt a busy session leaves its hand-over
+        // armed until the interrupted turn is truly over. This wake is where
+        // that evidence arrives — a settle that reached the workbench — so the
+        // intent is spent here, once, with the session's own state proving the
+        // turn has ended, and with the message the reader actually sent. The
+        // rest of the queue keeps its order and its hold: spending the intent
+        // anywhere else would let an unrelated completion inherit the explicit
+        // bypass the gesture armed.
+        let steering_target =
+            self.composer_queue_steering_dispatches
+                .iter()
+                .find_map(|(session_id, message_id)| {
+                    VibexSessionId::parse(session_id.clone())
+                        .ok()
+                        .filter(|parsed| !self.composer_queue_handover_must_wait(parsed))
+                        .map(|parsed| (parsed, *message_id))
+                });
+        if let Some((session_id, message_id)) = steering_target {
+            self.composer_queue_steering_dispatches
+                .remove(session_id.as_str());
+            self.dispatch_explicit_queue_message(
+                message_id,
+                ComposerQueueDispatchBehavior::AfterInterrupt,
+                window,
+                cx,
+            );
+        }
         let session_ids =
             std::mem::take(&mut self.composer_queue_ready_after_continuation_session_ids);
         if session_ids.is_empty() {
@@ -36549,13 +38312,6 @@ impl VibexWorkbench {
         }
     }
 
-    fn move_composer_queue_message_to_front(&mut self, message_id: u64) -> Option<VibexSessionId> {
-        let session_id = promote_composer_queue_message(&mut self.composer_queue, message_id);
-        self.publish_sidebar_invalidation();
-        self.composer_queue_changed();
-        session_id
-    }
-
     fn resume_composer_queue(
         &mut self,
         session_id: VibexSessionId,
@@ -36573,20 +38329,47 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Sends one queued message now, wherever it sits in the queue.
+    ///
+    /// Only this message leaves. The entries in front of it keep their order
+    /// and keep waiting — a queued row is the reader's instruction about what
+    /// to send next, so an explicit send of one entry must not release the
+    /// entries it jumped, reorder the queue around it, or lift the hold the
+    /// rest of it waits under.
     fn steer_composer_queue_message(
         &mut self,
         message_id: u64,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.move_composer_queue_message_to_front(message_id) else {
+        let Some(session_id) = self
+            .composer_queue
+            .iter()
+            .find(|message| message.id == message_id)
+            .map(|message| message.session_id.clone())
+        else {
             return;
         };
-        self.composer_queue_paused_session_ids
-            .remove(session_id.as_str());
+        // An explicit per-message send clears the deadline: the reader asked
+        // for this message now, and the entry must not re-arm its old moment —
+        // whether the send lands here or after the busy turn it interrupts
+        // settles.
+        if let Some(message) = self
+            .composer_queue
+            .iter_mut()
+            .find(|message| message.id == message_id)
+        {
+            message.scheduled_at_ms = None;
+        }
         if self.agent_session_is_active(&session_id) {
             if !self.agent_action_pending && self.selected_session_id.as_ref() == Some(&session_id)
             {
+                // The turn in the way has to stop first. The intent remembers
+                // WHICH message the reader sent, so the settled queue
+                // re-evaluation dispatches that one — not whatever sits at the
+                // head by then.
+                self.composer_queue_steering_dispatches
+                    .insert(session_id.as_str().to_string(), message_id);
                 self.interrupt_session_with_queue_behavior(
                     ComposerQueueInterruptBehavior::Steer,
                     window,
@@ -36594,8 +38377,8 @@ impl VibexWorkbench {
                 );
             }
         } else {
-            self.maybe_dispatch_next_composer_queue_message(
-                Some(&session_id),
+            self.dispatch_explicit_queue_message(
+                message_id,
                 ComposerQueueDispatchBehavior::ForceNext,
                 window,
                 cx,
@@ -36657,7 +38440,7 @@ impl VibexWorkbench {
             .remove(session_id.as_str());
         self.composer_queue_interrupted_session_ids
             .remove(session_id.as_str());
-        self.composer_queue_steering_session_ids
+        self.composer_queue_steering_dispatches
             .remove(session_id.as_str());
         cx.notify();
     }
@@ -36945,6 +38728,20 @@ impl VibexWorkbench {
                         _ => locale::text("Message was not sent", "消息未发送", "訊息未傳送")
                             .to_string(),
                     };
+                    // "Message was not sent" is the same row for every cause:
+                    // a missing workspace, a rejected model id, an Agent that
+                    // never started. The durable submission kept the Agent's
+                    // own bounded refusal, so show it under that sentence
+                    // instead of leaving the reader to guess.
+                    let failure_reason = (state.status == MessageSubmissionStatus::Failed)
+                        .then(|| {
+                            vibex_core::RuntimeSelectionActionableError::refusal_detail(
+                                state.error_code.as_deref().unwrap_or_default(),
+                                state.error_detail_redacted.as_deref(),
+                            )
+                        })
+                        .flatten()
+                        .map(|detail| locale::localize_ui_message(&detail));
                     let dismiss_key = state.message_idempotency_key.clone();
                     let dismiss_session = state.session_id.clone();
                     // A row that only reports "not sent" leaves the reader with
@@ -36989,11 +38786,19 @@ impl VibexWorkbench {
                                 .into_any_element()
                         })
                         .child(
-                            div()
+                            v_flex()
                                 .min_w_0()
                                 .flex_1()
-                                .text_color(cx.theme().muted_foreground)
-                                .child(label),
+                                .child(div().text_color(cx.theme().muted_foreground).child(label))
+                                .when_some(failure_reason, |this, reason| {
+                                    this.child(
+                                        div()
+                                            .whitespace_normal()
+                                            .text_color(cx.theme().muted_foreground)
+                                            .opacity(0.85)
+                                            .child(reason),
+                                    )
+                                }),
                         )
                         .when(terminal, |this| {
                             this.when(recoverable, |this| {
@@ -40499,10 +42304,10 @@ impl VibexWorkbench {
                 }
             }
             ComposerQueueInterruptBehavior::Steer => {
-                self.composer_queue_paused_session_ids
-                    .remove(session_id.as_str());
-                self.composer_queue_steering_session_ids
-                    .insert(session_id.as_str().to_string());
+                // The send-now gesture armed the steering intent itself, and
+                // the hold the rest of the queue waits under stays untouched:
+                // an explicit send is about one message, not about releasing
+                // the entries it jumped.
             }
             ComposerQueueInterruptBehavior::Pause => {}
         }
@@ -40558,17 +42363,31 @@ impl VibexWorkbench {
                     }
                     match &outcome {
                         Ok(Ok(_)) => {
+                            // The interrupt's own open-session snapshot is the
+                            // evidence the turn is really over. While the
+                            // session still holds a turn — locally armed or not
+                            // settled yet — the send-now hand-over waits:
+                            // dispatching into that turn would only park the
+                            // message behind it, and the reader's next stop
+                            // would release it again as a turn of its own. The
+                            // intent stays armed and the settled queue
+                            // re-evaluation spends it.
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer
-                                && !this.session_turn_pending(&interrupted_session_id)
+                                && !this.composer_queue_handover_must_wait(&interrupted_session_id)
                             {
-                                this.composer_queue_steering_session_ids
-                                    .remove(interrupted_session_id.as_str());
-                                this.maybe_dispatch_next_composer_queue_message(
-                                    Some(&interrupted_session_id),
-                                    ComposerQueueDispatchBehavior::AfterInterrupt,
-                                    window,
-                                    cx,
-                                );
+                                if let Some(message_id) = this
+                                    .composer_queue_steering_dispatches
+                                    .remove(interrupted_session_id.as_str())
+                                {
+                                    this.dispatch_explicit_queue_message(
+                                        message_id,
+                                        ComposerQueueDispatchBehavior::AfterInterrupt,
+                                        window,
+                                        cx,
+                                    );
+                                }
+                            } else if queue_behavior == ComposerQueueInterruptBehavior::Steer {
+                                this.mark_composer_queue_for_recheck(&interrupted_session_id);
                             }
                         }
                         Ok(Err(error)) => {
@@ -40578,10 +42397,10 @@ impl VibexWorkbench {
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
-                                this.composer_queue_steering_session_ids
+                                // The send never happened: drop the intent and
+                                // leave the queue's own hold as it was.
+                                this.composer_queue_steering_dispatches
                                     .remove(interrupted_session_id.as_str());
-                                this.composer_queue_paused_session_ids
-                                    .insert(interrupted_session_id.as_str().to_string());
                             }
                         }
                         Err(error) => {
@@ -40591,10 +42410,8 @@ impl VibexWorkbench {
                             this.composer_queue_interrupted_session_ids
                                 .remove(interrupted_session_id.as_str());
                             if queue_behavior == ComposerQueueInterruptBehavior::Steer {
-                                this.composer_queue_steering_session_ids
+                                this.composer_queue_steering_dispatches
                                     .remove(interrupted_session_id.as_str());
-                                this.composer_queue_paused_session_ids
-                                    .insert(interrupted_session_id.as_str().to_string());
                             }
                         }
                     }
@@ -40613,13 +42430,6 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let Some(session_id) = self.move_composer_queue_message_to_front(message_id) else {
-            return;
-        };
-        let Some(backend) = self.backend.clone() else {
-            self.steer_composer_queue_message(message_id, window, cx);
-            return;
-        };
         let Some(message) = self
             .composer_queue
             .iter()
@@ -40628,12 +42438,18 @@ impl VibexWorkbench {
         else {
             return;
         };
+        let session_id = message.session_id.clone();
+        let Some(backend) = self.backend.clone() else {
+            self.steer_composer_queue_message(message_id, window, cx);
+            return;
+        };
         if !message.mentions.is_empty() || !self.agent_session_is_active(&session_id) {
             self.steer_composer_queue_message(message_id, window, cx);
             return;
         }
-        self.composer_queue_paused_session_ids
-            .remove(session_id.as_str());
+        // Steering one message into the running turn says nothing about the
+        // queue's own hold: the pause the reader installed keeps holding the
+        // entries behind this one.
         let after_sequence = self.session_view_end_sequence(&session_id).unwrap_or(0);
         self.install_optimistic_user_message(OptimisticUserMessage {
             mentions: message.mentions.clone(),
@@ -41341,13 +43157,19 @@ impl VibexWorkbench {
         }
         let initialize_draft = !self.new_session_draft_initialized;
         self.new_session_open = true;
+        // The session Composer is leaving the screen, so its schedule editor
+        // goes with it; keeping the flag would reopen the panel on return.
+        self.message_schedule_open = None;
+        self.message_schedule_editor = None;
         // The page is a fresh start every time it is opened, so the input
         // arrives in its compact shape rather than in the reading shape the
         // previous draft left behind.
         self.new_session_expanded = false;
-        // A draft that is re-opened starts unowned again; only a folder row's
-        // new-chat action re-aims it, and it does so after this call.
+        // A draft that is re-opened starts unowned again; only a folder or
+        // group row's new-chat action re-aims it, and it does so after this
+        // call.
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.sync_agent_streaming_surface_visibility();
         self.new_session_runtime_menu_open = false;
         self.runtime_choice_menu_open = None;
@@ -41427,6 +43249,7 @@ impl VibexWorkbench {
         self.clear_new_session_message_draft(window, cx);
         self.new_session_draft_initialized = false;
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.new_session_workspace.reset_after_success();
     }
 
@@ -41489,6 +43312,7 @@ impl VibexWorkbench {
                 .insert(session_id.as_str().to_string());
         }
         self.file_new_session_in_folder(&session_id);
+        self.file_new_session_in_group(&session_id, cx);
         self.reconcile_sidebar_state();
         self.publish_sidebar_invalidation();
         self.optimistic_runtime_selections
@@ -41766,6 +43590,7 @@ impl VibexWorkbench {
         // the whole cleanup.
         self.new_session_eligibility_task = None;
         self.new_session_folder_id = None;
+        self.new_session_group_id = None;
         self.new_session_error = None;
         self.new_session_eligibility_error = None;
         self.sync_new_session_worktree_inputs(window, cx);
@@ -41800,14 +43625,69 @@ impl VibexWorkbench {
             self.new_session_folder_id = next;
             cx.notify();
         }
+        // A draft is filed under a folder or a group, never both: choosing a
+        // folder releases the group the draft may have been aimed at.
+        if self.new_session_folder_id.is_some() && self.new_session_group_id.take().is_some() {
+            cx.notify();
+        }
     }
 
-    /// The folders the draft's project offers, in sidebar order.
+    /// Aims the draft at `group_id`, or at no group for `None`.
+    ///
+    /// The page's filing control and a group row's new-chat action are the only
+    /// writers. A group that has since been dissolved, or that belongs to
+    /// another project or Worktree than the draft runs in, is ignored rather
+    /// than written, so a stale id can never promise a membership the sidebar
+    /// would not show.
+    fn set_new_session_group(&mut self, group_id: Option<String>, cx: &mut Context<Self>) {
+        let draft_project_id = self
+            .new_session_workspace
+            .project_id
+            .as_ref()
+            .map(|project_id| project_id.as_str().to_string());
+        let draft_workspace_id = self
+            .new_session_workspace
+            .fixed_workspace
+            .as_ref()
+            .map(|workspace| workspace.id.as_str().to_string())
+            .or_else(|| {
+                self.new_session_workspace
+                    .origin_workspace_id
+                    .as_ref()
+                    .map(|workspace_id| workspace_id.as_str().to_string())
+            });
+        let next = group_id.filter(|group_id| {
+            self.ui_state
+                .sidebar
+                .organization
+                .group(group_id)
+                .is_some_and(|group| {
+                    Some(group.project_id.clone()) == draft_project_id
+                        && draft_workspace_id
+                            .as_ref()
+                            .is_none_or(|workspace_id| *workspace_id == group.workspace_id)
+                })
+        });
+        if self.new_session_group_id != next {
+            self.new_session_group_id = next;
+            cx.notify();
+        }
+        // A group is single-Worktree, so joining one is a stronger placement
+        // than a folder: the folder answer is released with it.
+        if self.new_session_group_id.is_some() && self.new_session_folder_id.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The folders and session groups the draft's project offers, in sidebar
+    /// order.
     ///
     /// A folder scoped to another Worktree is left out: the sidebar would never
     /// show the session under it, and [`Self::file_new_session_in_folder`] would
-    /// decline the placement after the fact. A project with no folders yields an
-    /// empty list, which is what hides the control.
+    /// decline the placement after the fact. A group is single-Worktree, so it
+    /// is offered only for the Worktree the draft runs in. A project with
+    /// neither folders nor groups yields an empty list, which is what hides the
+    /// control.
     fn new_session_folder_choices(&self) -> Vec<NewSessionFolderChoice> {
         let Some(project_id) = self
             .new_session_workspace
@@ -41848,7 +43728,7 @@ impl VibexWorkbench {
                 .map_or(0, |depth| depth + 1);
             depths.insert(folder_id.clone(), depth);
         }
-        folders
+        let mut choices = folders
             .into_iter()
             .filter(|(_, folder)| {
                 folder.workspace_id.is_none() || folder.workspace_id == session_workspace_id
@@ -41856,9 +43736,42 @@ impl VibexWorkbench {
             .map(|(folder_id, folder)| NewSessionFolderChoice {
                 label: folder.name.clone(),
                 depth: depths.get(&folder_id).copied().unwrap_or(0),
-                folder_id,
+                target: NewSessionFilingTarget::Folder(folder_id),
             })
-            .collect()
+            .collect::<Vec<_>>();
+        // A group is a filing answer like a folder, so it is offered in the
+        // same control with its own glyph. Groups follow the folders in
+        // sidebar order; a group filed inside a folder is indented under it
+        // the way a nested folder is.
+        let groups = self
+            .ui_state
+            .sidebar
+            .organization
+            .groups_for_project(&project_id);
+        choices.extend(
+            groups
+                .into_iter()
+                .filter(|(_, group)| {
+                    session_workspace_id
+                        .as_ref()
+                        .is_some_and(|workspace_id| *workspace_id == group.workspace_id)
+                })
+                .map(|(group_id, group)| {
+                    let depth = self
+                        .ui_state
+                        .sidebar
+                        .organization
+                        .parent_of(&SidebarOrganizationItem::Group(group_id.clone()))
+                        .and_then(|parent| depths.get(&parent).copied())
+                        .map_or(0, |depth| depth + 1);
+                    NewSessionFolderChoice {
+                        label: group.name.clone(),
+                        depth,
+                        target: NewSessionFilingTarget::Group(group_id),
+                    }
+                }),
+        );
+        choices
     }
 
     /// Opens the new-session page on the project or Worktree `folder_id`
@@ -41886,6 +43799,53 @@ impl VibexWorkbench {
         // session is filed under are the same answer.
         self.set_new_session_folder(Some(folder_id.clone()), cx);
         self.reveal_sidebar_folder(&folder_id);
+        cx.notify();
+    }
+
+    /// Opens the new-session page on the Worktree `group_id` is anchored to,
+    /// and remembers the group so the session the page creates joins it.
+    ///
+    /// A group is always single-Worktree, so its Worktree is the draft's target
+    /// while it is still known and its project is the fallback, the same way a
+    /// folder row resolves its own target.
+    fn open_new_session_in_group(
+        &mut self,
+        group_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(group) = self.ui_state.sidebar.organization.group(&group_id).cloned() else {
+            return;
+        };
+        if !self
+            .workspaces
+            .iter()
+            .any(|(project, _)| project.id.as_str() == group.project_id)
+        {
+            return;
+        }
+        let target = vibex_core::WorkspaceId::parse(&group.workspace_id)
+            .ok()
+            .filter(|workspace_id| {
+                self.workspaces
+                    .iter()
+                    .any(|(_, workspace)| workspace.id == *workspace_id)
+            })
+            .map(NewSessionOpenTarget::Workspace)
+            .or_else(|| {
+                ProjectId::parse(&group.project_id)
+                    .ok()
+                    .map(NewSessionOpenTarget::Project)
+            });
+        let Some(target) = target else {
+            return;
+        };
+        // Opening the page clears the filing answers, so the group that owns
+        // this draft is recorded after it, through the same setter the page's
+        // control writes with.
+        self.open_new_session(Some(target), window, cx);
+        self.set_new_session_group(Some(group_id.clone()), cx);
+        self.reveal_sidebar_group(&group_id);
         cx.notify();
     }
 
@@ -41952,6 +43912,30 @@ impl VibexWorkbench {
         self.publish_sidebar_invalidation();
     }
 
+    /// Opens the sidebar down to `group_id`, the way a folder row's new-chat
+    /// action reveals its folder. A session started from a group row has to be
+    /// visible inside that group once it exists.
+    fn reveal_sidebar_group(&mut self, group_id: &str) {
+        let Some(group) = self.ui_state.sidebar.organization.group(group_id).cloned() else {
+            return;
+        };
+        self.ui_state
+            .sidebar
+            .organization
+            .collapsed_group_ids
+            .remove(group_id);
+        self.reveal_sidebar_organization_ancestors(SidebarOrganizationItem::Group(
+            group_id.to_string(),
+        ));
+        self.sidebar_state.collapsed_ids.remove(&group.project_id);
+        self.ui_state
+            .sidebar
+            .collapsed_workspace_ids
+            .remove(&group.workspace_id);
+        self.queue_ui_state();
+        self.publish_sidebar_invalidation();
+    }
+
     /// Files a session created from a folder row's new-chat action under that
     /// folder. The placement is written before the sidebar reconciles, so the
     /// session never spends a frame at the project root.
@@ -41996,6 +43980,35 @@ impl VibexWorkbench {
             .collapsed_folder_ids
             .remove(&folder_id);
         self.queue_ui_state();
+    }
+
+    /// Files a session created from a group row's new-chat action — or from
+    /// the page's filing control aimed at a group — into that group. The join
+    /// is written before the sidebar reconciles, so the session never spends a
+    /// frame at the project root.
+    fn file_new_session_in_group(&mut self, session_id: &VibexSessionId, cx: &mut Context<Self>) {
+        let Some(group_id) = self.new_session_group_id.clone() else {
+            return;
+        };
+        // A group that was dissolved while the draft was open has nothing to
+        // join; the session stays where the sidebar would naturally place it.
+        if self
+            .ui_state
+            .sidebar
+            .organization
+            .group(&group_id)
+            .is_none()
+        {
+            return;
+        }
+        // The join enforces the group's own Worktree, so a draft that moved to
+        // another Worktree simply does not join. The shared menu path also
+        // syncs the group's workspace and reveals the row.
+        self.add_sessions_to_group_from_menu(
+            &group_id,
+            std::slice::from_ref(&session_id.as_str().to_string()),
+            cx,
+        );
     }
 
     fn probe_new_session_eligibility(
@@ -43274,18 +45287,17 @@ impl VibexWorkbench {
                         this.reconcile_sidebar_state();
                         this.publish_sidebar_invalidation();
                         this.refresh_workspace_contexts(cx);
-                        let steering = this
-                            .composer_queue_steering_session_ids
-                            .remove(session_id.as_str());
+                        // The steering intent is not this completion's answer
+                        // either: a send-now's explicit bypass is spent by the
+                        // settled queue re-evaluation, never by whatever
+                        // submission happened to finish next.
                         let interrupted = this
                             .composer_queue_interrupted_session_ids
                             .remove(session_id.as_str());
-                        if initial_message_completed || steering || interrupted {
+                        if initial_message_completed || interrupted {
                             this.maybe_dispatch_next_composer_queue_message(
                                 Some(&session_id),
-                                if steering {
-                                    ComposerQueueDispatchBehavior::AfterInterrupt
-                                } else if initial_message_completed {
+                                if initial_message_completed {
                                     ComposerQueueDispatchBehavior::AfterCompletion
                                 } else {
                                     ComposerQueueDispatchBehavior::Automatic
@@ -45192,7 +47204,7 @@ impl VibexWorkbench {
             self.session_generation = self.session_generation.saturating_add(1);
             self.selected_session_id = None;
             self.timeline = TimelineModel::default();
-            self.timeline_scroll = VirtualListScrollHandle::new();
+            self.timeline_scroll = gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0));
             self.timeline_row_sizes = Rc::new(Vec::new());
             self.invalidate_timeline_render_caches();
             self.runtime_selection = None;
@@ -46430,8 +48442,7 @@ impl VibexWorkbench {
             self.timeline_follow.set_following_bottom(false);
             self.timeline_scroll_to_latest_pending = false;
             self.timeline_scroll_anchor_pending = false;
-            self.timeline_scroll
-                .scroll_to_item(turn_index, ScrollStrategy::Center);
+            self.timeline_scroll.scroll_to_reveal_item(turn_index);
         }
         cx.notify();
     }
@@ -46896,8 +48907,7 @@ impl VibexWorkbench {
         self.timeline_scroll_to_latest_pending = false;
         self.timeline_scroll_anchor_pending = false;
         self.rebuild_timeline_sizes();
-        self.timeline_scroll
-            .scroll_to_item(turn_index, ScrollStrategy::Center);
+        self.timeline_scroll.scroll_to_reveal_item(turn_index);
         cx.notify();
         true
     }
@@ -54381,9 +56391,10 @@ impl VibexWorkbench {
             // A folder `Tab` draws the plate and the separator; the tab keeps
             // its agent mark, its title and its status column, plus the drag
             // and drop that reorder the strip.
-            // The pane that holds the keyboard says so here: its active tab
-            // carries a quiet accent mark and the rest of the strip stays quiet.
-            // This is the mark the pane frame used to shout with a bright border.
+            // The active tab only brightens its label. The pane that holds the
+            // keyboard is marked by the frame around it — the way an active pane
+            // is drawn in a terminal multiplexer — and the strip keeps no accent
+            // bar of its own.
             let tab_holds_focus = focused && selected;
             let tab_element = Tab::new()
                 .selected(selected)
@@ -54399,16 +56410,6 @@ impl VibexWorkbench {
                         .items_center()
                         .gap_1()
                         .cursor_pointer()
-                        .when(tab_holds_focus, |this| {
-                            this.child(
-                                div()
-                                    .flex_none()
-                                    .w(px(2.0))
-                                    .h(px(12.0))
-                                    .rounded_full()
-                                    .bg(cx.theme().primary.opacity(0.75)),
-                            )
-                        })
                         .child(sidebar_agent_logo(&agent_id, selected, cx))
                         .child(div().min_w_0().truncate().child(title_element))
                         .child(status_mark)
@@ -54602,48 +56603,18 @@ impl VibexWorkbench {
                 this.child(tab_strip_drop_cue(cx.theme().primary.opacity(0.60)))
             });
 
+        // A pane the workspace paints always renders its conversation. The
+        // live-pane budget belongs to automatic presentations, never to this
+        // decision: gating content on it made the pane that had just lost the
+        // keyboard fall back to a "select this pane" placeholder while the
+        // focused pane showed its own — a conversation that vanished on blur
+        // and came back on click. Focus travels with the composer, the find bar
+        // and the terminal's own frame below; it does not decide whether the
+        // transcript is painted.
         let content = match active_session_id.as_deref() {
-            Some(session_id)
-                if self
-                    .ui_state
-                    .sidebar
-                    .organization
-                    .group(group_id)
-                    .is_some_and(|group| {
-                        group.live_session_ids().iter().any(|id| id == session_id)
-                    }) =>
-            {
+            Some(session_id) => {
                 self.render_session_group_pane_content(session_id, focused, window, cx)
             }
-            Some(_) => v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locale::text(
-                            "Select this pane to load its conversation",
-                            "选择此窗格以加载会话",
-                            "選取此窗格以載入會話",
-                        )),
-                )
-                .child(
-                    Button::new(format!("session-group-load-{pane_id}"))
-                        .small()
-                        .label(locale::text("Open conversation", "打开会话", "開啟會話"))
-                        .on_click(cx.listener({
-                            let group_id = group_id.to_string();
-                            let pane_id = pane_id.clone();
-                            move |this, _, _, cx| {
-                                this.focus_session_group_pane(&group_id, &pane_id, cx)
-                            }
-                        })),
-                )
-                .into_any_element(),
             None => div()
                 .flex_1()
                 .min_h_0()
@@ -54669,22 +56640,23 @@ impl VibexWorkbench {
             .min_h_0()
             .overflow_hidden()
             .bg(cx.theme().background)
-            // The focused pane is marked by its tab, not by a bright frame
-            // around the whole pane. A near-white border on the seam between two
-            // panes read as a second divider — the loudest line on the screen —
-            // while the thing it meant to say was already in the tab. So the
-            // frame stays the ordinary border for every pane, the hovered pane
-            // lifts it slightly, and the focused pane only carries a quiet
-            // emphasis, which is where the tab it belongs to sits.
+            // The frame is a card edge, not a second divider. A split stacks
+            // three hairlines on one seam — this pane's border, its neighbour's
+            // and the resize handle's line — so the resting weight is a third
+            // of the authored `border` and the seam reads as one hairline. The
+            // selected pane is marked inside its content, where the keyboard
+            // goes — a composer wears the focus ring, a terminal its own
+            // window's frame — so this frame only answers the pointer.
             .border_1()
-            .border_color(cx.theme().border)
-            // Hover answers "which pane would take a click", so it lifts the
-            // frame one step. Focus answers "which pane has the keyboard", and it
-            // is said by the tab; the frame only gains a touch more weight than
-            // hover so a hovered pane never outshines the focused one.
-            .hover(|this| this.border_color(cx.theme().foreground.opacity(0.10)))
-            .when(focused, |this| {
-                this.border_color(cx.theme().foreground.opacity(0.18))
+            .border_color(session_group_pane_frame(
+                cx.theme().border,
+                SESSION_GROUP_PANE_FRAME_REST_WEIGHT,
+            ))
+            .hover(|this| {
+                this.border_color(session_group_pane_frame(
+                    cx.theme().border,
+                    SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+                ))
             })
             .when(!focused, |this| {
                 // Focus the pane on the way down. The event keeps propagating so
@@ -54808,6 +56780,9 @@ impl VibexWorkbench {
                 .child(self.render_session_terminal_page_for_session(
                     pane_session,
                     focused,
+                    // A pane draws its selection in the terminal's own frame;
+                    // the single-session page has no pane to mark.
+                    focused,
                     window,
                     cx,
                 ))
@@ -54877,7 +56852,7 @@ impl VibexWorkbench {
         // primary between panes would store and reload a view per pane for
         // nothing.
         let composer = self
-            .ensure_composer_view(Some(&pane_session_id), focused, cx)
+            .ensure_composer_view(Some(&pane_session_id), focused, focused, cx)
             .into_any_element();
         self.session_group_pane_with_composer(conversation, conversation_find, composer, window, cx)
     }
@@ -54925,17 +56900,20 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// Gives every group member selected by the live-pane budget a complete
-    /// view; hidden tabs load their timelines only when selected.
+    /// Gives every painted pane a complete view; hidden tabs load their
+    /// timelines only when selected.
     ///
     /// A session only has a timeline once something asked for it. Without this
     /// pass the workspace would show one complete conversation beside panes
-    /// stuck on their loading state.
+    /// stuck on their loading state. The set is the painted panes, not the
+    /// presentation's live budget, so a pane keeps its view when the keyboard
+    /// moves to a sibling and the renderer never has to fall back to the
+    /// "select this pane" placeholder.
     fn ensure_session_group_views(&mut self, group_id: &str, cx: &mut Context<Self>) {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
-        let members = group.live_session_ids();
+        let members = group.painted_session_ids();
         let hidden: Vec<String> = self
             .ui_state
             .sidebar
@@ -55155,6 +57133,23 @@ impl VibexWorkbench {
         self.queue_ui_state();
     }
 
+    /// Asks the pane that just took the keyboard to hand it to its content.
+    ///
+    /// A terminal pane takes the keyboard into its own grid; a conversation
+    /// pane puts the caret back into its composer. Both surfaces are built by
+    /// that pane's next render, so the request is remembered rather than acted
+    /// on here, and each surface consumes the request that names it.
+    fn request_session_group_pane_keyboard(&mut self, session_id: &str) {
+        if self
+            .registered_session(session_id)
+            .is_some_and(AgentSession::is_terminal)
+        {
+            self.session_terminal_focus_request = Some(session_id.to_string());
+        } else {
+            self.session_group_composer_focus_request = Some(session_id.to_string());
+        }
+    }
+
     fn focus_session_group_pane(&mut self, group_id: &str, pane_id: &str, cx: &mut Context<Self>) {
         let active = self
             .ui_state
@@ -55171,6 +57166,9 @@ impl VibexWorkbench {
             .is_some_and(|group| group.focus_pane(pane_id));
         if changed {
             self.queue_ui_state();
+        }
+        if changed && let Some(session_id) = active.as_deref() {
+            self.request_session_group_pane_keyboard(session_id);
         }
         if let Some(session_id) = active
             && let Ok(session_id) = VibexSessionId::parse(&session_id)
@@ -55209,6 +57207,9 @@ impl VibexWorkbench {
             });
         if changed {
             self.queue_ui_state();
+        }
+        if changed {
+            self.request_session_group_pane_keyboard(session_id);
         }
         if let Ok(session_id) = VibexSessionId::parse(session_id)
             && self.selected_session_id.as_ref() != Some(&session_id)
@@ -55464,6 +57465,11 @@ impl VibexWorkbench {
             self.sidebar_rename_target == Some(SidebarRenameTarget::Group(group_id.clone()));
         let group_name = group.name.clone();
         let member_count = group.member_count();
+        // While this row's context menu is open the row keeps the hover wash,
+        // the way a session row does, so the reader can see which group the
+        // menu's commands act on while the pointer sits on the menu.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Group(group_id.clone()));
         // A collapsed group stands in for its members, so it reports their
         // status; an expanded one lets each member row speak for itself.
         let collapsed_status = collapsed
@@ -55504,6 +57510,20 @@ impl VibexWorkbench {
         let release_out_group_id = group_id.clone();
         let session_drop_group_id = group_id.clone();
         let group_drag_target_group_id = group_id.clone();
+        let toggle_group_id = group_id.clone();
+        let menu_button_group_id = group_id.clone();
+        let menu_button_group_name = group_name.clone();
+        let menu_button_entity = cx.weak_entity();
+        let new_session_group_id = group_id.clone();
+        let group_toggle_label = if collapsed {
+            locale::text("Expand group", "展开会话组", "展開會話組")
+        } else {
+            locale::text("Collapse group", "折叠会话组", "摺疊會話組")
+        };
+        let group_actions_label =
+            sidebar_session_group_actions_label(self.resolved_locale(), &group_name);
+        let group_new_session_label =
+            sidebar_new_session_for_group_label(self.resolved_locale(), &group_name);
         let drag_payload = SidebarGroupDrag {
             group_id: group_id.clone(),
             label: group_name.clone().into(),
@@ -55533,6 +57553,8 @@ impl VibexWorkbench {
             .aria_label(group_name.clone())
             .bg(if drop_active {
                 cx.theme().tokens.drop_target.into()
+            } else if context_menu_hovered {
+                theme::hover_wash(cx.theme().is_dark())
             } else {
                 cx.theme().transparent
             })
@@ -55729,11 +57751,101 @@ impl VibexWorkbench {
                                     cx,
                                 ))
                             })
-                            .when(collapsed_status.is_none(), |this| {
-                                this.child(
-                                    div().flex_none().text_xs().child(format!("{member_count}")),
-                                )
-                            })
+                            .when(
+                                collapsed_status.is_none() && !renaming && reorder_enabled,
+                                |this| {
+                                    this.child(
+                                        // The row no longer reports its member
+                                        // count: the avatars already say who is
+                                        // inside. The slot instead carries the
+                                        // hover action cluster, shaped like the
+                                        // project row's — collapse, more, new
+                                        // session — so a group offers the same
+                                        // three answers on hover.
+                                        h_flex()
+                                            .id(format!("sidebar-group-actions-{group_id}"))
+                                            .flex_none()
+                                            .h(px(24.0))
+                                            .items_center()
+                                            .gap(px(2.0))
+                                            .invisible()
+                                            .group_hover(&hover_group, |style| style.visible())
+                                            .on_mouse_down(MouseButton::Left, |_, _, cx| {
+                                                cx.stop_propagation()
+                                            })
+                                            .on_click(|_, _, cx| cx.stop_propagation())
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-toggle-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(if collapsed {
+                                                    IconName::ChevronRight
+                                                } else {
+                                                    IconName::ChevronDown
+                                                })
+                                                .tooltip(group_toggle_label)
+                                                .on_click(cx.listener(move |this, _, _, cx| {
+                                                    cx.stop_propagation();
+                                                    this.toggle_sidebar_group(&toggle_group_id, cx);
+                                                })),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-menu-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(IconName::Ellipsis)
+                                                .tooltip(group_actions_label)
+                                                .dropdown_menu(move |menu, window, cx| {
+                                                    Self::build_sidebar_group_menu(
+                                                        menu,
+                                                        menu_button_group_id.clone(),
+                                                        menu_button_group_name.clone(),
+                                                        auto_continue,
+                                                        menu_button_entity.clone(),
+                                                        window,
+                                                        cx,
+                                                    )
+                                                })
+                                                .anchor(gpui::Anchor::TopRight),
+                                            )
+                                            .child(
+                                                Button::new(format!(
+                                                    "sidebar-group-new-{group_id}"
+                                                ))
+                                                .xsmall()
+                                                .ghost()
+                                                .compact()
+                                                .w(px(24.0))
+                                                .h(px(24.0))
+                                                .icon(IconName::Plus)
+                                                .accessibility_label(
+                                                    group_new_session_label.clone(),
+                                                )
+                                                .tooltip(group_new_session_label)
+                                                .on_click(cx.listener(
+                                                    move |this, _, window, cx| {
+                                                        cx.stop_propagation();
+                                                        this.open_new_session_in_group(
+                                                            new_session_group_id.clone(),
+                                                            window,
+                                                            cx,
+                                                        );
+                                                    },
+                                                )),
+                                            ),
+                                    )
+                                },
+                            )
                             .when(pinned, |this| {
                                 this.child(
                                     sidebar_icon("icons/vibex/pin.svg")
@@ -55900,6 +58012,11 @@ impl VibexWorkbench {
         let renaming =
             self.sidebar_rename_target == Some(SidebarRenameTarget::Folder(folder_id.clone()));
         let hover_group: SharedString = format!("sidebar-folder-{folder_id}").into();
+        // While this row's context menu is open the row keeps the hover wash,
+        // the way a session row does, so the menu never leaves its own row
+        // unmarked while the pointer sits on the menu.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Folder(folder_id.clone()));
         let click_folder_id = folder_id.clone();
         let context_folder_id = folder_id.clone();
         let context_folder_name = folder_name.clone();
@@ -55990,6 +58107,8 @@ impl VibexWorkbench {
             .bg(
                 if drop_position == Some(SidebarOrganizationDropPosition::Into) {
                     cx.theme().tokens.drop_target.into()
+                } else if context_menu_hovered {
+                    theme::hover_wash(cx.theme().is_dark())
                 } else {
                     cx.theme().transparent
                 },
@@ -56801,6 +58920,11 @@ impl VibexWorkbench {
         });
         let context_menu_hover_entity = cx.weak_entity();
         let context_menu_project_id = project_id_string.clone();
+        // While this row's context menu is open the row keeps the hover wash,
+        // even after the pointer travels onto the menu: the highlight is what
+        // tells the reader which row the menu's commands act on.
+        let context_menu_hovered = self.sidebar_context_menu_target
+            == Some(SidebarContextMenuTarget::Project(project_id_string.clone()));
         let drag_target_project_id = project_id_string.clone();
         let folder_drag_target_project_id = project_id_string.clone();
         let session_root_target_project_id = project_id_string.clone();
@@ -56823,6 +58947,8 @@ impl VibexWorkbench {
             .rounded(px(8.0))
             .bg(if project_scope_drop_active {
                 cx.theme().tokens.drop_target.into()
+            } else if context_menu_hovered {
+                theme::hover_wash(cx.theme().is_dark())
             } else {
                 cx.theme().transparent
             })
@@ -59298,14 +61424,6 @@ impl VibexWorkbench {
                     .on_click(cx.listener(move |this, _, window, cx| match &item.action {
                         RuntimeChoiceMenuAction::NewSession(selection) => {
                             this.choose_new_session_runtime(selection.clone(), window, cx)
-                        }
-                        RuntimeChoiceMenuAction::ActiveSession(selection) => {
-                            this.choose_runtime_selection(
-                                ComposerTarget::Session,
-                                selection.clone(),
-                                window,
-                                cx,
-                            )
                         }
                         RuntimeChoiceMenuAction::Feature {
                             target,
@@ -62149,39 +64267,55 @@ impl VibexWorkbench {
                 }
             });
         }
-        // The folder control speaks for where the draft will be filed. Its
+        // The filing control speaks for where the draft will be filed. Its
         // choices belong to the draft's project, so a project switch reloads
-        // them, and a project without folders simply offers none — which is
-        // what hides the control entirely.
+        // them, and a project without folders or groups simply offers none —
+        // which is what hides the control entirely.
         let folder_choices = self.new_session_folder_choices();
-        let folder_choice_ids = folder_choices
+        let folder_choice_targets = folder_choices
             .iter()
-            .map(|choice| choice.folder_id.clone())
+            .map(|choice| choice.target.clone())
             .collect::<Vec<_>>();
-        // A folder row's new-chat action pre-selects a folder that the project
-        // may already have offered, so the remembered folder is read from the
-        // draft rather than cached: the trigger simply shows what the draft
-        // will be filed under.
-        let active_folder_id = self
-            .new_session_folder_id
+        // A folder or group row's new-chat action pre-selects a destination the
+        // project may already have offered, so the remembered answer is read
+        // from the draft rather than cached: the trigger simply shows what the
+        // draft will be filed under.
+        let active_filing_target = self
+            .new_session_group_id
             .clone()
-            .filter(|folder_id| folder_choice_ids.contains(folder_id));
-        let folder_has_choices = !folder_choice_ids.is_empty();
-        // The remembered folder can name a folder the draft's project does not
-        // offer — the reader switched projects while a folder row's draft was
+            .map(NewSessionFilingTarget::Group)
+            .or_else(|| {
+                self.new_session_folder_id
+                    .clone()
+                    .map(NewSessionFilingTarget::Folder)
+            })
+            .filter(|target| folder_choice_targets.contains(target));
+        let folder_has_choices = !folder_choice_targets.is_empty();
+        // The remembered destination can name one the draft's project does not
+        // offer — the reader switched projects while a row-started draft was
         // open. Filing nowhere is the honest answer, and the trigger already
         // reads as the project root for it.
-        let folder_trigger_label = active_folder_id
+        let folder_trigger_label = active_filing_target
             .as_ref()
-            .and_then(|folder_id| {
+            .and_then(|target| {
                 folder_choices
                     .iter()
-                    .find(|choice| &choice.folder_id == folder_id)
+                    .find(|choice| &choice.target == target)
             })
             .map(|choice| choice.label.clone())
             .unwrap_or_else(|| {
                 locale::text("Project root", "项目根目录", "專案根目錄").to_string()
             });
+        // A group wears the layers glyph the sidebar's group rows and menus
+        // use, so the two kinds of destination never read as one.
+        let folder_trigger_icon = if active_filing_target
+            .as_ref()
+            .is_some_and(NewSessionFilingTarget::is_group)
+        {
+            sidebar_icon("icons/vibex/layers.svg").size(px(14.0))
+        } else {
+            Icon::new(IconName::Folder).size(px(14.0))
+        };
         // The trigger is a ghost button like the project and location triggers
         // beside it: this row answers "where does this session run and where is
         // it filed", and three bordered selects there read as three forms. The
@@ -62194,9 +64328,9 @@ impl VibexWorkbench {
             .selected(self.new_session_folder_menu_open)
             .text_color(muted_foreground)
             .tooltip(locale::text(
-                "Folder this session is filed under",
-                "会话所属文件夹",
-                "會話所屬資料夾",
+                "Folder or group this session is filed under",
+                "会话所属文件夹或会话组",
+                "會話所屬資料夾或會話組",
             ))
             .child(
                 h_flex()
@@ -62204,7 +64338,7 @@ impl VibexWorkbench {
                     // The project trigger leads with the same folder glyph and
                     // chevron, so the two triggers read as one column of
                     // "where" answers rather than two unrelated menus.
-                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                    .child(folder_trigger_icon)
                     .child(
                         div()
                             .max_w(px(140.0))
@@ -62218,9 +64352,15 @@ impl VibexWorkbench {
         let folder_rows = folder_choices
             .iter()
             .map(|choice| {
-                let selected = active_folder_id.as_ref() == Some(&choice.folder_id);
-                let folder_id = choice.folder_id.clone();
-                Button::new(format!("new-session-folder-{folder_id}"))
+                let selected = active_filing_target.as_ref() == Some(&choice.target);
+                let target = choice.target.clone();
+                let target_id = target.id().to_string();
+                let row_icon = if target.is_group() {
+                    sidebar_icon("icons/vibex/layers.svg").size(px(14.0))
+                } else {
+                    Icon::new(IconName::Folder).size(px(14.0))
+                };
+                Button::new(format!("new-session-folder-{target_id}"))
                     .small()
                     .ghost()
                     .w_full()
@@ -62242,7 +64382,7 @@ impl VibexWorkbench {
                                     // so the menu reads as the tree the sidebar
                                     // draws rather than a flat list of names.
                                     .pl(px(choice.depth as f32 * 12.0))
-                                    .child(Icon::new(IconName::Folder).size(px(14.0)))
+                                    .child(row_icon)
                                     .child(div().min_w_0().truncate().child(choice.label.clone())),
                             )
                             .when(selected, |this| {
@@ -62250,7 +64390,14 @@ impl VibexWorkbench {
                             }),
                     )
                     .on_click(cx.listener(move |this, _, window, cx| {
-                        this.set_new_session_folder(Some(folder_id.clone()), cx);
+                        match target.clone() {
+                            NewSessionFilingTarget::Folder(folder_id) => {
+                                this.set_new_session_folder(Some(folder_id), cx);
+                            }
+                            NewSessionFilingTarget::Group(group_id) => {
+                                this.set_new_session_group(Some(group_id), cx);
+                            }
+                        }
                         this.new_session_folder_menu_open = false;
                         this.new_session_input
                             .update(cx, |input, cx| input.focus(window, cx));
@@ -62259,10 +64406,10 @@ impl VibexWorkbench {
             })
             .collect::<Vec<_>>();
         // Filing at the project root is a real answer — it is what a draft gets
-        // when the reader never picks a folder — so it is offered as its own
-        // row instead of being reachable only by clearing a selection.
+        // when the reader never picks a destination — so it is offered as its
+        // own row instead of being reachable only by clearing a selection.
         let folder_root_row = {
-            let selected = active_folder_id.is_none();
+            let selected = active_filing_target.is_none();
             Button::new("new-session-folder-root")
                 .small()
                 .ghost()
@@ -62294,6 +64441,7 @@ impl VibexWorkbench {
                 )
                 .on_click(cx.listener(|this, _, window, cx| {
                     this.set_new_session_folder(None, cx);
+                    this.set_new_session_group(None, cx);
                     this.new_session_folder_menu_open = false;
                     this.new_session_input
                         .update(cx, |input, cx| input.focus(window, cx));
@@ -63430,9 +65578,9 @@ impl VibexWorkbench {
                 self.timeline_row_sizes
                     .iter()
                     .map(|row_size| f32::from(row_size.height)),
-                f32::from(self.timeline_scroll.offset().y),
+                f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y),
                 self.timeline_list_padding_top_px,
-                f32::from(self.timeline_scroll.bounds().size.height),
+                f32::from(self.timeline_scroll.viewport_bounds().size.height),
             );
             agent_turn_preview_rail_visible_slots(&rail_entries, visible_rows)
         };
@@ -63625,8 +65773,7 @@ impl VibexWorkbench {
                         this.timeline_follow.set_following_bottom(false);
                         this.timeline_scroll_to_latest_pending = false;
                         this.timeline_scroll_anchor_pending = false;
-                        this.timeline_scroll
-                            .scroll_to_item(row_index, ScrollStrategy::Center);
+                        this.timeline_scroll.scroll_to_reveal_item(row_index);
                         cx.notify();
                     }))
                     .child(
@@ -63732,135 +65879,31 @@ impl VibexWorkbench {
     /// focused: the pane shows the same live timeline as the focused one, but
     /// the composer belongs to the focused pane alone, so the input, its
     /// drafts and its suggestions stay untouched.
-    fn render_agent_workbench_for(
-        &mut self,
-        include_composer: bool,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        // Sample this view's frame cadence before the pass adds to it: a live
-        // label's repeating sweep is only worth its frames while the timeline
-        // is drawing on time. See [`timeline_activity::LiveLabelFrameGate`].
-        self.live_label_frame_gate
-            .observe(cx.background_executor().now(), window.refresh_interval(cx));
-        #[cfg(test)]
-        {
-            self.markdown_surfaces_built = 0;
-        }
-        if include_composer {
-            // Elicitation forms are keyed by request id and owned by the session
-            // that asked the question, so the focused view only settles its own
-            // requests here; the answers being typed into another session's form
-            // are deliberately out of its reach.
-            self.prune_elicitation_forms(cx);
-        }
-        // Replay the row heights prepaint measured for *this* session before the
-        // extent is rebuilt, so a pane's own measurements land in its own view.
-        // Prepaint cannot apply them itself: by then the whole tree is built and
-        // the borrowed view belongs to whichever pane released last, so a split
-        // would write every pane's heights into one view and re-trigger a full
-        // size rebuild on every frame.
-        self.flush_deferred_timeline_turn_heights(cx);
-        self.apply_pending_timeline_row_heights();
-        let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
-        self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
-            AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
-        } else {
-            self.timeline_disclosure_settle_frames.saturating_sub(1)
-        };
-        let disclosure_landed =
-            disclosure_was_settling && self.timeline_disclosure_settle_frames == 0;
-        self.timeline_disclosure_animating = false;
-        if self.timeline_disclosure_settle_frames > 0 {
-            // The spring asks for no frame once it stops, and the settling that
-            // follows is only seen by the renders after that.
-            window.request_animation_frame();
-        }
-        // The list inset and activity columns share the window's rem scale.
-        // Resolved heights from another scale cannot seed this layout.
-        if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
-            self.capture_timeline_scroll_anchor();
-            self.invalidate_timeline_layout_measurements();
-        }
-        self.timeline_list_padding_top_px = f32::from(window.rem_size());
-        let selected = self.selected_session().cloned();
-        let mut turns = self.conversation_turns_cached();
-        if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
-            self.rebuild_timeline_sizes();
-            turns = self.conversation_turns_cached();
-        }
-        if disclosure_landed {
-            self.resume_timeline_follow_after_disclosure();
-        }
-        // Resolve a pending bottom scroll only after the row extent is rebuilt:
-        // an invalidated size table would otherwise swallow the request because
-        // `scroll_timeline_to_latest` skips an empty table.
-        self.apply_pending_timeline_scroll();
-        self.prefetch_older_timeline_if_needed(cx);
-        self.request_expanded_timeline_details(cx);
-        let turns_summary = self.conversation_turns_summary;
-        self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
-        let rendered_turns = self.conversation_turns_render_cache.clone();
-        let row_sizes = self.timeline_row_sizes.clone();
-        let rendered_row_sizes = row_sizes.clone();
+    /// Builds the transcript's surface: the empty state, the list of turns and
+    /// the bottom control.
+    ///
+    /// Called from [`TimelineSurfaceView`], which owns the element tree. Built
+    /// inline in the workbench's own render, every frame the list asked for
+    /// rebuilt the workbench, and a workbench notify refreshes the sidebar, the
+    /// composer and every group pane.
+    fn render_timeline_surface(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let strings = self.strings();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
-        // The same insets keep the timeline, the composer and the banners
-        // between them on one spine: the pane's gutter, widened on both sides
-        // when the preview rail is pinned inside the left one.
         let content_insets = self.session_content_insets();
-        // The live view owns the session, not the selection: a group pane
-        // renders another session's runtime controls while the selection still
-        // names the focused pane.
         let live_session_id = self.timeline.session_id.clone();
-        // The virtual list is one element per session: its id scopes the cached
-        // row layout, so two panes must never share it.
-        let timeline_list_id = SharedString::from(format!(
-            "agent-timeline-turns-{}",
-            live_session_id
-                .as_ref()
-                .map(VibexSessionId::as_str)
-                .unwrap_or("none")
-        ));
-        // The banner, its dismissal and the frame after a click all read one
-        // answer: the request is still unresolved, unacknowledged, and the
-        // session can still be parked on it. A card nobody can answer — an
-        // interrupt that cancelled the callback, a session that settled — never
-        // reaches the banner, so closing it records a request that is already
-        // gone instead of one that came back on the next frame.
-        let pending_permission = turns_summary.has_pending_permission
-            && self.permission_alert_is_pending(live_session_id.as_ref());
-        self.sync_timeline_bottom_control(self.timeline_scroll.max_offset().y > px(0.0), cx);
-        let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
-        let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
-        // The rail is the pane's reading lane, not the conversation viewport's.
-        // Every composer extension (plan, queue, goal) resizes the viewport
-        // from below, and a rail anchored to it slid a tick up under the
-        // reader's eye whenever one of them opened. A group pane builds its own
-        // rail over its own composer instead.
-        let turn_preview_rail = if include_composer {
-            self.render_session_pane_rail(cx)
-        } else {
-            None
-        };
+        let selected = self.selected_session().cloned();
+        let turns = self.conversation_turns_cached();
+        let rendered_turns = self.conversation_turns_render_cache.clone();
+        let rendered_row_sizes = self.timeline_row_sizes.clone();
+        let render_entity = cx.weak_entity();
+        let rows_hang_from_bottom = self.timeline_rows_hang_from_bottom();
         let timeline_layout_entity = cx.weak_entity();
-        // Prepaint runs after the whole element tree is built, so by then the
-        // borrowed view may already belong to another pane. Carry the measured
-        // session with the closure and write the width back into *that* view,
-        // otherwise a split's two widths would take turns invalidating each
-        // other's row measurements.
         let timeline_layout_session_id = self.timeline.session_id.clone();
-        // The row measurement needs the same routing as the width, so carry a
-        // cheap second copy of the session id into the virtual list's closure.
         let timeline_measure_session_id: Option<SharedString> = self
             .timeline
             .session_id
             .as_ref()
             .map(|session_id| SharedString::from(session_id.as_str()));
-        // The virtual list builds its rows during layout and prepaint, after the
-        // render pass has handed this pane's view back. Carry the session so the
-        // closure can borrow it again: a row resolved against the focused pane's
-        // view loses its payloads, its expansion state and its measurements.
         let timeline_render_session_id = self.timeline.session_id.clone();
         let timeline_surface = div()
             .relative()
@@ -63936,50 +65979,59 @@ impl VibexWorkbench {
                             // scrolled pane still following its own stream, and
                             // it snapped back to the bottom on the next chunk.
                             let scroll_session_id = timeline_render_session_id.clone();
-                            move |this, event: &ScrollEvent, _, cx| {
+                            move |this, event: &ScrollEvent, window, cx| {
+                                let line_height = window.line_height();
                                 this.with_session_view_for_render(
                                     scroll_session_id.as_ref(),
-                                    |this| this.handle_timeline_scroll_wheel(event, cx),
+                                    |this| {
+                                        this.handle_timeline_scroll_wheel(event, line_height, cx)
+                                    },
                                 );
                             }
                         }))
                         .child(
-                            // The transcript keeps the per-turn virtual list
-                            // rather than `MessageScroller`: this list needs
-                            // pixel anchors and reveal inside turns taller than
-                            // the viewport, and the published scroller state
-                            // exposes only row-level navigation. See
+                            // The transcript renders through `gpui::list`, not
+                            // `v_virtual_list`: only `gpui::list` carries
+                            // gpui-fast's list layer, which replays a scrolled
+                            // row instead of rebuilding it. `v_virtual_list` is
+                            // `gpui_base::VirtualList` and has no layer path at
+                            // all, so the transcript composited nothing while it
+                            // scrolled. See
                             // `.trellis/spec/frontend/timeline-scrolling.md`.
-                            v_virtual_list(
-                                cx.entity().clone(),
-                                // Element state is keyed by this id, and the
-                                // virtual list caches its measured row layout
-                                // there. A constant id made every pane share
-                                // one cache: a pane picked up the other pane's
-                                // row heights and scroll offset, which showed up
-                                // as a shrunken timeline with a blank band and a
-                                // viewport that jumped when focus moved.
-                                timeline_list_id.clone(),
-                                row_sizes,
-                                move |this, visible_range, window, cx| {
-                                    // Layout and prepaint run after the render
-                                    // pass, so the borrowed view belongs to the
-                                    // focused pane by now. Building this pane's
-                                    // rows against it would freeze a working
-                                    // pane's conversation and hand its rows the
-                                    // other session's expansions and caches.
-                                    this.with_session_view_for_render(
-                                        timeline_render_session_id.as_ref(),
-                                        |this| {
-                                            let rendered_turns = rendered_turns.borrow().clone();
-                                            let turn_count = rendered_turns.len();
-                                            let hangs_from_bottom =
-                                                this.timeline_rows_hang_from_bottom();
-                                            visible_range
-                                                .filter_map(|index| {
-                                                    let turn = rendered_turns.get(index)?;
-                                                    let row_height =
-                                                        rendered_row_sizes.get(index)?.height;
+                            gpui::list(
+                                self.timeline_scroll.clone(),
+                                move |index, window, cx| {
+                                    // `gpui::list` hands the row renderer only
+                                    // the index, so the owning view is reached
+                                    // through the weak entity the shell already
+                                    // holds. Layout and prepaint run after the
+                                    // render pass, so the borrowed view belongs
+                                    // to the focused pane by now. Building this
+                                    // pane's rows against it would freeze a
+                                    // working pane's conversation and hand its
+                                    // rows the other session's expansions and
+                                    // caches.
+                                    let Some(entity) = render_entity.upgrade() else {
+                                        return div().into_any_element();
+                                    };
+                                    entity.update(cx, |this, cx| {
+                                        this.with_session_view_for_render(
+                                            timeline_render_session_id.as_ref(),
+                                            |this| {
+                                                let rendered_turns =
+                                                    rendered_turns.borrow().clone();
+                                                let turn_count = rendered_turns.len();
+                                                let hangs_from_bottom = rows_hang_from_bottom;
+                                                let Some(turn) = rendered_turns.get(index)
+                                                else {
+                                                    return div().into_any_element();
+                                                };
+                                                let Some(row_height) =
+                                                    rendered_row_sizes.get(index).map(|row| row.height)
+                                                else {
+                                                    return div().into_any_element();
+                                                };
+                                                {
                                                     let measured_height_entity = cx.weak_entity();
                                                     let measured_turn_id = turn.id.clone();
                                                     let measured_session_id =
@@ -63992,8 +66044,7 @@ impl VibexWorkbench {
                                                         window,
                                                         cx,
                                                     );
-                                                    Some(
-                                                        h_flex()
+                                                    h_flex()
                                                             // A turn keeps its layout node by id
                                                             // when older history is prepended and
                                                             // every index shifts under it.
@@ -64055,16 +66106,14 @@ impl VibexWorkbench {
                                                                     )
                                                                     .child(turn_content),
                                                             )
-                                                            .into_any_element(),
-                                                    )
-                                                })
-                                                .collect()
-                                        },
-                                    )
+                                                            .into_any_element()
+                                                }
+                                            },
+                                        )
+                                    })
                                 },
                             )
                             .size_full()
-                            .track_scroll(&self.timeline_scroll)
                             .px(px(content_insets.horizontal))
                             .py_4()
                             .gap_0(),
@@ -64083,12 +66132,165 @@ impl VibexWorkbench {
                         }),
                 )
             });
+        timeline_surface.into_any_element()
+    }
+
+    fn render_agent_workbench_for(
+        &mut self,
+        include_composer: bool,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Sample this view's frame cadence before the pass adds to it: a live
+        // label's repeating sweep is only worth its frames while the timeline
+        // is drawing on time. See [`timeline_activity::LiveLabelFrameGate`].
+        self.live_label_frame_gate
+            .observe(cx.background_executor().now(), window.refresh_interval(cx));
+        #[cfg(test)]
+        {
+            self.markdown_surfaces_built = 0;
+        }
+        if include_composer {
+            // Elicitation forms are keyed by request id and owned by the session
+            // that asked the question, so the focused view only settles its own
+            // requests here; the answers being typed into another session's form
+            // are deliberately out of its reach.
+            self.prune_elicitation_forms(cx);
+        }
+        // Replay the row heights prepaint measured for *this* session before the
+        // extent is rebuilt, so a pane's own measurements land in its own view.
+        // Prepaint cannot apply them itself: by then the whole tree is built and
+        // the borrowed view belongs to whichever pane released last, so a split
+        // would write every pane's heights into one view and re-trigger a full
+        // size rebuild on every frame.
+        self.flush_deferred_timeline_turn_heights(cx);
+        self.apply_pending_timeline_row_heights();
+        // The reader's place is sampled before this frame lays anything out, so
+        // an extent that shrinks under them has the row they were reading to
+        // come back to. Reading it costs one borrow of the list's anchor.
+        //
+        // Not while a restore is pending: that restore was captured before the
+        // window it belongs to was replaced, and sampling again here would
+        // overwrite it with the position the replacement already produced.
+        if !self.timeline_scroll_anchor_pending && !self.timeline_scroll_to_latest_pending {
+            self.capture_timeline_scroll_anchor();
+        }
+        let disclosure_was_settling = self.timeline_disclosure_settle_frames > 0;
+        self.timeline_disclosure_settle_frames = if self.timeline_disclosure_animating {
+            AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES
+        } else {
+            self.timeline_disclosure_settle_frames.saturating_sub(1)
+        };
+        let disclosure_landed =
+            disclosure_was_settling && self.timeline_disclosure_settle_frames == 0;
+        self.timeline_disclosure_animating = false;
+        if self.timeline_disclosure_settle_frames > 0 {
+            // The spring asks for no frame once it stops, and the settling that
+            // follows is only seen by the renders after that.
+            window.request_animation_frame();
+        }
+        // The list inset and activity columns share the window's rem scale.
+        // Resolved heights from another scale cannot seed this layout.
+        if self.timeline_list_padding_top_px != f32::from(window.rem_size()) {
+            self.capture_timeline_scroll_anchor();
+            self.invalidate_timeline_layout_measurements();
+        }
+        self.timeline_list_padding_top_px = f32::from(window.rem_size());
+        let turns = self.conversation_turns_cached();
+        if timeline_virtual_rows_need_rebuild(turns.len(), self.timeline_row_sizes.len()) {
+            self.rebuild_timeline_sizes();
+        }
+        if disclosure_landed {
+            self.resume_timeline_follow_after_disclosure();
+        }
+        // Resolve a pending bottom scroll only after the row extent is rebuilt:
+        // an invalidated size table would otherwise swallow the request because
+        // `scroll_timeline_to_latest` skips an empty table.
+        self.apply_pending_timeline_scroll();
+        // The list lays out the rows it was told about, so the table and its
+        // count have to agree before the element is built.
+        self.sync_timeline_list_rows();
+        // An anchor is applied *after* the sync, unlike the bottom scroll: a
+        // count change resets the list, and a reset drops the anchor the restore
+        // is about to set. Applying it first left the reader at row zero with
+        // nothing pending to correct it.
+        self.apply_pending_timeline_anchor();
+        self.hold_the_live_edge_anchor();
+        // After the anchor, because restoring one can leave the offset past the
+        // end of a document that has not been measured yet; before the trace, so
+        // a correction this frame is named by it.
+        self.keep_the_reader_out_of_the_clamp();
+        // Traced after the moves above, so the frame that moved the transcript
+        // is the frame the trace names.
+        self.trace_timeline_scroll();
+        self.install_timeline_scroll_handler();
+        self.prefetch_older_timeline_if_needed(cx);
+        self.request_expanded_timeline_details(cx);
+        let turns_summary = self.conversation_turns_summary;
+        self.sync_timeline_duration_tick(turns_summary.has_incomplete_turn, cx);
+        // The row renderer runs inside the list's own layout borrow, so nothing
+        // it does may read the list's state. The one decision a row makes about
+        // the scroll position is whether the turn hangs from the bottom edge,
+        // and that is resolved before the element is built.
+        self.resolve_timeline_rows_hang_from_bottom();
+        // Both are taken here, outside the list's layout: the reveal runs inside
+        // the list's prepaint and cannot read either of them there.
+        // A viewport that shrank because the composer grew is not a reason to
+        // move the conversation: tail mode would re-pin the end and lift the
+        // content by the composer's own height. Pausing keeps the reader's rows
+        // where they are; the tail resumes when they return to the bottom.
+        let viewport = self.timeline_scroll.viewport_bounds();
+        if self.timeline_follow.following_bottom
+            && viewport.size.height != self.timeline_viewport.size.height
+            && self.timeline_scroll.is_following_tail()
+        {
+            self.timeline_scroll.pause_following_tail();
+        }
+        self.timeline_viewport = viewport;
+        self.apply_pending_timeline_reveal();
+        let content_max_width = session_content_max_width(self.ui_state.session.content_width);
+        // The same insets keep the timeline, the composer and the banners
+        // between them on one spine: the pane's gutter, widened on both sides
+        // when the preview rail is pinned inside the left one.
+        let content_insets = self.session_content_insets();
+        // The live view owns the session, not the selection: a group pane
+        // renders another session's runtime controls while the selection still
+        // names the focused pane.
+        let live_session_id = self.timeline.session_id.clone();
+        // The banner, its dismissal and the frame after a click all read one
+        // answer: the request is still unresolved, unacknowledged, and the
+        // session can still be parked on it. A card nobody can answer — an
+        // interrupt that cancelled the callback, a session that settled — never
+        // reaches the banner, so closing it records a request that is already
+        // gone instead of one that came back on the next frame.
+        let pending_permission = turns_summary.has_pending_permission
+            && self.permission_alert_is_pending(live_session_id.as_ref());
+        self.sync_timeline_bottom_control(
+            self.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
+            cx,
+        );
+        let timeline_bottom_control_visible = self.timeline_bottom_control_visible;
+        let timeline_bottom_control_mounted = self.timeline_bottom_control_mounted;
+        // The rail is the pane's reading lane, not the conversation viewport's.
+        // Every composer extension (plan, queue, goal) resizes the viewport
+        // from below, and a rail anchored to it slid a tick up under the
+        // reader's eye whenever one of them opened. A group pane builds its own
+        // rail over its own composer instead.
+        let turn_preview_rail = if include_composer {
+            self.render_session_pane_rail(cx)
+        } else {
+            None
+        };
+        let timeline_surface = self
+            .ensure_timeline_surface_view(live_session_id.as_ref(), cx)
+            .cached(StyleRefinement::default().flex_1().min_h_0())
+            .into_any_element();
         let runtime_controls = self.render_runtime_controls(live_session_id.as_ref(), cx);
         let conversation_find = include_composer
             .then(|| self.render_conversation_find(cx))
             .flatten();
         let composer = include_composer.then(|| {
-            self.ensure_composer_view(live_session_id.as_ref(), true, cx)
+            self.ensure_composer_view(live_session_id.as_ref(), true, false, cx)
                 .into_any_element()
         });
         // Terminal mode routes its own near-fullscreen expansion through the
@@ -64402,6 +66604,20 @@ impl VibexWorkbench {
                     }),
             ),
         };
+        // The Agent's refusal is the only explanation of *why* the switch did
+        // not take. The product sentence says "configuration unavailable",
+        // which names no cause and reads the same for an unknown model id, a
+        // rejected option and a broken endpoint. Show the recorded reason, and
+        // make the row grow instead of truncating it away: a reason cut at 30
+        // characters explains nothing.
+        let failure_detail = state
+            .actionable_error
+            .as_ref()
+            .and_then(|error| error.detail.as_deref())
+            // The Agent's refusal is evidence, not product copy: translate it
+            // only when it is one of the runtime sentences this client owns,
+            // and otherwise show it exactly as the Agent wrote it.
+            .map(locale::localize_ui_message);
         let recovery_hint = state
             .actionable_error
             .as_ref()
@@ -64427,7 +66643,7 @@ impl VibexWorkbench {
                         this.max_w(px(max_width))
                     })
                     .min_h(px(36.0))
-                    .items_center()
+                    .when(failure_detail.is_some(), |this| this.items_start())
                     .gap_2()
                     .rounded_lg()
                     .border_1()
@@ -64444,7 +66660,22 @@ impl VibexWorkbench {
                         v_flex()
                             .min_w_0()
                             .flex_1()
-                            .child(div().truncate().text_xs().font_medium().child(title))
+                            .child(
+                                div()
+                                    .whitespace_normal()
+                                    .text_xs()
+                                    .font_medium()
+                                    .child(title),
+                            )
+                            .when_some(failure_detail, |this, detail| {
+                                this.child(
+                                    div()
+                                        .whitespace_normal()
+                                        .text_xs()
+                                        .text_color(cx.theme().danger)
+                                        .child(detail),
+                                )
+                            })
                             .when_some(recovery_hint, |this, hint| {
                                 this.child(
                                     div()
@@ -64515,68 +66746,11 @@ impl VibexWorkbench {
         self.view_session_id.is_some() && self.view_session_id == self.selected_session_id
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn render_composer_runtime_choice(
-        &mut self,
-        id: String,
-        label: String,
-        icon: AnyElement,
-        choices: Vec<RuntimeCascadeChoice>,
-        selected_value: String,
-        default_value: Option<String>,
-        compact: bool,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
-        let selected_label = choices
-            .iter()
-            .find(|choice| choice.value == selected_value)
-            .map(|choice| choice.label.clone())
-            .unwrap_or_else(|| label.to_string());
-        let tooltip = format!("{label}: {selected_label}");
-        let content = runtime_selector_dropdown_content(icon, selected_label, compact, cx);
-        let menu_id = format!("composer-runtime-choice-{id}{}", self.composer_menu_scope());
-        let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
-            .clamp(160.0, COMPOSER_RUNTIME_MENU_MAX_HEIGHT);
-        let choices_empty = choices.is_empty();
-        let controls_pending = self.active_runtime_controls_pending();
-        let trigger = Button::new(format!("composer-runtime-{id}"))
-            .xsmall()
-            .ghost()
-            .h(px(32.0))
-            .when(compact, |button| button.compact().w(px(32.0)))
-            .when(!compact, |button| button.px_2())
-            .tooltip(tooltip)
-            .child(content)
-            .disabled(choices_empty || controls_pending);
-        let choice_count = choices.len();
-        let items_selected_value = selected_value.clone();
-        self.render_runtime_choice_popover(
-            menu_id,
-            trigger,
-            choice_count,
-            move || {
-                choices
-                    .into_iter()
-                    .map(|choice| RuntimeChoiceMenuItem {
-                        selected: choice.value == items_selected_value,
-                        id: choice.value,
-                        label: choice.label,
-                        action: RuntimeChoiceMenuAction::ActiveSession(choice.selection),
-                    })
-                    .collect()
-            },
-            default_value,
-            self.composer_geometry,
-            menu_max_height,
-            self.composer_menu_scope_focused(),
-            cx,
-        )
-    }
-
     fn render_composer_runtime_cascade(
         &mut self,
         desired: SessionRuntimeSelection,
         catalog: Rc<SessionRuntimeOptionCatalog>,
+        projection: Rc<RuntimeCascadeProjection>,
         compact: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -64585,14 +66759,36 @@ impl VibexWorkbench {
                 && option.selection.auth_source == desired.auth_source
                 && option.selection.model == desired.model
         });
-        let selected_provider_model_label = runtime_provider_model_label(selected_option, &desired);
+        // The bar names the supplier and the model together, the way the home
+        // page's chip does: two Providers can serve one model name, and a bar
+        // that showed only the model left the reader unable to tell which one a
+        // turn would run as. The pair is the same `supplier/model` the tooltip
+        // and the panel's rows use, so one selection reads the same everywhere.
+        // A long pair truncates inside the chip's own cap; the reasoning level
+        // beside it keeps its width.
+        let trigger_model_label = runtime_provider_model_label(selected_option, &desired);
+        // The trigger names the run configuration, not just the model: the
+        // reasoning level rides beside the model name so the reader can see
+        // the whole choice without opening the panel. It is its own element,
+        // not part of one label: a long model name truncates itself and must
+        // not eat the depth on the way out.
+        let effort_label = projection
+            .reasoning_efforts
+            .iter()
+            .find(|choice| choice.value == runtime_reasoning_effort_value(Some(&desired)))
+            .map(|choice| choice.label.clone());
+        let trigger_label = match &effort_label {
+            Some(effort) => format!("{trigger_model_label} · {effort}"),
+            None => trigger_model_label.clone(),
+        };
+        // The tooltip spells the pair out in words, and names the account on
+        // its own line, so a truncated chip still leaves the whole selection
+        // readable on hover.
+        let account_label = runtime_selection_account_label(selected_option, &desired);
         let tooltip = format!(
-            "{}: {selected_provider_model_label}",
-            locale::text(
-                "Authentication source / Model",
-                "认证方式 / 模型",
-                "認證方式 / 模型",
-            )
+            "{}: {trigger_label}\n{}: {account_label}",
+            locale::text("Model", "模型", "模型"),
+            locale::text("Authentication source", "认证方式", "認證方式"),
         );
         let model_icon = desired
             .model_id()
@@ -64609,9 +66805,10 @@ impl VibexWorkbench {
                     theme::semantic_color("chart-2", cx.theme().is_dark()),
                 )
             });
-        let content = runtime_selector_dropdown_content(
+        let content = runtime_selector_dropdown_content_parts(
             model_icon,
-            selected_provider_model_label,
+            trigger_model_label,
+            effort_label,
             compact,
             cx,
         );
@@ -64622,7 +66819,11 @@ impl VibexWorkbench {
             .map(|session_id| session_id.as_str().to_string());
         let tracked_content = div()
             .when(compact, |this| this.size_full())
-            .when(!compact, |this| this.flex_none())
+            // A long provider/model name must not push the send action off a
+            // narrow pane: the label truncates inside a bounded chip.
+            .when(!compact, |this| {
+                this.flex_none().max_w(px(240.0)).overflow_hidden()
+            })
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
                     let changed = this
@@ -64682,6 +66883,21 @@ impl VibexWorkbench {
         );
         let menu_width = (self.last_visibility.layout.viewport_width as f32 - 32.0)
             .clamp(220.0, COMPOSER_RUNTIME_MENU_WIDTH);
+        // The run options dock beside the model list as one column, so the
+        // panel widens by the column instead of scattering the same choices
+        // across the composer as separate chips.
+        let options_docked = matches!(
+            self.composer_runtime_menu_view,
+            ComposerRuntimeMenuView::AuthSource
+        ) && (!projection.reasoning_efforts.is_empty()
+            || !projection.modes.is_empty()
+            || !projection.features.is_empty());
+        let panel_width = if options_docked {
+            (menu_width + COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH)
+                .min(self.last_visibility.layout.viewport_width as f32 - 32.0)
+        } else {
+            menu_width
+        };
         // See the new-session twin: one fixed height per viewport, so
         // switching Agent or typing a query never resizes the panel.
         let menu_max_height = (self.last_visibility.layout.viewport_height as f32 - 128.0)
@@ -64902,7 +67118,7 @@ impl VibexWorkbench {
         };
         let menu_panel = v_flex()
             .id("composer-runtime-cascade-content")
-            .w(px(menu_width))
+            .w(px(panel_width))
             .h(px(menu_placement.height))
             .min_h_0()
             .overflow_hidden()
@@ -64911,7 +67127,30 @@ impl VibexWorkbench {
             .border_color(cx.theme().border.opacity(0.70))
             .bg(cx.theme().popover)
             .shadow_lg()
-            .child(menu_content);
+            .child(
+                h_flex()
+                    .size_full()
+                    .min_h_0()
+                    .child(
+                        div()
+                            .h_full()
+                            .min_h_0()
+                            .w(px(menu_width))
+                            .min_w_0()
+                            .flex_none()
+                            .child(menu_content),
+                    )
+                    .when(options_docked && menu_mounted, |this| {
+                        this.child(
+                            div()
+                                .h_full()
+                                .w(px(1.0))
+                                .flex_none()
+                                .bg(cx.theme().border.opacity(0.70)),
+                        )
+                        .child(self.render_composer_runtime_options(&desired, &projection, cx))
+                    }),
+            );
         let popover = Popover::new(format!("composer-runtime-cascade{scope}"))
             .anchor(menu_placement.anchor)
             .appearance(false)
@@ -64932,30 +67171,395 @@ impl VibexWorkbench {
         div().flex_none().child(popover).into_any_element()
     }
 
-    fn render_composer_terminal_menu(&mut self, cx: &mut Context<Self>) -> AnyElement {
-        let panel_mode = self.composer_terminal_opens_in_panel();
-        let tooltip = if self.composer_terminals.is_empty() {
-            "Create Composer terminal"
-        } else if panel_mode && self.composer_terminal_panel_open {
-            // The button is the panel's toggle in panel mode, so it has to name
-            // what the next press does, not just what the surface is.
-            "Hide terminal panel"
-        } else if panel_mode {
-            "Show terminal panel"
-        } else {
-            "Switch to terminal mode"
+    /// The run-options column docked beside the cascade's model list.
+    ///
+    /// One panel owns the whole run configuration: the model list picks what
+    /// runs, this column tunes how it runs — reasoning levels first, then the
+    /// conversation mode, then the feature toggles. Picking a level or a mode
+    /// keeps the panel open so the reader can keep tuning; the model list's
+    /// own pick still closes it, because that is the choice the panel was
+    /// opened for.
+    fn render_composer_runtime_options(
+        &mut self,
+        desired: &SessionRuntimeSelection,
+        projection: &RuntimeCascadeProjection,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let rest_background = runtime_menu_rest_background(cx);
+        let highlight_background = runtime_menu_highlight_background(cx);
+        let selected_background = runtime_menu_selected_background(cx);
+        let controls_pending = self.active_runtime_controls_pending();
+        let scope = self.composer_menu_scope();
+        // Each section wears the icon its chip carried on the composer, in
+        // the same chart hue, so the run configuration reads the same here as
+        // it did on the bar: thinking depth, conversation mode, then features.
+        let is_dark = cx.theme().is_dark();
+        let heading = |icon: AnyElement, label: String| {
+            h_flex()
+                .w_full()
+                .flex_none()
+                .items_center()
+                .gap(px(6.0))
+                .px(px(10.0))
+                .pt(px(8.0))
+                .pb(px(4.0))
+                .text_size(type_scale::menu_section_title())
+                .font_semibold()
+                .text_color(cx.theme().muted_foreground)
+                .child(icon)
+                .child(label)
         };
-        Button::new("composer-terminal-menu")
-            .ghost()
-            .compact()
-            .size(px(32.0))
-            .icon(IconName::SquareTerminal)
-            .tooltip(tooltip)
-            .disabled(self.agent_action_pending || self.view_session_id.is_none())
-            .on_click(cx.listener(|this, _, window, cx| {
-                this.toggle_composer_terminal(window.window_handle(), window, cx)
-            }))
-            .into_any_element()
+        let effort_heading_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/brain.svg",
+                theme::semantic_color("chart-3", is_dark),
+            )
+        };
+        let mode_heading_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/shield-alert.svg",
+                theme::semantic_color("chart-4", is_dark),
+            )
+        };
+        let feature_icon = || {
+            new_session_selector_icon(
+                "icons/vibex/zap.svg",
+                theme::semantic_color("chart-5", is_dark),
+            )
+        };
+        let mut column = v_flex()
+            .id(format!("composer-runtime-options{scope}"))
+            .h_full()
+            .min_h_0()
+            .w(px(COMPOSER_RUNTIME_OPTIONS_COLUMN_WIDTH))
+            .flex_none()
+            .overflow_y_scroll()
+            .scroll_gutter()
+            .pb(px(6.0));
+        if !projection.reasoning_efforts.is_empty() {
+            let default_effort = runtime_default_reasoning_effort(&projection.reasoning_efforts);
+            let selected_value = runtime_reasoning_effort_value(Some(desired));
+            column = column.child(heading(
+                effort_heading_icon(),
+                locale::text("Thinking depth", "思考深度", "思考深度").to_string(),
+            ));
+            for choice in projection.reasoning_efforts.iter().cloned() {
+                let selected = choice.value == selected_value
+                    || (selected_value.is_empty()
+                        && default_effort.as_deref() == Some(choice.value.as_str()));
+                let is_default = default_effort.as_deref() == Some(choice.value.as_str());
+                let row_id = format!("composer-runtime-options-effort:{}{scope}", choice.value);
+                let selection = choice.selection;
+                column = column.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .mx(px(6.0))
+                        .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(type_scale::menu_row())
+                        .bg(if selected {
+                            selected_background
+                        } else {
+                            hover_blend(&row_id, rest_background, highlight_background)
+                        })
+                        .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            );
+                            // Tuning keeps the panel up: the reader came to
+                            // configure the run, not to pick one level and
+                            // start over.
+                            this.runtime_menu_closing_since = None;
+                            this.composer_runtime_menu_open = true;
+                            cx.notify();
+                        }))
+                        .child(div().min_w_0().flex_1().truncate().child(choice.label))
+                        .when(is_default, |this| {
+                            this.child(runtime_menu_default_badge(cx))
+                        })
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
+                );
+            }
+        }
+        if !projection.modes.is_empty() {
+            let selected_value = desired.mode_id.clone().unwrap_or_default();
+            column = column.child(heading(
+                mode_heading_icon(),
+                locale::text("Conversation mode", "对话模式", "對話模式").to_string(),
+            ));
+            for choice in projection.modes.iter().cloned() {
+                let selected = choice.value == selected_value;
+                let row_id = format!("composer-runtime-options-mode:{}{scope}", choice.value);
+                let selection = choice.selection;
+                column = column.child(
+                    div()
+                        .id(SharedString::from(row_id.clone()))
+                        .mx(px(6.0))
+                        .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                        .flex_none()
+                        .px_2()
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .rounded(px(6.0))
+                        .cursor_pointer()
+                        .text_size(type_scale::menu_row())
+                        .bg(if selected {
+                            selected_background
+                        } else {
+                            hover_blend(&row_id, rest_background, highlight_background)
+                        })
+                        .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                        .on_click(cx.listener(move |this, _, window, cx| {
+                            this.choose_runtime_selection(
+                                ComposerTarget::Session,
+                                selection.clone(),
+                                window,
+                                cx,
+                            );
+                            this.runtime_menu_closing_since = None;
+                            this.composer_runtime_menu_open = true;
+                            cx.notify();
+                        }))
+                        .child(div().min_w_0().flex_1().truncate().child(choice.label))
+                        .when(selected, |this| {
+                            this.child(Icon::new(IconName::Check).size(px(14.0)))
+                        }),
+                );
+            }
+        }
+        for feature in projection.features.iter().cloned() {
+            let current = feature.value_for(&desired.config_values);
+            let tooltip = runtime_feature_tooltip(&feature, current.as_ref());
+            match feature.kind {
+                SessionRuntimeFeatureKind::Toggle => {
+                    let feature_id = feature.id.clone();
+                    let checked = current.as_ref().is_some_and(|value| value.value == "true");
+                    column =
+                        column.child(
+                            h_flex()
+                                .mx(px(6.0))
+                                .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                                .flex_none()
+                                .px_2()
+                                .items_center()
+                                .gap_2()
+                                .child(feature_icon())
+                                .child(
+                                    div()
+                                        .min_w_0()
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(type_scale::menu_row())
+                                        .child(feature.label.clone()),
+                                )
+                                .child(
+                                    Switch::new(SharedString::from(format!(
+                                        "composer-runtime-options-feature-{}{scope}",
+                                        feature.id
+                                    )))
+                                    .small()
+                                    .checked(checked)
+                                    .disabled(controls_pending)
+                                    .tooltip(tooltip)
+                                    .on_click(cx.listener(move |this, enabled: &bool, _, cx| {
+                                        this.set_runtime_feature_value(
+                                            RuntimeFeatureTarget::ActiveSession,
+                                            &feature_id,
+                                            enabled.to_string(),
+                                            cx,
+                                        )
+                                    })),
+                                ),
+                        );
+                }
+                SessionRuntimeFeatureKind::Select => {
+                    let values = runtime_feature_values(&feature);
+                    let selected_value = current
+                        .as_ref()
+                        .map(|value| value.value.clone())
+                        .unwrap_or_default();
+                    column = column.child(heading(feature_icon(), feature.label.clone()));
+                    for value in values {
+                        let selected = value.value == selected_value;
+                        let row_id = format!(
+                            "composer-runtime-options-feature:{}:{}{scope}",
+                            feature.id, value.value
+                        );
+                        let feature_id = feature.id.clone();
+                        let next_value = value.value.clone();
+                        let label = value.label.clone().unwrap_or_else(|| value.value.clone());
+                        column = column.child(
+                            div()
+                                .id(SharedString::from(row_id.clone()))
+                                .mx(px(6.0))
+                                .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                                .flex_none()
+                                .px_2()
+                                .flex()
+                                .items_center()
+                                .gap_2()
+                                .rounded(px(6.0))
+                                .cursor_pointer()
+                                .text_size(type_scale::menu_row())
+                                .bg(if selected {
+                                    selected_background
+                                } else {
+                                    hover_blend(&row_id, rest_background, highlight_background)
+                                })
+                                .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                                .on_click(cx.listener(move |this, _, _, cx| {
+                                    this.set_runtime_feature_value(
+                                        RuntimeFeatureTarget::ActiveSession,
+                                        &feature_id,
+                                        next_value.clone(),
+                                        cx,
+                                    )
+                                }))
+                                .child(div().min_w_0().flex_1().truncate().child(label))
+                                .when(selected, |this| {
+                                    this.child(Icon::new(IconName::Check).size(px(14.0)))
+                                }),
+                        );
+                    }
+                }
+                SessionRuntimeFeatureKind::String => {
+                    // A free-text feature opens its own dialog, exactly as
+                    // the chip it replaces did. The row names the feature and
+                    // its current value; the dialog carries the description.
+                    let selected_label = current
+                        .as_ref()
+                        .and_then(|value| value.label.clone())
+                        .unwrap_or_else(|| {
+                            current
+                                .as_ref()
+                                .map(|value| value.value.clone())
+                                .filter(|value| !value.is_empty())
+                                .unwrap_or_else(|| feature.label.clone())
+                        });
+                    let row_id = format!("composer-runtime-options-string:{}{scope}", feature.id);
+                    let feature_label = feature.label.clone();
+                    column = column.child(
+                        div()
+                            .id(SharedString::from(row_id.clone()))
+                            .mx(px(6.0))
+                            .h(px(COMPOSER_RUNTIME_CHOICE_ROW_HEIGHT))
+                            .flex_none()
+                            .px_2()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .rounded(px(6.0))
+                            .cursor_pointer()
+                            .text_size(type_scale::menu_row())
+                            .bg(hover_blend(&row_id, rest_background, highlight_background))
+                            .on_hover(hover_listener(cx.entity_id(), row_id.clone()))
+                            .on_click(cx.listener(move |this, _, window, cx| {
+                                this.prompt_runtime_feature_value(
+                                    RuntimeFeatureTarget::ActiveSession,
+                                    feature.clone(),
+                                    window,
+                                    cx,
+                                )
+                            }))
+                            .child(feature_icon())
+                            .child(div().min_w_0().flex_1().truncate().child(feature_label))
+                            .child(
+                                div()
+                                    .flex_none()
+                                    .max_w(px(88.0))
+                                    .truncate()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(selected_label),
+                            )
+                            .child(
+                                Icon::new(IconName::ChevronRight)
+                                    .size(px(13.0))
+                                    .text_color(cx.theme().muted_foreground),
+                            ),
+                    );
+                }
+            }
+        }
+        column.into_any_element()
+    }
+
+    /// What the terminal control does on this frame, in the reader's language.
+    ///
+    /// The control is the panel's toggle in panel mode, so the label has to
+    /// name what the next press does, not just what the surface is.
+    fn composer_terminal_action_label(&self) -> &'static str {
+        let panel_mode = self.composer_terminal_opens_in_panel();
+        if self.composer_terminals.is_empty() {
+            locale::text(
+                "Create Composer terminal",
+                "新建输入框终端",
+                "新增輸入框終端",
+            )
+        } else if panel_mode && self.composer_terminal_panel_open {
+            locale::text("Hide terminal panel", "隐藏终端面板", "隱藏終端面板")
+        } else if panel_mode {
+            locale::text("Show terminal panel", "显示终端面板", "顯示終端面板")
+        } else {
+            locale::text(
+                "Switch to terminal mode",
+                "切换到终端模式",
+                "切換到終端模式",
+            )
+        }
+    }
+
+    fn render_composer_terminal_menu(
+        &mut self,
+        size: f32,
+        glyph: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // The mark lifts a step under the pointer: the footer's resting ink at
+        // rest, the foreground's own ink while the wrapper reports hover. The
+        // wrapper is what listens, because the tooltip below owns the button's
+        // one hover listener.
+        let ink = composer_instrument_ink(
+            motion::hover_t(COMPOSER_TERMINAL_HOVER_KEY),
+            COMPOSER_FOOTER_INSTRUMENT_REST_INK,
+            cx,
+        );
+        composer_instrument_hover_target(
+            COMPOSER_TERMINAL_HOVER_KEY,
+            cx.entity_id(),
+            Button::new("composer-terminal-menu")
+                .ghost()
+                .compact()
+                .size(px(size))
+                // The square is the glyph's seat, not a box around it: the kit pads
+                // a sized button that carries children by a fifth of its side and
+                // clips what escapes the padded box, which cut a hair off the
+                // terminal frame's corners on a 22px seat. See the schedule button's
+                // sized twin for the same rule.
+                .p(px(0.0))
+                .child(composer_instrument_glyph(
+                    Icon::new(IconName::SquareTerminal),
+                    glyph,
+                    ink,
+                ))
+                .tooltip(self.composer_terminal_action_label())
+                .disabled(self.agent_action_pending || self.view_session_id.is_none())
+                .on_click(cx.listener(|this, _, window, cx| {
+                    this.toggle_composer_terminal(window.window_handle(), window, cx)
+                })),
+        )
     }
 
     fn render_composer_terminal_tab(
@@ -68424,13 +71028,17 @@ impl VibexWorkbench {
             .flat_map(|row| row.item_ids.iter().cloned())
             .collect::<Vec<_>>();
         let entity = cx.weak_entity();
-        let scroll = self.timeline_scroll.clone();
         div()
             .w_full()
             .min_w_0()
             .on_prepaint(move |bounds, _, cx| {
                 let _ = entity.update(cx, |this, cx| {
-                    this.reveal_session_search_row(&item_ids, aim, bounds, &scroll, cx);
+                    // The shift itself cannot be applied here: `ListState`
+                    // borrows its own layout for the whole prepaint, and
+                    // reading or writing the offset inside that borrow panics.
+                    // The row reports where it landed; the next render moves
+                    // the viewport onto it.
+                    this.reveal_session_search_row(&item_ids, aim, bounds, cx);
                 });
             })
             .child(element)
@@ -68468,7 +71076,6 @@ impl VibexWorkbench {
         item_ids: &[String],
         aim: f32,
         bounds: Bounds<Pixels>,
-        scroll: &VirtualListScrollHandle,
         cx: &mut Context<Self>,
     ) {
         let reveals_permission = self
@@ -68482,17 +71089,21 @@ impl VibexWorkbench {
         if !reveals_permission && !reveals_match {
             return;
         }
-        // The row's prepaint bounds already carry the scroll offset, so they
-        // are directly comparable with the viewport the handle tracked. A
-        // viewport with no height has nothing to reveal inside, and the
-        // turn-level scroll the caller already asked for still stands.
-        let viewport = scroll.bounds();
         if reveals_permission {
             self.pending_permission_reveal_item_id = None;
         }
         if reveals_match {
             self.pending_session_search_reveal_item_id = None;
         }
+        // The row's prepaint bounds already carry the scroll offset, so they
+        // are directly comparable with the viewport. A viewport with no height
+        // has nothing to reveal inside, and the turn-level scroll the caller
+        // already asked for still stands.
+        //
+        // The viewport is the one recorded before the element was built, not a
+        // read of the list now: this runs inside the list's own prepaint, and
+        // `viewport_bounds` borrows the layout that prepaint already holds.
+        let viewport = self.timeline_viewport;
         if viewport.size.height <= px(0.0) {
             return;
         }
@@ -68500,11 +71111,12 @@ impl VibexWorkbench {
         if delta_y == px(0.0) {
             return;
         }
-        let offset = scroll.offset();
-        scroll.set_offset(point(offset.x, offset.y + delta_y));
-        // The virtual list picked the rows it renders from the offset this
-        // frame was laid out with, so the shifted viewport needs one more pass
-        // to fill itself from the new position.
+        // The shift cannot be applied here. Every way to move a `ListState`
+        // reads its current position first — `scroll_by` calls
+        // `logical_scroll_top`, `viewport_bounds` borrows the layout — and this
+        // runs inside the list's own prepaint, which already holds that borrow.
+        // Park the distance and let the next render apply it.
+        self.pending_timeline_reveal_delta += delta_y;
         cx.notify();
     }
 
@@ -73181,6 +75793,31 @@ impl VibexWorkbench {
         }
     }
 
+    /// The picture a read activity points at, drawn as its row's mark.
+    ///
+    /// Resolving here keeps the workspace root in the one place that already
+    /// knows it, and lets the card's click open the same full-window preview a
+    /// transcript image uses. Every other read row — a text file, a path
+    /// outside the workspace, a write or an edit — gets `None` and keeps its
+    /// file-type mark.
+    fn timeline_read_image_thumbnail(
+        &self,
+        row: &TimelineRow,
+        activity: &timeline_activity::Activity,
+        entity: WeakEntity<Self>,
+        cx: &App,
+    ) -> Option<AnyElement> {
+        let workspace_root = self.view_session()?.workspace_root.clone();
+        let path = timeline_image::image_read_path(activity, Some(workspace_root.as_str()))?;
+        Some(timeline_image::thumbnail(
+            &row.id,
+            &path,
+            activity.target(),
+            entity,
+            cx,
+        ))
+    }
+
     fn render_process_activity_line(
         &mut self,
         row: &TimelineRow,
@@ -73229,6 +75866,8 @@ impl VibexWorkbench {
             &self.active_timeline().items,
             cx,
         );
+        let thumbnail =
+            self.timeline_read_image_thumbnail(row, &projection.activity, cx.weak_entity(), cx);
         let header = timeline_activity::header(
             format!("activity:{}", row.id),
             &projection.activity,
@@ -73236,6 +75875,7 @@ impl VibexWorkbench {
             has_details.then_some((expanded, progress)),
             target,
             duration,
+            thumbnail,
             self.live_label_frame_gate.animating(),
             cx,
         )
@@ -73520,6 +76160,8 @@ impl VibexWorkbench {
                 )
                 .into_any_element()
             });
+        let thumbnail =
+            self.timeline_read_image_thumbnail(row, &projection.activity, cx.weak_entity(), cx);
         let header = timeline_activity::header(
             format!("file-card-header:{}", row.id),
             &projection.activity,
@@ -73527,6 +76169,7 @@ impl VibexWorkbench {
             Some((expanded, progress)),
             target,
             statistics,
+            thumbnail,
             self.live_label_frame_gate.animating(),
             cx,
         )
@@ -77094,6 +79737,128 @@ impl VibexWorkbench {
         Some(queue.into_any_element())
     }
 
+    /// The line under the Composer's surface.
+    ///
+    /// The surface is for composing; the line under it answers for the session
+    /// as a whole. On the left sit the Agent and the project the reader is
+    /// talking to; on the right sit the instruments that act on the whole
+    /// session — the message schedule, the terminal, and the context-usage
+    /// ring, in that order. The clock and the terminal used to be surface
+    /// controls; they moved here because neither of them edits the draft, so
+    /// neither belongs inside the box the reader types into.
+    fn render_composer_footer(
+        &mut self,
+        enabled: bool,
+        inset: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let locale = self.resolved_locale();
+        // Both halves read the borrowed view — a group pane composes for its
+        // own session, so the line names that session's Agent and project even
+        // while the sidebar highlights another pane.
+        let (agent_identity, project_name) = match self.view_session() {
+            Some(session) => {
+                let agent = self
+                    .session_desired_agent_id(session.id.as_str())
+                    .unwrap_or(&session.agent_id)
+                    .to_string();
+                let project = self
+                    .workspaces
+                    .iter()
+                    .find(|(project, _)| project.id == session.project_id)
+                    .map_or_else(
+                        || project_name_from_root(locale, &session.workspace_root),
+                        |(project, _)| project_display_name(locale, project),
+                    );
+                (Some(agent), Some(project))
+            }
+            None => (None, None),
+        };
+        let session_id = self.view_session_id.clone();
+        let controls_enabled = enabled && !self.agent_action_pending;
+        // The left half is a caption, not a control: the mark is a hair under
+        // the instrument glyphs beside it and both parts take the muted ink,
+        // so the line names the session without competing with the surface
+        // above it or the instruments on its own right.
+        let caption_ink = cx.theme().muted_foreground.opacity(0.92);
+        let mut leading = h_flex().min_w_0().items_center().gap(px(6.0));
+        if let Some(identity) = agent_identity {
+            leading = leading.child(agent_brand_icon(
+                &identity,
+                px(COMPOSER_FOOTER_MARK_SIZE),
+                Some(caption_ink),
+            ));
+        }
+        if let Some(name) = project_name {
+            leading = leading.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_xs()
+                    .font_medium()
+                    .text_color(caption_ink)
+                    .child(name),
+            );
+        }
+        let mut trailing = h_flex()
+            .flex_none()
+            .items_center()
+            .gap(px(COMPOSER_FOOTER_GAP));
+        if let Some(session_id) = session_id {
+            trailing = trailing
+                .child(self.render_message_schedule_button_sized(
+                    MessageScheduleTarget::Session(session_id),
+                    controls_enabled,
+                    COMPOSER_FOOTER_CONTROL_SIZE,
+                    COMPOSER_FOOTER_GLYPH_SIZE,
+                    cx,
+                ))
+                .child(self.render_composer_terminal_menu(
+                    COMPOSER_FOOTER_CONTROL_SIZE,
+                    COMPOSER_FOOTER_GLYPH_SIZE,
+                    cx,
+                ))
+                .child(button_with_aria_label(
+                    Button::new("open-session-usage")
+                        .ghost()
+                        .compact()
+                        .size(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                        // The ring is the button's whole content, so the seat
+                        // gives it every point it has: the kit's inset padding
+                        // would clip the readout on all four sides of a 22px
+                        // square. Same rule as the terminal control above.
+                        .p(px(0.0))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            let session_filter = this.selected_session_id.clone();
+                            this.open_usage(session_filter, cx);
+                        }))
+                        .child(render_cache_token_ring(
+                            self.token_usage.as_ref(),
+                            COMPOSER_FOOTER_CONTROL_SIZE,
+                            cx,
+                        )),
+                    locale::text("Open usage statistics", "打开用量统计", "開啟用量統計"),
+                ));
+        }
+        h_flex()
+            .id("composer-footer")
+            .debug_selector(|| "composer-footer".to_string())
+            .w_full()
+            .min_w_0()
+            // Both halves share one baseline: the row is as tall as its
+            // instruments, and the caption centres on them instead of
+            // floating below the surface's radius.
+            .min_h(px(COMPOSER_FOOTER_CONTROL_SIZE))
+            .items_center()
+            .justify_between()
+            .gap_2()
+            .px(px(inset))
+            .pt(px(COMPOSER_FOOTER_TOP_PADDING))
+            .child(leading)
+            .child(trailing)
+            .into_any_element()
+    }
+
     /// Renders the composer of the borrowed view.
     ///
     /// `enabled` is false for a group pane that does not hold the keyboard: the
@@ -77106,8 +79871,30 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
         enabled: bool,
+        pane_focused: bool,
     ) -> AnyElement {
         let composer_input = self.ensure_composer_input(window, cx);
+        // A pane selection hands the keyboard to the pane's content, and the
+        // caret is how a conversation pane shows it. The composer only exists
+        // once this pane's session view is borrowed, so the click leaves a
+        // request and this frame is where it lands. The request is one shot:
+        // the pane stays selected for many frames, and re-focusing on each of
+        // them would take the caret away from whatever else the reader picked
+        // inside the pane.
+        let composer_focus_requested = pane_focused
+            && enabled
+            && self.view_session_id.as_ref().is_some_and(|session_id| {
+                self.session_group_composer_focus_request.as_deref() == Some(session_id.as_str())
+            });
+        if composer_focus_requested {
+            self.session_group_composer_focus_request = None;
+            if !self.composer_terminal_mode {
+                let input = composer_input.clone();
+                cx.defer_in(window, move |_, window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                });
+            }
+        }
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
@@ -77193,7 +79980,14 @@ impl VibexWorkbench {
         // The composer shares the content spine with the timeline above it.
         let content_insets = self.session_content_insets();
         let is_dark = cx.theme().is_dark();
-        let composer_background = composer_surface_background(is_dark);
+        let composer_background = composer_surface_fill(is_dark);
+        // Whether the caret is sitting in this box right now. The pane flag says
+        // which pane the keyboard belongs to; this one says the keyboard is in
+        // the box, and it is the only focus there is in the single-session
+        // column. A caret appearing is a state the edge has to answer for, or
+        // the one control the reader is typing into looks exactly like a box
+        // that is merely present.
+        let composer_input_focused = composer_input.read(cx).focus_handle(cx).is_focused(window);
         let composer_collaboration = self.render_composer_collaboration(cx);
         let composer_plan = self.render_composer_plan(cx);
         // The goal row rides the queued-message surface whenever that panel is
@@ -77259,80 +80053,126 @@ impl VibexWorkbench {
         // failure — asks for the full box, because those rows have nowhere to go
         // on a one-line bar.
         let composer_draft = composer_input.read(cx).value();
-        let composer_draft_is_empty = composer_draft.trim().is_empty();
+        // Only a draft with no characters at all is the empty case. A draft
+        // of newlines is not: it has rows, and those rows ask for the box.
+        let composer_draft_is_empty = composer_draft.is_empty();
+        // The density reads the draft at the width the ONE-LINE bar would give
+        // it, measured from the pane's column rather than from either density's
+        // layout: reading the live input made a draft at the wrap boundary
+        // count two rows in the bar and one in the box, and the surface
+        // bounced between the densities on every frame.
+        let composer_slim_width = composer_slim_input_width(
+            composer_width,
+            content_max_width,
+            content_insets.horizontal,
+            compact_runtime_controls,
+            runtime_projection.is_some(),
+        );
+        // The textarea draws at the component's Medium input size: 0.875rem.
+        let composer_probe_font = window.text_style().font();
+        let composer_probe_font_size = f32::from(window.rem_size()) * 0.875;
+        let composer_density_rows = composer_draft_wrapped_rows(
+            &mut self.composer_density_probe,
+            &composer_input,
+            composer_draft.as_str(),
+            composer_slim_width,
+            composer_probe_font,
+            composer_probe_font_size,
+            cx,
+        );
+        // The surface's height still follows the input's own wrapped rows: the
+        // box it reserves has to fit the rows the painted input actually draws.
+        let composer_rows = {
+            let input = composer_input.read(cx);
+            composer_wrapped_rows(input, composer_draft.as_str())
+        };
         let composer_density = composer_density(
-            {
-                let input = composer_input.read(cx);
-                composer_wrapped_rows(input, composer_draft.as_str())
-            },
+            composer_density_rows,
             composer_draft_is_empty,
             self.composer_attachments.is_empty(),
-            composer_extension_visible,
-            composer_plan.is_some()
-                || composer_goal.is_some()
-                || composer_collaboration.is_some()
-                || generation_status.is_some()
-                || failover_prompt.is_some()
-                || failover_notices.is_some()
-                || self.agent_error.is_some()
-                || continuation_available,
             self.composer_expanded,
         );
         let composer_is_slim = composer_density == ComposerDensity::Slim;
+        // The surface's attach and expand controls answer the pointer the way
+        // the footer's instruments do: a step darker at rest, the foreground's
+        // ink under it. Both densities share one fade key per control, so a
+        // draft that flips density under the pointer keeps the highlight it had
+        // instead of losing it with the rebuilt button.
+        let attach_ink = composer_instrument_ink(
+            motion::hover_t(COMPOSER_ATTACH_HOVER_KEY),
+            COMPOSER_ROW_INSTRUMENT_REST_INK,
+            cx,
+        );
+        let expand_ink = composer_instrument_ink(
+            motion::hover_t(COMPOSER_EXPAND_HOVER_KEY),
+            COMPOSER_ROW_INSTRUMENT_REST_INK,
+            cx,
+        );
+        // The surface's height glides to the height its content asks for. The
+        // decision above commits the final layout at once — the caret and the
+        // draft survive — while the box the reader sees sweeps between the
+        // one-line bar and the growing multi-row box over one short ease-out.
+        // A session switch snaps: the borrowed view is another draft, and
+        // morphing between two sessions' heights would animate a change the
+        // reader made by navigating, not by typing.
+        let composer_surface_target = composer_surface_height(composer_density, composer_rows);
+        let composer_morph_key = composer_surface_morph_key(
+            self.view_session_id
+                .as_ref()
+                .map(|session_id| session_id.as_str()),
+        );
+        let composer_morph_snap = motion::reduced_motion(cx)
+            || self.composer_expanded
+            || self.composer_surface_session.as_ref() != self.view_session_id.as_ref();
+        self.composer_surface_session = self.view_session_id.clone();
+        let composer_surface_height_now = motion::resolve_height(
+            &composer_morph_key,
+            composer_surface_target,
+            composer_morph_snap,
+            cx.entity_id(),
+        );
+        // How settled the committed density is (0..1): 1 when the box rests
+        // at its target, less while the glide is still travelling. The chrome
+        // that differs between the two densities — the corner radius — rides
+        // the same progress so nothing snaps mid-morph.
+        let composer_density_span = (composer_surface_height(ComposerDensity::Full, 2)
+            - COMPOSER_SLIM_SURFACE_HEIGHT)
+            .max(1.0);
+        let composer_density_settle = (1.0
+            - (composer_surface_target - composer_surface_height_now).abs()
+                / composer_density_span)
+            .clamp(0.0, 1.0);
+        let composer_surface_radius = if composer_is_slim {
+            motion::lerp(
+                COMPOSER_SURFACE_RADIUS,
+                COMPOSER_SLIM_SURFACE_RADIUS,
+                composer_density_settle,
+            )
+        } else {
+            motion::lerp(
+                COMPOSER_SLIM_SURFACE_RADIUS,
+                COMPOSER_SURFACE_RADIUS,
+                composer_density_settle,
+            )
+        };
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
         let session_uninitialized = self.selected_session_runtime_uninitialized();
         let (runtime_controls_cascade, runtime_controls_other) =
             if let Some((desired, catalog, projection)) = runtime_projection {
+                // The reasoning levels, conversation modes and feature
+                // toggles live in the cascade's own docked options column
+                // (see `render_composer_runtime_options`): one panel owns the
+                // whole run configuration, and the composer's bar carries one
+                // run-configuration control instead of a row of chips.
                 let cascade = self.render_composer_runtime_cascade(
                     desired.clone(),
                     catalog,
+                    projection.clone(),
                     compact_runtime_controls,
                     cx,
                 );
-                let mut other = Vec::new();
-                if !projection.reasoning_efforts.is_empty() {
-                    let default_effort =
-                        runtime_default_reasoning_effort(&projection.reasoning_efforts);
-                    other.push(self.render_composer_runtime_choice(
-                        "effort".into(),
-                        locale::text("Thinking depth", "思考深度", "思考深度").into(),
-                        new_session_selector_icon(
-                            "icons/vibex/brain.svg",
-                            theme::semantic_color("chart-3", is_dark),
-                        ),
-                        projection.reasoning_efforts.clone(),
-                        runtime_reasoning_effort_value(Some(&desired)),
-                        default_effort,
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                if !projection.modes.is_empty() {
-                    other.push(self.render_composer_runtime_choice(
-                        "mode".into(),
-                        locale::text("Conversation mode", "对话模式", "對話模式").into(),
-                        new_session_selector_icon(
-                            "icons/vibex/shield-alert.svg",
-                            theme::semantic_color("chart-4", is_dark),
-                        ),
-                        projection.modes.clone(),
-                        desired.mode_id.clone().unwrap_or_default(),
-                        None,
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                for feature in projection.features.iter().cloned() {
-                    other.push(self.render_runtime_feature(
-                        RuntimeFeatureTarget::ActiveSession,
-                        feature,
-                        desired.clone(),
-                        compact_runtime_controls,
-                        cx,
-                    ));
-                }
-                (cascade, other)
+                (cascade, Vec::<AnyElement>::new())
             } else if session_uninitialized && !compact_runtime_controls {
                 // Imported sessions have no runtime selection yet. Offer the
                 // session's Agent for first activation instead of hiding the
@@ -77380,10 +80220,17 @@ impl VibexWorkbench {
             } else {
                 (Empty.into_any_element(), Vec::new())
             };
-        // A slim bar seats the action on its own row, where 28 px matches the
-        // controls beside it; the full box seats it in the trailing column, where
-        // 32 px matches the two stacked buttons above it.
-        let primary_action_size = if composer_is_slim { 28.0 } else { 32.0 };
+        // The cascade seats on exactly one of the two layouts, so the branch
+        // that mounts it takes it out of the slot.
+        let mut runtime_controls_cascade = Some(runtime_controls_cascade);
+        // The slim bar closes its row with the disc the bar is built around,
+        // while the full box seats a 32px action that matches the corner
+        // button above.
+        let primary_action_size = if composer_is_slim {
+            COMPOSER_SLIM_PRIMARY_ACTION_SIZE
+        } else {
+            32.0
+        };
         let primary_action = if session_running {
             Button::new("interrupt-agent")
                 .danger()
@@ -77405,22 +80252,67 @@ impl VibexWorkbench {
                 .on_click(cx.listener(|this, _, window, cx| this.interrupt_session(window, cx)))
                 .into_any_element()
         } else {
+            // The send disc is the one saturated control on the surface, and
+            // the kit's disabled wash paints it at a tenth of the accent, which
+            // on a dark page leaves a flat grey hole where the reader expects
+            // the button. So the disc keeps its own fill — quiet until there is
+            // something to send, bright once there is — while the button stays
+            // disabled exactly as before: the press is what is gated, not the
+            // picture.
+            let send_ready = can_send && enabled && !self.agent_action_pending;
+            let send_fill = if send_ready {
+                cx.theme().foreground
+            } else {
+                motion::mix(cx.theme().foreground, composer_background, 0.62)
+            };
+            let send_ink = if send_ready {
+                cx.theme().background
+            } else {
+                cx.theme().foreground.opacity(0.5)
+            };
+            let send_loading = self.agent_action_pending || self.agent_turn_pending;
             Button::new("send-agent-message")
-                .primary()
+                // The variant owns the hover and active washes as well as the
+                // rest fill: a direct `.hover(...)` on a Button collides with
+                // the kit's own hover slot and panics.
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(send_fill)
+                        .foreground(send_ink)
+                        .hover(motion::mix(send_fill, cx.theme().background, 0.12))
+                        .active(motion::mix(send_fill, cx.theme().background, 0.2)),
+                )
                 .compact()
                 .size(px(primary_action_size))
                 .rounded(px(primary_action_size / 2.0))
-                .icon(IconName::ArrowUp)
+                .bg(send_fill)
+                // The arrow is a child at a fixed size rather than the button's
+                // icon: the kit draws an icon at three quarters of its button,
+                // and a 24px arrow inside a 32px disc filled the circle edge to
+                // edge instead of sitting in it. A pending send drops the arrow
+                // and lets the button mount its own spinner in that place, so
+                // the disc never shows two marks at once.
+                .when(!send_loading, |button| {
+                    button.child(
+                        Icon::new(IconName::ArrowUp)
+                            .size(px(16.0))
+                            .text_color(send_ink),
+                    )
+                })
                 .tooltip(if self.composer_message_schedule().is_some() {
                     locale::text("Schedule message", "定时发送", "定時傳送")
                 } else {
                     locale::text("Send message", "发送消息", "傳送訊息")
                 })
-                .loading(self.agent_action_pending || self.agent_turn_pending)
+                .loading(send_loading)
                 .disabled(!can_send || !enabled)
                 .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx)))
                 .into_any_element()
         };
+        // The send/stop action seats on exactly one of the two layouts — the
+        // slim bar's own row or the full box's control row — so the branch
+        // that mounts it takes it out of the slot.
+        let mut primary_action = Some(primary_action);
         v_flex()
             .id("agent-composer")
             .relative()
@@ -77701,25 +80593,31 @@ impl VibexWorkbench {
                         v_flex()
                             .w_full()
                             .min_w_0()
-                            // The slim bar is one row tall; the full box keeps
-                            // its reserved two rows and control column. Both read
-                            // the same border, fill and shadow, so the densities
-                            // differ only in the room they ask for.
-                            .min_h(px(if composer_is_slim {
-                                COMPOSER_SLIM_SURFACE_HEIGHT
-                            } else {
-                                ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT
-                            }))
+                            // The surface paints the morphed height while the
+                            // density decision has already committed its final
+                            // layout: the box sweeps between the one-line bar
+                            // and the growing multi-row box, and the caret and
+                            // draft inside it never remount. Both densities
+                            // read the same border, fill and shadow.
+                            .h(px(composer_surface_height_now))
+                            .overflow_hidden()
                             .when(self.composer_expanded, |this| {
-                                this.flex_1().min_h(px(240.0))
+                                this.h_auto().flex_1().min_h(px(240.0))
                             })
-                            .rounded(px(if composer_is_slim {
-                                COMPOSER_SLIM_SURFACE_RADIUS
-                            } else {
-                                COMPOSER_SURFACE_RADIUS
-                            }))
+                            .rounded(px(composer_surface_radius))
                             .border_1()
-                            .border_color(cx.theme().border)
+                            // The focused pane's composer is where that pane
+                            // says it holds the keyboard: the box wears the
+                            // focus ring every focused control wears, while the
+                            // pane frame stays quiet. In the single-session
+                            // column there is no pane to mark, so the caret in
+                            // the box is what lights the edge.
+                            .border_color(composer_surface_border(
+                                is_dark,
+                                pane_focused,
+                                composer_input_focused,
+                                cx,
+                            ))
                             .bg(composer_background)
                             .when(composer_extension_visible, |this| {
                                 this.shadow(vec![
@@ -77745,13 +80643,17 @@ impl VibexWorkbench {
                             .when(!composer_extension_visible && !is_dark, |this| this.shadow_sm())
                             .on_prepaint({
                                 let surface_session = geometry_session.clone();
+                                let surface_morph_key = composer_morph_key.clone();
                                 move |bounds, _, cx| {
                                     let _ = surface_geometry_entity.update(cx, |this, cx| {
                                         let changed = this.record_composer_geometry(
                                             surface_session.as_deref(),
                                             |geometry| geometry.surface_bounds = Some(bounds),
                                         );
-                                        if changed {
+                                        if composer_measurement_wants_repaint(
+                                            changed,
+                                            &surface_morph_key,
+                                        ) {
                                             cx.notify();
                                         }
                                     });
@@ -77761,17 +80663,24 @@ impl VibexWorkbench {
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
-                                    // The slim bar centres its one line; the full
-                                    // box aligns the text to the top of the two
-                                    // rows it reserves.
+                                    // The slim bar is ONE row: the input line and
+                                    // every control share it, vertically centred.
+                                    // The full box aligns the text to the top of
+                                    // the rows it reserves and keeps its control
+                                    // row underneath.
                                     .map(|this| {
                                         if composer_is_slim {
-                                            this.min_h(px(COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT))
+                                            this.flex_1()
                                                 .items_center()
                                                 .px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
-                                                .py_1()
+                                                .py(px(COMPOSER_SLIM_ROW_VERTICAL_PADDING))
                                         } else {
-                                            this.min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                            // The trailing column is taller than
+                                            // two text rows, so the row reserves
+                                            // its height; the input stretches to
+                                            // meet it rather than leaving a band
+                                            // of dead space under a short draft.
+                                            this.min_h(px(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT))
                                                 .flex_1()
                                                 .items_start()
                                                 .px_3()
@@ -77790,14 +80699,19 @@ impl VibexWorkbench {
                                                 ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT
                                             }))
                                             .flex_1()
-                                            // The expanded composer is a fullscreen input:
-                                            // the slot stretches and the textarea fills it,
-                                            // instead of stopping at the auto-grow row cap.
-                                            .when(self.composer_expanded, |this| {
+                                            // The expanded composer is a fullscreen
+                                            // input: the slot stretches and the
+                                            // textarea fills it, instead of stopping
+                                            // at the auto-grow row cap. The full box
+                                            // stretches too, so the empty rows below a
+                                            // short draft are still the input: a press
+                                            // there places the caret.
+                                            .when(!composer_is_slim, |this| {
                                                 this.self_stretch()
                                             })
                                             .on_prepaint({
                                                 let input_session = geometry_session.clone();
+                                                let input_morph_key = composer_morph_key.clone();
                                                 move |bounds, _, cx| {
                                                     let _ = input_geometry_entity.update(
                                                         cx,
@@ -77810,7 +80724,10 @@ impl VibexWorkbench {
                                                                             Some(bounds)
                                                                     },
                                                                 );
-                                                            if changed {
+                                                            if composer_measurement_wants_repaint(
+                                                                changed,
+                                                                &input_morph_key,
+                                                            ) {
                                                                 cx.notify();
                                                             }
                                                         },
@@ -77993,9 +80910,12 @@ impl VibexWorkbench {
                                                     // by the time the next frame
                                                     // renders it.
                                                     .readonly(!enabled)
-                                                    .when(self.composer_expanded, |this| {
-                                                        this.h_full()
-                                                    })
+                                                    // The full box reserves the
+                                                    // trailing column's height for
+                                                    // its input; the editor owns the
+                                                    // whole band so a press below the
+                                                    // last line still places the caret.
+                                                    .when(!composer_is_slim, |this| this.h_full())
                                                     .on_token_click(cx.listener(
                                                         |this,
                                                          event: &InlineTokenClickEvent,
@@ -78010,29 +80930,67 @@ impl VibexWorkbench {
                                                     )),
                                             )
                                     )
-                                    // The trailing column is three stacked
-                                    // controls, so it is taller than the text
-                                    // beside it and sets the floor for the whole
-                                    // surface. A slim bar has one row to spend, so
-                                    // the same three controls are laid along that
-                                    // row instead — see the slim branch below.
-                                    .when(!composer_is_slim, |this| {
-                                        this.child(
-                                            v_flex()
-                                                .flex_none()
-                                                .items_center()
-                                                .gap_1()
-                                                .child(
-                                                    Button::new("toggle-composer-expanded")
-                                                    .xsmall()
+                                    // The two densities seat their controls
+                                    // differently, and neither carries the
+                                    // schedule or the terminal any more: those
+                                    // moved to the line under the surface, where
+                                    // they answer for the session as a whole.
+                                    // The slim bar keeps attach and expand beside
+                                    // the text; the full box seats expand in the
+                                    // trailing corner and attach on the control
+                                    // row below. Nothing is dropped from either
+                                    // density.
+                                    .map(|this| {
+                                        if composer_is_slim {
+                                            this.child(composer_instrument_hover_target(
+                                                COMPOSER_ATTACH_HOVER_KEY,
+                                                cx.entity_id(),
+                                                Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(30.0))
-                                                    .icon(if self.composer_expanded {
-                                                        IconName::Minimize
-                                                    } else {
-                                                        IconName::Maximize
-                                                    })
+                                                    .size(px(COMPOSER_SLIM_ROW_CONTROL_SIZE))
+                                                    .rounded(px(
+                                                        COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
+                                                    ))
+                                                    .child(composer_instrument_glyph(
+                                                        Icon::default()
+                                                            .path("icons/vibex/paperclip.svg"),
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        attach_ink,
+                                                    ))
+                                                    .tooltip(locale::text(
+                                                        "Add attachments",
+                                                        "添加附件",
+                                                        "新增附件",
+                                                    ))
+                                                    .disabled(self.agent_action_pending)
+                                                    .on_click(cx.listener(
+                                                        |this, _, window, cx| {
+                                                            this.choose_composer_attachments(
+                                                                window, cx,
+                                                            )
+                                                        },
+                                                    )),
+                                            ))
+                                            .child(composer_instrument_hover_target(
+                                                COMPOSER_EXPAND_HOVER_KEY,
+                                                cx.entity_id(),
+                                                Button::new("toggle-composer-expanded")
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(COMPOSER_SLIM_ROW_CONTROL_SIZE))
+                                                    .rounded(px(
+                                                        COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
+                                                    ))
+                                                    .child(composer_instrument_glyph(
+                                                        if self.composer_expanded {
+                                                            Icon::new(IconName::Minimize)
+                                                        } else {
+                                                            Icon::new(IconName::Maximize)
+                                                        },
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        expand_ink,
+                                                    ))
                                                     .tooltip(if self.composer_expanded {
                                                         locale::text(
                                                             "Collapse input",
@@ -78051,102 +81009,101 @@ impl VibexWorkbench {
                                                             !this.composer_expanded;
                                                         cx.notify();
                                                     })),
-                                            )
-                                            .when_some(self.view_session_id.clone(), |this, session_id| {
-                                                this.child(self.render_message_schedule_button(
-                                                    MessageScheduleTarget::Session(session_id),
-                                                    enabled,
-                                                    cx,
-                                                ))
-                                            })
-                                            .child(self.render_composer_terminal_menu(cx)),
-                                        )
-                                    })
-                                    // The same three controls, on the bar's own
-                                    // row. Nothing is dropped from the slim
-                                    // composer: it is the full one with its
-                                    // column folded flat.
-                                    .when(composer_is_slim, |this| {
-                                        this.child(
-                                            Button::new("toggle-composer-expanded")
-                                                .xsmall()
-                                                .ghost()
-                                                .compact()
-                                                .size(px(28.0))
-                                                .px_0()
-                                                .icon(if self.composer_expanded {
-                                                    IconName::Minimize
-                                                } else {
-                                                    IconName::Maximize
-                                                })
-                                                .tooltip(if self.composer_expanded {
-                                                    locale::text(
-                                                        "Collapse input",
-                                                        "收起输入框",
-                                                        "收合輸入框",
-                                                    )
-                                                } else {
-                                                    locale::text(
-                                                        "Expand input",
-                                                        "展开输入框",
-                                                        "展開輸入框",
-                                                    )
-                                                })
-                                                .on_click(cx.listener(|this, _, _, cx| {
-                                                    this.composer_expanded =
-                                                        !this.composer_expanded;
-                                                    cx.notify();
-                                                })),
-                                        )
-                                        .when_some(
-                                            self.view_session_id.clone(),
-                                            |this, session_id| {
-                                                this.child(
-                                                    self.render_message_schedule_button(
-                                                        MessageScheduleTarget::Session(
-                                                            session_id,
-                                                        ),
-                                                        enabled,
-                                                        cx,
-                                                    ),
-                                                )
-                                            },
-                                        )
-                                        .child(self.render_composer_terminal_menu(cx))
+                                            ))
+                                            .children(runtime_controls_cascade.take())
+                                            .children(primary_action.take())
+                                        } else {
+                                            // One button in the corner: the clock
+                                            // and the terminal live on the line
+                                            // under the box now. It draws its own
+                                            // glyph for the pointer's ink, so the
+                                            // seat clears the kit's inset padding
+                                            // (see the footer's instruments), and
+                                            // it draws the slim row's 15px mark so
+                                            // the same control reads the same size
+                                            // in both densities.
+                                            this.child(composer_instrument_hover_target(
+                                                COMPOSER_EXPAND_HOVER_KEY,
+                                                cx.entity_id(),
+                                                Button::new("toggle-composer-expanded")
+                                                    .xsmall()
+                                                    .ghost()
+                                                    .compact()
+                                                    .size(px(COMPOSER_TRAILING_CONTROL_SIZE))
+                                                    .p(px(0.0))
+                                                    .child(composer_instrument_glyph(
+                                                        if self.composer_expanded {
+                                                            Icon::new(IconName::Minimize)
+                                                        } else {
+                                                            Icon::new(IconName::Maximize)
+                                                        },
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        expand_ink,
+                                                    ))
+                                                    .tooltip(if self.composer_expanded {
+                                                        locale::text(
+                                                            "Collapse input",
+                                                            "收起输入框",
+                                                            "收合輸入框",
+                                                        )
+                                                    } else {
+                                                        locale::text(
+                                                            "Expand input",
+                                                            "展开输入框",
+                                                            "展開輸入框",
+                                                        )
+                                                    })
+                                                    .on_click(cx.listener(|this, _, _, cx| {
+                                                        this.composer_expanded =
+                                                            !this.composer_expanded;
+                                                        cx.notify();
+                                                    })),
+                                            ))
+                                        }
                                     }),
                             )
                             .when_some(self.composer_message_schedule(), |this, schedule| {
                                 this.child(self.render_message_schedule_draft_hint(schedule, cx))
                             })
-                            .child(
+                            // The full box keeps its control row under the
+                            // text: attachments on the left, the run-configuration
+                            // cascade and the send action on the right. The
+                            // slim bar has already seated every one of these
+                            // on its single row above. The usage ring and the
+                            // schedule/terminal controls live on the footer
+                            // line below, so neither density repeats them here.
+                            .when(!composer_is_slim, |this| {
+                                this.child(
                                 h_flex()
                                     .w_full()
                                     .min_w_0()
                                     .items_center()
                                     .justify_between()
                                     .gap_2()
-                                    .map(|this| {
-                                        if composer_is_slim {
-                                            this.px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
-                                                .pb_1()
-                                        } else {
-                                            this.px_3().pb_3()
-                                        }
-                                    })
+                                    .px_3()
+                                    .pb_3()
                                     .child(
                                         h_flex()
-                                            .id("composer-runtime-controls-scroll")
+                                            .id("composer-runtime-controls-left")
                                             .min_w_0()
                                             .flex_1()
                                             .items_center()
                                             .gap_1()
                                             .overflow_x_scroll()
-                                            .child(
+                                            .child(composer_instrument_hover_target(
+                                                COMPOSER_ATTACH_HOVER_KEY,
+                                                cx.entity_id(),
                                                 Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
                                                     .size(px(primary_action_size))
-                                                    .icon(IconName::Plus)
+                                                    .rounded(px(primary_action_size / 2.0))
+                                                    .child(composer_instrument_glyph(
+                                                        Icon::default()
+                                                            .path("icons/vibex/paperclip.svg"),
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        attach_ink,
+                                                    ))
                                                     .tooltip(locale::text(
                                                         "Add attachments",
                                                         "添加附件",
@@ -78160,35 +81117,15 @@ impl VibexWorkbench {
                                                             )
                                                         },
                                                     )),
-                                            )
+                                            ))
                                             .children(runtime_controls_other)
                                     )
                                     .child(
                                         h_flex()
-                                            .id("composer-runtime-controls-cascade")
+                                            .id("composer-runtime-controls-right")
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(button_with_aria_label(
-                                                Button::new("open-session-usage")
-                                                    .ghost()
-                                                    .compact()
-                                                    .size(px(32.0))
-                                                    .on_click(cx.listener(|this, _, _, cx| {
-                                                        let session_filter =
-                                                            this.selected_session_id.clone();
-                                                        this.open_usage(session_filter, cx);
-                                                    }))
-                                                    .child(render_cache_token_ring(
-                                                        self.token_usage.as_ref(),
-                                                        cx,
-                                                    )),
-                                                locale::text(
-                                                    "Open usage statistics",
-                                                    "打开用量统计",
-                                                    "開啟用量統計",
-                                                ),
-                                            ))
                                             .when_some(
                                                 delegation_subject.as_ref().and_then(|mention| {
                                                     mention.agent_id.as_ref().map(|agent_id| {
@@ -78219,17 +81156,27 @@ impl VibexWorkbench {
                                                     )
                                                 },
                                             )
-                                            .child(runtime_controls_cascade),
+                                            .children(runtime_controls_cascade.take()),
                                     )
                                     .child(
                                         h_flex()
                                             .flex_none()
                                             .items_center()
                                             .gap_1()
-                                            .child(primary_action),
+                                            .children(primary_action.take()),
                                     ),
-                            ),
-                    ),
+                                )
+                            }),
+                    )
+                    .child(self.render_composer_footer(
+                        enabled,
+                        if composer_is_slim {
+                            COMPOSER_SLIM_HORIZONTAL_PADDING
+                        } else {
+                            12.0
+                        },
+                        cx,
+                    )),
             )
             .into_any_element()
     }
@@ -78254,7 +81201,7 @@ impl VibexWorkbench {
         let Some(session) = self.selected_session().cloned() else {
             return empty_center_content();
         };
-        self.render_session_terminal_page_for_session(session, true, window, cx)
+        self.render_session_terminal_page_for_session(session, true, false, window, cx)
     }
 
     /// The terminal page for one session.
@@ -78267,6 +81214,7 @@ impl VibexWorkbench {
         &mut self,
         session: AgentSession,
         focused: bool,
+        pane_focused: bool,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
@@ -78295,7 +81243,15 @@ impl VibexWorkbench {
                     // the radius cuts away.
                     .bg(window_fill)
                     .border_1()
-                    .border_color(cx.theme().border)
+                    // A selected pane is marked by its content: a terminal
+                    // lights its own rounded window, the way the active pane is
+                    // drawn in a terminal multiplexer. The single-session page
+                    // has no pane to mark and keeps the hairline.
+                    .border_color(if pane_focused {
+                        cx.theme().ring
+                    } else {
+                        cx.theme().border
+                    })
                     .child(body),
             )
             .into_any_element()
@@ -78569,7 +81525,9 @@ impl VibexWorkbench {
     ///
     /// The single-session column shows one terminal; an open group shows the
     /// active tab of every pane it paints. A hidden tab and a pane the
-    /// maximized layout is not drawing are not visible, so they stay out.
+    /// maximized layout is not drawing are not visible, so they stay out. The
+    /// set follows the painted panes, not the presentation budget, so a pane
+    /// that loses the keyboard keeps its grid polling.
     fn visible_terminal_session_ids(&self) -> BTreeSet<String> {
         let mut visible = BTreeSet::new();
         if self.ui_state.workbench.active_tab != "agent"
@@ -78579,7 +81537,7 @@ impl VibexWorkbench {
             return visible;
         }
         if let Some((_, group)) = self.active_session_group() {
-            let live = group.live_session_ids();
+            let painted = group.painted_session_ids();
             for pane_id in group.layout.pane_ids() {
                 if group
                     .maximized_pane_id
@@ -78595,7 +81553,7 @@ impl VibexWorkbench {
                 else {
                     continue;
                 };
-                if live.iter().any(|id| id == active) {
+                if painted.iter().any(|id| id == active) {
                     self.note_visible_terminal_session(&mut visible, active);
                 }
             }
@@ -78909,6 +81867,27 @@ impl VibexWorkbench {
         view
     }
 
+    /// The transcript surface's own render boundary, created on first use for
+    /// the session it draws.
+    ///
+    /// Keyed by session — a surface renders the transcript of its own view — and
+    /// `__none__` stands for a workbench with no session, which is the only key
+    /// the composer's own map uses too.
+    fn ensure_timeline_surface_view(
+        &mut self,
+        session_id: Option<&VibexSessionId>,
+        cx: &mut Context<Self>,
+    ) -> Entity<TimelineSurfaceView> {
+        let key = session_id.map_or_else(|| "__none__".to_string(), |id| id.as_str().to_string());
+        if let Some(view) = self.timeline_surface_views.get(&key) {
+            return view.clone();
+        }
+        let workbench = cx.entity();
+        let view = cx.new(|cx| TimelineSurfaceView::new(&workbench, session_id.cloned(), cx));
+        self.timeline_surface_views.insert(key, view.clone());
+        view
+    }
+
     fn ensure_timeline_view(&mut self, cx: &mut Context<Self>) -> Entity<TimelineView> {
         if let Some(view) = self.timeline_view.as_ref() {
             return view.clone();
@@ -78927,21 +81906,25 @@ impl VibexWorkbench {
         &mut self,
         session_id: Option<&VibexSessionId>,
         enabled: bool,
+        pane_focused: bool,
         cx: &mut Context<Self>,
     ) -> Entity<ComposerView> {
         let key = session_id.map_or_else(|| "__none__".to_string(), |id| id.as_str().to_string());
         if let Some(view) = self.composer_views.get(&key) {
             let view = view.clone();
-            if view.read(cx).enabled != enabled {
+            if view.read(cx).enabled != enabled || view.read(cx).pane_focused != pane_focused {
                 view.update(cx, |this, cx| {
                     this.enabled = enabled;
+                    this.pane_focused = pane_focused;
                     cx.notify();
                 });
             }
             return view;
         }
         let workbench = cx.entity();
-        let view = cx.new(|cx| ComposerView::new(&workbench, session_id.cloned(), enabled, cx));
+        let view = cx.new(|cx| {
+            ComposerView::new(&workbench, session_id.cloned(), enabled, pane_focused, cx)
+        });
         self.composer_views.insert(key, view.clone());
         view
     }
@@ -78958,6 +81941,12 @@ impl VibexWorkbench {
             view.update(cx, |_, cx| cx.notify());
         }
         for view in self.session_group_pane_views.values() {
+            view.update(cx, |_, cx| cx.notify());
+        }
+        // A pane view only mounts its session's surface; it does not notify it.
+        // The surface is the view that owns the list, so the repaint has to
+        // reach it by name.
+        for view in self.timeline_surface_views.values() {
             view.update(cx, |_, cx| cx.notify());
         }
     }
@@ -79870,6 +82859,7 @@ impl VibexWorkbench {
                     if changed {
                         this.session_group_pane_views.clear();
                         this.composer_views.clear();
+                        this.timeline_surface_views.clear();
                         this.queue_ui_state();
                         this.publish_sidebar_invalidation();
                         cx.notify();
@@ -86652,6 +89642,38 @@ fn runtime_attribution_line(attribution: &str) -> String {
         .join(SEPARATOR)
 }
 
+/// The model a selection names, without the account it runs as.
+///
+/// The run-configuration trigger is a chip on the Composer's bar, where the
+/// model name is the part the reader scans for; the account is the same for
+/// most of a session's life and is reported in the tooltip and in the panel.
+/// Both branches read the catalogue when it describes the selection, because
+/// the catalogue's labels are the names the reader chose.
+fn runtime_model_label(
+    option: Option<&SessionRuntimeOption>,
+    selection: &SessionRuntimeSelection,
+) -> String {
+    option
+        .map(|option| option.model_label.clone())
+        .unwrap_or_else(|| runtime_model_selection_label(&selection.model))
+}
+
+/// The account a selection runs as, named for a tooltip.
+///
+/// The catalogue's own auth-source label is the name the reader gave the
+/// Provider Profile; a selection the catalogue has not described yet falls
+/// back to the kind, as the chip's composed label does.
+fn runtime_selection_account_label(
+    option: Option<&SessionRuntimeOption>,
+    selection: &SessionRuntimeSelection,
+) -> String {
+    option
+        .map(|option| {
+            runtime_auth_source_selection_label(&selection.auth_source, &option.auth_source_label)
+        })
+        .unwrap_or_else(|| runtime_auth_source_placeholder_label(&selection.auth_source))
+}
+
 fn runtime_provider_model_label(
     option: Option<&SessionRuntimeOption>,
     selection: &SessionRuntimeSelection,
@@ -86659,7 +89681,7 @@ fn runtime_provider_model_label(
     option
         .map(|option| {
             format!(
-                "{} / {}",
+                "{}/{}",
                 runtime_auth_source_selection_label(
                     &selection.auth_source,
                     &option.auth_source_label,
@@ -86675,7 +89697,7 @@ fn runtime_provider_model_label(
             // a name the reader chose, so the route's own label and the model
             // part are shown instead of the addresses.
             format!(
-                "{} / {}",
+                "{}/{}",
                 runtime_auth_source_placeholder_label(&selection.auth_source),
                 runtime_model_selection_label(&selection.model)
             )
@@ -87439,6 +90461,25 @@ fn runtime_selector_dropdown_content(
     compact: bool,
     cx: &App,
 ) -> AnyElement {
+    runtime_selector_dropdown_content_parts(icon, selected_label, None, compact, cx)
+}
+
+/// The control's label in two parts: the name that may truncate, and a suffix
+/// that names the rest of the configuration and must not.
+///
+/// The run-configuration trigger reads "provider/model · thinking depth". When
+/// one label carried both, a long model name ate the depth: the whole string
+/// truncated from the right. The depth is the part that tells two otherwise
+/// identical trigger labels apart, so it keeps its width and the model name —
+/// the part a long name makes unreadable anyway — is the one that truncates.
+/// With room to spare both are shown in full.
+fn runtime_selector_dropdown_content_parts(
+    icon: AnyElement,
+    selected_label: String,
+    suffix: Option<String>,
+    compact: bool,
+    cx: &App,
+) -> AnyElement {
     if compact {
         div()
             .size_full()
@@ -87448,18 +90489,39 @@ fn runtime_selector_dropdown_content(
             .child(icon)
             .into_any_element()
     } else {
-        h_flex()
-            .flex_none()
+        let has_suffix = suffix.is_some();
+        let content = h_flex()
+            .min_w_0()
             .gap(px(6.0))
             .child(div().flex_none().child(icon))
-            .child(div().flex_none().whitespace_nowrap().child(selected_label))
+            .child(div().min_w_0().truncate().child(selected_label))
+            .when_some(suffix, |this, suffix| {
+                this.child(
+                    div()
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(cx.theme().muted_foreground)
+                        .child(suffix),
+                )
+            })
             .child(
                 Icon::new(IconName::ChevronDown)
                     .size(px(13.0))
                     .flex_none()
                     .text_color(cx.theme().muted_foreground),
-            )
-            .into_any_element()
+            );
+        // Without a suffix the row keeps its legacy sizing: it is as wide as
+        // its label and the surrounding chip clips it. With a suffix the row
+        // caps itself instead, so the flex layout shrinks the label and keeps
+        // the suffix and the chevron at their full width.
+        // The trigger chip is capped at 240px including its own padding, so
+        // the label row keeps 224 of them.
+        let content = if has_suffix {
+            content.max_w(px(224.0))
+        } else {
+            content.flex_none()
+        };
+        content.into_any_element()
     }
 }
 
@@ -87581,6 +90643,24 @@ fn sidebar_new_session_for_folder_label(
     }
 }
 
+fn sidebar_session_group_actions_label(locale: locale::ResolvedLocale, group_name: &str) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("Actions for group {group_name}"),
+        locale::ResolvedLocale::ZhCn => format!("「{group_name}」会话组操作"),
+        locale::ResolvedLocale::ZhTw => format!("「{group_name}」會話組操作"),
+        _ => format!("Actions for group {group_name}"),
+    }
+}
+
+fn sidebar_new_session_for_group_label(locale: locale::ResolvedLocale, group_name: &str) -> String {
+    match locale {
+        locale::ResolvedLocale::En => format!("New chat in group {group_name}"),
+        locale::ResolvedLocale::ZhCn => format!("在「{group_name}」会话组中新建会话"),
+        locale::ResolvedLocale::ZhTw => format!("在「{group_name}」會話組中建立會話"),
+        _ => format!("New chat in group {group_name}"),
+    }
+}
+
 fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &str) -> String {
     match locale {
         locale::ResolvedLocale::En => {
@@ -87591,6 +90671,19 @@ fn sidebar_delete_session_description(locale: locale::ResolvedLocale, title: &st
         _ => {
             format!("Delete \"{title}\"? This action cannot be undone.")
         }
+    }
+}
+
+/// Paints one state of a group pane's frame off the theme's `border` hairline.
+///
+/// The weight multiplies the token's alpha directly: `Hsla::opacity` clamps its
+/// factor below 1, so a hover weight through it would silently hand back the
+/// resting hairline. Hue and lightness stay the token's, which is what keeps
+/// hover a brightening of the same line rather than a second colour on screen.
+fn session_group_pane_frame(border: Hsla, weight: f32) -> Hsla {
+    Hsla {
+        a: (border.a * weight).min(1.0),
+        ..border
     }
 }
 
@@ -88506,7 +91599,15 @@ fn tabular_numerals() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
 }
 
-fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> AnyElement {
+/// The usage ring on the footer.
+///
+/// The ring is a readout, not a control: it draws at three quarters of the
+/// button that carries it, in muted ink, so the footer's three instruments
+/// read as one quiet group rather than three buttons of the same weight. The
+/// centre is left empty — the percentage lives in the tooltip and the panel —
+/// because a number inside a 22px ring at this size is unreadable and the ring
+/// itself already says the fraction.
+fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, size: f32, cx: &mut App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let context_fraction = usage.and_then(context_window_usage_fraction);
     // `ProgressCircle` paints its track from the progress color at reduced
@@ -88617,12 +91718,18 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, cx: &mut App) -> Any
     div()
         .id("composer-cache-token-ring")
         .flex_none()
-        .size(px(28.0))
+        .size(px(size))
         .flex()
         .items_center()
         .justify_center()
         .child(
+            // The ring is asked for the square that paints
+            // `COMPOSER_FOOTER_RING_SIZE`, not for the control's own square:
+            // `ProgressCircle` draws at three quarters of the size it is given,
+            // so the raw 22px seat used to land a 16.5px disc — the loudest mark
+            // on a row of 14px glyphs instead of a peer of them.
             ProgressCircle::new("composer-cache-token-ring-progress")
+                .size(px(COMPOSER_FOOTER_RING_SIZE / PROGRESS_CIRCLE_DRAWN_SCALE))
                 .value(context_percent)
                 .color(progress_color),
         )
@@ -90316,6 +93423,28 @@ fn connections_profile_id(alias: &str, now_ms: i64) -> String {
 ///
 /// Both edit the same `SshConnectionProfile`, so they read the same input
 /// entities and render the same labels; only the surrounding surface differs.
+/// What a detected data directory is, in the reader's language.
+fn runtime_home_kind_labels(
+    kind: crate::ssh_connection::homes::RuntimeHomeKind,
+) -> (&'static str, &'static str, &'static str) {
+    use crate::ssh_connection::homes::RuntimeHomeKind as Kind;
+    match kind {
+        Kind::Managed => ("Independent data", "独立数据", "獨立資料"),
+        Kind::DesktopStable => (
+            "Desktop data · stable",
+            "桌面端数据 · stable",
+            "桌面端資料 · stable",
+        ),
+        Kind::DesktopRc => ("Desktop data · rc", "桌面端数据 · rc", "桌面端資料 · rc"),
+        Kind::DesktopPreview => (
+            "Desktop data · preview",
+            "桌面端数据 · preview",
+            "桌面端資料 · preview",
+        ),
+        Kind::DesktopLegacy => ("Desktop data · legacy", "旧版桌面端数据", "舊版桌面端資料"),
+    }
+}
+
 fn ssh_profile_edit_fields(
     name: &Entity<InputState>,
     client: &Entity<InputState>,
@@ -96036,6 +99165,7 @@ impl FoundationSettings {
                 proxy_jump: effective.proxy_jump,
                 remote_install_root,
                 remote_home: environment.home.clone(),
+                runtime_home: None,
                 remote_os: Some(environment.os.clone()),
                 workspace_roots: vec![environment.home.clone()],
                 remote_port,
@@ -102052,6 +105182,8 @@ impl Render for VibexWorkbench {
         // still has a blend mid-flight is asked for its next frame directly, so
         // a fade inside a cached subtree advances without rebuilding the window.
         motion::schedule_hover_frames(window);
+        // The composer's height glide rides the same per-frame drive.
+        motion::schedule_height_morph_frames(window);
         self.present_persistence_note(window, cx);
         self.present_settings_operation_notice(window, cx);
         self.present_runtime_registry_error(window, cx);
@@ -108870,7 +112002,7 @@ mod tests {
             v_flex()
                 .w(px(list_width))
                 .child(
-                    v_virtual_list(
+                    gpui_base::v_virtual_list(
                         cx.entity(),
                         "user-message-fit-list",
                         row_sizes,
@@ -109523,6 +112655,94 @@ mod tests {
                                         .child(h_flex().w_full().h(px(52.0)).flex_none()),
                                 ),
                         ),
+                )
+        }
+    }
+
+    /// Mirrors the full box's height chain: the surface reserves the input's
+    /// minimum band, the input row stretches to meet it, and the textarea fills
+    /// it. The slot is measured because a band left as padding under a short
+    /// draft is exactly the regression this pins.
+    struct ComposerFullBoxLayoutProbe {
+        input: Entity<TextareaState>,
+        surface_height: Rc<Cell<f32>>,
+        input_row_height: Rc<Cell<f32>>,
+        input_slot_height: Rc<Cell<f32>>,
+        slot_origin: Rc<Cell<f32>>,
+        control_row_height: Rc<Cell<f32>>,
+    }
+
+    impl Render for ComposerFullBoxLayoutProbe {
+        fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+            let surface_height = self.surface_height.clone();
+            let input_row_height = self.input_row_height.clone();
+            let input_slot_height = self.input_slot_height.clone();
+            let slot_origin = self.slot_origin.clone();
+            let control_row_height = self.control_row_height.clone();
+            v_flex()
+                .id("agent-workbench")
+                .size_full()
+                .min_h_0()
+                .justify_end()
+                .overflow_hidden()
+                .child(
+                    v_flex().w(px(720.0)).child(
+                        v_flex()
+                            .w_full()
+                            .min_w_0()
+                            .h(px(composer_surface_height(ComposerDensity::Full, 2)))
+                            .overflow_hidden()
+                            .border_1()
+                            .on_prepaint(move |bounds, _, _| {
+                                surface_height.set(f32::from(bounds.size.height));
+                            })
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .min_w_0()
+                                    .min_h(px(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT))
+                                    .flex_1()
+                                    .items_start()
+                                    .px_3()
+                                    .pt_3()
+                                    .pb_1()
+                                    .on_prepaint(move |bounds, _, _| {
+                                        input_row_height.set(f32::from(bounds.size.height));
+                                    })
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))
+                                            .flex_1()
+                                            .self_stretch()
+                                            .on_prepaint(move |bounds, _, _| {
+                                                input_slot_height
+                                                    .set(f32::from(bounds.size.height));
+                                                slot_origin.set(f32::from(bounds.origin.y));
+                                            })
+                                            .child(
+                                                Textarea::new(&self.input)
+                                                    .appearance(false)
+                                                    .h_full(),
+                                            ),
+                                    )
+                                    .child(
+                                        v_flex()
+                                            .flex_none()
+                                            .items_center()
+                                            .child(div().size(px(COMPOSER_TRAILING_CONTROL_SIZE))),
+                                    ),
+                            )
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .h(px(COMPOSER_FULL_CONTROL_ROW_HEIGHT))
+                                    .flex_none()
+                                    .on_prepaint(move |bounds, _, _| {
+                                        control_row_height.set(f32::from(bounds.size.height));
+                                    }),
+                            ),
+                    ),
                 )
         }
     }
@@ -110826,7 +114046,7 @@ mod tests {
         // The session composer wires both keys to the shared handler.
         let composer = source
             .split_once(
-                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
@@ -111594,39 +114814,62 @@ mod tests {
         assert!(route.contains("\"usage\" => \"usage\".to_string()"));
         assert!(route.contains("usage.activate(session_filter, cx)"));
 
+        // The live indicator rides the footer now, so the opener lives there.
         let composer = source
-            .split_once("Button::new(\"open-session-usage\")")
-            .expect("the live usage indicator should open Usage")
-            .1;
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        assert!(composer.contains("Button::new(\"open-session-usage\")"));
         assert!(composer.contains("this.open_usage(session_filter, cx);"));
     }
 
     #[test]
-    fn composer_terminal_toggle_sits_below_fullscreen_control() {
+    fn composer_trailing_controls_stack_above_the_control_row() {
         let source = include_str!("app.rs");
         let composer = source
             .split_once(
-                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n    ) -> AnyElement {",
+                "    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {",
             )
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("composer renderer should remain inspectable");
-        let usage = composer
-            .find("Button::new(\"open-session-usage\")")
-            .expect("token usage action should exist");
         let fullscreen = composer
-            .find("Button::new(\"toggle-composer-expanded\")")
+            .rfind("Button::new(\"toggle-composer-expanded\")")
             .expect("composer fullscreen action should exist");
-        let terminal = composer
-            .find("self.render_composer_terminal_menu(cx)")
-            .expect("terminal mode action should exist");
+        let control_row = composer
+            .find("id(\"composer-runtime-controls-left\")")
+            .expect("the full box's control row should exist");
         let primary_action = composer
-            .find(".child(primary_action)")
+            .rfind(".children(primary_action.take())")
             .expect("send or stop action should exist");
-
-        assert!(fullscreen < terminal);
+        // The corner carries the expand toggle only, above the control row:
+        // the clock, the terminal and the usage ring moved to the footer.
+        assert!(fullscreen < control_row);
+        assert!(control_row < primary_action);
+        assert!(!composer.contains("render_composer_terminal_menu("));
+        assert!(!composer.contains("render_message_schedule_button_sized("));
+        assert!(!composer.contains("open-session-usage"));
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        let clock = footer
+            .find("render_message_schedule_button_sized(")
+            .expect("the footer should carry the message schedule");
+        let terminal = footer
+            .find("render_composer_terminal_menu(")
+            .expect("the footer should carry the terminal toggle");
+        let usage = footer
+            .find("Button::new(\"open-session-usage\")")
+            .expect("the footer should carry the usage ring");
+        assert!(clock < terminal);
         assert!(terminal < usage);
-        assert!(usage < primary_action);
     }
 
     #[test]
@@ -111649,6 +114892,347 @@ mod tests {
         // the tab itself no longer draws an underline of its own.
         assert!(tab.contains(".selected(active)"));
         assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
+    }
+
+    /// The footer's three marks draw at one optical size inside one seat.
+    ///
+    /// The kit pads a sized button that carries children by a fifth of its side
+    /// and clips what escapes, so a 14px glyph in a 22px seat lost a hair of its
+    /// own stroke on all four edges — the clock's ring and the terminal's frame
+    /// read as cut. The usage ring failed the other way: `ProgressCircle` paints
+    /// at three quarters of the square it is given, so the seat's own 22px
+    /// landed a 16.5px disc beside two 14px glyphs. Both halves are measured
+    /// here, with the edge the caret lights, so the row cannot drift back into
+    /// either mistake.
+    #[test]
+    fn composer_footer_marks_share_one_seat_and_one_optical_size() {
+        let source = include_str!("app.rs");
+        assert_eq!(COMPOSER_FOOTER_GLYPH_SIZE - COMPOSER_FOOTER_RING_SIZE, 1.0);
+        const { assert!(COMPOSER_FOOTER_RING_SIZE < COMPOSER_FOOTER_CONTROL_SIZE) };
+        assert_eq!(PROGRESS_CIRCLE_DRAWN_SCALE, 0.75);
+        const { assert!(COMPOSER_FOCUSED_INPUT_RING_MIX > 0.5) };
+        const { assert!(COMPOSER_FOCUSED_INPUT_RING_MIX < 1.0) };
+
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        let usage = footer
+            .split_once("Button::new(\"open-session-usage\")")
+            .and_then(|(_, tail)| tail.split_once(".on_click"))
+            .map(|(body, _)| body)
+            .expect("the usage ring's button should remain inspectable");
+        assert!(usage.contains(".size(px(COMPOSER_FOOTER_CONTROL_SIZE))"));
+        assert!(
+            usage.contains(".p(px(0.0))"),
+            "the ring's seat must not inset the readout it carries"
+        );
+
+        let terminal = source
+            .split_once("    fn render_composer_terminal_menu(")
+            .and_then(|(_, tail)| tail.split_once(".child(composer_instrument_glyph("))
+            .map(|(body, _)| body)
+            .expect("the terminal control should remain inspectable");
+        assert!(terminal.contains(".size(px(size))"));
+        assert!(
+            terminal.contains(".p(px(0.0))"),
+            "the terminal's glyph owns its whole seat"
+        );
+        assert!(
+            terminal.contains("composer_instrument_hover_target("),
+            "the terminal's mark fades under a wrapper, not under its tooltip's button"
+        );
+        assert!(
+            terminal.contains("COMPOSER_TERMINAL_HOVER_KEY"),
+            "and answers the pointer under the footer's own key"
+        );
+        assert!(
+            terminal.contains("COMPOSER_FOOTER_INSTRUMENT_REST_INK"),
+            "and rests at the footer's ink rather than the caption's"
+        );
+
+        let schedule = include_str!("message_schedule.rs");
+        let sized = schedule
+            .split_once("    fn render_message_schedule_button_at(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The element id the popover"))
+            .map(|(body, _)| body)
+            .expect("the sized schedule control should remain inspectable");
+        assert!(
+            sized.contains(".p(px(0.0))"),
+            "the clock's glyph owns its whole seat"
+        );
+        assert!(
+            sized.contains("composer_instrument_hover_target("),
+            "the clock answers the pointer under a wrapper around its trigger"
+        );
+        assert!(
+            sized.contains("composer_instrument_glyph("),
+            "the clock draws the footer's two inks"
+        );
+        assert!(
+            sized.contains("COMPOSER_FOOTER_INSTRUMENT_REST_INK"),
+            "the clock rests at the footer's ink like the terminal beside it"
+        );
+
+        let ring = source
+            .split_once("fn render_cache_token_ring(")
+            .and_then(|(_, tail)| tail.split_once(".value(context_percent)"))
+            .map(|(body, _)| body)
+            .expect("the usage ring should remain inspectable");
+        assert!(
+            ring.contains(".size(px(COMPOSER_FOOTER_RING_SIZE / PROGRESS_CIRCLE_DRAWN_SCALE))"),
+            "the readout is asked for its drawn diameter, not for the seat's square"
+        );
+    }
+
+    /// The surface's attach and expand controls answer the pointer too.
+    ///
+    /// A draft's most frequent controls must say they are pressable the same way
+    /// the footer's instruments do: a step darker at rest, the foreground's ink
+    /// under the pointer. Both densities share one fade key per control, so a
+    /// draft that flips density under the pointer keeps the highlight instead of
+    /// losing it with the rebuilt button, and the trailing corner draws its own
+    /// glyph so it can carry that ink at all — the kit's `.icon(...)` tints with
+    /// the button's foreground, which a ghost button never changes.
+    #[test]
+    fn composer_surface_controls_answer_the_pointer_with_one_ink() {
+        let source = include_str!("app.rs");
+        const { assert!(COMPOSER_ROW_INSTRUMENT_REST_INK < COMPOSER_INSTRUMENT_HOVER_INK) };
+        const { assert!(COMPOSER_ROW_INSTRUMENT_REST_INK > COMPOSER_FOOTER_INSTRUMENT_REST_INK) };
+        assert_eq!(
+            COMPOSER_SURFACE_GLYPH_SIZE * 2.0,
+            COMPOSER_SLIM_ROW_CONTROL_SIZE
+        );
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        // Each control draws itself once per density: one key read for the ink
+        // plus one wrapper per button that listens under it.
+        assert_eq!(
+            composer.matches("COMPOSER_ATTACH_HOVER_KEY").count(),
+            3,
+            "both attach buttons listen under the one attach key"
+        );
+        assert_eq!(
+            composer.matches("COMPOSER_EXPAND_HOVER_KEY").count(),
+            3,
+            "both expand buttons listen under the one expand key"
+        );
+        assert_eq!(
+            composer.matches("composer_instrument_glyph(").count(),
+            4,
+            "both densities draw attach and expand as tinted children"
+        );
+        assert_eq!(
+            composer
+                .matches("composer_instrument_hover_target(")
+                .count(),
+            4,
+            "every one of those buttons fades under a wrapper, never on the button itself"
+        );
+        assert!(
+            composer.contains(".p(px(0.0))"),
+            "the corner's glyph needs the whole seat once it stops being a kit icon"
+        );
+        assert!(
+            composer.contains("COMPOSER_SURFACE_GLYPH_SIZE"),
+            "the corner draws the slim row's mark, so one control is one size"
+        );
+        assert!(
+            !composer.contains(".icon(if self.composer_expanded {"),
+            "the corner must draw its own glyph to carry the fade's ink"
+        );
+        assert!(
+            !composer.contains("motion::hover_listener("),
+            "every one of these buttons carries a tooltip, which owns its one hover listener"
+        );
+    }
+
+    /// The wrapper really is what receives the pointer.
+    ///
+    /// The kit's tooltip owns each instrument button's one `on_hover`, so the
+    /// fade hangs on a div drawn around the seat. A source inspection can only
+    /// see the call; this drives a real pointer across the seat and reads the
+    /// fade store back, because a mark that never lights is exactly the bug a
+    /// hover implementation can hide from its own tests.
+    #[gpui::test]
+    fn composer_instrument_hover_wrapper_lifts_the_marks_ink(cx: &mut TestAppContext) {
+        struct Probe;
+
+        impl Render for Probe {
+            fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+                let ink = composer_instrument_ink(
+                    motion::hover_t(COMPOSER_TERMINAL_HOVER_KEY),
+                    COMPOSER_FOOTER_INSTRUMENT_REST_INK,
+                    cx,
+                );
+                div()
+                    .debug_selector(|| "composer-instrument-probe".to_string())
+                    .w(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                    .h(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                    .child(composer_instrument_hover_target(
+                        COMPOSER_TERMINAL_HOVER_KEY,
+                        cx.entity_id(),
+                        Button::new("composer-instrument-probe-button")
+                            .ghost()
+                            .compact()
+                            .size(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                            .p(px(0.0))
+                            .tooltip("probe")
+                            .child(composer_instrument_glyph(
+                                Icon::new(IconName::SquareTerminal),
+                                COMPOSER_FOOTER_GLYPH_SIZE,
+                                ink,
+                            )),
+                    ))
+                    .into_any_element()
+            }
+        }
+
+        cx.update(gpui_component::init);
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let probe = cx.new(|_| Probe);
+            gpui_component::Root::new(probe, window, cx)
+        });
+        // Paint once so the wrapper's hitbox exists, then find the seat.
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let seat = cx
+            .debug_bounds("composer-instrument-probe")
+            .expect("the probe should be painted");
+        let seat_limit = px(COMPOSER_FOOTER_CONTROL_SIZE + 1.0);
+        assert!(
+            seat.size.width <= seat_limit && seat.size.height <= seat_limit,
+            "the fade must hug the seat, not the whole page: {seat:?}"
+        );
+
+        // Park the pointer clear of the seat, then walk it onto the seat. The
+        // enter is the half that matters: a wrapper that never hears the pointer
+        // is the bug this test exists to catch.
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(seat.bottom_right() + point(px(120.0), px(120.0)), cx);
+            let _ = window.draw(cx);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        let parked = motion::hover_t(COMPOSER_TERMINAL_HOVER_KEY);
+        assert!(
+            parked < 0.05,
+            "a pointer clear of the seat leaves the mark at rest: {parked}"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(seat.center(), cx);
+            let _ = window.draw(cx);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let hovered = motion::hover_t(COMPOSER_TERMINAL_HOVER_KEY);
+        assert!(
+            hovered > 0.05,
+            "the wrapper's enter has to reach the fade store: {hovered}"
+        );
+
+        cx.update(|window, cx| {
+            window.simulate_mouse_move(seat.bottom_right() + point(px(120.0), px(120.0)), cx);
+            let _ = window.draw(cx);
+        });
+        std::thread::sleep(std::time::Duration::from_millis(220));
+        let left = motion::hover_t(COMPOSER_TERMINAL_HOVER_KEY);
+        assert!(
+            left < 0.05,
+            "and the leave has to fade the mark back to rest: {left}"
+        );
+    }
+
+    /// A caret in the box lights its edge; the pane flag still outranks it.
+    #[test]
+    fn composer_surface_border_answers_for_both_rings() {
+        let source = include_str!("app.rs");
+        let border = source
+            .split_once("fn composer_surface_border(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the composer's edge should remain inspectable");
+        assert!(
+            border.contains("if pane_focused {"),
+            "a focused pane takes the ring outright"
+        );
+        assert!(
+            border.contains("motion::mix(rest, cx.theme().ring, COMPOSER_FOCUSED_INPUT_RING_MIX)"),
+            "the caret's highlight is a blend, not a second focus ring"
+        );
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(
+            composer.contains(".is_focused(window)"),
+            "the edge reads the caret the box actually holds"
+        );
+        assert!(composer.contains("composer_input_focused,"));
+
+        let subscription = source
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n/// Field access on the workbench resolves to the borrowed session view.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("composer input subscription should remain inspectable");
+        assert!(
+            subscription.contains("matches!(event, InputEvent::Focus | InputEvent::Blur)"),
+            "focus and blur ask for the frame that draws the edge"
+        );
+    }
+
+    /// A glide repaints the composer alone, and its measurements wait.
+    #[test]
+    fn composer_height_glide_repaints_only_its_host_view() {
+        let source = include_str!("app.rs");
+        let composer_view = source
+            .split_once("impl Render for ComposerView {")
+            .and_then(|(_, tail)| tail.split_once("\n/// The transcript's own render boundary."))
+            .map(|(body, _)| body)
+            .expect("the composer's host view should remain inspectable");
+        assert!(composer_view.contains("motion::with_height_owner(owner,"));
+        assert!(
+            composer_view.contains("motion::schedule_height_morph_frames(window);"),
+            "the host ticks the store after the render that may have armed a glide"
+        );
+
+        let measure = source
+            .split_once("fn composer_measurement_wants_repaint(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the measurement gate should remain inspectable");
+        assert!(measure.contains("motion::height_morph_in_flight(morph_key)"));
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert_eq!(
+            composer
+                .matches("composer_measurement_wants_repaint(")
+                .count(),
+            2,
+            "both measurements — the surface and the input slot — wait out a glide"
+        );
+        assert_eq!(
+            composer.matches("composer_surface_morph_key(").count(),
+            1,
+            "one spelling of the morph key keeps render and measurement in step"
+        );
     }
 
     #[test]
@@ -111890,6 +115474,25 @@ mod tests {
         assert!(project.contains("workspace.agent_summary.total"));
         assert!(project.contains("let project_session_count_badge = div()"));
         assert!(project.contains(".rounded_full()"));
+        // While the row's context menu is open the row keeps the hover wash,
+        // so the reader can see which project the menu's commands act on.
+        assert!(
+            project
+                .contains("== Some(SidebarContextMenuTarget::Project(project_id_string.clone()))")
+        );
+        assert!(project.contains("theme::hover_wash(cx.theme().is_dark())"));
+
+        // A folder row keeps the same wash while its own menu is open.
+        let folder = source
+            .split_once("    fn render_sidebar_folder(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn render_sidebar_project_appearance_popover(")
+            })
+            .map(|(body, _)| body)
+            .expect("folder renderer should remain inspectable");
+        assert!(folder.contains(".context_menu(move |menu, window, cx|"));
+        assert!(folder.contains("== Some(SidebarContextMenuTarget::Folder(folder_id.clone()))"));
+        assert!(folder.contains("theme::hover_wash(cx.theme().is_dark())"));
     }
 
     /// The project row's trailing mark counts only live work, and a project
@@ -112806,7 +116409,7 @@ mod tests {
         // two panes would share it.
         for field in [
             "timeline: TimelineModel",
-            "timeline_scroll: VirtualListScrollHandle",
+            "timeline_scroll: gpui::ListState",
             "timeline_follow: TimelineFollowState",
             "streaming_row_state",
             "runtime_selection",
@@ -112858,16 +116461,22 @@ mod tests {
         // with itself could never report a change, and the real report arrives
         // from prepaint through `sync_session_view_layout_width`.
         assert!(!geometry.contains("cached_timeline_layout_width"));
-        // Only a real layout change may drop the measured row extents: the
-        // turns cache key also moves for view-local session state, and
-        // re-estimating the whole table there would scroll the restored view.
+        // Only a real layout change may re-derive the row extents: the turns
+        // cache key also moves for view-local session state, and re-estimating
+        // the whole table there would scroll the restored view. Even a layout
+        // change keeps the measured heights as the seed — a restored view
+        // routed through character-count estimates bounces on the bottom edge.
         let layout_change = geometry
             .find("let geometry_changed = content_width_changed;")
             .expect("view geometry should separate layout changes from projection changes");
-        let invalidate = geometry
-            .find("self.invalidate_timeline_layout_measurements();")
-            .expect("a layout change should still invalidate the measurements");
-        assert!(layout_change < invalidate);
+        let retarget = geometry
+            .find("self.retarget_timeline_layout_width();")
+            .expect("a layout change should retarget the table, not wipe it");
+        assert!(layout_change < retarget);
+        assert!(
+            !geometry.contains("self.invalidate_timeline_layout_measurements();"),
+            "a restore must keep the measured heights as the seed the next prepaint corrects"
+        );
         assert!(geometry.contains("if geometry_changed || turns_cache_changed {"));
         assert!(geometry.contains("self.timeline_scroll_anchor_pending ="));
         assert!(geometry.contains("!self.timeline_follow.following_bottom"));
@@ -113061,7 +116670,33 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn timeline_row_heights("))
             .map(|(body, _)| body)
             .expect("pending timeline scroll should remain inspectable");
-        assert!(apply.contains("self.apply_timeline_scroll_anchor();"));
+        assert!(apply.contains("self.scroll_timeline_to_latest();"));
+        // An anchor is applied after the row-count sync, not with the bottom
+        // scroll: a reset drops the list's anchor, so a restore that ran first
+        // was wiped and the reader landed at row zero.
+        let anchor = apply
+            .split_once("    fn apply_pending_timeline_anchor(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Holds the timeline for a disclosure"))
+            .map(|(body, _)| body)
+            .expect("the pending anchor should remain inspectable");
+        assert!(anchor.contains("self.apply_timeline_scroll_anchor();"));
+        let render = source
+            .split_once("        self.apply_pending_timeline_scroll();")
+            .and_then(|(_, tail)| {
+                tail.split_once("        self.install_timeline_scroll_handler();")
+            })
+            .map(|(body, _)| body)
+            .expect("the render's scroll resolution should remain inspectable");
+        let sync_at = render
+            .find("self.sync_timeline_list_rows();")
+            .expect("the row count is synced in the render");
+        let anchor_at = render
+            .find("self.apply_pending_timeline_anchor();")
+            .expect("a pending anchor is resolved in the render");
+        assert!(
+            sync_at < anchor_at,
+            "the anchor has to land on the synced table"
+        );
 
         let capture = source
             .split_once("    fn capture_timeline_scroll_anchor(")
@@ -113073,7 +116708,13 @@ mod tests {
             capture
                 .contains("self.timeline_row_sizes.len() != self.conversation_turns_cache.len()")
         );
-        assert!(capture.contains(".preserve_anchor_at(turn_id, span,"));
+        assert!(capture.contains("self.timeline_scroll.logical_scroll_top()"));
+        assert!(capture.contains(".preserve_anchor_at("));
+        assert!(capture.contains("f32::from(offset_in_row)"));
+        // An anchor past the last row carries no place of its own: it has to be
+        // read as the bottom of that row, or a restore lands a screen above it.
+        assert!(capture.contains("top.item_ix > last_row"));
+        assert!(capture.contains("(height - viewport).max(px(0.0))"));
         assert!(capture.contains("timeline_turn_anchor_span"));
 
         // The restore path resolves the turn by id first and falls back to the
@@ -113092,7 +116733,12 @@ mod tests {
         // newest row, which is the jump this path exists to prevent.
         assert!(restore.contains("self.timeline_follow.has_anchor()"));
         assert!(restore.contains("self.settle_timeline_anchor_on_oldest_row()"));
-        assert!(restore.contains("self.timeline_scroll.set_offset(point(px(0.0), px(0.0)))"));
+        assert!(restore.contains("self.timeline_scroll"));
+        assert!(
+            restore.contains("self.timeline_scroll.scroll_to(gpui::ListOffset {"),
+            "the anchor is placed as a row, not mapped back through a pixel offset"
+        );
+        assert!(restore.contains(".set_offset_from_scrollbar(point(px(0.0), px(0.0)))"));
 
         let resolve = source
             .split_once("    fn timeline_anchor_row_index(")
@@ -115279,12 +118925,20 @@ mod tests {
 
         assert_eq!(
             runtime_provider_model_label(Some(&option), &option.selection),
-            "Codex profile / Codex model"
+            "Codex profile/Codex model"
         );
         assert_eq!(
             runtime_provider_model_label(None, &option.selection),
-            "provider_codex / codex_model"
+            "provider_codex/codex_model"
         );
+        // The bare model label still exists for the surfaces that show a model
+        // without its supplier; the Composer's and the home page's chips use the
+        // pair above.
+        assert_eq!(
+            runtime_model_label(Some(&option), &option.selection),
+            "Codex model"
+        );
+        assert_eq!(runtime_model_label(None, &option.selection), "codex_model");
     }
 
     /// The notice that explains a normalized mode names the catalogue's label,
@@ -116192,7 +119846,11 @@ mod tests {
 
         let filing = source
             .split_once("    fn file_new_session_in_folder(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn probe_new_session_eligibility("))
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// Files a session created from a group row's new-chat action",
+                )
+            })
             .map(|(body, _)| body)
             .expect("folder filing should remain inspectable");
         assert!(filing.contains("organization.place_into_folder("));
@@ -116201,7 +119859,7 @@ mod tests {
         );
         assert!(filing.contains("is_none_or(|workspace_id| workspace_id == session_workspace_id)"));
         assert!(filing.contains("collapsed_folder_ids"));
-        assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_workspace.reset_after_success();"));
+        assert!(source.contains("self.new_session_folder_id = None;\n        self.new_session_group_id = None;\n        self.new_session_workspace.reset_after_success();"));
     }
 
     /// A folder's batch checkbox speaks for everything the folder shows: the
@@ -118063,7 +121721,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("timeline wheel handler should remain inspectable");
 
-        assert!(handler.contains("self.timeline_scroll.max_offset().y <= px(0.0)"));
+        assert!(handler.contains("self.timeline_scroll.max_offset_for_scrollbar().y <= px(0.0)"));
         assert!(handler.contains(".timer(AGENT_TIMELINE_SCROLL_IDLE_DELAY)"));
         assert_eq!(handler.matches("cx.notify();").count(), 1);
 
@@ -118090,7 +121748,7 @@ mod tests {
             .find("this.with_session_view_for_render(")
             .expect("the wheel handler should borrow the pane's view");
         let call = timeline[wheel..]
-            .find("this.handle_timeline_scroll_wheel(event, cx)")
+            .find("this.handle_timeline_scroll_wheel(event, line_height, cx)")
             .expect("the wheel handler should run the follow-state update");
         assert!(borrow < call);
     }
@@ -118885,6 +122543,17 @@ mod tests {
             agent_generation_token_rate(Some(30), Some(30), Duration::from_secs(2)),
             None
         );
+        // A counter that went backwards is not a rate, and asking for one must
+        // stay a `None`: the subtraction that would underflow while the guard
+        // is false is exactly what aborted the app on a debug build.
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(10), Duration::from_secs(2)),
+            None
+        );
+        assert_eq!(
+            agent_generation_token_rate(Some(30), Some(10), Duration::ZERO),
+            None
+        );
     }
 
     #[test]
@@ -119105,11 +122774,11 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("permission reveal should remain inspectable");
-        // The virtual list only scrolls whole turns, so the card is revealed
-        // once its row has been laid out.
+        // The list only scrolls whole rows, so the card is revealed once its
+        // row has been laid out.
         assert!(reveal.contains("self.pending_permission_reveal_item_id = Some(target.item_id);"));
         assert!(reveal.contains("self.timeline_scroll"));
-        assert!(reveal.contains("ScrollStrategy::Center"));
+        assert!(reveal.contains("scroll_to_reveal_item"));
 
         let dismiss = source
             .split_once("    fn dismiss_pending_permission_alert(")
@@ -121425,6 +125094,34 @@ mod tests {
     }
 
     #[test]
+    fn a_failed_switch_banner_shows_the_agents_own_refusal() {
+        // The failed row used to print only the product sentence, so an
+        // unknown model id, a rejected option and a broken endpoint all read
+        // as "configuration unavailable". The banner carries the recorded
+        // refusal — and wraps, because a reason truncated to one short line
+        // explains nothing.
+        let source = include_str!("app.rs");
+        let controls = source
+            .split_once("    fn render_runtime_controls(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The pane a session Composer"))
+            .map(|(body, _)| body)
+            .expect("runtime controls should remain inspectable");
+        assert!(
+            controls.contains("and_then(|error| error.detail.as_deref())"),
+            "the banner must read the actionable error's detail"
+        );
+        assert!(
+            controls.contains(".text_color(cx.theme().danger)")
+                && controls.contains(".whitespace_normal()"),
+            "the refusal is drawn in the danger colour and is allowed to wrap"
+        );
+        assert!(
+            !controls.contains(".child(div().truncate().text_xs().font_medium().child(title))"),
+            "the failed row may no longer truncate its only explanation"
+        );
+    }
+
+    #[test]
     fn composer_surfaces_match_the_connected_two_surface_visual_contract() {
         for is_dark in [false, true] {
             let composer = composer_surface_background(is_dark);
@@ -121455,9 +125152,55 @@ mod tests {
         assert_eq!(COMPOSER_SURFACE_MIN_HEIGHT, 112.0);
         assert_eq!(ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT, 136.0);
         assert_eq!(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT, 80.0);
+        // The full box's floor is the editor's 80px band, the row's 16px
+        // insets, the 44px control row and the surface's 2px hairline. The
+        // trailing corner keeps one 30px button, shorter than that band.
+        assert_eq!(COMPOSER_TRAILING_STACK_HEIGHT, 30.0);
+        assert_eq!(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT, 96.0);
+        assert_eq!(COMPOSER_FULL_SURFACE_MIN_HEIGHT, 142.0);
+        // The line under the surface keeps its own controls and insets: a
+        // caption's row, so its instruments are a size under the bar's own.
+        assert_eq!(COMPOSER_FOOTER_CONTROL_SIZE, 22.0);
+        assert_eq!(COMPOSER_FOOTER_GAP, 6.0);
+        assert_eq!(COMPOSER_FOOTER_TOP_PADDING, 8.0);
+        assert_eq!(COMPOSER_FOOTER_MARK_SIZE, 13.0);
+        assert_eq!(COMPOSER_FOOTER_GLYPH_SIZE, 14.0);
+        // The footer's marks stay under half the bar's controls; a caption
+        // that reaches the surface's own size stops being one.
+        const { assert!(COMPOSER_FOOTER_GLYPH_SIZE < COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0) };
+        const {
+            assert!(
+                COMPOSER_FOOTER_CONTROL_SIZE < COMPOSER_SLIM_ROW_CONTROL_SIZE,
+                "the footer's instruments stay quieter than the bar's controls"
+            );
+        }
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
+        // The one-line bar is a pill: its radius is larger than half its
+        // height, so both ends close into full semicircles.
+        assert_eq!(COMPOSER_SLIM_SURFACE_RADIUS, 24.0);
+        // The bar is the tallest control on its row plus the row's own inset
+        // and the surface's hairline.
+        assert_eq!(COMPOSER_SLIM_ROW_CONTROL_SIZE, 30.0);
+        assert_eq!(COMPOSER_SLIM_PRIMARY_ACTION_SIZE, 32.0);
+        assert_eq!(COMPOSER_SLIM_ROW_VERTICAL_PADDING, 7.0);
+        assert_eq!(COMPOSER_SLIM_SURFACE_HEIGHT, 48.0);
+        // The bar's height is its row, its inset and its hairline, so the
+        // three have to agree or the pill's ends stop meeting the text.
+        assert_eq!(
+            COMPOSER_SLIM_SURFACE_HEIGHT,
+            2.0 * COMPOSER_SLIM_ROW_VERTICAL_PADDING
+                + COMPOSER_SLIM_PRIMARY_ACTION_SIZE
+                + COMPOSER_SURFACE_HAIRLINE,
+            "the bar's height is its row, its inset and its hairline"
+        );
+        const {
+            assert!(
+                COMPOSER_SLIM_SURFACE_RADIUS >= COMPOSER_SLIM_SURFACE_HEIGHT / 2.0,
+                "the bar's ends have to close into semicircles"
+            )
+        };
 
         let source = include_str!("app.rs");
         let input_setup = source
@@ -121480,30 +125223,47 @@ mod tests {
         assert!(composer.contains("session_content_max_width"));
         assert!(!composer.contains("COMPOSER_MAX_WIDTH"));
         assert!(composer.contains("toggle-composer-expanded"));
-        assert!(composer.contains("this.flex_1().min_h(px(240.0))"));
+        assert!(composer.contains("this.h_auto().flex_1().min_h(px(240.0))"));
         assert!(composer.contains("this.flex_1().min_h_0()"));
-        assert!(composer.contains("ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT"));
         assert!(composer.contains("ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT"));
-        assert!(composer.contains(".min_h(px(ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT))"));
-        // Both densities are drawn by the same renderer, chosen from the draft.
+        // The full box reserves the trailing column's height for its input and
+        // stretches the editor across the whole band, so the space under a
+        // short draft is input rather than padding.
+        assert!(composer.contains("COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT"));
+        // Every non-slim density fills its reserved band with the editor, so
+        // the text starts at the top and the band belongs to the input.
+        assert!(composer.contains(".when(!composer_is_slim, |this| this.h_full())"));
+        // Both densities are drawn by the same renderer, chosen from the draft,
+        // and the surface's height glides to the height the content asks for.
         assert!(composer.contains("let composer_density = composer_density("));
+        // The density reads the draft at the one-line bar's own input width,
+        // never at the live input's: the two densities give the input
+        // different widths, and a decision that reads its own layout's answer
+        // oscillates at the wrap boundary.
+        assert!(composer.contains("let composer_density_rows = composer_draft_wrapped_rows("));
+        assert!(composer.contains("let composer_slim_width = composer_slim_input_width("));
+        assert!(composer.contains("            composer_density_rows,"));
         assert!(composer.contains("COMPOSER_SLIM_SURFACE_HEIGHT"));
         assert!(composer.contains("COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT"));
+        assert!(composer.contains("let composer_surface_target = composer_surface_height("));
+        assert!(composer.contains("motion::resolve_height("));
+        assert!(composer.contains(".h(px(composer_surface_height_now))"));
+        assert!(composer.contains(".rounded(px(composer_surface_radius))"));
         assert!(composer.contains(".when(self.composer_expanded, |this| this.pt_4())"));
         let fullscreen_button = composer
             .find("toggle-composer-expanded")
             .expect("composer fullscreen control should remain present");
-        let slim_branch = composer
-            .find(".when(!composer_is_slim, |this| {")
-            .expect("the stacked trailing column should be gated to the full box");
-        assert!(
-            slim_branch < fullscreen_button,
-            "the stacked column, expand control included, belongs to the full box"
-        );
-        let terminal_button = composer
-            .find("self.render_composer_terminal_menu(cx)")
-            .expect("composer terminal control should remain present");
-        assert!(fullscreen_button < terminal_button);
+        // The full box seats its one remaining surface control — expand — in
+        // the trailing corner; the control row stays under the text. The
+        // clock, the terminal and the usage ring live on the footer instead.
+        let control_row = composer
+            .find("id(\"composer-runtime-controls-left\")")
+            .expect("the control row should remain inspectable");
+        assert!(fullscreen_button < control_row);
+        assert!(!composer.contains("render_message_schedule_button_sized("));
+        assert!(!composer.contains("render_composer_terminal_menu("));
+        assert!(!composer.contains("open-session-usage"));
+        assert!(composer.contains(".when(!composer_is_slim, |this| {"));
         assert!(composer.contains(".pb_1()"));
         assert!(composer.contains(".when(composer_extension_visible, |this|"));
         assert!(composer.contains("px(-2.0)"));
@@ -121727,45 +125487,82 @@ mod tests {
             .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
             .map(|(body, _)| body)
             .expect("session composer should remain inspectable");
-        assert_eq!(composer.matches("choose-composer-attachments").count(), 1);
+        // Both densities render the attachment control once — on the slim
+        // row, or on the full box's control row — and the schedule, the
+        // terminal and the usage ring are not surface controls any more.
+        assert_eq!(composer.matches("choose-composer-attachments").count(), 2);
         assert!(!composer.contains("choose-composer-images"));
-        assert!(composer.contains("composer-runtime-controls-cascade"));
-        assert!(composer.contains(".child(runtime_controls_cascade)"));
+        assert!(composer.contains("composer-runtime-controls-right"));
+        assert!(composer.contains(".children(runtime_controls_cascade.take())"));
         assert!(composer.contains("children(runtime_controls_other)"));
-        let attachment = composer
-            .find("choose-composer-attachments")
-            .expect("composer attachment control should be present");
+        // Built at runtime so this test does not match its own text.
+        let retired_menu = format!("render_composer_{}(", "more_menu");
+        assert!(!composer.contains(&retired_menu));
+
+        let slim_attach = composer
+            .find("Button::new(\"choose-composer-attachments\")")
+            .expect("the slim row should seat attach");
+        let slim_expand = composer
+            .find("Button::new(\"toggle-composer-expanded\")")
+            .expect("the slim row should seat expand");
+        let slim_cascade = composer
+            .find(".children(runtime_controls_cascade.take())")
+            .expect("the slim bar should seat the run-configuration control");
+        let submit = composer
+            .find(".children(primary_action.take())")
+            .expect("composer submit control should remain present");
+        // The slim row reads left to right: attach, expand, run configuration,
+        // send — the input takes everything else.
+        assert!(slim_attach < slim_expand);
+        assert!(slim_expand < slim_cascade);
+        assert!(slim_cascade < submit);
         let other_runtime_controls = composer
             .find("children(runtime_controls_other)")
             .expect("composer secondary runtime controls should stay beside attachments");
         let cascade_runtime_controls = composer
-            .find("composer-runtime-controls-cascade")
+            .find("composer-runtime-controls-right")
             .expect("composer cascade should stay beside the submit control");
-        let token_usage = composer
-            .find("open-session-usage")
-            .expect("composer token usage control should be present");
-        let cascade_content = composer
-            .find(".child(runtime_controls_cascade)")
-            .expect("composer cascade content should be present");
-        let submit = composer
-            .find(".child(primary_action)")
-            .expect("composer submit control should remain present");
-        assert!(attachment < other_runtime_controls);
         assert!(other_runtime_controls < cascade_runtime_controls);
-        assert!(cascade_runtime_controls < token_usage);
-        assert!(token_usage < cascade_content);
-        assert!(cascade_runtime_controls < submit);
-        let composer_effort = composer
+        // Thinking depth, conversation mode and the feature toggles are no
+        // longer chips on the composer: the cascade's docked options column
+        // owns them, so one panel carries the whole run configuration.
+        assert!(!composer.contains("Thinking depth"));
+        assert!(!composer.contains("Conversation mode"));
+        assert!(!composer.contains("render_runtime_feature("));
+        assert!(composer.contains("render_composer_runtime_cascade("));
+        let options = source
+            .split_once("    fn render_composer_runtime_options(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .map(|(body, _)| body)
+            .expect("the docked options column should remain inspectable");
+        let options_effort = options
             .find("Thinking depth")
-            .expect("composer reasoning control should be rendered");
-        let composer_mode = composer
+            .expect("the options column should own the reasoning levels");
+        let options_mode = options
             .find("Conversation mode")
-            .expect("composer mode control should be rendered");
-        let composer_feature = composer
-            .find("render_runtime_feature(")
-            .expect("composer feature controls should be rendered");
-        assert!(composer_effort < composer_mode);
-        assert!(composer_mode < composer_feature);
+            .expect("the options column should own the conversation modes");
+        let options_feature = options
+            .find("SessionRuntimeFeatureKind::Toggle")
+            .expect("the options column should own the feature toggles");
+        assert!(options_effort < options_mode);
+        assert!(options_mode < options_feature);
+        assert!(options.contains("choose_runtime_selection("));
+        assert!(options.contains("set_runtime_feature_value("));
+        assert!(options.contains("prompt_runtime_feature_value("));
+        // Each section wears the icon its chip carried on the composer, in
+        // the same chart hue: brain for thinking depth, shield for the
+        // conversation mode, zap for the feature rows.
+        // The section titles are sized to read as tall as the 16px icon
+        // beside them, not as a caption below the rows they group.
+        assert!(options.contains("type_scale::menu_section_title()"));
+        assert!(options.contains("effort_heading_icon()"));
+        assert!(options.contains("mode_heading_icon()"));
+        assert!(options.contains("icons/vibex/brain.svg"));
+        assert!(options.contains("icons/vibex/shield-alert.svg"));
+        assert!(options.contains("icons/vibex/zap.svg"));
+        assert!(options.contains(r#"theme::semantic_color("chart-3", is_dark)"#));
+        assert!(options.contains(r#"theme::semantic_color("chart-4", is_dark)"#));
+        assert!(options.contains(r#"theme::semantic_color("chart-5", is_dark)"#));
     }
 
     /// The fullscreen composer is an input box, not just a taller surface: the
@@ -121853,6 +125650,94 @@ mod tests {
         // to opt into it, so guard the two expanded-only hooks in its source.
         assert!(composer.contains("this.self_stretch()"));
         assert!(composer.contains("this.h_full()"));
+    }
+
+    /// The full box's input row stretches to its reserved band, and the editor
+    /// fills it: the space under a short draft is input, not padding.
+    #[gpui::test]
+    fn full_composer_input_fills_its_reserved_band(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let surface_height = Rc::new(Cell::new(0.0));
+        let input_row_height = Rc::new(Cell::new(0.0));
+        let input_slot_height = Rc::new(Cell::new(0.0));
+        let slot_origin = Rc::new(Cell::new(0.0));
+        let control_row_height = Rc::new(Cell::new(0.0));
+        let input_slot: Rc<RefCell<Option<Entity<TextareaState>>>> = Rc::new(RefCell::new(None));
+        let stored = input_slot.clone();
+        let probe_surface = surface_height.clone();
+        let probe_row = input_row_height.clone();
+        let probe_slot = input_slot_height.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 8));
+            *stored.borrow_mut() = Some(input.clone());
+            ComposerFullBoxLayoutProbe {
+                input,
+                surface_height: probe_surface,
+                input_row_height: probe_row,
+                input_slot_height: probe_slot,
+                slot_origin: slot_origin.clone(),
+                control_row_height: control_row_height.clone(),
+            }
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("the probe owns its input");
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| {
+                input.set_value("one line\nand a second", window, cx)
+            });
+            for _ in 0..2 {
+                window.simulate_next_frame(cx);
+                let _ = window.draw(cx);
+            }
+        });
+        let surface = surface_height.get();
+        let row = input_row_height.get();
+        let slot = input_slot_height.get();
+        let control = control_row_height.get();
+        let (caret_from_slot_top, input_height, line_height) = input.read_with(cx, |input, _| {
+            let geom = input.prepaint_caret_geometry().expect("caret geometry");
+            (
+                f32::from(geom.cursor_bounds().origin.y) - slot_origin.get(),
+                f32::from(geom.input_bounds().size.height),
+                f32::from(geom.line_height()),
+            )
+        });
+        assert!(
+            (row - COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT).abs() <= 0.5,
+            "the input row should stretch to its band: {row}"
+        );
+        assert!(
+            (slot - ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT).abs() <= 0.5,
+            "the input slot should be the editor's band: {slot}"
+        );
+        // The text sits at the top of the band, within one line advance of its
+        // first row, and the editor covers the band instead of shrinking to
+        // its two rows and floating in the middle of it.
+        assert!(
+            caret_from_slot_top <= line_height,
+            "the first line should start at the band's top: {caret_from_slot_top} with line height {line_height}"
+        );
+        assert!(
+            input_height >= slot - COMPOSER_INPUT_VERTICAL_PADDING,
+            "the editor should fill the band: {input_height} of {slot}"
+        );
+        assert!(
+            (control - COMPOSER_FULL_CONTROL_ROW_HEIGHT).abs() <= 0.5,
+            "the control row keeps its own height: {control}"
+        );
+        // The prepaint bounds are the surface's content box; the border is
+        // outside them. What matters is that the rows fill that box exactly,
+        // and that the box is the floor the editor's band asks for.
+        assert!(
+            (surface + COMPOSER_SURFACE_HAIRLINE - COMPOSER_FULL_SURFACE_MIN_HEIGHT).abs() <= 0.5,
+            "the surface should ask for the column's floor: surface {surface}"
+        );
+        assert!(
+            (row + control - surface).abs() <= 0.5,
+            "the rows should fill the surface: row {row} control {control} surface {surface}"
+        );
     }
 
     #[gpui::test]
@@ -122661,9 +126546,12 @@ mod tests {
         assert!(!completion.contains("this.agent_action_pending = false;"));
         assert!(completion.contains("initial_message_completed"));
         assert!(completion.contains("ComposerQueueDispatchBehavior::AfterCompletion"));
-        assert!(completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
-        assert!(completion.contains("composer_queue_steering_session_ids"));
         assert!(completion.contains("composer_queue_interrupted_session_ids"));
+        // A completion is never a steering answer: the explicit bypass a
+        // send-now armed is spent by the settled queue re-evaluation, not by
+        // whatever submission happened to finish next.
+        assert!(!completion.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+        assert!(!completion.contains("composer_queue_steering_dispatches"));
         // A failed or cancelled initial turn only skips this dispatch. Pausing
         // the queue is reserved for an explicit user interrupt.
         assert!(!completion.contains("composer_queue_paused_session_ids"));
@@ -122726,6 +126614,79 @@ mod tests {
         assert!(paused_guard < dispatch_call);
         assert!(!flush.contains("composer_queue_paused_session_ids.remove"));
         assert!(flush.contains("self.maybe_dispatch_next_composer_queue_message("));
+    }
+
+    #[test]
+    fn a_steer_interrupt_leaves_no_explicit_bypass_for_later_completions() {
+        let source = include_str!("app.rs");
+        let completion = source
+            .split_once("    fn dispatch_admitted_composer_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_composer_queue_turn_status("))
+            .map(|(body, _)| body)
+            .expect("submission completion should remain inspectable");
+        let flush = source
+            .split_once("    fn flush_composer_queue_dispatches_after_continuation(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn begin_composer_queue_edit("))
+            .map(|(body, _)| body)
+            .expect("queue re-evaluation should remain inspectable");
+        let interrupt = source
+            .split_once("    fn interrupt_session_with_queue_behavior(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Sends a queued message"))
+            .map(|(body, _)| body)
+            .expect("session interrupt should remain inspectable");
+
+        // A submission completion advances the queue with the behavior the
+        // submission itself implies. The steering intent is not its answer:
+        // spending it there handed whatever finished next the explicit bypass
+        // the send-now gesture armed, and one click walked the whole queue out
+        // while a turn still held its session.
+        assert!(!completion.contains("composer_queue_steering_dispatches"));
+        assert!(!completion.contains("composer_queue_steering_session_ids"));
+
+        // The intent is spent once, by the settled queue re-evaluation, and
+        // only after the interrupted session has actually settled — and it is
+        // spent on the message the reader sent, not on whatever rose to the
+        // head by then.
+        assert!(flush.contains("composer_queue_steering_dispatches"));
+        assert!(flush.contains("composer_queue_handover_must_wait"));
+        assert!(flush.contains("dispatch_explicit_queue_message"));
+        assert!(flush.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
+
+        // The interrupt's own hand-over waits for the same evidence: its fresh
+        // snapshot must not show a turn still occupying the session.
+        assert!(interrupt.contains("composer_queue_handover_must_wait"));
+        assert!(interrupt.contains("mark_composer_queue_for_recheck"));
+    }
+
+    #[test]
+    fn a_send_now_dispatches_only_the_message_the_reader_sent() {
+        let source = include_str!("app.rs");
+        let steer = source
+            .split_once("    fn steer_composer_queue_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn toggle_composer_queue_send_mode("))
+            .map(|(body, _)| body)
+            .expect("send-now gesture should remain inspectable");
+        let explicit = source
+            .split_once("    fn dispatch_explicit_queue_message(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Whether the pre-send queue is still"))
+            .map(|(body, _)| body)
+            .expect("explicit dispatch should remain inspectable");
+
+        // The gesture no longer promotes the clicked message to the head: a
+        // send of one middle row released every entry in front of it — the
+        // queue lost its order, and the jumped-over messages went out with the
+        // click instead of waiting their turn.
+        assert!(!steer.contains("move_composer_queue_message_to_front"));
+        assert!(!steer.contains("promote_composer_queue_message"));
+        // The anchor carries a newline so these asserts cannot match their own
+        // text in this source.
+        assert!(!source.contains("fn promote_composer_queue_message(\n"));
+        assert!(!source.contains("fn move_composer_queue_message_to_front(\n"));
+
+        // The clicked message is lifted out at its own position; everything
+        // around it stays exactly where it was.
+        assert!(explicit.contains(".position(|queued| queued.id == message_id)"));
+        assert!(steer.contains("dispatch_explicit_queue_message"));
     }
 
     #[test]
@@ -123231,7 +127192,7 @@ mod tests {
     }
 
     #[test]
-    fn composer_queue_reorders_only_within_a_session_and_steer_promotes_the_message() {
+    fn composer_queue_reorders_only_within_a_session() {
         let selection = SessionRuntimeSelection::provider(
             AgentId::parse("agent-queue").unwrap(),
             ProviderProfileId::parse("provider_queue").unwrap(),
@@ -123265,19 +127226,16 @@ mod tests {
             [3, 1, 2]
         );
         assert!(!reorder_composer_queue_message(&mut queue, 1, 4, true));
-        assert_eq!(
-            promote_composer_queue_message(&mut queue, 2)
-                .expect("queued message should be promoted")
-                .as_str(),
-            "session_queue_a"
-        );
+        // Reordering keeps the messages of other sessions where they are; it
+        // never promotes one entry past them. A send-now is not a reorder: it
+        // lifts one message out of the queue and leaves this order standing.
         assert_eq!(
             queue
                 .iter()
                 .filter(|message| message.session_id.as_str() == "session_queue_a")
                 .map(|message| message.id)
                 .collect::<Vec<_>>(),
-            [2, 3, 1]
+            [3, 1, 2]
         );
     }
 
@@ -123342,7 +127300,11 @@ mod tests {
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Pause"));
         assert!(interrupt.contains("ComposerQueueInterruptBehavior::Steer"));
         assert!(interrupt.contains("turn_was_locally_pending"));
-        assert!(interrupt.contains("composer_queue_steering_session_ids"));
+        // The steering arm no longer lifts the hold the rest of the queue
+        // waits under, and its hand-over spends the intent the gesture armed.
+        assert!(!interrupt.contains("composer_queue_paused_session_ids\n            .remove"));
+        assert!(interrupt.contains("composer_queue_steering_dispatches"));
+        assert!(interrupt.contains("dispatch_explicit_queue_message"));
         assert!(interrupt.contains("ComposerQueueDispatchBehavior::AfterInterrupt"));
     }
 
@@ -123448,6 +127410,411 @@ mod tests {
         assert!(!composer_runtime_controls_are_compact(861.0));
     }
 
+    /// The surface's height is a pure function of the draft: one line is a
+    /// bar, each further wrapped line adds one line advance, and the growth
+    /// stops at the input's own row cap where the textarea starts scrolling.
+    #[test]
+    fn composer_surface_height_grows_with_the_draft_and_stops_at_the_row_cap() {
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Slim, 1),
+            COMPOSER_SLIM_SURFACE_HEIGHT
+        );
+        // The full box's floor is the editor's own minimum band, not two text
+        // rows: the box must fit the rows it reserves, and the trailing corner
+        // is shorter than that band now.
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 1),
+            COMPOSER_FULL_SURFACE_MIN_HEIGHT
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 2),
+            COMPOSER_FULL_SURFACE_MIN_HEIGHT
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 3),
+            COMPOSER_FULL_SURFACE_MIN_HEIGHT,
+            "three rows still fit inside the input's band"
+        );
+        // Four rows reach past the band, so the box is exactly the text plus
+        // the row's chrome from here on: a row adds one line advance, never a
+        // reserved blank line.
+        let chrome = COMPOSER_INPUT_VERTICAL_PADDING
+            + COMPOSER_FULL_INPUT_ROW_VERTICAL_PADDING
+            + COMPOSER_FULL_CONTROL_ROW_HEIGHT
+            + COMPOSER_SURFACE_HAIRLINE;
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 4),
+            4.0 * COMPOSER_INPUT_LINE_HEIGHT + chrome
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 5),
+            5.0 * COMPOSER_INPUT_LINE_HEIGHT + chrome
+        );
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, 6),
+            6.0 * COMPOSER_INPUT_LINE_HEIGHT + chrome
+        );
+        let capped = composer_surface_height(ComposerDensity::Full, COMPOSER_INPUT_MAX_ROWS);
+        assert_eq!(
+            capped,
+            COMPOSER_INPUT_MAX_ROWS as f32 * COMPOSER_INPUT_LINE_HEIGHT + chrome
+        );
+
+        assert_eq!(
+            composer_surface_height(ComposerDensity::Full, COMPOSER_INPUT_MAX_ROWS + 4),
+            capped,
+            "past the cap the textarea scrolls inside a fixed surface"
+        );
+        // Both sides are constants, so this is a compile-time fact: the bar has
+        // to be shorter than the box, or the morph has nothing to glide.
+        const {
+            assert!(
+                COMPOSER_SLIM_SURFACE_HEIGHT < ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT,
+                "the bar must be shorter than the box, or the morph has nothing to glide"
+            );
+            assert!(
+                ACTIVE_COMPOSER_SURFACE_MIN_HEIGHT <= COMPOSER_FULL_SURFACE_MIN_HEIGHT,
+                "the full box's floor has to cover the multi-row floor as well"
+            )
+        };
+    }
+
+    /// The bar's input width comes from the pane's column and the controls
+    /// the bar seats beside the text — never from the density being chosen.
+    #[test]
+    fn composer_slim_input_width_is_a_property_of_the_pane_not_the_density() {
+        let wide = composer_slim_input_width(1200.0, None, 24.0, false, true);
+        // 1200 - 48 inset = 1152 surface; minus insets/hairlines/four 8px
+        // gaps and the fixed controls (attach 30 + expand 30 + send 32) and
+        // the 240px trigger.
+        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
+        // The compact trigger frees the label's width for the draft.
+        let compact = composer_slim_input_width(1200.0, None, 24.0, true, true);
+        assert_eq!(compact, wide + 240.0 - 32.0);
+        // No runtime selection, no trigger at all.
+        let bare = composer_slim_input_width(1200.0, None, 24.0, false, false);
+        assert_eq!(bare, wide + 240.0);
+        // The session content cap bounds the surface, and a sliver of a pane
+        // still leaves the probe a usable width instead of a negative one.
+        let capped = composer_slim_input_width(4000.0, Some(1024.0), 24.0, false, true);
+        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
+        assert!(composer_slim_input_width(200.0, None, 0.0, false, true) >= 120.0);
+    }
+
+    /// The reported failure: a draft that wraps to two rows on the slim bar's
+    /// input but fits one row on the full box's wider input made the density
+    /// flip on every frame. The probe answers at the bar's width regardless of
+    /// which density is painted, so the decision is a fixed point.
+    #[gpui::test]
+    fn composer_density_does_not_oscillate_at_the_wrap_boundary(cx: &mut TestAppContext) {
+        cx.update(gpui_component::init);
+        let input_slot: Rc<RefCell<Option<Entity<TextareaState>>>> = Rc::new(RefCell::new(None));
+        let stored = input_slot.clone();
+        let (_, cx) = cx.add_window_view(|window, cx| {
+            let input = cx.new(|cx| TextareaState::new(window, cx).auto_grow(1, 8));
+            *stored.borrow_mut() = Some(input.clone());
+            let probe = cx.new(|_| ComposerTokenProbe {
+                input,
+                agent_identity: None,
+            });
+            gpui_component::Root::new(probe, window, cx)
+        });
+        let input = input_slot
+            .borrow()
+            .clone()
+            .expect("the probe owns its input");
+        // The probe window lays the textarea out at 160px; a draft of this
+        // length wraps there but fits the wider box the full density gives.
+        let draft = "a draft that sits right at the wrap boundary of the bar";
+        cx.update(|window, cx| {
+            input.update(cx, |input, cx| input.set_value(draft, window, cx));
+            let _ = window.draw(cx);
+        });
+        let (font, font_size) = cx.update(|window, _| {
+            (
+                window.text_style().font(),
+                f32::from(window.rem_size()) * 0.875,
+            )
+        });
+        // The bar's input is narrow (the probe window's own 160px column);
+        // the full box's input is much wider. The live map wraps at 160px.
+        let slim_width = 160.0;
+        let full_width = 600.0;
+        let mut probe = None;
+        let rows_at_bar_width = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                slim_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert!(
+            rows_at_bar_width >= 2,
+            "the fixture draft must wrap on the bar's width: {rows_at_bar_width}"
+        );
+        // Whatever density is painted next — even one whose own input fits the
+        // draft on a single row — the probe keeps answering at the bar's width.
+        let rows_again = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                slim_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(rows_again, rows_at_bar_width);
+        assert_eq!(
+            composer_density(rows_again, false, true, false),
+            ComposerDensity::Full,
+            "a draft that wraps on the bar stays in the box"
+        );
+        // The full box's own width would call it one line — reading THAT is
+        // what used to flip the density back to the bar.
+        let rows_at_box_width = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                draft,
+                full_width,
+                font.clone(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(rows_at_box_width, 1);
+        // And back at the bar's width the answer returns to two: the probe
+        // tracks the width it is asked about, never the painted layout.
+        let rows_back = cx.update(|_, cx| {
+            composer_draft_wrapped_rows(&mut probe, &input, draft, slim_width, font, font_size, cx)
+        });
+        assert_eq!(rows_back, rows_at_bar_width);
+        // A short draft is one row at the bar's width and keeps the bar.
+        let short = "hi";
+        let short_rows = cx.update(|window, cx| {
+            composer_draft_wrapped_rows(
+                &mut probe,
+                &input,
+                short,
+                slim_width,
+                window.text_style().font(),
+                font_size,
+                cx,
+            )
+        });
+        assert_eq!(short_rows, 1);
+        assert_eq!(
+            composer_density(short_rows, false, true, false),
+            ComposerDensity::Slim
+        );
+    }
+
+    /// A notice row above the Composer must not stretch it.
+    ///
+    /// The continuation prompt, the generation status, the plan, the goal, the
+    /// collaboration bar and the queued messages are siblings of the surface,
+    /// not rows of it. Folding them into the density decision made a blank
+    /// draft render the full box — with an empty textarea and a reserved band
+    /// under it — for as long as the plan or the notice was up.
+    #[test]
+    fn composer_notices_do_not_force_the_full_box() {
+        assert_eq!(
+            composer_density(1, true, true, false),
+            ComposerDensity::Slim,
+            "a blank draft keeps the bar even with rows above it"
+        );
+        let source = include_str!("app.rs");
+        let call = source
+            .split_once("let composer_density = composer_density(")
+            .and_then(|(_, tail)| tail.split_once(");"))
+            .map(|(body, _)| body)
+            .expect("the density call should remain inspectable");
+        for inside in [
+            "composer_density_rows",
+            "composer_draft_is_empty",
+            "composer_attachments",
+            "composer_expanded",
+        ] {
+            assert!(call.contains(inside), "the density reads {inside}");
+        }
+        for outside in [
+            "continuation_available",
+            "composer_plan",
+            "composer_goal",
+            "composer_collaboration",
+            "composer_queue",
+            "generation_status",
+            "failover",
+            "agent_error",
+            "composer_extension_visible",
+        ] {
+            assert!(
+                !call.contains(outside),
+                "{outside} lives above the surface and must not choose its density"
+            );
+        }
+    }
+
+    /// A newline is a row, not an empty draft.
+    ///
+    /// The density used to treat a whitespace-only draft as empty, so pressing
+    /// Enter in the one-line bar added rows that the bar cannot show: the
+    /// surface stayed 46px and the controls were pushed down inside it. The
+    /// empty case is a draft with no characters at all, and a newline asks for
+    /// the full box like any other second row.
+    #[test]
+    fn a_draft_of_newlines_asks_for_the_full_box() {
+        assert_eq!(
+            composer_density(2, false, true, false),
+            ComposerDensity::Full,
+            "a second row — even a blank one — is a second row"
+        );
+        let source = include_str!("app.rs");
+        assert!(source.contains("let composer_draft_is_empty = composer_draft.is_empty();"));
+        // Built at runtime so this assertion's own text is not the needle it
+        // finds in the file.
+        let trimming = format!(
+            "let composer_draft_is_empty = composer_draft.{}.is_empty();",
+            "trim()"
+        );
+        assert!(!source.contains(&trimming));
+    }
+
+    /// The line under the surface carries the session's instruments.
+    ///
+    /// Neither density keeps the clock, the terminal or the usage ring inside
+    /// the box: the slim bar seats attach and expand beside the text, the full
+    /// box seats expand in the corner and attach on its control row, and the
+    /// three session instruments read left to right on the footer — schedule,
+    /// terminal, usage.
+    #[test]
+    fn the_footer_carries_the_session_instruments() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        let attach = composer
+            .find("Button::new(\"choose-composer-attachments\")")
+            .expect("the slim row should seat attach");
+        let expand = composer
+            .find("Button::new(\"toggle-composer-expanded\")")
+            .expect("the slim row should seat expand");
+        let cascade = composer
+            .find(".children(runtime_controls_cascade.take())")
+            .expect("the run configuration should stay in the bar");
+        let send = composer
+            .find(".children(primary_action.take())")
+            .expect("the send action should stay in the bar");
+        // The slim row reads left to right: attach, expand, run configuration,
+        // send — the input takes everything else.
+        assert!(attach < expand);
+        assert!(expand < cascade);
+        assert!(cascade < send);
+        // The old fold-menu and its schedule anchor are gone. The needles are
+        // built at runtime so this test does not match its own text.
+        let retired_menu = format!("render_composer_{}(", "more_menu");
+        let retired_anchor = format!("render_message_schedule_{}(", "anchor");
+        assert!(!source.contains(&retired_menu));
+        assert!(!source.contains(&retired_anchor));
+
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("the footer should remain inspectable");
+        let clock = footer
+            .find("render_message_schedule_button_sized(")
+            .expect("the footer should carry the schedule");
+        let terminal = footer
+            .find("render_composer_terminal_menu(")
+            .expect("the footer should carry the terminal");
+        let usage = footer
+            .find("Button::new(\"open-session-usage\")")
+            .expect("the footer should carry the usage ring");
+        assert!(clock < terminal);
+        assert!(terminal < usage);
+        // The left half names the session: the Agent's mark, then the project.
+        assert!(footer.contains("agent_brand_icon("));
+        assert!(footer.contains("project_display_name(locale, project)"));
+    }
+
+    /// The clock's tooltip loses its dangling ellipsis, and the terminal's
+    /// tooltip speaks the reader's language.
+    #[test]
+    fn composer_tooltips_are_complete_and_localized() {
+        let schedule = include_str!("message_schedule.rs");
+        assert!(
+            !schedule.contains("定时发送…") && !schedule.contains("Schedule message…"),
+            "the clock tooltip must not trail off"
+        );
+        assert!(
+            schedule.contains("locale::text(\"Schedule message\", \"定时发送\", \"定時傳送\")")
+        );
+
+        let source = include_str!("app.rs");
+        let terminal = source
+            .split_once("    fn composer_terminal_action_label(&self)")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .map(|(body, _)| body)
+            .expect("the terminal label should remain inspectable");
+        assert!(
+            terminal.matches("locale::text(").count() >= 4,
+            "every terminal action names itself through the locale"
+        );
+        for localized in [
+            "新建输入框终端",
+            "隐藏终端面板",
+            "显示终端面板",
+            "切换到终端模式",
+        ] {
+            assert!(terminal.contains(localized), "missing {localized}");
+        }
+    }
+
+    /// A long provider/model name truncates itself and keeps the thinking
+    /// depth: the two parts of the run-configuration trigger are separate
+    /// elements, not one string.
+    #[test]
+    fn the_run_configuration_trigger_keeps_the_thinking_depth_visible() {
+        let source = include_str!("app.rs");
+        let cascade = source
+            .split_once("    fn render_composer_runtime_cascade(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
+            .map(|(body, _)| body)
+            .expect("the cascade should remain inspectable");
+        assert!(cascade.contains("runtime_selector_dropdown_content_parts("));
+        assert!(cascade.contains("effort_label"));
+        // The chip names the same `supplier/model` pair the home page's chip
+        // and the panel's rows do: two Providers can serve one model name, and
+        // a bare model left the reader guessing which one a turn would run as.
+        assert!(cascade.contains("runtime_provider_model_label("));
+        assert!(!cascade.contains("let trigger_model_label = runtime_model_label("));
+
+        let parts = source
+            .split_once("fn runtime_selector_dropdown_content_parts(")
+            .and_then(|(_, tail)| tail.split_once("\nfn runtime_profile_count_label("))
+            .map(|(body, _)| body)
+            .expect("the two-part label should remain inspectable");
+        assert!(parts.contains("has_suffix"));
+        assert!(parts.contains("max_w(px(224.0))"));
+        // The name shrinks and truncates; the depth and the chevron keep their
+        // width instead of being clipped off the end of the chip.
+        assert!(parts.contains(".child(div().min_w_0().truncate().child(selected_label))"));
+        assert!(parts.contains(
+            ".when_some(suffix, |this, suffix| {\n                this.child(\n                    div()\n                        .flex_none()"
+        ));
+    }
+
     #[test]
     fn runtime_menu_height_does_not_follow_its_content() {
         // Switching Agent or typing a query must never resize the panel, so
@@ -123460,7 +127827,7 @@ mod tests {
             .expect("new-session runtime cascade should remain inspectable");
         let composer = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("current-session runtime cascade should remain inspectable");
 
@@ -124475,7 +128842,7 @@ mod tests {
             .expect("new-session runtime cascade should remain inspectable");
         let current_session = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("current-session runtime cascade should remain inspectable");
         let provider_groups = source
@@ -124866,7 +129233,7 @@ mod tests {
 
         let cascade = source
             .split_once("    fn render_composer_runtime_cascade(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_options("))
             .map(|(body, _)| body)
             .expect("the composer cascade should remain inspectable");
         assert!(cascade.contains("let focused_pane = self.composer_menu_scope_focused();"));
@@ -124876,15 +129243,16 @@ mod tests {
         assert!(cascade.contains(".filter(|_| focused_pane);"));
         assert!(cascade.contains("Popover::new(format!(\"composer-runtime-cascade{scope}\"))"));
 
-        let choice = source
-            .split_once("    fn render_composer_runtime_choice(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_cascade("))
+        // The docked options column shares the cascade's pane scope: its rows
+        // and its scroll id carry the same suffix, so one pane's column cannot
+        // open or scroll inside another pane's panel.
+        let options = source
+            .split_once("    fn render_composer_runtime_options(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_terminal_menu("))
             .map(|(body, _)| body)
-            .expect("the composer choice chips should remain inspectable");
-        // The menu id carries the pane, and the chip only honours the flag on the
-        // pane that owns the keyboard.
-        assert!(choice.contains("self.composer_menu_scope()"));
-        assert!(choice.contains("self.composer_menu_scope_focused(),"));
+            .expect("the docked options column should remain inspectable");
+        assert!(options.contains("let scope = self.composer_menu_scope();"));
+        assert!(options.contains("composer-runtime-options{scope}"));
 
         let popover = source
             .split_once("    fn render_runtime_choice_popover(")
@@ -130599,8 +134967,10 @@ mod tests {
 
         assert!(renderer.contains("agent_turn_preview_rail_visible_slots("));
         assert!(renderer.contains("timeline_visible_row_range("));
-        assert!(renderer.contains("f32::from(self.timeline_scroll.offset().y)"));
-        assert!(renderer.contains("f32::from(self.timeline_scroll.bounds().size.height)"));
+        assert!(
+            renderer.contains("f32::from(self.timeline_scroll.scroll_px_offset_for_scrollbar().y)")
+        );
+        assert!(renderer.contains("f32::from(self.timeline_scroll.viewport_bounds().size.height)"));
         // The pointer still outranks the reading position for its own slot, and
         // the reading position outranks the pointer's neighbourhood fade. The
         // reading bar is a position marker, not a second selection, so it stays
@@ -132127,31 +136497,55 @@ mod tests {
         assert!(owner.contains("MarkdownSurfaceOwner::BorrowedView"));
     }
 
-    /// Every pane's timeline is its own virtual list.
+    /// Every pane's timeline owns its own scroll state.
     ///
-    /// The list caches its measured row layout under its element id, so a
-    /// constant id made the panes share one cache: a pane drew the other pane's
-    /// row heights (a shrunken timeline with a blank band) and picked up its
-    /// scroll offset when focus moved.
+    /// The list caches its measured row layout in its `ListState`, so a shared
+    /// state made the panes share one cache: a pane drew the other pane's row
+    /// heights (a shrunken timeline with a blank band) and picked up its scroll
+    /// offset when focus moved. The state is a field of `SessionView`, so the
+    /// isolation is now structural rather than an element id that has to be
+    /// kept unique by hand.
     #[test]
-    fn every_pane_timeline_is_its_own_virtual_list() {
+    fn every_pane_timeline_is_its_own_list() {
         let source = include_str!("app.rs");
-        let workbench = source
-            .split_once("    fn render_agent_workbench_for(")
-            .and_then(|(_, tail)| tail.split_once("\n    fn render_composer_runtime_choice("))
+        let view = source
+            .split_once("pub struct SessionView {")
+            .and_then(|(_, tail)| tail.split_once("\n}"))
             .map(|(body, _)| body)
-            .expect("agent workbench should remain inspectable");
-        let list_id = workbench
-            .find("let timeline_list_id = SharedString::from(format!(")
-            .expect("the timeline list id should be built per session");
-        let list = workbench
-            .find("timeline_list_id.clone(),")
-            .expect("the virtual list should use the per-session id");
-        assert!(list_id < list);
-        assert!(workbench.contains("\"agent-timeline-turns-{}"));
-        assert!(workbench.contains("VibexSessionId::as_str"));
-        // The old constant id must be gone from the call.
-        assert!(!workbench.contains("\"agent-timeline-turns\","));
+            .expect("the session view should remain inspectable");
+        assert!(
+            view.contains("timeline_scroll: gpui::ListState"),
+            "the scroll state belongs to the view, so two panes cannot share it"
+        );
+        let surface = source
+            .split_once("    fn render_timeline_surface(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_agent_workbench_for("))
+            .map(|(body, _)| body)
+            .expect("the transcript surface should remain inspectable");
+        assert!(surface.contains("gpui::list("));
+        assert!(
+            !surface.contains("let timeline_list_id"),
+            "the per-session element id is no longer what keeps the panes apart"
+        );
+        // The surface owns its element tree, so a scroll rebuilds it alone.
+        let view = source
+            .split_once("struct TimelineSurfaceView {")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The child Agent rail's own render boundary.")
+            })
+            .map(|(body, _)| body)
+            .expect("the transcript surface's view should remain inspectable");
+        assert!(view.contains("cx.observe(workbench, |_, _, cx| cx.notify()).detach();"));
+        // The surface renders the transcript of its own session, not of whatever
+        // view happens to be borrowed when it paints: one shared surface painted
+        // the focused pane's conversation into every pane, at that pane's scroll
+        // offset. See `a_pane_gets_its_own_transcript_surface`.
+        assert!(
+            view.contains("session_id: Option<VibexSessionId>"),
+            "the surface has to know which session it draws"
+        );
+        assert!(view.contains("this.with_session_view_for_render(session_id.as_ref(),"));
+        assert!(view.contains("this.render_timeline_surface(cx)"));
     }
 
     /// A drag that never leaves the pane it started in splits that pane, and a
@@ -132294,8 +136688,9 @@ mod tests {
     }
 
     /// A collapsed group reports its members' status in the same trailing
-    /// column a session row keeps for its own, and shows the count only when
-    /// there is no status to report.
+    /// column a session row keeps for its own. With no status to report the
+    /// column carries the hover action cluster instead of a member count: the
+    /// avatars already say who is inside, so a number would repeat them.
     #[test]
     fn a_collapsed_group_reports_member_status_in_the_session_status_column() {
         let source = include_str!("app.rs");
@@ -132320,18 +136715,35 @@ mod tests {
         // Collapsed is what decides whether the row speaks for its members.
         assert!(group_row.contains("let collapsed_status = collapsed"));
         assert!(group_row.contains("self.session_group_status(&group)"));
-        // The count and the status share one fixed-width trailing column, the
-        // same one a session row uses.
+        // The status and the action cluster share one fixed-width trailing
+        // column, the same one a session row uses.
         assert!(group_row.contains(".w(px(SIDEBAR_STATUS_COLUMN_WIDTH))"));
         let status_slot = group_row
             .find("sidebar_aggregate_status_indicator(")
             .expect("the group row should render the aggregate status");
-        let count_slot = group_row
-            .find("format!(\"{member_count}\")")
-            .expect("the group row should render the member count");
-        assert!(status_slot < count_slot);
+        let actions_slot = group_row
+            .find("sidebar-group-actions-{group_id}")
+            .expect("the group row should carry the hover action cluster");
+        assert!(status_slot < actions_slot);
         assert!(group_row.contains(".when_some(collapsed_status, |this, status| {"));
-        assert!(group_row.contains(".when(collapsed_status.is_none(), |this| {"));
+        assert!(group_row.contains("collapsed_status.is_none() && !renaming && reorder_enabled,"));
+        // The member count is no longer painted; the cluster takes its slot.
+        assert!(!group_row.contains("format!(\"{member_count}\")"));
+        // The cluster is hover-only and shaped like the project row's:
+        // collapse, more, new session — and the new-chat action aims the
+        // new-session page at this group.
+        assert!(group_row.contains(".invisible()"));
+        assert!(group_row.contains(".group_hover(&hover_group, |style| style.visible())"));
+        assert!(group_row.contains("sidebar-group-toggle-{group_id}"));
+        assert!(group_row.contains("this.toggle_sidebar_group(&toggle_group_id, cx);"));
+        assert!(group_row.contains("sidebar-group-menu-{group_id}"));
+        assert!(group_row.contains("sidebar-group-new-{group_id}"));
+        assert!(group_row.contains("this.open_new_session_in_group("));
+        assert!(group_row.contains("sidebar_new_session_for_group_label("));
+        // While the row's own context menu is open the row keeps the hover
+        // wash, the way a session row does.
+        assert!(group_row.contains("SidebarContextMenuTarget::Group(group_id.clone())"));
+        assert!(group_row.contains("theme::hover_wash(cx.theme().is_dark())"));
         // The group's auto-continue rides the ring's color instead of a second
         // glyph in the trailing column, which keeps the column holding one mark
         // at a time. A group that never chose follows its project default, so
@@ -132390,7 +136802,11 @@ mod tests {
         assert!(session_menu.contains("move |mut submenu, _window, _cx|"));
     }
 
-    /// Each live pane owns a complete view and resolves its own requests.
+    /// Each painted pane owns a complete view and resolves its own requests.
+    ///
+    /// The set is the painted panes, never the presentation's live budget or
+    /// whichever pane holds the keyboard: a pane that loses focus must keep
+    /// the conversation it is showing.
     #[test]
     fn group_panes_materialize_views_and_resolve_requests_for_their_own_session() {
         let source = include_str!("app.rs");
@@ -132402,10 +136818,25 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group view materialization should remain inspectable");
-        // Only the live members materialize views and histories.
-        assert!(ensure.contains("group.live_session_ids()"));
+        // Every painted pane materializes its view and history, and only the
+        // painted panes do: a hidden tab still loads when it is selected.
+        assert!(ensure.contains("group.painted_session_ids()"));
+        assert!(!ensure.contains("group.live_session_ids()"));
         assert!(ensure.contains("self.ensure_session_view(&session_id);"));
         assert!(ensure.contains("self.ensure_session_group_view_loaded(&session_id, cx);"));
+
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane rendering should remain inspectable");
+        // Content is decided by the active session alone. Focus may gate the
+        // composer, the find bar and the terminal hand-off, but never whether
+        // the transcript is painted.
+        assert!(pane.contains("match active_session_id.as_deref()"));
+        assert!(!pane.contains("live_session_ids()"));
+        assert!(!pane.contains("painted_session_ids()"));
+        assert!(!pane.contains("Select this pane to load its conversation"));
 
         let load = source
             .split_once("    fn load_session_group_view(")
@@ -132556,7 +136987,9 @@ mod tests {
         // one: there is exactly one composer implementation.
         let wrapper = source
             .split_once("\n    fn session_group_pane_with_composer(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Gives every group member"))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives every painted pane a complete view")
+            })
             .map(|(body, _)| body)
             .expect("pane composer wrapper should remain inspectable");
         assert!(wrapper.contains("composer: AnyElement"));
@@ -132607,7 +137040,9 @@ mod tests {
         // The composer is built while the pane's own view is borrowed.
         // Re-borrowing the primary between panes made a split store and reload a
         // view twice for every pane, every frame.
-        assert!(content.contains(".ensure_composer_view(Some(&pane_session_id), focused, cx)"));
+        assert!(
+            content.contains(".ensure_composer_view(Some(&pane_session_id), focused, focused, cx)")
+        );
         // The find bar is built in the same borrow, and only for the focused
         // pane: it searches that pane's conversation, so a bar in every pane
         // would put two live inputs on one query.
@@ -132861,6 +137296,135 @@ mod tests {
             .expect("group pane renderer should remain inspectable");
         assert!(pane.contains("active_session_id.as_deref() == Some(selected.as_str())"));
         assert!(!pane.contains("pane.session_ids\n                .iter()\n                .any"));
+    }
+
+    /// A group pane's frame is a card edge, not a second divider.
+    ///
+    /// A split stacks hairlines on its seam, so the resting frame stays well
+    /// under the authored `border` and hover clears it by a margin the eye reads
+    /// at a glance without changing the token.
+    #[test]
+    fn the_group_pane_frame_rests_quiet_and_answers_hover() {
+        let border = gpui::hsla(0.58, 0.24, 0.62, 0.15);
+        let rest = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_REST_WEIGHT);
+        let hovered = session_group_pane_frame(border, SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT);
+
+        // Hover has to be a highlight rather than a step of a hair, and it
+        // brightens the resting hairline instead of recolouring it.
+        assert!(hovered.a >= rest.a * 4.0);
+        assert!((rest.a - border.a * SESSION_GROUP_PANE_FRAME_REST_WEIGHT).abs() < 1e-6);
+        assert!((hovered.a - border.a * SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT).abs() < 1e-6);
+        for frame in [rest, hovered] {
+            assert_eq!((frame.h, frame.s, frame.l), (border.h, border.s, border.l));
+        }
+
+        // A high-contrast border is already near the ceiling, so the weight has
+        // to clamp to a valid alpha instead of asking for more than opaque.
+        let strong = session_group_pane_frame(
+            gpui::hsla(0.0, 0.0, 1.0, 0.9),
+            SESSION_GROUP_PANE_FRAME_HOVER_WEIGHT,
+        );
+        assert_eq!(strong.a, 1.0);
+    }
+
+    /// A selected pane is marked inside its content, not by its frame.
+    ///
+    /// The frame stays a quiet card edge and the strip carries no accent bar:
+    /// the composer the pane owns wears the focus ring, and a terminal pane
+    /// lights its own rounded window, the way an active pane is drawn in a
+    /// terminal multiplexer. The single-session column has no pane to mark, so
+    /// neither surface rings there.
+    #[test]
+    fn a_selected_group_pane_is_marked_by_its_content() {
+        let source = include_str!("app.rs");
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane renderer should remain inspectable");
+        // The frame answers the pointer only; the tab strip keeps no accent bar.
+        assert!(!pane.contains(".ring"));
+        assert!(!pane.contains("SESSION_GROUP_PANE_FRAME_FOCUS_RING_ALPHA"));
+        assert!(!pane.contains("primary.opacity(0.75)"));
+
+        // A pane hands its focus to the composer it builds, which rings its box.
+        let content = source
+            .split_once("    fn render_session_group_pane_content(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Puts a pane's own composer under its conversation.")
+            })
+            .map(|(body, _)| body)
+            .expect("group pane content should remain inspectable");
+        assert!(
+            content.contains(".ensure_composer_view(Some(&pane_session_id), focused, focused, cx)")
+        );
+        let composer = source
+            .split_once("    fn render_composer(\n        &mut self,\n        window: &mut Window,\n        cx: &mut Context<Self>,\n        enabled: bool,\n        pane_focused: bool,\n    ) -> AnyElement {")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should keep the pane-focus argument");
+        let composer_ring = composer
+            .find("if pane_focused {")
+            .expect("the composer must ask whether its pane holds the keyboard");
+        assert!(composer[composer_ring..].contains("cx.theme().ring"));
+
+        // A terminal pane lights its own window frame instead.
+        let terminal = source
+            .split_once("    fn render_session_terminal_page_for_session(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// The surface the page frames, or the stand-in")
+            })
+            .map(|(body, _)| body)
+            .expect("the per-session terminal page should remain inspectable");
+        let terminal_ring = terminal
+            .find("if pane_focused {")
+            .expect("the terminal page must ask whether its pane holds the keyboard");
+        assert!(terminal[terminal_ring..].contains("cx.theme().ring"));
+        // The single-session page has no pane to mark.
+        assert!(source.contains(
+            "self.render_session_terminal_page_for_session(session, true, false, window, cx)"
+        ));
+    }
+
+    /// Selecting a pane hands the keyboard to the conversation inside it.
+    ///
+    /// A click on an unselected pane focuses that pane, and the composer it
+    /// shows is where the caret then has to land. The request is stored by the
+    /// click and consumed by the pane's composer on the frame that builds its
+    /// textarea, because that textarea does not exist before the render.
+    #[test]
+    fn a_selected_group_pane_puts_the_caret_back_in_its_composer() {
+        let source = include_str!("app.rs");
+
+        // Selecting a pane asks for the keyboard, naming the session the pane
+        // shows rather than the pane itself: the composer is built per session.
+        let focus_pane = source
+            .split_once("    fn focus_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_group_tab("))
+            .map(|(body, _)| body)
+            .expect("pane focus should remain inspectable");
+        assert!(focus_pane.contains("self.request_session_group_pane_keyboard(session_id)"));
+
+        // A terminal pane takes the keyboard into its grid; a conversation
+        // pane puts the caret back into its composer.
+        let request = source
+            .split_once("    fn request_session_group_pane_keyboard(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_group_pane("))
+            .map(|(body, _)| body)
+            .expect("the keyboard hand-off should remain inspectable");
+        assert!(request.contains("self.session_terminal_focus_request = Some"));
+        assert!(request.contains("self.session_group_composer_focus_request = Some"));
+
+        // The composer adopts the request and clears it, so a pane that stays
+        // selected keeps the caret where the reader put it afterwards.
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(composer.contains("self.session_group_composer_focus_request.as_deref()"));
+        assert!(composer.contains("self.session_group_composer_focus_request = None;"));
+        assert!(composer.contains("input.update(cx, |input, cx| input.focus(window, cx));"));
     }
 
     /// A group pane's strip is the preview strip's sibling: the same metrics,
@@ -133229,9 +137793,7 @@ mod tests {
 
         let setter = source
             .split_once("    fn set_new_session_folder(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    /// The folders the draft's project offers")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    /// Aims the draft at `group_id`"))
             .map(|(body, _)| body)
             .expect("the folder setter should remain inspectable");
         // A stale or foreign folder is refused rather than written. The guard
@@ -133269,9 +137831,50 @@ mod tests {
             .expect("the workspace control row should remain inspectable");
         assert!(control_row.contains(".when_some(folder_control, |this, folder_control| {"));
         assert!(control_row.contains("child(location_control)"));
-        assert!(source.contains("this.set_new_session_folder(folder_id.clone(), cx);"));
+        assert!(source.contains("this.set_new_session_folder(Some(folder_id), cx);"));
         assert!(source.contains("this.set_new_session_folder(None, cx);"));
         assert!(source.contains("self.set_new_session_folder(Some(folder_id.clone()), cx);"));
+        // A session group is a filing destination like a folder: offered in
+        // the same control with the layers glyph the sidebar's group rows
+        // use, written through its own setter, and joined by the session the
+        // draft creates.
+        assert!(choices.contains("groups_for_project(&project_id)"));
+        assert!(choices.contains("NewSessionFilingTarget::Group(group_id)"));
+        assert!(page.contains("this.set_new_session_group(Some(group_id), cx);"));
+        assert!(page.contains("this.set_new_session_group(None, cx);"));
+        assert!(page.contains("sidebar_icon(\"icons/vibex/layers.svg\").size(px(14.0))"));
+        let group_setter = source
+            .split_once("    fn set_new_session_group(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n    /// The folders and session groups the draft's project offers",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("the group setter should remain inspectable");
+        assert!(group_setter.contains(".group(group_id)"));
+        assert!(group_setter.contains("Some(group.project_id.clone()) == draft_project_id"));
+        // A draft is filed under a folder or a group, never both.
+        assert!(setter.contains("self.new_session_group_id.take().is_some()"));
+        assert!(group_setter.contains("self.new_session_folder_id.take().is_some()"));
+        let group_filing = source
+            .split_once("    fn file_new_session_in_group(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn probe_new_session_eligibility("))
+            .map(|(body, _)| body)
+            .expect("group filing should remain inspectable");
+        assert!(group_filing.contains("self.add_sessions_to_group_from_menu("));
+        let registration = source
+            .split_once("    fn open_pending_new_session(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn update_pending_new_session_workspace("))
+            .map(|(body, _)| body)
+            .expect("pending new-session registration should remain inspectable");
+        let file_group = registration
+            .find("self.file_new_session_in_group(&session_id, cx);")
+            .expect("a group-aimed draft should join its session");
+        let reconcile = registration
+            .find("self.reconcile_sidebar_state();")
+            .expect("the sidebar should reconcile after the row exists");
+        assert!(file_group < reconcile);
     }
 
     /// An expanded group draws a tree connector beside each member row.
@@ -135055,6 +139658,137 @@ mod tests {
         page.session_id = VibexSessionId::parse("session_other").unwrap();
         let error = next_authoritative_timeline_cursor(&session_id, 0, &page).unwrap_err();
         assert_eq!(error, TimelineRestoreError::PageSessionMismatch);
+    }
+
+    #[tokio::test]
+    async fn a_window_opens_on_a_turn_boundary() {
+        let session_id = VibexSessionId::parse("session_turn_align").unwrap();
+        let page = |start: i64, end: i64, has_older: bool, at_turn_start: bool| TimelinePage {
+            session_id: session_id.clone(),
+            items: (start..=end)
+                .map(|sequence| indexed_timeline_item(&session_id, sequence, "row"))
+                .collect(),
+            start_sequence: Some(start),
+            end_sequence: Some(end),
+            has_older,
+            has_newer: false,
+            starts_at_turn_start: at_turn_start,
+            leading_turn_start: None,
+            omitted: None,
+        };
+
+        // One running turn is bigger than a page, so the newest page opens in
+        // the middle of it. The walk reaches back to the page that opens the
+        // turn, and the window is a whole number of turns again.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window =
+            align_timeline_window_to_turn_start(page(500, 999, true, false), move |before| {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Ok(page(before - 500, before - 1, false, true))
+                }
+            })
+            .await;
+        assert_eq!(reads.get(), 1);
+        assert_eq!(window.start_sequence, Some(0));
+        assert!(window.starts_at_turn_start);
+        assert_eq!(window.items.len(), 1000);
+
+        // A walk that never reaches a boundary stops at the page budget instead
+        // of reading the whole session: the window is still usable, it just
+        // opens mid-turn until history is paged in under it.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window =
+            align_timeline_window_to_turn_start(page(9000, 9999, true, false), move |before| {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Ok(page(before - 500, before - 1, true, false))
+                }
+            })
+            .await;
+        assert_eq!(reads.get(), AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES);
+        assert!(!window.starts_at_turn_start);
+
+        // The oldest page of a session needs no walk at all.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window = align_timeline_window_to_turn_start(page(0, 9, false, false), move |before| {
+            let counter = counter.clone();
+            async move {
+                counter.set(counter.get() + 1);
+                Ok(page(before - 10, before - 1, false, true))
+            }
+        })
+        .await;
+        assert_eq!(reads.get(), 0);
+        assert_eq!(window.start_sequence, Some(0));
+    }
+
+    #[gpui::test]
+    async fn anchor_recovery_walk_retries_a_failed_page_once() {
+        let session_id = VibexSessionId::parse("session_recovery").unwrap();
+        let page = |start_sequence: i64, end_sequence: i64, has_older: bool| TimelinePage {
+            session_id: session_id.clone(),
+            items: (start_sequence..=end_sequence)
+                .map(|sequence| indexed_timeline_item(&session_id, sequence, "row"))
+                .collect(),
+            start_sequence: Some(start_sequence),
+            end_sequence: Some(end_sequence),
+            has_older,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: None,
+        };
+
+        // The first read of the page below the window fails — a saturated
+        // machine, a busy store — and the walk survives it: the retry lands
+        // the page, so the window still covers the turn the reader holds.
+        let attempts = Rc::new(std::cell::Cell::new(0_usize));
+        let retry_attempts = attempts.clone();
+        let window =
+            extend_timeline_window_back_to(page(40, 60, true), Some(10), move |before_sequence| {
+                let attempts = retry_attempts.clone();
+                async move {
+                    let attempt = attempts.get();
+                    attempts.set(attempt + 1);
+                    if attempt == 0 {
+                        Err(vibex_core::VibexError::storage(
+                            "timeline_page_read_failed",
+                            "the page read failed once",
+                        ))
+                    } else if before_sequence == 40 {
+                        Ok(page(10, 39, false))
+                    } else {
+                        Ok(page(0, 0, false))
+                    }
+                }
+            })
+            .await;
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(window.start_sequence, Some(10));
+
+        // A read that fails twice is still the end of the walk: the window is
+        // left exactly as it arrived, which is the best-effort contract.
+        let attempts = Rc::new(std::cell::Cell::new(0_usize));
+        let failed_attempts = attempts.clone();
+        let window = extend_timeline_window_back_to(page(40, 60, true), Some(10), move |_| {
+            let attempts = failed_attempts.clone();
+            async move {
+                attempts.set(attempts.get() + 1);
+                Err(vibex_core::VibexError::storage(
+                    "timeline_page_read_failed",
+                    "the page read keeps failing",
+                ))
+            }
+        })
+        .await;
+        assert_eq!(attempts.get(), 2);
+        assert_eq!(window.start_sequence, Some(40));
     }
 
     #[test]

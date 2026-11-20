@@ -46,6 +46,8 @@ back, and a closing row flashes a blank band.
 | A running turn stays on the live edge, and so does a row closing there. | The reader is watching the turn arrive, and a closing row has to bring the viewport down either way. |
 | Rows hang from the bottom of their boxes only while a disclosure moves on the bottom edge and for `AGENT_TIMELINE_DISCLOSURE_SETTLE_FRAMES` after it stops (`timeline_rows_hang_from_bottom`), and never for a row opened with the screen held. | It keeps the visible edge exact and moves the difference to the top of the turn. A stream must not do this: a shorter Markdown reparse is held in place by the same slack, and hanging it bounces the whole turn. |
 | The windowed run and group body place their rows through `timeline_window_origins`, measuring every row before placing any. | They reserve a height of their own, so hanging the virtual row alone still moves what is under a disclosure. A row with no measured neighbour starts from the table, which keeps a pinned reveal on its own origin. |
+| The streaming preserve policy holds a turn's extent only while the reader is scrolled up (`record_timeline_turn_height`). | A held extent is a blank band under the last row and the viewport is anchored to it, so releasing the band slides the last row down by its height. At the live edge the band is the last thing on screen: the hold buys nothing there, and a disclosure frame — which releases it by dropping `timeline_disclosure_animating` — turns the release into a visible jump of everything below. Scrolled up, the band sits below the fold, where it is exactly what keeps a transient reparse from bouncing. |
+| The settle window reads the clock that drives the view's frames (`cx.background_executor().now()`), not `Instant::now()`. | A test advances the frame clock to draw, so a process-clock reading makes the window depend on how long the fixture took: the same probe failed alone and passed in the suite because wall time had settled the hold. |
 | The child Agent rail takes no part in any of this. | It scrolls by itself, and its rows name turns of another timeline, so they neither release the parent's follow nor open its settle window. |
 | A disclosure landing on the bottom edge resumes the follow (`resume_timeline_follow_after_disclosure`). | The reader never scrolled, so the wheel-idle state machine has nothing to resume from. The distance comes from the row table, because the handle's extent is still the last prepaint's. |
 
@@ -67,9 +69,9 @@ definite height, and the card's row set is reconciled before every draw.
 
 ## 4. Why the Main Transcript Does Not Use MessageScroller
 
-`gpui-component 0.8.x`'s `MessageScrollerState` exposes `logical_scroll_top`,
-`scroll_to_item(index)`, `scroll_to_end`, and row-count mutations. It does not
-expose:
+`MessageScrollerState` in the resolved `gpui-component 0.10.0` exposes
+`logical_scroll_top`, `scroll_to_item`, `scroll_to_offset`, `scroll_to_end`, and
+row-count mutations. It does not expose:
 
 - `scroll_to(ListOffset)` / `scroll_by`, so an offset inside a turn cannot be
   restored;
@@ -84,10 +86,17 @@ lose reveal inside turns taller than the viewport, and change the first-frame
 extent. Forking or vendoring the crate is prohibited by
 [`rust-dependency-sources.md`](../backend/rust-dependency-sources.md).
 
-## 5. Required Upstream API Before Migrating
+That is an argument against the *wrapper*, not against the element. Every one of
+those capabilities exists on `ListState`, which `MessageScrollerState` wraps and
+does not re-export, and `gpui::list(state, renderer)` is public gpui — the same
+shape §3a already uses for the Providers → Models tab. `v_virtual_list` is
+`gpui_base::VirtualList`, which contains no `fast::layers` code at all, so the
+transcript gets no list layer today; `gpui::list` carries the full one. §5
+records the measurement and the shape of the migration.
 
-The main transcript can move to `MessageScroller` once the published state
-exposes:
+## 5. What the Wrapper Would Need, and What Is Already Available
+
+`MessageScroller` — the wrapper — would need its published state to expose:
 
 ```rust
 MessageScrollerState::scroll_to(ListOffset);
@@ -107,15 +116,235 @@ explicit approval. The published crate still gives the row renderer only an
 index, so a caller cannot build a row from `&mut self` without routing through a
 weak entity and a snapshot.
 
-Two things follow. The API gap is no longer the blocker — the *payoff* is
-(see §7.1: a layer only pays when its content is stable across scrolled frames).
-And until a release carries the new API, any migration would have to work
-through the published surface, which is a larger rewrite of the row builders
-than the geometry changes alone suggest.
+Verified against the resolved `gpui-component 0.10.0` source
+(`src/message_scroller.rs`): `scroll_to_offset(ListOffset)` is published; the
+rest of the list above is not, and `MessageScroller::new` still takes
+`impl FnMut(usize, &mut Window, &mut App) -> E`. So four of the five state
+accessors, the row-height hints, and the owning-entity renderer are all still
+absent from what this workspace can build against.
 
-Until then, keep the per-turn virtual list and adopt only compatible
-`MessageScroller` affordances (for example, the log role or the jump-button
-visual language) without removing the pixel-scroll state.
+Two things follow. The payoff is real and the element is the reason (see the
+measurement below): the transcript's element has no list layer, while
+`gpui::list` does. And the `MessageScrollerState` surface above is a thin
+re-export, not the whole capability — most of what the requirement list asks
+for is already reachable one level down.
+
+**Status: the transcript can get a list layer, without changing or forking
+`gpui-component`.** An earlier revision of this section closed the question on
+the claim that a list layer would not engage on the transcript. That claim was
+wrong, and the reason is worth recording because it is the whole argument for
+the migration.
+
+The two elements are not the same thing:
+
+| Element | `fast::layers` references | List layer |
+| --- | --- | --- |
+| `gpui::list` — what `MessageScroller` renders internally | 17 | supported (`begin_list` / `paint_row` / `end_list`) |
+| `gpui_base::VirtualList` — what `v_virtual_list` is | **0** | none |
+
+So the transcript does not merely fail to composite today: the element it uses
+has no list-layer code path at all, and measured on the real transcript the
+container composites zero frames across twelve scrolled frames. `MessageScroller`
+wraps `gpui::list`, which *does* carry the full list layer — rows replay instead
+of being rebuilt, and a list layer is exempt from the tile budget. On the
+transcript that is the difference between rebuilding the visible turns every
+scrolled frame and replaying them.
+
+**The API gap is not a wall: use `gpui::list` directly.** Everything the
+requirement list asks for already exists one level down, on `ListState` — the
+type `MessageScrollerState` wraps and never re-exports:
+
+| Wanted | Where it lives in `gpui-fast 0.1.16` |
+| --- | --- |
+| `scroll_to(ListOffset)` | `ListState::scroll_to` |
+| `scroll_by` | `ListState::scroll_by` |
+| `viewport_bounds` | `ListState::viewport_bounds` |
+| offset / max offset | `ListState::scroll_px_offset_for_scrollbar`, `max_offset_for_scrollbar` |
+| row height hints | `ListState::with_uniform_item_height`, per-item `size_hint` |
+| renderer owning entity | not on `list()`, but a captured `WeakEntity` is the standard pattern here already |
+
+`gpui::list(state, renderer)` is a public gpui constructor, and `ListState` is
+`Clone`, so a view can own one and still pass it to the element. Nothing in
+`gpui-component` has to change, and nothing has to be forked — this is the
+dependency-source policy's preferred outcome, not an exception to it.
+
+Measured: a plain `gpui::list` over 200 stable rows composites **eleven frames of
+twelve** scrolled frames, against **zero** for the same content through
+`v_virtual_list`. So "can the transcript get a list layer" is answered yes, and
+the remaining work is a row-builder rewrite onto `ListState`, not a wait on an
+upstream release.
+
+**The migration is done.** The transcript renders through `gpui::list` with a
+`ListState` the `SessionView` owns, and every desktop test passes (2016). What
+the rewrite had to solve is recorded here because none of it is obvious from the
+API:
+
+| Problem | What the rewrite does |
+| --- | --- |
+| `list()`'s renderer receives only an index | the row builder reaches the view through a `WeakEntity` and `Entity::update`, the pattern every other row callback here already used |
+| The renderer runs inside the list's own layout borrow | nothing in a row may read the list's state. The one scroll-derived decision a row makes — whether the turn hangs from the bottom edge — is resolved once before the element is built and cached on the view |
+| Unmeasured rows contribute no extent | `reset_with_uniform_height` seeds them from the table's median row height. Without it the scrollbar reads a zero-length document and the transcript cannot scroll at all until every row has been on screen |
+| `scroll_px_offset_for_scrollbar` counts the list's padding, `max_offset_for_scrollbar` does not | both are read through view-level accessors that put them in one coordinate system; comparing the raw pair leaves a padding-sized band that makes the transcript read as never reaching its bottom edge |
+| `scroll_to_end` parks the viewport past the last row | `scroll_timeline_to_latest` anchors at the end only when the content overflows; a transcript that fits drops the anchor instead |
+
+**The layer still does not engage on the transcript.** Measured after the
+migration: the same `ListState`, drawn through a bare `gpui::list` in another
+window, composites eleven of twelve scrolled frames — while the workbench's own
+path composites zero. The element is no longer the blocker; the owner is. A
+wheel over the transcript notifies the workbench, and `owner_scrolled_only`
+requires that nothing but the scroll notified it. That is §7.3's second blocker,
+the P0b work of narrowing notifications, and it now applies to the transcript
+exactly as it does to the sidebar.
+
+**Solved: the scrollbar's fade was the blocker.** Bisecting the surface found
+it. `pinned_scrollbar` draws `Scrollbar` as a child of the view holding the
+scroller, and the bar asks for an animation frame while its fade runs;
+`Window::request_animation_frame` attributes the request to
+`window.current_view()`, so it landed inside the list's own layer path and
+`eligible` refused the layer for as long as the fade ran — every scrolled frame.
+`ScrollbarOverlay` (in `apps/desktop/src/gpui_ext/mod.rs`) paints the bar in a
+view of its own, which moves the attribution off the surface. Measured on the
+transcript's surface with the same rows and state: **0 of 12 composited frames
+with the bar inline, 11 of 12 with it in its own view.** This is the same
+blocker §7.2 recorded for the sidebar; the sidebar also had a second one behind
+it, which is why the overlay did not help there, while the transcript had only
+this.
+
+How to bisect this class of problem, since reading the policy does not tell you
+which rule fired: build a minimal surface that returns the list alone and
+confirm it composites, then add the real surface's pieces back one at a time.
+The minimal list composited 11 of 12 immediately, which ruled out the element,
+the rows, the view boundary and the wrapper in one step and left the bar.
+
+Two more things were measured while narrowing it, and both matter to whoever
+picks this up:
+
+- **The rows are the cost, not the shell.** Stubbing the row builder's content
+  takes a scrolled frame from thirteen rebuilt views to one. So the work below
+  is worth doing on its own account even before the layer engages: a scrolled
+  frame stops rebuilding every visible turn.
+- **`gpui::list` notifies the view that painted it, and no subscription can
+  refuse that.** The notify is delivered by `App::notify` straight to the
+  view's invalidator, not through the observer list, so a view that records the
+  scroll count and skips the notify in its `observe` callback is still rebuilt.
+  The count (`TranscriptScrollNotifies`, taken in the list's own scroll handler,
+  which runs just before the notify) therefore buys nothing until the list is
+  painted by a view that holds nothing else. That is the shape §7.3 already
+  describes for the sidebar and the shape `ChildAgentRailView` uses: the
+  element and its scroll state move into a view of their own, and a scroll then
+  rebuilds that view alone.
+
+## 5b. A row-count change must not move the reader
+
+`gpui::list` keeps the reader's place in its scroll anchor, and the only way to
+tell it a row was added or removed is `reset` — which drops the anchor. A list
+without one starts at `ListOffset::default()`, i.e. row zero, so the next frame
+paints the top of the conversation. Both ways the row count moves are therefore
+still broken if the reset is taken as the whole job:
+
+| Change | What has to happen |
+| --- | --- |
+| A turn is appended (live event, a sent message) | the reader's offset is already the place they keep: nothing above the viewport moved. Read the offset before the reset and set it back afterwards. |
+| An older page is prepended (a history read) | the content above the viewport grew, so the offset has to follow the row the reader was in: `capture_timeline_scroll_anchor` before the merge, and the pending anchor after the reset. |
+
+Order is part of the rule, and it splits the two pending scrolls apart:
+
+- `apply_pending_timeline_scroll` (the bottom follow) runs **before**
+  `sync_timeline_list_rows`: `scroll_to_end` on a list that has not been told its
+  count yet is a no-op, so the count has to exist first — that is the order the
+  transcript already had.
+- `apply_pending_timeline_anchor` runs **after** it. Applying an anchor first and
+  resetting the count afterwards wiped the anchor it had just restored — the
+  reader landed at row zero with no pending work left to correct it — and the
+  restore was clamped against the previous table's extent.
+
+The two cannot share one call: a bottom follow must win over a stale anchor, and
+an anchor must land on the table the reset installed.
+
+## 5b-bis. The list drops every hint when its width changes
+
+`gpui::list` invalidates all cached item heights whenever its width or padding
+differs from the last layout — its **first** layout always does — and it rewrites
+every item as `Unmeasured { size_hint: None }`. A hint-less row contributes no
+height, so the transcript's extent becomes "the rows that have been measured",
+not the conversation. Measured on a 120-turn fixture: the list reported 556px
+where the row table said 33,360px, and the figure grew by a row's height every
+time the reader scrolled one into view — the scrollbar thumb, the anchor mapping
+and `scroll_to_end` all described the shorter document, and the offset lurched
+with it.
+
+| Rule | Why |
+| --- | --- |
+| `sync_timeline_list_rows` seeds `reset_with_uniform_height` again after the width has settled, not on the frame it changed. | Seeding on the changed frame only feeds the wipe; a pane being dragged narrower changes the width on every frame, so the seed waits for it to stop. |
+| The seed restores `logical_scroll_top()` (row index + offset inside the row), not an absolute pixel offset. | The anchor is exact across the reset and describes the reader's place; a pixel offset is only an approximation of it, and is wrong the moment any row above changes height. |
+| A reader on the live edge is sent back with `scroll_to_end()` after the reset. | Without an anchor the list starts at its first row, which is the top of the conversation. |
+| The scroll position is read back the way the list itself means it. | `scroll_px_offset_for_scrollbar` includes the list's padding and `max_offset_for_scrollbar` does not; `timeline_max_scroll_offset`/`timeline_scroll_offset` put both in one coordinate system, and a test must use that pair rather than the raw ones. |
+
+## 5b-ter. Holding the screen survives the landing frame
+
+`resume_timeline_follow_after_disclosure` resumed the follow whenever the
+viewport was within 2px of the bottom. An opening row that held the screen left
+the viewport exactly at the *pre-growth* bottom, so the landing frame read that
+as "the reader never scrolled" and scrolled the newly opened row into view —
+undoing the hold the click asked for, one frame after the spring stopped.
+
+| Rule | Why |
+| --- | --- |
+| A disclosure that holds the screen (`timeline_disclosure_holds_screen`) never resumes the follow when it lands. | The hold *is* the reader's instruction; the landing frame must not reinterpret it. A closing row does not hold, so it still resumes at the bottom edge. |
+
+## 5b-quater. The reader's place is a row, kept current
+
+| Rule | Why |
+| --- | --- |
+| `capture_timeline_scroll_anchor` reads `ListState::logical_scroll_top()` — the row and the distance into it — instead of resolving a pixel offset against a copy of the row table. | That is the identity the list itself lays out with, and it costs nothing, so the render can refresh it on every frame. |
+| The render captures it every frame while the reader is not following the bottom. | A read that finishes a moment after the reader kept scrolling would otherwise restore the place they left — a jump in whichever direction they went since. |
+| `apply_timeline_scroll_anchor` places that row with `scroll_to(ListOffset)`, not with a pixel offset through `set_offset_from_scrollbar`. | The pixel mapping runs the offset back through the list's padding and its own item heights, and the padding stays in the result as a bias. |
+| A test fixture that parks the reader must park the list (row + offset), not a pixel offset derived from the table. | The list resolves a pixel offset through the heights it knows; before a row has been measured that is its hint, not the table's estimate, so the two disagree. |
+
+## 5b-quinquies. A reopen under load must not bounce the reader
+
+Opening a session borrows its cached view and paints it synchronously, then
+re-reads the authority (a tail patch, or the newest window when the view fell
+behind the stream). Under load that read lands late, and two rules keep the
+interval between the borrowed frame and the landing from reading as a bounce:
+
+| Rule | Why |
+| --- | --- |
+| A prepared window that opens below the turn the reader's anchor names is refused once (`TimelineInstall::AnchorLost`), and the loader re-reads contiguously with the anchor covered (`reread_timeline_covering_reader_anchor`). The recovery read is marked `anchor_recovery_spent` and its answer installs regardless. | Installing the short window resolves the anchor to nothing and clamps the old offset — the reader is thrown out of their place while the borrowed view was still painting it. The cover walk is best effort (a page can fail on a saturated machine), so the install is the last line of defence. One refusal only: a place that cannot be kept costs a single extra read, never a retry loop. |
+| A restore keeps the measured turn heights as the seed (`refresh_borrowed_view_geometry`): a stale row-table stamp rebuilds the table against the current projection, and a content-width change retargets it (`retarget_timeline_layout_width`). Neither wipes the measurements. | Wiping them routes the whole restored view through character-count estimates for a frame. On the bottom edge the scroll offset is resolved from the table itself, so that frame is a visible jump; the next prepaint corrects whatever the replacement changed. |
+| The anchor's identity across a window change is its sequence range, not the turn id (`prepared_window_loses_reader_anchor`). | A page landing above the reader renames the leading turn; the range still overlaps the turn the reader was holding. |
+
+## 5b-sexies. A live turn arriving must not move a scrolled-up reader
+
+A running session appends turns while the reader is scrolled up into the
+history. The list learns a new row count only through a mutation, and the
+mutation chosen decides whether the reader moves:
+
+| Rule | Why |
+| --- | --- |
+| A pure append splices the new rows onto the end (`sync_timeline_list_rows`, keyed on `timeline_list_synced_turn_ids`) instead of `reset_with_uniform_height`. | The uniform reset re-hints *every* row with the mean height, including the measured ones above the reader. The list resolves their pixel offset through those hints, so each live turn moved the reader by the difference between the mean and what those rows really measure — a jump on every turn while the session runs. A splice keeps the untouched rows' measured heights and shifts the list's own anchor by the count delta. |
+| After a splice, the next frame does not re-seed the table: the count agrees and the ids are unchanged, so the sync records the width and returns. | The appended rows sit below the fold and measure themselves when they scroll into view. Re-seeding would re-hint the measured rows a second time and undo the splice. A genuine width wipe still resets, because there the list has already dropped every hint itself. |
+| Only appends splice; a prepend or a mid-window replacement still resets and restores the captured anchor. | A prepend shifts every row index, so the measured heights no longer sit at the indices the list holds them at; the anchor restore is the correct tool there (§5b). |
+
+## 5c. One transcript surface per session
+
+`TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
+transcript. It renders during the paint pass, after the pane loop has handed its
+borrowed views back, so a surface with no session of its own paints whichever
+view happens to be borrowed — the focused one. Shared across panes, that showed
+every pane the focused conversation over that pane's `ListState`: identical rows,
+identical offset, and a scroll in one moved them all. A pane looked right only
+once it was clicked, because clicking made its session the focused one.
+
+Rules that follow:
+
+- A surface is created per session (`timeline_surface_views`, keyed by session
+  id) and borrows that session for its render
+  (`with_session_view_for_render`), exactly as `ComposerView` does.
+- It is dropped with the session's view and cleared with the panes it is mounted
+  beside.
+- `notify_timeline_surfaces` has to notify the surfaces by name: a pane view
+  only mounts its surface, it does not notify it.
 
 ## 6. Tests Required
 
@@ -129,6 +358,24 @@ visual language) without removing the pixel-scroll state.
 - `cargo test -p vibex-desktop --locked child_agent_rail` covers the child
   Agent rail's virtualization and its separation from the parent's Markdown
   surfaces.
+- `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` and
+  `an_older_page_above_the_reader_keeps_their_place` pin §5b: both fail with the
+  reader at offset zero (an append) or parked on the wrong rows (a prepend) if
+  the reset is left to itself or the order is reversed.
+- `a_pane_gets_its_own_transcript_surface` pins §5c: two sessions must not share
+  one surface.
+- `scrolling_a_long_transcript_moves_by_the_requested_distance` pins §5b-bis:
+  the extent has to cover the whole table, and twenty 100px scroll steps have to
+  move the offset by exactly 100px each. Without the re-seed it reports 556px of
+  33,360px on the first step.
+- `a_window_that_drops_the_readers_turn_is_refused_once_then_installed_covering`
+  and `a_parked_revision_bump_restores_measured_geometry` pin §5b-quinquies:
+  the refused window leaves the borrowed view and the anchor untouched, the
+  covering answer installs, and a restore whose table stamp is stale keeps its
+  measured extents frame for frame.
+- `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` pins §5b-sexies
+  at the pixel level: an appended turn leaves the reader's offset exactly put,
+  not merely within a row's tolerance.
 
 ## 7. Sidebar list migration
 
@@ -152,7 +399,8 @@ scroll over the sidebar column:
 | Views built per frame | 1 (`views_built` 1, `views_reused` 1) |
 
 Two conclusions follow, and they are the reason this section is a record of a
-rejected plan rather than a to-do:
+rejected plan rather than a to-do — with a third recorded below the next
+paragraph, once the container's background was measured separately:
 
 - **`SidebarSessionRun` already virtualizes.** One view is built per scrolled
   frame, not one per row. Swapping the element for `MessageScroller` cannot
@@ -173,6 +421,33 @@ milliseconds keeps the animation running for every one of them; that is why the
 blocker shows up in tests even when a reader's own machine would let the fade
 settle between scrolls. Sleeping past the fade before each frame does not make
 the sidebar composite either, so the finding is not an artifact of the harness.
+
+**The scroll container's background is not a blocker.** It is painted
+`cx.theme().transparent` by default, and `fast::layers::background::bake` only
+clears a layer's tiles with a solid, opaque, borderless, unrounded quad that
+covers the whole viewport — so it looked like a second, independent cause.
+Measured on the real `#sidebar-session-list` in a 200-session workbench, drawing
+sixteen scrolled frames, `window.layout_stats().layer_frames_composited`:
+
+| Background | Scrollbar | Composited frames |
+| --- | --- | --- |
+| transparent | present | 0 |
+| transparent | removed | 8, then 0 |
+| opaque | present | 0 |
+| opaque | removed | 8, then 0 |
+
+The background makes no difference at all: the sidebar's panel (`#agent-sidebar`,
+`.bg(cx.theme().sidebar)`) is already painted under the container, and the bake
+rule finds that quad either way. A minimal isolated `div` probe that scrolls
+fifteen stable rows *does* show the difference (0 composited transparent, 9
+opaque), which is what made the wrong reading available — a bare container has
+no opaque ancestor to bake, while the sidebar does. Trust the sidebar harness,
+not the synthetic one, for this question.
+
+The scrollbar is the first blocker and the dependency record is the second: with
+the bar gone the container composites eight frames and is then demoted, which is
+the `deps_unchanged=false` finding of §7.2 arriving on schedule
+(`REPROMOTE_AFTER_STABLE_FRAMES`). Neither is removed by painting the container.
 
 ### 7.2 The scrollbar-overlay experiment
 
@@ -204,7 +479,11 @@ rather than merged.
 ### 7.3 What has to be true before either migration is worth doing
 
 A scroll layer only pays for itself when its content is stable across scrolled
-frames. The sidebar has two independent blockers, and both have to go:
+frames. This subsection is about the **sidebar**; the transcript's situation is
+the opposite one and is recorded in §5 — its element has no list layer at all,
+so there is nothing to stabilise until it moves to an element that does.
+
+The sidebar has two independent blockers, and both have to go:
 
 1. The scrollbar's fade must not be attributed to the view that owns the
    scroller (the overlay experiment in §7.2).
@@ -212,8 +491,45 @@ frames. The sidebar has two independent blockers, and both have to go:
    That is the P0b work of narrowing notifications: a scroll frame should
    notify the scroll container, not the whole workbench.
 
+The container's background is deliberately not on this list: §7.1 measured it
+against the real sidebar and it changes nothing, because the panel behind the
+container is already opaque. Painting the container solid would only be needed
+if it were ever hosted over a translucent surface.
+
+**The first of those two is now solved**, by the same change that let the
+transcript composite: `pinned_scrollbar` paints the bar in a view of its own
+(see §5), so the sidebar's column now composites eight of sixteen scrolled
+frames instead of none. The second is measured precisely and is the remaining
+work:
+
+- With the row builder's content stubbed, the column composites **fifteen of
+  sixteen** frames and its prepaint drops from ~6.5 ms to ~47 µs. The rows are
+  the whole of what remains.
+- The cause is not what a row reads. It is that the row builder must reach the
+  workbench through `Entity::update`, and an update is a write: the access log
+  bumps its write generation even when the closure does nothing, which
+  `owner_change` reports as `Changed` and `scroll_only` refuses. An *empty*
+  `update` reproduces the demotion on its own, so no amount of making the row
+  read less will fix it.
+- `&mut self` is needed because the row resolves `sidebar_selection_index`,
+  which `render_agent_sidebar` rebuilds each pass, and because
+  `sidebar_workspace_groups` calls `reconcile_legacy_sidebar_folder_worktree_owners`
+  and then `queue_ui_state`. Both early-return on unchanged inputs, but they are
+  `&mut`, and so the whole chain is.
+
+So the work is: make the sidebar's render chain take `&self`. The two caches it
+writes (`sidebar_selection_index`, `sidebar_projection_cache`) can move behind
+`RefCell`; the reconcile step cannot, because `queue_ui_state` is a real write
+to the UI-state writer. That step belongs before the render, next to the other
+per-pass work in `render_agent_sidebar`, which is where the rest of this
+section's blockers have been cleared from.
+
 Until both hold, neither `MessageScroller` nor an overlay scrollbar changes what
-the reader pays, and the existing `SidebarSessionRun` is the right shape.
+the reader pays *for the sidebar*, and the existing `SidebarSessionRun` is the
+right shape. Both were measured, not inferred: removing the bar alone lifts
+`owner_animating` and the container composites for eight frames before the
+dependency record demotes it again, which is the same finding the overlay
+experiment reached from the other side.
 
 If the migration is revisited, the mechanics are unchanged: flatten every
 section (project, workspace, folder, group, session run) into one row list,
@@ -275,3 +591,88 @@ done. Making rows survive a scroll needs a cache the run can reuse across
 frames, which `AnyElement` cannot be — it is consumed by drawing — so that would
 mean a virtual list that owns the rows, i.e. the `MessageScroller` migration in
 §7.1, and it would only pay for the rows it does *not* have to rebuild.
+
+## 9. Why the transcript bounced, and what keeps it still
+
+The transcript "jumped" for months with every fix chasing a different theory. It
+was five separate faults, each with its own signature in the `TLSCROLL` trace
+(`VIBEX_TIMELINE_TRACE`), and each now has a test. Read this before touching
+`sync_timeline_list_rows`, `scroll_timeline_to_latest`, or the anchor capture.
+
+### 9.1 One hint for every row is a stand-in, not a height
+
+`ListState::reset_with_uniform_height` is the only seeding entry point, so every
+unmeasured row starts at one height. The first layout of a row replaces that with
+its real height. If the reader's anchor is *inside* that row, their place was a
+distance into a box that just changed size, so the row re-normalizes the anchor
+and the viewport moves. Signature: `top=A:x → top=B:y` with `B > A`, a few hundred
+pixels, on the *first* pass over a session, going *up* (rows below are never the
+problem — their correction happens below the fold).
+
+Two things shrink it to nothing: seed with the **mean** of the table (its product
+with the row count is the table's own total, unlike the median), and measure a
+window of up to `TIMELINE_MEASURE_ALL_MAX_ROWS` in one pass when it is seeded, so
+the rows are exact before the reader reaches them. Longer windows keep the
+visible-only layout, because laying out a transcript at once is the cost the
+virtual list exists to avoid.
+
+### 9.2 A pane animating its width re-seeds every frame
+
+A width change wipes the list's hints, so the sync re-seeded — including on every
+frame of a session-opening animation (0 → 360 → 508 → … → 1080 in one capture,
+one seed per frame). Each seed rebuilt the whole document from one hint and
+re-derived the anchor from it. The sync now splices the count into a
+width-changing frame and seeds once, on the frame the width holds still.
+Signature: `seeds` climbing every frame while `width` walks.
+
+### 9.3 A page above is spliced, never rebuilt
+
+An older page landing above the reader used to take the same reset, dropping
+every measured row and re-deriving them from a hint — a perturbation the size of
+the page, corrected row by row afterwards. `splice(0..0, added)` inserts the rows
+and shifts the anchor by their count, so the reader keeps their row and every
+measurement survives. Appends still take the reset: a new row at the bottom needs
+a hint before the live edge can be placed against it.
+
+### 9.4 The end anchor is not a position
+
+`scroll_to_end` anchors *past* the last row. That anchor has no row and no
+distance into one, and its reported offset is the whole document — a viewport
+beyond the last offset the list can travel. Reading `offset_in_item` off it
+records the *top* of the last row as the reader's place; a guard comparing the
+offset against the bare maximum calls every frame at the bottom a clamp (the
+bottom already runs a padding past it). Capture it as the bottom of the last row
+and skip it in the clamp guard.
+
+### 9.5 The live edge has two representations, one padding apart
+
+The end anchor paints by walking back from the last row; the layout's fill branch
+derives a row anchor and counts the list's padding, placing the same content one
+padding band lower. A frame alternating between them is a padding-sized bounce.
+The list is put in its own tail mode at the live edge, left when the reader
+scrolls away, and paused when the composer changes the viewport so a taller
+composer lifts the composer and not the conversation.
+
+### 9.6 A streaming row only grows
+
+An estimate replaced by a measurement is often shorter, and the drop moves
+everything below the row up by the difference — a third of a screen mid-read. The
+streaming last row holds its height until its turn finishes; every other row
+takes its measurement immediately.
+
+### 9.7 The tests that pin it
+
+| Test | Invariant |
+| --- | --- |
+| `a_fresh_transcript_scrolls_up_by_what_the_wheel_asked` | A session's first scroll up moves by the wheel, and the row under the viewport travels with it |
+| `scrolling_a_long_transcript_moves_by_the_requested_distance` | Every step moves exactly as far as it was asked |
+| `a_streaming_turn_does_not_rock_the_live_edge` | Growth may only move the live edge toward the end |
+| `a_streaming_turn_below_does_not_move_a_reader_who_scrolled_up` | A stream below never moves a reader above |
+| `a_reseeded_transcript_is_as_tall_as_its_rows` | A seeded document matches its table |
+| `an_older_page_above_the_reader_keeps_their_place` | A spliced page leaves the reader's row and distance alone |
+| `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` | An appended turn leaves the anchor alone |
+
+The residual, known and accepted: the padding band of §9.5 is worth ~30px at the
+moment the reader leaves or re-enters the live edge, and the trace reports
+`unexplained` for wheel events that the list correctly ignores at the end of the
+document.

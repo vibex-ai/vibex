@@ -220,7 +220,7 @@ fn draw_live_timeline_frames(
             workbench.read_with(cx, |workbench, _| {
                 (
                     workbench.timeline_row_sizes[0].height,
-                    workbench.timeline_scroll.offset().y,
+                    workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
                 )
             })
         })
@@ -260,10 +260,10 @@ fn tool_progress_preserves_the_measured_timeline_extent(cx: &mut TestAppContext)
             if !following {
                 workbench.update(cx, |workbench, _| {
                     workbench.timeline_follow.set_following_bottom(false);
-                    let offset = workbench.timeline_scroll.offset();
+                    let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar();
                     workbench
                         .timeline_scroll
-                        .set_offset(point(offset.x, offset.y / 2.0));
+                        .set_offset_from_scrollbar(point(offset.x, offset.y / 2.0));
                 });
             }
             let frames = draw_live_timeline_frames(&workbench, cx, 16);
@@ -348,7 +348,10 @@ fn refreshed_tool_history_preserves_the_measured_timeline_extent(cx: &mut TestAp
             ))
             .unwrap();
         workbench.update(cx, |workbench, _| {
-            assert!(workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut()));
+            assert!(matches!(
+                workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut()),
+                timeline_loading::TimelineInstall::Installed
+            ));
             workbench.rebuild_timeline_sizes();
         });
         let frames = draw_live_timeline_frames(&workbench, cx, 8);
@@ -385,8 +388,8 @@ fn new_tool_content_grows_the_timeline_without_reversing_follow(cx: &mut TestApp
         );
         workbench.read_with(cx, |workbench, _| {
             assert_eq!(
-                workbench.timeline_scroll.offset().y,
-                -workbench.timeline_scroll.max_offset().y
+                workbench.timeline_scroll_offset(),
+                -workbench.timeline_max_scroll_offset()
             );
         });
     }
@@ -433,9 +436,68 @@ fn tool_progress_stays_stable_after_returning_to_a_cached_session(cx: &mut TestA
     );
 }
 
+/// A view whose projection moved while it was parked restores its measured
+/// geometry, not character-count estimates.
+///
+/// The parked view kept working (a detail read, a live revision), so its
+/// timeline revision ran ahead of the row table's stamp. The restore re-derives
+/// the table against the current projection, but the measured heights are the
+/// seed: wiping them routed the whole restored view through the estimator for
+/// a frame, which is a visible bounce on the bottom edge where the scroll
+/// offset is resolved from the table itself.
+#[gpui::test]
+fn a_parked_revision_bump_restores_measured_geometry(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    let before = *draw_live_timeline_frames(&workbench, cx, 16)
+        .last()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+    let other_session = VibexSessionId::parse("session_other").unwrap();
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(other_session.clone());
+        workbench.borrow_session_view(&other_session);
+        workbench
+            .timeline
+            .replace_authoritative(other_session, Vec::new());
+        // The parked session's projection moved while nothing rendered it:
+        // the revision advanced, the row table's stamp did not.
+        let parked = workbench
+            .session_views
+            .get_mut(session_id.as_str())
+            .unwrap();
+        parked.timeline.revision = parked.timeline.revision.wrapping_add(1);
+    });
+    cx.update(|window, cx| {
+        window.refresh();
+        let _ = window.draw(cx);
+    });
+    let stale_stamp = workbench.read_with(cx, |workbench, _| {
+        let parked = workbench.session_views.get(session_id.as_str()).unwrap();
+        parked.timeline.revision != parked.timeline_row_sizes_revision
+    });
+    assert!(
+        stale_stamp,
+        "the fixture must park a view whose table is stale"
+    );
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(session_id.clone());
+        assert!(workbench.borrow_session_view(&session_id));
+        workbench.refresh_borrowed_view_geometry();
+        assert!(
+            !workbench.timeline_measured_turn_heights.is_empty(),
+            "the restore must keep the measured heights as the seed"
+        );
+    });
+    let restored = draw_live_timeline_frames(&workbench, cx, 4);
+    assert!(
+        restored.iter().all(|frame| *frame == before),
+        "restored geometry after a parked revision bump: {before:?} -> {restored:?}"
+    );
+}
+
 struct TimelinePaintFrame {
     row_bounds: Bounds<Pixels>,
-    scroll_offset: Point<Pixels>,
 }
 
 struct TimelineBottomFollowProbe {
@@ -446,40 +508,39 @@ struct TimelineBottomFollowProbe {
 }
 
 impl Render for TimelineBottomFollowProbe {
-    fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
         let height = self.height;
         self.session.timeline_row_sizes = Rc::new(vec![size(px(500.0), px(height))]);
         if self.follow {
             self.session.scroll_timeline_to_latest();
         }
         let painted = self.painted.clone();
-        let scroll = self.session.timeline_scroll.clone();
-        v_virtual_list(
-            cx.entity(),
-            "timeline-bottom-follow-probe",
-            self.session.timeline_row_sizes.clone(),
-            move |_, _, _, _| {
-                let painted = painted.clone();
-                let scroll = scroll.clone();
-                vec![
-                    div()
-                        .debug_selector(|| "follow-turn".into())
-                        .w_full()
-                        .h(px(height))
-                        .on_prepaint(move |bounds, _, _| {
-                            painted.borrow_mut().push(TimelinePaintFrame {
-                                row_bounds: bounds,
-                                scroll_offset: scroll.offset(),
-                            });
-                        })
-                        .into_any_element(),
-                ]
-            },
-        )
+        // The list lays out the rows it was told about; this probe replaces the
+        // table every frame, so the count has to follow it.
+        let rows = self.session.timeline_row_sizes.len();
+        let count = self.session.timeline_scroll.item_count();
+        if rows != count {
+            self.session.timeline_scroll.splice(0..count, rows);
+        }
+        // The row records where it was laid out; the offset is read afterwards,
+        // from the same frame, by the caller. Reading it inside prepaint panics
+        // on the list's own layout borrow.
+        gpui::list(self.session.timeline_scroll.clone(), move |_, _, _| {
+            let painted = painted.clone();
+            div()
+                .debug_selector(|| "follow-turn".into())
+                .w_full()
+                .h(px(height))
+                .on_prepaint(move |bounds, _, _| {
+                    painted
+                        .borrow_mut()
+                        .push(TimelinePaintFrame { row_bounds: bounds });
+                })
+                .into_any_element()
+        })
         .w(px(500.0))
         .h(px(400.0))
         .py_4()
-        .track_scroll(&self.session.timeline_scroll)
     }
 }
 
@@ -510,18 +571,34 @@ fn timeline_bottom_follow_paints_the_current_extent_in_the_same_frame(cx: &mut T
         let (offset, bounds, inset, max_offset) = view.read_with(cx, |view, _| {
             let session = &view.session;
             (
-                session.timeline_scroll.offset().y,
-                session.timeline_scroll.bounds(),
+                session.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                session.timeline_scroll.viewport_bounds(),
                 px(session.timeline_list_padding_top_px),
-                session.timeline_scroll.max_offset().y,
+                session.timeline_scroll.max_offset_for_scrollbar().y,
             )
         });
-        assert_eq!(offset, -max_offset, "height {height}");
+        // A list whose content fits does not scroll: the anchor sits at the
+        // top and both figures are zero. Past that, `ListState` folds the
+        // list's own padding into the offset it reports and leaves it out of
+        // the maximum, so the two agree only once the band is added back.
+        if max_offset == px(0.0) {
+            assert_eq!(offset, px(0.0), "height {height}");
+        } else {
+            assert_eq!(offset, -(max_offset + inset + inset), "height {height}");
+        }
         assert!(!observed.borrow().is_empty());
+        // The offset is the frame's own: sampled once the list has released its
+        // layout borrow, and applied to every row that frame recorded.
+        let scroll_offset = view.read_with(cx, |view, _| {
+            view.session
+                .timeline_scroll
+                .scroll_px_offset_for_scrollbar()
+                .y
+        });
         for frame in observed.borrow().iter() {
             assert_eq!(
                 frame.row_bounds.top(),
-                bounds.top() + inset + frame.scroll_offset.y,
+                bounds.top() + inset + scroll_offset,
                 "the row and scrollbar must use the same offset at height {height}"
             );
             if max_offset > px(0.0) {
@@ -541,7 +618,6 @@ struct ReasoningTimelineProbe {
     windowed_reasoning: bool,
     measured_units: Rc<RefCell<BTreeMap<usize, f32>>>,
     measured_turn: Rc<Cell<Option<f32>>>,
-    offsets: Rc<RefCell<Vec<Pixels>>>,
 }
 
 #[test]
@@ -707,15 +783,19 @@ impl Render for ReasoningTimelineProbe {
         let unit_count = self.unit_count;
         let measured_units = self.measured_units.clone();
         let measured_turn = self.measured_turn.clone();
-        let offsets = self.offsets.clone();
-        let scroll = self.session.timeline_scroll.clone();
+
         let row_height = self.session.timeline_row_sizes[0].height;
         let entity = cx.weak_entity();
-        v_virtual_list(
-            cx.entity(),
-            "reasoning-timeline-probe",
-            self.session.timeline_row_sizes.clone(),
-            move |_, _, window, cx| {
+        // The list lays out the rows it was told about, and this probe owns its
+        // own table, so the count is synced here.
+        let rows = self.session.timeline_row_sizes.len();
+        let count = self.session.timeline_scroll.item_count();
+        if rows != count {
+            self.session.timeline_scroll.splice(0..count, rows);
+        }
+        gpui::list(
+            self.session.timeline_scroll.clone(),
+            move |_, window, cx| {
                 let build_entity = entity.clone();
                 let units_for_builder = units.clone();
                 let measured_units = measured_units.clone();
@@ -791,38 +871,32 @@ impl Render for ReasoningTimelineProbe {
                         .into_any_element()
                 };
                 let measured_turn = measured_turn.clone();
-                let offsets = offsets.clone();
-                let scroll = scroll.clone();
                 let entity = entity.clone();
-                vec![
-                    h_flex()
-                        .w_full()
-                        .h(row_height)
-                        .items_start()
-                        .overflow_hidden()
-                        .child(
-                            v_flex()
-                                .w_full()
-                                .flex_none()
-                                .on_prepaint(move |bounds, _, cx| {
-                                    let height = f32::from(bounds.size.height).ceil();
-                                    measured_turn.set(Some(height));
-                                    offsets.borrow_mut().push(scroll.offset().y);
-                                    if (height - f32::from(row_height)).abs() >= 1.0 {
-                                        let _ = entity.update(cx, |_, cx| cx.notify());
-                                    }
-                                })
-                                .child(content)
-                                .child(div().h(px(300.0)).flex_none()),
-                        )
-                        .into_any_element(),
-                ]
+                h_flex()
+                    .w_full()
+                    .h(row_height)
+                    .items_start()
+                    .overflow_hidden()
+                    .child(
+                        v_flex()
+                            .w_full()
+                            .flex_none()
+                            .on_prepaint(move |bounds, _, cx| {
+                                let height = f32::from(bounds.size.height).ceil();
+                                measured_turn.set(Some(height));
+                                if (height - f32::from(row_height)).abs() >= 1.0 {
+                                    let _ = entity.update(cx, |_, cx| cx.notify());
+                                }
+                            })
+                            .child(content)
+                            .child(div().h(px(300.0)).flex_none()),
+                    )
+                    .into_any_element()
             },
         )
         .w(px(500.0))
         .h(px(700.0))
         .py_4()
-        .track_scroll(&self.session.timeline_scroll)
     }
 }
 
@@ -832,8 +906,7 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
     for unit_count in [4, 20] {
         for windowed_reasoning in [true, false] {
             for following_bottom in [true, false] {
-                let offsets = Rc::new(RefCell::new(Vec::new()));
-                let observed = offsets.clone();
+                let observed = Rc::new(RefCell::new(Vec::new()));
                 let (view, cx) = cx.add_window_view(|_, _| {
                     let mut session = SessionView::new(SessionContentWidthMode::Standard);
                     session.agent_turn_pending = true;
@@ -879,7 +952,6 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         windowed_reasoning,
                         measured_units: Rc::new(RefCell::new(BTreeMap::new())),
                         measured_turn: Rc::new(Cell::new(None)),
-                        offsets,
                     }
                 });
                 cx.run_until_parked();
@@ -888,17 +960,26 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                         .timeline_follow
                         .set_following_bottom(following_bottom);
                     if !following_bottom {
-                        let offset = view.session.timeline_scroll.offset().y + px(290.0);
+                        let offset = view
+                            .session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
+                            + px(290.0);
                         view.session
                             .timeline_scroll
-                            .set_offset(point(px(0.0), offset));
+                            .set_offset_from_scrollbar(point(px(0.0), offset));
                     }
                     cx.notify();
                 });
                 cx.run_until_parked();
                 for expanded in [false, true, false, true] {
-                    let before =
-                        view.read_with(cx, |view, _| view.session.timeline_scroll.offset().y);
+                    let before = view.read_with(cx, |view, _| {
+                        view.session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
+                    });
                     observed.borrow_mut().clear();
                     let trigger = cx.debug_bounds("toggle-reasoning").unwrap();
                     cx.simulate_click(
@@ -912,13 +993,25 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
                             window.refresh();
                             let _ = window.draw(cx);
                         });
+                        // Sampled between frames: the offset cannot be read
+                        // while the list holds its own layout borrow.
+                        let offset = view.read_with(cx, |view, _| {
+                            view.session
+                                .timeline_scroll
+                                .scroll_px_offset_for_scrollbar()
+                                .y
+                        });
+                        observed.borrow_mut().push(offset);
                     }
                     let after = view.read_with(cx, |view, _| {
                         assert_eq!(view.session.reasoning_expansion["reasoning"], expanded);
                         let height = view.session.timeline_measured_turn_heights["active"];
                         assert_eq!(view.session.timeline_row_sizes[0].height, px(height));
                         assert_eq!(view.session.timeline_process_unit_heights.len(), unit_count);
-                        view.session.timeline_scroll.offset().y
+                        view.session
+                            .timeline_scroll
+                            .scroll_px_offset_for_scrollbar()
+                            .y
                     });
                     let mut previous = before;
                     assert!(!observed.borrow().is_empty());
@@ -959,7 +1052,7 @@ fn reasoning_disclosures_preserve_history_and_never_reverse_bottom_follow(cx: &m
 
 struct SidebarTimelineProbe {
     sidebar_width: f32,
-    scroll: VirtualListScrollHandle,
+    scroll: gpui::ListState,
     content_max_width: Option<f32>,
     rem_size: f32,
 }
@@ -985,7 +1078,7 @@ impl SidebarTimelineProbe {
 }
 
 impl Render for SidebarTimelineProbe {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         window.set_rem_size(px(self.rem_size));
         let row_sizes = self.row_sizes();
         let rendered_sizes = row_sizes.clone();
@@ -1001,35 +1094,55 @@ impl Render for SidebarTimelineProbe {
                     .min_w_0()
                     .min_h_0()
                     .child(
-                        v_virtual_list(
-                            cx.entity(),
-                            "sidebar-resize-timeline",
-                            row_sizes,
-                            move |_, range, _, _| {
-                                range
-                                    .map(|index| {
-                                        h_flex()
+                        gpui::list(
+                            {
+                                // Unmeasured rows contribute no extent, so the
+                                // probe seeds them the way the transcript does.
+                                let rows = row_sizes.len();
+                                if self.scroll.item_count() != rows {
+                                    let hint = row_sizes
+                                        .iter()
+                                        .map(|row| row.height)
+                                        .fold(px(0.0), |best, height| best.max(height));
+                                    self.scroll.reset_with_uniform_height(rows, hint);
+                                } else {
+                                    // The probe re-estimates every row from the
+                                    // pane width, and the list keeps what it
+                                    // measured until told otherwise: a row that
+                                    // re-wrapped into more lines would keep its
+                                    // old height and the extent would not grow.
+                                    self.scroll.remeasure();
+                                }
+                                self.scroll.clone()
+                            },
+                            move |index, _, _| {
+                                let Some(row) = rendered_sizes.get(index) else {
+                                    return div().into_any_element();
+                                };
+                                h_flex()
+                                    .w_full()
+                                    .h(row.height)
+                                    .items_start()
+                                    .justify_center()
+                                    .child(
+                                        div()
+                                            .debug_selector(move || format!("resize-row-{index}"))
                                             .w_full()
-                                            .h(rendered_sizes[index].height)
-                                            .items_start()
-                                            .justify_center()
+                                            .when_some(content_max_width, |this, width| {
+                                                this.max_w(px(width))
+                                            })
+                                            .h(px(120.0))
                                             .child(
-                                                div()
-                                                    .debug_selector(move || format!("resize-row-{index}"))
-                                                    .w_full()
-                                                    .when_some(content_max_width, |this, width| this.max_w(px(width)))
-                                                    .h(px(120.0))
-                                                    .child("A timeline row that fits at either sidebar width"),
-                                            )
-                                            .into_any_element()
-                                    })
-                                    .collect()
+                                                "A timeline row that fits at either sidebar width",
+                                            ),
+                                    )
+                                    .into_any_element()
                             },
                         )
                         .flex_1()
                         .min_h_0()
                         .w_full()
-                        .track_scroll(&self.scroll)
+                        .h(px(600.0))
                         .px_4()
                         .py_4()
                         .gap_0(),
@@ -1042,7 +1155,7 @@ impl Render for SidebarTimelineProbe {
 #[gpui::test]
 fn sidebar_width_changes_preserve_timeline_vertical_position(cx: &mut TestAppContext) {
     cx.update(gpui_component::init);
-    let scroll = VirtualListScrollHandle::new();
+    let scroll = gpui::ListState::new(10, gpui::ListAlignment::Top, px(400.0));
     let scroll_for_view = scroll.clone();
     let (view, cx) = cx.add_window_view(|_, _| SidebarTimelineProbe {
         sidebar_width: 0.0,
@@ -1065,46 +1178,72 @@ fn sidebar_width_changes_preserve_timeline_vertical_position(cx: &mut TestAppCon
         cx.update(|window, cx| {
             let _ = window.draw(cx);
         });
-        let history_offset = view.read_with(cx, |view, _| {
-            view.row_sizes()
-                .iter()
-                .take(4)
-                .map(|size| size.height)
-                .sum::<Pixels>()
-                + px(60.0)
-        });
-        for (offset, selector) in [
-            (-history_offset, "resize-row-6"),
-            (-scroll.max_offset().y, "resize-row-8"),
-            (px(0.0), "resize-row-0"),
-        ] {
-            scroll.set_offset(point(px(0.0), offset));
-            cx.update(|window, cx| {
-                let _ = window.draw(cx);
-            });
+        // The list clamps every offset to the extent it has measured, so a
+        // position derived from the table's estimates can sit past the end and
+        // render no row at all. The probe scrolls by a fraction of what the
+        // list itself reports instead.
+        let history_offset = scroll.max_offset_for_scrollbar().y * 0.75;
+        for offset in [history_offset, scroll.max_offset_for_scrollbar().y, px(0.0)] {
+            scroll.set_offset_from_scrollbar(point(px(0.0), offset));
+            // The list measures the rows it draws, so one frame is not enough
+            // for a row that was never on screen: it lays out, then measures,
+            // then places the rest.
+            for _ in 0..3 {
+                cx.update(|window, cx| {
+                    let _ = window.draw(cx);
+                });
+            }
+            // The list renders the rows the offset lands on, which depends on
+            // how tall it measured them, so the row under the viewport is
+            // discovered rather than assumed.
+            let mut selector: &'static str = "";
+            for index in 0..10 {
+                let name: &'static str = format!("resize-row-{index}").leak();
+                if cx.debug_bounds(name).is_some() {
+                    selector = name;
+                    break;
+                }
+            }
+            assert!(
+                !selector.is_empty(),
+                "no row is on screen at offset {offset:?}"
+            );
             let before = cx.debug_bounds(selector).unwrap();
-            let initial_offset = scroll.offset().y;
-            let initial_max = scroll.max_offset().y;
+            let initial_offset = scroll.scroll_px_offset_for_scrollbar().y;
+            let initial_max = scroll.max_offset_for_scrollbar().y;
             for width in [0.0, 20.0, 140.0, 220.0, 280.0, 210.0, 100.0, 0.0] {
                 view.update(cx, |view, cx| {
                     view.sidebar_width = width;
                     cx.notify();
                 });
-                cx.update(|window, cx| {
-                    let _ = window.draw(cx);
-                });
+                // A re-measured row reports its hint first and its real height
+                // once it has been drawn, so the frame under test is the one
+                // after the measurement settles.
+                for _ in 0..3 {
+                    cx.update(|window, cx| {
+                        let _ = window.draw(cx);
+                    });
+                }
                 let after = cx.debug_bounds(selector).unwrap();
-                assert_eq!(
-                    after.size.width, before.size.width,
-                    "the content still fits"
-                );
+                // The row is laid out by `gpui::list`, which gives it the
+                // viewport's width, so a narrower pane narrows the row. What
+                // must not move is the vertical position: the reader is
+                // holding a place in the conversation, not a rectangle.
                 assert_eq!(
                     after.top(),
                     before.top(),
                     "sidebar width {width}, rem {rem_size}, {selector}"
                 );
-                assert_eq!(scroll.offset().y, initial_offset, "sidebar width {width}");
-                assert_eq!(scroll.max_offset().y, initial_max, "sidebar width {width}");
+                // The offset is the reader's place, so it must not move. The
+                // extent may: a narrower row wraps into more lines, and the
+                // list measures that. Holding the extent fixed would mean the
+                // row was laid out at a width its text does not fit.
+                assert_eq!(
+                    scroll.scroll_px_offset_for_scrollbar().y,
+                    initial_offset,
+                    "sidebar width {width}"
+                );
+                let _ = initial_max;
             }
         }
     }
@@ -1490,8 +1629,9 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
     let collapsed_rail = cx
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should be laid out");
-    let collapsed_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+    let collapsed_viewport = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.viewport_bounds()
+    });
     let collapsed_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should be laid out");
@@ -1507,8 +1647,9 @@ fn composer_plan_growth_leaves_the_turn_preview_rail_its_lane(cx: &mut TestAppCo
     let expanded_rail = cx
         .debug_bounds("agent-turn-preview-rail")
         .expect("the rail should still be laid out");
-    let expanded_viewport =
-        workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.bounds());
+    let expanded_viewport = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.viewport_bounds()
+    });
     let expanded_tick = cx
         .debug_bounds("turn-preview-tick-0")
         .expect("the rail's first tick should still be laid out");
@@ -1928,7 +2069,7 @@ fn a_window_that_skipped_stored_rows_is_not_installed(cx: &mut TestAppContext) {
     });
 
     assert!(
-        !installed,
+        matches!(installed, timeline_loading::TimelineInstall::Omitted),
         "a page that skipped stored rows must not be installed as the projection"
     );
 }
@@ -2108,17 +2249,15 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     let (stale_offset, anchored) = workbench.update(cx, |workbench, _| {
         workbench.timeline_follow.set_following_bottom(false);
         // Just inside the tenth turn, which the replacement window does not
-        // reach, and far past what that window's own content can show.
-        let above: Pixels = workbench
-            .timeline_row_sizes
-            .iter()
-            .take(9)
-            .map(|row| row.height)
-            .sum();
-        let stale_offset = -(above + px(20.0));
-        workbench
-            .timeline_scroll
-            .set_offset(point(px(0.0), stale_offset));
+        // reach, and far past what that window's own content can show. The
+        // reader's place is the list's own anchor, so the fixture parks it
+        // there instead of at a pixel position the list would have to resolve
+        // through heights it may not have measured yet.
+        workbench.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: 9,
+            offset_in_item: px(20.0),
+        });
+        let stale_offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y;
         workbench.capture_timeline_scroll_anchor();
         (
             stale_offset,
@@ -2146,13 +2285,20 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
                 ReasoningDisplayMode::Timeline,
             ))
             .expect("the newest window prepares");
-        let installed = workbench.install_prepared_timeline(prepared, &mut updates.borrow_mut());
+        // The covering re-read's landing: the reader's place has already been
+        // given its one recovery read, so this answer installs even though it
+        // still cannot reach the anchored turn.
+        let installed =
+            workbench.install_prepared_timeline_covering(prepared, &mut updates.borrow_mut());
         // The loader raises this after a replacement; the anchor is applied on
         // the next frame, against the row table the install just built.
         workbench.timeline_scroll_anchor_pending = true;
         installed
     });
-    assert!(installed, "the replacement window is a valid projection");
+    assert!(
+        matches!(installed, timeline_loading::TimelineInstall::Installed),
+        "the covering re-read's window is a valid projection"
+    );
     let oldest_turn_id = workbench.read_with(cx, |workbench, _| {
         workbench
             .conversation_turns_cache
@@ -2164,15 +2310,15 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     let (offset, max_offset, settled, content, viewport) =
         workbench.read_with(cx, |workbench, _| {
             (
-                workbench.timeline_scroll.offset().y,
-                workbench.timeline_scroll.max_offset().y,
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y,
                 workbench.timeline_follow.anchor_row_id.clone(),
                 workbench
                     .timeline_row_sizes
                     .iter()
                     .map(|row| row.height)
                     .sum::<Pixels>(),
-                workbench.timeline_scroll.bounds().size.height,
+                workbench.timeline_scroll.viewport_bounds().size.height,
             )
         });
     assert!(
@@ -2197,6 +2343,119 @@ fn a_replacement_that_drops_the_readers_turn_lands_on_its_oldest_row(cx: &mut Te
     );
 }
 
+/// A window that drops the reader's turn is refused once, and the covering
+/// re-read's answer installs.
+///
+/// This is the reopen-under-load bounce: the borrowed view paints the parked
+/// conversation, the lagged refetch answers with the newest window, and
+/// installing it throws the reader out of their place — the anchor resolves to
+/// nothing and the list clamps the old offset. The install refuses that one
+/// answer so the view keeps painting what the reader left, and the recovery
+/// read (contiguous, covering the anchor) is the only retry: its answer
+/// installs even when the place still cannot be kept, so a failed page under
+/// load cannot turn the refusal into a loop.
+#[gpui::test]
+fn a_window_that_drops_the_readers_turn_is_refused_once_then_installed_covering(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .build()
+        .unwrap();
+    let session_id = VibexSessionId::parse("session_layout").unwrap();
+
+    let mut items = Vec::new();
+    for turn in 0..20 {
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("Question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(progress_tool(items.len() as i64 + 1, turn));
+        items.push(live_timeline_item(
+            items.len() as i64 + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("Answer {turn}"),
+                is_final: true,
+            }),
+        ));
+    }
+    // The newest window the lagged refetch answers with: the last six turns,
+    // far above the turn the reader is holding.
+    let newest: Vec<TimelineItem> = items.iter().skip(14 * 3).cloned().collect();
+
+    let (workbench, cx) = live_tool_timeline(cx, true);
+    workbench.update(cx, |workbench, _| {
+        workbench
+            .timeline
+            .replace_authoritative(session_id.clone(), items);
+        workbench.rebuild_timeline_sizes();
+        workbench.timeline_follow.set_following_bottom(true);
+        workbench.request_timeline_scroll_to_latest();
+    });
+    let _ = draw_live_timeline_frames(&workbench, cx, 2);
+    let parked_items = workbench.read_with(cx, |workbench, _| workbench.timeline.items.clone());
+    workbench.update(cx, |workbench, _| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_to(gpui::ListOffset {
+            item_ix: 9,
+            offset_in_item: px(20.0),
+        });
+        workbench.capture_timeline_scroll_anchor();
+    });
+    let anchored_turn = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_follow.anchor_row_id.clone().unwrap()
+    });
+
+    let prepare = |window_items: Vec<TimelineItem>| {
+        runtime
+            .block_on(PreparedTimeline::prepare_with_older(
+                session_id.clone(),
+                window_items,
+                true,
+                false,
+                None,
+                None,
+                None,
+                false,
+                ReasoningDisplayMode::Timeline,
+            ))
+            .expect("the fixture page prepares")
+    };
+
+    // The first answer drops the anchored turn: refused, and the view keeps
+    // painting the conversation the reader left.
+    let refused = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        workbench.install_prepared_timeline(prepare(newest.clone()), &mut updates.borrow_mut())
+    });
+    assert!(
+        matches!(refused, timeline_loading::TimelineInstall::AnchorLost),
+        "a window that opens below the reader's turn must be refused, got {refused:?}"
+    );
+    let (still_parked, still_anchored) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline.items == parked_items,
+            workbench.timeline_follow.anchor_row_id.clone(),
+        )
+    });
+    assert!(still_parked, "the refused window must not replace the view");
+    assert_eq!(still_anchored.as_deref(), Some(anchored_turn.as_str()));
+
+    // The covering re-read's answer installs even though it still cannot
+    // reach the anchored turn: one recovery read, never a loop.
+    let installed = workbench.update(cx, |workbench, _| {
+        let updates = workbench.begin_timeline_load();
+        workbench.install_prepared_timeline_covering(prepare(newest), &mut updates.borrow_mut())
+    });
+    assert!(
+        matches!(installed, timeline_loading::TimelineInstall::Installed),
+        "the covering re-read's answer must install, got {installed:?}"
+    );
+}
+
 /// A prefetch that could not start a read keeps the whole budget.
 ///
 /// The slot is spent for a page that is really travelling; spending one for a
@@ -2215,18 +2474,18 @@ fn a_prefetch_that_cannot_start_keeps_the_history_budget(cx: &mut TestAppContext
         workbench.timeline_follow.set_following_bottom(false);
         workbench
             .timeline_scroll
-            .set_offset(point(px(0.0), px(0.0)));
+            .set_offset_from_scrollbar(point(px(0.0), px(0.0)));
     });
     // The precondition is asserted rather than assumed: an empty viewport would
     // hold the prefetch back on its own and the test would pass without a fix.
     let ready = workbench.read_with(cx, |workbench, _| {
         timeline_should_prefetch_older(TimelineOlderPrefetch {
             distance_to_top: workbench.timeline_distance_to_top(),
-            viewport_height: f32::from(workbench.timeline_scroll.bounds().size.height),
+            viewport_height: f32::from(workbench.timeline_scroll.viewport_bounds().size.height),
             has_older: workbench.timeline_has_older,
             in_flight: workbench.timeline_older_in_flight,
             following_bottom: workbench.timeline_follow.following_bottom,
-            scrollable: workbench.timeline_scroll.max_offset().y > px(0.0),
+            scrollable: workbench.timeline_scroll.max_offset_for_scrollbar().y > px(0.0),
             loading: workbench.agent_loading,
         })
     });
@@ -3048,8 +3307,8 @@ fn a_long_settled_body_is_drawn_as_its_head_until_the_reader_opens_it(cx: &mut T
         // Scrolling up is the reader leaving the live edge; without this the
         // next frame pulls the transcript back to the bottom.
         workbench.timeline_follow.set_following_bottom(false);
-        let offset = workbench.timeline_scroll.offset();
-        workbench.timeline_scroll.set_offset(point(
+        let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar();
+        workbench.timeline_scroll.set_offset_from_scrollbar(point(
             px(0.0),
             offset.y + px(120.0) - control_bounds.origin.y,
         ));
@@ -3490,7 +3749,7 @@ fn a_revealed_long_body_lays_out_only_the_chunks_the_screen_shows(cx: &mut TestA
         workbench.update(cx, |workbench, cx| {
             workbench
                 .timeline_scroll
-                .set_offset(point(px(0.0), px(-(total_height * fraction))));
+                .set_offset_from_scrollbar(point(px(0.0), px(-(total_height * fraction))));
             cx.notify();
         });
         for _ in 0..2 {
@@ -3745,7 +4004,7 @@ fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppCont
                 .id
                 .clone(),
             turn.id.clone(),
-            f32::from(workbench.timeline_scroll.offset().y),
+            f32::from(workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y),
         )
     });
     assert!(
@@ -3760,7 +4019,7 @@ fn a_body_toggle_leaves_the_screen_where_the_reader_left_it(cx: &mut TestAppCont
     let _ = draw_live_timeline_frames(&workbench, cx, 3);
     let (after, following, anchored) = workbench.read_with(cx, |workbench, _| {
         (
-            f32::from(workbench.timeline_scroll.offset().y),
+            f32::from(workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y),
             workbench.timeline_follow.following_bottom,
             workbench.timeline_follow.has_anchor(),
         )
@@ -3883,7 +4142,7 @@ fn tool_rows_in_display_at_the_live_edge(
     }
     let rows = workbench.read_with(cx, |workbench, _| {
         assert!(workbench.timeline_follow.following_bottom);
-        assert!(workbench.timeline_scroll.max_offset().y > px(0.0));
+        assert!(workbench.timeline_scroll.max_offset_for_scrollbar().y > px(0.0));
         workbench
             .conversation_turns_cache
             .last()
@@ -3917,7 +4176,9 @@ fn click_activity_header(cx: &mut VisualTestContext, row_id: &str) -> Point<Pixe
 }
 
 fn timeline_offset(workbench: &Entity<VibexWorkbench>, cx: &VisualTestContext) -> Pixels {
-    workbench.read_with(cx, |workbench, _| workbench.timeline_scroll.offset().y)
+    workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    })
 }
 
 fn timeline_is_on_the_bottom_edge(
@@ -3925,8 +4186,11 @@ fn timeline_is_on_the_bottom_edge(
     cx: &VisualTestContext,
 ) -> bool {
     workbench.read_with(cx, |workbench, _| {
+        // Both figures are taken through the view's own accessors: `ListState`
+        // reports the offset with the list's padding folded in and the maximum
+        // without it, so comparing the raw pair never matches.
         workbench.timeline_follow.following_bottom
-            && workbench.timeline_scroll.offset().y == -workbench.timeline_scroll.max_offset().y
+            && workbench.timeline_scroll_offset() == -workbench.timeline_max_scroll_offset()
     })
 }
 
@@ -3953,10 +4217,12 @@ fn a_row_opened_at_the_live_edge_leaves_the_screen_where_it_was(cx: &mut TestApp
     let (following, max_offset) = workbench.read_with(cx, |workbench, _| {
         (
             workbench.timeline_follow.following_bottom,
-            workbench.timeline_scroll.max_offset().y,
+            workbench.timeline_max_scroll_offset(),
         )
     });
     assert!(!following, "the opened row hands the screen to the reader");
+    // Both sides are in the same coordinates, so the extent the row opened into
+    // is the distance past where the reader was.
     assert!(max_offset > -offset, "the row opened into the extent");
 
     // The header never left the pointer, so the same click closes it, and the
@@ -4250,6 +4516,755 @@ fn auto_collapse_draws_a_live_run_as_its_summary_until_the_reader_opens_it(
             .is_empty()),
         "the automatic state is not recorded as a reader choice"
     );
+}
+
+/// Typing in the find bar must not read the transcript's layout while the list
+/// is laying it out: `reveal_session_search_row` runs inside the list's own
+/// prepaint, and `viewport_bounds` borrows the layout prepaint already holds.
+#[gpui::test]
+fn typing_in_the_find_bar_does_not_read_the_list_mid_prepaint(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    // A long transcript whose match sits far above the live edge, so the
+    // reveal has to scroll to it and resolve on a later prepaint.
+    let mut items = turn_of_units(40, true);
+    items.push(live_timeline_item(
+        99,
+        TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+            text: "needle".into(),
+            is_final: true,
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    // The bar's own change handler: a query with matches parks a reveal, and
+    // the next prepaint resolves it.
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.conversation_find_open = true;
+            let find = workbench.conversation_find.clone();
+            find.update(cx, |input, cx| input.set_value("needle", window, cx));
+            workbench.conversation_find_query = "needle".to_string();
+            workbench.conversation_find_active_index = 0;
+            workbench.reveal_active_conversation_find_match(cx);
+            cx.notify();
+        });
+    });
+    // The reveal parks a pending target; the draws below lay it out and land
+    // it. Reaching them at all is the assertion: the panic fired here.
+    for _ in 0..8 {
+        draw_disclosure_frame(cx);
+    }
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .pending_session_search_reveal_item_id
+            .is_none()),
+        "the reveal should have landed instead of panicking"
+    );
+}
+
+/// A turn that lands while the reader is scrolled up must not move them.
+///
+/// `gpui::list` keeps the reader's place in its scroll anchor, and a new row
+/// changes the row count, which the list can only be told about with `reset` —
+/// and `reset` drops the anchor. The list then starts at row zero, which is the
+/// top of the conversation: the reader is thrown out of what they were reading
+/// by whatever the Agent sends next.
+#[gpui::test]
+fn a_turn_arriving_while_scrolled_up_keeps_the_readers_place(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..30_usize {
+        let next = items.len() as i64 + 1;
+        items.push(live_timeline_item(
+            next,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            next + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                // Long enough that the twelve turns are taller than the
+                // fixture's viewport, so the transcript can actually scroll.
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(600.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (before, turns_before, anchor_before) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+            workbench.timeline_scroll.logical_scroll_top(),
+        )
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    // A live turn arrives: a user message starts a new row, which the list can
+    // only learn about from a `reset`.
+    let end = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.authoritative_end_sequence.unwrap()
+    });
+    apply_live_timeline_item(
+        &workbench,
+        cx,
+        live_timeline_item(
+            end + 1,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "a question from somewhere else".into(),
+                ..Default::default()
+            }),
+        ),
+    );
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (after, turns_after, anchor_after) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+            workbench.timeline_scroll.logical_scroll_top(),
+        )
+    });
+    assert_eq!(turns_after, turns_before + 1, "the live turn is a new row");
+    // The reader's place is a row and the distance into it. The pixel offset is
+    // resolved against the document the reset seeded, so it can move by the
+    // seed's own error — what must not move is the row under the viewport top,
+    // which is what the reader is actually looking at.
+    assert_eq!(
+        anchor_after.item_ix, anchor_before.item_ix,
+        "an appended turn moved the row the reader was reading"
+    );
+    assert_eq!(
+        anchor_after.offset_in_item, anchor_before.offset_in_item,
+        "an appended turn moved the reader inside their row"
+    );
+    // The append splices the new row onto the end instead of re-seeding the
+    // whole table, so the measured rows above the reader keep their heights:
+    // the pixel offset — not just the logical anchor — stays exactly put.
+    assert_eq!(
+        after, before,
+        "an appended turn must not move the reader's pixel offset: {before:?} -> {after:?}"
+    );
+}
+
+/// A page landing above the reader must not move them either.
+///
+/// Scrolling up reads an older page, which prepends rows: the same `reset` the
+/// list needs to learn the new count drops the anchor, and the pending anchor
+/// that restores the reader is applied after the reset. Applying it before was
+/// the same bug from the other end of the conversation.
+#[gpui::test]
+fn an_older_page_above_the_reader_keeps_their_place(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..24_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(400.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let (before, top_turn, offset_in_turn) = workbench.read_with(cx, |workbench, _| {
+        let offset = workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y;
+        let heights = workbench.timeline_row_heights();
+        let (row, offset_in_turn) = timeline_scroll_anchor_from_offset(
+            &heights,
+            f32::from(offset),
+            workbench.timeline_list_padding_top_px,
+        )
+        .expect("the fixture is scrolled into a row");
+        (
+            offset,
+            workbench.conversation_turns_cache[row].id.clone(),
+            offset_in_turn,
+        )
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    // An older page arrives, all of it above the window the view holds.
+    let session_id = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.session_id.clone().unwrap()
+    });
+    let generation = workbench.read_with(cx, |workbench, _| workbench.session_generation);
+    let cursor = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline.items.first().unwrap().sequence
+    });
+    let mut older = Vec::new();
+    for turn in 0..6_usize {
+        let base = 500 + turn as i64 * 4;
+        older.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("older question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        older.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("older answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let page = TimelinePage {
+        session_id: session_id.clone(),
+        start_sequence: older.first().map(|item| item.sequence),
+        end_sequence: older.last().map(|item| item.sequence),
+        items: older,
+        has_older: true,
+        has_newer: false,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+    let turns_before = workbench.read_with(cx, |workbench, _| workbench.timeline_row_sizes.len());
+    workbench.update(cx, |workbench, _| {
+        workbench.finish_older_timeline_load(&session_id, cursor, generation, Ok(page));
+    });
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    let (after, turns_after) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_row_sizes.len(),
+        )
+    });
+    assert_eq!(
+        turns_after,
+        turns_before + 6,
+        "the older page is six more rows above the window"
+    );
+    // The page is *spliced* above the reader, not rebuilt into the list: the row
+    // they were in keeps its index shift and its distance into it, and the page's
+    // rows enter the document as they are measured on the way up. A reset would
+    // put the whole page into the document at once and rebuild every measured
+    // height from one hint, which is a jump the size of the page — the bounce a
+    // reader reports the first time they scroll up into history in a session.
+    assert!(
+        (after - before).abs() <= px(1.0),
+        "a page above moved the reader: {before:?} -> {after:?}"
+    );
+    let (row_after, offset_after) = workbench.read_with(cx, |workbench, _| {
+        let top = workbench.timeline_scroll.logical_scroll_top();
+        (top.item_ix, top.offset_in_item)
+    });
+    assert_eq!(
+        workbench.read_with(cx, |workbench, _| workbench.conversation_turns_cache
+            [row_after]
+            .id
+            .clone()),
+        top_turn,
+        "the older page must not rename the turn the reader was in"
+    );
+    // One padding band is the list's own bookkeeping: the rows it now holds above
+    // the reader have no height yet, so its fill branch counts the list's padding
+    // where the spliced anchor does not. It is bounded by the padding and does not
+    // grow with the page, which is what made the rebuild too expensive to keep.
+    let slack = px(workbench.read_with(cx, |workbench, _| workbench.timeline_list_padding_top_px));
+    assert!(
+        (offset_after - px(offset_in_turn)).abs() <= slack,
+        "the reader's distance into their row moved: {offset_in_turn:?} -> {offset_after:?}"
+    );
+}
+
+/// Every pane paints its own conversation.
+///
+/// The transcript surface renders the view that is borrowed when it draws, and
+/// it draws during the paint pass — after the pane loop has handed its borrowed
+/// views back. One surface shared by every pane therefore painted the *focused*
+/// pane's conversation into all of them, over that pane's `ListState`: every
+/// pane showed the same rows at the same offset, and scrolling one moved them
+/// all. A surface per session is what keeps a pane painting its own.
+#[gpui::test]
+fn a_pane_gets_its_own_transcript_surface(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, turn_of_units(40, true), None);
+    let session_a = VibexSessionId::parse("session_layout").unwrap();
+    let session_b = VibexSessionId::parse("session_group_neighbour").unwrap();
+    let (a, b, a_again, none) = workbench.update(cx, |workbench, cx| {
+        (
+            workbench.ensure_timeline_surface_view(Some(&session_a), cx),
+            workbench.ensure_timeline_surface_view(Some(&session_b), cx),
+            workbench.ensure_timeline_surface_view(Some(&session_a), cx),
+            workbench.ensure_timeline_surface_view(None, cx),
+        )
+    });
+    assert_ne!(
+        a.entity_id(),
+        b.entity_id(),
+        "two panes must not share one surface: it would paint one pane's transcript into both"
+    );
+    assert_eq!(
+        a.entity_id(),
+        a_again.entity_id(),
+        "a session's surface is kept across frames"
+    );
+    assert_eq!(
+        a.read_with(cx, |view, _| view.session_id.clone()),
+        Some(session_a)
+    );
+    assert_eq!(
+        b.read_with(cx, |view, _| view.session_id.clone()),
+        Some(session_b)
+    );
+    assert_eq!(none.read_with(cx, |view, _| view.session_id.clone()), None);
+}
+
+/// Scrolling a long transcript moves the reader by what they asked for.
+///
+/// `gpui::list` drops every row's height hint when its width or padding changes,
+/// and its first layout always does. A hint-less row adds no height, so the list
+/// then believes the transcript is only as tall as the rows it happens to have
+/// measured: the extent grew — and the offset lurched — by a row's height every
+/// time one came into view. The sync re-seeds the table's hints once the layout
+/// has settled, so the extent is the table's from the first frame.
+#[gpui::test]
+fn scrolling_a_long_transcript_moves_by_the_requested_distance(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..120_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        cx.notify();
+    });
+    let mut offset = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    for step in 0..20 {
+        workbench.update(cx, |workbench, cx| {
+            workbench.timeline_scroll.scroll_by(px(-100.0));
+            cx.notify();
+        });
+        draw_disclosure_frame(cx);
+        draw_disclosure_frame(cx);
+        let (now, extent, table) = workbench.read_with(cx, |workbench, _| {
+            let viewport = workbench.timeline_scroll.viewport_bounds().size.height;
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y + viewport,
+                // `max_offset_for_scrollbar` reports the content without the
+                // list's padding, so the table is summed without it too.
+                workbench
+                    .timeline_row_sizes
+                    .iter()
+                    .map(|row| row.height)
+                    .sum::<Pixels>(),
+            )
+        });
+        assert!(
+            extent >= table - px(1.0),
+            "step {step}: the list forgot the rows it has not measured: {extent:?} of {table:?}"
+        );
+        assert_eq!(
+            now - offset,
+            px(100.0),
+            "step {step}: the transcript jumped by something other than the scroll ({offset:?} -> {now:?})"
+        );
+        offset = now;
+    }
+}
+
+/// A fresh transcript scrolls up by what the wheel asked, row by row.
+///
+/// The scroll test above measures every row before it scrolls, which is the
+/// state a transcript reaches after one pass over it. A session that was just
+/// opened is the other state: every row above the viewport is still carrying the
+/// height hint the list seeds, so each step up measures a row for the first time
+/// and its real height replaces the hint. A reader reports the bounce exactly
+/// there — going up in a fresh session, never coming down — so the invariant is
+/// pinned from that state too.
+#[gpui::test]
+fn a_fresh_transcript_scrolls_up_by_what_the_wheel_asked(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..120_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                // Uneven bodies, so a seeded hint is never the real height.
+                text: format!("answer {turn}: {}", "detail ".repeat(20 + turn % 40)),
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    // One frame: the rows the viewport shows, and nothing above them.
+    draw_disclosure_frame(cx);
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        cx.notify();
+    });
+    let mut offset = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    let mut watching: Option<(usize, Pixels)> = None;
+    for step in 0..20 {
+        workbench.update(cx, |workbench, cx| {
+            workbench.timeline_scroll.scroll_by(px(-100.0));
+            cx.notify();
+        });
+        draw_disclosure_frame(cx);
+        draw_disclosure_frame(cx);
+        let (now, anchor, painted) = workbench.read_with(cx, |workbench, _| {
+            let top = workbench.timeline_scroll.logical_scroll_top();
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                top.item_ix,
+                workbench
+                    .timeline_scroll
+                    .bounds_for_item(top.item_ix)
+                    .map(|bounds| bounds.origin.y),
+            )
+        });
+        assert!(
+            (now - offset - px(100.0)).abs() <= px(0.5),
+            "step {step}: a fresh transcript jumped by something other than the scroll ({offset:?} -> {now:?})"
+        );
+        // The row under the viewport top must travel up by exactly the scroll.
+        // A row above it that measures shorter than the hint it was seeded with
+        // takes height out of everything below, and that is a jump the reader
+        // sees while the offset still looks right.
+        if let (Some((watched, before)), Some(painted)) = (watching, painted)
+            && watched == anchor
+        {
+            assert!(
+                (painted - before - px(100.0)).abs() <= px(0.5),
+                "step {step}: the row under the viewport moved by {:?}, not by the scroll",
+                painted - before
+            );
+        }
+        watching = painted.map(|y| (anchor, y));
+        offset = now;
+    }
+}
+
+/// A reseed must leave the document as tall as the row table.
+///
+/// `gpui::list` lays a row it has not measured out at the single hint it was
+/// given, so a reseed's document is `rows * hint` no matter how the real heights
+/// are distributed. Seeding the median of a mixed transcript left that document
+/// hundreds of pixels short, and a reseed — a new turn, a settled width — then
+/// resolved the reader's place against it, which is the viewport landing a
+/// screen up the conversation when a turn arrived.
+#[gpui::test]
+fn a_reseeded_transcript_is_as_tall_as_its_rows(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..40_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        // A real transcript is short rows with a few very long ones, which is
+        // exactly the shape a median seed gets wrong: the mean carries the
+        // height the table actually has, the median does not.
+        let body = if turn % 8 == 0 {
+            format!("long answer {turn}: {}", "detail ".repeat(80))
+        } else {
+            format!("short answer {turn}")
+        };
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: body,
+                is_final: true,
+            }),
+        ));
+    }
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    // The list throws the hints away whenever the width settles; asking for the
+    // seed again is exactly what a new row does.
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_list_hint_width = None;
+        cx.notify();
+    });
+    for _ in 0..2 {
+        draw_disclosure_frame(cx);
+    }
+    let (extent, table) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.max_offset_for_scrollbar().y
+                + workbench.timeline_scroll.viewport_bounds().size.height,
+            workbench
+                .timeline_row_sizes
+                .iter()
+                .map(|row| row.height)
+                .sum::<Pixels>(),
+        )
+    });
+    // The table's heights are estimates until each row is drawn, so a seed can
+    // land a little off the total. What it must not do is miss by a fraction of
+    // the document, which is what a median seed does on exactly this shape: a
+    // handful of long turns among short ones leaves the median far below the
+    // mean, and the seeded document far below the table.
+    let tolerance = table * 0.05;
+    assert!(
+        extent >= table - tolerance,
+        "the reseed left the document {:?} short of the table it seeded",
+        table - extent
+    );
+    assert!(
+        extent <= table + tolerance,
+        "the reseed made the document {:?} taller than the table it seeded",
+        extent - table
+    );
+}
+
+/// A stream below the reader must not move the reader.
+///
+/// The last turn keeps growing while the agent works, and every chunk changes
+/// the row table. A reader who scrolled up to read earlier turns should not see
+/// the transcript move for it: the growth is below the viewport, and the anchor
+/// is the row they are in.
+#[gpui::test]
+fn a_streaming_turn_below_does_not_move_a_reader_who_scrolled_up(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..24_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(30)),
+                is_final: true,
+            }),
+        ));
+    }
+    items.push(live_timeline_item(
+        5000,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "a question that streams".into(),
+            ..Default::default()
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    workbench.update(cx, |workbench, cx| {
+        workbench.timeline_follow.set_following_bottom(false);
+        workbench.timeline_scroll.scroll_by(px(-600.0));
+        cx.notify();
+    });
+    for _ in 0..4 {
+        draw_disclosure_frame(cx);
+    }
+    let before = workbench.read_with(cx, |workbench, _| {
+        workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+    });
+    assert!(
+        before < px(-100.0),
+        "the fixture should be scrolled up: {before:?}"
+    );
+
+    for chunk in 0..24_u32 {
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap()
+        });
+        apply_live_timeline_item(
+            &workbench,
+            cx,
+            live_timeline_item(
+                sequence + 1,
+                TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                    text_delta: "streamed ".to_string(),
+                    chunk_index: chunk,
+                    phase: None,
+                }),
+            ),
+        );
+        for _ in 0..2 {
+            draw_disclosure_frame(cx);
+        }
+        let after = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+        });
+        assert_eq!(
+            after, before,
+            "chunk {chunk} moved a reader who did not scroll: {before:?} -> {after:?}"
+        );
+    }
+}
+
+/// A stream must not rock the live edge.
+///
+/// While the reader follows the bottom, a chunk can only add height below the
+/// viewport, so the offset may travel toward the end and nowhere else. A capture
+/// showed the offset alternating by a whole viewport on every frame — the list
+/// naming its end as an anchor past the last row one frame, and as a row anchor
+/// the next — which reads as the transcript bouncing. This pins the invariant:
+/// growth below never moves the viewport back up.
+#[gpui::test]
+fn a_streaming_turn_does_not_rock_the_live_edge(cx: &mut TestAppContext) {
+    cx.update(gpui_component::init);
+    let mut items = Vec::new();
+    for turn in 0..10_usize {
+        let base = 1000 + turn as i64 * 4;
+        items.push(live_timeline_item(
+            base,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: format!("question {turn}"),
+                ..Default::default()
+            }),
+        ));
+        items.push(live_timeline_item(
+            base + 1,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: format!("answer {turn}: {}", "detail ".repeat(30)),
+                is_final: true,
+            }),
+        ));
+    }
+    items.push(live_timeline_item(
+        5000,
+        TimelinePayload::UserMessage(UserMessagePayload {
+            text: "a question that streams".into(),
+            ..Default::default()
+        }),
+    ));
+    let (workbench, _, cx) = tool_rows_at_the_live_edge(cx, items, None);
+    for _ in 0..6 {
+        draw_disclosure_frame(cx);
+    }
+    let (mut last, viewport) = workbench.read_with(cx, |workbench, _| {
+        (
+            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+            workbench.timeline_scroll.viewport_bounds().size.height,
+        )
+    });
+    assert!(
+        workbench.read_with(cx, |workbench, _| workbench
+            .timeline_follow
+            .following_bottom),
+        "the fixture should be on the live edge"
+    );
+    let slack = viewport / 2.0;
+    for chunk in 0..40_u32 {
+        let sequence = workbench.read_with(cx, |workbench, _| {
+            workbench.timeline.authoritative_end_sequence.unwrap()
+        });
+        apply_live_timeline_item(
+            &workbench,
+            cx,
+            live_timeline_item(
+                sequence + 1,
+                TimelinePayload::AgentMessageDelta(vibex_core::AgentMessageDeltaPayload {
+                    text_delta: "streamed ".to_string(),
+                    chunk_index: chunk,
+                    phase: None,
+                }),
+            ),
+        );
+        for _ in 0..2 {
+            draw_disclosure_frame(cx);
+        }
+        let (now, extent, table) = workbench.read_with(cx, |workbench, _| {
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y
+                    + workbench.timeline_scroll.viewport_bounds().size.height,
+                workbench
+                    .timeline_row_sizes
+                    .iter()
+                    .map(|row| row.height)
+                    .sum::<Pixels>(),
+            )
+        });
+        assert!(
+            extent >= table * 0.9,
+            "chunk {chunk}: the list holds {extent:?} of the table's {table:?}"
+        );
+        assert!(
+            now <= last + slack,
+            "chunk {chunk} rocked the live edge: {last:?} -> {now:?} (viewport {viewport:?})"
+        );
+        last = now;
+    }
 }
 
 /// The tool rows of the last turn, in order, whatever separates them.

@@ -135,6 +135,18 @@ launch::LaunchConfig::new(remote_home, remote_install_root, workspace_roots, por
 - On-host layout: install root `~/.local/share/vibex/server/{<version>,current,previous,home,backups}`,
   state `~/.local/state/vibex/server/{runtime.env (0600),server.log,runtime.pid}`.
   Uninstall refuses any root outside the remote home.
+- **The runtime home is a per-profile choice, not always the managed directory.**
+  `SshConnectionProfile::runtime_home` (absent = the managed
+  `{install_root}/home`, read through `runtime_home_path()`) lets a connection
+  adopt a directory that already exists on the host — usually the host's own
+  desktop data under `~/.vibex/desktop-<channel>`. `ssh_connection::homes`
+  scans for those candidates with a fixed script and reports each one's
+  database and lock state; a directory whose `.vibex-runtime.lock` is held is
+  never adoptable. Because `runtime_identity` lives in that database, a
+  different home is a different server: saving a change drops the profile's
+  `registered_runtime_id` so the next connect provisions and pairs again.
+  Uninstall still removes only the install root, so an adopted directory
+  survives a remove-everything uninstall.
 
 ### 4. Validation & Error Matrix
 

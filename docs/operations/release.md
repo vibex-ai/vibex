@@ -22,6 +22,10 @@ Confirm that the public repository contains only source-owned changes and that
 private Trellis task paths are not staged. Do not publish a package from a dirty
 or unverified source identity.
 
+`pnpm check:mobile-native` belongs to the preflight only while mobile packaging is
+enabled. It cannot pass while the phone client is still on `gpui-pre` and the
+shared UI crates build against `gpui-fast`; see [Mobile](#mobile).
+
 ## Desktop
 
 The tag-triggered GitHub Actions release uses standard GitHub-hosted runners and
@@ -171,6 +175,18 @@ artifact trust stays with the signed `vibex-update.json`, and every link is
 built from the verified tag.
 
 ## Mobile
+
+Android and iOS packaging is opt-in while the mobile client is ported to the
+backend the desktop runs on. The desktop, the TUI, `vibex-server` and the
+container images build against `gpui-fast`; `apps/mobile` still builds through
+the `gpui-pre-mobile` platform layer, so a phone build links two different
+`gpui` crates and cannot compile. Both mobile jobs are gated on the repository
+variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the jobs are skipped,
+the publish job still releases the desktop, headless server and container
+artifacts, and the Downloads table simply omits the Android and iOS rows. A
+mobile job that does run and fails still holds the release. Set the variable to
+`true` once the platform layer is ported, and gate that release on
+`pnpm check:mobile-native` again.
 
 Android and iOS are built independently from the desktop package. Tagged
 releases publish signed Android APK/AAB files plus an unsigned iOS simulator

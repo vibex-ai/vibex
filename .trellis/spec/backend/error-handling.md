@@ -232,6 +232,11 @@ returns `None`; it does not expose or reinterpret a remote filesystem path.
 - Native resolution validates the workspace and containment before returning
   `Some(path)`. An empty relative path resolves to the workspace root. Files,
   directories and allowed symlink targets retain the file service's semantics.
+- Containment is decided by the logical workspace path. A Windows directory
+  junction (`mklink /J`) whose entry lives inside the workspace is followed to
+  its target even when that target is outside the root; `..` traversal,
+  absolute child paths, and symbolic links that resolve outside the workspace
+  are still rejected.
 - Local openers receive the actual file or directory, never a preview-cache
   copy. Editing in another application must change the workspace file; terminals
   must use the selected directory or the selected file's parent.

@@ -340,7 +340,7 @@ This inventory records source and license provenance. The corresponding license 
 | gpui-pre-util | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-ztracing | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
 | gpui-pre-ztracing-macro | 0.3.12 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 | Apache-2.0 | cargo-manifest |
-| gpui-tokio | 0.1.8 | path:crates/gpui-tokio | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| gpui-tokio | 0.1.9 | path:crates/gpui-tokio | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
 | granit-parser | 1.3.0 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
 | gtk | 0.19.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | gtk-sys | 0.19.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
@@ -920,34 +920,34 @@ This inventory records source and license provenance. The corresponding license 
 | vecmath | 1.0.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | version-compare | 0.2.1 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | version_check | 0.9.5 | registry+https://github.com/rust-lang/crates.io-index | MIT OR Apache-2.0 | MIT | cargo-manifest |
-| vibex-agent | 0.1.8 | path:crates/agent | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-agent-acp | 0.1.8 | path:crates/agent-acp | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-app-update | 0.1.8 | path:crates/app-update | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-backend | 0.1.8 | path:crates/vibex-backend | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-backup | 0.1.8 | path:crates/backup | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-brands | 0.1.8 | path:crates/vibex-brands | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-browser | 0.1.8 | path:crates/browser | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-client | 0.1.8 | path:apps/tui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-computer | 0.1.8 | path:crates/computer | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-config-switch | 0.1.8 | path:crates/config-switch | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-content | 0.1.8 | path:crates/content | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-core | 0.1.8 | path:crates/core | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-db | 0.1.8 | path:crates/db | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-desktop-model | 0.1.8 | path:crates/desktop-model | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-desktop-runtime | 0.1.8 | path:crates/desktop-runtime | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-diagnostics | 0.1.8 | path:crates/diagnostics | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-fs | 0.1.8 | path:crates/fs | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-git | 0.1.8 | path:crates/git | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-im-channel | 0.1.6 | path:crates/im-channel | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-model-catalog | 0.1.8 | path:crates/model-catalog | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-model-gateway | 0.1.8 | path:crates/model-gateway | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-relay | 0.1.8 | path:crates/relay | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-remote | 0.1.8 | path:crates/remote | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-remote-client | 0.1.8 | path:crates/vibex-remote-client | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-terminal | 0.1.8 | path:crates/terminal | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-terminal-ui | 0.1.8 | path:crates/vibex-terminal-ui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-tui | 0.1.8 | path:crates/vibex-tui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
-| vibex-ui | 0.1.8 | path:crates/vibex-ui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-agent | 0.1.9 | path:crates/agent | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-agent-acp | 0.1.9 | path:crates/agent-acp | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-app-update | 0.1.9 | path:crates/app-update | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-backend | 0.1.9 | path:crates/vibex-backend | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-backup | 0.1.9 | path:crates/backup | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-brands | 0.1.9 | path:crates/vibex-brands | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-browser | 0.1.9 | path:crates/browser | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-client | 0.1.9 | path:apps/tui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-computer | 0.1.9 | path:crates/computer | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-config-switch | 0.1.9 | path:crates/config-switch | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-content | 0.1.9 | path:crates/content | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-core | 0.1.9 | path:crates/core | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-db | 0.1.9 | path:crates/db | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-desktop-model | 0.1.9 | path:crates/desktop-model | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-desktop-runtime | 0.1.9 | path:crates/desktop-runtime | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-diagnostics | 0.1.9 | path:crates/diagnostics | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-fs | 0.1.9 | path:crates/fs | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-git | 0.1.9 | path:crates/git | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-im-channel | 0.1.9 | path:crates/im-channel | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-model-catalog | 0.1.9 | path:crates/model-catalog | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-model-gateway | 0.1.9 | path:crates/model-gateway | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-relay | 0.1.9 | path:crates/relay | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-remote | 0.1.9 | path:crates/remote | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-remote-client | 0.1.9 | path:crates/vibex-remote-client | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-terminal | 0.1.9 | path:crates/terminal | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-terminal-ui | 0.1.9 | path:crates/vibex-terminal-ui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-tui | 0.1.9 | path:crates/vibex-tui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
+| vibex-ui | 0.1.9 | path:crates/vibex-ui | AGPL-3.0-or-later | AGPL-3.0-or-later | cargo-manifest |
 | vswhom | 0.1.0 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | vswhom-sys | 0.1.3 | registry+https://github.com/rust-lang/crates.io-index | MIT | MIT | cargo-manifest |
 | vte | 0.15.0 | registry+https://github.com/rust-lang/crates.io-index | Apache-2.0 OR MIT | Apache-2.0 | cargo-manifest |
@@ -1135,7 +1135,7 @@ This inventory records source and license provenance. The corresponding license 
 | Input | Files | Source | Declared license | Policy selection |
 | --- | ---: | --- | --- | --- |
 | gpui-kit bundled Lucide icon set | 1830 | https://github.com/longbridge/gpui-kit | Apache-2.0 AND ISC | (Apache-2.0 AND ISC) |
-| Vibex Desktop GPUI reviewed icon bundle | 236 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
+| Vibex Desktop GPUI reviewed icon bundle | 237 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
 | Vibex desktop application and tray icons | 15 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex native mobile brand mark | 1 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | Vibex native mobile application icons | 19 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset | AGPL-3.0-or-later | AGPL-3.0-or-later |

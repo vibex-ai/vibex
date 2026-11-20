@@ -11892,6 +11892,15 @@ fn runtime_picker_preview(
     if app.run_options_for(&selection).is_empty() {
         return Line::from("");
     }
+    // A failed switch explains itself here: the row above says only that the
+    // previous Agent is still in use, and the Agent's refusal — an unknown
+    // model id, a rejected option — is the one sentence that says what to fix.
+    if let Some(detail) = app.runtime_selection_failure_detail() {
+        return Line::from(Span::styled(
+            truncate_to_width(detail, width, "…"),
+            theme.danger(),
+        ));
+    }
     let body = app
         .run_option_values(&selection)
         .unwrap_or_else(|| strings.runtime_default().to_string());

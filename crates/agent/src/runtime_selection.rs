@@ -674,6 +674,19 @@ impl RuntimeSelectionService {
                 .as_deref()
                 .map(actionable_error_for_code)
                 .transpose()?
+                // The outer code says "configuration unavailable", which is
+                // true of every live failure and actionable for none of them.
+                // The switch journal kept the Agent's own refusal (an unknown
+                // model id, a rejected option) on the way to storage; carry it
+                // beside the product sentence so the reader can fix the cause
+                // instead of guessing at it.
+                .map(|error| {
+                    error.with_detail(
+                        latest
+                            .as_ref()
+                            .and_then(|record| record.error_detail_redacted.as_deref()),
+                    )
+                })
         } else {
             None
         };
@@ -1978,7 +1991,9 @@ mod tests {
             &session_id,
             &record.switch_id,
             "runtime_switch_configuration_unavailable",
-            Some("redacted configuration failure"),
+            Some(
+                "runtime_switch_configuration_unavailable:acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)",
+            ),
         )
         .unwrap();
         let stored = AgentSessionRuntimeRepository::get_runtime_state(&conn, &session_id)
@@ -2005,6 +2020,17 @@ mod tests {
                 .as_ref()
                 .map(|error| error.code.as_str()),
             Some("runtime_switch_configuration_unavailable")
+        );
+        // The product sentence names no cause; the journal's refusal is what
+        // tells the reader which model the Agent rejected.
+        assert_eq!(
+            failed
+                .actionable_error
+                .as_ref()
+                .and_then(|error| error.detail.as_deref()),
+            Some(
+                "acp_rpc_error (model: session/set_config_option: Invalid params: unknown model: qwenwork/deepseek-flash)"
+            )
         );
 
         // Versions before this fix cleared the initial desired value while

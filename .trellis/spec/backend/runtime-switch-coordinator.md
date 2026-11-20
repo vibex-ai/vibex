@@ -283,6 +283,11 @@ twice or advance to `N + 1` merely because the durable switch is scanned.
   worker stopping without terminal writes.
 - Redaction: RuntimeBinding, switch intent/records, journal request/records do
   not Debug-print native ids, resume identities, tokens, or config payloads.
+- Failure detail: a failed switch round-trips `error_detail_redacted` through
+  `RuntimeSwitchRecord`; the selection state strips the duplicated code prefix
+  into `actionable_error.detail`; a submission that fails on that switch keeps
+  the cause beside "message was not sent"; an empty or control-bearing detail
+  is dropped without losing the failure.
 
 ### 7. Wrong vs Correct
 
@@ -394,6 +399,19 @@ agent://runtime-selection-event
   materialization activates that exact binding and generation, a storage CAS
   may restore `Ready` only when desired equals effective, no switch is pending,
   and the binding row is still Current. The failed switch stays in the journal.
+- Every terminal switch failure keeps two things: the stable failure code and
+  the Agent's own bounded refusal (`runtime_switches.error_detail_redacted`,
+  written by `operation_failure_detail` as `<code>:<cause> (<agent refusal>)`).
+  The product projection carries the refusal beside the code as
+  `RuntimeSelectionActionableError.detail`, with the duplicated `<code>:`
+  prefix stripped, because the code alone says only "configuration
+  unavailable" — the same sentence for an unknown model id, a rejected option
+  and a broken endpoint. A surface that shows the code must show the detail;
+  the reason is evidence and is passed through as the Agent wrote it rather
+  than translated into product copy. A message submission that failed on a
+  terminal switch carries the same detail, so "message was not sent" names the
+  cause beside it. Losing the detail — empty, too long, or control-bearing —
+  drops only the explanation, never the failure.
 - If the initial switch fails before any binding commits, SQLite retains the
   desired selection and a null effective selection. The non-optional product
   projection exposes that same-revision durable target as effective only while

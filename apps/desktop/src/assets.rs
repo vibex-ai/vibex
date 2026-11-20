@@ -794,6 +794,18 @@ const VIBEX_ASSETS: &[(&str, &[u8])] = &[
             "/assets/icons/file-video-camera.svg"
         )),
     ),
+    // The Composer's attach control. It is Lucide's `paperclip` (ISC, the same
+    // set `gpui-kit-assets` bundles): the kit names its icons from a curated
+    // default list, and that list has no paperclip, so the component's
+    // `IconName` cannot reach one. A `+` stood in for it and read as "add a
+    // row to the composer" rather than "attach a file to this message".
+    (
+        "icons/vibex/paperclip.svg",
+        include_bytes!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/paperclip.svg"
+        )),
+    ),
     // The Provider section's filter-and-sort button draws this glyph. It lives
     // outside the gpui-kit default bundle, so naming it there resolved to an
     // unregistered path and the button drew an empty frame.

@@ -219,6 +219,10 @@ pub const MENU_OUT: MotionSpec = MotionSpec::new(100, EASE);
 pub const DIALOG_IN: MotionSpec = MotionSpec::new(180, EASE);
 /// Sidebar / pane width+height transitions: 200ms ease-out.
 pub const RESIZE: MotionSpec = MotionSpec::new(200, EASE_OUT);
+/// The composer's height morph between its one-line bar and its multi-row
+/// box: 180ms ease-out. Short enough that typing never waits on it, long
+/// enough that the timeline's bottom edge glides instead of jumping.
+pub const COMPOSER_MORPH: MotionSpec = MotionSpec::new(180, EASE_OUT);
 /// Segmented-control thumb travel: 200ms ease-out, the same movement class a
 /// region uses when it changes place.
 pub const SEGMENT_SLIDE: MotionSpec = MotionSpec::new(200, EASE_OUT);
@@ -530,6 +534,238 @@ pub fn hover_listener(
 pub fn schedule_hover_frames(window: &mut Window) {
     HOVER_FADES.with(|fades| {
         fades.borrow_mut().tick_at(Instant::now(), |owner| {
+            window.on_next_frame(move |_, cx| cx.notify(owner));
+        });
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Height morphs (the composer's density change)
+// ---------------------------------------------------------------------------
+
+/// One in-flight height morph: an eased glide from the height the surface had
+/// when its target changed to the live target.
+///
+/// The morph animates the surface's COMMITTED height: the density decision
+/// commits its final layout immediately (the input entity never remounts —
+/// the caret survives) while the surface's height glides toward it. The
+/// surface sits at the BOTTOM of the session column, so its bottom edge is
+/// stationary on screen and only the top edge sweeps; the control row rides
+/// the stationary bottom while the text glides with the top.
+///
+/// Like the hover fades, this is driven manually from wall time, never
+/// `with_animation`: the composer's tree is rebuilt on every timeline frame,
+/// and an element-id-keyed clock would replay the morph from 0 on any remount
+/// mid-flight. The target is re-read every frame, so a draft that keeps
+/// growing mid-morph moves the endpoint instead of finishing on a stale
+/// height, and a reversal re-anchors at the CURRENT animated height.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct HeightMorph {
+    /// Rendered height when the target changed — the glide's start point.
+    pub from: f32,
+    pub started: Instant,
+}
+
+impl HeightMorph {
+    fn duration() -> Duration {
+        COMPOSER_MORPH.total().mul_f32(speed_scale())
+    }
+
+    /// Eased progress (0..1) at `now`.
+    pub fn progress(&self, now: Instant) -> f32 {
+        let duration = Self::duration();
+        if duration.is_zero() {
+            return 1.0;
+        }
+        let raw =
+            now.saturating_duration_since(self.started).as_secs_f32() / duration.as_secs_f32();
+        COMPOSER_MORPH.curve.eval(raw.clamp(0.0, 1.0))
+    }
+
+    pub fn settled(&self, now: Instant) -> bool {
+        now.saturating_duration_since(self.started) >= Self::duration()
+    }
+
+    /// The height to paint this frame: eased lerp from the change-time height
+    /// to the LIVE target.
+    pub fn height(&self, target: f32, now: Instant) -> f32 {
+        lerp(self.from, target, self.progress(now))
+    }
+}
+
+/// One surface's height-morph state: the last target it committed, the last
+/// height it painted, and the morph in flight (if any).
+#[derive(Debug, Clone, Copy)]
+struct HeightEntry {
+    target: f32,
+    last_height: f32,
+    morph: Option<HeightMorph>,
+    /// Wall clock at the last read (liveness stamp — see [`HeightMorphs`]).
+    seen: Instant,
+    /// The view whose render reads this morph; it gets the follow-up frames.
+    owner: EntityId,
+}
+
+/// Per-key height-morph store, the layout twin of [`HoverFades`].
+///
+/// Same threading and staleness rules: a main-thread `thread_local`, entries
+/// stamped on read, pruned by [`HeightMorphs::tick_at`] when a full lease
+/// passes unread so a remounted surface starts clean instead of inheriting a
+/// dead entry's height.
+#[derive(Default)]
+pub struct HeightMorphs {
+    entries: HashMap<String, HeightEntry>,
+}
+
+impl HeightMorphs {
+    /// Resolve the height one surface paints this frame.
+    ///
+    /// `target` is the height the committed layout asks for. A changed target
+    /// arms one morph from the last painted height (mid-flight that is the
+    /// CURRENT animated height, so a reversal hands off seamlessly); an
+    /// unchanged target never restarts the animation. `snap` (reduced motion,
+    /// a session switch, or a first paint with no measured height) commits the
+    /// target immediately and kills anything in flight.
+    pub fn resolve_at(
+        &mut self,
+        key: &str,
+        target: f32,
+        snap: bool,
+        owner: EntityId,
+        now: Instant,
+    ) -> f32 {
+        let previous = self.entries.get(key).copied();
+        let mut entry = match previous {
+            Some(entry) => entry,
+            None => HeightEntry {
+                target,
+                last_height: target,
+                morph: None,
+                seen: now,
+                owner,
+            },
+        };
+        entry.seen = now;
+        entry.owner = owner;
+        let changed = (entry.target - target).abs() > 0.5;
+        let in_flight = entry.morph.is_some_and(|morph| !morph.settled(now));
+        if snap || previous.is_none() {
+            entry.morph = None;
+        } else if changed && !in_flight {
+            // A settled surface arms a fresh glide from its resting height.
+            // A target that moves MID-flight is tracked by the running morph
+            // — `height` lerps toward the live target — never restarted:
+            // re-anchoring per keystroke would stretch the glide forever,
+            // and a reversal at the far end of an ease-out has almost no
+            // distance left to re-anchor over anyway.
+            entry.morph = Some(HeightMorph {
+                from: entry.last_height,
+                started: now,
+            });
+        }
+        entry.target = target;
+        let height = match entry.morph {
+            Some(morph) if !morph.settled(now) => morph.height(target, now),
+            _ => {
+                entry.morph = None;
+                target
+            }
+        };
+        entry.last_height = height;
+        self.entries.insert(key.to_string(), entry);
+        height
+    }
+
+    /// Once-per-frame bookkeeping (call exactly once per frame from the window
+    /// root, beside [`HoverFades::tick_at`]): prune entries a full lease went
+    /// unread, and hand every owner whose morph is still mid-flight to
+    /// `schedule` so it can request its next frame.
+    pub fn tick_at(&mut self, now: Instant, mut schedule: impl FnMut(EntityId)) {
+        let mut active: Vec<EntityId> = Vec::new();
+        self.entries.retain(|_, entry| {
+            if now.saturating_duration_since(entry.seen) > HOVER_LEASE {
+                return false;
+            }
+            let in_flight = entry.morph.is_some_and(|morph| !morph.settled(now));
+            if in_flight && !active.contains(&entry.owner) {
+                active.push(entry.owner);
+            }
+            true
+        });
+        for owner in active {
+            schedule(owner);
+        }
+    }
+}
+
+thread_local! {
+    static HEIGHT_MORPHS: RefCell<HeightMorphs> = RefCell::new(HeightMorphs::default());
+}
+
+thread_local! {
+    /// The view a height morph should ask for its next frame while one is being
+    /// built inside it.
+    ///
+    /// Same idea as the hover fades' owner scope, and it exists for the same
+    /// reason times a hundred: the morph runs for a dozen frames, and the
+    /// composer is hosted by a view of its own precisely so that a frame of its
+    /// own does not rebuild the sidebar, every pane and the transcript beside
+    /// it. Handing the morph the workbench's id made every one of those frames a
+    /// whole-window rebuild, which is what a coarse, stepping glide looks like.
+    static HEIGHT_OWNER_SCOPE: Cell<Option<EntityId>> = const { Cell::new(None) };
+}
+
+/// Runs `build` with `owner` as the height-morph owner for every
+/// [`resolve_height`] built inside it.
+///
+/// The host view that embeds a morphing surface pushes its own id here, so the
+/// frames the morph asks for repaint that view instead of whatever view happens
+/// to be rendering the surface.
+pub fn with_height_owner<R>(owner: EntityId, build: impl FnOnce() -> R) -> R {
+    let previous = HEIGHT_OWNER_SCOPE.with(|scope| scope.replace(Some(owner)));
+    let result = build();
+    HEIGHT_OWNER_SCOPE.with(|scope| scope.set(previous));
+    result
+}
+
+/// The host view that currently owns the height morph, if any.
+fn scoped_height_owner() -> Option<EntityId> {
+    HEIGHT_OWNER_SCOPE.with(Cell::get)
+}
+
+/// Resolve the height for `key` this frame (see [`HeightMorphs::resolve_at`]).
+pub fn resolve_height(key: &str, target: f32, snap: bool, owner: EntityId) -> f32 {
+    let owner = scoped_height_owner().unwrap_or(owner);
+    HEIGHT_MORPHS.with(|morphs| {
+        morphs
+            .borrow_mut()
+            .resolve_at(key, target, snap, owner, Instant::now())
+    })
+}
+
+/// Whether `key`'s surface is mid-glide this frame.
+///
+/// A surface that is animating its own height is, by definition, about to be
+/// repainted by the morph's own frame drive. A caller that measures it — the
+/// composer parks its bounds for the menus it anchors — can ask here before
+/// asking for a repaint of its own, so one glide does not wake every view that
+/// watches the measurement.
+pub fn height_morph_in_flight(key: &str) -> bool {
+    HEIGHT_MORPHS.with(|morphs| {
+        let morphs = morphs.borrow();
+        let now = Instant::now();
+        morphs
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.morph.is_some_and(|morph| !morph.settled(now)))
+    })
+}
+
+/// Frame-drive hook for height morphs: call ONCE per frame beside
+/// [`schedule_hover_frames`].
+pub fn schedule_height_morph_frames(window: &mut Window) {
+    HEIGHT_MORPHS.with(|morphs| {
+        morphs.borrow_mut().tick_at(Instant::now(), |owner| {
             window.on_next_frame(move |_, cx| cx.notify(owner));
         });
     });
@@ -940,6 +1176,152 @@ mod tests {
         fades.set_at("ghost", false, false, owner(), t0);
         assert!(fades.entries.is_empty(), "no entry for a leave-only key");
         assert_eq!(fades.value_at("ghost", t0), 0.0);
+    }
+
+    #[test]
+    fn height_morph_glides_to_the_live_target_and_reverses_continuously() {
+        let mut morphs = HeightMorphs::default();
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+
+        // First paint commits the target without a morph.
+        assert_eq!(
+            morphs.resolve_at("composer", 64.0, false, owner(), t0),
+            64.0
+        );
+        // A changed target starts the glide at the last painted height.
+        assert_eq!(
+            morphs.resolve_at("composer", 136.0, false, owner(), t0),
+            64.0
+        );
+        let mid = morphs.resolve_at("composer", 136.0, false, owner(), ms(90));
+        assert!(mid > 64.0 && mid < 136.0, "mid-flight: {mid}");
+        assert_eq!(
+            morphs.resolve_at("composer", 136.0, false, owner(), ms(180)),
+            136.0
+        );
+
+        // A reversal mid-flight re-anchors at the CURRENT animated height:
+        // the frame after the flip continues from where the glide was —
+        // never a pop back to an endpoint. Ease-out covers most of the
+        // distance in the first frames, so the reads sit right at the start.
+        morphs.resolve_at("composer", 64.0, false, owner(), ms(200));
+        let growing = morphs.resolve_at("composer", 136.0, false, owner(), ms(201));
+        assert!(growing > 64.0 && growing <= 136.0, "mid-flight: {growing}");
+        let at_flip = morphs.resolve_at("composer", 64.0, false, owner(), ms(202));
+        assert!(
+            at_flip <= growing && growing - at_flip < 16.0,
+            "continuity: {growing} vs {at_flip}"
+        );
+        let falling = morphs.resolve_at("composer", 64.0, false, owner(), ms(280));
+        assert!(falling < at_flip, "glides back down");
+        assert_eq!(
+            morphs.resolve_at("composer", 64.0, false, owner(), ms(390)),
+            64.0
+        );
+    }
+
+    #[test]
+    fn height_morph_tracks_a_target_that_moves_mid_flight() {
+        let mut morphs = HeightMorphs::default();
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        morphs.resolve_at("composer", 64.0, false, owner(), t0);
+        morphs.resolve_at("composer", 136.0, false, owner(), t0);
+        // The draft keeps growing: the morph aims at the new endpoint instead
+        // of finishing on the stale one.
+        let mid = morphs.resolve_at("composer", 180.0, false, owner(), ms(90));
+        assert!(mid > 64.0 && mid < 180.0, "mid-flight: {mid}");
+        assert_eq!(
+            morphs.resolve_at("composer", 180.0, false, owner(), ms(180)),
+            180.0
+        );
+    }
+
+    #[test]
+    fn height_morph_snap_kills_the_flight_and_never_arms_one() {
+        let mut morphs = HeightMorphs::default();
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        morphs.resolve_at("composer", 64.0, false, owner(), t0);
+        morphs.resolve_at("composer", 136.0, false, owner(), t0);
+        // A session switch (snap) commits immediately, mid-flight included.
+        assert_eq!(
+            morphs.resolve_at("composer", 200.0, true, owner(), ms(50)),
+            200.0
+        );
+        assert_eq!(
+            morphs.resolve_at("composer", 64.0, true, owner(), ms(60)),
+            64.0
+        );
+    }
+
+    /// The morph's frames go to the view that hosts the surface.
+    ///
+    /// A glide is a dozen frames, and the composer that arms one is a view of
+    /// its own: notified as the workbench, each step rewrote the sidebar, every
+    /// pane and the transcript as well, which is the cost that turns a short
+    /// ease-out into a stepping glide.
+    #[test]
+    fn height_morph_frames_go_to_the_scoped_host_view() {
+        let workbench = EntityId::from(3);
+        let host = EntityId::from(4);
+        let key = "morph_owner_scope";
+        resolve_height(key, 64.0, false, workbench);
+        resolve_height(key, 136.0, false, workbench);
+        assert!(height_morph_in_flight(key));
+        // A read inside the host's render hands the morph to the host.
+        with_height_owner(host, || {
+            let _ = resolve_height(key, 136.0, false, workbench);
+        });
+        let owner =
+            HEIGHT_MORPHS.with(|morphs| morphs.borrow().entries.get(key).map(|entry| entry.owner));
+        assert_eq!(owner, Some(host), "the host view drives the glide");
+        // Outside the scope the workbench's own id is back in charge.
+        let _ = resolve_height(key, 136.0, false, workbench);
+        let owner =
+            HEIGHT_MORPHS.with(|morphs| morphs.borrow().entries.get(key).map(|entry| entry.owner));
+        assert_eq!(owner, Some(workbench), "the scope is restored on exit");
+    }
+
+    /// A settled glide is not in flight, so measurement wake-ups resume.
+    #[test]
+    fn height_morph_reports_flight_only_while_it_travels() {
+        let key = "morph_flight_window";
+        let owner = owner();
+        // First paint commits without a glide.
+        resolve_height(key, 64.0, false, owner);
+        assert!(!height_morph_in_flight(key));
+        resolve_height(key, 136.0, false, owner);
+        assert!(height_morph_in_flight(key));
+        // A snap (reduced motion, a session switch) lands at once.
+        resolve_height(key, 200.0, true, owner);
+        assert!(!height_morph_in_flight(key));
+    }
+
+    #[test]
+    fn height_tick_reports_flight_and_prunes_unread_entries() {
+        let mut morphs = HeightMorphs::default();
+        let t0 = Instant::now();
+        let ms = |m: u64| t0 + Duration::from_millis(m);
+        let mut owners = Vec::new();
+        let mut tick = |morphs: &mut HeightMorphs, now: Instant| {
+            owners.clear();
+            morphs.tick_at(now, |owner| owners.push(owner));
+            owners.clone()
+        };
+
+        morphs.resolve_at("composer", 64.0, false, owner(), t0);
+        morphs.resolve_at("composer", 136.0, false, owner(), t0);
+        assert_eq!(tick(&mut morphs, ms(50)), vec![owner()]);
+        morphs.resolve_at("composer", 136.0, false, owner(), ms(50));
+        // Settled: no more frames needed, entry kept for the next change.
+        assert!(tick(&mut morphs, ms(200)).is_empty());
+        morphs.resolve_at("composer", 136.0, false, owner(), ms(200));
+        assert!(morphs.entries.contains_key("composer"));
+        // A full lease without a read evicts the entry.
+        tick(&mut morphs, ms(700));
+        assert!(morphs.entries.is_empty(), "unread entry evicted");
     }
 
     #[test]

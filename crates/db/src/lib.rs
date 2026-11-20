@@ -99,7 +99,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 89;
+pub const CURRENT_SCHEMA_VERSION: i64 = 90;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12743,6 +12743,11 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // recorded last and independent of the ACP tables above.
     apply_session_transport(conn, &mut applied)?;
     apply_im_chat_channels(conn, &mut applied)?;
+    // A provider names a session from the prompt it was sent, and the
+    // authority instructions that open a prompt used to be reported back as
+    // the name; recorded last because it only repairs titles the earlier
+    // migrations made possible.
+    apply_session_title_instruction_echo(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -19593,6 +19598,7 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "89:im_chat_channels",
+                "90:agent_session_title_instruction_echo",
             ]
         );
         let agent_models: (Option<String>, Option<String>) = conn
@@ -19766,6 +19772,7 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "89:im_chat_channels",
+                "90:agent_session_title_instruction_echo",
             ]
         );
         let activation_completed_at_ms: Option<i64> = conn
@@ -19924,6 +19931,7 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "89:im_chat_channels",
+                "90:agent_session_title_instruction_echo",
             ]
         );
         let stored: (String, Option<String>, Option<i64>) = conn
@@ -20116,6 +20124,7 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "89:im_chat_channels",
+                "90:agent_session_title_instruction_echo",
             ]
         );
         assert_eq!(
@@ -21577,6 +21586,7 @@ mod tests {
                 "87:opencode_session_header",
                 "88:agent_session_transport",
                 "89:im_chat_channels",
+                "90:agent_session_title_instruction_echo",
             ]
         );
         let managed = ManagedWorktreeRepository::get_by_id(&conn, &worktree_id)
@@ -23379,6 +23389,91 @@ mod tests {
         let mut reapplied = Vec::new();
         apply_session_title_lock(&mut conn, &mut reapplied).unwrap();
         assert!(reapplied.is_empty());
+
+        cleanup_db(temp);
+    }
+
+    #[test]
+    fn session_title_instruction_echo_migration_restores_the_readers_message() {
+        let temp = temp_db_path("session-title-echo-migration");
+        let mut conn = open_database(&temp).unwrap();
+        conn.execute_batch(
+            r#"
+            CREATE TABLE schema_migrations (
+                version INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms INTEGER NOT NULL
+            );
+            CREATE TABLE agent_sessions (
+                session_id TEXT PRIMARY KEY,
+                title TEXT NOT NULL,
+                title_locked INTEGER NOT NULL DEFAULT 0,
+                current_agent_id TEXT,
+                updated_at_ms INTEGER NOT NULL DEFAULT 0,
+                deleted_at_ms INTEGER
+            );
+            CREATE TABLE agent_timeline_items (
+                session_id TEXT NOT NULL,
+                sequence INTEGER NOT NULL,
+                kind TEXT NOT NULL,
+                payload_json TEXT NOT NULL,
+                PRIMARY KEY (session_id, sequence)
+            );
+            INSERT INTO agent_sessions (session_id, title, current_agent_id) VALUES
+                ('echoed', 'Runtime instruction: a short emoji', 'codex'),
+                ('echoed-no-message', 'Runtime instruction: a short emoji reaction is welcome', 'opencode'),
+                ('echoed-after-internal-turn', 'Runtime instruction: a short emoji', 'codex'),
+                ('renamed', 'Runtime instruction: my own label', 'codex'),
+                ('unaffected', 'Fix the flake', 'codex'),
+                ('deleted', 'Runtime instruction: a short emoji', 'codex');
+            UPDATE agent_sessions SET title_locked = 1 WHERE session_id = 'renamed';
+            UPDATE agent_sessions SET deleted_at_ms = 7 WHERE session_id = 'deleted';
+            INSERT INTO agent_timeline_items (session_id, sequence, kind, payload_json) VALUES
+                ('echoed', 1, 'user_message',
+                 '{"type":"user_message","data":{"text":"Fix the   emoji\nreaction title","provenance":{"kind":"human_input"}}}'),
+                ('echoed', 2, 'user_message',
+                 '{"type":"user_message","data":{"text":"a later message","provenance":{"kind":"human_input"}}}'),
+                ('echoed-no-message', 1, 'system_notice',
+                 '{"type":"system_notice","data":{"message":"Agent session is initializing"}}'),
+                ('echoed-after-internal-turn', 1, 'user_message',
+                 '{"type":"user_message","data":{"text":"delegated work","provenance":{"kind":"delegation"}}}');
+            "#,
+        )
+        .unwrap();
+
+        let mut applied = Vec::new();
+        apply_session_title_instruction_echo(&mut conn, &mut applied).unwrap();
+        assert_eq!(applied, ["90:agent_session_title_instruction_echo"]);
+
+        fn title(conn: &Connection, session_id: &str) -> String {
+            conn.query_row(
+                "SELECT title FROM agent_sessions WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get(0),
+            )
+            .unwrap()
+        }
+        // The reader's first message names the row, normalized the way every
+        // automatic title is.
+        assert_eq!(title(&conn, "echoed"), "Fix the emoji reaction title");
+        // Nothing the reader wrote: the generic creation label is honest, and
+        // is what the manager seeds until a real message arrives.
+        assert_eq!(title(&conn, "echoed-no-message"), "opencode session");
+        // A delegated prompt is not the reader's writing either.
+        assert_eq!(title(&conn, "echoed-after-internal-turn"), "codex session");
+        // A manual rename is the reader's decision, and a row that never
+        // echoed the instruction is not touched.
+        assert_eq!(title(&conn, "renamed"), "Runtime instruction: my own label");
+        assert_eq!(title(&conn, "unaffected"), "Fix the flake");
+        assert_eq!(
+            title(&conn, "deleted"),
+            "Runtime instruction: a short emoji"
+        );
+
+        let mut reapplied = Vec::new();
+        apply_session_title_instruction_echo(&mut conn, &mut reapplied).unwrap();
+        assert!(reapplied.is_empty());
+        assert_eq!(title(&conn, "echoed"), "Fix the emoji reaction title");
 
         cleanup_db(temp);
     }
@@ -28602,5 +28697,108 @@ fn apply_im_chat_channels(conn: &mut Connection, applied: &mut Vec<String>) -> V
     if !already_recorded {
         applied.push(format!("{VERSION}:{NAME}"));
     }
+    Ok(())
+}
+
+/// Replaces session titles that echoed the instructions opening every prompt.
+///
+/// A provider names a session from the prompt it is sent, and Vibex opens that
+/// prompt with an authority instruction ("Runtime instruction: …"). The name a
+/// provider reported was therefore the instruction instead of the
+/// conversation, and the session list showed it. The name the reader's first
+/// message seeds is what such a row should carry, so it is rebuilt from the
+/// first human message in the timeline; a session without one falls back to
+/// the generic `<agent> session` label the manager hands out at creation. A
+/// locked title is a manual rename and is left alone.
+fn apply_session_title_instruction_echo(
+    conn: &mut Connection,
+    applied: &mut Vec<String>,
+) -> VibexResult<()> {
+    const VERSION: i64 = 90;
+    const NAME: &str = "agent_session_title_instruction_echo";
+    if migration_applied(conn, VERSION)? {
+        return Ok(());
+    }
+    let echoed = {
+        let mut statement = conn
+            .prepare(
+                "SELECT session_id, COALESCE(current_agent_id, 'agent')
+                 FROM agent_sessions
+                 WHERE title_locked = 0
+                   AND deleted_at_ms IS NULL
+                   AND title LIKE 'Runtime instruction:%'",
+            )
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read Agent session titles",
+            ))?;
+        statement
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read Agent session titles",
+            ))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read Agent session titles",
+            ))?
+    };
+    let tx = conn.transaction().map_err(storage_err(
+        "migration_transaction_failed",
+        "failed to start the Agent session title repair transaction",
+    ))?;
+    for (session_id, agent_id) in echoed {
+        let first_message = tx
+            .query_row(
+                "SELECT json_extract(payload_json, '$.data.text')
+                 FROM agent_timeline_items
+                 WHERE session_id = ?1
+                   AND kind = 'user_message'
+                   AND json_extract(payload_json, '$.data.provenance.kind') = 'human_input'
+                 ORDER BY sequence
+                 LIMIT 1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map_err(storage_err(
+                "migration_apply_failed",
+                "failed to read the Agent session timeline",
+            ))?
+            .flatten();
+        let title = first_message
+            .as_deref()
+            .and_then(vibex_core::normalize_agent_session_title)
+            .or_else(|| vibex_core::normalize_agent_session_title(&format!("{agent_id} session")))
+            .unwrap_or_else(|| format!("{agent_id} session"));
+        // The row's own timestamp is left alone: restoring a label is not
+        // activity, and bumping it would reorder the reader's session list.
+        tx.execute(
+            "UPDATE agent_sessions
+             SET title = ?2
+             WHERE session_id = ?1 AND title_locked = 0",
+            params![session_id, title],
+        )
+        .map_err(storage_err(
+            "migration_apply_failed",
+            "failed to restore an Agent session title",
+        ))?;
+    }
+    tx.execute(
+        "INSERT INTO schema_migrations (version, name, applied_at_ms) VALUES (?1, ?2, ?3)",
+        params![VERSION, NAME, unix_timestamp_ms()],
+    )
+    .map_err(storage_err(
+        "migration_record_failed",
+        "failed to record the Agent session title repair migration",
+    ))?;
+    tx.commit().map_err(storage_err(
+        "migration_commit_failed",
+        "failed to commit the Agent session title repair migration",
+    ))?;
+    applied.push(format!("{VERSION}:{NAME}"));
     Ok(())
 }

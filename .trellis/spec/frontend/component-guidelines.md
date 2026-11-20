@@ -642,6 +642,16 @@ that stops updating and as blank bands between rows. Measurements a pane records
 during prepaint belong to the same view, and the transient borrow is
 deliberately unweighed so a per-row swap does not re-walk a whole timeline.
 
+The set of sessions that hold a live view is the set of *painted* panes
+(`SessionGroupUiState::painted_session_ids`), never the presentation's live
+budget (`live_session_ids`, which is focus-ordered and cut to
+`SESSION_GROUP_LIVE_PANE_LIMIT` for an Agent-requested layout). A hand-split
+workspace is bounded by `SESSION_GROUP_PANE_LIMIT` instead: every pane it paints
+owns a complete view and its active tab always renders its conversation, so
+moving the keyboard to a sibling cannot evict a view or swap a transcript for a
+"select this pane" placeholder. The live budget therefore orders and bounds what
+an automatic layout may ask for; it is not the renderer's visibility rule.
+
 The same rule covers input that arrives without focusing the pane. A wheel event
 is routed to the element under the pointer, so scrolling a pane the keyboard is
 not on clears that pane's follow state — borrow its view in the listener too. A
@@ -878,6 +888,178 @@ of prose — not a reference and not one editing unit — so it stays ordinary t
 as does anything typed by hand and never picked from the menu. Do not paint a
 tint behind typed `/`, `@` or `$` text to imitate a chip: two visuals for one
 idea is what the atomic token replaced.
+
+### Composer densities
+
+The session and home Composers draw two densities from one renderer: a
+one-line bar and the full box. Keep the decision a pure function of what lives
+*inside* the surface — the draft's wrapped rows at the bar's own input width,
+whether attachments exist, and whether the input is expanded. The rows that
+ride *above* the box (continuation prompt, generation status, plan, goal,
+collaboration bar, queued messages) are siblings of the surface, not rows of
+it, and must never choose its density: a blank draft under an active plan is
+still the one-line bar, and rendering the full box there left an empty
+textarea with a reserved band under it. "Empty" means no characters at all: a
+draft of newlines has rows, and the bar cannot show a second row, so Enter in
+the slim bar has to move the surface to the full box instead of pushing the
+bar's controls down inside a 48px surface.
+
+The surface itself carries only what edits the draft:
+
+| Density | Attach | Expand |
+| --- | --- | --- |
+| Slim | row, left of the text | row, left of the text |
+| Full | control row, bottom-left | trailing corner, top-right |
+
+The schedule, the terminal and the context-usage ring are not surface controls:
+none of them edits the draft, so they answer for the session as a whole and
+live on the line under the surface (`render_composer_footer`). That line keeps
+the surface's own horizontal inset and reads, left to right: the session's
+Agent mark and project name, then the schedule, the terminal and the usage
+ring. Keep the two halves on one line — the left half names the target, the
+right half holds the instruments — and do not add a second floating row above
+the box for them: the session's instruments belong to the same baseline as the
+session it names.
+
+The line is a caption, not a second toolbar. Its controls are a size under the
+bar's own (`COMPOSER_FOOTER_CONTROL_SIZE` = 22, against the bar's 30), and the
+left half takes `muted-foreground` rather than the foreground: on a page-colored
+backdrop a foreground caption read as body text and pulled the eye back down
+past the box. The project line is `text_xs` at medium weight beside a 13px
+Agent mark (`COMPOSER_FOOTER_MARK_SIZE`), which keeps both halves on one
+baseline with the instruments. Do not raise the footer's controls to the bar's
+size to make them easier to hit — they are readouts and rare actions, and the
+surface above owns the frequent ones.
+
+The three instruments must also *draw* at one optical size, and neither the kit
+nor a naive diameter gets there. A sized `Button` that carries children pads
+itself by a fifth of its square on each side and clips the content box, so a
+14px glyph inside a 22px seat lost a hair off all four edges of its own stroke
+and the clock read as cut; the footer's instrument buttons therefore set
+`p(px(0.0))` and let the glyphs occupy the whole seat. The usage ring is the
+mirror-image trap: the seat is a 22px square, but `ProgressCircle` paints at
+three quarters of the size it is handed, so asking it for the seat drew a
+16.5px disc — the loudest mark on a row of 14px glyphs. It is asked for the
+square that paints `COMPOSER_FOOTER_RING_SIZE` (15, a point over the glyphs
+because a stroke carries less weight than a solid mark), through
+`PROGRESS_CIRCLE_DRAWN_SCALE` rather than a bare `0.75`.
+
+Every instrument glyph — the footer's schedule and terminal, the surface's
+attach and expand — takes its ink from `composer_instrument_ink`: a rest step
+under the caption's muted ink while the pointer is elsewhere
+(`COMPOSER_FOOTER_INSTRUMENT_REST_INK` = 0.70, `COMPOSER_ROW_INSTRUMENT_REST_INK`
+= 0.78) and the foreground's near-white under the pointer
+(`COMPOSER_INSTRUMENT_HOVER_INK` = 0.92). Do not paint a single static tone and
+lean on the button's hover background: the kit's `.icon(...)` tints with the
+button's foreground, and a ghost button keeps that foreground unchanged under the
+pointer, so a mark that must be dim at rest and bright on hover has to be a
+tinted child. Such a child also needs the whole seat — a sized `Button` that
+carries children insets and clips it — hence the `p(px(0.0))`.
+
+The fade itself hangs on `composer_instrument_hover_target`, a div drawn **around**
+the button, never on the button. Every one of these buttons carries a tooltip,
+the kit's tooltip already owns that button's single `on_hover`, and a second one
+panics at paint; a group-based variant (`group_hover` on a `.group(...)` button)
+compiled and looked right but never fired on screen, which is why
+`composer_instrument_hover_wrapper_lifts_the_marks_ink` drives a real pointer
+across the seat and reads the fade store back. The wrapper's hitbox sits on the
+button's own bounds, so the fade starts and ends where the control does. Both
+densities of one control share one fade key (`COMPOSER_ATTACH_HOVER_KEY`,
+`COMPOSER_EXPAND_HOVER_KEY`, `COMPOSER_TERMINAL_HOVER_KEY`, and a per-session
+`composer-footer-schedule:<id>`): a density flip rebuilds the button under the
+pointer, and a renamed key would drop the highlight at the moment the reader is
+watching it.
+
+The slim row then reads attach → expand → run configuration → send, with no
+fold-menu: four separate controls fit because the row only seats two of them
+plus the cascade and the action. The two utility controls share a 30px seat
+(`COMPOSER_SLIM_ROW_CONTROL_SIZE`) and draw 15px marks in muted ink; the send
+disc is the row's tallest control at 32px (`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`)
+and its only saturated mark, so the row gains its weight from color rather than
+from size. The attach glyph is the bundled `paperclip` (ISC), not the kit's
+`Plus`: a `+` on a message composer reads as "add a row to the draft", and the
+paperclip says "attach a file to this message" without a tooltip. The bar's
+height is the disc plus its 7px inset above and below and the surface's hairline
+(`COMPOSER_SLIM_SURFACE_HEIGHT` = 48), and its radius is exactly half of it
+(`COMPOSER_SLIM_SURFACE_RADIUS`), which is what closes both ends into
+semicircles. The row's fixed widths are what `composer_slim_input_width`
+subtracts, so a new control there must be added to that figure as well, or the
+density probe wraps a line later than the painted bar does.
+
+The run-configuration chip names the **supplier and the model together** —
+`provider/model` — through `runtime_provider_model_label`, the same pair the
+home page's chip and the panel's rows use. A bare model name was ambiguous: two
+Providers can serve one model, and a chip that showed only the model left the
+reader unable to tell which one a turn would run as. An Agent account reads
+`Agent account/model`, because there the Agent is the account; a Provider
+Profile keeps the name its owner gave it, and a route shows its own label. The
+pair truncates inside the chip's 240px cap while the thinking depth beside it
+keeps its width, and the tooltip spells the pair out and names the account on
+its own line, so a clipped chip still leaves the whole selection readable.
+
+The surface's fill is `composer-surface` lifted a few points toward the
+foreground in a dark appearance (`composer_surface_fill`). The authored plate
+sits only three points above the page, which is right for a card that a hairline
+already separates, but it left the one surface the reader types into looking
+like a hole. A light appearance keeps the authored color. The edge follows the
+same rule (`composer_surface_border`): the focused pane still takes the ring,
+while a dark appearance draws its own stronger hairline instead of the theme's
+ten-percent `border`, which is tuned for two adjacent plates rather than for the
+one edge that has to say where the box begins.
+
+The send disc keeps its own fill rather than the kit's primary variant: the kit
+paints a disabled primary at fifteen percent of the accent, which on a dark
+page is a flat grey hole exactly where the reader expects the button. The
+control stays `disabled` — the press is what is gated — while its disc mixes
+between the composer's own fill and the foreground, and its arrow takes
+`background` as ink once there is something to send.
+
+The trailing corner seats one button (expand), shorter than the input's own
+minimum band. The surface's floor is therefore the editor
+(`COMPOSER_FULL_SURFACE_MIN_HEIGHT` = the 80px text band + the row's 16px
+insets + the 44px control row + the 2px hairline), and the textarea fills the
+same height (`h_full`, never just a minimum: a minimum leaves the editor
+content-sized and the frame's centring floats a short draft in the middle of
+the band). Past the floor the surface is derived from the draft itself — rows ×
+the input's line advance plus its own padding, then the row's insets, the
+control row and the surface hairline. Do not grow a fixed base instead: the
+old `base + (rows - 2) × advance` reserved a blank band under the last line,
+and that band is what the reader sees as wasted input space.
+
+### The composer's height glide
+
+The two densities are one renderer at two heights, and the surface's height
+glides between them (`motion::resolve_height` under
+`composer_surface_morph_key`) while the committed layout switches at once so the
+caret and the draft survive. Two rules keep the glide from stepping.
+
+**Its frames belong to the ComposerView, not the workbench.** A glide runs for a
+dozen frames; notifying the workbench for each one rebuilt the sidebar, every
+pane and the transcript beside the composer, and the surface arrived in visible
+steps — the shape of an animation that is too expensive to run. `ComposerView`
+renders inside `motion::with_height_owner`, so the morph asks that boundary for
+its frames, and it ticks the store at the end of its own render (after the read
+that may have armed one). Reduced motion, a session switch and the fullscreen
+editor still snap.
+
+**A measurement taken mid-glide does not ask for a repaint.** The surface parks
+its bounds for the menus it anchors, and those bounds move every frame of a
+glide; a repaint request per step woke the same whole window the morph was
+avoiding. `composer_measurement_wants_repaint` holds the request back while
+`motion::height_morph_in_flight` says the glide is running — the glide's own
+frames repaint the composer, which adopts the parked bounds at the start of
+every render, and the settled bounds land once the glide ends.
+
+### The composer's edge
+
+`composer_surface_border` answers for two kinds of focus. A focused *pane* takes
+the theme's ring outright: which pane the keys reach has to read from across the
+window. A caret in the box — the only focus the single-session column has —
+takes that ring mixed into the resting hairline
+(`COMPOSER_FOCUSED_INPUT_RING_MIX` = 0.6), enough that the box says it is the
+thing being typed into without shouting like a pane boundary. The input
+subscription asks for the frame on `InputEvent::Focus` and `Blur`; a focus
+change is a one-off, not a per-keystroke cost.
 
 ### Session activity indicators
 
