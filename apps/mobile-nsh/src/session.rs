@@ -174,6 +174,8 @@ pub struct SessionService {
     sidebar_project_order: Signal<Vec<String>>,
     sidebar_workspace_order: Signal<Vec<(String, Vec<String>)>>,
     sidebar_session_order: Signal<Vec<String>>,
+    collapsed_projects: Signal<Vec<String>>,
+    collapsed_workspaces: Signal<Vec<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
     draft: Signal<String>,
     sending: Signal<bool>,
@@ -376,6 +378,8 @@ impl SessionService {
             sidebar_project_order: signal(Vec::new()),
             sidebar_workspace_order: signal(Vec::new()),
             sidebar_session_order: signal(Vec::new()),
+            collapsed_projects: signal(Vec::new()),
+            collapsed_workspaces: signal(Vec::new()),
             timeline: signal(Vec::new()),
             draft: signal(String::new()),
             sending: signal(false),
@@ -610,6 +614,20 @@ impl SessionService {
             sidebar_project_order: self.sidebar_project_order,
             sidebar_workspace_order: self.sidebar_workspace_order,
             sidebar_session_order: self.sidebar_session_order,
+            collapsed_projects: self.collapsed_projects,
+            collapsed_workspaces: self.collapsed_workspaces,
+            on_set_project_collapsed: {
+                let service = self.clone();
+                Rc::new(move |id: &str, collapsed: bool| {
+                    service.set_project_collapsed(id, collapsed)
+                })
+            },
+            on_set_workspace_collapsed: {
+                let service = self.clone();
+                Rc::new(move |id: &str, collapsed: bool| {
+                    service.set_workspace_collapsed(id, collapsed)
+                })
+            },
             sidebar_sections: self.sidebar_sections,
             folder_open: self.folder_open,
             folder_name: self.folder_name,
@@ -3980,6 +3998,32 @@ impl SessionService {
                     )),
                 }
             }
+        });
+    }
+
+    fn set_project_collapsed(&self, id: &str, collapsed: bool) {
+        self.collapsed_projects.update(|projects| {
+            projects.retain(|candidate| candidate != id);
+            if collapsed {
+                projects.push(id.to_owned());
+            }
+        });
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetProjectCollapsed {
+            project_id: id.to_owned(),
+            collapsed,
+        });
+    }
+
+    fn set_workspace_collapsed(&self, id: &str, collapsed: bool) {
+        self.collapsed_workspaces.update(|workspaces| {
+            workspaces.retain(|candidate| candidate != id);
+            if collapsed {
+                workspaces.push(id.to_owned());
+            }
+        });
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed {
+            workspace_id: id.to_owned(),
+            collapsed,
         });
     }
 

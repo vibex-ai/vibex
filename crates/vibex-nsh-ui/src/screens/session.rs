@@ -452,6 +452,10 @@ pub struct SessionHost {
     pub sidebar_project_order: Signal<Vec<String>>,
     pub sidebar_workspace_order: Signal<Vec<(String, Vec<String>)>>,
     pub sidebar_session_order: Signal<Vec<String>>,
+    pub collapsed_projects: Signal<Vec<String>>,
+    pub collapsed_workspaces: Signal<Vec<String>>,
+    pub on_set_project_collapsed: SessionToggle,
+    pub on_set_workspace_collapsed: SessionToggle,
     pub on_set_session_auto_continue: SessionToggle,
     pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
     pub folder_open: Signal<bool>,
@@ -4173,7 +4177,8 @@ fn attachment_preview_sheet(
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
-    let collapsed_projects = signal(Vec::<String>::new());
+    let collapsed_projects = host.collapsed_projects;
+    let on_set_project_collapsed = host.on_set_project_collapsed.clone();
     let search_open = signal(false);
     let query = signal(String::new());
     let select_mode = signal(false);
@@ -4489,6 +4494,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             group,
                                             active,
                                             collapsed,
+                                            on_set_project_collapsed.clone(),
                                             on_select.clone(),
                                             on_menu.clone(),
                                             open,
@@ -5226,6 +5232,7 @@ fn drawer_group(
     group: ReadSignal<DrawerGroup>,
     active: Signal<Option<String>>,
     collapsed: Signal<Vec<String>>,
+    on_project_collapse: SessionToggle,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     open: Signal<bool>,
@@ -5243,17 +5250,12 @@ fn drawer_group(
         .flex_col()
         .gap(px(2.0))
         .child({
+            let on_project_collapse = on_project_collapse.clone();
             button()
                 .on_press(move || {
                     let id = group.get_untracked().id;
-                    collapsed.update(|collapsed| {
-                        if let Some(index) = collapsed.iter().position(|candidate| candidate == &id)
-                        {
-                            collapsed.remove(index);
-                        } else {
-                            collapsed.push(id);
-                        }
-                    });
+                    let collapsed_now = collapsed.with(|collapsed| collapsed.contains(&id));
+                    on_project_collapse(&id, !collapsed_now);
                 })
                 .w_full()
                 .min_h(px(32.0))

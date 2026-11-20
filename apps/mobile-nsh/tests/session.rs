@@ -414,6 +414,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let sidebar_project_order = signal(Vec::new());
     let sidebar_workspace_order = signal(Vec::new());
     let sidebar_session_order = signal(Vec::new());
+    let collapsed_projects = signal(Vec::new());
+    let collapsed_workspaces = signal(Vec::new());
     let sidebar_sections = signal(Vec::new());
     let folder_open = signal(false);
     let folder_name = signal(String::new());
@@ -814,6 +816,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         sidebar_project_order,
         sidebar_workspace_order,
         sidebar_session_order,
+        collapsed_projects,
+        collapsed_workspaces,
+        on_set_project_collapsed: Rc::new(|_, _| {}),
+        on_set_workspace_collapsed: Rc::new(|_, _| {}),
         on_set_session_auto_continue: Rc::new(|_, _| {}),
         sidebar_sections,
         folder_open,
