@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<shortcuts xmlns:android="http://schemas.android.com/apk/res/android">
+    <shortcut
+        android:enabled="true"
+        android:icon="@mipmap/ic_launcher"
+        android:shortcutId="new_session"
+        android:shortcutLongLabel="@string/shortcut_new_session"
+        android:shortcutShortLabel="@string/shortcut_new_session">
+        <intent
+            android:action="ai.vibex.mobile.nsh.NEW_SESSION"
+            android:targetClass="com.longbridge.nsh.MainActivity"
+            android:targetPackage="ai.vibex.mobile.nsh" />
+    </shortcut>
+</shortcuts>

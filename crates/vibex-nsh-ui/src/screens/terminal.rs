@@ -7,7 +7,9 @@
 
 use std::rc::Rc;
 
-use nsh_base::{SheetEvent, Terminal, TerminalEvent, button, sheet, terminal as terminal_view};
+use nsh_base::{
+    SheetEvent, Terminal, TerminalApi, TerminalEvent, button, sheet, terminal as terminal_view,
+};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
@@ -92,6 +94,18 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         )
+                        .child({
+                            let term_ref = host.term_ref;
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/clipboard-paste.svg")),
+                                copy::text("Copy terminal", "复制终端内容", "複製終端內容"),
+                                move || {
+                                    if let Some(api) = term_ref.api::<TerminalApi>() {
+                                        set_clipboard(api.text());
+                                    }
+                                },
+                            )
+                        })
                         .child({
                             let on_open_menu = host.on_open_menu.clone();
                             action::icon_button(

@@ -70,6 +70,15 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeScanResult(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// Records a launcher shortcut asking for a new session.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeNewSession(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) {
+    host::request_new_session();
+}
+
 /// Reports text another app shared into Vibex.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeShareText(

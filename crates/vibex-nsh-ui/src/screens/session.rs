@@ -526,6 +526,7 @@ pub struct SessionHost {
     pub show_token_usage: Signal<bool>,
     pub show_plan_goal: Signal<bool>,
     pub show_generation_status: Signal<bool>,
+    pub show_reasoning: Signal<bool>,
     pub team_open: Signal<bool>,
     pub team_tasks: Signal<Vec<crate::screens::team::TeamTaskView>>,
     pub team_busy: Signal<bool>,

@@ -236,6 +236,7 @@ fn settings_host(
     let show_token_usage = settings.show_token_usage;
     let show_plan_goal = settings.show_plan_goal;
     let show_generation_status = settings.show_generation_status;
+    let show_reasoning = settings.show_reasoning;
     let settings_for_appearance = settings.clone();
     let settings_for_language = settings.clone();
     let settings_for_haptics = settings.clone();
@@ -249,9 +250,11 @@ fn settings_host(
     let settings_for_token = settings.clone();
     let settings_for_plan = settings.clone();
     let settings_for_generation = settings.clone();
+    let settings_for_reasoning = settings.clone();
     let services_for_token = services;
     let services_for_plan = services;
     let services_for_generation = services;
+    let services_for_reasoning = services;
     let pairing_for_disconnect = pairing.clone();
     let pairing_for_clear = pairing.clone();
     SettingsHost {
@@ -269,6 +272,7 @@ fn settings_host(
         show_token_usage,
         show_plan_goal,
         show_generation_status,
+        show_reasoning,
         runtime: pairing.connected_label(),
         saved: pairing.saved(),
         on_appearance: Rc::new(move |appearance| {
@@ -319,6 +323,12 @@ fn settings_host(
                 service.set_show_generation_status(enabled);
             }
         }),
+        on_show_reasoning: Rc::new(move |enabled| {
+            settings_for_reasoning.set_show_reasoning(enabled);
+            if let Some(service) = services_for_reasoning.get_untracked() {
+                service.set_show_reasoning(enabled);
+            }
+        }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
         on_reconnect: Rc::new(move || {
             if let Some(service) = services.get_untracked() {
@@ -358,6 +368,11 @@ fn start_back_poller(
                 && let Some(service) = services.get_untracked()
             {
                 service.receive_shared_text(text);
+            }
+            if host::take_new_session_request()
+                && let Some(service) = services.get_untracked()
+            {
+                service.open_new_session();
             }
             if !host::take_back() {
                 continue;

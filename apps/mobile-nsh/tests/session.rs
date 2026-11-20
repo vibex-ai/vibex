@@ -381,6 +381,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let show_plan_goal = signal(true);
     let show_generation_status = signal(true);
     let find_open = signal(false);
+    let show_reasoning = signal(true);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -743,6 +744,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         show_plan_goal,
         show_generation_status,
         find_open,
+        show_reasoning,
         on_toggle_find: Rc::new(move || find_open.update(|open| *open = !*open)),
         plan,
         goal,
@@ -1195,6 +1197,7 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     app.wait_for("hello from the pty").unwrap();
     assert!(app.screen().shows("Esc"));
     assert!(app.screen().shows("Ctrl+C"));
+    app.press("role:button[Copy terminal]").unwrap();
 }
 
 #[test]

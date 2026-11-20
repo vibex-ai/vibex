@@ -274,6 +274,7 @@ pub struct SessionService {
     show_token_usage: Signal<bool>,
     show_plan_goal: Signal<bool>,
     show_generation_status: Signal<bool>,
+    show_reasoning: Signal<bool>,
     find_open: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
@@ -432,6 +433,7 @@ impl SessionService {
             show_token_usage: signal(crate::settings::show_token_usage()),
             show_plan_goal: signal(crate::settings::show_plan_goal()),
             show_generation_status: signal(crate::settings::show_generation_status()),
+            show_reasoning: signal(crate::settings::show_reasoning()),
             find_open: signal(false),
             plan: signal(None),
             goal: signal(None),
@@ -732,6 +734,7 @@ impl SessionService {
             show_token_usage: self.show_token_usage,
             show_plan_goal: self.show_plan_goal,
             show_generation_status: self.show_generation_status,
+            show_reasoning: self.show_reasoning,
             find_open: self.find_open,
             on_toggle_find: {
                 let service = self.clone();
@@ -1919,6 +1922,11 @@ impl SessionService {
         self.publish();
     }
 
+    pub fn set_show_reasoning(&self, enabled: bool) {
+        self.show_reasoning.set(enabled);
+        self.publish();
+    }
+
     fn open_team(&self) {
         self.team_open.set(true);
         self.refresh_team();
@@ -2722,6 +2730,9 @@ impl SessionService {
         });
         let plan = plan_view(&model.items);
         let goal = goal_view(&model.items);
+        entries.retain(|entry| {
+            entry.kind != EntryKind::Reasoning || self.show_reasoning.get_untracked()
+        });
         let editable = turns
             .iter()
             .rev()
@@ -3709,7 +3720,7 @@ impl SessionService {
     }
 
     /// Opens the new-session sheet with the runtime's choices.
-    fn open_new_session(&self) {
+    pub fn open_new_session(&self) {
         self.files_open.set(false);
         self.git_open.set(false);
         self.terminal_open.set(false);

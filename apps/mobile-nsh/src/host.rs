@@ -92,6 +92,10 @@ pub fn discovery_available() -> bool {
     DISCOVERY_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// A launcher shortcut asked for a new session.
+static NEW_SESSION_REQUESTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
 /// Text another app shared into Vibex, waiting for the engine to take it.
 static SHARED_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -206,6 +210,20 @@ pub fn share_text(text: &str) {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(text.to_owned());
+}
+
+/// Records a launcher shortcut asking for a new session.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host owns the shortcuts")
+)]
+pub fn request_new_session() {
+    NEW_SESSION_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the shortcut's request, if one is waiting.
+pub fn take_new_session_request() -> bool {
+    NEW_SESSION_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Takes the shared text, if one is waiting.
@@ -493,6 +511,13 @@ mod tests {
 #[cfg(test)]
 mod shared_text_tests {
     use super::*;
+
+    #[test]
+    fn a_shortcut_request_is_taken_once() {
+        request_new_session();
+        assert!(take_new_session_request());
+        assert!(!take_new_session_request());
+    }
 
     #[test]
     fn shared_text_is_trimmed_and_taken_once() {
