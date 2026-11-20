@@ -30,6 +30,14 @@ fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
         body: body.to_owned(),
         meta: String::new(),
         streaming: false,
+        turn_id: id.to_owned(),
+        process_count: 0,
+        expanded: false,
+        attachments: Vec::new(),
+        last_sequence: 0,
+        started_at_ms: 0,
+        ended_at_ms: 0,
+        complete: true,
     }
 }
 
@@ -118,6 +126,34 @@ fn QuestionShell() -> impl IntoElement {
             }],
         }),
     ))
+}
+
+/// A turn with a working fold and a picture in its user message.
+#[component]
+fn TurnShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let mut header = entry("h1", EntryKind::ProcessHeader, "Worked for 2s", "");
+    let now = nsh_core::time::unix_ms() as i64;
+    header.process_count = 2;
+    header.expanded = true;
+    header.turn_id = "t1".to_owned();
+    header.started_at_ms = now - 2_000;
+    header.ended_at_ms = now;
+    let mut user = entry("u1", EntryKind::User, "", "Look at this");
+    user.turn_id = "t1".to_owned();
+    user.attachments = vec![AttachmentItem {
+        id: "a1".to_owned(),
+        label: "photo.jpg".to_owned(),
+        mime_type: "image/jpeg".to_owned(),
+        uri: "data:image/jpeg;base64,".to_owned(),
+    }];
+    host.timeline = signal(vec![
+        user,
+        header,
+        entry("t1", EntryKind::Tool, "cargo test", "Running"),
+        entry("a1", EntryKind::Agent, "Claude", "Done"),
+    ]);
+    session::session(host)
 }
 
 /// The same shell while its runtime is unreachable and its transcript is on
@@ -473,6 +509,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_mention_query,
         on_new_session,
         on_open_settings: Rc::new(|| {}),
+        on_toggle_turn: Rc::new(|_| {}),
+        on_fork: Rc::new(|_| {}),
         terminal_open,
         terminal_title,
         terminal_error,
@@ -588,6 +626,19 @@ fn a_dropped_connection_keeps_the_transcript_and_offers_retry() {
     app.wait_for("Desktop is unavailable").unwrap();
     assert!(app.screen().shows("Morning. The build is green."));
     assert!(app.screen().shows("Retry"));
+}
+
+#[test]
+fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
+    let mut config = EngineConfig::new(Root::of::<TurnShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Worked for 2s").unwrap();
+    assert!(app.screen().shows("cargo test"));
+    assert!(app.screen().shows("photo.jpg"));
+    assert!(app.screen().shows("Copy"));
+    assert!(app.screen().shows("Share"));
+    assert!(app.screen().shows("Fork"));
 }
 
 #[test]

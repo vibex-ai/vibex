@@ -85,6 +85,8 @@ pub enum EntryKind {
     Notice,
     /// A failure.
     Error,
+    /// The fold above one turn's working rows.
+    ProcessHeader,
 }
 
 /// One row of the transcript.
@@ -99,6 +101,22 @@ pub struct TimelineEntry {
     /// A short status ("done", "running", a path).
     pub meta: String,
     pub streaming: bool,
+    /// The turn this row belongs to; empty when the row stands alone.
+    pub turn_id: String,
+    /// The fold's row count, on a process header.
+    pub process_count: usize,
+    /// Whether the fold is open, on a process header.
+    pub expanded: bool,
+    /// What the user message carried.
+    pub attachments: Vec<AttachmentItem>,
+    /// The row's newest sequence, for a fork cut.
+    pub last_sequence: i64,
+    /// When the turn started, for its working header.
+    pub started_at_ms: i64,
+    /// When the turn ended, when it did.
+    pub ended_at_ms: i64,
+    /// Whether the turn is finished.
+    pub complete: bool,
 }
 
 /// The answer a permission card offers.
@@ -297,6 +315,10 @@ pub struct SessionHost {
     pub on_new_session: Action,
     /// Opens the settings sheet over the shell.
     pub on_open_settings: Action,
+    /// Opens or closes one turn's working rows.
+    pub on_toggle_turn: Rc<dyn Fn(&str)>,
+    /// Forks the conversation through a row's sequence.
+    pub on_fork: Rc<dyn Fn(i64)>,
     /// The terminal surface, when it is open over the shell.
     pub terminal_open: Signal<bool>,
     pub terminal_title: Signal<Option<SharedString>>,
@@ -707,6 +729,8 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let timeline = host.timeline;
     let active = host.active;
     let error = host.error;
+    let on_toggle_turn = host.on_toggle_turn.clone();
+    let on_fork = host.on_fork.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -737,10 +761,13 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
         .child(when(
             move || timeline.with(|entries| !entries.is_empty()),
             move || {
-                virtual_list(
-                    move || timeline.with(|entries| entries.len()),
-                    move |at: Position| entry_row(at, timeline),
-                )
+                virtual_list(move || timeline.with(|entries| entries.len()), {
+                    let on_toggle_turn = on_toggle_turn.clone();
+                    let on_fork = on_fork.clone();
+                    move |at: Position| {
+                        entry_row(at, timeline, on_toggle_turn.clone(), on_fork.clone())
+                    }
+                })
                 .keys(move || {
                     timeline.with(|entries| {
                         entries
@@ -772,16 +799,25 @@ fn empty_hint(message: &'static str) -> impl IntoElement {
 /// The row is made once and reused by the list, so each shape is a region
 /// bound to the row's kind: when a cell shows another kind, its branch swaps
 /// without rebuilding the cell.
-fn entry_row(at: Position, entries: Signal<Vec<TimelineEntry>>) -> impl IntoElement {
+fn entry_row(
+    at: Position,
+    entries: Signal<Vec<TimelineEntry>>,
+    on_toggle_turn: Rc<dyn Fn(&str)>,
+    on_fork: Rc<dyn Fn(i64)>,
+) -> impl IntoElement {
     let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
     view()
         .w_full()
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
-        .child(entry_element(entry))
+        .child(entry_element(entry, on_toggle_turn, on_fork))
 }
 
-fn entry_element(entry: Memo<Option<TimelineEntry>>) -> impl IntoElement {
+fn entry_element(
+    entry: Memo<Option<TimelineEntry>>,
+    on_toggle_turn: Rc<dyn Fn(&str)>,
+    on_fork: Rc<dyn Fn(i64)>,
+) -> impl IntoElement {
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
     let body =
         computed(move || entry.with(|e| e.as_ref().map(|e| e.body.clone()).unwrap_or_default()));
@@ -790,6 +826,21 @@ fn entry_element(entry: Memo<Option<TimelineEntry>>) -> impl IntoElement {
     let meta =
         computed(move || entry.with(|e| e.as_ref().map(|e| e.meta.clone()).unwrap_or_default()));
     let streaming = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.streaming)));
+    let attachments = computed(move || {
+        entry.with(|e| {
+            e.as_ref()
+                .map(|e| e.attachments.clone())
+                .unwrap_or_default()
+        })
+    });
+    let turn_id =
+        computed(move || entry.with(|e| e.as_ref().map(|e| e.turn_id.clone()).unwrap_or_default()));
+    let process_count = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.process_count)));
+    let expanded = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expanded)));
+    let sequence = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.last_sequence)));
+    let started_at_ms = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.started_at_ms)));
+    let ended_at_ms = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.ended_at_ms)));
+    let complete = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.complete)));
 
     view()
         .w_full()
@@ -797,11 +848,31 @@ fn entry_element(entry: Memo<Option<TimelineEntry>>) -> impl IntoElement {
         .gap(px(theme::SPACING_XS))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::User)),
-            move || user_bubble(body),
+            move || user_bubble(body, attachments),
+        ))
+        .child(when(
+            move || kind.with(|kind| *kind == Some(EntryKind::ProcessHeader)),
+            {
+                let on_toggle_turn = on_toggle_turn.clone();
+                move || {
+                    process_header_row(
+                        started_at_ms,
+                        ended_at_ms,
+                        complete,
+                        process_count,
+                        expanded,
+                        turn_id,
+                        on_toggle_turn.clone(),
+                    )
+                }
+            },
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Agent)),
-            move || agent_prose(title, body, streaming),
+            {
+                let on_fork = on_fork.clone();
+                move || agent_prose(title, body, streaming, sequence, on_fork.clone())
+            },
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Reasoning)),
@@ -817,24 +888,129 @@ fn entry_element(entry: Memo<Option<TimelineEntry>>) -> impl IntoElement {
         ))
 }
 
-fn user_bubble(body: Memo<String>) -> impl IntoElement {
-    view().w_full().flex_row().justify_end().child(
-        view()
-            .max_w(px(320.0))
-            .rounded(px(14.0))
-            .bg(theme::background_dim)
-            .px(px(theme::SPACING_MD))
-            .py(px(theme::SPACING_SM))
-            .child(
-                text(move || body.get())
-                    .text_size(px(theme::font_body()))
-                    .line_height(theme::line_height_for(theme::font_body()))
-                    .text_color(theme::foreground),
-            ),
-    )
+fn user_bubble(body: Memo<String>, attachments: Memo<Vec<AttachmentItem>>) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_col()
+        .items_end()
+        .gap(px(theme::SPACING_XS))
+        .child(
+            view()
+                .max_w(px(320.0))
+                .rounded(px(14.0))
+                .bg(theme::background_dim)
+                .px(px(theme::SPACING_MD))
+                .py(px(theme::SPACING_SM))
+                .child(
+                    text(move || body.get())
+                        .text_size(px(theme::font_body()))
+                        .line_height(theme::line_height_for(theme::font_body()))
+                        .text_color(theme::foreground),
+                ),
+        )
+        .child(when(
+            move || !attachments.with(|items| items.is_empty()),
+            move || message_attachments(attachments),
+        ))
 }
 
-fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -> impl IntoElement {
+fn message_attachments(attachments: Memo<Vec<AttachmentItem>>) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .flex_wrap()
+        .justify_end()
+        .gap(px(theme::SPACING_XS))
+        .child(each(
+            move || attachments.get(),
+            |item| item.id.clone(),
+            move |item, _| {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .min_h(px(28.0))
+                    .px(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(theme::border_subtle)
+                    .bg(theme::background_dim)
+                    .child(
+                        text(move || item.with(|item| item.label.clone()))
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_secondary),
+                    )
+            },
+        ))
+}
+
+fn process_header_row(
+    started_at_ms: Memo<i64>,
+    ended_at_ms: Memo<i64>,
+    complete: Memo<bool>,
+    process_count: Memo<usize>,
+    expanded: Memo<bool>,
+    turn_id: Memo<String>,
+    on_toggle: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    button()
+        .w_full()
+        .min_h(px(36.0))
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .active(|style| style.opacity(0.8))
+        .on_press(move || on_toggle(&turn_id.get_untracked()))
+        .child(
+            text(move || {
+                let label = if complete.get() {
+                    copy::text("Worked for", "工作了", "工作了")
+                } else {
+                    copy::text("Working for", "工作了", "工作了")
+                };
+                format!(
+                    "{label} {}",
+                    work_duration(started_at_ms.get(), ended_at_ms.get(), complete.get())
+                )
+            })
+            .flex_1()
+            .truncate()
+            .text_size(px(theme::font_detail()))
+            .text_color(theme::text_secondary),
+        )
+        .child(
+            text(move || process_count.get().to_string())
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted),
+        )
+        .child(
+            text(move || if expanded.get() { "▾" } else { "▸" })
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted),
+        )
+}
+
+fn work_duration(started_at_ms: i64, ended_at_ms: i64, complete: bool) -> String {
+    let end = if complete && ended_at_ms > 0 {
+        ended_at_ms
+    } else {
+        nsh_core::time::unix_ms() as i64
+    };
+    let seconds = ((end - started_at_ms).max(0) / 1_000) as u64;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60),
+    }
+}
+
+fn agent_prose(
+    title: Memo<String>,
+    body: Memo<String>,
+    streaming: Memo<bool>,
+    sequence: Memo<i64>,
+    on_fork: Rc<dyn Fn(i64)>,
+) -> impl IntoElement {
     view()
         .w_full()
         .flex_col()
@@ -860,9 +1036,6 @@ fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -
                 )),
         )
         .child(
-            // Markdown, with the open syntax of a still-arriving reply repaired
-            // as it streams. `nsh` lays the blocks out natively and only shows
-            // the blocks that changed again.
             text_view()
                 .markdown(move || Some(body.get().into()))
                 .options(move || MarkdownOptions {
@@ -870,6 +1043,51 @@ fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -
                     ..MarkdownOptions::default()
                 })
                 .selectable(true),
+        )
+        .child(message_actions(body, sequence, on_fork))
+}
+
+fn message_actions(
+    body: Memo<String>,
+    sequence: Memo<i64>,
+    on_fork: Rc<dyn Fn(i64)>,
+) -> impl IntoElement {
+    view()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .child(small_action(
+            copy::text("Copy", "复制", "複製"),
+            move || set_clipboard(body.get_untracked()),
+        ))
+        .child(small_action(
+            copy::text("Share", "分享", "分享"),
+            move || {
+                let text = body.get_untracked();
+                spawn(async move {
+                    let _ = share(nsh_core::share::ShareRequest::new().text(text)).await;
+                });
+            },
+        ))
+        .child(small_action(copy::text("Fork", "分叉", "分叉"), {
+            let on_fork = on_fork.clone();
+            move || on_fork(sequence.get_untracked())
+        }))
+}
+
+fn small_action(label: &'static str, on_press: impl Fn() + 'static) -> ButtonElement {
+    button()
+        .on_press(on_press)
+        .min_h(px(28.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .active(|style| style.opacity(0.7))
+        .child(
+            text(label)
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted),
         )
 }
 

@@ -25,20 +25,20 @@ use vibex_backend::{
     GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind, ApprovalResponder,
-    CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
-    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind, AgentSessionState,
+    ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
     ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
-    GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
-    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, MessageAttachment,
-    MessageProvenance, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
-    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
+    GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
+    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
+    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
-use vibex_desktop_model::TimelineModel;
+use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
@@ -155,6 +155,10 @@ pub struct SessionService {
     drafts: Rc<RefCell<BTreeMap<String, String>>>,
     /// The serialized drafts last written, so an unchanged map is not rewritten.
     drafts_snapshot: Rc<RefCell<String>>,
+    /// The state the runtime last reported for each session, for turn folds.
+    session_states: Rc<RefCell<BTreeMap<String, AgentSessionState>>>,
+    /// The turns whose working rows the reader opened.
+    expanded_turns: Rc<RefCell<std::collections::BTreeSet<String>>>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -258,6 +262,8 @@ impl SessionService {
             retry_now: Rc::new(Cell::new(false)),
             drafts: Rc::new(RefCell::new(load_drafts())),
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
+            session_states: Rc::new(RefCell::new(BTreeMap::new())),
+            expanded_turns: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -424,6 +430,14 @@ impl SessionService {
             },
             on_disconnect: self.on_disconnect.clone(),
             on_open_settings: self.on_open_settings.clone(),
+            on_toggle_turn: {
+                let service = self.clone();
+                Rc::new(move |turn_id: &str| service.toggle_turn(turn_id))
+            },
+            on_fork: {
+                let service = self.clone();
+                Rc::new(move |sequence: i64| service.fork_at(sequence))
+            },
             on_permission: {
                 let service = self.clone();
                 Rc::new(move |request_id: &str, choice: PermissionChoice| {
@@ -707,6 +721,10 @@ impl SessionService {
                     sessions.iter().any(|session| session.id.as_str() == active)
                 });
                 self.sessions.set(rows);
+                *self.session_states.borrow_mut() = sessions
+                    .iter()
+                    .map(|session| (session.id.as_str().to_owned(), session.state))
+                    .collect();
                 if !active_exists {
                     if let Some(first) = sessions.first() {
                         self.open(first.id.as_str());
@@ -894,6 +912,9 @@ impl SessionService {
             }
             BackendEvent::SessionUpdated(session) => {
                 self.note_online();
+                self.session_states
+                    .borrow_mut()
+                    .insert(session.id.as_str().to_owned(), session.state);
                 let row = summary(&session);
                 self.sessions.update(|sessions| {
                     if let Some(existing) =
@@ -913,6 +934,9 @@ impl SessionService {
                     .collect::<Vec<_>>();
                 self.sessions
                     .update(|sessions| sessions.retain(|session| !ids.contains(&session.id)));
+                self.session_states
+                    .borrow_mut()
+                    .retain(|id, _| !ids.contains(id));
                 self.drafts.borrow_mut().retain(|id, _| !ids.contains(id));
                 self.persist_drafts();
                 let active = self.active.get_untracked();
@@ -1107,22 +1131,111 @@ impl SessionService {
 
     /// Re-projects the kept model into the shell's rows.
     fn publish(&self) {
-        let rows = self
-            .model
-            .borrow()
-            .rows()
-            .into_iter()
-            .map(|row| TimelineEntry {
-                id: row.id,
-                kind: entry_kind(row.kind),
-                title: row.title,
-                body: row.body,
-                meta: String::new(),
-                streaming: row.streaming,
-            })
-            .collect::<Vec<_>>();
-        self.timeline.set(rows);
+        let active = self.active.get_untracked();
+        let state = active
+            .as_ref()
+            .and_then(|active| self.session_states.borrow().get(active).copied());
+        let model = self.model.borrow();
+        let turns = model.conversation_turns(state, state == Some(AgentSessionState::Running));
+        let mut entries = Vec::new();
+        for turn in &turns {
+            if let Some(row) = turn.user_row.as_ref() {
+                entries.push(self.entry_from_row(row, turn, &model.items));
+            }
+            if !turn.process_rows.is_empty() {
+                let expanded = self.expanded_turns.borrow().contains(&turn.id)
+                    || (turn.conclusion_row.is_none() && (!turn.complete || turn.superseded));
+                entries.push(process_header(turn, expanded));
+                if expanded {
+                    for row in &turn.process_rows {
+                        entries.push(self.entry_from_row(row, turn, &model.items));
+                    }
+                }
+            }
+            if let Some(row) = turn.conclusion_row.as_ref() {
+                entries.push(self.entry_from_row(row, turn, &model.items));
+            } else if !turn.complete || turn.superseded {
+                entries.push(live_turn_entry(turn));
+            }
+        }
+        drop(model);
+        self.timeline.set(entries);
         self.refresh_pending();
+    }
+
+    fn entry_from_row(
+        &self,
+        row: &TimelineRow,
+        turn: &TimelineConversationTurn,
+        items: &[vibex_core::TimelineItem],
+    ) -> TimelineEntry {
+        TimelineEntry {
+            id: row.id.clone(),
+            kind: entry_kind(row.kind),
+            title: row.title.clone(),
+            body: row.body.clone(),
+            meta: String::new(),
+            streaming: row.streaming,
+            turn_id: turn.id.clone(),
+            process_count: turn.process_rows.len(),
+            expanded: false,
+            attachments: row_attachments(row, items),
+            last_sequence: row.last_sequence,
+            started_at_ms: turn.started_at_ms,
+            ended_at_ms: turn.ended_at_ms.unwrap_or(0),
+            complete: turn.complete,
+        }
+    }
+
+    fn toggle_turn(&self, turn_id: &str) {
+        let mut expanded = self.expanded_turns.borrow_mut();
+        if !expanded.remove(turn_id) {
+            expanded.insert(turn_id.to_owned());
+        }
+        drop(expanded);
+        self.publish();
+    }
+
+    /// Forks the conversation through `through_sequence`, then opens the new
+    /// session.
+    fn fork_at(&self, through_sequence: i64) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(source_session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let expected = self.model.borrow().authoritative_end_sequence;
+        let through_sequence = if through_sequence <= 0 {
+            ForkAgentSessionRequest::AT_TIP
+        } else {
+            through_sequence
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .fork_session(MutationRequest::new(ForkAgentSessionRequest {
+                        source_session_id,
+                        through_sequence,
+                        expected_source_end_sequence: expected,
+                    }))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(session)) => {
+                    service.refresh();
+                    service.open(session.id.as_str());
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_fork_task_failed",
+                    format!("forking the session did not finish: {error}"),
+                )),
+            }
+        });
     }
 
     /// Re-reads the pending permission from the projection.
@@ -3047,6 +3160,90 @@ fn load_drafts() -> BTreeMap<String, String> {
     Storage::get_item(DRAFTS_KEY)
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+/// The attachments a user row carried, from the items behind it.
+fn row_attachments(row: &TimelineRow, items: &[vibex_core::TimelineItem]) -> Vec<AttachmentItem> {
+    for id in &row.item_ids {
+        let Some(item) = items.iter().find(|item| item.id.as_str() == id) else {
+            continue;
+        };
+        let TimelinePayload::UserMessage(message) = &item.payload else {
+            continue;
+        };
+        return message
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| AttachmentItem {
+                id: format!("{}:{index}", row.id),
+                label: attachment.display_label().to_owned(),
+                mime_type: attachment.mime_type.clone().unwrap_or_default(),
+                uri: attachment.uri.clone().unwrap_or_default(),
+            })
+            .collect();
+    }
+    Vec::new()
+}
+
+fn process_header(turn: &TimelineConversationTurn, expanded: bool) -> TimelineEntry {
+    let label = if turn.complete {
+        copy::text("Worked for", "工作了", "工作了")
+    } else {
+        copy::text("Working for", "工作了", "工作了")
+    };
+    TimelineEntry {
+        id: format!("turn-header:{}", turn.id),
+        kind: EntryKind::ProcessHeader,
+        title: format!(
+            "{label} {}",
+            compact_duration(turn.started_at_ms, turn.ended_at_ms)
+        ),
+        body: String::new(),
+        meta: String::new(),
+        streaming: !turn.complete,
+        turn_id: turn.id.clone(),
+        process_count: turn.process_rows.len(),
+        expanded,
+        attachments: Vec::new(),
+        last_sequence: 0,
+        started_at_ms: turn.started_at_ms,
+        ended_at_ms: turn.ended_at_ms.unwrap_or(0),
+        complete: turn.complete,
+    }
+}
+
+fn live_turn_entry(turn: &TimelineConversationTurn) -> TimelineEntry {
+    TimelineEntry {
+        id: format!("turn-live:{}", turn.id),
+        kind: EntryKind::Agent,
+        title: copy::text("Agent", "Agent", "Agent").to_owned(),
+        body: turn
+            .live_status
+            .clone()
+            .filter(|status| !status.trim().is_empty())
+            .unwrap_or_else(|| copy::text("Thinking...", "思考中…", "思考中…").to_owned()),
+        meta: String::new(),
+        streaming: true,
+        turn_id: turn.id.clone(),
+        process_count: turn.process_rows.len(),
+        expanded: false,
+        attachments: Vec::new(),
+        last_sequence: turn.process_rows.last().map_or(0, |row| row.last_sequence),
+        started_at_ms: turn.started_at_ms,
+        ended_at_ms: turn.ended_at_ms.unwrap_or(0),
+        complete: false,
+    }
+}
+
+fn compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> String {
+    let end = ended_at_ms.unwrap_or_else(unix_timestamp_ms);
+    let seconds = ((end - started_at_ms).max(0) / 1_000) as u64;
+    match seconds {
+        0..=59 => format!("{seconds}s"),
+        60..=3_599 => format!("{}m {}s", seconds / 60, seconds % 60),
+        _ => format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60),
+    }
 }
 
 fn entry_kind(kind: vibex_desktop_model::TimelineRowKind) -> EntryKind {
