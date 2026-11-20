@@ -514,6 +514,9 @@ pub struct SessionHost {
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
     /// Opens a row's full detail, by row id and sequence.
     pub on_toggle_detail: ToggleDetail,
+    /// Whether the conversation find bar is open.
+    pub find_open: Signal<bool>,
+    pub on_toggle_find: Action,
     /// Whether the last turn needs an explicit continue, and the action for it.
     pub needs_continue: Signal<bool>,
     pub on_continue_turn: Action,
@@ -896,6 +899,7 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
     let active = host.active;
     let refresh = host.on_refresh.clone();
     let on_open_history = host.on_open_history.clone();
+    let on_toggle_find = host.on_toggle_find.clone();
     view()
         .w_full()
         .pt_safe_area()
@@ -939,6 +943,14 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::foreground),
                 )
+                .child({
+                    let on_toggle_find = on_toggle_find.clone();
+                    action::icon_button(
+                        icon(include_str!("../../assets/icons/search.svg")),
+                        copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
+                        move || on_toggle_find(),
+                    )
+                })
                 .child(action::icon_button(
                     icon(include_str!("../../assets/icons/refresh.svg")),
                     copy::text("Refresh", "刷新", "重新整理"),
@@ -1022,6 +1034,27 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let editable_sequence = host.editable_sequence;
     let on_edit_message = host.on_edit_message.clone();
     let on_open_attachment = host.on_open_attachment.clone();
+    let find_open = host.find_open;
+    let find_query = signal(String::new());
+    let find_cursor = signal(0usize);
+    let find_target = signal(0usize);
+    let find_matches = computed(move || {
+        let query = find_query.with(|query| query.trim().to_lowercase());
+        if query.is_empty() {
+            return Vec::new();
+        }
+        timeline.with(|entries| {
+            entries
+                .iter()
+                .enumerate()
+                .filter(|(_, entry)| {
+                    entry.title.to_lowercase().contains(&query)
+                        || entry.body.to_lowercase().contains(&query)
+                })
+                .map(|(index, _)| index)
+                .collect::<Vec<_>>()
+        })
+    });
     let has_older = host.has_older;
     let loading_older = host.loading_older;
     let on_load_older = host.on_load_older.clone();
@@ -1094,45 +1127,149 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                                 )
                         }
                     }))
-                    .child(
-                        virtual_list(move || timeline.with(|entries| entries.len()), {
-                            let on_toggle_turn = on_toggle_turn.clone();
-                            let on_toggle_detail = on_toggle_detail.clone();
-                            let on_fork = on_fork.clone();
-                            let editable_sequence = editable_sequence;
-                            let on_edit_message = on_edit_message.clone();
-                            let on_open_attachment = on_open_attachment.clone();
-                            move |at: Position| {
-                                entry_row(
-                                    at,
-                                    timeline,
-                                    on_toggle_turn.clone(),
-                                    on_toggle_detail.clone(),
-                                    on_fork.clone(),
-                                    editable_sequence,
-                                    on_edit_message.clone(),
-                                    on_open_attachment.clone(),
-                                )
+                    .child(when(move || find_open.get(), {
+                        let close = find_open;
+                        move || find_bar(find_query, find_matches, find_cursor, find_target, close)
+                    }))
+                    .child(dynamic({
+                        let on_toggle_turn = on_toggle_turn.clone();
+                        let on_toggle_detail = on_toggle_detail.clone();
+                        let on_fork = on_fork.clone();
+                        let on_edit_message = on_edit_message.clone();
+                        let on_open_attachment = on_open_attachment.clone();
+                        move || {
+                            let target = find_target.get();
+                            let list =
+                                virtual_list(move || timeline.with(|entries| entries.len()), {
+                                    let on_toggle_turn = on_toggle_turn.clone();
+                                    let on_toggle_detail = on_toggle_detail.clone();
+                                    let on_fork = on_fork.clone();
+                                    let editable_sequence = editable_sequence;
+                                    let on_edit_message = on_edit_message.clone();
+                                    let on_open_attachment = on_open_attachment.clone();
+                                    move |at: Position| {
+                                        entry_row(
+                                            at,
+                                            timeline,
+                                            on_toggle_turn.clone(),
+                                            on_toggle_detail.clone(),
+                                            on_fork.clone(),
+                                            editable_sequence,
+                                            on_edit_message.clone(),
+                                            on_open_attachment.clone(),
+                                        )
+                                    }
+                                })
+                                .keys(move || {
+                                    timeline.with(|entries| {
+                                        entries
+                                            .iter()
+                                            .map(|entry| entry.id.clone())
+                                            .collect::<Vec<_>>()
+                                    })
+                                })
+                                .estimated_item_size(px(72.0));
+                            if target > 0 {
+                                list.initial_scroll_index(target.saturating_sub(1)).flex_1()
+                            } else {
+                                // A chat opens at its newest message and stays
+                                // there while a reply streams in, unless the
+                                // reader scrolled up.
+                                list.alignment(ListAlignment::Bottom)
+                                    .follow_end(px(120.0))
+                                    .flex_1()
                             }
-                        })
-                        .keys(move || {
-                            timeline.with(|entries| {
-                                entries
-                                    .iter()
-                                    .map(|entry| entry.id.clone())
-                                    .collect::<Vec<_>>()
-                            })
-                        })
-                        .estimated_item_size(px(72.0))
-                        // A chat opens at its newest message and stays there
-                        // while a reply streams in, unless the reader scrolled
-                        // up.
-                        .alignment(ListAlignment::Bottom)
-                        .follow_end(px(120.0))
-                        .flex_1(),
-                    )
+                        }
+                    }))
             },
         ))
+}
+
+fn find_bar(
+    query: Signal<String>,
+    matches: Memo<Vec<usize>>,
+    cursor: Signal<usize>,
+    target: Signal<usize>,
+    close: Signal<bool>,
+) -> impl IntoElement {
+    let count = computed(move || {
+        let total = matches.with(|matches| matches.len());
+        if total == 0 {
+            "0/0".to_owned()
+        } else {
+            format!(
+                "{}/{}",
+                cursor.with(|cursor| (*cursor).min(total - 1)) + 1,
+                total
+            )
+        }
+    });
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_XS))
+        .border_b_1()
+        .border_b_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            field::text_field_with(
+                query,
+                copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
+                move |_| {
+                    cursor.set(0);
+                    target.set(0);
+                },
+            )
+            .flex_1(),
+        )
+        .child(
+            text(move || count.get())
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted),
+        )
+        .child(find_step("‹", -1, matches, cursor, target))
+        .child(find_step("›", 1, matches, cursor, target))
+        .child(small_action(
+            copy::text("Close", "关闭", "關閉"),
+            move || {
+                close.set(false);
+            },
+        ))
+}
+
+fn find_step(
+    glyph: &'static str,
+    direction: isize,
+    matches: Memo<Vec<usize>>,
+    cursor: Signal<usize>,
+    target: Signal<usize>,
+) -> impl IntoElement {
+    button()
+        .on_press(move || {
+            let total = matches.with(|matches| matches.len());
+            if total == 0 {
+                return;
+            }
+            let next = if direction < 0 {
+                (cursor.get_untracked() + total - 1) % total
+            } else {
+                (cursor.get_untracked() + 1) % total
+            };
+            cursor.set(next);
+            target.set(matches.with(|matches| matches[next]) + 1);
+        })
+        .min_h(px(theme::TOUCH_TARGET))
+        .min_w(px(theme::TOUCH_TARGET))
+        .items_center()
+        .justify_center()
+        .child(
+            text(glyph)
+                .text_size(px(theme::font_heading()))
+                .text_color(theme::text_secondary),
+        )
 }
 
 fn empty_hint(message: &'static str) -> impl IntoElement {

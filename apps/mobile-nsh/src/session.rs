@@ -271,6 +271,7 @@ pub struct SessionService {
     show_token_usage: Signal<bool>,
     show_plan_goal: Signal<bool>,
     show_generation_status: Signal<bool>,
+    find_open: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
@@ -425,6 +426,7 @@ impl SessionService {
             show_token_usage: signal(crate::settings::show_token_usage()),
             show_plan_goal: signal(crate::settings::show_plan_goal()),
             show_generation_status: signal(crate::settings::show_generation_status()),
+            find_open: signal(false),
             plan: signal(None),
             goal: signal(None),
             history: signal(Vec::new()),
@@ -710,6 +712,11 @@ impl SessionService {
             show_token_usage: self.show_token_usage,
             show_plan_goal: self.show_plan_goal,
             show_generation_status: self.show_generation_status,
+            find_open: self.find_open,
+            on_toggle_find: {
+                let service = self.clone();
+                Rc::new(move || service.find_open.update(|open| *open = !*open))
+            },
             plan: self.plan,
             goal: self.goal,
             history: self.history,

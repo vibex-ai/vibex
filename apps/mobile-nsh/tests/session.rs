@@ -371,6 +371,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let show_token_usage = signal(true);
     let show_plan_goal = signal(true);
     let show_generation_status = signal(true);
+    let find_open = signal(false);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -732,6 +733,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         show_token_usage,
         show_plan_goal,
         show_generation_status,
+        find_open,
+        on_toggle_find: Rc::new(move || find_open.update(|open| *open = !*open)),
         plan,
         goal,
         history,
@@ -1041,6 +1044,18 @@ fn the_drawer_selects_sessions_for_a_batch() {
     app.wait_for("1 selected").unwrap();
     app.press("Done").unwrap();
     app.wait_for_gone("Archive", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn the_conversation_can_be_searched() {
+    let mut app = start();
+    app.press("role:button[Find in conversation]").unwrap();
+    app.type_text("text:Find in conversation", "green").unwrap();
+    app.wait_for("1/1").unwrap();
+    app.press("›").unwrap();
+    app.press("Close").unwrap();
+    app.wait_for_gone("1/1", std::time::Duration::from_secs(5))
         .unwrap();
 }
 
