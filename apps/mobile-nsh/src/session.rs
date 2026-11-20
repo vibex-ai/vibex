@@ -4048,35 +4048,21 @@ impl SessionService {
         if name.is_empty() {
             return;
         }
-        let revision = self.sidebar_snapshot.borrow().revision;
+        let parent = self.folder_parent.get_untracked();
         let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
-        spawn(async move {
-            let mutation = RemoteSidebarOrganizationMutation::CreateFolder {
+        self.sidebar_mutation_attempt(
+            RemoteSidebarOrganizationMutation::CreateFolder {
                 name,
                 project_id: None,
                 workspace_id: None,
-                parent_folder_id: service.folder_parent.get_untracked(),
-            };
-            let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
-                    .await
-            })
-            .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.folder_name.set(String::new());
-                    service.folder_open.set(false);
-                    service.apply_sidebar(snapshot);
-                }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_folder_task_failed",
-                    format!("creating the folder did not finish: {error}"),
-                )),
-            }
-        });
+                parent_folder_id: parent,
+            },
+            1,
+            Some(Rc::new(move || {
+                service.folder_name.set(String::new());
+                service.folder_open.set(false);
+            })),
+        );
     }
 
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
@@ -4309,10 +4295,15 @@ impl SessionService {
     }
 
     fn sidebar_mutation(&self, mutation: RemoteSidebarOrganizationMutation) {
-        self.sidebar_mutation_attempt(mutation, 1);
+        self.sidebar_mutation_attempt(mutation, 1, None);
     }
 
-    fn sidebar_mutation_attempt(&self, mutation: RemoteSidebarOrganizationMutation, retries: u8) {
+    fn sidebar_mutation_attempt(
+        &self,
+        mutation: RemoteSidebarOrganizationMutation,
+        retries: u8,
+        done: Option<Rc<dyn Fn()>>,
+    ) {
         let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
         let sidebar = self.sidebar_backend.clone();
@@ -4326,7 +4317,12 @@ impl SessionService {
             })
             .await;
             match result {
-                Ok(Ok(snapshot)) => service.apply_sidebar(snapshot),
+                Ok(Ok(snapshot)) => {
+                    service.apply_sidebar(snapshot);
+                    if let Some(done) = done.as_ref() {
+                        done();
+                    }
+                }
                 Ok(Err(error))
                     if retries > 0
                         && (error.kind == BackendErrorKind::Conflict
@@ -4337,7 +4333,7 @@ impl SessionService {
                     match refresh {
                         Ok(Ok(snapshot)) => {
                             service.apply_sidebar(snapshot);
-                            service.sidebar_mutation_attempt(mutation, retries - 1);
+                            service.sidebar_mutation_attempt(mutation, retries - 1, done.clone());
                         }
                         _ => service.fail(&error),
                     }
