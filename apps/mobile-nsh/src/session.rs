@@ -25,18 +25,22 @@ use vibex_backend::{
     GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind, AgentSessionState,
-    ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind,
+    AgentSessionRuntimeSelectionState, AgentSessionState, ApprovalResponder,
+    CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
     ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
     ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
     GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
     MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
     PermissionResolution, PermissionResponseKind, RenameAgentSessionRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeOptionAvailability,
-    SendAgentMessageRequest, SessionRuntimeOption, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
+    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -49,7 +53,8 @@ use vibex_nsh_ui::{
     screens::session::{
         AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
         PermissionChoice, PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind,
-        QuestionOption, QuestionResponse, SessionHost, SessionState, SessionSummary, TimelineEntry,
+        QuestionOption, QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
+        RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry,
     },
     screens::terminal::TerminalChoice,
 };
@@ -162,6 +167,16 @@ pub struct SessionService {
     session_states: Rc<RefCell<BTreeMap<String, AgentSessionState>>>,
     /// The turns whose working rows the reader opened.
     expanded_turns: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    /// The open session's runtime selection and the runtime's catalogue.
+    runtime_state: Rc<RefCell<Option<AgentSessionRuntimeSelectionState>>>,
+    runtime_catalog: Signal<Option<SessionRuntimeOptionCatalog>>,
+    runtime_summary: Signal<Option<RuntimeSummaryView>>,
+    runtime_option_views: Signal<Vec<RuntimeOptionView>>,
+    runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
+    runtime_modes: Signal<Vec<RuntimeChoiceView>>,
+    runtime_features: Signal<Vec<RuntimeFeatureView>>,
+    runtime_open: Signal<bool>,
+    runtime_busy: Signal<bool>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -269,6 +284,15 @@ impl SessionService {
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
             session_states: Rc::new(RefCell::new(BTreeMap::new())),
             expanded_turns: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            runtime_state: Rc::new(RefCell::new(None)),
+            runtime_catalog: signal(None),
+            runtime_summary: signal(None),
+            runtime_option_views: signal(Vec::new()),
+            runtime_reasoning: signal(Vec::new()),
+            runtime_modes: signal(Vec::new()),
+            runtime_features: signal(Vec::new()),
+            runtime_open: signal(false),
+            runtime_busy: signal(false),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -437,6 +461,37 @@ impl SessionService {
             },
             on_disconnect: self.on_disconnect.clone(),
             on_open_settings: self.on_open_settings.clone(),
+            runtime_summary: self.runtime_summary,
+            runtime_options: self.runtime_option_views,
+            runtime_reasoning: self.runtime_reasoning,
+            runtime_modes: self.runtime_modes,
+            runtime_features: self.runtime_features,
+            runtime_open: self.runtime_open,
+            runtime_busy: self.runtime_busy,
+            on_open_runtime: {
+                let service = self.clone();
+                Rc::new(move || service.open_runtime())
+            },
+            on_close_runtime: {
+                let service = self.clone();
+                Rc::new(move || service.runtime_open.set(false))
+            },
+            on_choose_runtime: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.choose_runtime(id))
+            },
+            on_choose_reasoning: {
+                let service = self.clone();
+                Rc::new(move |value: &str| service.choose_reasoning(value))
+            },
+            on_choose_mode: {
+                let service = self.clone();
+                Rc::new(move |value: &str| service.choose_mode(value))
+            },
+            on_choose_feature: {
+                let service = self.clone();
+                Rc::new(move |id: &str, value: &str| service.choose_feature(id, value))
+            },
             on_toggle_turn: {
                 let service = self.clone();
                 Rc::new(move |turn_id: &str| service.toggle_turn(turn_id))
@@ -1057,6 +1112,16 @@ impl SessionService {
         self.mentions.set(Vec::new());
         self.mentions_loaded.set(false);
         self.error.set(None);
+        self.runtime_state.replace(None);
+        self.runtime_catalog.set(None);
+        self.runtime_summary.set(None);
+        self.runtime_option_views.set(Vec::new());
+        self.runtime_reasoning.set(Vec::new());
+        self.runtime_modes.set(Vec::new());
+        self.runtime_features.set(Vec::new());
+        self.runtime_open.set(false);
+        self.runtime_busy.set(false);
+        self.refresh_runtime(&session_id);
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -1067,6 +1132,317 @@ impl SessionService {
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
                     format!("opening the session did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Opens the runtime sheet, loading its choices when they are not held.
+    fn open_runtime(&self) {
+        self.runtime_open.set(true);
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        if self
+            .runtime_catalog
+            .with_untracked(|catalog| catalog.is_none())
+        {
+            self.refresh_runtime(&session_id);
+        }
+    }
+
+    /// Reads the open session's selection and the runtime's catalogue.
+    fn refresh_runtime(&self, session_id: &VibexSessionId) {
+        let session_id = session_id.clone();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let requested = session_id.clone();
+            let result = background(async move {
+                let state = backend.runtime_selection(requested.clone()).await?;
+                let catalog = backend.list_runtime_options().await?;
+                Ok::<_, BackendError>((state, catalog))
+            })
+            .await;
+            if let Ok(Ok((state, catalog))) = result {
+                service.apply_runtime(&session_id, state, catalog);
+            }
+        });
+    }
+
+    fn apply_runtime(
+        &self,
+        session_id: &VibexSessionId,
+        state: AgentSessionRuntimeSelectionState,
+        catalog: SessionRuntimeOptionCatalog,
+    ) {
+        if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        self.runtime_state.replace(Some(state.clone()));
+        self.runtime_catalog.set(Some(catalog.clone()));
+        self.rebuild_runtime_views(&state.desired, &catalog);
+    }
+
+    fn rebuild_runtime_views(
+        &self,
+        selection: &SessionRuntimeSelection,
+        catalog: &SessionRuntimeOptionCatalog,
+    ) {
+        let option = catalog
+            .options
+            .iter()
+            .find(|option| &option.selection == selection);
+        let model = match &selection.model {
+            RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
+            _ => copy::text("Default", "默认", "預設").to_owned(),
+        };
+        let reasoning_label = option
+            .and_then(|option| {
+                selection.reasoning_effort.as_ref().and_then(|value| {
+                    option
+                        .reasoning_efforts
+                        .iter()
+                        .find(|candidate| &candidate.value == value)
+                        .map(|candidate| {
+                            candidate
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| candidate.value.clone())
+                        })
+                })
+            })
+            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
+        let mode_label = option
+            .and_then(|option| {
+                selection.mode_id.as_ref().and_then(|value| {
+                    option
+                        .modes
+                        .iter()
+                        .find(|candidate| &candidate.value == value)
+                        .map(|candidate| {
+                            candidate
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| candidate.value.clone())
+                        })
+                })
+            })
+            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
+        self.runtime_summary.set(Some(RuntimeSummaryView {
+            agent: option
+                .map(|option| option.agent_label.clone())
+                .unwrap_or_else(|| selection.agent_id.as_str().to_owned()),
+            model: option
+                .map(|option| option.model_label.clone())
+                .unwrap_or(model),
+            reasoning: reasoning_label,
+            mode: mode_label,
+            options_set: !selection.config_values.is_empty(),
+            available: option
+                .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available),
+        }));
+        self.runtime_option_views.set(
+            catalog
+                .options
+                .iter()
+                .enumerate()
+                .map(|(index, option)| RuntimeOptionView {
+                    id: index.to_string(),
+                    agent: option.agent_label.clone(),
+                    model: option.model_label.clone(),
+                    detail: option.auth_source_label.clone(),
+                    selected: &option.selection == selection,
+                    available: option.availability == RuntimeOptionAvailability::Available,
+                })
+                .collect(),
+        );
+        let reasoning = option
+            .filter(|option| !option.reasoning_efforts.is_empty())
+            .map(|option| {
+                let mut choices = vec![RuntimeChoiceView {
+                    value: "default".to_owned(),
+                    label: copy::text("Default", "默认", "預設").to_owned(),
+                    selected: selection.reasoning_effort.is_none(),
+                }];
+                choices.extend(option.reasoning_efforts.iter().map(|candidate| {
+                    RuntimeChoiceView {
+                        value: candidate.value.clone(),
+                        label: candidate
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| candidate.value.clone()),
+                        selected: selection.reasoning_effort.as_deref()
+                            == Some(candidate.value.as_str()),
+                    }
+                }));
+                choices
+            })
+            .unwrap_or_default();
+        self.runtime_reasoning.set(reasoning);
+        let modes = option
+            .filter(|option| !option.modes.is_empty())
+            .map(|option| {
+                let mut choices = vec![RuntimeChoiceView {
+                    value: "default".to_owned(),
+                    label: copy::text("Default", "默认", "預設").to_owned(),
+                    selected: selection.mode_id.is_none(),
+                }];
+                choices.extend(option.modes.iter().map(|candidate| {
+                    RuntimeChoiceView {
+                        value: candidate.value.clone(),
+                        label: candidate
+                            .label
+                            .clone()
+                            .unwrap_or_else(|| candidate.value.clone()),
+                        selected: selection.mode_id.as_deref() == Some(candidate.value.as_str()),
+                    }
+                }));
+                choices
+            })
+            .unwrap_or_default();
+        self.runtime_modes.set(modes);
+        let features = option
+            .map(|option| {
+                option
+                    .features
+                    .iter()
+                    .map(|feature| {
+                        let current = selection
+                            .config_values
+                            .get(&feature.id)
+                            .cloned()
+                            .or_else(|| {
+                                feature
+                                    .current_value
+                                    .as_ref()
+                                    .map(|value| value.value.clone())
+                            })
+                            .or_else(|| {
+                                feature
+                                    .default_value
+                                    .as_ref()
+                                    .map(|value| value.value.clone())
+                            });
+                        RuntimeFeatureView {
+                            id: feature.id.clone(),
+                            label: feature.label.clone(),
+                            detail: feature.description.clone().unwrap_or_default(),
+                            toggle: feature.kind == SessionRuntimeFeatureKind::Toggle,
+                            selected: feature.kind == SessionRuntimeFeatureKind::Toggle
+                                && current.as_deref() == Some("true"),
+                            values: feature
+                                .values
+                                .iter()
+                                .map(|value| RuntimeChoiceView {
+                                    value: value.value.clone(),
+                                    label: value
+                                        .label
+                                        .clone()
+                                        .unwrap_or_else(|| value.value.clone()),
+                                    selected: current.as_deref() == Some(value.value.as_str()),
+                                })
+                                .collect(),
+                        }
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        self.runtime_features.set(features);
+    }
+
+    fn choose_runtime(&self, id: &str) {
+        let Ok(index) = id.parse::<usize>() else {
+            return;
+        };
+        let catalog = self.runtime_catalog.get_untracked();
+        let Some(option) = catalog.and_then(|catalog| catalog.options.get(index).cloned()) else {
+            return;
+        };
+        self.apply_selection(option.selection);
+    }
+
+    fn choose_reasoning(&self, value: &str) {
+        let Some(mut selection) = self.current_selection() else {
+            return;
+        };
+        selection.reasoning_effort = (value != "default").then(|| value.to_owned());
+        self.apply_selection(selection);
+    }
+
+    fn choose_mode(&self, value: &str) {
+        let Some(mut selection) = self.current_selection() else {
+            return;
+        };
+        selection.mode_id = (value != "default").then(|| value.to_owned());
+        self.apply_selection(selection);
+    }
+
+    fn choose_feature(&self, id: &str, value: &str) {
+        let Some(mut selection) = self.current_selection() else {
+            return;
+        };
+        selection
+            .config_values
+            .insert(id.to_owned(), value.to_owned());
+        self.apply_selection(selection);
+    }
+
+    fn current_selection(&self) -> Option<SessionRuntimeSelection> {
+        self.runtime_state
+            .borrow()
+            .as_ref()
+            .map(|state| state.desired.clone())
+    }
+
+    fn apply_selection(&self, desired: SessionRuntimeSelection) {
+        if self.runtime_busy.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let Some(state) = self.runtime_state.borrow().clone() else {
+            return;
+        };
+        self.runtime_busy.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .set_desired_runtime(MutationRequest::new(
+                        SetDesiredAgentSessionRuntimeRequest {
+                            session_id: session_id.clone(),
+                            idempotency_key: RequestId::new().into_string(),
+                            expected_revision: state.session_revision,
+                            expected_selection_revision: state.selection_revision,
+                            desired,
+                            interaction: RuntimeSelectionInteraction::Seamless,
+                        },
+                    ))
+                    .await
+            })
+            .await;
+            service.runtime_busy.set(false);
+            match result {
+                Ok(Ok(state)) => {
+                    service.runtime_state.replace(Some(state.clone()));
+                    if let Some(catalog) = service.runtime_catalog.get_untracked() {
+                        service.rebuild_runtime_views(&state.desired, &catalog);
+                    }
+                    service.refresh();
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("changing the runtime did not finish: {error}"),
                 )),
             }
         });

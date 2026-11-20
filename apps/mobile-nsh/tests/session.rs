@@ -17,8 +17,9 @@ use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, G
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
-    PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, SessionHost,
-    SessionState, SessionSummary, TimelineEntry,
+    PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, RuntimeChoiceView,
+    RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
+    TimelineEntry,
 };
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
@@ -156,6 +157,49 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell whose session has a runtime to change.
+#[component]
+fn RuntimeShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.runtime_summary = signal(Some(RuntimeSummaryView {
+        agent: "Claude".to_owned(),
+        model: "Claude 4".to_owned(),
+        reasoning: "High".to_owned(),
+        mode: "Default".to_owned(),
+        options_set: false,
+        available: true,
+    }));
+    host.runtime_options = signal(vec![
+        RuntimeOptionView {
+            id: "0".to_owned(),
+            agent: "Claude".to_owned(),
+            model: "Claude 4".to_owned(),
+            detail: "Pro".to_owned(),
+            selected: true,
+            available: true,
+        },
+        RuntimeOptionView {
+            id: "1".to_owned(),
+            agent: "Codex".to_owned(),
+            model: "GPT-5".to_owned(),
+            detail: "Team".to_owned(),
+            selected: false,
+            available: true,
+        },
+    ]);
+    host.runtime_reasoning = signal(vec![RuntimeChoiceView {
+        value: "default".to_owned(),
+        label: "Default".to_owned(),
+        selected: false,
+    }]);
+    let runtime_open = signal(false);
+    let close = runtime_open;
+    host.runtime_open = runtime_open;
+    host.on_open_runtime = Rc::new(move || runtime_open.set(true));
+    host.on_close_runtime = Rc::new(move || close.set(false));
+    session::session(host)
+}
+
 /// A transcript that knows it has older history.
 #[component]
 fn OlderShell() -> impl IntoElement {
@@ -197,6 +241,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let connection_error = signal(None::<SharedString>);
     let has_older = signal(false);
     let loading_older = signal(false);
+    let runtime_summary = signal(None);
+    let runtime_options = signal(Vec::new());
+    let runtime_reasoning = signal(Vec::new());
+    let runtime_modes = signal(Vec::new());
+    let runtime_features = signal(Vec::new());
+    let runtime_open = signal(false);
+    let runtime_busy = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -500,6 +551,19 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         connection_error,
         has_older,
         loading_older,
+        runtime_summary,
+        runtime_options,
+        runtime_reasoning,
+        runtime_modes,
+        runtime_features,
+        runtime_open,
+        runtime_busy,
+        on_open_runtime: Rc::new(|| {}),
+        on_close_runtime: Rc::new(|| {}),
+        on_choose_runtime: Rc::new(|_| {}),
+        on_choose_reasoning: Rc::new(|_| {}),
+        on_choose_mode: Rc::new(|_| {}),
+        on_choose_feature: Rc::new(|_, _| {}),
         on_retry: Rc::new(|| {}),
         runtime,
         pending,
@@ -639,6 +703,18 @@ fn a_dropped_connection_keeps_the_transcript_and_offers_retry() {
     app.wait_for("Desktop is unavailable").unwrap();
     assert!(app.screen().shows("Morning. The build is green."));
     assert!(app.screen().shows("Retry"));
+}
+
+#[test]
+fn the_composer_opens_the_runtime_choices() {
+    let mut config = EngineConfig::new(Root::of::<RuntimeShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Claude 4").unwrap();
+    app.press("Claude 4").unwrap();
+    app.wait_for("Agent and model").unwrap();
+    app.wait_for("Reasoning").unwrap();
+    app.wait_for("Codex · GPT-5").unwrap();
 }
 
 #[test]

@@ -119,6 +119,48 @@ pub struct TimelineEntry {
     pub complete: bool,
 }
 
+/// What the open session is running on, for the composer's chips.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeSummaryView {
+    pub agent: String,
+    pub model: String,
+    pub reasoning: String,
+    pub mode: String,
+    /// Whether the session has been moved off the Agent's own defaults.
+    pub options_set: bool,
+    pub available: bool,
+}
+
+/// One Agent + auth source + model the runtime can run.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeOptionView {
+    pub id: String,
+    pub agent: String,
+    pub model: String,
+    pub detail: String,
+    pub selected: bool,
+    pub available: bool,
+}
+
+/// One value of a reasoning, mode or session option row.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeChoiceView {
+    pub value: String,
+    pub label: String,
+    pub selected: bool,
+}
+
+/// One of the Agent's own session options.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RuntimeFeatureView {
+    pub id: String,
+    pub label: String,
+    pub detail: String,
+    pub toggle: bool,
+    pub selected: bool,
+    pub values: Vec<RuntimeChoiceView>,
+}
+
 /// The answer a permission card offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionChoice {
@@ -247,6 +289,8 @@ use crate::screens::new_session::{
 
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
+/// Chooses a value for one of the Agent's session options.
+type ChooseFeature = Rc<dyn Fn(&str, &str)>;
 
 /// One entry of the composer's `/` palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -318,6 +362,20 @@ pub struct SessionHost {
     pub on_new_session: Action,
     /// Opens the settings sheet over the shell.
     pub on_open_settings: Action,
+    /// The runtime the open session runs on, and the choices the runtime offers.
+    pub runtime_summary: Signal<Option<RuntimeSummaryView>>,
+    pub runtime_options: Signal<Vec<RuntimeOptionView>>,
+    pub runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
+    pub runtime_modes: Signal<Vec<RuntimeChoiceView>>,
+    pub runtime_features: Signal<Vec<RuntimeFeatureView>>,
+    pub runtime_open: Signal<bool>,
+    pub runtime_busy: Signal<bool>,
+    pub on_open_runtime: Action,
+    pub on_close_runtime: Action,
+    pub on_choose_runtime: Rc<dyn Fn(&str)>,
+    pub on_choose_reasoning: Rc<dyn Fn(&str)>,
+    pub on_choose_mode: Rc<dyn Fn(&str)>,
+    pub on_choose_feature: ChooseFeature,
     /// Opens or closes one turn's working rows.
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
     /// Reads the page above the transcript.
@@ -589,6 +647,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             move || question_card(question, resolving, on_question.clone())
         }))
         .child(composer(host.clone()))
+        .child(runtime_sheet(host.clone()))
         .child(drawer(host.clone(), drawer_open))
         .child(session_actions_sheet(
             host.session_actions,
@@ -1721,6 +1780,11 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let active = host.active;
     let attachments = host.attachments;
     let on_remove_attachment = host.on_remove_attachment.clone();
+    let runtime_summary = host.runtime_summary;
+    let runtime_reasoning = host.runtime_reasoning;
+    let runtime_modes = host.runtime_modes;
+    let runtime_features = host.runtime_features;
+    let on_open_runtime = host.on_open_runtime.clone();
     let running = computed(move || {
         let Some(active) = active.get() else {
             return false;
@@ -1764,6 +1828,18 @@ fn composer(host: SessionHost) -> impl IntoElement {
             move || !attachments.with(|attachments| attachments.is_empty()),
             move || attachment_chips(attachments, on_remove_attachment.clone()),
         ))
+        .child(when(move || runtime_summary.get().is_some(), {
+            let on_open_runtime = on_open_runtime.clone();
+            move || {
+                runtime_chip_row(
+                    runtime_summary,
+                    runtime_reasoning,
+                    runtime_modes,
+                    runtime_features,
+                    on_open_runtime.clone(),
+                )
+            }
+        }))
         .child(
             view()
                 .w_full()
@@ -1839,6 +1915,396 @@ fn composer(host: SessionHost) -> impl IntoElement {
         .child(when(
             move || keyboard_height().0 == 0.0,
             || view().h(safe_area().bottom),
+        ))
+}
+
+/// The composer's runtime chips: the model, and the Agent's own options.
+fn runtime_chip_row(
+    summary: Signal<Option<RuntimeSummaryView>>,
+    reasoning: Signal<Vec<RuntimeChoiceView>>,
+    modes: Signal<Vec<RuntimeChoiceView>>,
+    features: Signal<Vec<RuntimeFeatureView>>,
+    on_open: Action,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .child({
+            let on_open = on_open.clone();
+            button()
+                .on_press(move || on_open())
+                .flex_1()
+                .min_w(px(0.0))
+                .min_h(px(28.0))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .rounded(px(theme::RADIUS_CONTROL))
+                .border_1()
+                .border_color(theme::border_subtle)
+                .bg(theme::background_dim)
+                .px(px(theme::SPACING_SM))
+                .active(|style| style.opacity(0.8))
+                .child(
+                    text(move || {
+                        summary.with(|summary| {
+                            summary
+                                .as_ref()
+                                .map(|summary| summary.model.clone())
+                                .unwrap_or_else(|| copy::text("Model", "模型", "模型").to_owned())
+                        })
+                    })
+                    .flex_1()
+                    .truncate()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_secondary),
+                )
+        })
+        .child(chip_button(
+            move || {
+                reasoning.with(|choices| {
+                    choices
+                        .iter()
+                        .find(|choice| choice.selected)
+                        .map(|choice| choice.label.clone())
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| copy::text("Reasoning", "推理", "推理").to_owned())
+                })
+            },
+            on_open.clone(),
+        ))
+        .child(chip_button(
+            move || {
+                modes.with(|choices| {
+                    choices
+                        .iter()
+                        .find(|choice| choice.selected)
+                        .map(|choice| choice.label.clone())
+                        .filter(|label| !label.is_empty())
+                        .unwrap_or_else(|| copy::text("Mode", "模式", "模式").to_owned())
+                })
+            },
+            on_open.clone(),
+        ))
+        .child(when(
+            move || features.with(|features| !features.is_empty()),
+            {
+                let on_open = on_open.clone();
+                move || {
+                    chip_button(
+                        move || copy::text("Options", "选项", "選項").to_owned(),
+                        on_open.clone(),
+                    )
+                }
+            },
+        ))
+}
+
+fn chip_button(label: impl Fn() -> String + 'static, on_press: Action) -> ButtonElement {
+    button()
+        .on_press(move || on_press())
+        .min_h(px(28.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_dim)
+        .active(|style| style.opacity(0.8))
+        .child(
+            text(label)
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_secondary),
+        )
+}
+
+/// The runtime sheet: the model list and the Agent's own option groups.
+fn runtime_sheet(host: SessionHost) -> impl IntoElement {
+    let open = host.runtime_open;
+    let on_close = host.on_close_runtime.clone();
+    let on_close_sheet = on_close.clone();
+    let summary = host.runtime_summary;
+    let options = host.runtime_options;
+    let reasoning = host.runtime_reasoning;
+    let modes = host.runtime_modes;
+    let features = host.runtime_features;
+    let busy = host.runtime_busy;
+    let on_choose_runtime = host.on_choose_runtime.clone();
+    let on_choose_reasoning = host.on_choose_reasoning.clone();
+    let on_choose_mode = host.on_choose_mode.clone();
+    let on_choose_feature = host.on_choose_feature.clone();
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close_sheet();
+            }
+        })
+        .child(
+            scroll().max_h(px(600.0)).child(
+                view()
+                    .w_full()
+                    .gap(px(theme::SPACING_MD))
+                    .p(px(theme::SPACING_MD))
+                    .pb_safe_area_plus(px(theme::SPACING_LG))
+                    .bg(theme::background_card)
+                    .rounded_t(px(16.0))
+                    .child(
+                        text(move || {
+                            summary.with(|summary| {
+                                summary
+                                    .as_ref()
+                                    .map(|summary| format!("{} · {}", summary.agent, summary.model))
+                                    .unwrap_or_else(|| {
+                                        copy::text("Runtime", "运行时", "執行環境").to_owned()
+                                    })
+                            })
+                        })
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                    )
+                    .child(section_label(copy::text(
+                        "Agent and model",
+                        "Agent 与模型",
+                        "Agent 與模型",
+                    )))
+                    .child(
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_XS))
+                            .child(each(
+                                move || options.get(),
+                                |option| option.id.clone(),
+                                move |option, _| {
+                                    let id = option.with(|option| option.id.clone());
+                                    let on_choose = on_choose_runtime.clone();
+                                    button()
+                                        .on_press(move || on_choose(&id))
+                                        .w_full()
+                                        .min_h(px(48.0))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .border_1()
+                                        .border_color(move || {
+                                            if option.with(|option| option.selected) {
+                                                theme::foreground()
+                                            } else {
+                                                theme::border_subtle()
+                                            }
+                                        })
+                                        .bg(move || {
+                                            if option.with(|option| option.selected) {
+                                                theme::background_dim()
+                                            } else {
+                                                theme::background_card()
+                                            }
+                                        })
+                                        .px(px(theme::SPACING_MD))
+                                        .py(px(theme::SPACING_XS))
+                                        .flex_col()
+                                        .items_start()
+                                        .disabled(move || {
+                                            busy.get() || !option.with(|option| option.available)
+                                        })
+                                        .disabled_style(|style| style.opacity(0.45))
+                                        .child(
+                                            text(move || {
+                                                option.with(|option| {
+                                                    format!("{} · {}", option.agent, option.model)
+                                                })
+                                            })
+                                            .truncate()
+                                            .text_size(px(theme::font_detail()))
+                                            .text_color(theme::foreground),
+                                        )
+                                        .child(
+                                            text(move || {
+                                                option.with(|option| option.detail.clone())
+                                            })
+                                            .truncate()
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_muted),
+                                        )
+                                },
+                            )),
+                    )
+                    .child(choice_section(
+                        copy::text("Reasoning", "推理", "推理"),
+                        reasoning,
+                        on_choose_reasoning,
+                    ))
+                    .child(choice_section(
+                        copy::text("Mode", "模式", "模式"),
+                        modes,
+                        on_choose_mode,
+                    ))
+                    .child(feature_section(features, on_choose_feature))
+                    .child({
+                        let on_close = on_close.clone();
+                        action::secondary(
+                            copy::text("Close", "关闭", "關閉"),
+                            icon(include_str!("../../assets/icons/x.svg")),
+                            false,
+                            move || on_close(),
+                        )
+                        .w_full()
+                    }),
+            ),
+        )
+}
+
+fn section_label(label: &'static str) -> impl IntoElement {
+    text(label)
+        .text_size(px(theme::font_micro()))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text_muted)
+}
+
+fn choice_section(
+    label: &'static str,
+    choices: Signal<Vec<RuntimeChoiceView>>,
+    on_choose: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(theme::SPACING_XS))
+        .child(when(move || !choices.with(|choices| choices.is_empty()), {
+            move || {
+                view()
+                    .w_full()
+                    .flex_col()
+                    .gap(px(theme::SPACING_XS))
+                    .child(section_label(label))
+            }
+        }))
+        .child(each(
+            move || choices.get(),
+            |choice| choice.value.clone(),
+            move |choice, _| {
+                let value = choice.with(|choice| choice.value.clone());
+                let on_choose = on_choose.clone();
+                button()
+                    .on_press(move || on_choose(&value))
+                    .w_full()
+                    .min_h(px(40.0))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .border_1()
+                    .border_color(move || {
+                        if choice.with(|choice| choice.selected) {
+                            theme::foreground()
+                        } else {
+                            theme::border_subtle()
+                        }
+                    })
+                    .px(px(theme::SPACING_MD))
+                    .items_center()
+                    .child(
+                        text(move || choice.with(|choice| choice.label.clone()))
+                            .text_size(px(theme::font_detail()))
+                            .text_color(theme::foreground),
+                    )
+            },
+        ))
+}
+
+fn feature_section(
+    features: Signal<Vec<RuntimeFeatureView>>,
+    on_choose: ChooseFeature,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(theme::SPACING_XS))
+        .child(when(
+            move || !features.with(|features| features.is_empty()),
+            || section_label(copy::text("Session options", "会话选项", "工作階段選項")),
+        ))
+        .child(each(
+            move || features.get(),
+            |feature| feature.id.clone(),
+            move |feature, _| {
+                let id = feature.with(|feature| feature.id.clone());
+                let toggle = feature.with(|feature| feature.toggle);
+                let on_choose = on_choose.clone();
+                if toggle {
+                    let next = if feature.with(|feature| feature.selected) {
+                        "false"
+                    } else {
+                        "true"
+                    };
+                    button()
+                        .on_press(move || on_choose(&id, next))
+                        .w_full()
+                        .min_h(px(40.0))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .border_1()
+                        .border_color(theme::border_subtle)
+                        .px(px(theme::SPACING_MD))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .child(
+                            text(move || feature.with(|feature| feature.label.clone()))
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(theme::font_detail()))
+                                .text_color(theme::foreground),
+                        )
+                        .child(
+                            text(move || {
+                                if feature.with(|feature| feature.selected) {
+                                    copy::text("On", "开", "開")
+                                } else {
+                                    copy::text("Off", "关", "關")
+                                }
+                            })
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted),
+                        )
+                        .into_element()
+                } else {
+                    let values = feature.with(|feature| feature.values.clone());
+                    view()
+                        .w_full()
+                        .flex_col()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            text(move || feature.with(|feature| feature.label.clone()))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
+                        )
+                        .children(values.into_iter().map({
+                            let on_choose = on_choose.clone();
+                            move |value| {
+                                let id = id.clone();
+                                let choice = value.value.clone();
+                                let on_choose = on_choose.clone();
+                                button()
+                                    .on_press(move || on_choose(&id, &choice))
+                                    .w_full()
+                                    .min_h(px(36.0))
+                                    .px(px(theme::SPACING_MD))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::background_dim)
+                                    .items_center()
+                                    .child(
+                                        text(value.label)
+                                            .text_size(px(theme::font_detail()))
+                                            .text_color(theme::text_secondary),
+                                    )
+                            }
+                        }))
+                        .into_element()
+                }
+            },
         ))
 }
 
