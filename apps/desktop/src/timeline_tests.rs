@@ -4805,7 +4805,7 @@ fn an_older_page_above_the_reader_keeps_their_place(cx: &mut TestAppContext) {
     // grow with the page, which is what made the rebuild too expensive to keep.
     let slack = px(workbench.read_with(cx, |workbench, _| workbench.timeline_list_padding_top_px));
     assert!(
-        (offset_after - px(offset_in_turn as f32)).abs() <= slack,
+        (offset_after - px(offset_in_turn)).abs() <= slack,
         "the reader's distance into their row moved: {offset_in_turn:?} -> {offset_after:?}"
     );
 }

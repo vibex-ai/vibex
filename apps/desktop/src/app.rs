@@ -6565,6 +6565,15 @@ pub struct SessionView {
     /// whether it may splice the ends — keeping the measured heights of the rows
     /// the reader is holding — or has to re-seed the whole table.
     timeline_list_synced_turn_ids: Vec<String>,
+    /// Whether a seed is owed once the width holds still.
+    ///
+    /// A pane animating its width must not seed on every frame of the animation,
+    /// but the seed cannot simply be skipped either: the list drops its hints on
+    /// each width change, and a list without hints reports a document only as tall
+    /// as the rows it has measured. This says the wipe still has to be answered
+    /// once the width settles, so the frame that follows an animation is not
+    /// mistaken for the frame after a splice.
+    timeline_list_seed_pending: bool,
     /// What the last transcript frame left the list at, and how far the wheel
     /// has asked it to move since.
     ///
@@ -6827,6 +6836,7 @@ impl SessionView {
             timeline_list_seen_width: px(0.0),
             timeline_list_hint_width: None,
             timeline_list_synced_turn_ids: Vec::new(),
+            timeline_list_seed_pending: false,
             timeline_trace: TimelineScrollTrace::default(),
             pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
@@ -33199,6 +33209,11 @@ impl VibexWorkbench {
         }
         let rows = self.timeline_row_sizes.len();
         let count = self.timeline_scroll.item_count();
+        let turn_ids: Vec<String> = self
+            .conversation_turns_cache
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect();
         let width = self.timeline_scroll.viewport_bounds().size.width;
         // `gpui::list` throws every item's height hint away when its width or
         // padding changes, and its first layout always finds one of them
@@ -33209,6 +33224,7 @@ impl VibexWorkbench {
         if width_changed {
             self.timeline_list_seen_width = width;
             self.timeline_list_hint_width = None;
+            self.timeline_list_seed_pending = true;
             // A pane animating its width — a session opening, a split sliding in —
             // moves it on every frame, and this is where that costs the reader
             // their place: a seed rebuilds the whole document from one hint and
@@ -33216,23 +33232,20 @@ impl VibexWorkbench {
             // is still kept in step, by splicing, which leaves every measured row
             // alone; the hints are seeded once the width holds still.
             if rows > count {
-                let prepended =
-                    count > 0 && self.timeline_leading_turn_id.as_deref() != leading.as_deref();
+                let previous = &self.timeline_list_synced_turn_ids;
+                let prepended = count > 0
+                    && previous.len() == count
+                    && turn_ids[rows - count..] == previous[..];
                 if prepended {
                     self.timeline_scroll.splice(0..0, rows - count);
                 } else {
                     self.timeline_scroll.splice(count..count, rows - count);
                 }
             }
-            self.timeline_leading_turn_id = leading;
+            self.timeline_list_synced_turn_ids = turn_ids;
             return;
         }
         let hints_missing = width > px(0.0) && self.timeline_list_hint_width != Some(width);
-        let turn_ids: Vec<String> = self
-            .conversation_turns_cache
-            .iter()
-            .map(|turn| turn.id.clone())
-            .collect();
         let ids_changed = turn_ids != self.timeline_list_synced_turn_ids;
         if rows == count && !hints_missing && !ids_changed {
             return;
@@ -33246,7 +33259,13 @@ impl VibexWorkbench {
         // they scroll into view — and record the width so the next frame does
         // not reset either. A genuine width wipe still goes through the reset
         // below, because there the list has already dropped every hint itself.
-        if hints_missing && !width_changed && rows == count && rows > 0 && !ids_changed {
+        if hints_missing
+            && !width_changed
+            && !self.timeline_list_seed_pending
+            && rows == count
+            && rows > 0
+            && !ids_changed
+        {
             self.timeline_list_hint_width = Some(width);
             return;
         }
@@ -33308,6 +33327,7 @@ impl VibexWorkbench {
         let held_anchor = (!self.timeline_follow.following_bottom)
             .then(|| self.timeline_scroll.logical_scroll_top());
         let hint = timeline_row_height_hint(&self.timeline_row_sizes).unwrap_or(px(0.0));
+        self.timeline_list_seed_pending = false;
         self.timeline_trace.seeds += 1;
         self.timeline_scroll
             .reset_with_uniform_height(rows, hint.max(px(1.0)));
