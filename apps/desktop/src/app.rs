@@ -6934,6 +6934,28 @@ impl SessionView {
         }
     }
 
+    /// Keeps the live edge on the list's own end anchor.
+    ///
+    /// `scroll_to_end` anchors past the last row, which the list paints by
+    /// walking back from the end; a layout that instead resolves that into a row
+    /// anchor places the same content one padding band lower, because its fill
+    /// counts the list's padding and the end anchor does not. A capture shows
+    /// exactly that pair alternating once a frame — the offset switching between
+    /// the document's height and the maximum plus one padding — which is a
+    /// padding-sized bounce painted sixty times a second. Re-stating the end
+    /// anchor every frame keeps one of the two out of the picture.
+    fn hold_the_live_edge_anchor(&mut self) {
+        if !self.timeline_follow.following_bottom
+            || self.timeline_scrollbar_interaction_active
+            || self.pending_timeline_reveal_delta != px(0.0)
+        {
+            return;
+        }
+        if self.timeline_scroll.logical_scroll_top().item_ix < self.timeline_scroll.item_count() {
+            self.timeline_scroll.scroll_to_end();
+        }
+    }
+
     fn set_reasoning_expanded(&mut self, row_id: String, turn_id: Option<&str>, expanded: bool) {
         // A click changes one disclosure, not the contents of the turn. Keep
         // measured geometry as the seed for prepaint, including offscreen
@@ -65872,6 +65894,7 @@ impl VibexWorkbench {
         // is about to set. Applying it first left the reader at row zero with
         // nothing pending to correct it.
         self.apply_pending_timeline_anchor();
+        self.hold_the_live_edge_anchor();
         // After the anchor, because restoring one can leave the offset past the
         // end of a document that has not been measured yet; before the trace, so
         // a correction this frame is named by it.
