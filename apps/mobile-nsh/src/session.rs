@@ -29,19 +29,19 @@ use vibex_core::{
     AgentNotificationKind, AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage,
     ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
     ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
-    FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
-    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitRemoteActionKind,
-    GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
-    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
-    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
-    WorkspaceId, unix_timestamp_ms,
+    ElicitationResolutionAction, FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind,
+    FileReadRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
+    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
+    GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest, GitStatusSummary,
+    GitWorktreeCreateRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -205,6 +205,9 @@ pub struct SessionService {
     session_states: Rc<RefCell<BTreeMap<String, AgentSessionState>>>,
     /// The turns whose working rows the reader opened.
     expanded_turns: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    /// The rows whose full detail the reader opened, and the detail itself.
+    expanded_rows: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    row_details: Rc<RefCell<BTreeMap<String, String>>>,
     /// The open session's runtime selection and the runtime's catalogue.
     runtime_state: Rc<RefCell<Option<AgentSessionRuntimeSelectionState>>>,
     runtime_catalog: Signal<Option<SessionRuntimeOptionCatalog>>,
@@ -342,6 +345,8 @@ impl SessionService {
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
             session_states: Rc::new(RefCell::new(BTreeMap::new())),
             expanded_turns: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            expanded_rows: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            row_details: Rc::new(RefCell::new(BTreeMap::new())),
             runtime_state: Rc::new(RefCell::new(None)),
             runtime_catalog: signal(None),
             runtime_summary: signal(None),
@@ -648,6 +653,12 @@ impl SessionService {
             on_toggle_turn: {
                 let service = self.clone();
                 Rc::new(move |turn_id: &str| service.toggle_turn(turn_id))
+            },
+            on_toggle_detail: {
+                let service = self.clone();
+                Rc::new(move |row_id: &str, sequence: i64| {
+                    service.toggle_row_detail(row_id, sequence)
+                })
             },
             on_load_older: {
                 let service = self.clone();
@@ -2215,16 +2226,35 @@ impl SessionService {
         turn: &TimelineConversationTurn,
         items: &[vibex_core::TimelineItem],
     ) -> TimelineEntry {
+        let expandable = matches!(
+            row.kind,
+            vibex_desktop_model::TimelineRowKind::ToolCall
+                | vibex_desktop_model::TimelineRowKind::Command
+                | vibex_desktop_model::TimelineRowKind::FileOperation
+                | vibex_desktop_model::TimelineRowKind::WebSearch
+                | vibex_desktop_model::TimelineRowKind::TodoUpdate
+        );
+        let expanded = self.expanded_rows.borrow().contains(&row.id);
+        let body = if expanded {
+            self.row_details
+                .borrow()
+                .get(&row.id)
+                .cloned()
+                .unwrap_or_else(|| row.body.clone())
+        } else {
+            row.body.clone()
+        };
         TimelineEntry {
             id: row.id.clone(),
             kind: entry_kind(row.kind),
             title: row.title.clone(),
-            body: row.body.clone(),
+            body,
             meta: String::new(),
             streaming: row.streaming,
             turn_id: turn.id.clone(),
             process_count: turn.process_rows.len(),
-            expanded: false,
+            expanded,
+            expandable,
             attachments: row_attachments(row, items),
             last_sequence: row.last_sequence,
             started_at_ms: turn.started_at_ms,
@@ -2240,6 +2270,58 @@ impl SessionService {
         }
         drop(expanded);
         self.publish();
+    }
+
+    /// Opens or closes one row's full detail, reading it on first open.
+    fn toggle_row_detail(&self, row_id: &str, sequence: i64) {
+        let mut expanded = self.expanded_rows.borrow_mut();
+        if expanded.remove(row_id) {
+            drop(expanded);
+            self.publish();
+            return;
+        }
+        expanded.insert(row_id.to_owned());
+        drop(expanded);
+        if self.row_details.borrow().contains_key(row_id) || sequence <= 0 {
+            self.publish();
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        let row_id = row_id.to_owned();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .fetch_timeline_item(FetchTimelineItemRequest {
+                        session_id,
+                        sequence,
+                    })
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(item)) => {
+                    let body = vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
+                        .into_iter()
+                        .next()
+                        .map(|row| row.body)
+                        .unwrap_or_default();
+                    service.row_details.borrow_mut().insert(row_id, body);
+                    service.publish();
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("reading the activity did not finish: {error}"),
+                )),
+            }
+        });
     }
 
     /// Forks the conversation through `through_sequence`, then opens the new
@@ -4550,6 +4632,7 @@ fn process_header(turn: &TimelineConversationTurn, expanded: bool) -> TimelineEn
         turn_id: turn.id.clone(),
         process_count: turn.process_rows.len(),
         expanded,
+        expandable: false,
         attachments: Vec::new(),
         last_sequence: 0,
         started_at_ms: turn.started_at_ms,
@@ -4573,6 +4656,7 @@ fn live_turn_entry(turn: &TimelineConversationTurn) -> TimelineEntry {
         turn_id: turn.id.clone(),
         process_count: turn.process_rows.len(),
         expanded: false,
+        expandable: false,
         attachments: Vec::new(),
         last_sequence: turn.process_rows.last().map_or(0, |row| row.last_sequence),
         started_at_ms: turn.started_at_ms,

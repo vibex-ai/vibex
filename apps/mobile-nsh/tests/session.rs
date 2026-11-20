@@ -35,6 +35,7 @@ fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
         turn_id: id.to_owned(),
         process_count: 0,
         expanded: false,
+        expandable: false,
         attachments: Vec::new(),
         last_sequence: 0,
         started_at_ms: 0,
@@ -159,10 +160,12 @@ fn TurnShell() -> impl IntoElement {
         uri: "data:image/jpeg;base64,".to_owned(),
     }];
     host.editable_sequence = signal(24);
+    let mut tool = entry("t1", EntryKind::Tool, "cargo test", "Running");
+    tool.expandable = true;
     host.timeline = signal(vec![
         user,
         header,
-        entry("t1", EntryKind::Tool, "cargo test", "Running"),
+        tool,
         entry("a1", EntryKind::Agent, "Claude", "Done"),
     ]);
     session::session(host)
@@ -707,6 +710,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_new_session,
         on_open_settings: Rc::new(|| {}),
         on_toggle_turn: Rc::new(|_| {}),
+        on_toggle_detail: Rc::new(|_, _| {}),
         on_fork: Rc::new(|_| {}),
         on_load_older: Rc::new(|| {}),
         terminal_open,
@@ -889,6 +893,7 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Worked for 2s").unwrap();
     assert!(app.screen().shows("cargo test"));
+    assert!(app.screen().shows("Detail"));
     assert!(app.screen().shows("photo.jpg"));
     assert!(app.screen().shows("Edit"));
     assert!(app.screen().shows("Copy"));

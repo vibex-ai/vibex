@@ -111,8 +111,10 @@ pub struct TimelineEntry {
     pub turn_id: String,
     /// The fold's row count, on a process header.
     pub process_count: usize,
-    /// Whether the fold is open, on a process header.
+    /// Whether the fold or the row's detail is open.
     pub expanded: bool,
+    /// Whether a row has more detail to read.
+    pub expandable: bool,
     /// What the user message carried.
     pub attachments: Vec<AttachmentItem>,
     /// The row's newest sequence, for a fork cut.
@@ -381,6 +383,8 @@ type Action = Rc<dyn Fn()>;
 type ChooseFeature = Rc<dyn Fn(&str, &str)>;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
+/// Opens one row's full detail.
+type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
 /// One entry of the composer's `/` palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -500,6 +504,8 @@ pub struct SessionHost {
     pub on_choose_feature: ChooseFeature,
     /// Opens or closes one turn's working rows.
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
+    /// Opens a row's full detail, by row id and sequence.
+    pub on_toggle_detail: ToggleDetail,
     /// Reads the page above the transcript.
     pub on_load_older: Action,
     /// Forks the conversation through a row's sequence.
@@ -952,6 +958,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let active = host.active;
     let error = host.error;
     let on_toggle_turn = host.on_toggle_turn.clone();
+    let on_toggle_detail = host.on_toggle_detail.clone();
     let on_fork = host.on_fork.clone();
     let editable_sequence = host.editable_sequence;
     let on_edit_message = host.on_edit_message.clone();
@@ -1030,6 +1037,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                     .child(
                         virtual_list(move || timeline.with(|entries| entries.len()), {
                             let on_toggle_turn = on_toggle_turn.clone();
+                            let on_toggle_detail = on_toggle_detail.clone();
                             let on_fork = on_fork.clone();
                             let editable_sequence = editable_sequence;
                             let on_edit_message = on_edit_message.clone();
@@ -1038,6 +1046,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                                     at,
                                     timeline,
                                     on_toggle_turn.clone(),
+                                    on_toggle_detail.clone(),
                                     on_fork.clone(),
                                     editable_sequence,
                                     on_edit_message.clone(),
@@ -1081,6 +1090,7 @@ fn entry_row(
     at: Position,
     entries: Signal<Vec<TimelineEntry>>,
     on_toggle_turn: Rc<dyn Fn(&str)>,
+    on_toggle_detail: ToggleDetail,
     on_fork: Rc<dyn Fn(i64)>,
     editable_sequence: Signal<i64>,
     on_edit_message: EditMessage,
@@ -1093,6 +1103,7 @@ fn entry_row(
         .child(entry_element(
             entry,
             on_toggle_turn,
+            on_toggle_detail,
             on_fork,
             editable_sequence,
             on_edit_message,
@@ -1102,6 +1113,7 @@ fn entry_row(
 fn entry_element(
     entry: Memo<Option<TimelineEntry>>,
     on_toggle_turn: Rc<dyn Fn(&str)>,
+    on_toggle_detail: ToggleDetail,
     on_fork: Rc<dyn Fn(i64)>,
     editable_sequence: Signal<i64>,
     on_edit_message: EditMessage,
@@ -1129,6 +1141,8 @@ fn entry_element(
     let started_at_ms = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.started_at_ms)));
     let ended_at_ms = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.ended_at_ms)));
     let complete = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.complete)));
+    let expandable = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expandable)));
+    let row_expanded = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expanded)));
 
     view()
         .w_full()
@@ -1176,7 +1190,16 @@ fn entry_element(
         ))
         .child(when(
             move || kind.with(|kind| matches!(kind, Some(EntryKind::Tool | EntryKind::Notice))),
-            move || tool_card(title, body, meta),
+            {
+                let on_toggle_detail = on_toggle_detail.clone();
+                move || {
+                    let on_toggle_detail = on_toggle_detail.clone();
+                    let toggle = Rc::new(move || {
+                        on_toggle_detail(&turn_id.get_untracked(), sequence.get_untracked())
+                    });
+                    tool_card(title, body, meta, expandable, row_expanded, toggle)
+                }
+            },
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Error)),
@@ -1451,7 +1474,14 @@ fn muted_prose(label: &'static str, body: Memo<String>) -> impl IntoElement {
         )
 }
 
-fn tool_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> impl IntoElement {
+fn tool_card(
+    title: Memo<String>,
+    body: Memo<String>,
+    meta: Memo<String>,
+    expandable: Memo<bool>,
+    expanded: Memo<bool>,
+    on_toggle: Rc<dyn Fn()>,
+) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(theme::RADIUS_CONTROL))
@@ -1477,7 +1507,29 @@ fn tool_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> imp
                     text(move || meta.get())
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
-                ),
+                )
+                .child(when(
+                    move || expandable.get(),
+                    move || {
+                        let on_toggle = on_toggle.clone();
+                        button()
+                            .on_press(move || on_toggle())
+                            .min_h(px(24.0))
+                            .px(px(theme::SPACING_XS))
+                            .items_center()
+                            .child(
+                                text(move || {
+                                    if expanded.get() {
+                                        copy::text("Hide", "收起", "收起")
+                                    } else {
+                                        copy::text("Detail", "详情", "詳情")
+                                    }
+                                })
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
+                            )
+                    },
+                )),
         )
         .child(
             text(move || body.get())
