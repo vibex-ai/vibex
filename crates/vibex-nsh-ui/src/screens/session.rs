@@ -515,6 +515,16 @@ pub struct SessionHost {
     /// Whether the last turn needs an explicit continue, and the action for it.
     pub needs_continue: Signal<bool>,
     pub on_continue_turn: Action,
+    pub team_open: Signal<bool>,
+    pub team_tasks: Signal<Vec<crate::screens::team::TeamTaskView>>,
+    pub team_busy: Signal<bool>,
+    pub team_error: Signal<Option<SharedString>>,
+    pub on_open_team: Action,
+    pub on_close_team: Action,
+    pub on_refresh_team: Action,
+    pub on_accept_team: Rc<dyn Fn(&str)>,
+    pub on_cancel_team: Rc<dyn Fn(&str)>,
+    pub on_interrupt_team: Rc<dyn Fn(&str)>,
     /// Reads the page above the transcript.
     pub on_load_older: Action,
     /// Forks the conversation through a row's sequence.
@@ -827,6 +837,17 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.on_archive_session.clone(),
             host.on_delete_session.clone(),
         ))
+        .child(crate::screens::team::team(crate::screens::team::TeamHost {
+            open: host.team_open,
+            tasks: host.team_tasks,
+            busy: host.team_busy,
+            error: host.team_error,
+            on_refresh: host.on_refresh_team.clone(),
+            on_accept: host.on_accept_team.clone(),
+            on_cancel: host.on_cancel_team.clone(),
+            on_interrupt: host.on_interrupt_team.clone(),
+            on_close: host.on_close_team.clone(),
+        }))
         .child(new_session_sheet(NewSessionHost {
             open: host.new_session_open,
             workspaces: host.new_workspaces,
@@ -3536,6 +3557,16 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             )
                             .w_full(),
                         )
+                        .child({
+                            let on_open_team = host.on_open_team.clone();
+                            action::secondary(
+                                copy::text("Team", "团队", "團隊"),
+                                icon(include_str!("../../assets/icons/bot.svg")),
+                                false,
+                                move || on_open_team(),
+                            )
+                            .w_full()
+                        })
                         .child(
                             action::primary(
                                 copy::text("New session", "新建会话", "新增工作階段"),

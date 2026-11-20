@@ -8,3 +8,5 @@ pub mod pairing;
 pub mod session;
 pub mod settings;
 pub mod terminal;
+
+pub mod team;

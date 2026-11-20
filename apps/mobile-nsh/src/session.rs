@@ -29,22 +29,23 @@ use vibex_core::{
     AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSourceKind,
     AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentNotificationKind,
     AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage, ApprovalResponder,
-    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind,
-    FileReadRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
-    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
-    GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceId,
-    unix_timestamp_ms,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, DelegationTaskPhase,
+    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
+    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
+    FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
+    FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
+    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
+    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -62,6 +63,7 @@ use vibex_nsh_ui::{
         RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
         TimelineEntry, TokenUsageView,
     },
+    screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
 };
 
@@ -259,6 +261,11 @@ pub struct SessionService {
     runtime_busy: Signal<bool>,
     token_usage: Signal<Option<TokenUsageView>>,
     needs_continue: Signal<bool>,
+    team_open: Signal<bool>,
+    team_tasks: Signal<Vec<TeamTaskView>>,
+    team_busy: Signal<bool>,
+    team_error: Signal<Option<SharedString>>,
+    team_revisions: Rc<RefCell<BTreeMap<String, u64>>>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
@@ -403,6 +410,11 @@ impl SessionService {
             runtime_busy: signal(false),
             token_usage: signal(None),
             needs_continue: signal(false),
+            team_open: signal(false),
+            team_tasks: signal(Vec::new()),
+            team_busy: signal(false),
+            team_error: signal(None),
+            team_revisions: Rc::new(RefCell::new(BTreeMap::new())),
             plan: signal(None),
             goal: signal(None),
             history: signal(Vec::new()),
@@ -626,6 +638,36 @@ impl SessionService {
             on_continue_turn: {
                 let service = self.clone();
                 Rc::new(move || service.continue_turn())
+            },
+            team_open: self.team_open,
+            team_tasks: self.team_tasks,
+            team_busy: self.team_busy,
+            team_error: self.team_error,
+            on_open_team: {
+                let service = self.clone();
+                Rc::new(move || service.open_team())
+            },
+            on_close_team: {
+                let service = self.clone();
+                Rc::new(move || service.team_open.set(false))
+            },
+            on_refresh_team: {
+                let service = self.clone();
+                Rc::new(move || service.refresh_team())
+            },
+            on_accept_team: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.control_team(id, TeamTaskAction::Accept))
+            },
+            on_cancel_team: {
+                let service = self.clone();
+                Rc::new(move |id: &str| {
+                    service.control_team(id, TeamTaskAction::Cancel { cascade: true })
+                })
+            },
+            on_interrupt_team: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.control_team(id, TeamTaskAction::Interrupt))
             },
             plan: self.plan,
             goal: self.goal,
@@ -1771,6 +1813,112 @@ impl SessionService {
             .config_values
             .insert(id.to_owned(), value.to_owned());
         self.apply_selection(selection);
+    }
+
+    fn open_team(&self) {
+        self.team_open.set(true);
+        self.refresh_team();
+    }
+
+    fn refresh_team(&self) {
+        if self.team_busy.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        self.team_busy.set(true);
+        self.team_error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .team_snapshot(TeamSnapshotRequest::new(session_id))
+                    .await
+            })
+            .await;
+            service.team_busy.set(false);
+            match result {
+                Ok(Ok(snapshot)) => {
+                    let mut revisions = service.team_revisions.borrow_mut();
+                    revisions.clear();
+                    let tasks = snapshot
+                        .tasks
+                        .into_iter()
+                        .map(|task| {
+                            let id = task.task_ref.as_uri();
+                            revisions.insert(id.clone(), task.revision);
+                            TeamTaskView {
+                                id,
+                                title: task.title,
+                                phase: team_phase_label(task.phase).to_owned(),
+                                detail: if task.task_summary.trim().is_empty() {
+                                    task.error_code.unwrap_or_default()
+                                } else {
+                                    task.task_summary
+                                },
+                                can_accept: task.phase == DelegationTaskPhase::AwaitingReview,
+                                can_cancel: task.phase.is_active()
+                                    && task.phase != DelegationTaskPhase::Cancelling,
+                                can_interrupt: task.phase.is_active(),
+                            }
+                        })
+                        .collect();
+                    drop(revisions);
+                    service.team_tasks.set(tasks);
+                }
+                Ok(Err(error)) => service.team_error.set(Some(error_text(&error))),
+                Err(error) => service.team_error.set(Some(
+                    format!("reading the team did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn control_team(&self, id: &str, action: TeamTaskAction) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let reference = VibexUseRef::parse(id);
+        let Some(task_id) = reference.as_ref().and_then(VibexUseRef::task_id) else {
+            return;
+        };
+        let revision = self.team_revisions.borrow().get(id).copied();
+        if self.team_busy.get_untracked() {
+            return;
+        }
+        self.team_busy.set(true);
+        self.team_error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .control_team_task(MutationRequest::new(TeamTaskControlRequest {
+                        session_id,
+                        task_id,
+                        action,
+                        expected_revision: revision,
+                    }))
+                    .await
+            })
+            .await;
+            service.team_busy.set(false);
+            match result {
+                Ok(Ok(_)) => service.refresh_team(),
+                Ok(Err(error)) => service.team_error.set(Some(error_text(&error))),
+                Err(error) => service.team_error.set(Some(
+                    format!("the task action did not finish: {error}").into(),
+                )),
+            }
+        });
     }
 
     /// Starts the next turn the runtime was waiting to continue.
@@ -4478,6 +4626,19 @@ async fn send_and_refetch(
         }))
         .await?;
     fetch_page(backend, session_id).await
+}
+
+fn team_phase_label(phase: DelegationTaskPhase) -> &'static str {
+    match phase {
+        DelegationTaskPhase::Queued => copy::text("Queued", "排队中", "排隊中"),
+        DelegationTaskPhase::Starting => copy::text("Starting", "启动中", "啟動中"),
+        DelegationTaskPhase::Active => copy::text("Active", "运行中", "執行中"),
+        DelegationTaskPhase::AwaitingReview => copy::text("Awaiting review", "待审核", "待審核"),
+        DelegationTaskPhase::Cancelling => copy::text("Cancelling", "取消中", "取消中"),
+        DelegationTaskPhase::Completed => copy::text("Completed", "已完成", "已完成"),
+        DelegationTaskPhase::Failed => copy::text("Failed", "失败", "失敗"),
+        DelegationTaskPhase::Cancelled => copy::text("Cancelled", "已取消", "已取消"),
+    }
 }
 
 fn summary(session: &vibex_core::AgentSession, spaces: &[WorkspaceSummary]) -> SessionSummary {

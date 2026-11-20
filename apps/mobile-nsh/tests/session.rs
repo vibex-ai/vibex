@@ -22,6 +22,7 @@ use vibex_nsh_ui::screens::session::{
     RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
     TimelineEntry, TokenUsageView,
 };
+use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
@@ -179,6 +180,34 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell with its team sheet open.
+#[component]
+fn TeamShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.team_open.set(true);
+    host.team_tasks.set(vec![
+        TeamTaskView {
+            id: "vibex://task/1".to_owned(),
+            title: "Review the parser".to_owned(),
+            phase: "Awaiting review".to_owned(),
+            detail: "The child finished its changes.".to_owned(),
+            can_accept: true,
+            can_cancel: true,
+            can_interrupt: true,
+        },
+        TeamTaskView {
+            id: "vibex://task/2".to_owned(),
+            title: "Port the tests".to_owned(),
+            phase: "Active".to_owned(),
+            detail: String::new(),
+            can_accept: false,
+            can_cancel: true,
+            can_interrupt: true,
+        },
+    ]);
+    session::session(host)
+}
+
 /// A shell with one discovered skill.
 #[component]
 fn SkillShell() -> impl IntoElement {
@@ -330,6 +359,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_busy = signal(false);
     let token_usage = signal(None);
     let needs_continue = signal(false);
+    let team_open = signal(false);
+    let team_tasks = signal(Vec::new());
+    let team_busy = signal(false);
+    let team_error = signal(None::<SharedString>);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -674,6 +707,16 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         token_usage,
         needs_continue,
         on_continue_turn: Rc::new(|| {}),
+        team_open,
+        team_tasks,
+        team_busy,
+        team_error,
+        on_open_team: Rc::new(|| {}),
+        on_close_team: Rc::new(|| {}),
+        on_refresh_team: Rc::new(|| {}),
+        on_accept_team: Rc::new(|_| {}),
+        on_cancel_team: Rc::new(|_| {}),
+        on_interrupt_team: Rc::new(|_| {}),
         plan,
         goal,
         history,
@@ -871,6 +914,18 @@ fn the_composer_opens_the_runtime_choices() {
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();
     app.wait_for("Codex · GPT-5").unwrap();
+}
+
+#[test]
+fn the_team_sheet_lists_tasks_and_their_actions() {
+    let mut config = EngineConfig::new(Root::of::<TeamShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Review the parser").unwrap();
+    assert!(app.screen().shows("Awaiting review"));
+    assert!(app.screen().shows("Accept"));
+    assert!(app.screen().shows("Interrupt"));
+    assert!(app.screen().shows("Port the tests"));
 }
 
 #[test]
