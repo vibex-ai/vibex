@@ -1,7 +1,7 @@
 {
   "name": "Vibex",
   "id": "ai.vibex.mobile.nsh",
-  "version": "0.1.8",
+  "version": "0.1.9",
   "appearance": "system",
   "rust": ".",
   "root": "App",

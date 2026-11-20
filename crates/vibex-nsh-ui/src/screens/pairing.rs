@@ -409,7 +409,7 @@ fn settings_sheet(open: Signal<bool>, host: PairingHost) -> impl IntoElement {
                 ))
                 .child(settings_row(
                     copy::text("Version", "版本", "版本"),
-                    "Vibex 0.1.8",
+                    concat!("Vibex ", env!("CARGO_PKG_VERSION")),
                 ))
                 .child(settings_row(
                     copy::text("License", "许可", "授權"),
