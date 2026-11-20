@@ -1871,6 +1871,17 @@ impl SessionService {
         self.apply_selection(selection);
     }
 
+    /// Puts text another app shared into the composer, or starts a session
+    /// with it when none is open.
+    pub fn receive_shared_text(&self, text: String) {
+        if self.active.get_untracked().is_some() {
+            self.draft.set(text);
+        } else {
+            self.new_prompt.set(text);
+            self.open_new_session();
+        }
+    }
+
     pub fn set_show_token_usage(&self, enabled: bool) {
         self.show_token_usage.set(enabled);
     }

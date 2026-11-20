@@ -354,6 +354,11 @@ fn start_back_poller(
                     .as_ref()
                     .is_some_and(|service| service.back_intercept());
             host::set_back_intercept(intercept);
+            if let Some(text) = host::take_shared_text()
+                && let Some(service) = services.get_untracked()
+            {
+                service.receive_shared_text(text);
+            }
             if !host::take_back() {
                 continue;
             }

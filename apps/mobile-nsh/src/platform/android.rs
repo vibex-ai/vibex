@@ -70,6 +70,20 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeScanResult(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// Reports text another app shared into Vibex.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeShareText(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    value: JString<'_>,
+) {
+    env.with_env(|_| -> jni::errors::Result<()> {
+        host::share_text(&value.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// Reports one local-network discovery event as the bridge's JSON contract.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeDiscoveryEvent(

@@ -92,6 +92,9 @@ pub fn discovery_available() -> bool {
     DISCOVERY_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Text another app shared into Vibex, waiting for the engine to take it.
+static SHARED_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// The name the platform reports for this phone, once the host sets it.
 static DEVICE_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -187,6 +190,29 @@ pub fn set_device_name(name: &str) {
         .get_or_init(|| Mutex::new(None))
         .lock()
         .unwrap_or_else(|error| error.into_inner()) = Some(name);
+}
+
+/// Records text a system share sent into the app.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host receives system shares")
+)]
+pub fn share_text(text: &str) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    *SHARED_TEXT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(text.to_owned());
+}
+
+/// Takes the shared text, if one is waiting.
+pub fn take_shared_text() -> Option<String> {
+    SHARED_TEXT
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
 }
 
 /// The platform's name for this phone, if the host reported one.
@@ -461,5 +487,17 @@ mod tests {
             HostEvent::DiscoveryFailed(message) => assert!(message.contains("invalid message")),
             other => panic!("expected a failure, got {other:?}"),
         }
+    }
+}
+
+#[cfg(test)]
+mod shared_text_tests {
+    use super::*;
+
+    #[test]
+    fn shared_text_is_trimmed_and_taken_once() {
+        share_text("  hello  ");
+        assert_eq!(take_shared_text().as_deref(), Some("hello"));
+        assert_eq!(take_shared_text(), None);
     }
 }

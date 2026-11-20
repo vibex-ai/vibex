@@ -66,6 +66,7 @@ public final class MainActivity extends Activity {
         setContentView(view);
         if (state == null) {
             view.handleUrlSchemeIntent(getIntent());
+            readSharedText(getIntent());
         }
         view.runRustApp("nsh");
         DevActivity.systemBars(this);
@@ -108,6 +109,17 @@ public final class MainActivity extends Activity {
         super.onNewIntent(intent);
         if (view != null) {
             view.handleUrlSchemeIntent(intent);
+        }
+        readSharedText(intent);
+    }
+
+    private void readSharedText(Intent intent) {
+        if (intent == null || !Intent.ACTION_SEND.equals(intent.getAction())) {
+            return;
+        }
+        String text = intent.getStringExtra(Intent.EXTRA_TEXT);
+        if (text != null && !text.trim().isEmpty()) {
+            NshHost.nativeShareText(text);
         }
     }
 
