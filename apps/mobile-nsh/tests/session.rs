@@ -182,7 +182,12 @@ fn TurnShell() -> impl IntoElement {
         tool,
         permission,
         entry("c1", EntryKind::Changes, "1 files changed", "src/main.rs"),
-        entry("a1", EntryKind::Agent, "Claude", "Done"),
+        entry(
+            "a1",
+            EntryKind::Agent,
+            "Claude",
+            "![shot](https://example.com/shot.png)\nDone",
+        ),
     ]);
     session::session(host)
 }

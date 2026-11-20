@@ -1615,6 +1615,7 @@ fn agent_prose(
     sequence: Memo<i64>,
     on_fork: Rc<dyn Fn(i64)>,
 ) -> impl IntoElement {
+    let images = computed(move || markdown_images(&body.get()));
     view()
         .w_full()
         .flex_col()
@@ -1648,7 +1649,53 @@ fn agent_prose(
                 })
                 .selectable(true),
         )
+        .child(when(
+            move || images.with(|images| !images.is_empty()),
+            move || {
+                view()
+                    .w_full()
+                    .flex_col()
+                    .gap(px(theme::SPACING_XS))
+                    .child(each(
+                        move || images.get(),
+                        |source| source.clone(),
+                        move |source, _| {
+                            image(move || ImageSrc::from(source.get_untracked()))
+                                .w_full()
+                                .max_h(px(320.0))
+                                .object_fit(nsh_core::ResizeMode::Contain)
+                        },
+                    ))
+            },
+        ))
         .child(message_actions(body, sequence, on_fork))
+}
+
+fn markdown_images(text: &str) -> Vec<String> {
+    let mut images = Vec::new();
+    let mut rest = text;
+    while let Some(start) = rest.find("![") {
+        rest = &rest[start + 2..];
+        let Some(close) = rest.find(']') else {
+            break;
+        };
+        let after = &rest[close + 1..];
+        let Some(after) = after.strip_prefix('(') else {
+            continue;
+        };
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        let source = after[..end].trim();
+        if source.starts_with("http") || source.starts_with("data:image/") {
+            images.push(source.to_owned());
+            if images.len() >= 4 {
+                break;
+            }
+        }
+        rest = &after[end + 1..];
+    }
+    images
 }
 
 fn message_actions(
