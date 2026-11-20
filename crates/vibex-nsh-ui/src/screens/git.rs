@@ -9,7 +9,10 @@ use std::rc::Rc;
 use nsh_base::{ButtonElement, button};
 use nsh_core::{element::ImageSrc, prelude::*};
 
-use crate::{copy, theme, ui::action};
+use crate::{
+    copy, theme,
+    ui::{action, field},
+};
 
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
@@ -105,6 +108,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
     let error = host.error;
     let on_refresh = host.on_refresh.clone();
     let show_history = host.show_history;
+    let history_query = signal(String::new());
     let commit_detail = host.commit_detail;
     view()
         .flex_1()
@@ -187,7 +191,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             {
                 let history = host.history;
                 let on_open_commit = host.on_open_commit.clone();
-                move || history_list(history, on_open_commit.clone())
+                move || history_list(history, history_query, on_open_commit.clone())
             },
         ))
         .child(when(
@@ -532,29 +536,61 @@ fn commit_bar(
 /// The history list.
 fn history_list(
     history: Signal<Vec<CommitRow>>,
+    query: Signal<String>,
     on_open_commit: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    view().flex_1().min_h(px(0.0)).child(
-        virtual_list(
-            move || history.with(|history| history.len()),
-            move |at: Position| history_row(at, history, on_open_commit.clone()),
-        )
-        .keys(move || {
+    let filtered = computed(move || {
+        query.with(|query| {
+            let query = query.trim().to_lowercase();
             history.with(|history| {
                 history
                     .iter()
-                    .map(|commit| commit.hash.clone())
+                    .filter(|commit| {
+                        query.is_empty()
+                            || commit.subject.to_lowercase().contains(&query)
+                            || commit.detail.to_lowercase().contains(&query)
+                            || commit.short_hash.to_lowercase().contains(&query)
+                            || commit.hash.to_lowercase().contains(&query)
+                    })
+                    .cloned()
                     .collect::<Vec<_>>()
             })
         })
-        .estimated_item_size(px(56.0))
-        .flex_1(),
-    )
+    });
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .flex_col()
+        .child(
+            view()
+                .px(px(theme::SPACING_LG))
+                .py(px(theme::SPACING_SM))
+                .child(field::text_field(
+                    query,
+                    copy::text("Search commits", "搜索提交", "搜尋提交"),
+                )),
+        )
+        .child(
+            virtual_list(
+                move || filtered.with(|filtered| filtered.len()),
+                move |at: Position| history_row(at, filtered, on_open_commit.clone()),
+            )
+            .keys(move || {
+                filtered.with(|filtered| {
+                    filtered
+                        .iter()
+                        .map(|commit| commit.hash.clone())
+                        .collect::<Vec<_>>()
+                })
+            })
+            .estimated_item_size(px(56.0))
+            .flex_1(),
+        )
 }
 
 fn history_row(
     at: Position,
-    history: Signal<Vec<CommitRow>>,
+    history: Memo<Vec<CommitRow>>,
     on_open_commit: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     let commit = computed(move || history.with(|history| history.get(at.index()).cloned()));

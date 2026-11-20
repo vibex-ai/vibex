@@ -1155,6 +1155,9 @@ fn the_git_surface_commits_and_shows_history() {
     app.wait_for("text:Commit message").unwrap();
     app.press("role:button[History]").unwrap();
     app.wait_for("Initial commit").unwrap();
+    app.type_text("text:Search commits", "zzz").unwrap();
+    app.wait_for_gone("Initial commit", std::time::Duration::from_secs(5))
+        .unwrap();
 }
 
 #[test]
