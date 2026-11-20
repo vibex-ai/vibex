@@ -37,8 +37,9 @@ use vibex_core::{
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
     GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
     GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest,
-    GitWorktreeDiscardRequest, GitWorktreeMergeRequest, GitWorktreeRestoreRequest, GoalAction,
-    GoalPhase, MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
+    GitWorktreeDiscardRequest, GitWorktreeMergeRequest, GitWorktreeOperationRequest,
+    GitWorktreeOperationStatus, GitWorktreeRestoreRequest, GoalAction, GoalPhase,
+    MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
     RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
     RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
@@ -56,7 +57,8 @@ use vibex_nsh_ui::{
     screens::connecting::ConnectionState,
     screens::files::{FileEntry, FilePreview, FilePreviewKindView},
     screens::git::{
-        BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeRow,
+        BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
+        WorktreeOperationRow, WorktreeRow,
     },
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
@@ -216,6 +218,7 @@ pub struct SessionService {
     worktree_menu: Signal<bool>,
     worktree_busy: Signal<bool>,
     worktree_error: Signal<Option<SharedString>>,
+    worktree_operations: Signal<Vec<WorktreeOperationRow>>,
     worktree_records: Rc<RefCell<Vec<GitManagedWorktreeRecord>>>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
@@ -400,6 +403,7 @@ impl SessionService {
             worktree_menu: signal(false),
             worktree_busy: signal(false),
             worktree_error: signal(None),
+            worktree_operations: signal(Vec::new()),
             worktree_records: Rc::new(RefCell::new(Vec::new())),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
@@ -669,6 +673,15 @@ impl SessionService {
             on_discard_worktree: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.discard_worktree(id))
+            },
+            worktree_operations: self.worktree_operations,
+            on_continue_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.continue_worktree_merge(id))
+            },
+            on_abort_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.abort_worktree_merge(id))
             },
             on_restore_worktree: {
                 let service = self.clone();
@@ -4962,8 +4975,33 @@ impl SessionService {
                             ),
                         })
                         .collect();
+                    let operations = snapshot
+                        .operations
+                        .iter()
+                        .filter(|operation| {
+                            matches!(
+                                operation.status,
+                                GitWorktreeOperationStatus::NeedsResolution
+                                    | GitWorktreeOperationStatus::Recoverable
+                                    | GitWorktreeOperationStatus::NeedsAttention
+                            )
+                        })
+                        .map(|operation| WorktreeOperationRow {
+                            id: operation.operation_id.as_str().to_owned(),
+                            label: operation
+                                .branch
+                                .clone()
+                                .or_else(|| operation.worktree_path.clone())
+                                .unwrap_or_default(),
+                            status: worktree_operation_status_label(operation.status).to_owned(),
+                            can_continue: operation.status
+                                == GitWorktreeOperationStatus::NeedsResolution,
+                            can_abort: true,
+                        })
+                        .collect();
                     *service.worktree_records.borrow_mut() = snapshot.managed_worktrees;
                     service.worktrees.set(rows);
+                    service.worktree_operations.set(operations);
                 }
                 Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
                 Err(error) => service.worktree_error.set(Some(
@@ -5051,6 +5089,59 @@ impl SessionService {
                         format!("checking the worktree did not finish: {error}").into(),
                     ));
                 }
+            }
+        });
+    }
+
+    fn continue_worktree_merge(&self, id: &str) {
+        let Ok(operation_id) = RequestId::parse(id) else {
+            return;
+        };
+        self.worktree_operation(operation_id, true);
+    }
+
+    fn abort_worktree_merge(&self, id: &str) {
+        let Ok(operation_id) = RequestId::parse(id) else {
+            return;
+        };
+        self.worktree_operation(operation_id, false);
+    }
+
+    fn worktree_operation(&self, operation_id: RequestId, cont: bool) {
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let request = GitWorktreeOperationRequest {
+                operation_id,
+                workspace_id: workspace,
+            };
+            let result = background(async move {
+                if cont {
+                    git.git_worktree_continue_merge(MutationRequest::new(request))
+                        .await
+                } else {
+                    git.git_worktree_abort_merge(MutationRequest::new(request))
+                        .await
+                }
+            })
+            .await;
+            service.worktree_busy.set(false);
+            match result {
+                Ok(Ok(_)) => service.load_worktrees(),
+                Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                Err(error) => service.worktree_error.set(Some(
+                    format!("the merge action did not finish: {error}").into(),
+                )),
             }
         });
     }
@@ -5683,6 +5774,26 @@ async fn send_and_refetch(
         }))
         .await?;
     fetch_page(backend, session_id).await
+}
+
+fn worktree_operation_status_label(status: GitWorktreeOperationStatus) -> &'static str {
+    match status {
+        GitWorktreeOperationStatus::Pending => copy::text("Pending", "等待中", "等待中"),
+        GitWorktreeOperationStatus::Queued => copy::text("Queued", "排队中", "排隊中"),
+        GitWorktreeOperationStatus::Running => copy::text("Running", "运行中", "執行中"),
+        GitWorktreeOperationStatus::Completed => copy::text("Completed", "已完成", "已完成"),
+        GitWorktreeOperationStatus::Failed => copy::text("Failed", "失败", "失敗"),
+        GitWorktreeOperationStatus::Recoverable => copy::text("Recoverable", "可恢复", "可還原"),
+        GitWorktreeOperationStatus::NeedsResolution => {
+            copy::text("Needs resolution", "需要解决冲突", "需要解決衝突")
+        }
+        GitWorktreeOperationStatus::Aborting => copy::text("Aborting", "中止中", "中止中"),
+        GitWorktreeOperationStatus::NeedsAttention => {
+            copy::text("Needs attention", "需要处理", "需要處理")
+        }
+        GitWorktreeOperationStatus::Aborted => copy::text("Aborted", "已中止", "已中止"),
+        GitWorktreeOperationStatus::Unknown => copy::text("Unknown", "未知", "未知"),
+    }
 }
 
 fn worktree_status_label(status: GitManagedWorktreeStatus) -> &'static str {

@@ -38,6 +38,16 @@ pub struct WorktreeRow {
     pub can_discard: bool,
 }
 
+/// One merge/operation needing attention.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeOperationRow {
+    pub id: String,
+    pub label: String,
+    pub status: String,
+    pub can_continue: bool,
+    pub can_abort: bool,
+}
+
 /// One changed path in the status list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitChangeRow {
@@ -101,6 +111,7 @@ pub struct GitHost {
     pub on_close_branches: Rc<dyn Fn()>,
     pub on_select_branch: Rc<dyn Fn(&str)>,
     pub worktrees: Signal<Vec<WorktreeRow>>,
+    pub worktree_operations: Signal<Vec<WorktreeOperationRow>>,
     pub worktree_menu: Signal<bool>,
     pub worktree_busy: Signal<bool>,
     pub worktree_error: Signal<Option<SharedString>>,
@@ -109,6 +120,8 @@ pub struct GitHost {
     pub on_archive_worktree: Rc<dyn Fn(&str)>,
     pub on_merge_worktree: Rc<dyn Fn(&str)>,
     pub on_discard_worktree: Rc<dyn Fn(&str)>,
+    pub on_continue_worktree: Rc<dyn Fn(&str)>,
+    pub on_abort_worktree: Rc<dyn Fn(&str)>,
     pub on_restore_worktree: Rc<dyn Fn(&str)>,
     pub on_toggle_amend: Rc<dyn Fn()>,
     pub on_toggle_push_after: Rc<dyn Fn()>,
@@ -247,12 +260,15 @@ pub fn git(host: GitHost) -> impl IntoElement {
         .child(worktree_sheet(
             host.worktree_menu,
             host.worktrees,
+            host.worktree_operations,
             host.worktree_busy,
             host.worktree_error,
             host.on_close_worktrees.clone(),
             host.on_archive_worktree.clone(),
             host.on_merge_worktree.clone(),
             host.on_discard_worktree.clone(),
+            host.on_continue_worktree.clone(),
+            host.on_abort_worktree.clone(),
             host.on_restore_worktree.clone(),
         ))
         .child(when(
@@ -606,12 +622,15 @@ fn commit_bar(
 fn worktree_sheet(
     open: Signal<bool>,
     worktrees: Signal<Vec<WorktreeRow>>,
+    operations: Signal<Vec<WorktreeOperationRow>>,
     busy: Signal<bool>,
     error: Signal<Option<SharedString>>,
     on_close: Rc<dyn Fn()>,
     on_archive: Rc<dyn Fn(&str)>,
     on_merge: Rc<dyn Fn(&str)>,
     on_discard: Rc<dyn Fn(&str)>,
+    on_continue: Rc<dyn Fn(&str)>,
+    on_abort: Rc<dyn Fn(&str)>,
     on_restore: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     sheet()
@@ -784,6 +803,96 @@ fn worktree_sheet(
                                         },
                                     )),
                             )
+                    },
+                ))
+                .child(when(
+                    move || !operations.with(|operations| operations.is_empty()),
+                    move || {
+                        let on_continue = on_continue.clone();
+                        let on_abort = on_abort.clone();
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_XS))
+                            .child(
+                                text(copy::text("Operations", "操作", "操作"))
+                                    .text_size(px(theme::font_micro()))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::text_muted),
+                            )
+                            .child(each(
+                                move || operations.get(),
+                                |operation| operation.id.clone(),
+                                move |operation, _| {
+                                    let on_continue = on_continue.clone();
+                                    let on_abort = on_abort.clone();
+                                    view()
+                                        .w_full()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(theme::SPACING_XS))
+                                        .p(px(theme::SPACING_SM))
+                                        .rounded(px(theme::RADIUS_CONTROL))
+                                        .bg(theme::background_dim)
+                                        .child(
+                                            text(move || {
+                                                let operation = operation.get();
+                                                format!(
+                                                    "{} · {}",
+                                                    operation.label, operation.status
+                                                )
+                                            })
+                                            .flex_1()
+                                            .truncate()
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_secondary),
+                                        )
+                                        .child(when(
+                                            move || operation.get().can_continue,
+                                            move || {
+                                                let on_continue = on_continue.clone();
+                                                let id = operation.get_untracked().id;
+                                                button()
+                                                    .on_press(move || {
+                                                        if !busy.get_untracked() {
+                                                            on_continue(&id);
+                                                        }
+                                                    })
+                                                    .min_h(px(28.0))
+                                                    .px(px(theme::SPACING_SM))
+                                                    .items_center()
+                                                    .child(
+                                                        text(copy::text(
+                                                            "Continue", "继续", "繼續",
+                                                        ))
+                                                        .text_size(px(theme::font_micro()))
+                                                        .text_color(theme::text_secondary),
+                                                    )
+                                            },
+                                        ))
+                                        .child(when(
+                                            move || operation.get().can_abort,
+                                            move || {
+                                                let on_abort = on_abort.clone();
+                                                let id = operation.get_untracked().id;
+                                                button()
+                                                    .on_press(move || {
+                                                        if !busy.get_untracked() {
+                                                            on_abort(&id);
+                                                        }
+                                                    })
+                                                    .min_h(px(28.0))
+                                                    .px(px(theme::SPACING_SM))
+                                                    .items_center()
+                                                    .child(
+                                                        text(copy::text("Abort", "中止", "中止"))
+                                                            .text_size(px(theme::font_micro()))
+                                                            .text_color(theme::accent_red),
+                                                    )
+                                            },
+                                        ))
+                                },
+                            ))
                     },
                 )),
         )
