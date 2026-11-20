@@ -292,6 +292,9 @@ pub struct SessionService {
     queue_paused_sessions: Rc<RefCell<std::collections::BTreeSet<String>>>,
     queued: Signal<Vec<QueuedMessageView>>,
     queue_paused: Signal<bool>,
+    schedule_open: Signal<bool>,
+    scheduled: Signal<bool>,
+    schedule_generation: Rc<Cell<u64>>,
     editable_sequence: Signal<i64>,
     editing: Signal<bool>,
     edit_state: Rc<RefCell<Option<EditState>>>,
@@ -455,6 +458,9 @@ impl SessionService {
             queue_paused_sessions: Rc::new(RefCell::new(loaded.1)),
             queued: signal(Vec::new()),
             queue_paused: signal(false),
+            schedule_open: signal(false),
+            scheduled: signal(false),
+            schedule_generation: Rc::new(Cell::new(0)),
             editable_sequence: signal(0),
             editing: signal(false),
             edit_state: Rc::new(RefCell::new(None)),
@@ -795,6 +801,24 @@ impl SessionService {
             on_move_queued: {
                 let service = self.clone();
                 Rc::new(move |id: u64, delta: isize| service.move_queued(id, delta))
+            },
+            schedule_open: self.schedule_open,
+            scheduled: self.scheduled,
+            on_open_schedule: {
+                let service = self.clone();
+                Rc::new(move || service.schedule_open.set(true))
+            },
+            on_close_schedule: {
+                let service = self.clone();
+                Rc::new(move || service.schedule_open.set(false))
+            },
+            on_schedule: {
+                let service = self.clone();
+                Rc::new(move |seconds: u64| service.schedule_message(seconds))
+            },
+            on_cancel_schedule: {
+                let service = self.clone();
+                Rc::new(move || service.cancel_scheduled())
             },
             on_clear_queue: {
                 let service = self.clone();
@@ -2319,6 +2343,44 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    fn schedule_message(&self, seconds: u64) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let text = self.draft.get_untracked().trim().to_owned();
+        let attachments = self.attachments.get_untracked();
+        if text.is_empty() && attachments.is_empty() {
+            return;
+        }
+        let mentions = self.armed_mentions_for(&text);
+        self.schedule_open.set(false);
+        self.scheduled.set(true);
+        let generation = self.schedule_generation.get().wrapping_add(1);
+        self.schedule_generation.set(generation);
+        let service = self.clone();
+        spawn(async move {
+            timer(Duration::from_secs(seconds)).await;
+            if service.schedule_generation.get() != generation
+                || service.active.get_untracked().as_deref() != Some(active.as_str())
+            {
+                return;
+            }
+            service.scheduled.set(false);
+            if service.draft.get_untracked() == text {
+                service.draft.set(String::new());
+                service.attachments.set(Vec::new());
+            }
+            service.armed_mentions.borrow_mut().clear();
+            service.deliver(text, attachments, mentions, false);
+        });
+    }
+
+    fn cancel_scheduled(&self) {
+        self.schedule_generation
+            .set(self.schedule_generation.get().wrapping_add(1));
+        self.scheduled.set(false);
     }
 
     fn enqueue(

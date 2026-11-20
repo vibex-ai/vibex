@@ -501,6 +501,13 @@ pub struct SessionHost {
     pub on_send_queued: Rc<dyn Fn(u64)>,
     pub on_remove_queued: Rc<dyn Fn(u64)>,
     pub on_move_queued: Rc<dyn Fn(u64, isize)>,
+    /// The scheduled-send menu and the prompt waiting on it.
+    pub schedule_open: Signal<bool>,
+    pub scheduled: Signal<bool>,
+    pub on_open_schedule: Action,
+    pub on_close_schedule: Action,
+    pub on_schedule: Rc<dyn Fn(u64)>,
+    pub on_cancel_schedule: Action,
     pub on_clear_queue: Action,
     pub on_toggle_queue_paused: Action,
     pub on_open_history: Action,
@@ -2412,6 +2419,12 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let on_send_queued = host.on_send_queued.clone();
     let on_remove_queued = host.on_remove_queued.clone();
     let on_move_queued = host.on_move_queued.clone();
+    let schedule_open = host.schedule_open;
+    let scheduled = host.scheduled;
+    let on_open_schedule = host.on_open_schedule.clone();
+    let on_close_schedule = host.on_close_schedule.clone();
+    let on_schedule = host.on_schedule.clone();
+    let on_cancel_schedule = host.on_cancel_schedule.clone();
     let on_clear_queue = host.on_clear_queue.clone();
     let on_toggle_queue_paused = host.on_toggle_queue_paused.clone();
     let editing = host.editing;
@@ -2530,6 +2543,35 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     }))
             }
         }))
+        .child(when(move || schedule_open.get(), {
+            let on_close_schedule = on_close_schedule.clone();
+            let on_schedule = on_schedule.clone();
+            move || schedule_picker(on_close_schedule.clone(), on_schedule.clone())
+        }))
+        .child(when(move || scheduled.get(), {
+            let on_cancel_schedule = on_cancel_schedule.clone();
+            move || {
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .px(px(theme::SPACING_SM))
+                    .py(px(theme::SPACING_XS))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::background_dim)
+                    .child(
+                        text(copy::text("Message scheduled", "消息已定时", "訊息已定時"))
+                            .flex_1()
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_secondary),
+                    )
+                    .child(small_action(copy::text("Cancel", "取消", "取消"), {
+                        let on_cancel_schedule = on_cancel_schedule.clone();
+                        move || on_cancel_schedule()
+                    }))
+            }
+        }))
         .child(when(move || !queued.with(|queued| queued.is_empty()), {
             move || {
                 queue_card(
@@ -2614,6 +2656,14 @@ fn composer(host: SessionHost) -> impl IntoElement {
                         move || on_attach_file(),
                     )
                 })
+                .child({
+                    let on_open_schedule = on_open_schedule.clone();
+                    action::icon_button(
+                        icon(include_str!("../../assets/icons/history.svg")),
+                        copy::text("Schedule message", "定时发送", "定時傳送"),
+                        move || on_open_schedule(),
+                    )
+                })
                 .child(when(move || running.get(), {
                     let on_interrupt = on_interrupt.clone();
                     move || {
@@ -2657,6 +2707,52 @@ fn composer(host: SessionHost) -> impl IntoElement {
 }
 
 /// The prompts written ahead of the running turn.
+fn schedule_picker(on_close: Action, on_schedule: Rc<dyn Fn(u64)>) -> impl IntoElement {
+    let choices = [
+        (
+            copy::text("In 5 minutes", "5 分钟后", "5 分鐘後"),
+            5 * 60u64,
+        ),
+        (
+            copy::text("In 30 minutes", "30 分钟后", "30 分鐘後"),
+            30 * 60u64,
+        ),
+        (copy::text("In 1 hour", "1 小时后", "1 小時後"), 60 * 60u64),
+    ];
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_SM))
+        .py(px(theme::SPACING_XS))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .bg(theme::background_dim)
+        .child(
+            text(copy::text("Send later", "稍后发送", "稍後傳送"))
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_secondary),
+        )
+        .child(each(
+            move || {
+                choices
+                    .iter()
+                    .map(|(label, seconds)| (*label, *seconds))
+                    .collect::<Vec<_>>()
+            },
+            |(_, seconds)| *seconds,
+            move |choice, _| {
+                let (label, seconds) = choice.get_untracked();
+                let on_schedule = on_schedule.clone();
+                small_action(label, move || on_schedule(seconds))
+            },
+        ))
+        .child(small_action(
+            copy::text("Close", "关闭", "關閉"),
+            move || on_close(),
+        ))
+}
+
 fn queue_card(
     queued: Signal<Vec<QueuedMessageView>>,
     paused: Signal<bool>,

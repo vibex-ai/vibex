@@ -399,6 +399,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let queued = signal(Vec::new());
     let queue_paused = signal(false);
     let editable_sequence = signal(0);
+    let schedule_open = signal(false);
+    let scheduled = signal(false);
     let editing = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
@@ -775,6 +777,15 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_send_queued: Rc::new(|_| {}),
         on_remove_queued: Rc::new(|_| {}),
         on_move_queued: Rc::new(|_, _| {}),
+        schedule_open,
+        scheduled,
+        on_open_schedule: Rc::new(move || schedule_open.set(true)),
+        on_close_schedule: Rc::new(move || schedule_open.set(false)),
+        on_schedule: Rc::new(move |_| {
+            schedule_open.set(false);
+            scheduled.set(true);
+        }),
+        on_cancel_schedule: Rc::new(move || scheduled.set(false)),
         on_clear_queue: Rc::new(|| {}),
         on_toggle_queue_paused: Rc::new(|| {}),
         on_open_history: Rc::new(|| {}),
@@ -1093,6 +1104,16 @@ fn the_drawer_selects_sessions_for_a_batch() {
     app.press("Done").unwrap();
     app.wait_for_gone("Archive", std::time::Duration::from_secs(5))
         .unwrap();
+}
+
+#[test]
+fn a_message_can_be_scheduled() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "Later").unwrap();
+    app.press("role:button[Schedule message]").unwrap();
+    app.wait_for("In 5 minutes").unwrap();
+    app.press("In 5 minutes").unwrap();
+    app.wait_for("Message scheduled").unwrap();
 }
 
 #[test]
