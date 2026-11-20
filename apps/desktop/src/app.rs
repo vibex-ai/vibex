@@ -6456,6 +6456,13 @@ pub struct SessionView {
     /// `None` while the width is still moving, which is also what marks the
     /// hints as lost and asks for the next seed.
     timeline_list_hint_width: Option<Pixels>,
+    /// The turn ids the list's rows were last synced against, in row order.
+    ///
+    /// A count change alone cannot say *which* rows moved: an append keeps every
+    /// row above it, a prepend shifts them all. Comparing the ids tells the sync
+    /// whether it may splice the ends — keeping the measured heights of the rows
+    /// the reader is holding — or has to re-seed the whole table.
+    timeline_list_synced_turn_ids: Vec<String>,
     /// What the last transcript frame left the list at, and how far the wheel
     /// has asked it to move since.
     ///
@@ -6717,6 +6724,7 @@ impl SessionView {
             timeline_viewport: Bounds::default(),
             timeline_list_seen_width: px(0.0),
             timeline_list_hint_width: None,
+            timeline_list_synced_turn_ids: Vec::new(),
             timeline_trace: TimelineScrollTrace::default(),
             pending_timeline_reveal_delta: px(0.0),
             timeline_row_sizes: Rc::new(Vec::new()),
@@ -33045,7 +33053,50 @@ impl VibexWorkbench {
             self.timeline_list_hint_width = None;
         }
         let hints_missing = width > px(0.0) && self.timeline_list_hint_width != Some(width);
-        if rows == count && !hints_missing {
+        let turn_ids: Vec<String> = self
+            .conversation_turns_cache
+            .iter()
+            .map(|turn| turn.id.clone())
+            .collect();
+        let ids_changed = turn_ids != self.timeline_list_synced_turn_ids;
+        if rows == count && !hints_missing && !ids_changed {
+            return;
+        }
+        // A splice appended rows the list has not measured, so the hints are
+        // marked lost. But the count now agrees and the ids are unchanged: the
+        // rows above the reader still hold their measured heights, and the new
+        // rows sit below the fold. Re-seeding the whole table here would re-hint
+        // those measured rows with the mean and move the reader's place a second
+        // time. Leave the list alone — the appended rows measure themselves when
+        // they scroll into view — and record the width so the next frame does
+        // not reset either. A genuine width wipe still goes through the reset
+        // below, because there the list has already dropped every hint itself.
+        if hints_missing && !width_changed && rows == count && rows > 0 && !ids_changed {
+            self.timeline_list_hint_width = Some(width);
+            return;
+        }
+        // A pure append splices the new rows onto the end instead of resetting
+        // the whole table. `reset_with_uniform_height` re-hints *every* row with
+        // the mean height, including the measured ones above the reader: the
+        // list resolves their offset through those hints, so a turn arriving
+        // below the fold moved the reader's place by the difference between the
+        // mean and what those rows really measure — a jump on every live turn
+        // while the session runs. A splice keeps the untouched rows' measured
+        // heights and leaves the anchor alone (the append is below it), so the
+        // reader stays exactly on the row they were reading. A prepend or a
+        // mid-window replacement still resets: those shift the indices the
+        // measured heights sit at, and the captured anchor is the tool for them.
+        let splice_ends = !hints_missing && rows != count && count > 0 && rows > 0 && {
+            let previous = &self.timeline_list_synced_turn_ids;
+            previous.len() == count && rows > count && turn_ids[..count] == previous[..]
+        };
+        if splice_ends {
+            self.timeline_scroll.splice(count..count, rows - count);
+            self.timeline_list_synced_turn_ids = turn_ids;
+            // The spliced rows carry no hint yet. Mark the hints lost so the
+            // next frame runs; it finds the count agreeing and the ids
+            // unchanged, and records the width without re-seeding (above).
+            self.timeline_list_hint_width = None;
             return;
         }
         // A row the list has never measured contributes nothing to the extent,
@@ -33071,6 +33122,7 @@ impl VibexWorkbench {
             Some(anchor) => self.timeline_scroll.scroll_to(anchor),
             None => self.timeline_scroll.scroll_to_end(),
         }
+        self.timeline_list_synced_turn_ids = turn_ids;
         // The hints only survive a layout that sees the same width as the last
         // one, which is why a width this frame changed is not recorded: the next
         // frame seeds again and its layout keeps the result.

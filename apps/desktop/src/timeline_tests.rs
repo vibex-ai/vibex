@@ -4654,9 +4654,12 @@ fn a_turn_arriving_while_scrolled_up_keeps_the_readers_place(cx: &mut TestAppCon
         anchor_after.offset_in_item, anchor_before.offset_in_item,
         "an appended turn moved the reader inside their row"
     );
-    assert!(
-        (after - before).abs() <= px(200.0),
-        "the seeded document moved the reader by more than a row: {before:?} -> {after:?}"
+    // The append splices the new row onto the end instead of re-seeding the
+    // whole table, so the measured rows above the reader keep their heights:
+    // the pixel offset — not just the logical anchor — stays exactly put.
+    assert_eq!(
+        after, before,
+        "an appended turn must not move the reader's pixel offset: {before:?} -> {after:?}"
     );
 }
 

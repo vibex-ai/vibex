@@ -314,6 +314,18 @@ interval between the borrowed frame and the landing from reading as a bounce:
 | A restore keeps the measured turn heights as the seed (`refresh_borrowed_view_geometry`): a stale row-table stamp rebuilds the table against the current projection, and a content-width change retargets it (`retarget_timeline_layout_width`). Neither wipes the measurements. | Wiping them routes the whole restored view through character-count estimates for a frame. On the bottom edge the scroll offset is resolved from the table itself, so that frame is a visible jump; the next prepaint corrects whatever the replacement changed. |
 | The anchor's identity across a window change is its sequence range, not the turn id (`prepared_window_loses_reader_anchor`). | A page landing above the reader renames the leading turn; the range still overlaps the turn the reader was holding. |
 
+## 5b-sexies. A live turn arriving must not move a scrolled-up reader
+
+A running session appends turns while the reader is scrolled up into the
+history. The list learns a new row count only through a mutation, and the
+mutation chosen decides whether the reader moves:
+
+| Rule | Why |
+| --- | --- |
+| A pure append splices the new rows onto the end (`sync_timeline_list_rows`, keyed on `timeline_list_synced_turn_ids`) instead of `reset_with_uniform_height`. | The uniform reset re-hints *every* row with the mean height, including the measured ones above the reader. The list resolves their pixel offset through those hints, so each live turn moved the reader by the difference between the mean and what those rows really measure — a jump on every turn while the session runs. A splice keeps the untouched rows' measured heights and shifts the list's own anchor by the count delta. |
+| After a splice, the next frame does not re-seed the table: the count agrees and the ids are unchanged, so the sync records the width and returns. | The appended rows sit below the fold and measure themselves when they scroll into view. Re-seeding would re-hint the measured rows a second time and undo the splice. A genuine width wipe still resets, because there the list has already dropped every hint itself. |
+| Only appends splice; a prepend or a mid-window replacement still resets and restores the captured anchor. | A prepend shifts every row index, so the measured heights no longer sit at the indices the list holds them at; the anchor restore is the correct tool there (§5b). |
+
 ## 5c. One transcript surface per session
 
 `TimelineSurfaceView` mounts the list, so it is the view that paints a pane's
@@ -361,6 +373,9 @@ Rules that follow:
   the refused window leaves the borrowed view and the anchor untouched, the
   covering answer installs, and a restore whose table stamp is stale keeps its
   measured extents frame for frame.
+- `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` pins §5b-sexies
+  at the pixel level: an appended turn leaves the reader's offset exactly put,
+  not merely within a row's tolerance.
 
 ## 7. Sidebar list migration
 
