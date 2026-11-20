@@ -2654,22 +2654,46 @@ impl SessionService {
         attachments: Vec<AttachmentItem>,
         mentions: Vec<VibexUseMention>,
     ) {
-        self.draft.set(String::new());
-        self.attachments.set(Vec::new());
-        self.armed_mentions.borrow_mut().clear();
-        self.sidebar_mutation(RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
-            session_id: session,
-            text,
-            attachments: attachments
-                .iter()
-                .map(|attachment| MessageAttachment {
-                    label: attachment.label.clone(),
-                    mime_type: Some(attachment.mime_type.clone()),
-                    uri: Some(attachment.uri.clone()),
-                    inline_text_offset: None,
-                })
-                .collect(),
-            mentions,
+        let revision = self.sidebar_snapshot.borrow().revision;
+        let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        let sent_text = text.clone();
+        spawn(async move {
+            let mutation = RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
+                session_id: session,
+                text,
+                attachments: attachments
+                    .iter()
+                    .map(|attachment| MessageAttachment {
+                        label: attachment.label.clone(),
+                        mime_type: Some(attachment.mime_type.clone()),
+                        uri: Some(attachment.uri.clone()),
+                        inline_text_offset: None,
+                    })
+                    .collect(),
+                mentions,
+            };
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    service.apply_sidebar(snapshot);
+                    if service.draft.get_untracked() == sent_text {
+                        service.draft.set(String::new());
+                        service.attachments.set(Vec::new());
+                    }
+                    service.armed_mentions.borrow_mut().clear();
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_queue_task_failed",
+                    format!("queueing the message did not finish: {error}"),
+                )),
+            }
         });
     }
 
