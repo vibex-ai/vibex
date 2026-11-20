@@ -4179,6 +4179,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let active = host.active;
     let collapsed_projects = host.collapsed_projects;
     let on_set_project_collapsed = host.on_set_project_collapsed.clone();
+    let collapsed_workspaces = host.collapsed_workspaces;
+    let on_set_workspace_collapsed = host.on_set_workspace_collapsed.clone();
     let search_open = signal(false);
     let query = signal(String::new());
     let select_mode = signal(false);
@@ -4483,6 +4485,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             project_order,
                                             workspace_order,
                                             session_order,
+                                            collapsed_workspaces,
                                         )
                                     },
                                     |group| group.id.clone(),
@@ -4502,6 +4505,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             selected,
                                             pinned,
                                             unread,
+                                            collapsed_workspaces,
+                                            on_set_workspace_collapsed.clone(),
                                         )
                                     },
                                 )),
@@ -4626,7 +4631,11 @@ struct DrawerGroup {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum DrawerRow {
-    Header { id: String, name: String },
+    Header {
+        id: String,
+        name: String,
+        workspace: Option<String>,
+    },
     Session(SessionSummary),
 }
 
@@ -4639,6 +4648,7 @@ impl DrawerRow {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drawer_groups(
     sessions: Signal<Vec<SessionSummary>>,
     query: Signal<String>,
@@ -4647,6 +4657,7 @@ fn drawer_groups(
     project_order: Signal<Vec<String>>,
     workspace_order: Signal<Vec<(String, Vec<String>)>>,
     session_order: Signal<Vec<String>>,
+    collapsed_workspaces: Signal<Vec<String>>,
 ) -> Vec<DrawerGroup> {
     sessions.with(|sessions| {
         let pinned_ids = pinned.get_untracked();
@@ -4654,6 +4665,7 @@ fn drawer_groups(
         let project_rank = project_order.get_untracked();
         let workspace_rank = workspace_order.get_untracked();
         let session_rank = session_order.get_untracked();
+        let collapsed_workspaces = collapsed_workspaces.get_untracked();
         let query = query.with(|query| query.trim().to_lowercase());
         let _ = &query;
         let mut groups: Vec<DrawerGroup> = Vec::new();
@@ -4730,10 +4742,13 @@ fn drawer_groups(
                     rows.push(DrawerRow::Header {
                         id: format!("{}:{key}", group.id),
                         name: label,
+                        workspace: Some(key.clone()),
                     });
-                    current = Some(key);
+                    current = Some(key.clone());
                 }
-                rows.push(DrawerRow::Session(session));
+                if !collapsed_workspaces.iter().any(|id| id == &key) {
+                    rows.push(DrawerRow::Session(session));
+                }
             }
             group.rows = rows;
         }
@@ -5240,6 +5255,8 @@ fn drawer_group(
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
     unread: Signal<Vec<String>>,
+    collapsed_workspaces: Signal<Vec<String>>,
+    on_workspace_collapse: SessionToggle,
 ) -> impl IntoElement {
     let closed = computed(move || {
         let id = group.with(|group| group.id.clone());
@@ -5287,6 +5304,7 @@ fn drawer_group(
             move || {
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
+                let on_workspace_collapse = on_workspace_collapse.clone();
                 view().w_full().flex_col().gap(px(2.0)).child(each(
                     move || group.with(|group| group.rows.clone()),
                     |row| row.key(),
@@ -5294,16 +5312,39 @@ fn drawer_group(
                         let on_select = on_select.clone();
                         let on_menu = on_menu.clone();
                         match row.get_untracked() {
-                            DrawerRow::Header { name, .. } => view()
-                                .w_full()
-                                .px(px(theme::SPACING_LG))
-                                .pt(px(4.0))
-                                .child(
-                                    text(name)
-                                        .text_size(px(theme::font_micro()))
-                                        .text_color(theme::text_muted),
-                                )
-                                .into_element(),
+                            DrawerRow::Header {
+                                name, workspace, ..
+                            } => {
+                                let on_workspace_collapse = on_workspace_collapse.clone();
+                                let collapsed_workspaces = collapsed_workspaces;
+                                let collapsed = workspace.as_ref().is_some_and(|id| {
+                                    collapsed_workspaces.with(|ids| ids.contains(id))
+                                });
+                                let toggle_workspace = workspace.clone();
+                                button()
+                                    .on_press(move || {
+                                        if let Some(workspace) = toggle_workspace.clone() {
+                                            on_workspace_collapse(&workspace, !collapsed);
+                                        }
+                                    })
+                                    .w_full()
+                                    .px(px(theme::SPACING_LG))
+                                    .pt(px(4.0))
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(2.0))
+                                    .child(
+                                        text(if collapsed { "▸" } else { "▾" })
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_muted),
+                                    )
+                                    .child(
+                                        text(name)
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_muted),
+                                    )
+                                    .into_element()
+                            }
                             DrawerRow::Session(session) => {
                                 let session = signal(session);
                                 session_row(
