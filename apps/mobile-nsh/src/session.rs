@@ -27,21 +27,22 @@ use vibex_backend::{
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, AgentGoalControlRequest,
     AgentNotificationKind, AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage,
-    ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
-    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind,
-    FileReadRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
-    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
-    GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
+    ApprovalResponder, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue,
+    ElicitationField, ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus,
+    ElicitationResolution, ElicitationResolutionAction, FetchTimelineItemRequest,
+    FetchTimelineRequest, FilePreviewKind, FileReadRequest, FileTreeRequest,
+    ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
+    GitDiffRequest, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
+    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GoalAction, GoalPhase,
+    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest,
+    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
+    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -219,6 +220,7 @@ pub struct SessionService {
     runtime_open: Signal<bool>,
     runtime_busy: Signal<bool>,
     token_usage: Signal<Option<TokenUsageView>>,
+    needs_continue: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
@@ -357,6 +359,7 @@ impl SessionService {
             runtime_open: signal(false),
             runtime_busy: signal(false),
             token_usage: signal(None),
+            needs_continue: signal(false),
             plan: signal(None),
             goal: signal(None),
             history: signal(Vec::new()),
@@ -571,6 +574,11 @@ impl SessionService {
             runtime_open: self.runtime_open,
             runtime_busy: self.runtime_busy,
             token_usage: self.token_usage,
+            needs_continue: self.needs_continue,
+            on_continue_turn: {
+                let service = self.clone();
+                Rc::new(move || service.continue_turn())
+            },
             plan: self.plan,
             goal: self.goal,
             history: self.history,
@@ -1713,6 +1721,38 @@ impl SessionService {
         self.apply_selection(selection);
     }
 
+    /// Starts the next turn the runtime was waiting to continue.
+    fn continue_turn(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let request_session = session_id.clone();
+            let result = background(async move {
+                backend
+                    .continue_turn(MutationRequest::new(ContinueAgentTurnRequest {
+                        session_id: request_session,
+                        correlation_id: None,
+                    }))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(_)) => service.reload(&session_id),
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("continuing the turn did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
     /// Pauses, resumes or clears the session's goal.
     fn control_goal(&self, control: GoalControl) {
         let Some(active) = self.active.get_untracked() else {
@@ -2201,6 +2241,12 @@ impl SessionService {
                 entries.push(live_turn_entry(turn));
             }
         }
+        let latest_ended_normally = turns
+            .last()
+            .is_some_and(|turn| turn.complete && !turn.failed && !turn.pending_permission);
+        let needs_continue = state.is_some_and(|state| {
+            vibex_core::agent_session_turn_requires_continuation(state, Some(latest_ended_normally))
+        });
         let plan = plan_view(&model.items);
         let goal = goal_view(&model.items);
         let editable = turns
@@ -2216,6 +2262,7 @@ impl SessionService {
         self.timeline.set(entries);
         self.plan.set(plan);
         self.goal.set(goal);
+        self.needs_continue.set(needs_continue);
         self.editable_sequence.set(editable);
         self.refresh_pending();
     }

@@ -510,6 +510,9 @@ pub struct SessionHost {
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
     /// Opens a row's full detail, by row id and sequence.
     pub on_toggle_detail: ToggleDetail,
+    /// Whether the last turn needs an explicit continue, and the action for it.
+    pub needs_continue: Signal<bool>,
+    pub on_continue_turn: Action,
     /// Reads the page above the transcript.
     pub on_load_older: Action,
     /// Forks the conversation through a row's sequence.
@@ -2131,6 +2134,8 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let on_cancel_edit = host.on_cancel_edit.clone();
     let on_replace_message = host.on_replace_message.clone();
     let on_goal_control = host.on_goal_control.clone();
+    let needs_continue = host.needs_continue;
+    let on_continue_turn = host.on_continue_turn.clone();
     let plan_open = signal(false);
     let on_open_runtime = host.on_open_runtime.clone();
     let running = computed(move || {
@@ -2180,6 +2185,39 @@ fn composer(host: SessionHost) -> impl IntoElement {
             move || !attachments.with(|attachments| attachments.is_empty()),
             move || attachment_chips(attachments, on_remove_attachment.clone()),
         ))
+        .child(when(move || needs_continue.get(), {
+            let on_continue_turn = on_continue_turn.clone();
+            move || {
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .px(px(theme::SPACING_SM))
+                    .py(px(theme::SPACING_XS))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::background_dim)
+                    .child(
+                        text(copy::text(
+                            "The last turn was paused.",
+                            "上一回合已暂停。",
+                            "上一回合已暫停。",
+                        ))
+                        .flex_1()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_secondary),
+                    )
+                    .child(action::secondary(
+                        copy::text("Continue", "继续", "繼續"),
+                        icon(include_str!("../../assets/icons/send.svg")),
+                        false,
+                        {
+                            let on_continue_turn = on_continue_turn.clone();
+                            move || on_continue_turn()
+                        },
+                    ))
+            }
+        }))
         .child(when(move || editing.get(), {
             let on_cancel_edit = on_cancel_edit.clone();
             move || {

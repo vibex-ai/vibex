@@ -239,6 +239,7 @@ fn RuntimeShell() -> impl IntoElement {
         label: "Default".to_owned(),
         selected: false,
     }]);
+    host.needs_continue = signal(true);
     host.token_usage = signal(Some(TokenUsageView {
         percent: Some(42),
         used: 42_000,
@@ -328,6 +329,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
     let token_usage = signal(None);
+    let needs_continue = signal(false);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -669,6 +671,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         runtime_open,
         runtime_busy,
         token_usage,
+        needs_continue,
+        on_continue_turn: Rc::new(|| {}),
         plan,
         goal,
         history,
@@ -855,6 +859,7 @@ fn the_composer_opens_the_runtime_choices() {
     app.wait_for("Claude 4").unwrap();
     app.wait_for("42%").unwrap();
     assert!(app.screen().shows("Ship P1"));
+    assert!(app.screen().shows("Continue"));
     assert!(app.screen().shows("Current plan"));
     assert!(app.screen().shows("Pause"));
     assert!(app.screen().shows("Queued · 1"));
