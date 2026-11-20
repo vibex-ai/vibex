@@ -34,8 +34,8 @@ use vibex_core::{
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
-    FileSearchRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
-    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
+    FileSearchRequest, FileTreeRequest, ForkAgentSessionRequest, GitBranchCheckoutRequest,
+    GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
     GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitRemoteActionKind,
     GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
     GitWorktreeConflictResolveRequest, GitWorktreeConflictVersion, GitWorktreeCreateRequest,
@@ -6071,9 +6071,38 @@ impl SessionService {
     }
 
     fn select_git_branch(&self, name: &str) {
-        *self.git_history_ref.borrow_mut() = Some(name.to_owned());
         self.git_branch_menu.set(false);
-        self.load_git_history();
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        let name = name.to_owned();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                git.git_branch_checkout(MutationRequest::new(GitBranchCheckoutRequest {
+                    workspace_id: workspace,
+                    name,
+                }))
+                .await
+            })
+            .await;
+            match result {
+                Ok(Ok(status)) => {
+                    service
+                        .git_branch
+                        .set(Some(status.branch.clone().unwrap_or_default().into()));
+                    *service.git_history_ref.borrow_mut() = None;
+                    service.load_git_branches();
+                    service.refresh_git();
+                }
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("switching the branch did not finish: {error}").into(),
+                )),
+            }
+        });
     }
 
     /// Fetches, pulls or pushes the open workspace's branch.

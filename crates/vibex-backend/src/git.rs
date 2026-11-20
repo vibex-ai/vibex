@@ -140,6 +140,19 @@ pub trait GitBackend: BackendBound {
         workspace_id: WorkspaceId,
     ) -> BackendFuture<'_, GitBranchListResponse>;
 
+    fn git_branch_checkout(
+        &self,
+        request: MutationRequest<vibex_core::GitBranchCheckoutRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        let _ = request;
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "git_branch_checkout_unavailable",
+                "Branch checkout is unavailable on this backend",
+            ))
+        })
+    }
+
     /// Renames the branch backing a managed worktree.
     fn git_worktree_rename_branch(
         &self,

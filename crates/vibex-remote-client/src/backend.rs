@@ -44,19 +44,19 @@ use vibex_core::{
     CreateAgentSessionRequest, DiagnosticExportOutcome, DiagnosticExportPayload,
     FetchTimelineRequest, FileMutationRequest, FileReadRequest, FileReadResponse,
     FileSearchRequest, FileSearchResult, FileTreeEntry, FileTreeRequest, FileWriteRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchListResponse, GitCommitDetail,
-    GitCommitDetailRequest, GitCommitRequest, GitCommitResult, GitDiffRequest, GitDiffResponse,
-    GitHistoryRequest, GitHistoryResponse, GitProjectEligibility, GitRemoteActionRequest,
-    GitRemoteActionResult, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
-    GitWorktreeAssistanceSessionRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictStageRequest, GitWorktreeCreateRequest, GitWorktreeCreateResult,
-    GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest, GitWorktreeLifecycleSnapshot,
-    GitWorktreeMergePlan, GitWorktreeMergeRequest, GitWorktreeOperationRecord,
-    GitWorktreeOperationRequest, GitWorktreeReadinessRecord, GitWorktreeReadinessRequest,
-    GitWorktreeRestoreRequest, ManagementSnapshotPayload, MessageSubmissionState,
-    OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary, ProviderConfiguredModel,
-    ProviderHealthSummary, ProviderNativeExportApplyRequest, ProviderNativeExportApplyResult,
-    ProviderNativeExportListRequest, ProviderNativeExportPreview,
+    ForkAgentSessionRequest, GetMessageSubmissionRequest, GitBranchCheckoutRequest,
+    GitBranchListResponse, GitCommitDetail, GitCommitDetailRequest, GitCommitRequest,
+    GitCommitResult, GitDiffRequest, GitDiffResponse, GitHistoryRequest, GitHistoryResponse,
+    GitProjectEligibility, GitRemoteActionRequest, GitRemoteActionResult, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeAssistanceSessionRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictStageRequest, GitWorktreeCreateRequest,
+    GitWorktreeCreateResult, GitWorktreeDestructivePreflight, GitWorktreeDiscardRequest,
+    GitWorktreeLifecycleSnapshot, GitWorktreeMergePlan, GitWorktreeMergeRequest,
+    GitWorktreeOperationRecord, GitWorktreeOperationRequest, GitWorktreeReadinessRecord,
+    GitWorktreeReadinessRequest, GitWorktreeRestoreRequest, ManagementSnapshotPayload,
+    MessageSubmissionState, OpenWorkspaceRequest, ProjectId, ProjectWorkspaceSummary,
+    ProviderConfiguredModel, ProviderHealthSummary, ProviderNativeExportApplyRequest,
+    ProviderNativeExportApplyResult, ProviderNativeExportListRequest, ProviderNativeExportPreview,
     ProviderNativeExportPreviewRequest, ProviderNativeExportRecordSummary,
     ProviderNativeExportRollbackRequest, ProviderNativeExportRollbackResult,
     ProviderNativeImportCreateRequest, ProviderNativeImportCreateResult,
@@ -100,17 +100,17 @@ use vibex_core::{
     RemoteFileDeleteResponse, RemoteFileMutationRequest, RemoteFileReadRequest,
     RemoteFileReadResponse, RemoteFileRenameResponse, RemoteFileSearchRequest,
     RemoteFileSearchResponse, RemoteFileTreeRequest, RemoteFileTreeResponse,
-    RemoteFileWriteRequest, RemoteFileWriteResponse, RemoteGitBranchListRequest,
-    RemoteGitBranchListResponse, RemoteGitCommitDetailRequest, RemoteGitCommitDetailResponse,
-    RemoteGitCommitRequest, RemoteGitCommitResponse, RemoteGitDiffRequest, RemoteGitDiffResponse,
-    RemoteGitHistoryRequest, RemoteGitHistoryResponse, RemoteGitRemoteActionRequest,
-    RemoteGitRemoteActionResponse, RemoteGitStageRequest, RemoteGitStatusMutationResponse,
-    RemoteGitStatusRequest, RemoteGitStatusResponse, RemoteGitWorktreeEligibilityRequest,
-    RemoteGitWorktreeEligibilityResponse, RemoteGitWorktreeRenameBranchRequest,
-    RemoteGitWorktreeSnapshotRequest, RemoteGitWorktreeSnapshotResponse, RemoteOperationKind,
-    RemotePairingOfferSummary, RemoteProviderHealthSummaryListRequest,
-    RemoteProviderHealthSummaryListResponse, RemoteProviderManagementSnapshot,
-    RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
+    RemoteFileWriteRequest, RemoteFileWriteResponse, RemoteGitBranchCheckoutRequest,
+    RemoteGitBranchListRequest, RemoteGitBranchListResponse, RemoteGitCommitDetailRequest,
+    RemoteGitCommitDetailResponse, RemoteGitCommitRequest, RemoteGitCommitResponse,
+    RemoteGitDiffRequest, RemoteGitDiffResponse, RemoteGitHistoryRequest, RemoteGitHistoryResponse,
+    RemoteGitRemoteActionRequest, RemoteGitRemoteActionResponse, RemoteGitStageRequest,
+    RemoteGitStatusMutationResponse, RemoteGitStatusRequest, RemoteGitStatusResponse,
+    RemoteGitWorktreeEligibilityRequest, RemoteGitWorktreeEligibilityResponse,
+    RemoteGitWorktreeRenameBranchRequest, RemoteGitWorktreeSnapshotRequest,
+    RemoteGitWorktreeSnapshotResponse, RemoteOperationKind, RemotePairingOfferSummary,
+    RemoteProviderHealthSummaryListRequest, RemoteProviderHealthSummaryListResponse,
+    RemoteProviderManagementSnapshot, RemoteProviderRequest, RemoteProviderRunHealthProbesRequest,
     RemoteProviderRunHealthProbesResponse, RemoteRenameDeviceRequest, RemoteRevokeDeviceRequest,
     RemoteTerminalCreateRequest, RemoteTerminalCreateResponse, RemoteTerminalKillRequest,
     RemoteTerminalKillResponse, RemoteTerminalListRequest, RemoteTerminalListResponse,
@@ -3122,6 +3122,41 @@ impl GitBackend for WebRemoteBackend {
                 ));
             }
             Ok(branches)
+        })
+    }
+
+    fn git_branch_checkout(
+        &self,
+        request: MutationRequest<GitBranchCheckoutRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let workspace_id = request.payload.workspace_id.clone();
+            let request_id = request.request_id.clone();
+            let key = Self::mutation_key(&request);
+            let payload =
+                RemoteWorkbenchRequest::GitBranchCheckout(RemoteGitBranchCheckoutRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::Git,
+                    payload,
+                    Some(request_id),
+                    Some((&key, None, None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            let status = decode::<RemoteGitStatusMutationResponse>(value)?.status;
+            if status.workspace_id != workspace_id {
+                return Err(BackendError::failed(
+                    "remote_git_workspace_mismatch",
+                    "remote Git response workspace does not match the request",
+                ));
+            }
+            Ok(status)
         })
     }
 

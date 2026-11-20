@@ -2074,6 +2074,27 @@ impl GitBackend for NativeBackend {
         })
     }
 
+    fn git_branch_checkout(
+        &self,
+        request: MutationRequest<vibex_core::GitBranchCheckoutRequest>,
+    ) -> BackendFuture<'_, GitStatusSummary> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            let git = runtime.git();
+            tokio::task::spawn_blocking(move || git.branch_checkout(&request.payload))
+                .await
+                .map_err(|_| {
+                    BackendError::failed(
+                        "git_branch_checkout_task_failed",
+                        "the branch checkout task did not complete",
+                    )
+                })?
+                .map_err(Into::into)
+        })
+    }
+
     fn git_worktree_rename_branch(
         &self,
         workspace_id: WorkspaceId,
