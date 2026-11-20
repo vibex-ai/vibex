@@ -506,6 +506,11 @@ impl PairingService {
         self.connected_label
     }
 
+    /// The saved runtimes, for the settings sheet's runtime actions.
+    pub fn saved(&self) -> Signal<Vec<SavedRuntime>> {
+        self.saved
+    }
+
     /// The runtime the page is connected to.
     pub fn connected(&self) -> Signal<Option<ConnectedRuntime>> {
         self.connected

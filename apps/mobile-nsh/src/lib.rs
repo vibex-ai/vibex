@@ -107,7 +107,7 @@ pub fn App() -> impl IntoElement {
         let open = settings_open;
         Rc::new(move || open.set(true))
     };
-    let settings_host = settings_host(&pairing, &settings, settings_open);
+    let settings_host = settings_host(&pairing, &settings, settings_open, services);
 
     view()
         .flex_1()
@@ -221,6 +221,7 @@ fn settings_host(
     pairing: &PairingService,
     settings: &SettingsState,
     open: Signal<bool>,
+    services: Signal<Option<Rc<SessionService>>>,
 ) -> SettingsHost {
     let appearance = settings.appearance;
     let language = settings.language;
@@ -242,6 +243,7 @@ fn settings_host(
         keep_screen_on,
         font_scale,
         runtime: pairing.connected_label(),
+        saved: pairing.saved(),
         on_appearance: Rc::new(move |appearance| {
             settings_for_appearance.set_appearance(appearance);
         }),
@@ -258,6 +260,15 @@ fn settings_host(
             settings_for_text.set_font_scale(percent);
         }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
+        on_reconnect: Rc::new(move || {
+            if let Some(service) = services.get_untracked() {
+                service.retry();
+            }
+        }),
+        on_switch_runtime: {
+            let pairing = pairing.clone();
+            Rc::new(move || pairing.open_switcher())
+        },
         on_clear_runtimes: Rc::new(move || pairing_for_clear.clear_runtimes()),
         on_close: { Rc::new(move || open.set(false)) },
     }

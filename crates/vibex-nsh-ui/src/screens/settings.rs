@@ -30,12 +30,16 @@ pub struct SettingsHost {
     pub font_scale: Signal<u32>,
     /// The connected runtime's label, when there is one.
     pub runtime: Signal<Option<SharedString>>,
+    /// The runtimes this phone saved, for the runtime actions.
+    pub saved: Signal<Vec<crate::screens::pairing::SavedRuntime>>,
     pub on_appearance: Rc<dyn Fn(Appearance)>,
     pub on_language: Rc<dyn Fn(copy::LanguagePreference)>,
     pub on_haptics: Rc<dyn Fn(bool)>,
     pub on_keep_screen_on: Rc<dyn Fn(bool)>,
     pub on_font_scale: Rc<dyn Fn(u32)>,
     pub on_disconnect: Rc<dyn Fn()>,
+    pub on_reconnect: Rc<dyn Fn()>,
+    pub on_switch_runtime: Rc<dyn Fn()>,
     pub on_clear_runtimes: Rc<dyn Fn()>,
     pub on_close: Rc<dyn Fn()>,
 }
@@ -111,20 +115,23 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                             "AGPL-3.0-or-later".to_owned()
                         })),
                 ))
-                .child({
+                .child(when(move || !host.saved.with(|saved| saved.is_empty()), {
                     let on_clear = host.on_clear_runtimes.clone();
-                    action::secondary(
-                        copy::text(
-                            "Remove saved runtimes",
-                            "移除已保存的运行时",
-                            "移除已儲存的執行環境",
-                        ),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || on_clear(),
-                    )
-                    .w_full()
-                })
+                    move || {
+                        let on_clear = on_clear.clone();
+                        action::secondary(
+                            copy::text(
+                                "Remove saved runtimes",
+                                "移除已保存的运行时",
+                                "移除已儲存的執行環境",
+                            ),
+                            icon(include_str!("../../assets/icons/x.svg")),
+                            false,
+                            move || on_clear(),
+                        )
+                        .w_full()
+                    }
+                }))
                 .child({
                     let on_close = on_close.clone();
                     action::secondary(
@@ -154,19 +161,53 @@ fn runtime_section(host: SettingsHost) -> impl IntoElement {
                     .unwrap_or_else(|| copy::text("Not connected", "未连接", "未連線").to_owned())
             },
         ))
-        .child(when(
-            move || runtime.get().is_some(),
+        .child(when(move || runtime.get().is_some(), {
+            let on_reconnect = host.on_reconnect.clone();
+            let on_switch = host.on_switch_runtime.clone();
+            let on_disconnect = on_disconnect.clone();
             move || {
-                let on_disconnect = on_disconnect.clone();
-                action::secondary(
-                    copy::text("Disconnect", "断开连接", "中斷連線"),
-                    icon(include_str!("../../assets/icons/plug-zap.svg")),
-                    false,
-                    move || on_disconnect(),
-                )
-                .w_full()
-            },
-        ))
+                view()
+                    .w_full()
+                    .flex_col()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        action::secondary(
+                            copy::text("Reconnect", "重新连接", "重新連線"),
+                            icon(include_str!("../../assets/icons/refresh.svg")),
+                            false,
+                            {
+                                let on_reconnect = on_reconnect.clone();
+                                move || on_reconnect()
+                            },
+                        )
+                        .w_full(),
+                    )
+                    .child(
+                        action::secondary(
+                            copy::text("Switch runtime", "切换运行时", "切換執行環境"),
+                            icon(include_str!("../../assets/icons/refresh.svg")),
+                            false,
+                            {
+                                let on_switch = on_switch.clone();
+                                move || on_switch()
+                            },
+                        )
+                        .w_full(),
+                    )
+                    .child(
+                        action::secondary(
+                            copy::text("Disconnect", "断开连接", "中斷連線"),
+                            icon(include_str!("../../assets/icons/plug-zap.svg")),
+                            false,
+                            {
+                                let on_disconnect = on_disconnect.clone();
+                                move || on_disconnect()
+                            },
+                        )
+                        .w_full(),
+                    )
+            }
+        }))
 }
 
 fn appearance_choices(
