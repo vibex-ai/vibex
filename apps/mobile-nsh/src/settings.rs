@@ -24,6 +24,41 @@ static HAPTICS_ENABLED: AtomicBool = AtomicBool::new(true);
 /// Whether an active turn or the terminal holds the display awake.
 static KEEP_SCREEN_ON: AtomicBool = AtomicBool::new(false);
 
+/// The notification categories the reader wants; master, completed, needs
+/// input and failure are bits of one byte, read on the event path.
+static NOTIFICATION_POLICY: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0b1111);
+
+/// Which notification a turn produced.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotificationKind {
+    Completed,
+    NeedsInput,
+    Failed,
+}
+
+/// Whether the reader asked for this category.
+pub fn notification_allowed(kind: NotificationKind) -> bool {
+    let policy = NOTIFICATION_POLICY.load(Ordering::Relaxed);
+    let category = match kind {
+        NotificationKind::Completed => 0b0010,
+        NotificationKind::NeedsInput => 0b0100,
+        NotificationKind::Failed => 0b1000,
+    };
+    policy & 0b0001 != 0 && policy & category != 0
+}
+
+fn notification_policy(
+    notifications: bool,
+    completed: bool,
+    needs_input: bool,
+    failed: bool,
+) -> u8 {
+    u8::from(notifications)
+        | (u8::from(completed) << 1)
+        | (u8::from(needs_input) << 2)
+        | (u8::from(failed) << 3)
+}
+
 /// Plays `haptic` when the reader left feedback on.
 pub fn haptic(haptic: Haptic) {
     if HAPTICS_ENABLED.load(Ordering::Relaxed) {
@@ -37,6 +72,10 @@ fn default_haptics() -> bool {
 
 fn default_font_scale() -> u32 {
     100
+}
+
+fn default_true() -> bool {
+    true
 }
 
 /// Whether the reader asked the screen to stay awake during work.
@@ -57,6 +96,14 @@ struct StoredSettings {
     keep_screen_on: bool,
     #[serde(default = "default_font_scale")]
     font_scale: u32,
+    #[serde(default = "default_true")]
+    notifications: bool,
+    #[serde(default = "default_true")]
+    notify_completed: bool,
+    #[serde(default = "default_true")]
+    notify_needs_input: bool,
+    #[serde(default = "default_true")]
+    notify_failed: bool,
 }
 
 impl Default for StoredSettings {
@@ -67,6 +114,10 @@ impl Default for StoredSettings {
             haptics: default_haptics(),
             keep_screen_on: false,
             font_scale: default_font_scale(),
+            notifications: true,
+            notify_completed: true,
+            notify_needs_input: true,
+            notify_failed: true,
         }
     }
 }
@@ -84,6 +135,11 @@ pub struct SettingsState {
     pub keep_screen_on: Signal<bool>,
     /// The text-size step, as a percentage of the ladder.
     pub font_scale: Signal<u32>,
+    /// The notification master switch and its three categories.
+    pub notifications: Signal<bool>,
+    pub notify_completed: Signal<bool>,
+    pub notify_needs_input: Signal<bool>,
+    pub notify_failed: Signal<bool>,
     /// Bumped on every language change: the root rebuilds the copy in place.
     pub revision: Signal<u64>,
 }
@@ -110,6 +166,10 @@ impl SettingsState {
             haptics: signal(stored.haptics),
             keep_screen_on: signal(stored.keep_screen_on),
             font_scale: signal(normalized_font_scale(stored.font_scale)),
+            notifications: signal(stored.notifications),
+            notify_completed: signal(stored.notify_completed),
+            notify_needs_input: signal(stored.notify_needs_input),
+            notify_failed: signal(stored.notify_failed),
             revision: signal(0),
         };
         if imported {
@@ -127,6 +187,7 @@ impl SettingsState {
         HAPTICS_ENABLED.store(self.haptics.get_untracked(), Ordering::Relaxed);
         KEEP_SCREEN_ON.store(self.keep_screen_on.get_untracked(), Ordering::Relaxed);
         vibex_nsh_ui::theme::set_font_scale_percent(self.font_scale.get_untracked());
+        self.refresh_notifications();
     }
 
     /// Chooses an appearance and keeps it.
@@ -186,6 +247,44 @@ impl SettingsState {
         self.persist();
     }
 
+    /// Turns the notification master switch, or one of its categories, on or
+    /// off.
+    pub fn set_notifications(&self, enabled: bool) {
+        self.notifications.set(enabled);
+        self.refresh_notifications();
+        self.persist();
+    }
+
+    pub fn set_notify_completed(&self, enabled: bool) {
+        self.notify_completed.set(enabled);
+        self.refresh_notifications();
+        self.persist();
+    }
+
+    pub fn set_notify_needs_input(&self, enabled: bool) {
+        self.notify_needs_input.set(enabled);
+        self.refresh_notifications();
+        self.persist();
+    }
+
+    pub fn set_notify_failed(&self, enabled: bool) {
+        self.notify_failed.set(enabled);
+        self.refresh_notifications();
+        self.persist();
+    }
+
+    fn refresh_notifications(&self) {
+        NOTIFICATION_POLICY.store(
+            notification_policy(
+                self.notifications.get_untracked(),
+                self.notify_completed.get_untracked(),
+                self.notify_needs_input.get_untracked(),
+                self.notify_failed.get_untracked(),
+            ),
+            Ordering::Relaxed,
+        );
+    }
+
     fn persist(&self) {
         let stored = StoredSettings {
             appearance: appearance_to_storage(self.appearance.get_untracked()).to_owned(),
@@ -193,6 +292,10 @@ impl SettingsState {
             haptics: self.haptics.get_untracked(),
             keep_screen_on: self.keep_screen_on.get_untracked(),
             font_scale: self.font_scale.get_untracked(),
+            notifications: self.notifications.get_untracked(),
+            notify_completed: self.notify_completed.get_untracked(),
+            notify_needs_input: self.notify_needs_input.get_untracked(),
+            notify_failed: self.notify_failed.get_untracked(),
         };
         if let Ok(text) = serde_json::to_string(&stored) {
             let _ = Storage::set_item(SETTINGS_KEY, text);
@@ -210,6 +313,10 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
             font_scale: settings
                 .font_scale_percent
                 .unwrap_or_else(default_font_scale),
+            notifications: true,
+            notify_completed: true,
+            notify_needs_input: true,
+            notify_failed: true,
         }
     }
 }

@@ -228,11 +228,19 @@ fn settings_host(
     let haptics = settings.haptics;
     let keep_screen_on = settings.keep_screen_on;
     let font_scale = settings.font_scale;
+    let notifications = settings.notifications;
+    let notify_completed = settings.notify_completed;
+    let notify_needs_input = settings.notify_needs_input;
+    let notify_failed = settings.notify_failed;
     let settings_for_appearance = settings.clone();
     let settings_for_language = settings.clone();
     let settings_for_haptics = settings.clone();
     let settings_for_screen = settings.clone();
     let settings_for_text = settings.clone();
+    let settings_for_notifications = settings.clone();
+    let settings_for_completed = settings.clone();
+    let settings_for_needs_input = settings.clone();
+    let settings_for_failed = settings.clone();
     let pairing_for_disconnect = pairing.clone();
     let pairing_for_clear = pairing.clone();
     SettingsHost {
@@ -242,6 +250,10 @@ fn settings_host(
         haptics,
         keep_screen_on,
         font_scale,
+        notifications,
+        notify_completed,
+        notify_needs_input,
+        notify_failed,
         runtime: pairing.connected_label(),
         saved: pairing.saved(),
         on_appearance: Rc::new(move |appearance| {
@@ -258,6 +270,18 @@ fn settings_host(
         }),
         on_font_scale: Rc::new(move |percent| {
             settings_for_text.set_font_scale(percent);
+        }),
+        on_notifications: Rc::new(move |enabled| {
+            settings_for_notifications.set_notifications(enabled);
+        }),
+        on_notify_completed: Rc::new(move |enabled| {
+            settings_for_completed.set_notify_completed(enabled);
+        }),
+        on_notify_needs_input: Rc::new(move |enabled| {
+            settings_for_needs_input.set_notify_needs_input(enabled);
+        }),
+        on_notify_failed: Rc::new(move |enabled| {
+            settings_for_failed.set_notify_failed(enabled);
         }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
         on_reconnect: Rc::new(move || {

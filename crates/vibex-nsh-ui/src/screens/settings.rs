@@ -28,6 +28,11 @@ pub struct SettingsHost {
     pub keep_screen_on: Signal<bool>,
     /// The text-size step, as a percentage of the ladder.
     pub font_scale: Signal<u32>,
+    /// The notification master switch and its three categories.
+    pub notifications: Signal<bool>,
+    pub notify_completed: Signal<bool>,
+    pub notify_needs_input: Signal<bool>,
+    pub notify_failed: Signal<bool>,
     /// The connected runtime's label, when there is one.
     pub runtime: Signal<Option<SharedString>>,
     /// The runtimes this phone saved, for the runtime actions.
@@ -37,6 +42,10 @@ pub struct SettingsHost {
     pub on_haptics: Rc<dyn Fn(bool)>,
     pub on_keep_screen_on: Rc<dyn Fn(bool)>,
     pub on_font_scale: Rc<dyn Fn(u32)>,
+    pub on_notifications: Rc<dyn Fn(bool)>,
+    pub on_notify_completed: Rc<dyn Fn(bool)>,
+    pub on_notify_needs_input: Rc<dyn Fn(bool)>,
+    pub on_notify_failed: Rc<dyn Fn(bool)>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_reconnect: Rc<dyn Fn()>,
     pub on_switch_runtime: Rc<dyn Fn()>,
@@ -60,88 +69,117 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
             }
         })
         .child(
-            view()
-                .w_full()
-                .gap(px(theme::SPACING_MD))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Settings", "设置", "設定"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(runtime_section(host.clone()))
-                .child(section(
-                    copy::text("Appearance", "外观", "外觀"),
-                    appearance_choices(host.appearance, host.on_appearance.clone()),
-                ))
-                .child(section(
-                    copy::text("Language", "语言", "語言"),
-                    language_choices(host.language, host.on_language.clone()),
-                ))
-                .child(section(
-                    copy::text("Text", "文字", "文字"),
-                    text_size_row(host.font_scale, host.on_font_scale.clone()),
-                ))
-                .child(section(
-                    copy::text("Feedback", "反馈", "回饋"),
-                    view()
-                        .w_full()
-                        .flex_col()
-                        .gap(px(theme::SPACING_XS))
-                        .child(toggle_row(
-                            copy::text("Haptic feedback", "触感反馈", "觸感回饋"),
-                            host.haptics,
-                            host.on_haptics.clone(),
-                        ))
-                        .child(toggle_row(
-                            copy::text("Keep the screen on", "保持屏幕常亮", "保持螢幕常亮"),
-                            host.keep_screen_on,
-                            host.on_keep_screen_on.clone(),
-                        )),
-                ))
-                .child(section(
-                    copy::text("About", "关于", "關於"),
-                    view()
-                        .w_full()
-                        .gap(px(theme::SPACING_XS))
-                        .child(value_row(copy::text("Version", "版本", "版本"), || {
-                            concat!("Vibex ", env!("CARGO_PKG_VERSION")).to_owned()
-                        }))
-                        .child(value_row(copy::text("License", "许可", "授權"), || {
-                            "AGPL-3.0-or-later".to_owned()
-                        })),
-                ))
-                .child(when(move || !host.saved.with(|saved| saved.is_empty()), {
-                    let on_clear = host.on_clear_runtimes.clone();
-                    move || {
-                        let on_clear = on_clear.clone();
+            scroll().max_h(px(600.0)).child(
+                view()
+                    .w_full()
+                    .gap(px(theme::SPACING_MD))
+                    .p(px(theme::SPACING_MD))
+                    .pb_safe_area_plus(px(theme::SPACING_LG))
+                    .bg(theme::background_card)
+                    .rounded_t(px(16.0))
+                    .child(
+                        text(copy::text("Settings", "设置", "設定"))
+                            .text_size(px(theme::font_heading()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    )
+                    .child(runtime_section(host.clone()))
+                    .child(section(
+                        copy::text("Appearance", "外观", "外觀"),
+                        appearance_choices(host.appearance, host.on_appearance.clone()),
+                    ))
+                    .child(section(
+                        copy::text("Language", "语言", "語言"),
+                        language_choices(host.language, host.on_language.clone()),
+                    ))
+                    .child(section(
+                        copy::text("Text", "文字", "文字"),
+                        text_size_row(host.font_scale, host.on_font_scale.clone()),
+                    ))
+                    .child(section(
+                        copy::text("Notifications", "通知", "通知"),
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_XS))
+                            .child(toggle_row(
+                                copy::text("Enable notifications", "启用通知", "啟用通知"),
+                                host.notifications,
+                                host.on_notifications.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text("Agent completed", "Agent 已完成", "Agent 已完成"),
+                                host.notify_completed,
+                                host.on_notify_completed.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text("Needs input", "需要输入", "需要輸入"),
+                                host.notify_needs_input,
+                                host.on_notify_needs_input.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text("Failed", "执行失败", "執行失敗"),
+                                host.notify_failed,
+                                host.on_notify_failed.clone(),
+                            )),
+                    ))
+                    .child(section(
+                        copy::text("Feedback", "反馈", "回饋"),
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_XS))
+                            .child(toggle_row(
+                                copy::text("Haptic feedback", "触感反馈", "觸感回饋"),
+                                host.haptics,
+                                host.on_haptics.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text("Keep the screen on", "保持屏幕常亮", "保持螢幕常亮"),
+                                host.keep_screen_on,
+                                host.on_keep_screen_on.clone(),
+                            )),
+                    ))
+                    .child(section(
+                        copy::text("About", "关于", "關於"),
+                        view()
+                            .w_full()
+                            .gap(px(theme::SPACING_XS))
+                            .child(value_row(copy::text("Version", "版本", "版本"), || {
+                                concat!("Vibex ", env!("CARGO_PKG_VERSION")).to_owned()
+                            }))
+                            .child(value_row(copy::text("License", "许可", "授權"), || {
+                                "AGPL-3.0-or-later".to_owned()
+                            })),
+                    ))
+                    .child(when(move || !host.saved.with(|saved| saved.is_empty()), {
+                        let on_clear = host.on_clear_runtimes.clone();
+                        move || {
+                            let on_clear = on_clear.clone();
+                            action::secondary(
+                                copy::text(
+                                    "Remove saved runtimes",
+                                    "移除已保存的运行时",
+                                    "移除已儲存的執行環境",
+                                ),
+                                icon(include_str!("../../assets/icons/x.svg")),
+                                false,
+                                move || on_clear(),
+                            )
+                            .w_full()
+                        }
+                    }))
+                    .child({
+                        let on_close = on_close.clone();
                         action::secondary(
-                            copy::text(
-                                "Remove saved runtimes",
-                                "移除已保存的运行时",
-                                "移除已儲存的執行環境",
-                            ),
+                            copy::text("Close", "关闭", "關閉"),
                             icon(include_str!("../../assets/icons/x.svg")),
                             false,
-                            move || on_clear(),
+                            move || on_close(),
                         )
                         .w_full()
-                    }
-                }))
-                .child({
-                    let on_close = on_close.clone();
-                    action::secondary(
-                        copy::text("Close", "关闭", "關閉"),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || on_close(),
-                    )
-                    .w_full()
-                }),
+                    }),
+            ),
         )
 }
 
@@ -316,12 +354,15 @@ fn toggle_row(
                 copy::text("Off", "关", "關").to_owned()
             }
         })))
-        .child(action::secondary(
-            copy::text("Toggle", "切换", "切換"),
-            icon(include_str!("../../assets/icons/check.svg")),
-            false,
-            move || on_toggle(!enabled.get_untracked()),
-        ))
+        .child(
+            action::secondary(
+                copy::text("Toggle", "切换", "切換"),
+                icon(include_str!("../../assets/icons/check.svg")),
+                false,
+                move || on_toggle(!enabled.get_untracked()),
+            )
+            .accessibility_label(label),
+        )
 }
 
 fn section(label: &'static str, body: impl IntoElement) -> impl IntoElement {

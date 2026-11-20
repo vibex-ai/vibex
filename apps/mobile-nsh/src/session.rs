@@ -17,6 +17,7 @@ use std::{
 use base64::Engine as _;
 use nsh_base::{Terminal, TerminalApi};
 use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
+use nsh_core::platform::Lifecycle;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 use vibex_backend::{
@@ -24,18 +25,18 @@ use vibex_backend::{
     GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
-    ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
-    ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
-    FetchTimelineRequest, FileReadRequest, FileTreeRequest, GitChangeKind, GitCommitDetailRequest,
-    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary,
-    GitWorktreeCreateRequest, MessageAttachment, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeOptionAvailability, SendAgentMessageRequest, SessionRuntimeOption,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
-    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
-    WorkspaceId, unix_timestamp_ms,
+    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind, ApprovalResponder,
+    CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
+    ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
+    GitChangeKind, GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
+    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, MessageAttachment,
+    MessageProvenance, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeOptionAvailability, SendAgentMessageRequest,
+    SessionRuntimeOption, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -154,6 +155,10 @@ pub struct SessionService {
     drafts: Rc<RefCell<BTreeMap<String, String>>>,
     /// The serialized drafts last written, so an unchanged map is not rewritten.
     drafts_snapshot: Rc<RefCell<String>>,
+    /// Notification id -> session id, for a press that arrives later.
+    notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
+    /// Bumped when the service stops, so its notification reader ends.
+    notification_generation: Rc<Cell<u64>>,
     on_disconnect: Rc<dyn Fn()>,
     on_switch_runtime: Rc<dyn Fn()>,
     on_open_settings: Rc<dyn Fn()>,
@@ -253,6 +258,8 @@ impl SessionService {
             retry_now: Rc::new(Cell::new(false)),
             drafts: Rc::new(RefCell::new(load_drafts())),
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
+            notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
+            notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
             on_switch_runtime,
             on_open_settings,
@@ -262,12 +269,15 @@ impl SessionService {
         service.start_connection();
         service.start_draft_saver();
         service.start_screen_policy();
+        service.start_notification_presses();
         Ok(service)
     }
 
     /// Stops the service's tasks when its runtime is replaced.
     pub fn shutdown(&self) {
         self.alive.set(false);
+        self.notification_generation
+            .set(self.notification_generation.get().wrapping_add(1));
         crate::host::set_keep_screen_on(false);
         self.terminal_generation
             .set(self.terminal_generation.get().wrapping_add(1));
@@ -759,6 +769,88 @@ impl SessionService {
         });
     }
 
+    /// Presents a notification and keeps its session for a later tap.
+    fn present_notification(&self, intent: vibex_core::AgentNotificationIntent) {
+        let kind = match intent.kind {
+            AgentNotificationKind::TurnCompleted => crate::settings::NotificationKind::Completed,
+            AgentNotificationKind::ApprovalRequired { .. }
+            | AgentNotificationKind::InputRequired { .. } => {
+                crate::settings::NotificationKind::NeedsInput
+            }
+            AgentNotificationKind::TurnFailed => crate::settings::NotificationKind::Failed,
+        };
+        if !crate::settings::notification_allowed(kind) {
+            return;
+        }
+        let background = nsh_core::element::lifecycle() != Lifecycle::Active;
+        let active = self.active.get_untracked().as_deref() == Some(intent.session_id.as_str());
+        if active && !background {
+            return;
+        }
+        if intent.expires_at_ms <= unix_timestamp_ms() {
+            return;
+        }
+        let body = match intent.kind {
+            AgentNotificationKind::ApprovalRequired { .. } => copy::text(
+                "An Agent operation is waiting for approval",
+                "有一项 Agent 操作等待批准",
+                "有一項 Agent 操作等待批准",
+            ),
+            AgentNotificationKind::InputRequired { .. } => copy::text(
+                "An Agent is waiting for your input",
+                "Agent 正在等待你的输入",
+                "Agent 正在等待你的輸入",
+            ),
+            AgentNotificationKind::TurnFailed => copy::text(
+                "An Agent turn failed",
+                "Agent 回合执行失败",
+                "Agent 回合執行失敗",
+            ),
+            AgentNotificationKind::TurnCompleted => copy::text(
+                "An Agent completed its work",
+                "Agent 已完成工作",
+                "Agent 已完成工作",
+            ),
+        };
+        let id = intent.notification_id.clone();
+        self.notification_sessions
+            .borrow_mut()
+            .insert(id.clone(), intent.session_id.as_str().to_owned());
+        spawn(async move {
+            let _ = request_notification_permission().await;
+            let _ = show_notification(nsh_core::notifications::Notification::new(
+                id, "Vibex", body,
+            ))
+            .await;
+        });
+    }
+
+    /// Opens the session a notification tap names.
+    fn start_notification_presses(&self) {
+        self.notification_generation
+            .set(self.notification_generation.get().wrapping_add(1));
+        let generation = self.notification_generation.get();
+        let service = self.clone();
+        spawn(async move {
+            loop {
+                let id = next_notification_press().await;
+                if !service.alive.get() || service.notification_generation.get() != generation {
+                    break;
+                }
+                // A platform without notifications answers at once with no
+                // id; do not spin on it.
+                if id.is_empty() {
+                    timer(Duration::from_secs(1)).await;
+                    continue;
+                }
+                let session = service.notification_sessions.borrow_mut().remove(&id);
+                if let Some(session) = session {
+                    service.open(&session);
+                }
+            }
+        });
+    }
+
     /// Moves the open composer's text into the draft map.
     fn stash_draft(&self) {
         let Some(active) = self.active.get_untracked() else {
@@ -866,6 +958,10 @@ impl SessionService {
             }
             BackendEvent::DeviceRenamed(renamed) => {
                 (self.on_device_renamed)(&renamed.display_name);
+            }
+            BackendEvent::Notification(intent) => {
+                self.note_online();
+                self.present_notification(intent);
             }
             BackendEvent::Disconnected => {
                 self.connection.set(ConnectionState::Connecting);
