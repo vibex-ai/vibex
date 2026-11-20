@@ -854,6 +854,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }),
         on_close_move: Rc::new(move || move_open.set(None)),
         on_move_session: Rc::new(|_, _| {}),
+        on_move_session_relative: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,

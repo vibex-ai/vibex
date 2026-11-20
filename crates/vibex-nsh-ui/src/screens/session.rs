@@ -415,6 +415,7 @@ type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
 type CollapseAction = SessionToggle;
 type SessionToggle = Rc<dyn Fn(&str, bool)>;
 type MoveSessionAction = Rc<dyn Fn(&str, Option<&str>)>;
+type MoveRelative = Rc<dyn Fn(&str, isize)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -478,6 +479,7 @@ pub struct SessionHost {
     pub on_open_move: Action,
     pub on_close_move: Action,
     pub on_move_session: MoveSessionAction,
+    pub on_move_session_relative: MoveRelative,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
     pub timeline: Signal<Vec<TimelineEntry>>,
@@ -4223,6 +4225,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let members_selected = signal(Vec::<String>::new());
     let on_set_group_members = host.on_set_group_members.clone();
     let on_set_group_pinned = host.on_set_group_pinned.clone();
+    let on_move_session_relative = host.on_move_session_relative.clone();
     let on_rename_group = host.on_rename_group.clone();
     let on_delete_group = host.on_delete_group.clone();
     let on_toggle_folder_collapsed = host.on_toggle_folder_collapsed.clone();
@@ -4459,6 +4462,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 .child({
                                     let section_select = on_select.clone();
                                     let section_menu = on_session_menu.clone();
+                                    let section_move = on_move_session_relative.clone();
                                     each(
                                         move || sidebar_sections.get(),
                                         |section| section.id.clone(),
@@ -4504,45 +4508,50 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 selected,
                                                 pinned,
                                                 unread,
+                                                section_move.clone(),
                                             )
                                         },
                                     )
                                 })
-                                .child(each(
-                                    move || {
-                                        drawer_groups(
-                                            sessions,
-                                            query,
-                                            host.pinned,
-                                            hidden_sessions,
-                                            project_order,
-                                            workspace_order,
-                                            session_order,
-                                            collapsed_workspaces,
-                                        )
-                                    },
-                                    |group| group.id.clone(),
-                                    move |group, _| {
-                                        let collapsed = collapsed_projects;
-                                        let on_select = on_select.clone();
-                                        let on_menu = on_session_menu.clone();
-                                        drawer_group(
-                                            group,
-                                            active,
-                                            collapsed,
-                                            on_set_project_collapsed.clone(),
-                                            on_select.clone(),
-                                            on_menu.clone(),
-                                            open,
-                                            select_mode,
-                                            selected,
-                                            pinned,
-                                            unread,
-                                            collapsed_workspaces,
-                                            on_set_workspace_collapsed.clone(),
-                                        )
-                                    },
-                                )),
+                                .child({
+                                    let group_move = on_move_session_relative.clone();
+                                    each(
+                                        move || {
+                                            drawer_groups(
+                                                sessions,
+                                                query,
+                                                host.pinned,
+                                                hidden_sessions,
+                                                project_order,
+                                                workspace_order,
+                                                session_order,
+                                                collapsed_workspaces,
+                                            )
+                                        },
+                                        |group| group.id.clone(),
+                                        move |group, _| {
+                                            let collapsed = collapsed_projects;
+                                            let on_select = on_select.clone();
+                                            let on_menu = on_session_menu.clone();
+                                            drawer_group(
+                                                group,
+                                                active,
+                                                collapsed,
+                                                on_set_project_collapsed.clone(),
+                                                on_select.clone(),
+                                                on_menu.clone(),
+                                                open,
+                                                select_mode,
+                                                selected,
+                                                pinned,
+                                                unread,
+                                                group_move.clone(),
+                                                collapsed_workspaces,
+                                                on_set_workspace_collapsed.clone(),
+                                            )
+                                        },
+                                    )
+                                }),
                         ),
                     ),
                 )
@@ -5165,6 +5174,7 @@ fn sidebar_section(
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
     unread: Signal<Vec<String>>,
+    on_move_relative: MoveRelative,
 ) -> impl IntoElement {
     let rows = computed(move || {
         let ids = section.with(|section| section.session_ids.clone());
@@ -5272,11 +5282,13 @@ fn sidebar_section(
             move || {
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
+                let on_move_relative = on_move_relative.clone();
                 view().w_full().flex_col().gap(px(2.0)).child(each(
                     move || rows.get(),
                     |session| session.id.clone(),
                     move |session, _| {
                         let session_signal = signal(session.get_untracked());
+                        let on_move_relative = on_move_relative.clone();
                         session_row(
                             session_signal,
                             active,
@@ -5287,6 +5299,7 @@ fn sidebar_section(
                             selected,
                             pinned,
                             unread,
+                            on_move_relative,
                         )
                     },
                 ))
@@ -5307,6 +5320,7 @@ fn drawer_group(
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
     unread: Signal<Vec<String>>,
+    on_move_relative: MoveRelative,
     collapsed_workspaces: Signal<Vec<String>>,
     on_workspace_collapse: SessionToggle,
 ) -> impl IntoElement {
@@ -5357,6 +5371,7 @@ fn drawer_group(
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
                 let on_workspace_collapse = on_workspace_collapse.clone();
+                let on_move_relative = on_move_relative.clone();
                 view().w_full().flex_col().gap(px(2.0)).child(each(
                     move || group.with(|group| group.rows.clone()),
                     |row| row.key(),
@@ -5399,6 +5414,7 @@ fn drawer_group(
                             }
                             DrawerRow::Session(session) => {
                                 let session = signal(session);
+                                let on_move_relative = on_move_relative.clone();
                                 session_row(
                                     session,
                                     active,
@@ -5409,6 +5425,7 @@ fn drawer_group(
                                     selected,
                                     pinned,
                                     unread,
+                                    on_move_relative,
                                 )
                                 .into_element()
                             }
@@ -5430,12 +5447,27 @@ fn session_row(
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
     unread: Signal<Vec<String>>,
+    on_move_relative: MoveRelative,
 ) -> impl IntoElement {
+    let dragged = signal(false);
     view()
         .w_full()
         .rounded(px(theme::RADIUS_CONTROL))
         .flex_row()
         .items_center()
+        .on_pan_start(move |_event: &PanEvent| dragged.set(true))
+        .on_pan_end(move |event: &PanEvent| {
+            if !dragged.get_untracked() {
+                return;
+            }
+            dragged.set(false);
+            let id = session.get_untracked().id;
+            if event.translation.y.0 < -28.0 {
+                on_move_relative(&id, -1);
+            } else if event.translation.y.0 > 28.0 {
+                on_move_relative(&id, 1);
+            }
+        })
         .child(
             button()
                 .flex_1()

@@ -724,6 +724,10 @@ impl SessionService {
                     service.move_session_to_folder(id, folder)
                 })
             },
+            on_move_session_relative: {
+                let service = self.clone();
+                Rc::new(move |id: &str, delta: isize| service.move_session_relative(id, delta))
+            },
             on_close_move: {
                 let service = self.clone();
                 Rc::new(move || service.move_open.set(None))
@@ -4121,6 +4125,57 @@ impl SessionService {
     fn delete_folder(&self, id: &str) {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::DeleteFolder {
             folder_id: id.to_owned(),
+        });
+    }
+
+    fn move_session_relative(&self, id: &str, delta: isize) {
+        let order = self.sidebar_session_order.get_untracked();
+        let Some((project, workspace)) = self.sessions.with(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| (session.project_id.clone(), session.workspace_id.clone()))
+        }) else {
+            return;
+        };
+        let mut siblings = self.sessions.with(|sessions| {
+            sessions
+                .iter()
+                .filter(|session| {
+                    session.project_id == project && session.workspace_id == workspace
+                })
+                .map(|session| session.id.clone())
+                .collect::<Vec<_>>()
+        });
+        siblings.sort_by_key(|session| {
+            order
+                .iter()
+                .position(|candidate| candidate == session)
+                .unwrap_or(usize::MAX)
+        });
+        let Some(index) = siblings.iter().position(|candidate| candidate == id) else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= siblings.len() as isize {
+            return;
+        }
+        let anchor = siblings[target as usize].clone();
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveItems {
+            items: vec![vibex_core::RemoteSidebarItemRef {
+                kind: RemoteSidebarItemKind::Session,
+                id: id.to_owned(),
+            }],
+            anchor: Some(vibex_core::RemoteSidebarItemRef {
+                kind: RemoteSidebarItemKind::Session,
+                id: anchor,
+            }),
+            position: if delta < 0 {
+                vibex_core::RemoteSidebarDropPosition::Before
+            } else {
+                vibex_core::RemoteSidebarDropPosition::After
+            },
+            project_id: Some(project),
         });
     }
 
