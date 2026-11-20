@@ -807,15 +807,11 @@ impl PairingService {
                 },
             );
             if connect_on_success {
-                if online {
-                    service.connect(bundle);
-                } else {
-                    service.fail_message(copy::text(
-                        "The runtime could not be reached.",
-                        "无法连接到运行时。",
-                        "無法連線到執行環境。",
-                    ));
-                }
+                // A saved runtime is entered even when the probe failed: the
+                // session service shows the connecting page and its own retry,
+                // which is where an unavailable runtime belongs. Refusing here
+                // left the reader on the list with a line of red text.
+                service.connect(bundle);
             }
         });
     }
