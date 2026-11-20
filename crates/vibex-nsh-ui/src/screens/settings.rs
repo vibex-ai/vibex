@@ -506,6 +506,7 @@ fn notifications_sheet(open: Signal<bool>, host: SettingsHost) -> impl IntoEleme
 }
 
 fn about_sheet(open: Signal<bool>) -> impl IntoElement {
+    let update_status = signal(None::<SharedString>);
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -544,6 +545,83 @@ fn about_sheet(open: Signal<bool>) -> impl IntoElement {
                     .line_height(theme::line_height_for(theme::font_caption()))
                     .text_color(theme::text_secondary),
                 )
+                .child(
+                    action::secondary(
+                        copy::text("Check for updates", "检查更新", "檢查更新"),
+                        icon(include_str!("../../assets/icons/refresh.svg")),
+                        false,
+                        move || {
+                            update_status.set(Some(
+                                copy::text("Checking…", "检查中…", "檢查中…").into(),
+                            ));
+                            spawn(async move {
+                                let result = nsh_core::element::fetch(
+                                    "https://api.github.com/repos/peatboy/vibex/releases/latest",
+                                )
+                                .await;
+                                let message = match result {
+                                    Ok(response) if response.ok() => {
+                                        let body = response.text();
+                                        let tag = body
+                                            .split("\"tag_name\"")
+                                            .nth(1)
+                                            .and_then(|rest| rest.split('"').nth(1))
+                                            .map(str::to_owned);
+                                        match tag {
+                                            Some(tag) => {
+                                                let tag = tag.trim_start_matches('v');
+                                                if tag == env!("CARGO_PKG_VERSION") {
+                                                    copy::text(
+                                                        "Up to date",
+                                                        "已是最新版本",
+                                                        "已是最新版本",
+                                                    )
+                                                    .to_owned()
+                                                } else {
+                                                    format!(
+                                                        "{} {tag}",
+                                                        copy::text(
+                                                            "Available:",
+                                                            "可更新到：",
+                                                            "可更新至："
+                                                        )
+                                                    )
+                                                }
+                                            }
+                                            None => copy::text(
+                                                "No release information",
+                                                "没有发布信息",
+                                                "沒有發佈資訊",
+                                            )
+                                            .to_owned(),
+                                        }
+                                    }
+                                    Ok(_) => copy::text(
+                                        "Update check failed",
+                                        "检查更新失败",
+                                        "檢查更新失敗",
+                                    )
+                                    .to_owned(),
+                                    Err(error) => format!(
+                                        "{}: {error}",
+                                        copy::text(
+                                            "Update check failed",
+                                            "检查更新失败",
+                                            "檢查更新失敗"
+                                        )
+                                    ),
+                                };
+                                update_status.set(Some(message.into()));
+                            });
+                        },
+                    )
+                    .w_full(),
+                )
+                .child(when(move || update_status.get().is_some(), move || {
+                    text(move || update_status.get().unwrap_or_default())
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_secondary)
+                }))
                 .child(
                     action::secondary(
                         copy::text("Release notes", "发布说明", "發佈說明"),
