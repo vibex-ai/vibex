@@ -455,6 +455,8 @@ pub struct SessionHost {
     /// The `$` skills the session offers.
     pub skills: Signal<Vec<CommandEntry>>,
     pub on_skill_query: MentionQuery,
+    /// Remembers the suggestion the reader picked, for its command or reference.
+    pub on_arm_entry: Rc<dyn Fn(&str)>,
     /// Files and photos waiting to be sent with the message.
     pub attachments: Signal<Vec<AttachmentItem>>,
     pub on_attach_image: Action,
@@ -771,7 +773,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             {
                 let commands = host.commands;
                 let draft = host.draft;
-                move || command_palette(commands, draft, PaletteKind::Slash)
+                let on_arm = host.on_arm_entry.clone();
+                move || command_palette(commands, draft, PaletteKind::Slash, on_arm.clone())
             },
         ))
         .child(when(
@@ -782,7 +785,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             {
                 let mentions = host.mentions;
                 let draft = host.draft;
-                move || command_palette(mentions, draft, PaletteKind::Mention)
+                let on_arm = host.on_arm_entry.clone();
+                move || command_palette(mentions, draft, PaletteKind::Mention, on_arm.clone())
             },
         ))
         .child(when(
@@ -793,7 +797,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             {
                 let skills = host.skills;
                 let draft = host.draft;
-                move || command_palette(skills, draft, PaletteKind::Skill)
+                let on_arm = host.on_arm_entry.clone();
+                move || command_palette(skills, draft, PaletteKind::Skill, on_arm.clone())
             },
         ))
         .child(when(move || host.pending.get().is_some(), {
@@ -1610,6 +1615,7 @@ fn command_palette(
     commands: Signal<Vec<CommandEntry>>,
     draft: Signal<String>,
     kind: PaletteKind,
+    on_arm: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -1642,7 +1648,10 @@ fn command_palette(
                         })
                     },
                     |command| command.id.clone(),
-                    move |command, _| command_row(command, draft, kind),
+                    {
+                        let on_arm = on_arm.clone();
+                        move |command, _| command_row(command, draft, kind, on_arm.clone())
+                    },
                 ))),
         )
 }
@@ -1651,10 +1660,13 @@ fn command_row(
     command: ReadSignal<CommandEntry>,
     draft: Signal<String>,
     kind: PaletteKind,
+    on_arm: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     button()
         .on_press(move || {
-            let insertion = command.get_untracked().insertion;
+            let command = command.get_untracked();
+            on_arm(&command.id);
+            let insertion = command.insertion;
             draft.set(match kind {
                 PaletteKind::Slash => insertion,
                 PaletteKind::Mention => insert_mention(&draft.get_untracked(), &insertion),

@@ -25,23 +25,25 @@ use vibex_backend::{
     GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
-    AgentCommandDiscoverRequest, AgentCommandTrigger, AgentGoalControlRequest,
-    AgentNotificationKind, AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage,
-    ApprovalResponder, ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue,
-    ElicitationField, ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus,
-    ElicitationResolution, ElicitationResolutionAction, FetchTimelineItemRequest,
-    FetchTimelineRequest, FilePreviewKind, FileReadRequest, FileTreeRequest,
-    ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
-    GitDiffRequest, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
-    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GoalAction, GoalPhase,
-    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest,
-    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
-    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
+    AgentCommandExecuteStatus, AgentCommandExecutionBehavior, AgentCommandSourceKind,
+    AgentCommandTrigger, AgentGoalControlRequest, AgentId, AgentNotificationKind,
+    AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage, ApprovalResponder,
+    ContinueAgentTurnRequest, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
+    ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
+    ElicitationResolutionAction, FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind,
+    FileReadRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
+    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
+    GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest, GitStatusSummary,
+    GitWorktreeCreateRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceId,
     unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
@@ -101,6 +103,7 @@ struct QueuedMessage {
     id: u64,
     text: String,
     attachments: Vec<AttachmentItem>,
+    mentions: Vec<VibexUseMention>,
 }
 
 /// The session shell's state and actions.
@@ -130,6 +133,10 @@ pub struct SessionService {
     mentions_loaded: Rc<Cell<bool>>,
     skills: Signal<Vec<CommandEntry>>,
     skills_loaded: Rc<Cell<bool>>,
+    /// The raw entries behind the palettes, for arming a command or reference.
+    entry_catalog: Rc<RefCell<BTreeMap<String, AgentCommandEntry>>>,
+    armed_command: Rc<RefCell<Option<AgentCommandEntry>>>,
+    armed_mentions: Rc<RefCell<Vec<(String, VibexUseMention)>>>,
     terminal_open: Signal<bool>,
     terminal_title: Signal<Option<SharedString>>,
     terminal_error: Signal<Option<SharedString>>,
@@ -284,6 +291,9 @@ impl SessionService {
             mentions_loaded: Rc::new(Cell::new(false)),
             skills: signal(Vec::new()),
             skills_loaded: Rc::new(Cell::new(false)),
+            entry_catalog: Rc::new(RefCell::new(BTreeMap::new())),
+            armed_command: Rc::new(RefCell::new(None)),
+            armed_mentions: Rc::new(RefCell::new(Vec::new())),
             terminal_open: signal(false),
             terminal_title: signal(None),
             terminal_error: signal(None),
@@ -488,6 +498,10 @@ impl SessionService {
             on_skill_query: {
                 let service = self.clone();
                 Rc::new(move |query: &str| service.query_skills(query))
+            },
+            on_arm_entry: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.arm_entry(id))
             },
             terminal_open: self.terminal_open,
             terminal_title: self.terminal_title,
@@ -1306,6 +1320,8 @@ impl SessionService {
         self.mentions_loaded.set(false);
         self.skills.set(Vec::new());
         self.skills_loaded.set(false);
+        self.armed_command.borrow_mut().take();
+        self.armed_mentions.borrow_mut().clear();
         self.error.set(None);
         self.runtime_state.replace(None);
         self.runtime_catalog.set(None);
@@ -1865,11 +1881,23 @@ impl SessionService {
         if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
             return;
         }
-        if self.turn_live() {
-            self.enqueue(active, text, attachments);
+        if let Some(command) = self.armed_command.borrow().clone()
+            && parse_slash_command_invocation(&text).is_some_and(|(name, _)| {
+                command
+                    .command_name
+                    .as_deref()
+                    .is_none_or(|candidate| candidate == name)
+            })
+        {
+            self.execute_command(command, text);
             return;
         }
-        self.deliver(text, attachments, true);
+        let mentions = self.armed_mentions_for(&text);
+        if self.turn_live() {
+            self.enqueue(active, text, attachments, mentions);
+            return;
+        }
+        self.deliver(text, attachments, mentions, true);
     }
 
     fn turn_live(&self) -> bool {
@@ -1887,7 +1915,82 @@ impl SessionService {
             })
     }
 
-    fn enqueue(&self, session: String, text: String, attachments: Vec<AttachmentItem>) {
+    fn armed_mentions_for(&self, text: &str) -> Vec<VibexUseMention> {
+        self.armed_mentions
+            .borrow()
+            .iter()
+            .filter(|(insertion, _)| !insertion.is_empty() && text.contains(insertion))
+            .map(|(_, mention)| mention.clone())
+            .collect()
+    }
+
+    /// Runs the `/` command the draft names instead of sending it as prose.
+    fn execute_command(&self, entry: AgentCommandEntry, text: String) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let Some((name, arguments)) = parse_slash_command_invocation(&text) else {
+            return;
+        };
+        self.sending.set(true);
+        self.error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let request_session = session_id.clone();
+            let result = background(async move {
+                backend
+                    .execute_agent_command(MutationRequest::new(AgentCommandExecuteRequest {
+                        session_id: request_session,
+                        command_id: Some(entry.id),
+                        trigger: AgentCommandTrigger::Slash,
+                        source_kind: entry.source_kind,
+                        command_text: text,
+                        command_name: Some(name),
+                        arguments,
+                        prompt_id: entry.prompt_id,
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                    }))
+                    .await
+            })
+            .await;
+            service.sending.set(false);
+            match result {
+                Ok(Ok(result)) => {
+                    if result.status == AgentCommandExecuteStatus::Failed {
+                        service.fail_text(result.message.as_deref().unwrap_or(copy::text(
+                            "The command could not run.",
+                            "命令无法执行。",
+                            "命令無法執行。",
+                        )));
+                    } else {
+                        service.armed_command.borrow_mut().take();
+                        service.draft.set(String::new());
+                        service.attachments.set(Vec::new());
+                    }
+                    service.reload(&session_id);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("running the command did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    fn enqueue(
+        &self,
+        session: String,
+        text: String,
+        attachments: Vec<AttachmentItem>,
+        mentions: Vec<VibexUseMention>,
+    ) {
         let id = self.queue_seq.get().wrapping_add(1);
         self.queue_seq.set(id);
         self.queue
@@ -1898,6 +2001,7 @@ impl SessionService {
                 id,
                 text: text.clone(),
                 attachments,
+                mentions,
             });
         self.draft.set(String::new());
         self.attachments.set(Vec::new());
@@ -1946,7 +2050,7 @@ impl SessionService {
             queue.remove(index)
         };
         self.publish_queue();
-        self.deliver(message.text, message.attachments, false);
+        self.deliver(message.text, message.attachments, message.mentions, false);
     }
 
     fn remove_queued(&self, id: u64) {
@@ -1997,10 +2101,15 @@ impl SessionService {
             queue.remove(0)
         };
         self.publish_queue();
-        self.deliver(message.text, message.attachments, false);
+        self.deliver(message.text, message.attachments, message.mentions, false);
     }
 
-    fn requeue(&self, text: String, attachments: Vec<AttachmentItem>) {
+    fn requeue(
+        &self,
+        text: String,
+        attachments: Vec<AttachmentItem>,
+        mentions: Vec<VibexUseMention>,
+    ) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
@@ -2012,12 +2121,19 @@ impl SessionService {
                 id,
                 text,
                 attachments,
+                mentions,
             },
         );
         self.publish_queue();
     }
 
-    fn deliver(&self, text: String, attachments: Vec<AttachmentItem>, from_composer: bool) {
+    fn deliver(
+        &self,
+        text: String,
+        attachments: Vec<AttachmentItem>,
+        mentions: Vec<VibexUseMention>,
+        from_composer: bool,
+    ) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
@@ -2029,6 +2145,7 @@ impl SessionService {
         let sent_text = text.clone();
         let retry_text = text.clone();
         let retry_attachments = attachments.clone();
+        let retry_mentions = mentions.clone();
         let sent_attachment_ids = attachments
             .iter()
             .map(|item| item.id.clone())
@@ -2045,8 +2162,14 @@ impl SessionService {
                     inline_text_offset: None,
                 })
                 .collect::<Vec<_>>();
-            let result =
-                background(send_and_refetch(backend, session_id.clone(), text, sends)).await;
+            let result = background(send_and_refetch(
+                backend,
+                session_id.clone(),
+                text,
+                sends,
+                mentions,
+            ))
+            .await;
             service.sending.set(false);
             match result {
                 Ok(Ok(page)) => {
@@ -2058,6 +2181,8 @@ impl SessionService {
                             items.retain(|item| !sent_attachment_ids.contains(&item.id))
                         });
                     }
+                    service.armed_command.borrow_mut().take();
+                    service.armed_mentions.borrow_mut().clear();
                     service.stash_draft();
                     service.persist_drafts();
                     service.apply_page(&session_id, page);
@@ -2068,13 +2193,13 @@ impl SessionService {
                 }
                 Ok(Err(error)) => {
                     if !from_composer {
-                        service.requeue(retry_text, retry_attachments);
+                        service.requeue(retry_text, retry_attachments, retry_mentions.clone());
                     }
                     service.fail(&error);
                 }
                 Err(error) => {
                     if !from_composer {
-                        service.requeue(retry_text, retry_attachments);
+                        service.requeue(retry_text, retry_attachments, retry_mentions.clone());
                     }
                     service.fail(&BackendError::failed(
                         "session_task_failed",
@@ -2586,6 +2711,51 @@ impl SessionService {
         });
     }
 
+    /// Keeps the raw entries behind the palettes so a picked row can arm its
+    /// command or reference.
+    fn remember_entries(&self, discovery: &vibex_core::AgentCommandDiscovery) {
+        let mut catalog = self.entry_catalog.borrow_mut();
+        for entry in discovery
+            .response
+            .entries
+            .iter()
+            .chain(discovery.quick_phrases.iter())
+            .chain(discovery.delegation_entries.iter())
+            .chain(discovery.session_entries.iter())
+        {
+            catalog.insert(entry.id.clone(), entry.clone());
+        }
+    }
+
+    fn arm_entry(&self, id: &str) {
+        let Some(entry) = self.entry_catalog.borrow().get(id).cloned() else {
+            return;
+        };
+        match entry.trigger {
+            AgentCommandTrigger::Slash
+                if matches!(
+                    entry.source_kind,
+                    AgentCommandSourceKind::Provider | AgentCommandSourceKind::Prompt
+                ) && entry.execution_behavior != AgentCommandExecutionBehavior::None =>
+            {
+                *self.armed_command.borrow_mut() = Some(entry);
+            }
+            AgentCommandTrigger::Mention => {
+                let Some(mention) = mention_for_entry(&entry) else {
+                    return;
+                };
+                let mut mentions = self.armed_mentions.borrow_mut();
+                mentions.retain(|(_, existing)| {
+                    existing.reference != mention.reference
+                        || existing.kind != mention.kind
+                        || existing.agent_id != mention.agent_id
+                });
+                mentions.push((entry.insertion_text.clone(), mention));
+            }
+            _ => {}
+        }
+    }
+
     /// Loads the `/` commands the open session offers.
     ///
     /// One read per session: the palette filters what came back locally as the
@@ -2619,6 +2789,7 @@ impl SessionService {
             })
             .await;
             if let Ok(Ok(discovery)) = result {
+                service.remember_entries(&discovery);
                 service.commands.set(command_entries(discovery));
             }
         });
@@ -2722,6 +2893,7 @@ impl SessionService {
             })
             .await;
             if let Ok(Ok(discovery)) = result {
+                service.remember_entries(&discovery);
                 let entries = command_entries(discovery);
                 service.mentions.set(entries);
             }
@@ -2758,6 +2930,7 @@ impl SessionService {
             })
             .await;
             if let Ok(Ok(discovery)) = result {
+                service.remember_entries(&discovery);
                 service.skills.set(command_entries(discovery));
             }
         });
@@ -4193,6 +4366,7 @@ async fn send_and_refetch(
     session_id: VibexSessionId,
     text: String,
     attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
 ) -> BackendResult<TimelinePage> {
     // The session's own selection is what the runtime expects the send to
     // carry; asking first also notices a runtime that cannot take a turn.
@@ -4204,7 +4378,7 @@ async fn send_and_refetch(
             desired_runtime: selection,
             text,
             attachments,
-            mentions: Vec::new(),
+            mentions,
             reasoning_effort: None,
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
@@ -4316,6 +4490,56 @@ fn change_letter(kind: GitChangeKind) -> &'static str {
 }
 
 /// The palette rows a discovery answers with, deduplicated by id.
+const COMPOSER_AGENT_REFERENCE_KEY: &str = "vibexUseAgentReference";
+const COMPOSER_SELECTION_REFERENCE_KEY: &str = "vibexUseSelectionReference";
+const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
+
+fn mention_for_entry(entry: &AgentCommandEntry) -> Option<VibexUseMention> {
+    let metadata = |key: &str| {
+        entry
+            .metadata
+            .iter()
+            .find(|metadata| metadata.key == key)
+            .map(|metadata| metadata.value.as_str())
+    };
+    if let (Some(agent_id), Some(option)) = (
+        metadata(COMPOSER_AGENT_REFERENCE_KEY),
+        metadata(COMPOSER_SELECTION_REFERENCE_KEY),
+    ) {
+        let agent_id = AgentId::parse(agent_id).ok()?;
+        let option = VibexUseRef::parse(option)?;
+        return Some(VibexUseMention::agent(
+            &agent_id,
+            &option,
+            Some(entry.label.as_str()),
+        ));
+    }
+    if let Some(session) = metadata(COMPOSER_SESSION_REFERENCE_KEY) {
+        let reference = VibexUseRef::parse(session)?;
+        let session_id = reference.session_id()?;
+        return Some(VibexUseMention::session(
+            &session_id,
+            Some(entry.label.as_str()),
+        ));
+    }
+    None
+}
+
+fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)> {
+    let rest = text.trim().strip_prefix('/')?;
+    let mut parts = rest.splitn(2, char::is_whitespace);
+    let name = parts.next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let arguments = parts
+        .next()
+        .map(str::trim)
+        .filter(|arguments| !arguments.is_empty())
+        .map(str::to_owned);
+    Some((name.to_owned(), arguments))
+}
+
 fn command_entries(discovery: vibex_core::AgentCommandDiscovery) -> Vec<CommandEntry> {
     let mut entries = Vec::new();
     let mut seen = std::collections::BTreeSet::new();

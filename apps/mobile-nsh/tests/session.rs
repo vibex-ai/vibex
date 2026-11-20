@@ -706,6 +706,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         mentions,
         skills,
         on_skill_query: Rc::new(|_| {}),
+        on_arm_entry: Rc::new(|_| {}),
         attachments,
         on_attach_image,
         on_attach_file: Rc::new(|| {}),
