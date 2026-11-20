@@ -70,7 +70,7 @@ use vibex_nsh_ui::{
         PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
         QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-        SidebarSectionView, TimelineEntry, TokenUsageView,
+        SidebarSectionKind, SidebarSectionView, TimelineEntry, TokenUsageView,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -613,6 +613,14 @@ impl SessionService {
             on_delete_folder: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.delete_folder(id))
+            },
+            on_rename_group: {
+                let service = self.clone();
+                Rc::new(move |id: &str, name: &str| service.rename_group(id, name))
+            },
+            on_delete_group: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.delete_group(id))
             },
             on_create_group: {
                 let service = self.clone();
@@ -3949,6 +3957,23 @@ impl SessionService {
         });
     }
 
+    fn rename_group(&self, id: &str, name: &str) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::RenameGroup {
+            group_id: id.to_owned(),
+            name,
+        });
+    }
+
+    fn delete_group(&self, id: &str) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::DeleteGroup {
+            group_id: id.to_owned(),
+        });
+    }
+
     fn create_group(&self, name: &str, members: &[String]) {
         let name = name.trim().to_owned();
         if name.is_empty() || members.is_empty() {
@@ -4048,6 +4073,7 @@ impl SessionService {
         }
         for folder in &snapshot.folders {
             sections.push(SidebarSectionView {
+                kind: SidebarSectionKind::Folder,
                 id: folder.id.clone(),
                 name: folder.name.clone(),
                 session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
@@ -4055,6 +4081,7 @@ impl SessionService {
         }
         for group in &snapshot.groups {
             sections.push(SidebarSectionView {
+                kind: SidebarSectionKind::Group,
                 id: group.id.clone(),
                 name: group.name.clone(),
                 session_ids: group.member_session_ids.clone(),

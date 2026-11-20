@@ -23,7 +23,7 @@ use vibex_nsh_ui::screens::session::{
     PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
     PlanStepView, PlanView, QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView,
     RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    SidebarSectionView, TimelineEntry, TokenUsageView,
+    SidebarSectionKind, SidebarSectionView, TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
@@ -198,9 +198,23 @@ fn TurnShell() -> impl IntoElement {
 fn FolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
+        kind: SidebarSectionKind::Folder,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
         session_ids: vec!["s2".to_owned()],
+    }]);
+    session::session(host)
+}
+
+/// A shell with one session group.
+#[component]
+fn GroupShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sidebar_sections.set(vec![SidebarSectionView {
+        kind: SidebarSectionKind::Group,
+        id: "group-1".to_owned(),
+        name: "Pair".to_owned(),
+        session_ids: vec!["s1".to_owned(), "s2".to_owned()],
     }]);
     session::session(host)
 }
@@ -775,6 +789,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_create_folder: Rc::new(|| {}),
         on_rename_folder: Rc::new(|_, _| {}),
         on_delete_folder: Rc::new(|_| {}),
+        on_rename_group: Rc::new(|_, _| {}),
+        on_delete_group: Rc::new(|_| {}),
         on_create_group: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
@@ -1161,6 +1177,18 @@ fn selected_sessions_can_become_a_group() {
     app.wait_for("1 selected").unwrap();
     app.press("Group").unwrap();
     app.wait_for("Group name").unwrap();
+}
+
+#[test]
+fn a_group_opens_its_actions() {
+    let mut config = EngineConfig::new(Root::of::<GroupShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Pair").unwrap();
+    app.press("role:button[Folder actions]").unwrap();
+    app.wait_for("Session group").unwrap();
 }
 
 #[test]

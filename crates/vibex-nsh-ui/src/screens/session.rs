@@ -186,9 +186,16 @@ pub struct TokenUsageView {
     pub output: u64,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarSectionKind {
+    Folder,
+    Group,
+}
+
 /// One drawer section the authority arranged: a folder or a session group.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarSectionView {
+    pub kind: SidebarSectionKind,
     pub id: String,
     pub name: String,
     pub session_ids: Vec<String>,
@@ -442,6 +449,8 @@ pub struct SessionHost {
     pub on_create_folder: Action,
     pub on_rename_folder: FolderNameAction,
     pub on_delete_folder: Rc<dyn Fn(&str)>,
+    pub on_rename_group: FolderNameAction,
+    pub on_delete_group: Rc<dyn Fn(&str)>,
     pub on_create_group: CreateGroupAction,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
@@ -4023,6 +4032,10 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_delete_folder = host.on_delete_folder.clone();
     let folder_actions = signal(None::<String>);
     let folder_rename = signal(String::new());
+    let group_actions = signal(None::<String>);
+    let group_rename = signal(String::new());
+    let on_rename_group = host.on_rename_group.clone();
+    let on_delete_group = host.on_delete_group.clone();
     let group_open = signal(false);
     let group_name = signal(String::new());
     let on_create_group = host.on_create_group.clone();
@@ -4159,6 +4172,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             }))
                     }
                 }))
+                .child(group_actions_sheet(
+                    group_actions,
+                    group_rename,
+                    on_rename_group.clone(),
+                    on_delete_group.clone(),
+                ))
                 .child(group_sheet(
                     group_open,
                     group_name,
@@ -4217,6 +4236,14 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                     Rc::new(move |id: &str, name: &str| {
                                                         folder_rename.set(name.to_owned());
                                                         folder_actions.set(Some(id.to_owned()));
+                                                    })
+                                                },
+                                                {
+                                                    let group_actions = group_actions;
+                                                    let group_rename = group_rename;
+                                                    Rc::new(move |id: &str, name: &str| {
+                                                        group_rename.set(name.to_owned());
+                                                        group_actions.set(Some(id.to_owned()));
                                                     })
                                                 },
                                                 open,
@@ -4463,6 +4490,73 @@ fn drawer_groups(
     })
 }
 
+fn group_actions_sheet(
+    action: Signal<Option<String>>,
+    name: Signal<String>,
+    on_rename: FolderNameAction,
+    on_delete: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    let open = computed(move || action.get().is_some());
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                action.set(None);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Session group", "会话分组", "工作階段分組"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(field::text_field(
+                    name,
+                    copy::text("Group name", "分组名称", "分組名稱"),
+                ))
+                .child({
+                    let on_rename = on_rename.clone();
+                    action::primary(
+                        copy::text("Rename", "重命名", "重新命名"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || {
+                            if let Some(id) = action.get_untracked()
+                                && !name.with(|name| name.trim().is_empty())
+                            {
+                                on_rename(&id, &name.get_untracked());
+                                action.set(None);
+                            }
+                        },
+                    )
+                    .w_full()
+                })
+                .child({
+                    let on_delete = on_delete.clone();
+                    action::secondary(
+                        copy::text("Delete", "删除", "刪除"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || {
+                            if let Some(id) = action.get_untracked() {
+                                on_delete(&id);
+                                action.set(None);
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
+        )
+}
+
 fn group_sheet(
     open: Signal<bool>,
     name: Signal<String>,
@@ -4636,6 +4730,7 @@ fn sidebar_section(
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     on_folder_menu: FolderNameAction,
+    on_group_menu: FolderNameAction,
     open: Signal<bool>,
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
@@ -4676,10 +4771,15 @@ fn sidebar_section(
                 )
                 .child({
                     let on_folder_menu = on_folder_menu.clone();
+                    let on_group_menu = on_group_menu.clone();
                     button()
                         .on_press(move || {
                             let section = section.get_untracked();
-                            on_folder_menu(&section.id, &section.name);
+                            if section.kind == SidebarSectionKind::Folder {
+                                on_folder_menu(&section.id, &section.name);
+                            } else {
+                                on_group_menu(&section.id, &section.name);
+                            }
                         })
                         .accessibility_label(copy::text(
                             "Folder actions",
