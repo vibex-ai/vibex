@@ -74,6 +74,8 @@ const TIMELINE_LIMIT: u32 = 200;
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 /// Where the newest transcript window of the last few sessions is kept.
 const TIMELINE_CACHE_KEY: &str = "vibex.mobile.timeline.v1";
+/// Where the prompts written ahead of a running turn are kept.
+const QUEUE_KEY: &str = "vibex.mobile.queue.v1";
 /// At most this many conversations are cached.
 const TIMELINE_CACHE_SESSIONS: usize = 4;
 
@@ -104,6 +106,34 @@ struct QueuedMessage {
     text: String,
     attachments: Vec<AttachmentItem>,
     mentions: Vec<VibexUseMention>,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredAttachment {
+    label: String,
+    mime_type: String,
+    uri: String,
+}
+
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredQueued {
+    id: u64,
+    text: String,
+    #[serde(default)]
+    attachments: Vec<StoredAttachment>,
+    #[serde(default)]
+    mentions: Vec<VibexUseMention>,
+}
+
+#[derive(Clone, Debug, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct StoredQueues {
+    #[serde(default)]
+    sessions: BTreeMap<String, Vec<StoredQueued>>,
+    #[serde(default)]
+    paused: Vec<String>,
 }
 
 /// The session shell's state and actions.
@@ -268,6 +298,7 @@ impl SessionService {
         let workspace_backend: Arc<dyn WorkspaceBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
+        let loaded = load_queues();
         let service = Self {
             bundle_host_id: Rc::new(bundle.host_id().to_owned()),
             backend,
@@ -374,9 +405,9 @@ impl SessionService {
             goal: signal(None),
             history: signal(Vec::new()),
             history_open: signal(false),
-            queue: Rc::new(RefCell::new(BTreeMap::new())),
-            queue_seq: Rc::new(Cell::new(0)),
-            queue_paused_sessions: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            queue: Rc::new(RefCell::new(loaded.0)),
+            queue_seq: Rc::new(Cell::new(loaded.2)),
+            queue_paused_sessions: Rc::new(RefCell::new(loaded.1)),
             queued: signal(Vec::new()),
             queue_paused: signal(false),
             editable_sequence: signal(0),
@@ -1211,6 +1242,8 @@ impl SessionService {
                     .borrow_mut()
                     .retain(|id, _| !ids.contains(id));
                 self.drafts.borrow_mut().retain(|id, _| !ids.contains(id));
+                self.queue.borrow_mut().retain(|id, _| !ids.contains(id));
+                self.persist_queues();
                 self.persist_drafts();
                 let active = self.active.get_untracked();
                 if active.as_ref().is_some_and(|active| ids.contains(active)) {
@@ -2006,6 +2039,7 @@ impl SessionService {
         self.draft.set(String::new());
         self.attachments.set(Vec::new());
         self.publish_queue();
+        self.persist_queues();
         crate::settings::haptic(nsh_core::Haptic::Selection);
     }
 
@@ -2035,6 +2069,48 @@ impl SessionService {
             .set(self.queue_paused_sessions.borrow().contains(&active));
     }
 
+    fn persist_queues(&self) {
+        let sessions = self
+            .queue
+            .borrow()
+            .iter()
+            .map(|(session, messages)| {
+                (
+                    session.clone(),
+                    messages
+                        .iter()
+                        .map(|message| StoredQueued {
+                            id: message.id,
+                            text: message.text.clone(),
+                            attachments: message
+                                .attachments
+                                .iter()
+                                .map(|attachment| StoredAttachment {
+                                    label: attachment.label.clone(),
+                                    mime_type: attachment.mime_type.clone(),
+                                    uri: attachment.uri.clone(),
+                                })
+                                .collect(),
+                            mentions: message.mentions.clone(),
+                        })
+                        .collect(),
+                )
+            })
+            .collect();
+        let stored = StoredQueues {
+            sessions,
+            paused: self
+                .queue_paused_sessions
+                .borrow()
+                .iter()
+                .cloned()
+                .collect(),
+        };
+        if let Ok(text) = serde_json::to_string(&stored) {
+            let _ = Storage::set_item(QUEUE_KEY, text);
+        }
+    }
+
     fn send_queued(&self, id: u64) {
         let Some(active) = self.active.get_untracked() else {
             return;
@@ -2050,6 +2126,7 @@ impl SessionService {
             queue.remove(index)
         };
         self.publish_queue();
+        self.persist_queues();
         self.deliver(message.text, message.attachments, message.mentions, false);
     }
 
@@ -2061,6 +2138,7 @@ impl SessionService {
             queue.retain(|message| message.id != id);
         }
         self.publish_queue();
+        self.persist_queues();
     }
 
     fn clear_queue(&self) {
@@ -2069,6 +2147,7 @@ impl SessionService {
         };
         self.queue.borrow_mut().remove(&active);
         self.publish_queue();
+        self.persist_queues();
     }
 
     fn toggle_queue_paused(&self) {
@@ -2081,6 +2160,7 @@ impl SessionService {
         }
         drop(paused);
         self.publish_queue();
+        self.persist_queues();
     }
 
     fn flush_queue(&self) {
@@ -2101,6 +2181,7 @@ impl SessionService {
             queue.remove(0)
         };
         self.publish_queue();
+        self.persist_queues();
         self.deliver(message.text, message.attachments, message.mentions, false);
     }
 
@@ -2125,6 +2206,7 @@ impl SessionService {
             },
         );
         self.publish_queue();
+        self.persist_queues();
     }
 
     fn deliver(
@@ -3223,6 +3305,8 @@ impl SessionService {
             .update(|sessions| sessions.retain(|s| s.id != id));
         self.drafts.borrow_mut().remove(id);
         self.persist_drafts();
+        self.queue.borrow_mut().remove(id);
+        self.persist_queues();
         if self.active.get_untracked().as_deref() != Some(id) {
             return;
         }
@@ -4745,6 +4829,46 @@ fn image_mime(name: &str) -> &'static str {
         "svg" => "image/svg+xml",
         _ => "image/jpeg",
     }
+}
+
+fn load_queues() -> (
+    BTreeMap<String, Vec<QueuedMessage>>,
+    std::collections::BTreeSet<String>,
+    u64,
+) {
+    let stored = Storage::get_item(QUEUE_KEY)
+        .and_then(|text| serde_json::from_str::<StoredQueues>(&text).ok())
+        .unwrap_or_default();
+    let mut next = 0;
+    let sessions = stored
+        .sessions
+        .into_iter()
+        .map(|(session, messages)| {
+            let messages = messages
+                .into_iter()
+                .map(|message| {
+                    next = next.max(message.id.saturating_add(1));
+                    QueuedMessage {
+                        id: message.id,
+                        text: message.text,
+                        attachments: message
+                            .attachments
+                            .into_iter()
+                            .map(|attachment| AttachmentItem {
+                                id: format!("queued:{}", message.id),
+                                label: attachment.label,
+                                mime_type: attachment.mime_type,
+                                uri: attachment.uri,
+                            })
+                            .collect(),
+                        mentions: message.mentions,
+                    }
+                })
+                .collect::<Vec<_>>();
+            (session, messages)
+        })
+        .collect();
+    (sessions, stored.paused.into_iter().collect(), next)
 }
 
 /// The cached transcript windows kept on this phone.
