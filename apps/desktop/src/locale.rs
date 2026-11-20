@@ -625,7 +625,7 @@ static STRINGS_ZH_CN: Strings = Strings {
     open_workspace: "打开工作区",
     no_preview: "暂无预览",
     no_workspace_files: "暂无工作区文件",
-    message_agent: "输入消息，或输入 / 唤出命令",
+    message_agent: "输入消息，或输入 / 唤出命令、@ 引用文件、会话或 Agent、$ 调用 Skill",
     agent_loading_session: "正在加载会话...",
     agent_start_conversation: "开始对话",
     agent_select_session: "创建或选择会话",
@@ -839,7 +839,7 @@ static STRINGS_ZH_TW: Strings = Strings {
     open_workspace: "開啟工作區",
     no_preview: "暫無預覽",
     no_workspace_files: "暫無工作區檔案",
-    message_agent: "輸入訊息，或輸入 / 喚出命令",
+    message_agent: "輸入訊息，或輸入 / 喚出命令、@ 引用檔案、會話或 Agent、$ 呼叫 Skill",
     agent_loading_session: "正在載入會話...",
     agent_start_conversation: "開始對話",
     agent_select_session: "建立或選擇會話",
@@ -3670,12 +3670,19 @@ mod tests {
         assert_eq!(strings(ResolvedLocale::En).general, "General");
         assert_eq!(strings(ResolvedLocale::ZhCn).theme, "主题");
         assert_eq!(strings(ResolvedLocale::ZhTw).undo_changes, "撤銷變更");
-        // The bar's empty state is a prompt, not a keybinding legend: at the
-        // bar's width the old sentence filled the whole row and wrapped, so it
-        // read as text the reader had typed rather than a hint.
+        // The bar's empty state names all three triggers, in the order the
+        // composer answers them: `/` for commands, `@` for a file, a session or
+        // an Agent, `$` for a Skill. It stays one sentence so it still reads as
+        // a hint rather than text the reader typed.
         assert_eq!(
             strings(ResolvedLocale::ZhCn).message_agent,
-            "输入消息，或输入 / 唤出命令"
+            "输入消息，或输入 / 唤出命令、@ 引用文件、会话或 Agent、$ 调用 Skill"
+        );
+        assert!(
+            strings(ResolvedLocale::ZhTw)
+                .message_agent
+                .contains("$ 呼叫 Skill"),
+            "the Chinese twin names the same three triggers"
         );
         assert_eq!(
             strings(ResolvedLocale::En).message_agent,

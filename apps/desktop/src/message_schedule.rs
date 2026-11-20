@@ -734,6 +734,14 @@ impl VibexWorkbench {
     /// caption it belongs to. The glyph is named separately because the kit
     /// draws an icon at three quarters of its button; at a caption's size that
     /// lands smaller than the row's own marks.
+    ///
+    /// A sized control drops the button's own inset padding. The kit pads a
+    /// button that carries children by a fifth of its square on each side and
+    /// then clips the content box, so a 14px glyph inside a 22px square lost a
+    /// hair off all four edges of its own stroke: the clock's ring and the
+    /// terminal's frame read as cut. The square is the caption's whole hit area
+    /// anyway, and the glyph is already the smaller of the two, so the padding
+    /// has nothing to protect.
     pub(super) fn render_message_schedule_button_sized(
         &self,
         target: MessageScheduleTarget,
@@ -758,15 +766,40 @@ impl VibexWorkbench {
             || label.to_string(),
             |schedule| format!("{label} {}", schedule.summary()),
         );
+        // A sized control is the Composer footer's instrument, so its glyph
+        // answers the pointer the way the terminal beside it does: a step under
+        // the caption's ink at rest, the caption's own ink while the pointer is
+        // on the seat. A group rather than a hover listener, because the
+        // tooltip below already owns this button's one listener; the unsized
+        // variants belong to other surfaces and keep the kit's own icon ink.
+        let sized_group = size.map(|_| {
+            format!(
+                "composer-footer-schedule:{}",
+                self.message_schedule_popover_id(&target)
+            )
+        });
+        let sized_ink = size.map(|_| {
+            (
+                composer_instrument_rest_ink(COMPOSER_FOOTER_INSTRUMENT_REST_INK, cx),
+                composer_instrument_hover_ink(cx),
+            )
+        });
         let trigger = button_with_aria_label(
             Button::new(self.message_schedule_popover_id(&target))
                 .small()
                 .ghost()
                 .compact()
-                .when_some(size, |button, (size, glyph)| {
-                    button
-                        .size(px(size))
-                        .child(Icon::default().path(CLOCK_ICON).size(px(glyph)))
+                .when_some(size.zip(sized_group).zip(sized_ink), |button, pair| {
+                    let (((size, glyph), group), (rest, hover)) = pair;
+                    button.size(px(size)).p(px(0.0)).group(group.clone()).child(
+                        composer_instrument_glyph(
+                            Icon::default().path(CLOCK_ICON),
+                            glyph,
+                            group,
+                            rest,
+                            hover,
+                        ),
+                    )
                 })
                 .map(|button| {
                     if size.is_none() {

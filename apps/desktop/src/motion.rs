@@ -702,12 +702,62 @@ thread_local! {
     static HEIGHT_MORPHS: RefCell<HeightMorphs> = RefCell::new(HeightMorphs::default());
 }
 
+thread_local! {
+    /// The view a height morph should ask for its next frame while one is being
+    /// built inside it.
+    ///
+    /// Same idea as the hover fades' owner scope, and it exists for the same
+    /// reason times a hundred: the morph runs for a dozen frames, and the
+    /// composer is hosted by a view of its own precisely so that a frame of its
+    /// own does not rebuild the sidebar, every pane and the transcript beside
+    /// it. Handing the morph the workbench's id made every one of those frames a
+    /// whole-window rebuild, which is what a coarse, stepping glide looks like.
+    static HEIGHT_OWNER_SCOPE: Cell<Option<EntityId>> = const { Cell::new(None) };
+}
+
+/// Runs `build` with `owner` as the height-morph owner for every
+/// [`resolve_height`] built inside it.
+///
+/// The host view that embeds a morphing surface pushes its own id here, so the
+/// frames the morph asks for repaint that view instead of whatever view happens
+/// to be rendering the surface.
+pub fn with_height_owner<R>(owner: EntityId, build: impl FnOnce() -> R) -> R {
+    let previous = HEIGHT_OWNER_SCOPE.with(|scope| scope.replace(Some(owner)));
+    let result = build();
+    HEIGHT_OWNER_SCOPE.with(|scope| scope.set(previous));
+    result
+}
+
+/// The host view that currently owns the height morph, if any.
+fn scoped_height_owner() -> Option<EntityId> {
+    HEIGHT_OWNER_SCOPE.with(Cell::get)
+}
+
 /// Resolve the height for `key` this frame (see [`HeightMorphs::resolve_at`]).
 pub fn resolve_height(key: &str, target: f32, snap: bool, owner: EntityId) -> f32 {
+    let owner = scoped_height_owner().unwrap_or(owner);
     HEIGHT_MORPHS.with(|morphs| {
         morphs
             .borrow_mut()
             .resolve_at(key, target, snap, owner, Instant::now())
+    })
+}
+
+/// Whether `key`'s surface is mid-glide this frame.
+///
+/// A surface that is animating its own height is, by definition, about to be
+/// repainted by the morph's own frame drive. A caller that measures it — the
+/// composer parks its bounds for the menus it anchors — can ask here before
+/// asking for a repaint of its own, so one glide does not wake every view that
+/// watches the measurement.
+pub fn height_morph_in_flight(key: &str) -> bool {
+    HEIGHT_MORPHS.with(|morphs| {
+        let morphs = morphs.borrow();
+        let now = Instant::now();
+        morphs
+            .entries
+            .get(key)
+            .is_some_and(|entry| entry.morph.is_some_and(|morph| !morph.settled(now)))
     })
 }
 
@@ -1204,6 +1254,49 @@ mod tests {
             morphs.resolve_at("composer", 64.0, true, owner(), ms(60)),
             64.0
         );
+    }
+
+    /// The morph's frames go to the view that hosts the surface.
+    ///
+    /// A glide is a dozen frames, and the composer that arms one is a view of
+    /// its own: notified as the workbench, each step rewrote the sidebar, every
+    /// pane and the transcript as well, which is the cost that turns a short
+    /// ease-out into a stepping glide.
+    #[test]
+    fn height_morph_frames_go_to_the_scoped_host_view() {
+        let workbench = EntityId::from(3);
+        let host = EntityId::from(4);
+        let key = "morph_owner_scope";
+        resolve_height(key, 64.0, false, workbench);
+        resolve_height(key, 136.0, false, workbench);
+        assert!(height_morph_in_flight(key));
+        // A read inside the host's render hands the morph to the host.
+        with_height_owner(host, || {
+            let _ = resolve_height(key, 136.0, false, workbench);
+        });
+        let owner =
+            HEIGHT_MORPHS.with(|morphs| morphs.borrow().entries.get(key).map(|entry| entry.owner));
+        assert_eq!(owner, Some(host), "the host view drives the glide");
+        // Outside the scope the workbench's own id is back in charge.
+        let _ = resolve_height(key, 136.0, false, workbench);
+        let owner =
+            HEIGHT_MORPHS.with(|morphs| morphs.borrow().entries.get(key).map(|entry| entry.owner));
+        assert_eq!(owner, Some(workbench), "the scope is restored on exit");
+    }
+
+    /// A settled glide is not in flight, so measurement wake-ups resume.
+    #[test]
+    fn height_morph_reports_flight_only_while_it_travels() {
+        let key = "morph_flight_window";
+        let owner = owner();
+        // First paint commits without a glide.
+        resolve_height(key, 64.0, false, owner);
+        assert!(!height_morph_in_flight(key));
+        resolve_height(key, 136.0, false, owner);
+        assert!(height_morph_in_flight(key));
+        // A snap (reduced motion, a session switch) lands at once.
+        resolve_height(key, 200.0, true, owner);
+        assert!(!height_morph_in_flight(key));
     }
 
     #[test]

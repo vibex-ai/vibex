@@ -931,6 +931,43 @@ baseline with the instruments. Do not raise the footer's controls to the bar's
 size to make them easier to hit — they are readouts and rare actions, and the
 surface above owns the frequent ones.
 
+The three instruments must also *draw* at one optical size, and neither the kit
+nor a naive diameter gets there. A sized `Button` that carries children pads
+itself by a fifth of its square on each side and clips the content box, so a
+14px glyph inside a 22px seat lost a hair off all four edges of its own stroke
+and the clock read as cut; the footer's instrument buttons therefore set
+`p(px(0.0))` and let the glyphs occupy the whole seat. The usage ring is the
+mirror-image trap: the seat is a 22px square, but `ProgressCircle` paints at
+three quarters of the size it is handed, so asking it for the seat drew a
+16.5px disc — the loudest mark on a row of 14px glyphs. It is asked for the
+square that paints `COMPOSER_FOOTER_RING_SIZE` (15, a point over the glyphs
+because a stroke carries less weight than a solid mark), through
+`PROGRESS_CIRCLE_DRAWN_SCALE` rather than a bare `0.75`.
+
+Every instrument glyph — the footer's schedule and terminal, the surface's
+attach and expand — takes its two inks from `composer_instrument_glyph`: a rest
+step under the caption's muted ink (`composer_instrument_rest_ink`) and the
+caption's own ink while the pointer is on the control
+(`composer_instrument_hover_ink`). Do not paint a single static tone and lean on
+the button's hover background: the kit's `.icon(...)` tints with the button's
+foreground, and a ghost button keeps that foreground unchanged under the
+pointer, so a mark that must be dim at rest and bright on hover has to be a
+tinted child. Such a child also needs the whole seat — a sized `Button` that
+carries children insets and clips it — hence the `p(px(0.0))`.
+
+The switch between the two inks rides a **hover group**, not a hover listener.
+Every one of these buttons carries a tooltip, the kit's tooltip already owns
+that button's single `on_hover`, and a second one panics at paint. The group
+(`COMPOSER_ATTACH_GROUP`, `COMPOSER_EXPAND_GROUP`, `COMPOSER_TERMINAL_GROUP`, and
+a per-session `composer-footer-schedule:<id>`) is read by the glyph's wrapper
+through `group_hover`, which also keeps the mark on the same beat as the button's
+own wash instead of half a beat behind it. Both densities of one control share
+one group: a density flip rebuilds the button under the pointer, and a renamed
+group would drop the highlight at the moment the reader is watching it. The
+footer's pair rests darker (`COMPOSER_FOOTER_INSTRUMENT_REST_INK` = 0.70) than
+the surface's own (`COMPOSER_ROW_INSTRUMENT_REST_INK` = 0.78) because they are
+rare actions a step below the box.
+
 The slim row then reads attach → expand → run configuration → send, with no
 fold-menu: four separate controls fit because the row only seats two of them
 plus the cascade and the action. The two utility controls share a 30px seat
@@ -983,6 +1020,41 @@ the input's line advance plus its own padding, then the row's insets, the
 control row and the surface hairline. Do not grow a fixed base instead: the
 old `base + (rows - 2) × advance` reserved a blank band under the last line,
 and that band is what the reader sees as wasted input space.
+
+### The composer's height glide
+
+The two densities are one renderer at two heights, and the surface's height
+glides between them (`motion::resolve_height` under
+`composer_surface_morph_key`) while the committed layout switches at once so the
+caret and the draft survive. Two rules keep the glide from stepping.
+
+**Its frames belong to the ComposerView, not the workbench.** A glide runs for a
+dozen frames; notifying the workbench for each one rebuilt the sidebar, every
+pane and the transcript beside the composer, and the surface arrived in visible
+steps — the shape of an animation that is too expensive to run. `ComposerView`
+renders inside `motion::with_height_owner`, so the morph asks that boundary for
+its frames, and it ticks the store at the end of its own render (after the read
+that may have armed one). Reduced motion, a session switch and the fullscreen
+editor still snap.
+
+**A measurement taken mid-glide does not ask for a repaint.** The surface parks
+its bounds for the menus it anchors, and those bounds move every frame of a
+glide; a repaint request per step woke the same whole window the morph was
+avoiding. `composer_measurement_wants_repaint` holds the request back while
+`motion::height_morph_in_flight` says the glide is running — the glide's own
+frames repaint the composer, which adopts the parked bounds at the start of
+every render, and the settled bounds land once the glide ends.
+
+### The composer's edge
+
+`composer_surface_border` answers for two kinds of focus. A focused *pane* takes
+the theme's ring outright: which pane the keys reach has to read from across the
+window. A caret in the box — the only focus the single-session column has —
+takes that ring mixed into the resting hairline
+(`COMPOSER_FOCUSED_INPUT_RING_MIX` = 0.6), enough that the box says it is the
+thing being typed into without shouting like a pane boundary. The input
+subscription asks for the frame on `InputEvent::Focus` and `Blur`; a focus
+change is a one-off, not a per-keystroke cost.
 
 ### Session activity indicators
 

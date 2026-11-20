@@ -1364,6 +1364,15 @@ const ACTIVE_COMPOSER_TEXT_AREA_MIN_HEIGHT: f32 = 80.0;
 /// width the row used to give it. The clock and the terminal moved to the line
 /// under the surface, so the corner owns a single button.
 const COMPOSER_TRAILING_CONTROL_SIZE: f32 = 30.0;
+/// The mark the Composer's own controls draw inside their seat.
+///
+/// The row's utility buttons are 30px and their marks 15: at a full-size mark a
+/// quiet control read as a third action competing with the send disc. The
+/// trailing corner keeps the size the kit gave it before it drew its own ink
+/// (`COMPOSER_TRAILING_CONTROL_SIZE` at the kit's three quarters), so swapping
+/// its glyph for a tinted one does not also resize the corner.
+const COMPOSER_SURFACE_GLYPH_SIZE: f32 = 15.0;
+const COMPOSER_TRAILING_GLYPH_SIZE: f32 = COMPOSER_TRAILING_CONTROL_SIZE * 0.75;
 /// The height the trailing corner asks the input row to reserve: one button.
 const COMPOSER_TRAILING_STACK_HEIGHT: f32 = COMPOSER_TRAILING_CONTROL_SIZE;
 /// The surface's own border, top and bottom. A surface height is a border-box
@@ -1401,7 +1410,58 @@ const COMPOSER_FOOTER_MARK_SIZE: f32 = 13.0;
 /// an 16px mark — half the bar's own. These draw a point under that instead, so
 /// the row stays a caption and the surface above keeps the heavier marks.
 const COMPOSER_FOOTER_GLYPH_SIZE: f32 = 14.0;
+/// The diameter the footer's usage ring paints at.
+///
+/// The ring is the third instrument on the same baseline, and it used to be the
+/// largest mark on it: the kit's circle was handed the control's own square and
+/// painted at three quarters of it, a 16.5px disc beside two 14px glyphs. A
+/// stroke needs a hair more room than a solid mark to carry the same weight, so
+/// the ring settles one point over the glyphs instead of at their width or at
+/// the control's.
+const COMPOSER_FOOTER_RING_SIZE: f32 = 15.0;
+/// The ink the footer's schedule and terminal glyphs rest at, and the ink every
+/// Composer instrument rises to under the pointer.
+///
+/// Both footer glyphs are rare controls that must stay findable without holding
+/// the eye: at the caption's full muted ink they read as a second pair of
+/// buttons beside a readout that is quieter than they are. A rest step under the
+/// caption's ink keeps them present, and the rise to the caption's own ink on
+/// hover is what says they are pressable at all. The surface's own controls sit
+/// a step brighter than the footer's — they are the frequent ones — but they
+/// answer the pointer the same way.
+const COMPOSER_FOOTER_INSTRUMENT_REST_INK: f32 = 0.70;
+const COMPOSER_ROW_INSTRUMENT_REST_INK: f32 = 0.78;
+const COMPOSER_INSTRUMENT_HOVER_INK: f32 = 1.0;
+/// The hover groups the Composer's own controls answer to.
+///
+/// A group rather than a hover listener: every one of these buttons carries a
+/// tooltip, and the kit's tooltip already owns that button's one `on_hover` —
+/// a second one panics. The group is the kit's own hover state, and it is also
+/// what lets the glyph ride the same instant the button's background wash does
+/// instead of stepping half a beat behind it. The keys are literals because
+/// both densities of one control must share a group: a draft that flips density
+/// rebuilds the button under the pointer, and a renamed group would drop the
+/// highlight at the moment the reader is watching the row.
+const COMPOSER_ATTACH_GROUP: &str = "composer-attach";
+const COMPOSER_EXPAND_GROUP: &str = "composer-expand";
+const COMPOSER_TERMINAL_GROUP: &str = "composer-footer-terminal";
+/// How much of the square it is given `ProgressCircle` actually paints.
+///
+/// The kit draws its ring at three quarters of the size it is handed, so a
+/// caller that thinks in diameters has to ask for the square that produces the
+/// one it wants. Naming the ratio keeps that division in one place instead of
+/// spelling `0.75` at the call site.
+const PROGRESS_CIRCLE_DRAWN_SCALE: f32 = 0.75;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
+/// How far the surface's resting edge moves toward the ring while the input
+/// holds the caret.
+///
+/// Past the halfway mark the edge stops reading as a hairline and the box
+/// starts reading as a second focus ring; under it the highlight is only
+/// visible to a reader who is already looking. This is the point where the
+/// change is unmistakable beside the resting box and still quieter than the
+/// ring a focused pane draws.
+const COMPOSER_FOCUSED_INPUT_RING_MIX: f32 = 0.6;
 /// The one-line composer is a single row: the input line and its controls
 /// share it, so the surface is the row's tallest control plus the row's inset
 /// above and below it and the surface's hairline. The multi-row box keeps the
@@ -4361,28 +4421,47 @@ fn composer_surface_fill(is_dark: bool) -> Hsla {
     }
 }
 
-/// A glyph on the Composer's slim row.
+/// The ink a Composer instrument rests at, and the ink it rises to under the
+/// pointer.
+///
+/// One control, two inks: the caller's `rest` step while the pointer is
+/// elsewhere, and the caption's own muted ink under it. The footer's pair rests
+/// darker than the surface's own controls — they are rare actions a step below
+/// the box, and the surface owns the frequent ones.
+fn composer_instrument_rest_ink(rest: f32, cx: &App) -> Hsla {
+    cx.theme().muted_foreground.opacity(rest)
+}
+
+fn composer_instrument_hover_ink(cx: &App) -> Hsla {
+    cx.theme()
+        .muted_foreground
+        .opacity(COMPOSER_INSTRUMENT_HOVER_INK)
+}
+
+/// A glyph on one of the Composer's own controls, tinted by its hover group.
 ///
 /// The row's utility controls seat two quiet marks and one filled disc, so
 /// their glyphs draw a couple of points under the button's own size and in the
 /// muted ink rather than the foreground: at a full 30px frame a 16px mark read
 /// as a third action competing with the send disc. The kit's `.icon(...)` API
-/// sizes its glyph at three quarters of the button, which is why these are
-/// children instead.
-fn composer_row_glyph(icon: Icon, cx: &App) -> AnyElement {
-    icon.size(px(15.0))
-        .text_color(cx.theme().muted_foreground.opacity(0.86))
-        .into_any_element()
-}
-
-/// A glyph on the footer's instrument row.
-///
-/// The same ink as the bar's marks, a point under the bar's own size, so the
-/// instruments read as the caption they are: present, nameable on hover, and
-/// never competing with the surface above.
-fn composer_footer_glyph(icon: Icon, size: f32, cx: &App) -> AnyElement {
-    icon.size(px(size))
-        .text_color(cx.theme().muted_foreground.opacity(0.92))
+/// sizes its glyph at three quarters of the button and tints it with the
+/// button's own foreground — which a ghost button keeps unchanged under the
+/// pointer — because these are children the mark carries its own two inks. It
+/// takes them from the button's `group`, not from a hover listener: the kit's
+/// tooltip already owns that button's one `on_hover`, and the group keeps the
+/// mark on the same beat as the background wash.
+fn composer_instrument_glyph(
+    icon: Icon,
+    size: f32,
+    group: impl Into<SharedString>,
+    rest: Hsla,
+    hover: Hsla,
+) -> AnyElement {
+    div()
+        .flex_none()
+        .text_color(rest)
+        .group_hover(group, move |this| this.text_color(hover))
+        .child(icon.size(px(size)))
         .into_any_element()
 }
 
@@ -4392,17 +4471,34 @@ fn composer_footer_glyph(icon: Icon, size: f32, cx: &App) -> AnyElement {
 /// between two plates and too quiet for the one edge that has to say where the
 /// box begins. The Composer draws its own edge a little stronger on a dark
 /// page; a light page keeps the theme's line, which already has more contrast
-/// against the white plate. A focused pane still takes the ring, because the
-/// keyboard's owner has to be the loudest thing on the page.
-fn composer_surface_border(is_dark: bool, focused: bool, cx: &App) -> Hsla {
-    if focused {
+/// against the white plate.
+///
+/// The edge also has to answer for the two different ways a composer holds the
+/// keyboard. A focused *pane* takes the theme's ring outright: it is a statement
+/// about which pane the keys reach, and it has to read from across the window.
+/// A focused *input* — a caret sitting in the box, which in the single-session
+/// column is the only focus there is — takes a blend of the resting hairline and
+/// that ring instead. The box has to say it is the thing being typed into, but
+/// at the full ring it shouted as loudly as a pane boundary for a state the
+/// reader entered by clicking one line of text.
+fn composer_surface_border(
+    is_dark: bool,
+    pane_focused: bool,
+    input_focused: bool,
+    cx: &App,
+) -> Hsla {
+    if pane_focused {
         return cx.theme().ring;
     }
-    if is_dark {
+    let rest = if is_dark {
         cx.theme().foreground.opacity(0.14)
     } else {
         cx.theme().border
+    };
+    if input_focused {
+        return motion::mix(rest, cx.theme().ring, COMPOSER_FOCUSED_INPUT_RING_MIX);
     }
+    rest
 }
 
 /// How much room a composer gives itself.
@@ -4584,6 +4680,32 @@ fn composer_surface_height(density: ComposerDensity, wrapped_rows: usize) -> f32
 
 fn composer_queue_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-queue", is_dark).opacity(COMPOSER_EXTENSION_SURFACE_OPACITY)
+}
+
+/// The height morph's key for one session's composer.
+///
+/// The renderer resolves the glide under this key, and the measurement the
+/// surface parks under the same pane asks whether a glide is running before it
+/// wakes anything. One spelling keeps the two halves talking about the same
+/// entry; a second `format!` at the call site is how they drift apart.
+fn composer_surface_morph_key(session_id: Option<&str>) -> String {
+    session_id.map_or_else(
+        || "composer-surface@primary".to_string(),
+        |id| format!("composer-surface@{id}"),
+    )
+}
+
+/// Whether a parked Composer measurement has to ask for a repaint.
+///
+/// The bounds move on every frame of a height glide, so a surface that was
+/// merely growing asked the workbench to repaint for each step as well. The
+/// glide already drives the Composer's own frames, and that view reads the
+/// parked measurement at the start of the render it makes — the extra request
+/// only woke the sidebar, every pane and the transcript beside it, once per
+/// step, for a change the frames in flight had already painted. The request is
+/// held back while the glide runs and lands on the settled bounds.
+fn composer_measurement_wants_repaint(changed: bool, morph_key: &str) -> bool {
+    changed && !motion::height_morph_in_flight(morph_key)
 }
 
 fn composer_plan_progress_label(
@@ -10817,11 +10939,24 @@ impl Render for ComposerView {
         let session_id = self.session_id.clone();
         let enabled = self.enabled;
         let pane_focused = self.pane_focused;
-        workbench.update(cx, |this, cx| {
-            this.with_session_view_for_render(session_id.as_ref(), |this| {
-                this.render_composer(window, cx, enabled, pane_focused)
+        // The surface's height morph belongs to this view, not to the
+        // workbench: a glide runs across a dozen frames, and every frame it
+        // asks for is a frame this boundary can paint on its own. Notified as
+        // the workbench, each step rebuilt the sidebar, every pane and the
+        // transcript beside the composer, and the glide arrived at the screen
+        // in steps — the shape of an animation that is too expensive to run.
+        let owner = cx.entity_id();
+        let element = workbench.update(cx, |this, cx| {
+            motion::with_height_owner(owner, || {
+                this.with_session_view_for_render(session_id.as_ref(), |this| {
+                    this.render_composer(window, cx, enabled, pane_focused)
+                })
             })
-        })
+        });
+        // The tick has to run after the render that armed the morph, or the
+        // first step of a fresh glide waits for somebody else's frame.
+        motion::schedule_height_morph_frames(window);
+        element
     }
 }
 
@@ -12660,6 +12795,14 @@ fn subscribe_composer_input(
             InputEvent::Focus => this.refresh_active_suggestions(ComposerTarget::Session, cx),
             InputEvent::PressEnter { shift: true, .. } | InputEvent::Blur => {}
             InputEvent::PressEnter { shift: false, .. } => {}
+        }
+        // A caret entering or leaving the box changes none of the state this
+        // subscription owns, but it does change what the surface's edge says:
+        // the box lights its ring while it is the thing being typed into. Ask
+        // for that frame — a focus change is a one-off, not a per-keystroke
+        // cost.
+        if matches!(event, InputEvent::Focus | InputEvent::Blur) {
+            cx.notify();
         }
         if switched {
             this.release_session_view();
@@ -67377,14 +67520,30 @@ impl VibexWorkbench {
         glyph: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // The control's ink answers the pointer through the button's own hover
+        // group: a step under the caption's ink at rest, the caption's own ink
+        // while the pointer is on it. The kit's tooltip already owns this
+        // button's one hover listener, so the group is both the only route and
+        // the right one — the mark moves on the same beat as the wash.
+        let rest_ink = composer_instrument_rest_ink(COMPOSER_FOOTER_INSTRUMENT_REST_INK, cx);
+        let hover_ink = composer_instrument_hover_ink(cx);
         Button::new("composer-terminal-menu")
             .ghost()
             .compact()
             .size(px(size))
-            .child(composer_footer_glyph(
+            // The square is the glyph's seat, not a box around it: the kit pads
+            // a sized button that carries children by a fifth of its side and
+            // clips what escapes the padded box, which cut a hair off the
+            // terminal frame's corners on a 22px seat. See the schedule button's
+            // sized twin for the same rule.
+            .p(px(0.0))
+            .group(COMPOSER_TERMINAL_GROUP)
+            .child(composer_instrument_glyph(
                 Icon::new(IconName::SquareTerminal),
                 glyph,
-                cx,
+                COMPOSER_TERMINAL_GROUP,
+                rest_ink,
+                hover_ink,
             ))
             .tooltip(self.composer_terminal_action_label())
             .disabled(self.agent_action_pending || self.view_session_id.is_none())
@@ -79655,6 +79814,11 @@ impl VibexWorkbench {
                         .ghost()
                         .compact()
                         .size(px(COMPOSER_FOOTER_CONTROL_SIZE))
+                        // The ring is the button's whole content, so the seat
+                        // gives it every point it has: the kit's inset padding
+                        // would clip the readout on all four sides of a 22px
+                        // square. Same rule as the terminal control above.
+                        .p(px(0.0))
                         .on_click(cx.listener(|this, _, _, cx| {
                             let session_filter = this.selected_session_id.clone();
                             this.open_usage(session_filter, cx);
@@ -79808,6 +79972,13 @@ impl VibexWorkbench {
         let content_insets = self.session_content_insets();
         let is_dark = cx.theme().is_dark();
         let composer_background = composer_surface_fill(is_dark);
+        // Whether the caret is sitting in this box right now. The pane flag says
+        // which pane the keyboard belongs to; this one says the keyboard is in
+        // the box, and it is the only focus there is in the single-session
+        // column. A caret appearing is a state the edge has to answer for, or
+        // the one control the reader is typing into looks exactly like a box
+        // that is merely present.
+        let composer_input_focused = composer_input.read(cx).focus_handle(cx).is_focused(window);
         let composer_collaboration = self.render_composer_collaboration(cx);
         let composer_plan = self.render_composer_plan(cx);
         // The goal row rides the queued-message surface whenever that panel is
@@ -79913,6 +80084,13 @@ impl VibexWorkbench {
             self.composer_expanded,
         );
         let composer_is_slim = composer_density == ComposerDensity::Slim;
+        // The surface's attach and expand controls answer the pointer the way
+        // the footer's instruments do: a step darker at rest, the caption's own
+        // ink under it. Both densities share one hover group per control, so a
+        // draft that flips density under the pointer keeps the highlight it had
+        // instead of losing it with the rebuilt button.
+        let surface_rest_ink = composer_instrument_rest_ink(COMPOSER_ROW_INSTRUMENT_REST_INK, cx);
+        let surface_hover_ink = composer_instrument_hover_ink(cx);
         // The surface's height glides to the height its content asks for. The
         // decision above commits the final layout at once — the caret and the
         // draft survive — while the box the reader sees sweeps between the
@@ -79921,11 +80099,10 @@ impl VibexWorkbench {
         // morphing between two sessions' heights would animate a change the
         // reader made by navigating, not by typing.
         let composer_surface_target = composer_surface_height(composer_density, composer_rows);
-        let composer_morph_key = format!(
-            "composer-surface{}",
+        let composer_morph_key = composer_surface_morph_key(
             self.view_session_id
                 .as_ref()
-                .map_or_else(|| "@primary".to_string(), |id| format!("@{}", id.as_str()))
+                .map(|session_id| session_id.as_str()),
         );
         let composer_morph_snap = motion::reduced_motion(cx)
             || self.composer_expanded
@@ -80415,11 +80592,13 @@ impl VibexWorkbench {
                             // The focused pane's composer is where that pane
                             // says it holds the keyboard: the box wears the
                             // focus ring every focused control wears, while the
-                            // pane frame stays quiet. The single-session column
-                            // has no pane to mark and keeps the hairline.
+                            // pane frame stays quiet. In the single-session
+                            // column there is no pane to mark, so the caret in
+                            // the box is what lights the edge.
                             .border_color(composer_surface_border(
                                 is_dark,
                                 pane_focused,
+                                composer_input_focused,
                                 cx,
                             ))
                             .bg(composer_background)
@@ -80447,13 +80626,17 @@ impl VibexWorkbench {
                             .when(!composer_extension_visible && !is_dark, |this| this.shadow_sm())
                             .on_prepaint({
                                 let surface_session = geometry_session.clone();
+                                let surface_morph_key = composer_morph_key.clone();
                                 move |bounds, _, cx| {
                                     let _ = surface_geometry_entity.update(cx, |this, cx| {
                                         let changed = this.record_composer_geometry(
                                             surface_session.as_deref(),
                                             |geometry| geometry.surface_bounds = Some(bounds),
                                         );
-                                        if changed {
+                                        if composer_measurement_wants_repaint(
+                                            changed,
+                                            &surface_morph_key,
+                                        ) {
                                             cx.notify();
                                         }
                                     });
@@ -80511,6 +80694,7 @@ impl VibexWorkbench {
                                             })
                                             .on_prepaint({
                                                 let input_session = geometry_session.clone();
+                                                let input_morph_key = composer_morph_key.clone();
                                                 move |bounds, _, cx| {
                                                     let _ = input_geometry_entity.update(
                                                         cx,
@@ -80523,7 +80707,10 @@ impl VibexWorkbench {
                                                                             Some(bounds)
                                                                     },
                                                                 );
-                                                            if changed {
+                                                            if composer_measurement_wants_repaint(
+                                                                changed,
+                                                                &input_morph_key,
+                                                            ) {
                                                                 cx.notify();
                                                             }
                                                         },
@@ -80746,10 +80933,14 @@ impl VibexWorkbench {
                                                     .rounded(px(
                                                         COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
                                                     ))
-                                                    .child(composer_row_glyph(
+                                                    .group(COMPOSER_ATTACH_GROUP)
+                                                    .child(composer_instrument_glyph(
                                                         Icon::default()
                                                             .path("icons/vibex/paperclip.svg"),
-                                                        cx,
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        COMPOSER_ATTACH_GROUP,
+                                                        surface_rest_ink,
+                                                        surface_hover_ink,
                                                     ))
                                                     .tooltip(locale::text(
                                                         "Add attachments",
@@ -80773,13 +80964,17 @@ impl VibexWorkbench {
                                                     .rounded(px(
                                                         COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
                                                     ))
-                                                    .child(composer_row_glyph(
+                                                    .group(COMPOSER_EXPAND_GROUP)
+                                                    .child(composer_instrument_glyph(
                                                         if self.composer_expanded {
                                                             Icon::new(IconName::Minimize)
                                                         } else {
                                                             Icon::new(IconName::Maximize)
                                                         },
-                                                        cx,
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        COMPOSER_EXPAND_GROUP,
+                                                        surface_rest_ink,
+                                                        surface_hover_ink,
                                                     ))
                                                     .tooltip(if self.composer_expanded {
                                                         locale::text(
@@ -80805,18 +81000,29 @@ impl VibexWorkbench {
                                         } else {
                                             // One button in the corner: the clock
                                             // and the terminal live on the line
-                                            // under the box now.
+                                            // under the box now. It draws its own
+                                            // glyph for the pointer's ink, so the
+                                            // seat clears the kit's inset padding
+                                            // (see the footer's instruments).
                                             this.child(
                                                 Button::new("toggle-composer-expanded")
                                                     .xsmall()
                                                     .ghost()
                                                     .compact()
                                                     .size(px(COMPOSER_TRAILING_CONTROL_SIZE))
-                                                    .icon(if self.composer_expanded {
-                                                        IconName::Minimize
-                                                    } else {
-                                                        IconName::Maximize
-                                                    })
+                                                    .p(px(0.0))
+                                                    .group(COMPOSER_EXPAND_GROUP)
+                                                    .child(composer_instrument_glyph(
+                                                        if self.composer_expanded {
+                                                            Icon::new(IconName::Minimize)
+                                                        } else {
+                                                            Icon::new(IconName::Maximize)
+                                                        },
+                                                        COMPOSER_TRAILING_GLYPH_SIZE,
+                                                        COMPOSER_EXPAND_GROUP,
+                                                        surface_rest_ink,
+                                                        surface_hover_ink,
+                                                    ))
                                                     .tooltip(if self.composer_expanded {
                                                         locale::text(
                                                             "Collapse input",
@@ -80873,10 +81079,14 @@ impl VibexWorkbench {
                                                     .compact()
                                                     .size(px(primary_action_size))
                                                     .rounded(px(primary_action_size / 2.0))
-                                                    .child(composer_row_glyph(
+                                                    .group(COMPOSER_ATTACH_GROUP)
+                                                    .child(composer_instrument_glyph(
                                                         Icon::default()
                                                             .path("icons/vibex/paperclip.svg"),
-                                                        cx,
+                                                        COMPOSER_SURFACE_GLYPH_SIZE,
+                                                        COMPOSER_ATTACH_GROUP,
+                                                        surface_rest_ink,
+                                                        surface_hover_ink,
                                                     ))
                                                     .tooltip(locale::text(
                                                         "Add attachments",
@@ -91497,12 +91707,13 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, size: f32, cx: &mut 
         .items_center()
         .justify_center()
         .child(
-            // The ring draws a little inside its button: `ProgressCircle`
-            // paints at three quarters of the square it is given, which lands
-            // the readout at 16px and leaves it visibly quieter than the two
-            // instrument glyphs beside it.
+            // The ring is asked for the square that paints
+            // `COMPOSER_FOOTER_RING_SIZE`, not for the control's own square:
+            // `ProgressCircle` draws at three quarters of the size it is given,
+            // so the raw 22px seat used to land a 16.5px disc — the loudest mark
+            // on a row of 14px glyphs instead of a peer of them.
             ProgressCircle::new("composer-cache-token-ring-progress")
-                .size(px(size))
+                .size(px(COMPOSER_FOOTER_RING_SIZE / PROGRESS_CIRCLE_DRAWN_SCALE))
                 .value(context_percent)
                 .color(progress_color),
         )
@@ -114667,6 +114878,240 @@ mod tests {
         assert!(!terminal.contains("Button::new(\"kill-composer-terminal\")"));
     }
 
+    /// The footer's three marks draw at one optical size inside one seat.
+    ///
+    /// The kit pads a sized button that carries children by a fifth of its side
+    /// and clips what escapes, so a 14px glyph in a 22px seat lost a hair of its
+    /// own stroke on all four edges — the clock's ring and the terminal's frame
+    /// read as cut. The usage ring failed the other way: `ProgressCircle` paints
+    /// at three quarters of the square it is given, so the seat's own 22px
+    /// landed a 16.5px disc beside two 14px glyphs. Both halves are measured
+    /// here, with the edge the caret lights, so the row cannot drift back into
+    /// either mistake.
+    #[test]
+    fn composer_footer_marks_share_one_seat_and_one_optical_size() {
+        let source = include_str!("app.rs");
+        assert_eq!(COMPOSER_FOOTER_RING_SIZE - COMPOSER_FOOTER_GLYPH_SIZE, 1.0);
+        assert!(COMPOSER_FOOTER_RING_SIZE < COMPOSER_FOOTER_CONTROL_SIZE);
+        assert_eq!(PROGRESS_CIRCLE_DRAWN_SCALE, 0.75);
+        assert!(COMPOSER_FOCUSED_INPUT_RING_MIX > 0.5);
+        assert!(COMPOSER_FOCUSED_INPUT_RING_MIX < 1.0);
+
+        let footer = source
+            .split_once("    fn render_composer_footer(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Renders the composer of the borrowed view.")
+            })
+            .map(|(body, _)| body)
+            .expect("composer footer should remain inspectable");
+        let usage = footer
+            .split_once("Button::new(\"open-session-usage\")")
+            .and_then(|(_, tail)| tail.split_once(".on_click"))
+            .map(|(body, _)| body)
+            .expect("the usage ring's button should remain inspectable");
+        assert!(usage.contains(".size(px(COMPOSER_FOOTER_CONTROL_SIZE))"));
+        assert!(
+            usage.contains(".p(px(0.0))"),
+            "the ring's seat must not inset the readout it carries"
+        );
+
+        let terminal = source
+            .split_once("    fn render_composer_terminal_menu(")
+            .and_then(|(_, tail)| tail.split_once(".child(composer_instrument_glyph("))
+            .map(|(body, _)| body)
+            .expect("the terminal control should remain inspectable");
+        assert!(terminal.contains(".size(px(size))"));
+        assert!(
+            terminal.contains(".p(px(0.0))"),
+            "the terminal's glyph owns its whole seat"
+        );
+        assert!(
+            terminal.contains(".group(COMPOSER_TERMINAL_GROUP)"),
+            "the terminal's mark rides the button's own hover group"
+        );
+        assert!(
+            terminal.contains("COMPOSER_FOOTER_INSTRUMENT_REST_INK"),
+            "and rests at the footer's ink rather than the caption's"
+        );
+
+        let schedule = include_str!("message_schedule.rs");
+        let sized = schedule
+            .split_once("    fn render_message_schedule_button_at(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// The element id the popover"))
+            .map(|(body, _)| body)
+            .expect("the sized schedule control should remain inspectable");
+        assert!(
+            sized.contains(".p(px(0.0))"),
+            "the clock's glyph owns its whole seat"
+        );
+        assert!(
+            sized.contains(".group(group.clone())"),
+            "the clock answers the pointer through its own hover group"
+        );
+        assert!(
+            sized.contains("composer_instrument_glyph("),
+            "the clock draws the footer's two inks"
+        );
+        assert!(
+            sized.contains("COMPOSER_FOOTER_INSTRUMENT_REST_INK"),
+            "the clock rests at the footer's ink like the terminal beside it"
+        );
+
+        let ring = source
+            .split_once("fn render_cache_token_ring(")
+            .and_then(|(_, tail)| tail.split_once(".value(context_percent)"))
+            .map(|(body, _)| body)
+            .expect("the usage ring should remain inspectable");
+        assert!(
+            ring.contains(".size(px(COMPOSER_FOOTER_RING_SIZE / PROGRESS_CIRCLE_DRAWN_SCALE))"),
+            "the readout is asked for its drawn diameter, not for the seat's square"
+        );
+    }
+
+    /// The surface's attach and expand controls answer the pointer too.
+    ///
+    /// A draft's most frequent controls must say they are pressable the same way
+    /// the footer's instruments do: a step darker at rest, the caption's ink
+    /// under the pointer. Both densities share one hover group per control, so a
+    /// draft that flips density under the pointer keeps the highlight instead of
+    /// losing it with the rebuilt button, and the trailing corner draws its own
+    /// glyph so it can carry that ink at all — the kit's `.icon(...)` tints with
+    /// the button's foreground, which a ghost button never changes.
+    #[test]
+    fn composer_surface_controls_answer_the_pointer_with_one_ink() {
+        let source = include_str!("app.rs");
+        assert!(COMPOSER_ROW_INSTRUMENT_REST_INK < COMPOSER_INSTRUMENT_HOVER_INK);
+        assert!(COMPOSER_ROW_INSTRUMENT_REST_INK > COMPOSER_FOOTER_INSTRUMENT_REST_INK);
+        assert_eq!(
+            COMPOSER_SURFACE_GLYPH_SIZE * 2.0,
+            COMPOSER_SLIM_ROW_CONTROL_SIZE
+        );
+        assert_eq!(
+            COMPOSER_TRAILING_GLYPH_SIZE,
+            COMPOSER_TRAILING_CONTROL_SIZE * PROGRESS_CIRCLE_DRAWN_SCALE
+        );
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        // Each control draws itself once per density, and every draw names its
+        // group twice — once on the button, once on the glyph that reads it.
+        assert_eq!(
+            composer.matches("COMPOSER_ATTACH_GROUP").count(),
+            4,
+            "both attach buttons own the group their glyph answers to"
+        );
+        assert_eq!(
+            composer.matches("COMPOSER_EXPAND_GROUP").count(),
+            4,
+            "both expand buttons own the group their glyph answers to"
+        );
+        assert_eq!(
+            composer.matches("composer_instrument_glyph(").count(),
+            4,
+            "both densities draw attach and expand as tinted children"
+        );
+        assert!(
+            composer.contains(".p(px(0.0))"),
+            "the corner's glyph needs the whole seat once it stops being a kit icon"
+        );
+        assert!(
+            !composer.contains(".icon(if self.composer_expanded {"),
+            "the corner must draw its own glyph to carry the group's ink"
+        );
+        assert!(
+            !composer.contains("motion::hover_listener("),
+            "every one of these buttons carries a tooltip, which owns its one hover listener"
+        );
+    }
+
+    /// A caret in the box lights its edge; the pane flag still outranks it.
+    #[test]
+    fn composer_surface_border_answers_for_both_rings() {
+        let source = include_str!("app.rs");
+        let border = source
+            .split_once("fn composer_surface_border(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the composer's edge should remain inspectable");
+        assert!(
+            border.contains("if pane_focused {"),
+            "a focused pane takes the ring outright"
+        );
+        assert!(
+            border.contains("motion::mix(rest, cx.theme().ring, COMPOSER_FOCUSED_INPUT_RING_MIX)"),
+            "the caret's highlight is a blend, not a second focus ring"
+        );
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(
+            composer.contains(".is_focused(window)"),
+            "the edge reads the caret the box actually holds"
+        );
+        assert!(composer.contains("composer_input_focused,"));
+
+        let subscription = source
+            .split_once("fn subscribe_composer_input(")
+            .and_then(|(_, tail)| {
+                tail.split_once(
+                    "\n/// Field access on the workbench resolves to the borrowed session view.",
+                )
+            })
+            .map(|(body, _)| body)
+            .expect("composer input subscription should remain inspectable");
+        assert!(
+            subscription.contains("matches!(event, InputEvent::Focus | InputEvent::Blur)"),
+            "focus and blur ask for the frame that draws the edge"
+        );
+    }
+
+    /// A glide repaints the composer alone, and its measurements wait.
+    #[test]
+    fn composer_height_glide_repaints_only_its_host_view() {
+        let source = include_str!("app.rs");
+        let composer_view = source
+            .split_once("impl Render for ComposerView {")
+            .and_then(|(_, tail)| tail.split_once("\n/// The transcript's own render boundary."))
+            .map(|(body, _)| body)
+            .expect("the composer's host view should remain inspectable");
+        assert!(composer_view.contains("motion::with_height_owner(owner,"));
+        assert!(
+            composer_view.contains("motion::schedule_height_morph_frames(window);"),
+            "the host ticks the store after the render that may have armed a glide"
+        );
+
+        let measure = source
+            .split_once("fn composer_measurement_wants_repaint(")
+            .and_then(|(_, tail)| tail.split_once("\n}\n"))
+            .map(|(body, _)| body)
+            .expect("the measurement gate should remain inspectable");
+        assert!(measure.contains("motion::height_morph_in_flight(morph_key)"));
+
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert_eq!(
+            composer
+                .matches("composer_measurement_wants_repaint(")
+                .count(),
+            2,
+            "both measurements — the surface and the input slot — wait out a glide"
+        );
+        assert_eq!(
+            composer.matches("composer_surface_morph_key(").count(),
+            1,
+            "one spelling of the morph key keeps render and measurement in step"
+        );
+    }
+
     #[test]
     fn composer_terminal_fullscreen_expands_like_input_composer() {
         let source = include_str!("app.rs");
@@ -136414,7 +136859,9 @@ mod tests {
         // one: there is exactly one composer implementation.
         let wrapper = source
             .split_once("\n    fn session_group_pane_with_composer(")
-            .and_then(|(_, tail)| tail.split_once("\n    /// Gives every group member"))
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    /// Gives every painted pane a complete view")
+            })
             .map(|(body, _)| body)
             .expect("pane composer wrapper should remain inspectable");
         assert!(wrapper.contains("composer: AnyElement"));
