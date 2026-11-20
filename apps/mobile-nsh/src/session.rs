@@ -624,6 +624,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.delete_group(id))
             },
+            on_set_group_members: {
+                let service = self.clone();
+                Rc::new(move |id: &str, members: &[String]| service.set_group_members(id, members))
+            },
             on_toggle_folder_collapsed: {
                 let service = self.clone();
                 Rc::new(move |id: &str, collapsed: bool| {
@@ -4027,6 +4031,13 @@ impl SessionService {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::RenameGroup {
             group_id: id.to_owned(),
             name,
+        });
+    }
+
+    fn set_group_members(&self, id: &str, members: &[String]) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupMembers {
+            group_id: id.to_owned(),
+            session_ids: members.to_vec(),
         });
     }
 

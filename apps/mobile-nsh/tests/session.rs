@@ -808,6 +808,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_delete_folder: Rc::new(|_| {}),
         on_rename_group: Rc::new(|_, _| {}),
         on_delete_group: Rc::new(|_| {}),
+        on_set_group_members: Rc::new(|_, _| {}),
         on_toggle_folder_collapsed: Rc::new(|_, _| {}),
         on_toggle_group_collapsed: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
@@ -1227,6 +1228,8 @@ fn a_group_opens_its_actions() {
     app.wait_for("Pair").unwrap();
     app.press("role:button[Folder actions]").unwrap();
     app.wait_for("Session group").unwrap();
+    app.press("Members").unwrap();
+    app.wait_for("Group members").unwrap();
 }
 
 #[test]

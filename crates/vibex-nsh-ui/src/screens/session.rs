@@ -454,6 +454,7 @@ pub struct SessionHost {
     pub on_delete_folder: Rc<dyn Fn(&str)>,
     pub on_rename_group: FolderNameAction,
     pub on_delete_group: Rc<dyn Fn(&str)>,
+    pub on_set_group_members: CreateGroupAction,
     pub on_toggle_folder_collapsed: CollapseAction,
     pub on_toggle_group_collapsed: CollapseAction,
     pub on_create_group: CreateGroupAction,
@@ -4146,6 +4147,9 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let folder_rename = signal(String::new());
     let group_actions = signal(None::<String>);
     let group_rename = signal(String::new());
+    let members_group = signal(None::<String>);
+    let members_selected = signal(Vec::<String>::new());
+    let on_set_group_members = host.on_set_group_members.clone();
     let on_rename_group = host.on_rename_group.clone();
     let on_delete_group = host.on_delete_group.clone();
     let on_toggle_folder_collapsed = host.on_toggle_folder_collapsed.clone();
@@ -4291,6 +4295,29 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                     group_rename,
                     on_rename_group.clone(),
                     on_delete_group.clone(),
+                    {
+                        let sections = sidebar_sections;
+                        Rc::new(move || {
+                            if let Some(id) = group_actions.get_untracked() {
+                                let members = sections.with(|sections| {
+                                    sections
+                                        .iter()
+                                        .find(|section| section.id == id)
+                                        .map(|section| section.session_ids.clone())
+                                        .unwrap_or_default()
+                                });
+                                members_selected.set(members);
+                                members_group.set(Some(id));
+                                group_actions.set(None);
+                            }
+                        })
+                    },
+                ))
+                .child(group_members_sheet(
+                    members_group,
+                    members_selected,
+                    sessions,
+                    on_set_group_members.clone(),
                 ))
                 .child(group_sheet(
                     group_open,
@@ -4623,6 +4650,7 @@ fn group_actions_sheet(
     name: Signal<String>,
     on_rename: FolderNameAction,
     on_delete: Rc<dyn Fn(&str)>,
+    on_members: Action,
 ) -> impl IntoElement {
     let open = computed(move || action.get().is_some());
     sheet()
@@ -4668,6 +4696,16 @@ fn group_actions_sheet(
                     .w_full()
                 })
                 .child({
+                    let on_members = on_members.clone();
+                    action::secondary(
+                        copy::text("Members", "成员", "成員"),
+                        icon(include_str!("../../assets/icons/bot.svg")),
+                        false,
+                        move || on_members(),
+                    )
+                    .w_full()
+                })
+                .child({
                     let on_delete = on_delete.clone();
                     action::secondary(
                         copy::text("Delete", "删除", "刪除"),
@@ -4677,6 +4715,95 @@ fn group_actions_sheet(
                             if let Some(id) = action.get_untracked() {
                                 on_delete(&id);
                                 action.set(None);
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
+        )
+}
+
+fn group_members_sheet(
+    group: Signal<Option<String>>,
+    members: Signal<Vec<String>>,
+    sessions: Signal<Vec<SessionSummary>>,
+    on_save: CreateGroupAction,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(group.get().is_some()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                group.set(None);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .max_h(px(520.0))
+                .gap(px(theme::SPACING_XS))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Group members", "分组成员", "分組成員"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(scroll().max_h(px(360.0)).child(
+                    view().w_full().flex_col().gap(px(2.0)).child(each(
+                        move || sessions.get(),
+                        |session| session.id.clone(),
+                        move |session, _| {
+                            let id = session.get_untracked().id;
+                            let checked = members.with(|members| members.contains(&id));
+                            button()
+                                .on_press(move || {
+                                    members.update(|members| {
+                                        if let Some(index) =
+                                            members.iter().position(|candidate| candidate == &id)
+                                        {
+                                            members.remove(index);
+                                        } else {
+                                            members.push(id.clone());
+                                        }
+                                    });
+                                })
+                                .w_full()
+                                .min_h(px(40.0))
+                                .px(px(theme::SPACING_SM))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .bg(theme::background_dim)
+                                .child(
+                                    text(if checked { "✓" } else { "·" })
+                                        .text_size(px(theme::font_caption()))
+                                        .text_color(theme::text_secondary),
+                                )
+                                .child(
+                                    text(move || session.get().title)
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(theme::font_body()))
+                                        .text_color(theme::foreground),
+                                )
+                        },
+                    )),
+                ))
+                .child({
+                    let on_save = on_save.clone();
+                    action::primary(
+                        copy::text("Save", "保存", "儲存"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || {
+                            if let Some(group_id) = group.get_untracked() {
+                                let ids = members.get_untracked();
+                                on_save(&group_id, &ids);
+                                group.set(None);
                             }
                         },
                     )
