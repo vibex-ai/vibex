@@ -160,6 +160,19 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell with one discovered skill.
+#[component]
+fn SkillShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.skills = signal(vec![CommandEntry {
+        id: "skill-1".to_owned(),
+        label: "My skill".to_owned(),
+        description: "A reusable skill".to_owned(),
+        insertion: "$my-skill ".to_owned(),
+    }]);
+    session::session(host)
+}
+
 /// A shell with earlier prompts to recall.
 #[component]
 fn HistoryShell() -> impl IntoElement {
@@ -307,6 +320,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let resolving = signal(false);
     let commands = signal(Vec::new());
     let mentions = signal(Vec::new());
+    let skills = signal(Vec::new());
     let attachments = signal(Vec::new());
     let on_attach_image = Rc::new(move || {
         attachments.update(|items| {
@@ -643,6 +657,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         question,
         commands,
         mentions,
+        skills,
+        on_skill_query: Rc::new(|_| {}),
         attachments,
         on_attach_image,
         on_attach_file: Rc::new(|| {}),
@@ -794,6 +810,18 @@ fn the_composer_opens_the_runtime_choices() {
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();
     app.wait_for("Codex · GPT-5").unwrap();
+}
+
+#[test]
+fn the_dollar_palette_inserts_a_skill() {
+    let mut config = EngineConfig::new(Root::of::<SkillShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.type_text("text:Message the Agent…", "$").unwrap();
+    app.wait_for("My skill").unwrap();
+    app.press("My skill").unwrap();
+    app.wait_for("$my-skill").unwrap();
 }
 
 #[test]

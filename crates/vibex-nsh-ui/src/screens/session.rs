@@ -397,6 +397,7 @@ type MentionQuery = Rc<dyn Fn(&str)>;
 enum PaletteKind {
     Slash,
     Mention,
+    Skill,
 }
 
 /// What the shell may do, and the state it shows.
@@ -437,6 +438,9 @@ pub struct SessionHost {
     /// The `@` references the session offers.
     pub mentions: Signal<Vec<CommandEntry>>,
     pub on_mention_query: MentionQuery,
+    /// The `$` skills the session offers.
+    pub skills: Signal<Vec<CommandEntry>>,
+    pub on_skill_query: MentionQuery,
     /// Files and photos waiting to be sent with the message.
     pub attachments: Signal<Vec<AttachmentItem>>,
     pub on_attach_image: Action,
@@ -744,6 +748,17 @@ fn shell(host: SessionHost) -> impl IntoElement {
                 let mentions = host.mentions;
                 let draft = host.draft;
                 move || command_palette(mentions, draft, PaletteKind::Mention)
+            },
+        ))
+        .child(when(
+            move || {
+                skill_query(&host.draft.get()).is_some()
+                    && !host.skills.with(|skills| skills.is_empty())
+            },
+            {
+                let skills = host.skills;
+                let draft = host.draft;
+                move || command_palette(skills, draft, PaletteKind::Skill)
             },
         ))
         .child(when(move || host.pending.get().is_some(), {
@@ -1518,6 +1533,7 @@ fn command_row(
             draft.set(match kind {
                 PaletteKind::Slash => insertion,
                 PaletteKind::Mention => insert_mention(&draft.get_untracked(), &insertion),
+                PaletteKind::Skill => insert_skill(&draft.get_untracked(), &insertion),
             });
         })
         .w_full()
@@ -1967,8 +1983,10 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let send = host.on_send.clone();
     let commands = host.commands;
     let mentions = host.mentions;
+    let skills = host.skills;
     let on_query = host.on_command_query.clone();
     let on_mention = host.on_mention_query.clone();
+    let on_skill = host.on_skill_query.clone();
     let on_interrupt = host.on_interrupt.clone();
     let sessions = host.sessions;
     let active = host.active;
@@ -2118,6 +2136,10 @@ fn composer(host: SessionHost) -> impl IntoElement {
                             match mention_query(text) {
                                 Some(query) => on_mention(&query),
                                 None => mentions.set(Vec::new()),
+                            }
+                            match skill_query(text) {
+                                Some(query) => on_skill(&query),
+                                None => skills.set(Vec::new()),
                             }
                         },
                     )
@@ -3458,6 +3480,32 @@ fn mention_query(text: &str) -> Option<String> {
 /// Replaces the `@…` token with the reference the person picked.
 fn insert_mention(text: &str, insertion: &str) -> String {
     match text.rfind('@') {
+        Some(at) => format!("{}{insertion}", &text[..at]),
+        None => insertion.to_owned(),
+    }
+}
+
+/// What was typed after `$` when it is still one skill name, if any.
+fn skill_query(text: &str) -> Option<String> {
+    let at = text.rfind('$')?;
+    let after = &text[at + 1..];
+    if after.chars().any(char::is_whitespace) {
+        return None;
+    }
+    if at > 0
+        && !text[..at]
+            .chars()
+            .next_back()
+            .is_some_and(|previous| previous.is_whitespace() || previous == '(')
+    {
+        return None;
+    }
+    Some(after.to_owned())
+}
+
+/// Replaces the `$…` token with the skill the person picked.
+fn insert_skill(text: &str, insertion: &str) -> String {
+    match text.rfind('$') {
         Some(at) => format!("{}{insertion}", &text[..at]),
         None => insertion.to_owned(),
     }

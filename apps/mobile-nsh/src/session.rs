@@ -113,6 +113,8 @@ pub struct SessionService {
     commands_loaded: Rc<Cell<bool>>,
     mentions: Signal<Vec<CommandEntry>>,
     mentions_loaded: Rc<Cell<bool>>,
+    skills: Signal<Vec<CommandEntry>>,
+    skills_loaded: Rc<Cell<bool>>,
     terminal_open: Signal<bool>,
     terminal_title: Signal<Option<SharedString>>,
     terminal_error: Signal<Option<SharedString>>,
@@ -256,6 +258,8 @@ impl SessionService {
             commands_loaded: Rc::new(Cell::new(false)),
             mentions: signal(Vec::new()),
             mentions_loaded: Rc::new(Cell::new(false)),
+            skills: signal(Vec::new()),
+            skills_loaded: Rc::new(Cell::new(false)),
             terminal_open: signal(false),
             terminal_title: signal(None),
             terminal_error: signal(None),
@@ -448,6 +452,11 @@ impl SessionService {
             question: self.question,
             commands: self.commands,
             mentions: self.mentions,
+            skills: self.skills,
+            on_skill_query: {
+                let service = self.clone();
+                Rc::new(move |query: &str| service.query_skills(query))
+            },
             terminal_open: self.terminal_open,
             terminal_title: self.terminal_title,
             terminal_error: self.terminal_error,
@@ -1221,6 +1230,8 @@ impl SessionService {
         self.commands_loaded.set(false);
         self.mentions.set(Vec::new());
         self.mentions_loaded.set(false);
+        self.skills.set(Vec::new());
+        self.skills_loaded.set(false);
         self.error.set(None);
         self.runtime_state.replace(None);
         self.runtime_catalog.set(None);
@@ -2471,6 +2482,41 @@ impl SessionService {
             if let Ok(Ok(discovery)) = result {
                 let entries = command_entries(discovery);
                 service.mentions.set(entries);
+            }
+        });
+    }
+
+    /// Loads the `$` skills the open session offers.
+    fn query_skills(&self, _query: &str) {
+        if self.skills_loaded.get() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        self.skills_loaded.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                backend
+                    .discover_agent_commands(AgentCommandDiscoverRequest {
+                        agent_id: None,
+                        provider_profile_id: None,
+                        session_id: Some(session_id),
+                        workspace_id: None,
+                        trigger: Some(AgentCommandTrigger::Dollar),
+                        query: None,
+                        limit: Some(40),
+                    })
+                    .await
+            })
+            .await;
+            if let Ok(Ok(discovery)) = result {
+                service.skills.set(command_entries(discovery));
             }
         });
     }
