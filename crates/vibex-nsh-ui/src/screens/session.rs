@@ -373,6 +373,8 @@ use crate::screens::new_session::{
 type Action = Rc<dyn Fn()>;
 /// Chooses a value for one of the Agent's session options.
 type ChooseFeature = Rc<dyn Fn(&str, &str)>;
+/// Opens one user message for replacement.
+type EditMessage = Rc<dyn Fn(i64, &str)>;
 
 /// One entry of the composer's `/` palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -461,6 +463,14 @@ pub struct SessionHost {
     /// Prompts written ahead of a running turn.
     pub queued: Signal<Vec<QueuedMessageView>>,
     pub queue_paused: Signal<bool>,
+    /// The sequence of the latest user message that can be edited, and whether
+    /// the composer is replacing it.
+    pub editable_sequence: Signal<i64>,
+    pub editing: Signal<bool>,
+    pub on_edit_message: EditMessage,
+    pub on_cancel_edit: Action,
+    pub on_replace_message: Rc<dyn Fn(&str)>,
+
     pub on_send_queued: Rc<dyn Fn(u64)>,
     pub on_remove_queued: Rc<dyn Fn(u64)>,
     pub on_clear_queue: Action,
@@ -904,6 +914,8 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let error = host.error;
     let on_toggle_turn = host.on_toggle_turn.clone();
     let on_fork = host.on_fork.clone();
+    let editable_sequence = host.editable_sequence;
+    let on_edit_message = host.on_edit_message.clone();
     let has_older = host.has_older;
     let loading_older = host.loading_older;
     let on_load_older = host.on_load_older.clone();
@@ -980,8 +992,17 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                         virtual_list(move || timeline.with(|entries| entries.len()), {
                             let on_toggle_turn = on_toggle_turn.clone();
                             let on_fork = on_fork.clone();
+                            let editable_sequence = editable_sequence;
+                            let on_edit_message = on_edit_message.clone();
                             move |at: Position| {
-                                entry_row(at, timeline, on_toggle_turn.clone(), on_fork.clone())
+                                entry_row(
+                                    at,
+                                    timeline,
+                                    on_toggle_turn.clone(),
+                                    on_fork.clone(),
+                                    editable_sequence,
+                                    on_edit_message.clone(),
+                                )
                             }
                         })
                         .keys(move || {
@@ -1022,19 +1043,29 @@ fn entry_row(
     entries: Signal<Vec<TimelineEntry>>,
     on_toggle_turn: Rc<dyn Fn(&str)>,
     on_fork: Rc<dyn Fn(i64)>,
+    editable_sequence: Signal<i64>,
+    on_edit_message: EditMessage,
 ) -> impl IntoElement {
     let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
     view()
         .w_full()
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
-        .child(entry_element(entry, on_toggle_turn, on_fork))
+        .child(entry_element(
+            entry,
+            on_toggle_turn,
+            on_fork,
+            editable_sequence,
+            on_edit_message,
+        ))
 }
 
 fn entry_element(
     entry: Memo<Option<TimelineEntry>>,
     on_toggle_turn: Rc<dyn Fn(&str)>,
     on_fork: Rc<dyn Fn(i64)>,
+    editable_sequence: Signal<i64>,
+    on_edit_message: EditMessage,
 ) -> impl IntoElement {
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
     let body =
@@ -1066,7 +1097,15 @@ fn entry_element(
         .gap(px(theme::SPACING_XS))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::User)),
-            move || user_bubble(body, attachments),
+            move || {
+                user_bubble(
+                    body,
+                    attachments,
+                    sequence,
+                    editable_sequence,
+                    on_edit_message.clone(),
+                )
+            },
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::ProcessHeader)),
@@ -1106,7 +1145,13 @@ fn entry_element(
         ))
 }
 
-fn user_bubble(body: Memo<String>, attachments: Memo<Vec<AttachmentItem>>) -> impl IntoElement {
+fn user_bubble(
+    body: Memo<String>,
+    attachments: Memo<Vec<AttachmentItem>>,
+    sequence: Memo<i64>,
+    editable_sequence: Signal<i64>,
+    on_edit: EditMessage,
+) -> impl IntoElement {
     view()
         .w_full()
         .flex_col()
@@ -1129,6 +1174,27 @@ fn user_bubble(body: Memo<String>, attachments: Memo<Vec<AttachmentItem>>) -> im
         .child(when(
             move || !attachments.with(|items| items.is_empty()),
             move || message_attachments(attachments),
+        ))
+        .child(when(
+            move || sequence.get() > 0 && editable_sequence.get() == sequence.get(),
+            {
+                let on_edit = on_edit.clone();
+                move || {
+                    let on_edit = on_edit.clone();
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .child(small_action(
+                            copy::text("Edit", "编辑", "編輯"),
+                            move || {
+                                let seq = sequence.get_untracked();
+                                let text = body.get_untracked();
+                                on_edit(seq, &text);
+                            },
+                        ))
+                }
+            },
         ))
 }
 
@@ -1921,6 +1987,9 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let on_remove_queued = host.on_remove_queued.clone();
     let on_clear_queue = host.on_clear_queue.clone();
     let on_toggle_queue_paused = host.on_toggle_queue_paused.clone();
+    let editing = host.editing;
+    let on_cancel_edit = host.on_cancel_edit.clone();
+    let on_replace_message = host.on_replace_message.clone();
     let on_goal_control = host.on_goal_control.clone();
     let plan_open = signal(false);
     let on_open_runtime = host.on_open_runtime.clone();
@@ -1950,7 +2019,11 @@ fn composer(host: SessionHost) -> impl IntoElement {
             }
             // The service clears the field once the runtime accepted the
             // message, so a failed send leaves the draft where it was.
-            send(text);
+            if editing.get_untracked() {
+                on_replace_message(text);
+            } else {
+                send(text);
+            }
         })
     };
     view()
@@ -1967,6 +2040,34 @@ fn composer(host: SessionHost) -> impl IntoElement {
             move || !attachments.with(|attachments| attachments.is_empty()),
             move || attachment_chips(attachments, on_remove_attachment.clone()),
         ))
+        .child(when(move || editing.get(), {
+            let on_cancel_edit = on_cancel_edit.clone();
+            move || {
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .px(px(theme::SPACING_SM))
+                    .py(px(theme::SPACING_XS))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .bg(theme::background_dim)
+                    .child(
+                        text(copy::text(
+                            "Replacing the last message",
+                            "正在替换上一条消息",
+                            "正在取代上一則訊息",
+                        ))
+                        .flex_1()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_secondary),
+                    )
+                    .child(small_action(copy::text("Cancel", "取消", "取消"), {
+                        let on_cancel_edit = on_cancel_edit.clone();
+                        move || on_cancel_edit()
+                    }))
+            }
+        }))
         .child(when(move || !queued.with(|queued| queued.is_empty()), {
             move || {
                 queue_card(
@@ -2056,7 +2157,13 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     move || {
                         let submit = submit.clone();
                         action::primary(
-                            copy::text("Send", "发送", "傳送"),
+                            move || {
+                                if editing.get() {
+                                    copy::text("Replace", "替换", "取代")
+                                } else {
+                                    copy::text("Send", "发送", "傳送")
+                                }
+                            },
                             icon(include_str!("../../assets/icons/send.svg")),
                             move || submit(),
                         )

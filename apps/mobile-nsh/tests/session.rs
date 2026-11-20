@@ -143,12 +143,14 @@ fn TurnShell() -> impl IntoElement {
     header.ended_at_ms = now;
     let mut user = entry("u1", EntryKind::User, "", "Look at this");
     user.turn_id = "t1".to_owned();
+    user.last_sequence = 24;
     user.attachments = vec![AttachmentItem {
         id: "a1".to_owned(),
         label: "photo.jpg".to_owned(),
         mime_type: "image/jpeg".to_owned(),
         uri: "data:image/jpeg;base64,".to_owned(),
     }];
+    host.editable_sequence = signal(24);
     host.timeline = signal(vec![
         user,
         header,
@@ -297,6 +299,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let history_open = signal(false);
     let queued = signal(Vec::new());
     let queue_paused = signal(false);
+    let editable_sequence = signal(0);
+    let editing = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -614,6 +618,11 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         history_open,
         queued,
         queue_paused,
+        editable_sequence,
+        editing,
+        on_edit_message: Rc::new(|_, _| {}),
+        on_cancel_edit: Rc::new(|| {}),
+        on_replace_message: Rc::new(|_| {}),
         on_send_queued: Rc::new(|_| {}),
         on_remove_queued: Rc::new(|_| {}),
         on_clear_queue: Rc::new(|| {}),
@@ -812,6 +821,7 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     app.wait_for("Worked for 2s").unwrap();
     assert!(app.screen().shows("cargo test"));
     assert!(app.screen().shows("photo.jpg"));
+    assert!(app.screen().shows("Edit"));
     assert!(app.screen().shows("Copy"));
     assert!(app.screen().shows("Share"));
     assert!(app.screen().shows("Fork"));

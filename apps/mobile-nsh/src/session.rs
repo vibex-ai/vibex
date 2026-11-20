@@ -73,6 +73,13 @@ const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 const RECONNECT_MIN_MS: u64 = 500;
 const RECONNECT_MAX_MS: u64 = 15_000;
 
+/// A user message the composer is replacing.
+#[derive(Clone, Debug)]
+struct EditState {
+    user_sequence: i64,
+    expected_end_sequence: i64,
+}
+
 /// A prompt held behind the running turn.
 #[derive(Clone, Debug)]
 struct QueuedMessage {
@@ -197,6 +204,9 @@ pub struct SessionService {
     queue_paused_sessions: Rc<RefCell<std::collections::BTreeSet<String>>>,
     queued: Signal<Vec<QueuedMessageView>>,
     queue_paused: Signal<bool>,
+    editable_sequence: Signal<i64>,
+    editing: Signal<bool>,
+    edit_state: Rc<RefCell<Option<EditState>>>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -323,6 +333,9 @@ impl SessionService {
             queue_paused_sessions: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
             queued: signal(Vec::new()),
             queue_paused: signal(false),
+            editable_sequence: signal(0),
+            editing: signal(false),
+            edit_state: Rc::new(RefCell::new(None)),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -505,6 +518,20 @@ impl SessionService {
             history_open: self.history_open,
             queued: self.queued,
             queue_paused: self.queue_paused,
+            editable_sequence: self.editable_sequence,
+            editing: self.editing,
+            on_edit_message: {
+                let service = self.clone();
+                Rc::new(move |sequence: i64, text: &str| service.edit_message(sequence, text))
+            },
+            on_cancel_edit: {
+                let service = self.clone();
+                Rc::new(move || service.cancel_edit())
+            },
+            on_replace_message: {
+                let service = self.clone();
+                Rc::new(move |text: &str| service.replace_message(text))
+            },
             on_send_queued: {
                 let service = self.clone();
                 Rc::new(move |id: u64| service.send_queued(id))
@@ -1205,6 +1232,9 @@ impl SessionService {
         self.runtime_open.set(false);
         self.runtime_busy.set(false);
         self.token_usage.set(None);
+        self.editable_sequence.set(0);
+        self.editing.set(false);
+        *self.edit_state.borrow_mut() = None;
         self.publish_queue();
         self.refresh_runtime(&session_id);
         self.refresh_token_usage(&session_id);
@@ -1218,6 +1248,107 @@ impl SessionService {
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
                     format!("opening the session did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
+    /// Puts `text` in the composer as a replacement for `sequence`.
+    fn edit_message(&self, sequence: i64, text: &str) {
+        let expected = self.model.borrow().authoritative_end_sequence.unwrap_or(0);
+        *self.edit_state.borrow_mut() = Some(EditState {
+            user_sequence: sequence,
+            expected_end_sequence: expected,
+        });
+        self.editing.set(true);
+        self.draft.set(text.to_owned());
+        self.attachments.set(Vec::new());
+    }
+
+    fn cancel_edit(&self) {
+        *self.edit_state.borrow_mut() = None;
+        self.editing.set(false);
+        self.draft.set(String::new());
+    }
+
+    /// Replaces the message the composer was opened on.
+    fn replace_message(&self, text: &str) {
+        let Some(edit) = self.edit_state.borrow().clone() else {
+            return;
+        };
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let text = text.trim().to_owned();
+        if text.is_empty() || self.sending.get_untracked() {
+            return;
+        }
+        self.sending.set(true);
+        self.error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let selection_backend = backend.clone();
+            let selection_id = session_id.clone();
+            let selection =
+                background(async move { selection_backend.runtime_selection(selection_id).await })
+                    .await;
+            let selection = match selection {
+                Ok(Ok(state)) => state.desired,
+                Ok(Err(error)) => {
+                    service.sending.set(false);
+                    service.fail(&error);
+                    return;
+                }
+                Err(error) => {
+                    service.sending.set(false);
+                    service.fail(&BackendError::failed(
+                        "session_task_failed",
+                        format!("reading the runtime did not finish: {error}"),
+                    ));
+                    return;
+                }
+            };
+            let request_session = session_id.clone();
+            let result = background(async move {
+                backend
+                    .replace_user_message(MutationRequest::new(
+                        vibex_core::ReplaceUserMessagePayload {
+                            user_sequence: edit.user_sequence,
+                            expected_end_sequence: edit.expected_end_sequence,
+                            message: SendAgentMessageRequest {
+                                session_id: request_session.clone(),
+                                message_idempotency_key: RequestId::new().into_string(),
+                                desired_runtime: selection,
+                                text,
+                                attachments: Vec::new(),
+                                mentions: Vec::new(),
+                                reasoning_effort: None,
+                                correlation_id: None,
+                                delivery: UserMessageDelivery::Prompt,
+                                prompt_context: None,
+                                provenance: MessageProvenance::HumanInput,
+                            },
+                        },
+                    ))
+                    .await
+            })
+            .await;
+            service.sending.set(false);
+            match result {
+                Ok(Ok(_)) => {
+                    service.edit_state.borrow_mut().take();
+                    service.editing.set(false);
+                    service.draft.set(String::new());
+                    service.reload(&session_id);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("replacing the message did not finish: {error}"),
                 )),
             }
         });
@@ -1937,10 +2068,20 @@ impl SessionService {
         }
         let plan = plan_view(&model.items);
         let goal = goal_view(&model.items);
+        let editable = turns
+            .iter()
+            .rev()
+            .find_map(|turn| {
+                (turn.complete && !turn.pending_permission)
+                    .then(|| turn.user_row.as_ref().map(|row| row.last_sequence))
+                    .flatten()
+            })
+            .unwrap_or(0);
         drop(model);
         self.timeline.set(entries);
         self.plan.set(plan);
         self.goal.set(goal);
+        self.editable_sequence.set(editable);
         self.refresh_pending();
     }
 
