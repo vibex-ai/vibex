@@ -51,6 +51,10 @@ fn sessions() -> Vec<SessionSummary> {
             agent: "Claude".to_owned(),
             meta: "2m".to_owned(),
             state: SessionState::Idle,
+            project_id: "p1".to_owned(),
+            project_name: "vibex".to_owned(),
+            workspace_id: "w1".to_owned(),
+            workspace_label: "main".to_owned(),
         },
         SessionSummary {
             id: "s2".to_owned(),
@@ -58,6 +62,10 @@ fn sessions() -> Vec<SessionSummary> {
             agent: "Codex".to_owned(),
             meta: "1h".to_owned(),
             state: SessionState::Idle,
+            project_id: "p1".to_owned(),
+            project_name: "vibex".to_owned(),
+            workspace_id: "w1".to_owned(),
+            workspace_label: "main".to_owned(),
         },
     ]
 }
@@ -529,6 +537,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                     agent: "Claude".to_owned(),
                     meta: "now".to_owned(),
                     state: SessionState::Idle,
+                    project_id: "p1".to_owned(),
+                    project_name: "vibex".to_owned(),
+                    workspace_id: "w1".to_owned(),
+                    workspace_label: "main".to_owned(),
                 },
             );
         });
@@ -546,6 +558,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                     agent: "Claude".to_owned(),
                     meta: "now".to_owned(),
                     state: SessionState::Idle,
+                    project_id: "p1".to_owned(),
+                    project_name: "vibex".to_owned(),
+                    workspace_id: "w1".to_owned(),
+                    workspace_label: "main".to_owned(),
                 },
             );
         });
@@ -872,6 +888,13 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         app.screen().shows("Settings"),
         "the drawer carries the way into settings"
     );
+    assert!(app.screen().shows("vibex"), "the project groups the rows");
+    app.press("role:button[Search sessions]").unwrap();
+    app.type_text("text:Search sessions", "zzz").unwrap();
+    app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
+        .unwrap();
+    app.press("role:button[Search sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("Please fix the tests").unwrap();
     app.wait_for_gone(
@@ -967,6 +990,11 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
         app.screen().shows("Settings"),
         "the drawer carries the way into settings"
     );
+    assert!(app.screen().shows("vibex"), "the project groups the rows");
+    app.press("role:button[Search sessions]").unwrap();
+    app.type_text("text:Search sessions", "zzz").unwrap();
+    app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
+        .unwrap();
     app.press("role:button[New session]").unwrap();
     app.wait_for("Claude · Sonnet").unwrap();
     app.press("role:button[Create]").unwrap();
@@ -1117,6 +1145,10 @@ fn OneSessionShell() -> impl IntoElement {
         agent: "Claude".to_owned(),
         meta: "2m".to_owned(),
         state: SessionState::Running,
+        project_id: "p1".to_owned(),
+        project_name: "vibex".to_owned(),
+        workspace_id: "w1".to_owned(),
+        workspace_label: "main".to_owned(),
     }]);
     session::session(host)
 }

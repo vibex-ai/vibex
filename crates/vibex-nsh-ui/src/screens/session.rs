@@ -68,6 +68,12 @@ pub struct SessionSummary {
     /// When it last spoke, already formatted ("2m", "14:05").
     pub meta: String,
     pub state: SessionState,
+    /// The project the session belongs to, for the drawer's grouping.
+    pub project_id: String,
+    pub project_name: String,
+    /// The checkout or worktree it runs in, for the row's second line.
+    pub workspace_id: String,
+    pub workspace_label: String,
 }
 
 /// What kind of timeline row this is.
@@ -3219,6 +3225,9 @@ fn session_actions_sheet(
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
+    let collapsed_projects = signal(Vec::<String>::new());
+    let search_open = signal(false);
+    let query = signal(String::new());
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
@@ -3250,7 +3259,20 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                     view()
                         .px(px(theme::SPACING_LG))
                         .pb(px(theme::SPACING_MD))
-                        .child(brand::wordmark()),
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .child(view().flex_1().child(brand::wordmark()))
+                        .child(action::icon_button(
+                            icon(include_str!("../../assets/icons/search.svg")),
+                            copy::text("Search sessions", "搜索会话", "搜尋工作階段"),
+                            move || {
+                                search_open.update(|open| *open = !*open);
+                                if !search_open.get_untracked() {
+                                    query.set(String::new());
+                                }
+                            },
+                        )),
                 )
                 .child(
                     view().flex_1().min_h(px(0.0)).child(
@@ -3258,20 +3280,36 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             view()
                                 .gap(px(theme::SPACING_XS))
                                 .px(px(theme::SPACING_SM))
+                                .child(when(move || search_open.get(), {
+                                    move || {
+                                        view()
+                                            .px(px(theme::SPACING_XS))
+                                            .pb(px(theme::SPACING_XS))
+                                            .child(field::text_field(
+                                                query,
+                                                copy::text(
+                                                    "Search sessions",
+                                                    "搜索会话",
+                                                    "搜尋工作階段",
+                                                ),
+                                            ))
+                                    }
+                                }))
                                 .child(each(
-                                    move || sessions.get(),
-                                    |session| session.id.clone(),
-                                    {
+                                    move || drawer_groups(sessions, query),
+                                    |group| group.id.clone(),
+                                    move |group, _| {
+                                        let collapsed = collapsed_projects;
                                         let on_select = on_select.clone();
-                                        move |session, _| {
-                                            session_row(
-                                                session,
-                                                active,
-                                                on_select.clone(),
-                                                on_session_menu.clone(),
-                                                open,
-                                            )
-                                        }
+                                        let on_menu = on_session_menu.clone();
+                                        drawer_group(
+                                            group,
+                                            active,
+                                            collapsed,
+                                            on_select.clone(),
+                                            on_menu.clone(),
+                                            open,
+                                        )
                                     },
                                 )),
                         ),
@@ -3375,6 +3413,119 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
         )
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct DrawerGroup {
+    id: String,
+    name: String,
+    sessions: Vec<SessionSummary>,
+}
+
+fn drawer_groups(sessions: Signal<Vec<SessionSummary>>, query: Signal<String>) -> Vec<DrawerGroup> {
+    sessions.with(|sessions| {
+        let query = query.with(|query| query.trim().to_lowercase());
+        let _ = &query;
+        let mut groups: Vec<DrawerGroup> = Vec::new();
+        for session in sessions {
+            if !query.is_empty()
+                && !session.title.to_lowercase().contains(&query)
+                && !session.agent.to_lowercase().contains(&query)
+                && !session.project_name.to_lowercase().contains(&query)
+                && !session.workspace_label.to_lowercase().contains(&query)
+            {
+                continue;
+            }
+            match groups
+                .iter_mut()
+                .find(|group| group.id == session.project_id)
+            {
+                Some(group) => group.sessions.push(session.clone()),
+                None => groups.push(DrawerGroup {
+                    id: session.project_id.clone(),
+                    name: if session.project_name.trim().is_empty() {
+                        session.project_id.clone()
+                    } else {
+                        session.project_name.clone()
+                    },
+                    sessions: vec![session.clone()],
+                }),
+            }
+        }
+        groups
+    })
+}
+
+fn drawer_group(
+    group: ReadSignal<DrawerGroup>,
+    active: Signal<Option<String>>,
+    collapsed: Signal<Vec<String>>,
+    on_select: Rc<dyn Fn(&str)>,
+    on_menu: SessionMenu,
+    open: Signal<bool>,
+) -> impl IntoElement {
+    let closed = computed(move || {
+        let id = group.with(|group| group.id.clone());
+        collapsed.with(|collapsed| collapsed.contains(&id))
+    });
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(2.0))
+        .child({
+            button()
+                .on_press(move || {
+                    let id = group.get_untracked().id;
+                    collapsed.update(|collapsed| {
+                        if let Some(index) = collapsed.iter().position(|candidate| candidate == &id)
+                        {
+                            collapsed.remove(index);
+                        } else {
+                            collapsed.push(id);
+                        }
+                    });
+                })
+                .w_full()
+                .min_h(px(32.0))
+                .px(px(theme::SPACING_XS))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .active(|style| style.opacity(0.8))
+                .child(
+                    text(move || if closed.get() { "▸" } else { "▾" })
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                )
+                .child(
+                    text(move || group.with(|group| group.name.clone()))
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(theme::font_caption()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_muted),
+                )
+                .child(
+                    text(move || group.with(|group| group.sessions.len().to_string()))
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                )
+        })
+        .child(when(move || !closed.get(), {
+            move || {
+                let on_select = on_select.clone();
+                let on_menu = on_menu.clone();
+                view().w_full().flex_col().gap(px(2.0)).child(each(
+                    move || group.with(|group| group.sessions.clone()),
+                    |session| session.id.clone(),
+                    move |session, _| {
+                        let on_select = on_select.clone();
+                        let on_menu = on_menu.clone();
+                        session_row(session, active, on_select, on_menu, open)
+                    },
+                ))
+            }
+        }))
+}
+
 fn session_row(
     session: ReadSignal<SessionSummary>,
     active: Signal<Option<String>>,
@@ -3431,7 +3582,14 @@ fn session_row(
                         .child(
                             text(move || {
                                 let session = session.get();
-                                format!("{} · {}", session.agent, session.meta)
+                                if session.workspace_label.trim().is_empty() {
+                                    format!("{} · {}", session.agent, session.meta)
+                                } else {
+                                    format!(
+                                        "{} · {} · {}",
+                                        session.agent, session.workspace_label, session.meta
+                                    )
+                                }
                             })
                             .truncate()
                             .text_size(px(theme::font_micro()))

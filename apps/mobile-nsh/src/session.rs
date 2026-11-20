@@ -887,10 +887,20 @@ impl SessionService {
     /// Lists the runtime's sessions and keeps the open one if it still exists.
     async fn reload_sessions(&self) -> bool {
         let backend = self.backend.clone();
+        let workspaces = self.workspace_backend.clone();
         let result = background(async move { backend.list_sessions(false).await }).await;
         match result {
             Ok(Ok(sessions)) => {
-                let rows = sessions.iter().map(summary).collect::<Vec<_>>();
+                let spaces = background(async move { workspaces.list_workspaces().await })
+                    .await
+                    .ok()
+                    .and_then(Result::ok)
+                    .unwrap_or_default();
+                *self.workspace_records.borrow_mut() = spaces.clone();
+                let rows = sessions
+                    .iter()
+                    .map(|session| summary(session, &spaces))
+                    .collect::<Vec<_>>();
                 let active_exists = self.active.get_untracked().is_some_and(|active| {
                     sessions.iter().any(|session| session.id.as_str() == active)
                 });
@@ -1089,7 +1099,7 @@ impl SessionService {
                 self.session_states
                     .borrow_mut()
                     .insert(session.id.as_str().to_owned(), session.state);
-                let row = summary(&session);
+                let row = summary(&session, &self.workspace_records.borrow());
                 self.sessions.update(|sessions| {
                     if let Some(existing) =
                         sessions.iter_mut().find(|existing| existing.id == row.id)
@@ -2694,7 +2704,7 @@ impl SessionService {
             service.session_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
-                    let row = summary(&session);
+                    let row = summary(&session, &service.workspace_records.borrow());
                     service.sessions.update(|sessions| {
                         if let Some(existing) = sessions.iter_mut().find(|s| s.id == row.id) {
                             *existing = row;
@@ -3871,7 +3881,26 @@ async fn send_and_refetch(
     fetch_page(backend, session_id).await
 }
 
-fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
+fn summary(session: &vibex_core::AgentSession, spaces: &[WorkspaceSummary]) -> SessionSummary {
+    let space = spaces
+        .iter()
+        .find(|space| space.workspace.id == session.workspace_id);
+    let project_name = space
+        .map(|space| space.project.name.clone())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| session.project_id.as_str().to_owned());
+    let workspace_label = space
+        .and_then(|space| space.git_branch.clone())
+        .filter(|branch| !branch.trim().is_empty())
+        .or_else(|| {
+            session
+                .workspace_root
+                .rsplit(['/', '\\'])
+                .next()
+                .filter(|name| !name.trim().is_empty())
+                .map(str::to_owned)
+        })
+        .unwrap_or_default();
     SessionSummary {
         id: session.id.as_str().to_owned(),
         title: if session.title.trim().is_empty() {
@@ -3888,6 +3917,10 @@ fn summary(session: &vibex_core::AgentSession) -> SessionSummary {
             vibex_core::AgentSessionState::Error => SessionState::Failed,
             _ => SessionState::Idle,
         },
+        project_id: session.project_id.as_str().to_owned(),
+        project_name,
+        workspace_id: session.workspace_id.as_str().to_owned(),
+        workspace_label,
     }
 }
 
