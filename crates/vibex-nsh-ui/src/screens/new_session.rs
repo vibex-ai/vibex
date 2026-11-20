@@ -11,9 +11,16 @@ use std::rc::Rc;
 use nsh_base::{SheetEvent, button, sheet};
 use nsh_core::{element::ImageSrc, prelude::*};
 
-use crate::screens::session::AttachmentItem;
+use crate::screens::session::{AttachmentItem, BrowseDirs};
 
 type Action = Rc<dyn Fn()>;
+
+/// One directory inside the authority's browse roots.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
 use crate::{copy, theme, ui::action};
 
 /// A workspace the new session can live in.
@@ -50,6 +57,11 @@ pub struct NewSessionHost {
     /// A path to open as a project before choosing it.
     pub project_path: Signal<String>,
     pub on_open_project: Rc<dyn Fn()>,
+    pub project_dirs: Signal<Vec<DirectoryEntry>>,
+    pub browser_open: Signal<bool>,
+    pub project_dir_path: Signal<Option<String>>,
+    pub project_dir_parent: Signal<Option<String>>,
+    pub on_browse_project_dirs: BrowseDirs,
     /// The session's optional title, first message and its attachments.
     pub title: Signal<String>,
     pub prompt: Signal<String>,
@@ -331,6 +343,113 @@ fn new_session_attachments(
                     false,
                     move || on_attach_file(),
                 )),
+        )
+}
+
+pub fn project_browser_sheet(
+    open: Signal<bool>,
+    dirs: Signal<Vec<DirectoryEntry>>,
+    current: Signal<Option<String>>,
+    parent: Signal<Option<String>>,
+    on_browse: BrowseDirs,
+    project_path: Signal<String>,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event {
+                open.set(*next);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .max_h(px(520.0))
+                .gap(px(theme::SPACING_XS))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(move || {
+                        current
+                            .get()
+                            .unwrap_or_else(|| copy::text("Folders", "文件夹", "資料夾").to_owned())
+                    })
+                    .truncate()
+                    .text_size(px(theme::font_heading()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::foreground),
+                )
+                .child({
+                    let on_browse = on_browse.clone();
+                    when(
+                        move || parent.get().is_some(),
+                        move || {
+                            let on_browse = on_browse.clone();
+                            action::secondary(
+                                copy::text("Parent folder", "上级文件夹", "上層資料夾"),
+                                icon(include_str!("../../assets/icons/chevron-left.svg")),
+                                false,
+                                move || {
+                                    if let Some(path) = parent.get_untracked() {
+                                        on_browse(Some(&path));
+                                    }
+                                },
+                            )
+                            .w_full()
+                        },
+                    )
+                })
+                .child({
+                    let browse_rows = on_browse.clone();
+                    each(
+                        move || dirs.get(),
+                        |directory| directory.path.clone(),
+                        move |directory, _| {
+                            let on_browse = browse_rows.clone();
+                            button()
+                                .on_press(move || on_browse(Some(&directory.get_untracked().path)))
+                                .w_full()
+                                .min_h(px(40.0))
+                                .px(px(theme::SPACING_SM))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .bg(theme::background_dim)
+                                .child(
+                                    svg(icon(include_str!("../../assets/icons/folder.svg")))
+                                        .w(px(theme::ICON_SM))
+                                        .h(px(theme::ICON_SM))
+                                        .text_color(theme::text_muted),
+                                )
+                                .child(
+                                    text(move || directory.get().name)
+                                        .flex_1()
+                                        .truncate()
+                                        .text_size(px(theme::font_body()))
+                                        .text_color(theme::foreground),
+                                )
+                        },
+                    )
+                })
+                .child({
+                    let on_browse = on_browse.clone();
+                    action::primary(
+                        copy::text("Use this folder", "使用此文件夹", "使用此資料夾"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || {
+                            if let Some(path) = current.get_untracked() {
+                                project_path.set(path);
+                                open.set(false);
+                                let _ = &on_browse;
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
         )
 }
 

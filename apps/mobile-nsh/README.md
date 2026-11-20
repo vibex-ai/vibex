@@ -121,13 +121,16 @@ A successful claim or a tapped saved runtime opens the session shell:
   replaces the list, a message field commits what is staged (`commit`), the
   History view lists recent commits (`git_history`), a commit opens its message
   and patch (`git_commit_detail`), and an unstaged diff can be discarded with
-  a native confirmation (`git_revert`). Branch switching is not offered: the
-  backend exposes the branch list but no checkout call.
+  a native confirmation (`git_revert`). The branch sheet lists local branches
+  and checks one out (`git_branch_checkout`), then refreshes status and
+  history; Worktrees are listed and archived, restored, merged or discarded
+  through the runtime's preflight calls.
 
-Attachments and `@`-mentions land with their own passes. The shell's tests
-mount it over a fixture; the live, answer and terminal paths are
-compile-verified and use the same projection and backend types the desktop
-tests cover.
+Attachments, `@`-mentions, the prompt queue, scheduled sends, session search,
+Sidebar folders/groups and the Android host integrations are covered by the
+headless and unit suites where the backend is a fixture. The shell's tests
+mount it over that fixture; live answer, terminal, Sidebar and Git paths are
+compile-verified and use the same backend types the desktop tests cover.
 
 ## Run it
 

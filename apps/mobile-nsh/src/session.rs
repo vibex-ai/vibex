@@ -63,7 +63,7 @@ use vibex_nsh_ui::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
         WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
     },
-    screens::new_session::{RuntimeChoice, WorkspaceChoice},
+    screens::new_session::{DirectoryEntry, RuntimeChoice, WorkspaceChoice},
     screens::session::{
         AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalControl, GoalPhaseView,
         GoalView, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
@@ -255,6 +255,10 @@ pub struct SessionService {
     new_worktree_branch: Signal<String>,
     new_base_ref: Signal<String>,
     new_project_path: Signal<String>,
+    project_dirs: Signal<Vec<DirectoryEntry>>,
+    project_browser_open: Signal<bool>,
+    project_dir_path: Signal<Option<String>>,
+    project_dir_parent: Signal<Option<String>>,
     new_title: Signal<String>,
     new_prompt: Signal<String>,
     new_attachments: Signal<Vec<AttachmentItem>>,
@@ -455,6 +459,10 @@ impl SessionService {
             new_worktree_branch: signal(String::new()),
             new_base_ref: signal(String::new()),
             new_project_path: signal(String::new()),
+            project_dirs: signal(Vec::new()),
+            project_browser_open: signal(false),
+            project_dir_path: signal(None),
+            project_dir_parent: signal(None),
             new_title: signal(String::new()),
             new_prompt: signal(String::new()),
             new_attachments: signal(Vec::new()),
@@ -1165,6 +1173,17 @@ impl SessionService {
             on_open_project: {
                 let service = self.clone();
                 Rc::new(move || service.open_project())
+            },
+            project_dirs: self.project_dirs,
+            project_browser_open: self.project_browser_open,
+            project_dir_path: self.project_dir_path,
+            project_dir_parent: self.project_dir_parent,
+            on_browse_project_dirs: {
+                let service = self.clone();
+                Rc::new(move |path: Option<&str>| {
+                    service.project_browser_open.set(true);
+                    service.browse_project_dirs(path.map(str::to_owned))
+                })
             },
             on_session_menu: {
                 let service = self.clone();
@@ -4081,6 +4100,14 @@ impl SessionService {
             .get_untracked()
             .iter()
             .any(|candidate| candidate == id);
+        self.pinned.update(|pinned| {
+            if pinned.iter().any(|candidate| candidate == id) {
+                pinned.retain(|candidate| candidate != id);
+            } else {
+                pinned.push(id.to_owned());
+            }
+        });
+        self.persist_pins();
         let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
         let sidebar = self.sidebar_backend.clone();
@@ -4653,6 +4680,37 @@ impl SessionService {
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
                     format!("creating the session did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn browse_project_dirs(&self, path: Option<String>) {
+        self.new_error.set(None);
+        let service = self.clone();
+        let workspaces = self.workspace_backend.clone();
+        spawn(async move {
+            let result =
+                background(async move { workspaces.browse_authority_directories(path).await })
+                    .await;
+            match result {
+                Ok(Ok(listing)) => {
+                    service.project_dirs.set(
+                        listing
+                            .entries
+                            .into_iter()
+                            .map(|entry| DirectoryEntry {
+                                name: entry.name,
+                                path: entry.path,
+                            })
+                            .collect(),
+                    );
+                    service.project_dir_path.set(Some(listing.path));
+                    service.project_dir_parent.set(listing.parent);
+                }
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("browsing the directories did not finish: {error}").into(),
                 )),
             }
         });
@@ -6092,7 +6150,7 @@ impl SessionService {
                 Ok(Ok(status)) => {
                     service
                         .git_branch
-                        .set(Some(status.branch.clone().unwrap_or_default().into()));
+                        .set(status.branch.clone().map(Into::into));
                     *service.git_history_ref.borrow_mut() = None;
                     service.load_git_branches();
                     service.refresh_git();

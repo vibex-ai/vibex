@@ -400,6 +400,7 @@ type SessionMenu = FolderNameAction;
 
 use crate::screens::new_session::{
     NewSessionHost, RuntimeChoice, WorkspaceChoice, new_session as new_session_sheet,
+    project_browser_sheet as project_browser,
 };
 
 /// A callback with no arguments.
@@ -416,6 +417,7 @@ type CollapseAction = SessionToggle;
 type SessionToggle = Rc<dyn Fn(&str, bool)>;
 type MoveSessionAction = Rc<dyn Fn(&str, Option<&str>)>;
 type MoveRelative = Rc<dyn Fn(&str, isize)>;
+pub type BrowseDirs = Rc<dyn Fn(Option<&str>)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -665,7 +667,12 @@ pub struct SessionHost {
     pub new_attachments: Signal<Vec<AttachmentItem>>,
     pub on_create_temporary_session: Action,
     pub new_project_path: Signal<String>,
+    pub project_dirs: Signal<Vec<crate::screens::new_session::DirectoryEntry>>,
+    pub project_browser_open: Signal<bool>,
+    pub project_dir_path: Signal<Option<String>>,
+    pub project_dir_parent: Signal<Option<String>>,
     pub on_open_project: Action,
+    pub on_browse_project_dirs: BrowseDirs,
     pub on_attach_new_image: Action,
     pub on_attach_new_file: Action,
     pub on_remove_new_attachment: Rc<dyn Fn(&str)>,
@@ -1001,6 +1008,14 @@ fn shell(host: SessionHost) -> impl IntoElement {
             on_interrupt: host.on_interrupt_team.clone(),
             on_close: host.on_close_team.clone(),
         }))
+        .child(project_browser(
+            host.project_browser_open,
+            host.project_dirs,
+            host.project_dir_path,
+            host.project_dir_parent,
+            host.on_browse_project_dirs.clone(),
+            host.new_project_path,
+        ))
         .child(new_session_sheet(NewSessionHost {
             open: host.new_session_open,
             workspaces: host.new_workspaces,
@@ -1014,6 +1029,11 @@ fn shell(host: SessionHost) -> impl IntoElement {
             on_create_temporary: host.on_create_temporary_session.clone(),
             project_path: host.new_project_path,
             on_open_project: host.on_open_project.clone(),
+            project_dirs: host.project_dirs,
+            browser_open: host.project_browser_open,
+            project_dir_path: host.project_dir_path,
+            project_dir_parent: host.project_dir_parent,
+            on_browse_project_dirs: host.on_browse_project_dirs.clone(),
             title: host.new_title,
             prompt: host.new_prompt,
             attachments: host.new_attachments,
@@ -2963,14 +2983,20 @@ fn queue_card(
                 let id = message.with(|message| message.id);
                 let send = on_send.clone();
                 let remove = on_remove.clone();
+                let dragging = signal(false);
                 view()
                     .w_full()
                     .flex_row()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
+                    .on_long_press(move || dragging.set(true))
                     .on_pan_end({
                         let on_move = on_move.clone();
                         move |event: &PanEvent| {
+                            if !dragging.get_untracked() {
+                                return;
+                            }
+                            dragging.set(false);
                             if event.translation.y.0 < -28.0 {
                                 on_move(id, -1);
                             } else if event.translation.y.0 > 28.0 {
@@ -5455,7 +5481,7 @@ fn session_row(
         .rounded(px(theme::RADIUS_CONTROL))
         .flex_row()
         .items_center()
-        .on_pan_start(move |_event: &PanEvent| dragged.set(true))
+        .on_long_press(move || dragged.set(true))
         .on_pan_end(move |event: &PanEvent| {
             if !dragged.get_untracked() {
                 return;

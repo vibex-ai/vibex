@@ -717,6 +717,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let new_worktree_branch = signal(String::new());
     let new_base_ref = signal(String::new());
     let new_project_path = signal(String::new());
+    let project_dirs = signal(Vec::new());
+    let project_browser_open = signal(false);
+    let project_dir_path = signal(None);
+    let project_dir_parent = signal(None);
     let on_create_worktree_session = Rc::new(move || {
         if new_worktree_branch.get_untracked().trim().is_empty() {
             return;
@@ -1061,6 +1065,11 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_create_temporary_session: Rc::new(|| {}),
         new_project_path,
         on_open_project: Rc::new(|| {}),
+        project_dirs,
+        project_browser_open,
+        project_dir_path,
+        project_dir_parent,
+        on_browse_project_dirs: Rc::new(|_| {}),
         new_worktree_branch,
         new_base_ref,
         new_title,
