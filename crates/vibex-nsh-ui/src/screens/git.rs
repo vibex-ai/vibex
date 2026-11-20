@@ -16,6 +16,7 @@ use crate::{
 
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
+pub type ResolveWorktree = Rc<dyn Fn(&str, &str, bool)>;
 
 /// One local branch in the branch sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -38,6 +39,12 @@ pub struct WorktreeRow {
     pub can_discard: bool,
 }
 
+/// One unresolved conflict.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct WorktreeConflictRow {
+    pub path: String,
+}
+
 /// One merge/operation needing attention.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct WorktreeOperationRow {
@@ -46,6 +53,7 @@ pub struct WorktreeOperationRow {
     pub status: String,
     pub can_continue: bool,
     pub can_abort: bool,
+    pub conflicts: Vec<WorktreeConflictRow>,
 }
 
 /// One changed path in the status list.
@@ -122,6 +130,7 @@ pub struct GitHost {
     pub on_discard_worktree: Rc<dyn Fn(&str)>,
     pub on_continue_worktree: Rc<dyn Fn(&str)>,
     pub on_abort_worktree: Rc<dyn Fn(&str)>,
+    pub on_resolve_worktree: ResolveWorktree,
     pub on_restore_worktree: Rc<dyn Fn(&str)>,
     pub on_toggle_amend: Rc<dyn Fn()>,
     pub on_toggle_push_after: Rc<dyn Fn()>,
@@ -269,6 +278,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             host.on_discard_worktree.clone(),
             host.on_continue_worktree.clone(),
             host.on_abort_worktree.clone(),
+            host.on_resolve_worktree.clone(),
             host.on_restore_worktree.clone(),
         ))
         .child(when(
@@ -631,6 +641,7 @@ fn worktree_sheet(
     on_discard: Rc<dyn Fn(&str)>,
     on_continue: Rc<dyn Fn(&str)>,
     on_abort: Rc<dyn Fn(&str)>,
+    on_resolve: ResolveWorktree,
     on_restore: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     sheet()
@@ -810,6 +821,7 @@ fn worktree_sheet(
                     move || {
                         let on_continue = on_continue.clone();
                         let on_abort = on_abort.clone();
+                        let on_resolve = on_resolve.clone();
                         view()
                             .w_full()
                             .flex_col()
@@ -826,9 +838,11 @@ fn worktree_sheet(
                                 move |operation, _| {
                                     let on_continue = on_continue.clone();
                                     let on_abort = on_abort.clone();
+                                    let on_resolve = on_resolve.clone();
                                     view()
                                         .w_full()
                                         .flex_row()
+                                        .flex_wrap()
                                         .items_center()
                                         .gap(px(theme::SPACING_XS))
                                         .p(px(theme::SPACING_SM))
@@ -891,10 +905,57 @@ fn worktree_sheet(
                                                     )
                                             },
                                         ))
+                                        .child(each(
+                                            move || operation.get().conflicts,
+                                            |conflict| conflict.path.clone(),
+                                            move |conflict, _| {
+                                                let on_resolve = on_resolve.clone();
+                                                let id = operation.get_untracked().id;
+                                                let path = conflict.get_untracked().path;
+                                                view()
+                                                    .w_full()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .gap(px(theme::SPACING_XS))
+                                                    .child(
+                                                        text(path.clone())
+                                                            .flex_1()
+                                                            .truncate()
+                                                            .text_size(px(theme::font_micro()))
+                                                            .text_color(theme::text_muted),
+                                                    )
+                                                    .child(small_text_button(
+                                                        copy::text("Worktree", "工作树", "工作樹"),
+                                                        {
+                                                            let on_resolve = on_resolve.clone();
+                                                            let id = id.clone();
+                                                            let path = path.clone();
+                                                            move || on_resolve(&id, &path, true)
+                                                        },
+                                                    ))
+                                                    .child(small_text_button(
+                                                        copy::text("Target", "目标", "目標"),
+                                                        move || on_resolve(&id, &path, false),
+                                                    ))
+                                            },
+                                        ))
                                 },
                             ))
                     },
                 )),
+        )
+}
+
+fn small_text_button(label: &'static str, on_press: impl Fn() + 'static) -> ButtonElement {
+    button()
+        .on_press(on_press)
+        .min_h(px(24.0))
+        .px(px(theme::SPACING_XS))
+        .items_center()
+        .child(
+            text(label)
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_secondary),
         )
 }
 

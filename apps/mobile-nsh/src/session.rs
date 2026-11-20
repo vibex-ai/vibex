@@ -36,16 +36,17 @@ use vibex_core::{
     FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
     GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest,
-    GitWorktreeDiscardRequest, GitWorktreeMergeRequest, GitWorktreeOperationRequest,
-    GitWorktreeOperationStatus, GitWorktreeRestoreRequest, GoalAction, GoalPhase,
-    MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictResolveRequest,
+    GitWorktreeConflictVersion, GitWorktreeCreateRequest, GitWorktreeDiscardRequest,
+    GitWorktreeMergeRequest, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
+    GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
+    OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
+    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
     TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
     TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
     WorkspaceId, unix_timestamp_ms,
@@ -58,7 +59,7 @@ use vibex_nsh_ui::{
     screens::files::{FileEntry, FilePreview, FilePreviewKindView},
     screens::git::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
-        WorktreeOperationRow, WorktreeRow,
+        WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
     },
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
@@ -682,6 +683,12 @@ impl SessionService {
             on_abort_worktree: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.abort_worktree_merge(id))
+            },
+            on_resolve_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str, path: &str, source: bool| {
+                    service.resolve_worktree_conflict(id, path, source)
+                })
             },
             on_restore_worktree: {
                 let service = self.clone();
@@ -4997,6 +5004,15 @@ impl SessionService {
                             can_continue: operation.status
                                 == GitWorktreeOperationStatus::NeedsResolution,
                             can_abort: true,
+                            conflicts: operation
+                                .detail
+                                .conflicts
+                                .iter()
+                                .filter(|conflict| !conflict.resolved)
+                                .map(|conflict| WorktreeConflictRow {
+                                    path: conflict.path.clone(),
+                                })
+                                .collect(),
                         })
                         .collect();
                     *service.worktree_records.borrow_mut() = snapshot.managed_worktrees;
@@ -5089,6 +5105,50 @@ impl SessionService {
                         format!("checking the worktree did not finish: {error}").into(),
                     ));
                 }
+            }
+        });
+    }
+
+    fn resolve_worktree_conflict(&self, id: &str, path: &str, source: bool) {
+        let Ok(operation_id) = RequestId::parse(id) else {
+            return;
+        };
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        let path = path.to_owned();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let request = GitWorktreeConflictResolveRequest {
+                operation_id,
+                workspace_id: workspace,
+                path,
+                version: if source {
+                    GitWorktreeConflictVersion::Source
+                } else {
+                    GitWorktreeConflictVersion::Target
+                },
+            };
+            let result = background(async move {
+                git.git_worktree_resolve_conflict(MutationRequest::new(request))
+                    .await
+            })
+            .await;
+            service.worktree_busy.set(false);
+            match result {
+                Ok(Ok(_)) => service.load_worktrees(),
+                Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                Err(error) => service.worktree_error.set(Some(
+                    format!("resolving the conflict did not finish: {error}").into(),
+                )),
             }
         });
     }

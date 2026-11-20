@@ -14,8 +14,8 @@ use nsh_testing::Headless;
 use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView};
 use vibex_nsh_ui::screens::git::{
-    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeOperationRow,
-    WorktreeRow,
+    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeConflictRow,
+    WorktreeOperationRow, WorktreeRow,
 };
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
@@ -402,6 +402,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         status: "Needs resolution".to_owned(),
         can_continue: true,
         can_abort: true,
+        conflicts: vec![WorktreeConflictRow {
+            path: "src/lib.rs".to_owned(),
+        }],
     }]);
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
@@ -917,6 +920,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_discard_worktree: Rc::new(|_| {}),
         on_continue_worktree: Rc::new(|_| {}),
         on_abort_worktree: Rc::new(|_| {}),
+        on_resolve_worktree: Rc::new(|_, _, _| {}),
         on_restore_worktree: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),
@@ -1351,6 +1355,8 @@ fn the_git_worktree_sheet_lists_managed_worktrees() {
     assert!(app.screen().shows("Merge"));
     assert!(app.screen().shows("Continue"));
     assert!(app.screen().shows("Abort"));
+    assert!(app.screen().shows("src/lib.rs"));
+    assert!(app.screen().shows("Target"));
 }
 
 #[test]
