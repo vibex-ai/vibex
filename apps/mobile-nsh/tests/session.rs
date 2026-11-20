@@ -773,6 +773,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_folder: Rc::new(move || folder_open.set(true)),
         on_close_folder: Rc::new(move || folder_open.set(false)),
         on_create_folder: Rc::new(|| {}),
+        on_rename_folder: Rc::new(|_, _| {}),
+        on_delete_folder: Rc::new(|_| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,
@@ -1167,6 +1169,8 @@ fn a_sidebar_folder_groups_its_sessions() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Work").unwrap();
     assert!(app.screen().shows("Fix the tests"));
+    app.press("role:button[Folder actions]").unwrap();
+    app.wait_for("Rename").unwrap();
 }
 
 #[test]

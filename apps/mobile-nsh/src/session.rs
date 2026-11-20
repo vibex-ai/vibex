@@ -606,6 +606,14 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.create_folder())
             },
+            on_rename_folder: {
+                let service = self.clone();
+                Rc::new(move |id: &str, name: &str| service.rename_folder(id, name))
+            },
+            on_delete_folder: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.delete_folder(id))
+            },
             on_toggle_pin: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.toggle_pin(id))
@@ -3916,6 +3924,45 @@ impl SessionService {
                         format!("changing the pin did not finish: {error}"),
                     ));
                 }
+            }
+        });
+    }
+
+    fn rename_folder(&self, id: &str, name: &str) {
+        let name = name.trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::RenameFolder {
+            folder_id: id.to_owned(),
+            name,
+        });
+    }
+
+    fn delete_folder(&self, id: &str) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::DeleteFolder {
+            folder_id: id.to_owned(),
+        });
+    }
+
+    fn sidebar_mutation(&self, mutation: RemoteSidebarOrganizationMutation) {
+        let revision = self.sidebar_snapshot.borrow().revision;
+        let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        spawn(async move {
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => service.apply_sidebar(snapshot),
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_sidebar_task_failed",
+                    format!("changing the sidebar did not finish: {error}"),
+                )),
             }
         });
     }

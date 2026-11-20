@@ -385,7 +385,7 @@ type OpenPath = Rc<dyn Fn(&str)>;
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
 
 /// Opens the actions sheet for a session, with its id and title.
-type SessionMenu = Rc<dyn Fn(&str, &str)>;
+type SessionMenu = FolderNameAction;
 
 use crate::screens::new_session::{
     NewSessionHost, RuntimeChoice, WorkspaceChoice, new_session as new_session_sheet,
@@ -394,11 +394,12 @@ use crate::screens::new_session::{
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 /// Chooses a value for one of the Agent's session options.
-type ChooseFeature = Rc<dyn Fn(&str, &str)>;
+type ChooseFeature = FolderNameAction;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
 type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 type BatchAction = Rc<dyn Fn(&[String])>;
+type FolderNameAction = Rc<dyn Fn(&str, &str)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -438,6 +439,8 @@ pub struct SessionHost {
     pub on_open_folder: Action,
     pub on_close_folder: Action,
     pub on_create_folder: Action,
+    pub on_rename_folder: FolderNameAction,
+    pub on_delete_folder: Rc<dyn Fn(&str)>,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
     pub timeline: Signal<Vec<TimelineEntry>>,
@@ -4014,6 +4017,10 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_open_folder = host.on_open_folder.clone();
     let on_close_folder = host.on_close_folder.clone();
     let on_create_folder = host.on_create_folder.clone();
+    let on_rename_folder = host.on_rename_folder.clone();
+    let on_delete_folder = host.on_delete_folder.clone();
+    let folder_actions = signal(None::<String>);
+    let folder_rename = signal(String::new());
     let hidden_sessions = computed(move || {
         sidebar_sections.with(|sections| {
             sections
@@ -4140,6 +4147,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             }))
                     }
                 }))
+                .child(folder_actions_sheet(
+                    folder_actions,
+                    folder_rename,
+                    on_rename_folder.clone(),
+                    on_delete_folder.clone(),
+                ))
                 .child(folder_sheet(
                     folder_open,
                     folder_name,
@@ -4180,6 +4193,14 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 active,
                                                 section_select.clone(),
                                                 section_menu.clone(),
+                                                {
+                                                    let folder_actions = folder_actions;
+                                                    let folder_rename = folder_rename;
+                                                    Rc::new(move |id: &str, name: &str| {
+                                                        folder_rename.set(name.to_owned());
+                                                        folder_actions.set(Some(id.to_owned()));
+                                                    })
+                                                },
                                                 open,
                                                 select_mode,
                                                 selected,
@@ -4424,6 +4445,73 @@ fn drawer_groups(
     })
 }
 
+fn folder_actions_sheet(
+    action: Signal<Option<String>>,
+    name: Signal<String>,
+    on_rename: FolderNameAction,
+    on_delete: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    let open = computed(move || action.get().is_some());
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                action.set(None);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Folder", "文件夹", "資料夾"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(field::text_field(
+                    name,
+                    copy::text("Folder name", "文件夹名称", "資料夾名稱"),
+                ))
+                .child({
+                    let on_rename = on_rename.clone();
+                    action::primary(
+                        copy::text("Rename", "重命名", "重新命名"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || {
+                            if let Some(id) = action.get_untracked()
+                                && !name.with(|name| name.trim().is_empty())
+                            {
+                                on_rename(&id, &name.get_untracked());
+                                action.set(None);
+                            }
+                        },
+                    )
+                    .w_full()
+                })
+                .child({
+                    let on_delete = on_delete.clone();
+                    action::secondary(
+                        copy::text("Delete", "删除", "刪除"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || {
+                            if let Some(id) = action.get_untracked() {
+                                on_delete(&id);
+                                action.set(None);
+                            }
+                        },
+                    )
+                    .w_full()
+                }),
+        )
+}
+
 fn folder_sheet(
     open: Signal<bool>,
     name: Signal<String>,
@@ -4477,6 +4565,7 @@ fn sidebar_section(
     active: Signal<Option<String>>,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
+    on_folder_menu: FolderNameAction,
     open: Signal<bool>,
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
@@ -4514,7 +4603,29 @@ fn sidebar_section(
                     text(move || rows.with(|rows| rows.len().to_string()))
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
-                ),
+                )
+                .child({
+                    let on_folder_menu = on_folder_menu.clone();
+                    button()
+                        .on_press(move || {
+                            let section = section.get_untracked();
+                            on_folder_menu(&section.id, &section.name);
+                        })
+                        .accessibility_label(copy::text(
+                            "Folder actions",
+                            "文件夹操作",
+                            "資料夾操作",
+                        ))
+                        .min_h(px(28.0))
+                        .min_w(px(28.0))
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            text("⋯")
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
+                        )
+                }),
         )
         .child(each(
             move || rows.get(),
