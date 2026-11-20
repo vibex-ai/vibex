@@ -8960,6 +8960,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn branch_checkout_rides_the_typed_git_operation() {
+        let transport = Arc::new(MockTransport::with_responses([]));
+        let backend = WebRemoteBackend::new(
+            transport.clone(),
+            RemoteAuthProof {
+                device_id: vibex_core::DeviceId::new(),
+                auth_token: "test-token".to_string(),
+            },
+        );
+        let error = backend
+            .git_branch_checkout(MutationRequest::new(GitBranchCheckoutRequest {
+                workspace_id: WorkspaceId::new(),
+                name: "feature/test".to_owned(),
+            }))
+            .await
+            .unwrap_err();
+        assert_eq!(error.code, "mock_unavailable");
+        let requests = transport.requests();
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].operation, "git");
+    }
+
+    #[tokio::test]
     async fn remote_provider_projection_keeps_entities_and_secret_mutation_private() {
         let transport = Arc::new(MockTransport::new([]));
         let backend = WebRemoteBackend::new(
