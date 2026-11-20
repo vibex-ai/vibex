@@ -4,12 +4,29 @@ on:
   push:
     tags:
       - "v[0-9]*"
+  # A release whose artifacts are already built is replayable without building
+  # them again: this dispatch publishes `tag` from the artifact bundles of
+  # `artifacts_run_id`, so a failure in the aggregate job costs the publish
+  # steps only, not another hour of native packaging. `download-artifact` reads
+  # another run's bundles through `run-id`, so the reused run only has to still
+  # hold them (14-day retention).
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to publish (for example v0.1.9)"
+        required: true
+        type: string
+      artifacts_run_id:
+        description: "Run ID whose desktop and server artifacts are reused"
+        required: true
+        type: string
 
 permissions:
   contents: read
 
 concurrency:
-  group: publish-release-${{ github.ref }}
+  # A replay and the tag push it replaces must not publish the same tag at once.
+  group: publish-release-${{ github.event.inputs.tag || github.ref }}
   cancel-in-progress: false
 
 env:
@@ -20,6 +37,9 @@ env:
 jobs:
   release-meta:
     name: Resolve release metadata
+    # A replay publishes an existing tag from artifacts an earlier run already
+    # built, so it resolves its identity from the dispatch inputs instead.
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
@@ -64,6 +84,9 @@ jobs:
   desktop:
     name: Desktop ${{ matrix.platform }} ${{ matrix.arch }}
     needs: release-meta
+    # A replay reuses the bundles this job produced earlier instead of
+    # rebuilding them for an hour.
+    if: ${{ github.event_name == 'push' }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -256,6 +279,7 @@ jobs:
   server-linux:
     name: Server Linux
     needs: release-meta
+    if: ${{ github.event_name == 'push' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -302,6 +326,7 @@ jobs:
   server-macos:
     name: Server macOS ${{ matrix.arch }}
     needs: release-meta
+    if: ${{ github.event_name == 'push' }}
     # macOS 14 images no longer exist; the x86_64 binary is cross-built here.
     runs-on: macos-15
     timeout-minutes: 120
@@ -355,7 +380,7 @@ jobs:
     # crates for a phone. Mobile packaging is therefore opt-in until that layer
     # is ported: set the repository variable VIBEX_MOBILE_RELEASES_ENABLED to
     # true to publish Android and iOS again.
-    if: ${{ vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
+    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -430,7 +455,7 @@ jobs:
     needs: release-meta
     # See mobile-android: the Apple packages are withheld for the same reason
     # and the same repository variable turns them back on.
-    if: ${{ vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
+    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
     timeout-minutes: 120
@@ -493,20 +518,82 @@ jobs:
     # desktop, server and container artifacts must still publish while mobile
     # packaging is switched off. A mobile job that actually ran and failed still
     # holds the release, which is what "a partial build never publishes" means.
-    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped') }}
+    # A replay starts no build job at all, so every `needs` result is `skipped`
+    # and the artifacts come from the run named in the dispatch inputs.
+    if: ${{ always() && (github.event_name == 'workflow_dispatch' || (needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped'))) }}
     runs-on: ubuntu-24.04
     steps:
       # The release body compares the published tag against the previous one and
       # falls back to the commit log when a range carries no merged pull
-      # requests, so this job needs the tags and the history behind them.
+      # requests, so this job needs the tags and the history behind them. A
+      # replay checks the tag out directly, so the tagged notes are the ones it
+      # publishes.
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
         with:
           fetch-depth: 0
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Resolve release identity
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ inputs.tag || github.ref_name }}"
+          case "${tag}" in
+            v[0-9]*) ;;
+            *) echo "not a release tag: ${tag}" >&2; exit 1 ;;
+          esac
+          version="${tag#v}"
+          case "${version}" in
+            *-preview.*) channel="preview" ;;
+            *-rc.*) channel="rc" ;;
+            *-*) echo "unsupported release prerelease channel: ${version}" >&2; exit 1 ;;
+            *) channel="stable" ;;
+          esac
+          # Every artifact this job publishes is named after the commit it was
+          # built from, so resolving the tag's commit is what selects them.
+          commit="$(git rev-parse --verify "${tag}^{commit}")"
+          {
+            echo "tag=${tag}"
+            echo "version=${version}"
+            echo "channel=${channel}"
+            echo "commit=${commit}"
+          } >> "${GITHUB_OUTPUT}"
+      - name: Verify the reused run built this tag
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ inputs.artifacts_run_id }}
+          TAG: ${{ steps.release.outputs.tag }}
+          TAG_COMMIT: ${{ steps.release.outputs.commit }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          built="$(gh api "repos/${GITHUB_REPOSITORY}/actions/runs/${RUN_ID}" --jq .head_sha)"
+          # Publishing binaries built from another commit under this tag would
+          # sign a release that no source in the tag produces, so the replay is
+          # only allowed when the bundles belong to the tagged commit.
+          if [[ "${built}" != "${TAG_COMMIT}" ]]; then
+            echo "run ${RUN_ID} built ${built}, but ${TAG} points at ${TAG_COMMIT}" >&2
+            exit 1
+          fi
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        if: github.event_name != 'workflow_dispatch'
         with:
-          pattern: "*-*-${{ github.sha }}"
+          pattern: "*-*-${{ steps.release.outputs.commit }}"
           path: target/release-downloads
           merge-multiple: false
+      # A replay collects the bundles of the run it names. The two steps exist
+      # because `download-artifact` refuses a token without a `run-id`, and a
+      # tag push has neither, so the inputs cannot be shared.
+      - name: Download the reused run's artifacts
+        if: github.event_name == 'workflow_dispatch'
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          pattern: "*-*-${{ steps.release.outputs.commit }}"
+          path: target/release-downloads
+          merge-multiple: false
+          run-id: ${{ inputs.artifacts_run_id }}
+          github-token: ${{ github.token }}
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt
@@ -521,7 +608,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          version="${{ needs.release-meta.outputs.version }}"
+          version="${{ steps.release.outputs.version }}"
           notes="docs/operations/release-notes-v${version}.md"
           # The desktop About page reads this asset to show the changelog in
           # the selected language, so a release without it would silently ship
@@ -544,17 +631,18 @@ jobs:
         env:
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
           VIBEX_UPDATE_SIGNING_KEY: ${{ secrets.VIBEX_UPDATE_SIGNING_KEY }}
-          # `success` or `skipped`: the phone package only exists when the
-          # mobile job was switched on for this release.
+          # `success` or `skipped`. A replay starts no mobile job of its own, so
+          # it always reads `skipped` and carries whatever the run it reuses
+          # published.
           MOBILE_ANDROID_RESULT: ${{ needs.mobile-android.result }}
         shell: bash
         run: |
           set -euo pipefail
           test -n "${VIBEX_UPDATE_PUBLIC_KEY}"
           test -n "${VIBEX_UPDATE_SIGNING_KEY}"
-          version="${{ needs.release-meta.outputs.version }}"
-          tag="${GITHUB_REF_NAME}"
-          channel="${{ needs.release-meta.outputs.channel }}"
+          version="${{ steps.release.outputs.version }}"
+          tag="${{ steps.release.outputs.tag }}"
+          channel="${{ steps.release.outputs.channel }}"
           repository_url="https://github.com/vibex-ai/vibex/releases/download/${tag}"
           manifest_args=( \
             --channel "${channel}" --version "${version}" \
@@ -629,14 +717,16 @@ jobs:
           require_artifact_class '*-windows-*-nsis.exe' 'Windows NSIS installer'
           # The Android client installs the signed APK straight from the
           # release, so the phone verifies the same manifest the desktop does.
-          # That requirement holds only for a release that packaged the phone
-          # client: while mobile packaging is switched off the aggregate job
-          # accepts a skipped mobile job, so demanding an APK here would fail
-          # every desktop-only release. The manifest then carries no Android
-          # entry, and the Downloads table omits the mobile rows.
+          # The APK is required only from a release whose mobile job ran: while
+          # mobile packaging is switched off the aggregate job accepts a skipped
+          # mobile job, so demanding an APK here would fail every desktop-only
+          # release. A replay has no mobile job of its own, so it carries the
+          # APK when the run it reuses published one and stays silent otherwise.
+          apk="target/publish/vibex-${version}-android-arm64.apk"
           if [[ "${MOBILE_ANDROID_RESULT:-}" == 'success' ]]; then
-            apk="target/publish/vibex-${version}-android-arm64.apk"
             require_artifact_class '*-android-arm64.apk' 'Android APK'
+          fi
+          if [[ -f "${apk}" ]]; then
             manifest_args+=(--artifact "android|arm64|apk|system_installer|${apk}|${repository_url}/$(basename "${apk}")")
           fi
           generated_key="$(cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- "${manifest_args[@]}")"
@@ -666,7 +756,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/release-body
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.release.outputs.tag }}"
           previous="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
           if [[ -z "${previous}" ]]; then
             echo "no previous tag reaches ${tag}; the composer will read the commit log"
@@ -688,7 +778,7 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/release-body
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.release.outputs.tag }}"
           previous="$(git describe --tags --abbrev=0 "${tag}^" 2>/dev/null || true)"
           args=(
             --tag "${tag}"
@@ -708,9 +798,9 @@ jobs:
           set -euo pipefail
           body="target/release-body/vibex-release-body.md"
           node scripts/release-body.mjs \
-            --version "${{ needs.release-meta.outputs.version }}" \
-            --tag "${GITHUB_REF_NAME}" \
-            --notes "docs/operations/release-notes-v${{ needs.release-meta.outputs.version }}.md" \
+            --version "${{ steps.release.outputs.version }}" \
+            --tag "${{ steps.release.outputs.tag }}" \
+            --notes "docs/operations/release-notes-v${{ steps.release.outputs.version }}.md" \
             --assets target/publish \
             --changelog target/release-body/generated-changelog.md \
             --contributors target/release-body/contributors.txt \
@@ -736,13 +826,13 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.release.outputs.tag }}"
           release_flags=(
             --verify-tag
-            --title "Vibex ${{ needs.release-meta.outputs.version }}"
+            --title "Vibex ${{ steps.release.outputs.version }}"
             --notes-file target/release-body/vibex-release-body.md
           )
-          if [[ "${{ needs.release-meta.outputs.channel }}" != "stable" ]]; then
+          if [[ "${{ steps.release.outputs.channel }}" != "stable" ]]; then
             release_flags+=(--prerelease)
           fi
           # `gh release create` stages the release as a draft and uploads the
@@ -773,17 +863,17 @@ jobs:
       # upgrades to whatever is there, so only a stable release is dispatched;
       # the workflow and `scripts/publish-aur.mjs` refuse a prerelease as well.
       - name: Publish the AUR package
-        if: needs.release-meta.outputs.channel == 'stable'
+        if: steps.release.outputs.channel == 'stable'
         env:
           GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ steps.release.outputs.tag }}"
           # A failure here must not fail a release whose artifacts are already
           # published, so the dispatch is reported and the run continues. The
           # workflow can be replayed for this tag from its own dispatch inputs.
-          if gh workflow run publish-aur.yml --ref "${GITHUB_REF_NAME}" -f tag="${tag}"; then
+          if gh workflow run publish-aur.yml --ref "${tag}" -f tag="${tag}"; then
             echo "dispatched publish-aur.yml for ${tag}"
           else
             echo "::warning::could not dispatch publish-aur.yml for ${tag}; run it manually with -f tag=${tag}"

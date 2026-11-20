@@ -361,13 +361,40 @@ function validatePackaging() {
   // The APK is the one mobile artifact the signed updater manifest insists on,
   // so that requirement has to follow the same switch. Demanding it
   // unconditionally fails every release whose mobile jobs were skipped, which
-  // is exactly what the skipped-job gate above exists to allow.
+  // is exactly what the skipped-job gate above exists to allow. Publishing it
+  // when it is there stays a separate, unconditional step so a replay can carry
+  // an APK the reused run produced.
   assert(
     (releaseWorkflow.match(/require_artifact_class '\*-android-arm64\.apk'/gu) ?? []).length === 1 &&
-      /if \[\[ "\$\{MOBILE_ANDROID_RESULT:-\}" == 'success' \]\]; then\s+apk=[^\n]+\s+require_artifact_class '\*-android-arm64\.apk'/u.test(
+      /if \[\[ "\$\{MOBILE_ANDROID_RESULT:-\}" == 'success' \]\]; then\s+require_artifact_class '\*-android-arm64\.apk' 'Android APK'\s+fi/u.test(
+        releaseWorkflow
+      ) &&
+      /apk="target\/publish\/vibex-\$\{version\}-android-arm64\.apk"[\s\S]{0,400}?if \[\[ -f "\$\{apk\}" \]\]; then/u.test(
         releaseWorkflow
       ),
     "publish workflow requires an Android APK even when the mobile jobs were skipped"
+  );
+  // A publish that fails after the artifacts were built must be replayable
+  // without rebuilding them: an hour of native packaging sits behind every one
+  // of those bundles, and they stay downloadable for two weeks. A replay starts
+  // no build job, publishes the tag from a named run's bundles, and refuses a
+  // run whose commit is not the tag's.
+  for (const required of [
+    "workflow_dispatch:",
+    "artifacts_run_id",
+    "run-id: ${{ inputs.artifacts_run_id }}",
+    "ref: ${{ inputs.tag || github.ref }}",
+    "Verify the reused run built this tag",
+    "steps.release.outputs.commit"
+  ]) {
+    assert(
+      releaseWorkflow.includes(required),
+      `publish workflow cannot replay a release from an earlier run's artifacts: ${required}`
+    );
+  }
+  assert(
+    (releaseWorkflow.match(/github\.event_name == 'push'/gu) ?? []).length >= 6,
+    "publish workflow replay would rebuild every package it is meant to reuse"
   );
   // The desktop About page resolves the changelog from a per-release notes
   // asset, so the publish workflow must stage the tagged document under the
