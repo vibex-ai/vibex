@@ -161,6 +161,10 @@ fn TurnShell() -> impl IntoElement {
         uri: "data:image/jpeg;base64,".to_owned(),
     }];
     host.editable_sequence = signal(24);
+    let preview = host.attachment_preview;
+    host.on_open_attachment = Rc::new(move |item: &AttachmentItem| {
+        preview.set(Some(item.clone()));
+    });
     let mut tool = entry("t1", EntryKind::Tool, "cargo test", "Running");
     tool.expandable = true;
     let mut permission = entry(
@@ -363,6 +367,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let team_tasks = signal(Vec::new());
     let team_busy = signal(false);
     let team_error = signal(None::<SharedString>);
+    let attachment_preview = signal(None::<AttachmentItem>);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -718,6 +723,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_accept_team: Rc::new(|_| {}),
         on_cancel_team: Rc::new(|_| {}),
         on_interrupt_team: Rc::new(|_| {}),
+        attachment_preview,
+        on_open_attachment: Rc::new(|_| {}),
+        on_close_attachment: Rc::new(|| {}),
         plan,
         goal,
         history,
@@ -973,6 +981,8 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     assert!(app.screen().shows("Run cargo test?"));
     assert!(app.screen().shows("Allowed"));
     assert!(app.screen().shows("photo.jpg"));
+    app.press("photo.jpg").unwrap();
+    app.wait_for("Attachment").unwrap();
     assert!(app.screen().shows("Edit"));
     assert!(app.screen().shows("Copy"));
     assert!(app.screen().shows("Share"));

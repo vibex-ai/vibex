@@ -267,6 +267,7 @@ pub struct SessionService {
     team_busy: Signal<bool>,
     team_error: Signal<Option<SharedString>>,
     team_revisions: Rc<RefCell<BTreeMap<String, u64>>>,
+    attachment_preview: Signal<Option<AttachmentItem>>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
@@ -417,6 +418,7 @@ impl SessionService {
             team_busy: signal(false),
             team_error: signal(None),
             team_revisions: Rc::new(RefCell::new(BTreeMap::new())),
+            attachment_preview: signal(None),
             plan: signal(None),
             goal: signal(None),
             history: signal(Vec::new()),
@@ -687,6 +689,17 @@ impl SessionService {
             on_interrupt_team: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.control_team(id, TeamTaskAction::Interrupt))
+            },
+            attachment_preview: self.attachment_preview,
+            on_open_attachment: {
+                let service = self.clone();
+                Rc::new(move |item: &AttachmentItem| {
+                    service.attachment_preview.set(Some(item.clone()))
+                })
+            },
+            on_close_attachment: {
+                let service = self.clone();
+                Rc::new(move || service.attachment_preview.set(None))
             },
             plan: self.plan,
             goal: self.goal,

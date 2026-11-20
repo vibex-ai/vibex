@@ -387,6 +387,7 @@ type Action = Rc<dyn Fn()>;
 type ChooseFeature = Rc<dyn Fn(&str, &str)>;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
+type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -581,6 +582,10 @@ pub struct SessionHost {
     pub on_attach_new_image: Action,
     pub on_attach_new_file: Action,
     pub on_remove_new_attachment: Rc<dyn Fn(&str)>,
+    /// The message attachment whose preview is open.
+    pub attachment_preview: Signal<Option<AttachmentItem>>,
+    pub on_open_attachment: OpenAttachment,
+    pub on_close_attachment: Action,
     pub on_create_worktree_session: Action,
     pub on_close_new_session: Action,
     /// The id of the session whose actions are open, if any.
@@ -841,6 +846,10 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.on_archive_session.clone(),
             host.on_delete_session.clone(),
         ))
+        .child(attachment_preview_sheet(
+            host.attachment_preview,
+            host.on_close_attachment.clone(),
+        ))
         .child(crate::screens::team::team(crate::screens::team::TeamHost {
             open: host.team_open,
             tasks: host.team_tasks,
@@ -1005,6 +1014,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let on_fork = host.on_fork.clone();
     let editable_sequence = host.editable_sequence;
     let on_edit_message = host.on_edit_message.clone();
+    let on_open_attachment = host.on_open_attachment.clone();
     let has_older = host.has_older;
     let loading_older = host.loading_older;
     let on_load_older = host.on_load_older.clone();
@@ -1084,6 +1094,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                             let on_fork = on_fork.clone();
                             let editable_sequence = editable_sequence;
                             let on_edit_message = on_edit_message.clone();
+                            let on_open_attachment = on_open_attachment.clone();
                             move |at: Position| {
                                 entry_row(
                                     at,
@@ -1093,6 +1104,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
                                     on_fork.clone(),
                                     editable_sequence,
                                     on_edit_message.clone(),
+                                    on_open_attachment.clone(),
                                 )
                             }
                         })
@@ -1129,6 +1141,7 @@ fn empty_hint(message: &'static str) -> impl IntoElement {
 /// The row is made once and reused by the list, so each shape is a region
 /// bound to the row's kind: when a cell shows another kind, its branch swaps
 /// without rebuilding the cell.
+#[allow(clippy::too_many_arguments)]
 fn entry_row(
     at: Position,
     entries: Signal<Vec<TimelineEntry>>,
@@ -1137,6 +1150,7 @@ fn entry_row(
     on_fork: Rc<dyn Fn(i64)>,
     editable_sequence: Signal<i64>,
     on_edit_message: EditMessage,
+    on_open_attachment: OpenAttachment,
 ) -> impl IntoElement {
     let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
     view()
@@ -1150,6 +1164,7 @@ fn entry_row(
             on_fork,
             editable_sequence,
             on_edit_message,
+            on_open_attachment,
         ))
 }
 
@@ -1160,6 +1175,7 @@ fn entry_element(
     on_fork: Rc<dyn Fn(i64)>,
     editable_sequence: Signal<i64>,
     on_edit_message: EditMessage,
+    on_open_attachment: OpenAttachment,
 ) -> impl IntoElement {
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
     let body =
@@ -1200,6 +1216,7 @@ fn entry_element(
                     sequence,
                     editable_sequence,
                     on_edit_message.clone(),
+                    on_open_attachment.clone(),
                 )
             },
         ))
@@ -1262,6 +1279,7 @@ fn user_bubble(
     sequence: Memo<i64>,
     editable_sequence: Signal<i64>,
     on_edit: EditMessage,
+    on_open_attachment: OpenAttachment,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -1284,7 +1302,7 @@ fn user_bubble(
         )
         .child(when(
             move || !attachments.with(|items| items.is_empty()),
-            move || message_attachments(attachments),
+            move || message_attachments(attachments, on_open_attachment.clone()),
         ))
         .child(when(
             move || sequence.get() > 0 && editable_sequence.get() == sequence.get(),
@@ -1309,7 +1327,10 @@ fn user_bubble(
         ))
 }
 
-fn message_attachments(attachments: Memo<Vec<AttachmentItem>>) -> impl IntoElement {
+fn message_attachments(
+    attachments: Memo<Vec<AttachmentItem>>,
+    on_open: OpenAttachment,
+) -> impl IntoElement {
     view()
         .w_full()
         .flex_row()
@@ -1320,7 +1341,12 @@ fn message_attachments(attachments: Memo<Vec<AttachmentItem>>) -> impl IntoEleme
             move || attachments.get(),
             |item| item.id.clone(),
             move |item, _| {
-                view()
+                let on_open = on_open.clone();
+                button()
+                    .on_press(move || {
+                        let item = item.get_untracked();
+                        on_open(&item);
+                    })
                     .flex_row()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
@@ -3419,6 +3445,105 @@ fn session_actions_sheet(
 }
 
 /// The session drawer, from the left edge.
+fn attachment_preview_sheet(
+    preview: Signal<Option<AttachmentItem>>,
+    close: Action,
+) -> impl IntoElement {
+    sheet()
+        .side(Placement::Bottom)
+        .open(move || Some(preview.with(Option::is_some)))
+        .close_on_swipe(true)
+        .on_open_change({
+            let close = close.clone();
+            move |event: &SheetEvent| {
+                if let SheetEvent::OpenChange(false, _) = event {
+                    close();
+                }
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .max_h(px(560.0))
+                .flex_col()
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .child(
+                    view()
+                        .w_full()
+                        .h(px(48.0))
+                        .flex_row()
+                        .items_center()
+                        .px(px(theme::SPACING_MD))
+                        .gap(px(theme::SPACING_SM))
+                        .border_b_1()
+                        .border_b_color(theme::border_subtle)
+                        .child(
+                            text(copy::text("Attachment", "附件", "附件"))
+                                .flex_1()
+                                .text_size(px(theme::font_heading()))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::foreground),
+                        )
+                        .child(action::icon_button(
+                            icon(include_str!("../../assets/icons/x.svg")),
+                            copy::text("Close", "关闭", "關閉"),
+                            {
+                                let close = close.clone();
+                                move || close()
+                            },
+                        )),
+                )
+                .child(when(
+                    move || {
+                        preview.with(|preview| {
+                            preview
+                                .as_ref()
+                                .is_some_and(|preview| preview.mime_type.starts_with("image/"))
+                        })
+                    },
+                    move || {
+                        view().p(px(theme::SPACING_MD)).items_center().child(
+                            image(move || {
+                                ImageSrc::from(preview.with(|preview| {
+                                    preview
+                                        .as_ref()
+                                        .map(|preview| preview.uri.clone())
+                                        .unwrap_or_default()
+                                }))
+                            })
+                            .w_full()
+                            .object_fit(nsh_core::ResizeMode::Contain),
+                        )
+                    },
+                ))
+                .child(when(
+                    move || {
+                        preview.with(|preview| {
+                            preview
+                                .as_ref()
+                                .is_some_and(|preview| !preview.mime_type.starts_with("image/"))
+                        })
+                    },
+                    move || {
+                        text(move || {
+                            preview.with(|preview| {
+                                preview
+                                    .as_ref()
+                                    .map(|preview| preview.label.clone())
+                                    .unwrap_or_default()
+                            })
+                        })
+                        .px(px(theme::SPACING_MD))
+                        .py(px(theme::SPACING_LG))
+                        .text_size(px(theme::font_detail()))
+                        .text_color(theme::text_secondary)
+                    },
+                )),
+        )
+}
+
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
