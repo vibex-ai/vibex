@@ -389,6 +389,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         status: "Active".to_owned(),
         can_archive: true,
         can_restore: false,
+        can_merge: true,
     }]);
     let worktree_menu = signal(false);
     let worktree_busy = signal(false);
@@ -902,6 +903,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_worktrees: Rc::new(move || worktree_menu.set(true)),
         on_close_worktrees: Rc::new(move || worktree_menu.set(false)),
         on_archive_worktree: Rc::new(|_| {}),
+        on_merge_worktree: Rc::new(|_| {}),
         on_restore_worktree: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),
@@ -1333,6 +1335,7 @@ fn the_git_worktree_sheet_lists_managed_worktrees() {
     app.wait_for("src/main.rs").unwrap();
     app.press("role:button[Worktrees]").unwrap();
     app.wait_for("/tmp/vibex-tree").unwrap();
+    assert!(app.screen().shows("Merge"));
 }
 
 #[test]

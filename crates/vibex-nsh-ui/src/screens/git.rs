@@ -34,6 +34,7 @@ pub struct WorktreeRow {
     pub status: String,
     pub can_archive: bool,
     pub can_restore: bool,
+    pub can_merge: bool,
 }
 
 /// One changed path in the status list.
@@ -105,6 +106,7 @@ pub struct GitHost {
     pub on_open_worktrees: Rc<dyn Fn()>,
     pub on_close_worktrees: Rc<dyn Fn()>,
     pub on_archive_worktree: Rc<dyn Fn(&str)>,
+    pub on_merge_worktree: Rc<dyn Fn(&str)>,
     pub on_restore_worktree: Rc<dyn Fn(&str)>,
     pub on_toggle_amend: Rc<dyn Fn()>,
     pub on_toggle_push_after: Rc<dyn Fn()>,
@@ -247,6 +249,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             host.worktree_error,
             host.on_close_worktrees.clone(),
             host.on_archive_worktree.clone(),
+            host.on_merge_worktree.clone(),
             host.on_restore_worktree.clone(),
         ))
         .child(when(
@@ -596,6 +599,7 @@ fn commit_bar(
         )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn worktree_sheet(
     open: Signal<bool>,
     worktrees: Signal<Vec<WorktreeRow>>,
@@ -603,6 +607,7 @@ fn worktree_sheet(
     error: Signal<Option<SharedString>>,
     on_close: Rc<dyn Fn()>,
     on_archive: Rc<dyn Fn(&str)>,
+    on_merge: Rc<dyn Fn(&str)>,
     on_restore: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     sheet()
@@ -684,6 +689,29 @@ fn worktree_sheet(
                                 view()
                                     .flex_row()
                                     .gap(px(theme::SPACING_XS))
+                                    .child(when(move || worktree.get().can_merge, {
+                                        let on_merge = on_merge.clone();
+                                        let id = worktree.get_untracked().id;
+                                        move || {
+                                            let on_merge = on_merge.clone();
+                                            let id = id.clone();
+                                            button()
+                                                .on_press(move || {
+                                                    if !busy.get_untracked() {
+                                                        on_merge(&id);
+                                                    }
+                                                })
+                                                .min_h(px(28.0))
+                                                .px(px(theme::SPACING_SM))
+                                                .items_center()
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .child(
+                                                    text(copy::text("Merge", "合并", "合併"))
+                                                        .text_size(px(theme::font_micro()))
+                                                        .text_color(theme::text_secondary),
+                                                )
+                                        }
+                                    }))
                                     .child(when(
                                         move || worktree.get().can_archive,
                                         move || {

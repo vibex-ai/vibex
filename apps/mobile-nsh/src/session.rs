@@ -36,7 +36,7 @@ use vibex_core::{
     FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
     GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest, GitWorktreeMergeRequest,
     GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
     OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
     PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest, RequestId,
@@ -661,6 +661,10 @@ impl SessionService {
             on_archive_worktree: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.archive_worktree(id))
+            },
+            on_merge_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.merge_worktree(id))
             },
             on_restore_worktree: {
                 let service = self.clone();
@@ -4944,6 +4948,8 @@ impl SessionService {
                             status: worktree_status_label(worktree.status).to_owned(),
                             can_archive: worktree.status == GitManagedWorktreeStatus::Active,
                             can_restore: worktree.status == GitManagedWorktreeStatus::Archived,
+                            can_merge: worktree.status == GitManagedWorktreeStatus::Active
+                                && worktree.target_workspace_id.is_some(),
                         })
                         .collect();
                     *service.worktree_records.borrow_mut() = snapshot.managed_worktrees;
@@ -5033,6 +5039,94 @@ impl SessionService {
                     service.worktree_busy.set(false);
                     service.worktree_error.set(Some(
                         format!("checking the worktree did not finish: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn merge_worktree(&self, id: &str) {
+        let Some(record) = self
+            .worktree_records
+            .borrow()
+            .iter()
+            .find(|worktree| worktree.worktree_id.as_str() == id)
+            .cloned()
+        else {
+            return;
+        };
+        let Some(target) = record.target_workspace_id.clone() else {
+            return;
+        };
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let plan_request = GitWorktreeMergeRequest {
+                workspace_id: workspace,
+                source_path: record.worktree_path.clone(),
+                target_workspace_id: Some(target),
+                strategy: None,
+                expected_source_head: record.head.clone(),
+                expected_target_head: None,
+                preflight_revision: None,
+            };
+            let plan_git = git.clone();
+            let plan =
+                background(async move { plan_git.git_worktree_merge_plan(plan_request).await })
+                    .await;
+            match plan {
+                Ok(Ok(plan)) if plan.preflight.allowed => {
+                    let request = GitWorktreeMergeRequest {
+                        workspace_id: plan.source_workspace_id.clone(),
+                        source_path: plan.source_path.clone(),
+                        target_workspace_id: Some(plan.target_workspace_id.clone()),
+                        strategy: None,
+                        expected_source_head: Some(plan.source_head.clone()),
+                        expected_target_head: Some(plan.target_head.clone()),
+                        preflight_revision: Some(plan.preflight.revision.clone()),
+                    };
+                    let result = background(async move {
+                        git.git_worktree_merge(MutationRequest::new(request)).await
+                    })
+                    .await;
+                    service.worktree_busy.set(false);
+                    match result {
+                        Ok(Ok(_)) => service.load_worktrees(),
+                        Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                        Err(error) => service.worktree_error.set(Some(
+                            format!("merging the worktree did not finish: {error}").into(),
+                        )),
+                    }
+                }
+                Ok(Ok(_)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        copy::text(
+                            "The runtime did not allow merging this worktree.",
+                            "运行时不允许合并这个 Worktree。",
+                            "執行環境不允許合併這個 Worktree。",
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        format!("planning the merge did not finish: {error}").into(),
                     ));
                 }
             }
