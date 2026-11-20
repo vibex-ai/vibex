@@ -170,6 +170,7 @@ pub struct SessionService {
     active: Signal<Option<String>>,
     pinned: Signal<Vec<String>>,
     unread: Signal<Vec<String>>,
+    auto_continue_sessions: Signal<Vec<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
     draft: Signal<String>,
     sending: Signal<bool>,
@@ -368,6 +369,7 @@ impl SessionService {
             active: signal(None),
             pinned: signal(load_pins()),
             unread: signal(Vec::new()),
+            auto_continue_sessions: signal(Vec::new()),
             timeline: signal(Vec::new()),
             draft: signal(String::new()),
             sending: signal(false),
@@ -598,6 +600,7 @@ impl SessionService {
             active: self.active,
             pinned: self.pinned,
             unread: self.unread,
+            auto_continue_sessions: self.auto_continue_sessions,
             sidebar_sections: self.sidebar_sections,
             folder_open: self.folder_open,
             folder_name: self.folder_name,
@@ -642,6 +645,12 @@ impl SessionService {
             on_set_group_members: {
                 let service = self.clone();
                 Rc::new(move |id: &str, members: &[String]| service.set_group_members(id, members))
+            },
+            on_set_session_auto_continue: {
+                let service = self.clone();
+                Rc::new(move |id: &str, enabled: bool| {
+                    service.set_session_auto_continue(id, enabled)
+                })
             },
             on_toggle_folder_collapsed: {
                 let service = self.clone();
@@ -3965,6 +3974,22 @@ impl SessionService {
         });
     }
 
+    fn set_session_auto_continue(&self, id: &str, enabled: bool) {
+        self.auto_continue_sessions.update(|sessions| {
+            if enabled {
+                if !sessions.iter().any(|candidate| candidate == id) {
+                    sessions.push(id.to_owned());
+                }
+            } else {
+                sessions.retain(|candidate| candidate != id);
+            }
+        });
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetSessionAutoContinue {
+            session_id: id.to_owned(),
+            enabled,
+        });
+    }
+
     fn mark_read(&self, id: &str) {
         if !self
             .unread
@@ -4166,6 +4191,19 @@ impl SessionService {
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
         self.pinned.set(snapshot.pinned_session_ids.clone());
         self.unread.set(snapshot.unread_session_ids.clone());
+        let mut auto = snapshot
+            .auto_continue_session_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (id, enabled) in &snapshot.auto_continue_session_overrides {
+            if *enabled {
+                auto.insert(id.clone());
+            } else {
+                auto.remove(id);
+            }
+        }
+        self.auto_continue_sessions.set(auto.into_iter().collect());
         let mut sections = Vec::new();
         let mut folder_parents: BTreeMap<String, String> = BTreeMap::new();
         for placement in &snapshot.placements {

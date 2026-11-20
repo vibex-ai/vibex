@@ -410,6 +410,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let active = signal(Some("s1".to_owned()));
     let pinned = signal(Vec::new());
     let unread = signal(Vec::new());
+    let auto_continue_sessions = signal(Vec::new());
     let sidebar_sections = signal(Vec::new());
     let folder_open = signal(false);
     let folder_name = signal(String::new());
@@ -806,6 +807,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         active,
         pinned,
         unread,
+        auto_continue_sessions,
+        on_set_session_auto_continue: Rc::new(|_, _| {}),
         sidebar_sections,
         folder_open,
         folder_name,

@@ -411,7 +411,8 @@ type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 type BatchAction = Rc<dyn Fn(&[String])>;
 type FolderNameAction = Rc<dyn Fn(&str, &str)>;
 type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
-type CollapseAction = Rc<dyn Fn(&str, bool)>;
+type CollapseAction = SessionToggle;
+type SessionToggle = Rc<dyn Fn(&str, bool)>;
 type MoveSessionAction = Rc<dyn Fn(&str, Option<&str>)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
@@ -447,6 +448,8 @@ pub struct SessionHost {
     pub active: Signal<Option<String>>,
     pub pinned: Signal<Vec<String>>,
     pub unread: Signal<Vec<String>>,
+    pub auto_continue_sessions: Signal<Vec<String>>,
+    pub on_set_session_auto_continue: SessionToggle,
     pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
     pub folder_open: Signal<bool>,
     pub folder_name: Signal<String>,
@@ -955,6 +958,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.on_close_session_actions.clone(),
             host.on_rename_session.clone(),
             host.on_open_move.clone(),
+            host.auto_continue_sessions,
+            host.on_set_session_auto_continue.clone(),
             host.pinned,
             host.on_toggle_pin.clone(),
             host.on_archive_session.clone(),
@@ -3828,6 +3833,8 @@ fn session_actions_sheet(
     on_close: Rc<dyn Fn()>,
     on_rename: Rc<dyn Fn()>,
     on_move: Action,
+    auto_continue: Signal<Vec<String>>,
+    on_toggle_auto_continue: SessionToggle,
     pinned: Signal<Vec<String>>,
     on_toggle_pin: Rc<dyn Fn(&str)>,
     on_archive: Rc<dyn Fn()>,
@@ -3888,6 +3895,36 @@ fn session_actions_sheet(
                         icon(include_str!("../../assets/icons/folder.svg")),
                         false,
                         move || on_move(),
+                    )
+                    .w_full()
+                })
+                .child({
+                    let on_toggle_auto_continue = on_toggle_auto_continue.clone();
+                    action::secondary(
+                        move || {
+                            let enabled = actions.with(|id| {
+                                id.as_ref().is_some_and(|id| {
+                                    auto_continue.with(|sessions| {
+                                        sessions.iter().any(|candidate| candidate == id)
+                                    })
+                                })
+                            });
+                            if enabled {
+                                copy::text("Auto-continue on", "自动继续已开", "自動繼續已開")
+                            } else {
+                                copy::text("Auto-continue off", "自动继续已关", "自動繼續已關")
+                            }
+                        },
+                        icon(include_str!("../../assets/icons/send.svg")),
+                        false,
+                        move || {
+                            if let Some(id) = actions.get_untracked() {
+                                let enabled = auto_continue.with(|sessions| {
+                                    sessions.iter().any(|candidate| candidate == &id)
+                                });
+                                on_toggle_auto_continue(&id, !enabled);
+                            }
+                        },
                     )
                     .w_full()
                 })
