@@ -3292,7 +3292,12 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
         .await
         .map_err(remote_error_into_vibex)?;
     let page = align_timeline_window_to_turn_start(page, |before_sequence| {
-        fetch_timeline_page_before_via_backend(backend.clone(), session_id.clone(), before_sequence, true)
+        fetch_timeline_page_before_via_backend(
+            backend.clone(),
+            session_id.clone(),
+            before_sequence,
+            true,
+        )
     })
     .await;
     Ok(
