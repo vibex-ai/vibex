@@ -544,6 +544,9 @@ jobs:
         env:
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
           VIBEX_UPDATE_SIGNING_KEY: ${{ secrets.VIBEX_UPDATE_SIGNING_KEY }}
+          # `success` or `skipped`: the phone package only exists when the
+          # mobile job was switched on for this release.
+          MOBILE_ANDROID_RESULT: ${{ needs.mobile-android.result }}
         shell: bash
         run: |
           set -euo pipefail
@@ -626,11 +629,16 @@ jobs:
           require_artifact_class '*-windows-*-nsis.exe' 'Windows NSIS installer'
           # The Android client installs the signed APK straight from the
           # release, so the phone verifies the same manifest the desktop does.
-          apk="target/publish/vibex-${version}-android-arm64.apk"
-          if [[ -f "${apk}" ]]; then
+          # That requirement holds only for a release that packaged the phone
+          # client: while mobile packaging is switched off the aggregate job
+          # accepts a skipped mobile job, so demanding an APK here would fail
+          # every desktop-only release. The manifest then carries no Android
+          # entry, and the Downloads table omits the mobile rows.
+          if [[ "${MOBILE_ANDROID_RESULT:-}" == 'success' ]]; then
+            apk="target/publish/vibex-${version}-android-arm64.apk"
+            require_artifact_class '*-android-arm64.apk' 'Android APK'
             manifest_args+=(--artifact "android|arm64|apk|system_installer|${apk}|${repository_url}/$(basename "${apk}")")
           fi
-          require_artifact_class '*-android-arm64.apk' 'Android APK'
           generated_key="$(cargo run --release --locked -p vibex-app-update --bin vibex-update-manifest -- "${manifest_args[@]}")"
           test "${generated_key}" = "update_public_key=${VIBEX_UPDATE_PUBLIC_KEY}"
       - name: Generate aggregate checksums

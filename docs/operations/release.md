@@ -183,8 +183,11 @@ the `gpui-pre-mobile` platform layer, so a phone build links two different
 `gpui` crates and cannot compile. Both mobile jobs are gated on the repository
 variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the jobs are skipped,
 the publish job still releases the desktop, headless server and container
-artifacts, and the Downloads table simply omits the Android and iOS rows. A
-mobile job that does run and fails still holds the release. Set the variable to
+artifacts, and the Downloads table simply omits the Android and iOS rows. The
+signed updater manifest drops its Android entry with them, because the APK is
+required only from a release that packaged the phone client; a phone keeps
+installing whatever build it already runs until packaging returns. A mobile job
+that does run and fails still holds the release. Set the variable to
 `true` once the platform layer is ported, and gate that release on
 `pnpm check:mobile-native` again.
 

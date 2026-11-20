@@ -358,6 +358,17 @@ function validatePackaging() {
       releaseWorkflow.includes("needs.mobile-ios.result == 'skipped'"),
     "publish workflow lost the mobile-release switch or its skipped-job handling"
   );
+  // The APK is the one mobile artifact the signed updater manifest insists on,
+  // so that requirement has to follow the same switch. Demanding it
+  // unconditionally fails every release whose mobile jobs were skipped, which
+  // is exactly what the skipped-job gate above exists to allow.
+  assert(
+    (releaseWorkflow.match(/require_artifact_class '\*-android-arm64\.apk'/gu) ?? []).length === 1 &&
+      /if \[\[ "\$\{MOBILE_ANDROID_RESULT:-\}" == 'success' \]\]; then\s+apk=[^\n]+\s+require_artifact_class '\*-android-arm64\.apk'/u.test(
+        releaseWorkflow
+      ),
+    "publish workflow requires an Android APK even when the mobile jobs were skipped"
+  );
   // The desktop About page resolves the changelog from a per-release notes
   // asset, so the publish workflow must stage the tagged document under the
   // exact name the updater requests.
