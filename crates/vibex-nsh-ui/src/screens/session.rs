@@ -388,6 +388,7 @@ type ChooseFeature = Rc<dyn Fn(&str, &str)>;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
 type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
+type BatchAction = Rc<dyn Fn(&[String])>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -598,6 +599,8 @@ pub struct SessionHost {
     pub session_rename: Signal<String>,
     pub session_busy: Signal<bool>,
     pub on_session_menu: SessionMenu,
+    pub on_archive_sessions: BatchAction,
+    pub on_delete_sessions: BatchAction,
     pub on_close_session_actions: Action,
     pub on_rename_session: Action,
     pub on_archive_session: Action,
@@ -3562,6 +3565,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let collapsed_projects = signal(Vec::<String>::new());
     let search_open = signal(false);
     let query = signal(String::new());
+    let select_mode = signal(false);
+    let selected = signal(Vec::<String>::new());
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
@@ -3606,8 +3611,72 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                     query.set(String::new());
                                 }
                             },
+                        ))
+                        .child(action::icon_button(
+                            icon(include_str!("../../assets/icons/menu.svg")),
+                            copy::text("Select sessions", "选择会话", "選取工作階段"),
+                            move || {
+                                let next = !select_mode.get_untracked();
+                                select_mode.set(next);
+                                if !next {
+                                    selected.set(Vec::new());
+                                }
+                            },
                         )),
                 )
+                .child(when(move || select_mode.get(), {
+                    let on_archive_sessions = host.on_archive_sessions.clone();
+                    let on_delete_sessions = host.on_delete_sessions.clone();
+                    move || {
+                        let on_archive_sessions = on_archive_sessions.clone();
+                        let on_delete_sessions = on_delete_sessions.clone();
+                        view()
+                            .w_full()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .px(px(theme::SPACING_LG))
+                            .pb(px(theme::SPACING_XS))
+                            .child(
+                                text(move || {
+                                    format!(
+                                        "{} {}",
+                                        selected.with(|selected| selected.len()),
+                                        copy::text("selected", "已选择", "已選取")
+                                    )
+                                })
+                                .flex_1()
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
+                            )
+                            .child(small_action(copy::text("Archive", "归档", "封存"), {
+                                let on_archive_sessions = on_archive_sessions.clone();
+                                move || {
+                                    let ids = selected.get_untracked();
+                                    if !ids.is_empty() {
+                                        on_archive_sessions(&ids);
+                                    }
+                                    selected.set(Vec::new());
+                                }
+                            }))
+                            .child(small_action(copy::text("Delete", "删除", "刪除"), {
+                                let on_delete_sessions = on_delete_sessions.clone();
+                                move || {
+                                    let ids = selected.get_untracked();
+                                    if !ids.is_empty() {
+                                        on_delete_sessions(&ids);
+                                    }
+                                    selected.set(Vec::new());
+                                }
+                            }))
+                            .child(small_action(copy::text("Done", "完成", "完成"), {
+                                move || {
+                                    select_mode.set(false);
+                                    selected.set(Vec::new());
+                                }
+                            }))
+                    }
+                }))
                 .child(
                     view().flex_1().min_h(px(0.0)).child(
                         scroll().flex_1().child(
@@ -3643,6 +3712,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             on_select.clone(),
                                             on_menu.clone(),
                                             open,
+                                            select_mode,
+                                            selected,
                                         )
                                     },
                                 )),
@@ -3798,6 +3869,7 @@ fn drawer_groups(sessions: Signal<Vec<SessionSummary>>, query: Signal<String>) -
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn drawer_group(
     group: ReadSignal<DrawerGroup>,
     active: Signal<Option<String>>,
@@ -3805,6 +3877,8 @@ fn drawer_group(
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     open: Signal<bool>,
+    select_mode: Signal<bool>,
+    selected: Signal<Vec<String>>,
 ) -> impl IntoElement {
     let closed = computed(move || {
         let id = group.with(|group| group.id.clone());
@@ -3863,7 +3937,15 @@ fn drawer_group(
                     move |session, _| {
                         let on_select = on_select.clone();
                         let on_menu = on_menu.clone();
-                        session_row(session, active, on_select, on_menu, open)
+                        session_row(
+                            session,
+                            active,
+                            on_select,
+                            on_menu,
+                            open,
+                            select_mode,
+                            selected,
+                        )
                     },
                 ))
             }
@@ -3876,6 +3958,8 @@ fn session_row(
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     open: Signal<bool>,
+    select_mode: Signal<bool>,
+    selected: Signal<Vec<String>>,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -3892,9 +3976,51 @@ fn session_row(
                 .gap(px(theme::SPACING_SM))
                 .active(|style| style.opacity(0.85))
                 .on_press(move || {
-                    on_select(&session.get_untracked().id);
-                    open.set(false);
+                    let id = session.get_untracked().id;
+                    if select_mode.get_untracked() {
+                        selected.update(|selected| {
+                            if let Some(index) =
+                                selected.iter().position(|candidate| candidate == &id)
+                            {
+                                selected.remove(index);
+                            } else {
+                                selected.push(id);
+                            }
+                        });
+                    } else {
+                        on_select(&id);
+                        open.set(false);
+                    }
                 })
+                .child(when(
+                    move || select_mode.get(),
+                    move || {
+                        let id = session.get_untracked().id;
+                        let checked = selected.with(|selected| selected.contains(&id));
+                        view()
+                            .w(px(18.0))
+                            .h(px(18.0))
+                            .rounded(px(9.0))
+                            .border_1()
+                            .border_color(if checked {
+                                theme::foreground()
+                            } else {
+                                theme::border_default()
+                            })
+                            .bg(if checked {
+                                theme::foreground()
+                            } else {
+                                theme::background_dim()
+                            })
+                            .items_center()
+                            .justify_center()
+                            .child(
+                                text(if checked { "✓" } else { "" })
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::background()),
+                            )
+                    },
+                ))
                 .child(
                     view()
                         .w(px(8.0))
@@ -3941,24 +4067,27 @@ fn session_row(
                         ),
                 ),
         )
-        .child({
-            button()
-                .min_h(px(theme::TOUCH_TARGET))
-                .min_w(px(theme::TOUCH_TARGET))
-                .items_center()
-                .justify_center()
-                .active(|style| style.opacity(0.7))
-                .accessibility_label(copy::text("Session actions", "会话操作", "工作階段操作"))
-                .on_press(move || {
-                    let session = session.get_untracked();
-                    on_menu(&session.id, &session.title);
-                })
-                .child(
-                    text("⋯")
-                        .text_size(px(theme::font_heading()))
-                        .text_color(theme::text_muted),
-                )
-        })
+        .child(when(move || !select_mode.get(), {
+            move || {
+                let on_menu = on_menu.clone();
+                button()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .min_w(px(theme::TOUCH_TARGET))
+                    .items_center()
+                    .justify_center()
+                    .active(|style| style.opacity(0.7))
+                    .accessibility_label(copy::text("Session actions", "会话操作", "工作階段操作"))
+                    .on_press(move || {
+                        let session = session.get_untracked();
+                        on_menu(&session.id, &session.title);
+                    })
+                    .child(
+                        text("⋯")
+                            .text_size(px(theme::font_heading()))
+                            .text_color(theme::text_muted),
+                    )
+            }
+        }))
 }
 
 /// What was typed after `@` when it is still one reference, if any.

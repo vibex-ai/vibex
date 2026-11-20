@@ -858,6 +858,14 @@ impl SessionService {
                     service.session_actions.set(Some(id.to_owned()));
                 })
             },
+            on_archive_sessions: {
+                let service = self.clone();
+                Rc::new(move |ids: &[String]| service.archive_sessions(ids))
+            },
+            on_delete_sessions: {
+                let service = self.clone();
+                Rc::new(move |ids: &[String]| service.delete_sessions(ids))
+            },
             on_close_session_actions: {
                 let service = self.clone();
                 Rc::new(move || service.session_actions.set(None))
@@ -3484,6 +3492,58 @@ impl SessionService {
                     "session_rename_task_failed",
                     format!("renaming the session did not finish: {error}"),
                 )),
+            }
+        });
+    }
+
+    fn archive_sessions(&self, ids: &[String]) {
+        let ids = ids.to_vec();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            for id in ids {
+                let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
+                    continue;
+                };
+                let call = backend.clone();
+                let result = background(async move {
+                    call.archive_session(MutationRequest::new(session_id)).await
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => service.drop_session(&id),
+                    Ok(Err(error)) => service.fail(&error),
+                    Err(error) => service.fail(&BackendError::failed(
+                        "session_archive_task_failed",
+                        format!("archiving the session did not finish: {error}"),
+                    )),
+                }
+            }
+        });
+    }
+
+    fn delete_sessions(&self, ids: &[String]) {
+        let ids = ids.to_vec();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            for id in ids {
+                let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
+                    continue;
+                };
+                let call = backend.clone();
+                let result = background(async move {
+                    call.delete_session(MutationRequest::new(session_id)).await
+                })
+                .await;
+                match result {
+                    Ok(Ok(())) => service.drop_session(&id),
+                    Ok(Err(error)) => service.fail(&error),
+                    Err(error) => service.fail(&BackendError::failed(
+                        "session_delete_task_failed",
+                        format!("deleting the session did not finish: {error}"),
+                    )),
+                }
             }
         });
     }

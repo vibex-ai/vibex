@@ -852,6 +852,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_close_session_actions: Rc::new(|| {}),
         on_rename_session,
         on_archive_session,
+        on_archive_sessions: Rc::new(|_| {}),
+        on_delete_sessions: Rc::new(|_| {}),
         on_delete_session,
         new_session_open,
         new_workspaces,
@@ -1026,6 +1028,20 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         std::time::Duration::from_secs(5),
     )
     .unwrap();
+}
+
+#[test]
+fn the_drawer_selects_sessions_for_a_batch() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
+    app.press("role:button[Select sessions]").unwrap();
+    app.wait_for("Archive").unwrap();
+    app.press("Fix the tests").unwrap();
+    app.wait_for("1 selected").unwrap();
+    app.press("Done").unwrap();
+    app.wait_for_gone("Archive", std::time::Duration::from_secs(5))
+        .unwrap();
 }
 
 #[test]
