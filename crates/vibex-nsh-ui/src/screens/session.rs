@@ -446,6 +446,7 @@ pub struct SessionHost {
     pub sessions: Signal<Vec<SessionSummary>>,
     pub active: Signal<Option<String>>,
     pub pinned: Signal<Vec<String>>,
+    pub unread: Signal<Vec<String>>,
     pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
     pub folder_open: Signal<bool>,
     pub folder_name: Signal<String>,
@@ -4139,6 +4140,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let selected = signal(Vec::<String>::new());
     let pinned = host.pinned;
     let sidebar_sections = host.sidebar_sections;
+    let unread = host.unread;
     let folder_open = host.folder_open;
     let folder_name = host.folder_name;
     let on_open_folder = host.on_open_folder.clone();
@@ -4418,6 +4420,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 select_mode,
                                                 selected,
                                                 pinned,
+                                                unread,
                                             )
                                         },
                                     )
@@ -4441,6 +4444,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             select_mode,
                                             selected,
                                             pinned,
+                                            unread,
                                         )
                                     },
                                 )),
@@ -5016,6 +5020,7 @@ fn sidebar_section(
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
+    unread: Signal<Vec<String>>,
 ) -> impl IntoElement {
     let rows = computed(move || {
         let ids = section.with(|section| section.session_ids.clone());
@@ -5129,6 +5134,7 @@ fn sidebar_section(
                             select_mode,
                             selected,
                             pinned,
+                            unread,
                         )
                     },
                 ))
@@ -5147,6 +5153,7 @@ fn drawer_group(
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
+    unread: Signal<Vec<String>>,
 ) -> impl IntoElement {
     let closed = computed(move || {
         let id = group.with(|group| group.id.clone());
@@ -5227,6 +5234,7 @@ fn drawer_group(
                                     select_mode,
                                     selected,
                                     pinned,
+                                    unread,
                                 )
                                 .into_element()
                             }
@@ -5247,6 +5255,7 @@ fn session_row(
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
     pinned: Signal<Vec<String>>,
+    unread: Signal<Vec<String>>,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -5332,6 +5341,20 @@ fn session_row(
                         .flex_1()
                         .min_w(px(0.0))
                         .gap(px(2.0))
+                        .child(when(
+                            move || {
+                                let id = session.get().id;
+                                unread
+                                    .with(|unread| unread.iter().any(|candidate| candidate == &id))
+                            },
+                            || {
+                                view()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(theme::accent_red())
+                            },
+                        ))
                         .child(
                             text(move || session.get().title.clone())
                                 .truncate()

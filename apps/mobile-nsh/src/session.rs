@@ -169,6 +169,7 @@ pub struct SessionService {
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     pinned: Signal<Vec<String>>,
+    unread: Signal<Vec<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
     draft: Signal<String>,
     sending: Signal<bool>,
@@ -366,6 +367,7 @@ impl SessionService {
             sessions: signal(Vec::new()),
             active: signal(None),
             pinned: signal(load_pins()),
+            unread: signal(Vec::new()),
             timeline: signal(Vec::new()),
             draft: signal(String::new()),
             sending: signal(false),
@@ -595,6 +597,7 @@ impl SessionService {
             sessions: self.sessions,
             active: self.active,
             pinned: self.pinned,
+            unread: self.unread,
             sidebar_sections: self.sidebar_sections,
             folder_open: self.folder_open,
             folder_name: self.folder_name,
@@ -1680,6 +1683,7 @@ impl SessionService {
             ));
             return;
         };
+        self.mark_read(id);
         // Each session owns its draft; switching saves the one being left
         // behind and brings back what the new one had.
         let previous = self.active.get_untracked();
@@ -3961,6 +3965,23 @@ impl SessionService {
         });
     }
 
+    fn mark_read(&self, id: &str) {
+        if !self
+            .unread
+            .get_untracked()
+            .iter()
+            .any(|candidate| candidate == id)
+        {
+            return;
+        }
+        self.unread
+            .update(|unread| unread.retain(|candidate| candidate != id));
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetSessionsUnread {
+            session_ids: vec![id.to_owned()],
+            unread: false,
+        });
+    }
+
     pub fn toggle_pin(&self, id: &str) {
         let pinned = !self
             .pinned
@@ -4144,6 +4165,7 @@ impl SessionService {
 
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
         self.pinned.set(snapshot.pinned_session_ids.clone());
+        self.unread.set(snapshot.unread_session_ids.clone());
         let mut sections = Vec::new();
         let mut folder_parents: BTreeMap<String, String> = BTreeMap::new();
         for placement in &snapshot.placements {
