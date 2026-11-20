@@ -29523,7 +29523,12 @@ impl VibexWorkbench {
     }
 
     /// Sessions whose view must survive eviction: the selected session and
-    /// every session a group workspace is currently showing.
+    /// every session a group workspace is currently painting.
+    ///
+    /// A painted pane owns its view whether or not it holds the keyboard, so
+    /// the set comes from the painted panes rather than from the presentation
+    /// budget: evicting the view of a pane that just lost focus would blank the
+    /// conversation the reader is still looking at.
     fn pinned_session_view_ids(&self) -> BTreeSet<String> {
         let mut pinned = BTreeSet::new();
         if let Some(selected) = self.selected_session_id.as_ref() {
@@ -29533,7 +29538,7 @@ impl VibexWorkbench {
             pinned.insert(live.as_str().to_string());
         }
         if let Some((_, group)) = self.active_session_group() {
-            pinned.extend(group.live_session_ids());
+            pinned.extend(group.painted_session_ids());
         }
         pinned
     }
@@ -56389,48 +56394,18 @@ impl VibexWorkbench {
                 this.child(tab_strip_drop_cue(cx.theme().primary.opacity(0.60)))
             });
 
+        // A pane the workspace paints always renders its conversation. The
+        // live-pane budget belongs to automatic presentations, never to this
+        // decision: gating content on it made the pane that had just lost the
+        // keyboard fall back to a "select this pane" placeholder while the
+        // focused pane showed its own — a conversation that vanished on blur
+        // and came back on click. Focus travels with the composer, the find bar
+        // and the terminal's own frame below; it does not decide whether the
+        // transcript is painted.
         let content = match active_session_id.as_deref() {
-            Some(session_id)
-                if self
-                    .ui_state
-                    .sidebar
-                    .organization
-                    .group(group_id)
-                    .is_some_and(|group| {
-                        group.live_session_ids().iter().any(|id| id == session_id)
-                    }) =>
-            {
+            Some(session_id) => {
                 self.render_session_group_pane_content(session_id, focused, window, cx)
             }
-            Some(_) => v_flex()
-                .flex_1()
-                .min_h_0()
-                .items_center()
-                .justify_center()
-                .gap_2()
-                .child(
-                    div()
-                        .text_sm()
-                        .text_color(cx.theme().muted_foreground)
-                        .child(locale::text(
-                            "Select this pane to load its conversation",
-                            "选择此窗格以加载会话",
-                            "選取此窗格以載入會話",
-                        )),
-                )
-                .child(
-                    Button::new(format!("session-group-load-{pane_id}"))
-                        .small()
-                        .label(locale::text("Open conversation", "打开会话", "開啟會話"))
-                        .on_click(cx.listener({
-                            let group_id = group_id.to_string();
-                            let pane_id = pane_id.clone();
-                            move |this, _, _, cx| {
-                                this.focus_session_group_pane(&group_id, &pane_id, cx)
-                            }
-                        })),
-                )
-                .into_any_element(),
             None => div()
                 .flex_1()
                 .min_h_0()
@@ -56716,17 +56691,20 @@ impl VibexWorkbench {
             .into_any_element()
     }
 
-    /// Gives every group member selected by the live-pane budget a complete
-    /// view; hidden tabs load their timelines only when selected.
+    /// Gives every painted pane a complete view; hidden tabs load their
+    /// timelines only when selected.
     ///
     /// A session only has a timeline once something asked for it. Without this
     /// pass the workspace would show one complete conversation beside panes
-    /// stuck on their loading state.
+    /// stuck on their loading state. The set is the painted panes, not the
+    /// presentation's live budget, so a pane keeps its view when the keyboard
+    /// moves to a sibling and the renderer never has to fall back to the
+    /// "select this pane" placeholder.
     fn ensure_session_group_views(&mut self, group_id: &str, cx: &mut Context<Self>) {
         let Some(group) = self.ui_state.sidebar.organization.group(group_id) else {
             return;
         };
-        let members = group.live_session_ids();
+        let members = group.painted_session_ids();
         let hidden: Vec<String> = self
             .ui_state
             .sidebar
@@ -81262,7 +81240,9 @@ impl VibexWorkbench {
     ///
     /// The single-session column shows one terminal; an open group shows the
     /// active tab of every pane it paints. A hidden tab and a pane the
-    /// maximized layout is not drawing are not visible, so they stay out.
+    /// maximized layout is not drawing are not visible, so they stay out. The
+    /// set follows the painted panes, not the presentation budget, so a pane
+    /// that loses the keyboard keeps its grid polling.
     fn visible_terminal_session_ids(&self) -> BTreeSet<String> {
         let mut visible = BTreeSet::new();
         if self.ui_state.workbench.active_tab != "agent"
@@ -81272,7 +81252,7 @@ impl VibexWorkbench {
             return visible;
         }
         if let Some((_, group)) = self.active_session_group() {
-            let live = group.live_session_ids();
+            let painted = group.painted_session_ids();
             for pane_id in group.layout.pane_ids() {
                 if group
                     .maximized_pane_id
@@ -81288,7 +81268,7 @@ impl VibexWorkbench {
                 else {
                     continue;
                 };
-                if live.iter().any(|id| id == active) {
+                if painted.iter().any(|id| id == active) {
                     self.note_visible_terminal_session(&mut visible, active);
                 }
             }
@@ -136190,7 +136170,11 @@ mod tests {
         assert!(session_menu.contains("move |mut submenu, _window, _cx|"));
     }
 
-    /// Each live pane owns a complete view and resolves its own requests.
+    /// Each painted pane owns a complete view and resolves its own requests.
+    ///
+    /// The set is the painted panes, never the presentation's live budget or
+    /// whichever pane holds the keyboard: a pane that loses focus must keep
+    /// the conversation it is showing.
     #[test]
     fn group_panes_materialize_views_and_resolve_requests_for_their_own_session() {
         let source = include_str!("app.rs");
@@ -136202,10 +136186,25 @@ mod tests {
             })
             .map(|(body, _)| body)
             .expect("group view materialization should remain inspectable");
-        // Only the live members materialize views and histories.
-        assert!(ensure.contains("group.live_session_ids()"));
+        // Every painted pane materializes its view and history, and only the
+        // painted panes do: a hidden tab still loads when it is selected.
+        assert!(ensure.contains("group.painted_session_ids()"));
+        assert!(!ensure.contains("group.live_session_ids()"));
         assert!(ensure.contains("self.ensure_session_view(&session_id);"));
         assert!(ensure.contains("self.ensure_session_group_view_loaded(&session_id, cx);"));
+
+        let pane = source
+            .split_once("    fn render_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_session_group_pane_content("))
+            .map(|(body, _)| body)
+            .expect("group pane rendering should remain inspectable");
+        // Content is decided by the active session alone. Focus may gate the
+        // composer, the find bar and the terminal hand-off, but never whether
+        // the transcript is painted.
+        assert!(pane.contains("match active_session_id.as_deref()"));
+        assert!(!pane.contains("live_session_ids()"));
+        assert!(!pane.contains("painted_session_ids()"));
+        assert!(!pane.contains("Select this pane to load its conversation"));
 
         let load = source
             .split_once("    fn load_session_group_view(")

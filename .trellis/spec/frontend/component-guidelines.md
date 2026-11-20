@@ -642,6 +642,16 @@ that stops updating and as blank bands between rows. Measurements a pane records
 during prepaint belong to the same view, and the transient borrow is
 deliberately unweighed so a per-row swap does not re-walk a whole timeline.
 
+The set of sessions that hold a live view is the set of *painted* panes
+(`SessionGroupUiState::painted_session_ids`), never the presentation's live
+budget (`live_session_ids`, which is focus-ordered and cut to
+`SESSION_GROUP_LIVE_PANE_LIMIT` for an Agent-requested layout). A hand-split
+workspace is bounded by `SESSION_GROUP_PANE_LIMIT` instead: every pane it paints
+owns a complete view and its active tab always renders its conversation, so
+moving the keyboard to a sibling cannot evict a view or swap a transcript for a
+"select this pane" placeholder. The live budget therefore orders and bounds what
+an automatic layout may ask for; it is not the renderer's visibility rule.
+
 The same rule covers input that arrives without focusing the pane. A wheel event
 is routed to the element under the pointer, so scrolling a pane the keyboard is
 not on clears that pane's follow state — borrow its view in the listener too. A
