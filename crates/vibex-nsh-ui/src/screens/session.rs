@@ -423,6 +423,9 @@ enum PaletteKind {
 pub struct SessionHost {
     pub sessions: Signal<Vec<SessionSummary>>,
     pub active: Signal<Option<String>>,
+    pub pinned: Signal<Vec<String>>,
+    pub on_toggle_pin: Rc<dyn Fn(&str)>,
+
     pub timeline: Signal<Vec<TimelineEntry>>,
     pub draft: Signal<String>,
     pub sending: Signal<bool>,
@@ -867,6 +870,8 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.session_busy,
             host.on_close_session_actions.clone(),
             host.on_rename_session.clone(),
+            host.pinned,
+            host.on_toggle_pin.clone(),
             host.on_archive_session.clone(),
             host.on_delete_session.clone(),
         ))
@@ -3567,12 +3572,15 @@ fn attachment_chip(
 }
 
 /// Rename, archive or delete one session.
+#[allow(clippy::too_many_arguments)]
 fn session_actions_sheet(
     actions: Signal<Option<String>>,
     rename: Signal<String>,
     busy: Signal<bool>,
     on_close: Rc<dyn Fn()>,
     on_rename: Rc<dyn Fn()>,
+    pinned: Signal<Vec<String>>,
+    on_toggle_pin: Rc<dyn Fn(&str)>,
     on_archive: Rc<dyn Fn()>,
     on_delete: Rc<dyn Fn()>,
 ) -> impl IntoElement {
@@ -3624,6 +3632,33 @@ fn session_actions_sheet(
                             .disabled_style(|style| style.opacity(0.4))
                         }),
                 )
+                .child({
+                    let on_toggle_pin = on_toggle_pin.clone();
+                    action::secondary(
+                        move || {
+                            let pinned = actions.with(|id| {
+                                id.as_ref().is_some_and(|id| {
+                                    pinned.with(|pinned| {
+                                        pinned.iter().any(|candidate| candidate == id)
+                                    })
+                                })
+                            });
+                            if pinned {
+                                copy::text("Unpin", "取消置顶", "取消置頂")
+                            } else {
+                                copy::text("Pin", "置顶", "置頂")
+                            }
+                        },
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        false,
+                        move || {
+                            if let Some(id) = actions.get_untracked() {
+                                on_toggle_pin(&id);
+                            }
+                        },
+                    )
+                    .w_full()
+                })
                 .child({
                     let on_archive = on_archive.clone();
                     action::secondary(
@@ -3759,6 +3794,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let query = signal(String::new());
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
+    let pinned = host.pinned;
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
@@ -3891,7 +3927,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                     }
                                 }))
                                 .child(each(
-                                    move || drawer_groups(sessions, query),
+                                    move || drawer_groups(sessions, query, host.pinned),
                                     |group| group.id.clone(),
                                     move |group, _| {
                                         let collapsed = collapsed_projects;
@@ -3906,6 +3942,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             open,
                                             select_mode,
                                             selected,
+                                            pinned,
                                         )
                                     },
                                 )),
@@ -4027,8 +4064,13 @@ struct DrawerGroup {
     sessions: Vec<SessionSummary>,
 }
 
-fn drawer_groups(sessions: Signal<Vec<SessionSummary>>, query: Signal<String>) -> Vec<DrawerGroup> {
+fn drawer_groups(
+    sessions: Signal<Vec<SessionSummary>>,
+    query: Signal<String>,
+    pinned: Signal<Vec<String>>,
+) -> Vec<DrawerGroup> {
     sessions.with(|sessions| {
+        let pinned_ids = pinned.get_untracked();
         let query = query.with(|query| query.trim().to_lowercase());
         let _ = &query;
         let mut groups: Vec<DrawerGroup> = Vec::new();
@@ -4057,6 +4099,11 @@ fn drawer_groups(sessions: Signal<Vec<SessionSummary>>, query: Signal<String>) -
                 }),
             }
         }
+        for group in &mut groups {
+            group
+                .sessions
+                .sort_by_key(|session| !pinned_ids.iter().any(|id| id == &session.id));
+        }
         groups
     })
 }
@@ -4071,6 +4118,7 @@ fn drawer_group(
     open: Signal<bool>,
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
+    pinned: Signal<Vec<String>>,
 ) -> impl IntoElement {
     let closed = computed(move || {
         let id = group.with(|group| group.id.clone());
@@ -4137,6 +4185,7 @@ fn drawer_group(
                             open,
                             select_mode,
                             selected,
+                            pinned,
                         )
                     },
                 ))
@@ -4144,6 +4193,7 @@ fn drawer_group(
         }))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn session_row(
     session: ReadSignal<SessionSummary>,
     active: Signal<Option<String>>,
@@ -4152,6 +4202,7 @@ fn session_row(
     open: Signal<bool>,
     select_mode: Signal<bool>,
     selected: Signal<Vec<String>>,
+    pinned: Signal<Vec<String>>,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -4221,6 +4272,17 @@ fn session_row(
                         .rounded(px(4.0))
                         .bg(move || session.get().state.dot()),
                 )
+                .child(when(
+                    move || {
+                        let id = session.get().id;
+                        pinned.with(|pinned| pinned.iter().any(|candidate| candidate == &id))
+                    },
+                    || {
+                        text("★")
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted)
+                    },
+                ))
                 .child(
                     view()
                         .flex_1()

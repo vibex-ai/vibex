@@ -187,6 +187,14 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell with the active session pinned.
+#[component]
+fn PinnedShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.pinned.set(vec!["s1".to_owned()]);
+    session::session(host)
+}
+
 /// A shell with its team sheet open.
 #[component]
 fn TeamShell() -> impl IntoElement {
@@ -346,6 +354,7 @@ fn OfflineShell() -> impl IntoElement {
 fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
+    let pinned = signal(Vec::new());
     let timeline = signal(transcript("s1"));
     let draft = signal(String::new());
     let sending = signal(false);
@@ -709,6 +718,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     SessionHost {
         sessions,
         active,
+        pinned,
+        on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,
         sending,
@@ -1049,6 +1060,16 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         std::time::Duration::from_secs(5),
     )
     .unwrap();
+}
+
+#[test]
+fn a_pinned_session_keeps_its_marker() {
+    let mut config = EngineConfig::new(Root::of::<PinnedShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("★").unwrap();
 }
 
 #[test]

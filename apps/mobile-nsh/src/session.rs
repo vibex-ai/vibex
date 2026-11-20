@@ -78,6 +78,8 @@ const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 const TIMELINE_CACHE_KEY: &str = "vibex.mobile.timeline.v1";
 /// Where the prompts written ahead of a running turn are kept.
 const QUEUE_KEY: &str = "vibex.mobile.queue.v1";
+/// Where the sessions the reader pinned are kept.
+const PINS_KEY: &str = "vibex.mobile.pins.v1";
 /// At most this many conversations are cached.
 const TIMELINE_CACHE_SESSIONS: usize = 4;
 
@@ -150,6 +152,7 @@ pub struct SessionService {
     workspace_backend: Arc<dyn WorkspaceBackend>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
+    pinned: Signal<Vec<String>>,
     timeline: Signal<Vec<TimelineEntry>>,
     draft: Signal<String>,
     sending: Signal<bool>,
@@ -326,6 +329,7 @@ impl SessionService {
             workspace_backend,
             sessions: signal(Vec::new()),
             active: signal(None),
+            pinned: signal(load_pins()),
             timeline: signal(Vec::new()),
             draft: signal(String::new()),
             sending: signal(false),
@@ -542,6 +546,11 @@ impl SessionService {
         SessionHost {
             sessions: self.sessions,
             active: self.active,
+            pinned: self.pinned,
+            on_toggle_pin: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.toggle_pin(id))
+            },
             timeline: self.timeline,
             draft: self.draft,
             sending: self.sending,
@@ -3610,6 +3619,20 @@ impl SessionService {
         });
     }
 
+    pub fn toggle_pin(&self, id: &str) {
+        self.pinned.update(|pinned| {
+            if let Some(index) = pinned.iter().position(|candidate| candidate == id) {
+                pinned.remove(index);
+            } else {
+                pinned.push(id.to_owned());
+            }
+        });
+        if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
+            let _ = Storage::set_item(PINS_KEY, text);
+        }
+        self.session_actions.set(None);
+    }
+
     /// Archives the session the actions sheet is open on.
     fn archive_open_session(&self) {
         let Some(id) = self.session_actions.get_untracked() else {
@@ -3700,6 +3723,11 @@ impl SessionService {
             .update(|sessions| sessions.retain(|s| s.id != id));
         self.drafts.borrow_mut().remove(id);
         self.persist_drafts();
+        self.pinned
+            .update(|pinned| pinned.retain(|candidate| candidate != id));
+        if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
+            let _ = Storage::set_item(PINS_KEY, text);
+        }
         self.queue.borrow_mut().remove(id);
         self.persist_queues();
         if self.active.get_untracked().as_deref() != Some(id) {
@@ -5364,6 +5392,12 @@ fn image_mime(name: &str) -> &'static str {
         "svg" => "image/svg+xml",
         _ => "image/jpeg",
     }
+}
+
+fn load_pins() -> Vec<String> {
+    Storage::get_item(PINS_KEY)
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn load_queues() -> (
