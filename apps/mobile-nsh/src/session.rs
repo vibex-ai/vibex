@@ -220,6 +220,7 @@ pub struct SessionService {
     new_base_ref: Signal<String>,
     new_title: Signal<String>,
     new_prompt: Signal<String>,
+    new_attachments: Signal<Vec<AttachmentItem>>,
     new_busy: Signal<bool>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Rc<RefCell<Vec<WorkspaceSummary>>>,
@@ -381,6 +382,7 @@ impl SessionService {
             new_base_ref: signal(String::new()),
             new_title: signal(String::new()),
             new_prompt: signal(String::new()),
+            new_attachments: signal(Vec::new()),
             new_busy: signal(false),
             new_error: signal(None),
             workspace_records: Rc::new(RefCell::new(Vec::new())),
@@ -609,6 +611,23 @@ impl SessionService {
             new_base_ref: self.new_base_ref,
             new_title: self.new_title,
             new_prompt: self.new_prompt,
+            new_attachments: self.new_attachments,
+            on_attach_new_image: {
+                let service = self.clone();
+                Rc::new(move || service.attach_new_images())
+            },
+            on_attach_new_file: {
+                let service = self.clone();
+                Rc::new(move || service.attach_new_files())
+            },
+            on_remove_new_attachment: {
+                let service = self.clone();
+                Rc::new(move |id: &str| {
+                    service
+                        .new_attachments
+                        .update(|items| items.retain(|item| item.id != id));
+                })
+            },
             new_busy: self.new_busy,
             new_error: self.new_error,
             resolving: self.resolving,
@@ -3040,6 +3059,67 @@ impl SessionService {
         });
     }
 
+    fn attach_new_images(&self) {
+        self.new_error.set(None);
+        let service = self.clone();
+        spawn(async move {
+            let mut request = PickRequest::new(true, 4);
+            request.max_dimension = Some(nsh_core::geometry::DevicePixels(1600));
+            let files = pick_images(request).await;
+            service.accept_new_attachments(files);
+        });
+    }
+
+    fn attach_new_files(&self) {
+        self.new_error.set(None);
+        let service = self.clone();
+        spawn(async move {
+            let mut request = FilePickRequest::new(true, 4);
+            request.max_size = Some(8 * 1024 * 1024);
+            let files = pick_files(request).await;
+            service.accept_new_attachments(files);
+        });
+    }
+
+    fn accept_new_attachments(&self, files: Vec<nsh_core::picker::PickedFile>) {
+        let mut too_large = None;
+        for file in files {
+            if file.status == PickedStatus::TooLarge {
+                too_large = Some(file.name);
+                continue;
+            }
+            let seq = self.attachment_seq.get().wrapping_add(1);
+            self.attachment_seq.set(seq);
+            let mime_type = file.mime.clone();
+            let uri = format!(
+                "data:{};base64,{}",
+                mime_type,
+                base64::engine::general_purpose::STANDARD.encode(file.data.bytes())
+            );
+            self.new_attachments.update(|items| {
+                items.push(AttachmentItem {
+                    id: format!("new-attachment-{seq}"),
+                    label: file.name,
+                    mime_type,
+                    uri,
+                });
+            });
+        }
+        if let Some(name) = too_large {
+            self.new_error.set(Some(
+                format!(
+                    "{name}: {}",
+                    copy::text(
+                        "too large to attach",
+                        "文件太大，无法附加",
+                        "檔案太大，無法附加",
+                    )
+                )
+                .into(),
+            ));
+        }
+    }
+
     /// Picks documents and keeps them as attachments for the next message.
     fn attach_files(&self) {
         self.error.set(None);
@@ -3311,7 +3391,8 @@ impl SessionService {
                     service.refresh();
                     service.open(session.id.as_str());
                     if !prompt.is_empty() {
-                        service.send(&prompt);
+                        let attachments = service.new_attachments.get_untracked();
+                        service.deliver(prompt, attachments, Vec::new(), false);
                     }
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
@@ -3488,6 +3569,7 @@ impl SessionService {
         self.new_error.set(None);
         self.new_title.set(String::new());
         self.new_prompt.set(String::new());
+        self.new_attachments.set(Vec::new());
         self.new_busy.set(true);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
@@ -3613,7 +3695,8 @@ impl SessionService {
                     service.refresh();
                     service.open(session.id.as_str());
                     if !prompt.is_empty() {
-                        service.send(&prompt);
+                        let attachments = service.new_attachments.get_untracked();
+                        service.deliver(prompt, attachments, Vec::new(), false);
                     }
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),

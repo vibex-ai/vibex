@@ -11,6 +11,9 @@ use std::rc::Rc;
 use nsh_base::{SheetEvent, button, sheet};
 use nsh_core::{element::ImageSrc, prelude::*};
 
+use crate::screens::session::AttachmentItem;
+
+type Action = Rc<dyn Fn()>;
 use crate::{copy, theme, ui::action};
 
 /// A workspace the new session can live in.
@@ -43,9 +46,13 @@ pub struct NewSessionHost {
     pub error: Signal<Option<SharedString>>,
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
-    /// The session's optional title and first message.
+    /// The session's optional title, first message and its attachments.
     pub title: Signal<String>,
     pub prompt: Signal<String>,
+    pub attachments: Signal<Vec<AttachmentItem>>,
+    pub on_attach_image: Action,
+    pub on_attach_file: Action,
+    pub on_remove_attachment: Rc<dyn Fn(&str)>,
     /// A branch name and optional base ref for a new worktree.
     pub worktree_branch: Signal<String>,
     pub base_ref: Signal<String>,
@@ -89,6 +96,12 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                         "第一条消息（可选）",
                         "第一則訊息（選填）",
                     ),
+                ))
+                .child(new_session_attachments(
+                    host.attachments,
+                    host.on_attach_image.clone(),
+                    host.on_attach_file.clone(),
+                    host.on_remove_attachment.clone(),
                 ))
                 .child(section_label(copy::text("Workspace", "工作区", "工作區")))
                 .child(choice_list(
@@ -244,6 +257,76 @@ where
                 .truncate()
                 .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
+        )
+}
+
+fn new_session_attachments(
+    attachments: Signal<Vec<AttachmentItem>>,
+    on_attach_image: Action,
+    on_attach_file: Action,
+    on_remove: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(theme::SPACING_XS))
+        .child(when(
+            move || !attachments.with(|items| items.is_empty()),
+            move || {
+                let on_remove = on_remove.clone();
+                view()
+                    .w_full()
+                    .flex_row()
+                    .flex_wrap()
+                    .gap(px(theme::SPACING_XS))
+                    .child(each(
+                        move || attachments.get(),
+                        |attachment| attachment.id.clone(),
+                        move |attachment, _| {
+                            let on_remove = on_remove.clone();
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .bg(theme::background_dim)
+                                .px(px(theme::SPACING_XS))
+                                .py(px(2.0))
+                                .child(
+                                    text(move || attachment.with(|item| item.label.clone()))
+                                        .text_size(px(theme::font_micro()))
+                                        .text_color(theme::text_secondary),
+                                )
+                                .child(
+                                    button()
+                                        .on_press(move || on_remove(&attachment.get_untracked().id))
+                                        .hit_slop(px(8.0))
+                                        .child(
+                                            text("×")
+                                                .text_size(px(theme::font_caption()))
+                                                .text_color(theme::text_muted),
+                                        ),
+                                )
+                        },
+                    ))
+            },
+        ))
+        .child(
+            view()
+                .flex_row()
+                .gap(px(theme::SPACING_XS))
+                .child(action::secondary(
+                    copy::text("Image", "图片", "圖片"),
+                    icon(include_str!("../../assets/icons/image.svg")),
+                    false,
+                    move || on_attach_image(),
+                ))
+                .child(action::secondary(
+                    copy::text("File", "文件", "檔案"),
+                    icon(include_str!("../../assets/icons/paperclip.svg")),
+                    false,
+                    move || on_attach_file(),
+                )),
         )
 }
 

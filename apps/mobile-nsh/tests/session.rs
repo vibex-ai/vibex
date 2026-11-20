@@ -380,6 +380,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let skills = signal(Vec::new());
     let new_title = signal(String::new());
     let new_prompt = signal(String::new());
+    let new_attachments = signal(Vec::new());
     let attachments = signal(Vec::new());
     let on_attach_image = Rc::new(move || {
         attachments.update(|items| {
@@ -850,6 +851,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_base_ref,
         new_title,
         new_prompt,
+        new_attachments,
+        on_attach_new_image: Rc::new(|| {}),
+        on_attach_new_file: Rc::new(|| {}),
+        on_remove_new_attachment: Rc::new(|_| {}),
         on_create_worktree_session,
         on_close_new_session: Rc::new(move || new_session_open.set(false)),
     }
