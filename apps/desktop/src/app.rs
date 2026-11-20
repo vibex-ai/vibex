@@ -1014,6 +1014,14 @@ const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
 const AGENT_TIMELINE_TURN_WINDOW: u32 = 8;
 /// Upper bound on the payload cost of one window or history page.
 const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
+/// How many pages a window may read before it starts on a turn boundary.
+///
+/// A page is capped by item count, and one running turn can exceed that cap on
+/// its own — a run with hundreds of tool calls is thousands of items. A window
+/// taken from the top then opens in the *middle* of the live turn, and a session
+/// with a long run behind it opens as a single partial turn until history loads
+/// under it. Reaching back to a turn boundary costs at most this many pages.
+const AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 8;
 /// How much a resumed load may pull before re-opening beats patching.
 ///
 /// Resuming from a view a long background run left far behind would make the
@@ -3196,6 +3204,10 @@ async fn fetch_timeline_window_or_contiguous(
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await?;
+    let page = align_timeline_window_to_turn_start(page, |before_sequence| {
+        fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
+    })
+    .await;
     Ok(
         extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
             fetch_timeline_page_before(runtime.clone(), session_id.clone(), before_sequence, true)
@@ -3223,6 +3235,10 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
         })
         .await
         .map_err(remote_error_into_vibex)?;
+    let page = align_timeline_window_to_turn_start(page, |before_sequence| {
+        fetch_timeline_page_before_via_backend(backend.clone(), session_id.clone(), before_sequence, true)
+    })
+    .await;
     Ok(
         extend_timeline_window_back_to(page, cover_sequence, |before_sequence| {
             fetch_timeline_page_before_via_backend(
@@ -3234,6 +3250,49 @@ async fn fetch_timeline_window_or_contiguous_via_backend(
         })
         .await,
     )
+}
+
+/// Reaches a window back until it starts on a turn boundary.
+///
+/// The newest page is capped by item count, and one running turn can be larger
+/// than that cap by itself. Such a page begins inside the live turn, so the view
+/// it installs holds one partial turn of a long conversation: the whole history
+/// is missing until pages load under it. Walking back to the boundary makes the
+/// window a whole number of turns, which is what the row table and the anchor
+/// both assume. Best effort and bounded: a failed page, a window that already
+/// starts at a boundary, or the page budget ends the walk with whatever the
+/// window holds.
+async fn align_timeline_window_to_turn_start<F, Fut>(
+    mut page: vibex_core::TimelinePage,
+    mut fetch_before: F,
+) -> vibex_core::TimelinePage
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = vibex_core::VibexResult<vibex_core::TimelinePage>>,
+{
+    let mut pages = 0;
+    while !page.starts_at_turn_start
+        && page.has_older
+        && pages < AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES
+    {
+        let Some(start_sequence) = page.start_sequence else {
+            break;
+        };
+        let older = match fetch_before(start_sequence).await {
+            Ok(older) => older,
+            // One retry, for the same reason the anchor walk takes one: a
+            // transient read must not leave the view on a partial turn.
+            Err(_) => match fetch_before(start_sequence).await {
+                Ok(older) => older,
+                Err(_) => break,
+            },
+        };
+        if !prepend_older_timeline_page(&mut page, older) {
+            break;
+        }
+        pages += 1;
+    }
+    page
 }
 
 /// Reaches a replaced window back to the oldest sequence a reader still holds.
@@ -139027,6 +139086,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_window_opens_on_a_turn_boundary() {
+        let session_id = VibexSessionId::parse("session_turn_align").unwrap();
+        let page = |start: i64, end: i64, has_older: bool, at_turn_start: bool| TimelinePage {
+            session_id: session_id.clone(),
+            items: (start..=end)
+                .map(|sequence| indexed_timeline_item(&session_id, sequence, "row"))
+                .collect(),
+            start_sequence: Some(start),
+            end_sequence: Some(end),
+            has_older,
+            has_newer: false,
+            starts_at_turn_start: at_turn_start,
+            leading_turn_start: None,
+            omitted: None,
+        };
+
+        // One running turn is bigger than a page, so the newest page opens in
+        // the middle of it. The walk reaches back to the page that opens the
+        // turn, and the window is a whole number of turns again.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window =
+            align_timeline_window_to_turn_start(page(500, 999, true, false), move |before| {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Ok(page(before - 500, before - 1, false, true))
+                }
+            })
+            .await;
+        assert_eq!(reads.get(), 1);
+        assert_eq!(window.start_sequence, Some(0));
+        assert!(window.starts_at_turn_start);
+        assert_eq!(window.items.len(), 1000);
+
+        // A walk that never reaches a boundary stops at the page budget instead
+        // of reading the whole session: the window is still usable, it just
+        // opens mid-turn until history is paged in under it.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window =
+            align_timeline_window_to_turn_start(page(9000, 9999, true, false), move |before| {
+                let counter = counter.clone();
+                async move {
+                    counter.set(counter.get() + 1);
+                    Ok(page(before - 500, before - 1, true, false))
+                }
+            })
+            .await;
+        assert_eq!(reads.get(), AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES);
+        assert!(!window.starts_at_turn_start);
+
+        // The oldest page of a session needs no walk at all.
+        let reads = Rc::new(std::cell::Cell::new(0_usize));
+        let counter = reads.clone();
+        let window = align_timeline_window_to_turn_start(page(0, 9, false, false), move |before| {
+            let counter = counter.clone();
+            async move {
+                counter.set(counter.get() + 1);
+                Ok(page(before - 10, before - 1, false, true))
+            }
+        })
+        .await;
+        assert_eq!(reads.get(), 0);
+        assert_eq!(window.start_sequence, Some(0));
+    }
+
+    #[gpui::test]
     async fn anchor_recovery_walk_retries_a_failed_page_once() {
         let session_id = VibexSessionId::parse("session_recovery").unwrap();
         let page = |start_sequence: i64, end_sequence: i64, has_older: bool| TimelinePage {
