@@ -199,6 +199,7 @@ fn FolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
+        pinned: false,
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -215,6 +216,7 @@ fn GroupShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Group,
+        pinned: false,
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -231,6 +233,7 @@ fn CollapsedFolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
+        pinned: false,
         parent_id: None,
         depth: 0,
         collapsed: true,
@@ -839,6 +842,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_rename_group: Rc::new(|_, _| {}),
         on_delete_group: Rc::new(|_| {}),
         on_set_group_members: Rc::new(|_, _| {}),
+        on_set_group_pinned: Rc::new(|_, _| {}),
         on_toggle_folder_collapsed: Rc::new(|_, _| {}),
         on_toggle_group_collapsed: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
@@ -1260,6 +1264,7 @@ fn a_group_opens_its_actions() {
     app.wait_for("Pair").unwrap();
     app.press("role:button[Folder actions]").unwrap();
     app.wait_for("Session group").unwrap();
+    assert!(app.screen().shows("Pin group"));
     app.press("Members").unwrap();
     app.wait_for("Group members").unwrap();
 }

@@ -196,6 +196,7 @@ pub enum SidebarSectionKind {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct SidebarSectionView {
     pub kind: SidebarSectionKind,
+    pub pinned: bool,
     pub id: String,
     pub parent_id: Option<String>,
     pub depth: usize,
@@ -469,6 +470,7 @@ pub struct SessionHost {
     pub on_rename_group: FolderNameAction,
     pub on_delete_group: Rc<dyn Fn(&str)>,
     pub on_set_group_members: CreateGroupAction,
+    pub on_set_group_pinned: SessionToggle,
     pub on_toggle_folder_collapsed: CollapseAction,
     pub on_toggle_group_collapsed: CollapseAction,
     pub on_create_group: CreateGroupAction,
@@ -4220,6 +4222,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let members_group = signal(None::<String>);
     let members_selected = signal(Vec::<String>::new());
     let on_set_group_members = host.on_set_group_members.clone();
+    let on_set_group_pinned = host.on_set_group_pinned.clone();
     let on_rename_group = host.on_rename_group.clone();
     let on_delete_group = host.on_delete_group.clone();
     let on_toggle_folder_collapsed = host.on_toggle_folder_collapsed.clone();
@@ -4365,6 +4368,22 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                     group_rename,
                     on_rename_group.clone(),
                     on_delete_group.clone(),
+                    {
+                        let on_set_group_pinned = on_set_group_pinned.clone();
+                        let sections = sidebar_sections;
+                        Rc::new(move || {
+                            if let Some(id) = group_actions.get_untracked() {
+                                let pinned = sections.with(|sections| {
+                                    sections
+                                        .iter()
+                                        .find(|section| section.id == id)
+                                        .is_some_and(|section| section.pinned)
+                                });
+                                on_set_group_pinned(&id, !pinned);
+                                group_actions.set(None);
+                            }
+                        })
+                    },
                     {
                         let sections = sidebar_sections;
                         Rc::new(move || {
@@ -4781,6 +4800,7 @@ fn group_actions_sheet(
     name: Signal<String>,
     on_rename: FolderNameAction,
     on_delete: Rc<dyn Fn(&str)>,
+    on_pin: Action,
     on_members: Action,
 ) -> impl IntoElement {
     let open = computed(move || action.get().is_some());
@@ -4823,6 +4843,16 @@ fn group_actions_sheet(
                                 action.set(None);
                             }
                         },
+                    )
+                    .w_full()
+                })
+                .child({
+                    let on_pin = on_pin.clone();
+                    action::secondary(
+                        copy::text("Pin group", "置顶分组", "置頂分組"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        false,
+                        move || on_pin(),
                     )
                     .w_full()
                 })
@@ -5188,6 +5218,14 @@ fn sidebar_section(
                             .text_color(theme::text_muted),
                         )
                 })
+                .child(when(
+                    move || section.with(|section| section.pinned),
+                    || {
+                        text("★")
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted)
+                    },
+                ))
                 .child(
                     text(move || section.with(|section| section.name.clone()))
                         .flex_1()

@@ -675,6 +675,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |id: &str, members: &[String]| service.set_group_members(id, members))
             },
+            on_set_group_pinned: {
+                let service = self.clone();
+                Rc::new(move |id: &str, pinned: bool| service.set_group_pinned(id, pinned))
+            },
             on_set_session_auto_continue: {
                 let service = self.clone();
                 Rc::new(move |id: &str, enabled: bool| {
@@ -4152,6 +4156,13 @@ impl SessionService {
         });
     }
 
+    fn set_group_pinned(&self, id: &str, pinned: bool) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupPinned {
+            group_id: id.to_owned(),
+            pinned,
+        });
+    }
+
     fn set_group_members(&self, id: &str, members: &[String]) {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupMembers {
             group_id: id.to_owned(),
@@ -4299,6 +4310,7 @@ impl SessionService {
         for folder in &snapshot.folders {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Folder,
+                pinned: false,
                 id: folder.id.clone(),
                 parent_id: folder_parents.get(&folder.id).cloned(),
                 depth: folder_depth(&folder.id),
@@ -4310,6 +4322,7 @@ impl SessionService {
         for group in &snapshot.groups {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Group,
+                pinned: group.pinned,
                 id: group.id.clone(),
                 parent_id: folder_parents.get(&group.id).cloned(),
                 depth: 0,
