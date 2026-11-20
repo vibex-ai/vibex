@@ -727,26 +727,29 @@ impl VibexWorkbench {
         self.render_message_schedule_button_at(target, enabled, None, cx)
     }
 
-    /// The same control at a caller-chosen square size.
+    /// The same control at a caller-chosen square and glyph size.
     ///
-    /// The full Composer stacks it in the 30px trailing column beside the
-    /// expand and terminal controls, where the default `small` icon button
-    /// (24px) would read a size smaller than its neighbours.
+    /// The Composer's footer seats it beside the terminal and the usage ring,
+    /// where the default `small` icon button would read larger than the
+    /// caption it belongs to. The glyph is named separately because the kit
+    /// draws an icon at three quarters of its button; at a caption's size that
+    /// lands smaller than the row's own marks.
     pub(super) fn render_message_schedule_button_sized(
         &self,
         target: MessageScheduleTarget,
         enabled: bool,
         size: f32,
+        glyph: f32,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        self.render_message_schedule_button_at(target, enabled, Some(size), cx)
+        self.render_message_schedule_button_at(target, enabled, Some((size, glyph)), cx)
     }
 
     fn render_message_schedule_button_at(
         &self,
         target: MessageScheduleTarget,
         enabled: bool,
-        size: Option<f32>,
+        size: Option<(f32, f32)>,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         let schedule = self.schedule_for_target(&target);
@@ -760,8 +763,18 @@ impl VibexWorkbench {
                 .small()
                 .ghost()
                 .compact()
-                .when_some(size, |button, size| button.size(px(size)))
-                .icon(sidebar_icon(CLOCK_ICON))
+                .when_some(size, |button, (size, glyph)| {
+                    button
+                        .size(px(size))
+                        .child(Icon::default().path(CLOCK_ICON).size(px(glyph)))
+                })
+                .map(|button| {
+                    if size.is_none() {
+                        button.icon(sidebar_icon(CLOCK_ICON))
+                    } else {
+                        button
+                    }
+                })
                 // Open is the popover's own state, and a target that carries a
                 // schedule stays marked while its panel is closed.
                 .selected(schedule.is_some())

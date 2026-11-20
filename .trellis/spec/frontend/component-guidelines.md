@@ -892,7 +892,7 @@ still the one-line bar, and rendering the full box there left an empty
 textarea with a reserved band under it. "Empty" means no characters at all: a
 draft of newlines has rows, and the bar cannot show a second row, so Enter in
 the slim bar has to move the surface to the full box instead of pushing the
-bar's controls down inside a 46px surface.
+bar's controls down inside a 48px surface.
 
 The surface itself carries only what edits the draft:
 
@@ -911,12 +911,56 @@ right half holds the instruments — and do not add a second floating row above
 the box for them: the session's instruments belong to the same baseline as the
 session it names.
 
+The line is a caption, not a second toolbar. Its controls are a size under the
+bar's own (`COMPOSER_FOOTER_CONTROL_SIZE` = 22, against the bar's 30), and the
+left half takes `muted-foreground` rather than the foreground: on a page-colored
+backdrop a foreground caption read as body text and pulled the eye back down
+past the box. The project line is `text_xs` at medium weight beside a 13px
+Agent mark (`COMPOSER_FOOTER_MARK_SIZE`), which keeps both halves on one
+baseline with the instruments. Do not raise the footer's controls to the bar's
+size to make them easier to hit — they are readouts and rare actions, and the
+surface above owns the frequent ones.
+
 The slim row then reads attach → expand → run configuration → send, with no
 fold-menu: four separate controls fit because the row only seats two of them
-plus the cascade and the action. The row's fixed widths are what
-`composer_slim_input_width` subtracts, so a new control there must be added to
-that figure as well, or the density probe wraps a line later than the painted
-bar does.
+plus the cascade and the action. The two utility controls share a 30px seat
+(`COMPOSER_SLIM_ROW_CONTROL_SIZE`) and draw 15px marks in muted ink; the send
+disc is the row's tallest control at 32px (`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`)
+and its only saturated mark, so the row gains its weight from color rather than
+from size. The attach glyph is the bundled `paperclip` (ISC), not the kit's
+`Plus`: a `+` on a message composer reads as "add a row to the draft", and the
+paperclip says "attach a file to this message" without a tooltip. The bar's
+height is the disc plus its 7px inset above and below and the surface's hairline
+(`COMPOSER_SLIM_SURFACE_HEIGHT` = 48), and its radius is exactly half of it
+(`COMPOSER_SLIM_SURFACE_RADIUS`), which is what closes both ends into
+semicircles. The row's fixed widths are what `composer_slim_input_width`
+subtracts, so a new control there must be added to that figure as well, or the
+density probe wraps a line later than the painted bar does.
+
+The run-configuration chip names the model, never `account / model`: the
+account is a fact about the run configuration rather than about the model,
+and a prefix in front of the name the reader scans for both crowded the chip
+and truncated the model from the left. The bare model name comes from
+`runtime_model_label`; the catalogue's full `account / model` pair stays
+available to the panel and to the tooltip, which reports the model and the
+authentication source on separate lines.
+
+The surface's fill is `composer-surface` lifted a few points toward the
+foreground in a dark appearance (`composer_surface_fill`). The authored plate
+sits only three points above the page, which is right for a card that a hairline
+already separates, but it left the one surface the reader types into looking
+like a hole. A light appearance keeps the authored color. The edge follows the
+same rule (`composer_surface_border`): the focused pane still takes the ring,
+while a dark appearance draws its own stronger hairline instead of the theme's
+ten-percent `border`, which is tuned for two adjacent plates rather than for the
+one edge that has to say where the box begins.
+
+The send disc keeps its own fill rather than the kit's primary variant: the kit
+paints a disabled primary at fifteen percent of the accent, which on a dark
+page is a flat grey hole exactly where the reader expects the button. The
+control stays `disabled` — the press is what is gated — while its disc mixes
+between the composer's own fill and the foreground, and its arrow takes
+`background` as ink once there is something to send.
 
 The trailing corner seats one button (expand), shorter than the input's own
 minimum band. The surface's floor is therefore the editor

@@ -1372,25 +1372,56 @@ const COMPOSER_FULL_SURFACE_MIN_HEIGHT: f32 = COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT
 /// The line under the Composer's surface: the session on the left, the
 /// surface's instruments on the right. Their controls are smaller than the
 /// bar's so the line reads as a caption rather than a second toolbar.
-const COMPOSER_FOOTER_CONTROL_SIZE: f32 = 24.0;
-const COMPOSER_FOOTER_GAP: f32 = 4.0;
-const COMPOSER_FOOTER_TOP_PADDING: f32 = 6.0;
+const COMPOSER_FOOTER_CONTROL_SIZE: f32 = 22.0;
+const COMPOSER_FOOTER_GAP: f32 = 6.0;
+const COMPOSER_FOOTER_TOP_PADDING: f32 = 8.0;
+/// The Agent mark on the footer.
+///
+/// A caption's mark: a point under the instruments' own glyphs, so the line
+/// reads as one annotation rather than a toolbar of its own.
+const COMPOSER_FOOTER_MARK_SIZE: f32 = 13.0;
+/// The glyph each footer instrument draws.
+///
+/// The kit sizes an icon at three quarters of its button, which at 22px lands
+/// an 16px mark — half the bar's own. These draw a point under that instead, so
+/// the row stays a caption and the surface above keeps the heavier marks.
+const COMPOSER_FOOTER_GLYPH_SIZE: f32 = 14.0;
 const COMPOSER_SURFACE_RADIUS: f32 = 20.0;
 /// The one-line composer is a single row: the input line and its controls
-/// share it, so the surface is one control's height plus the row's insets
-/// and hairlines (6 + 32 + 6 + 2). The multi-row box keeps the taller chrome
-/// it always had; the difference between the two is what the height morph
-/// glides across.
-const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 46.0;
+/// share it, so the surface is the row's tallest control plus the row's inset
+/// above and below it and the surface's hairline. The multi-row box keeps the
+/// taller chrome it always had; the difference between the two is what the
+/// height morph glides across.
+const COMPOSER_SLIM_SURFACE_HEIGHT: f32 = 48.0;
 /// One text line plus the row's own breathing room.
 const COMPOSER_SLIM_TEXT_AREA_MIN_HEIGHT: f32 = 26.0;
+/// The one-line row's vertical inset.
+///
+/// The bar is a pill, so its height is the row's tallest control plus this
+/// inset above and below it and the surface's hairline: 7 + 32 + 7 + 2.
+/// The inset is deliberately looser than the box's own, because a single row
+/// of text with a full-height control beside it needs the extra air to stop
+/// reading as a cropped box.
+const COMPOSER_SLIM_ROW_VERTICAL_PADDING: f32 = 7.0;
+/// The square the slim row seats its two utility controls in.
+///
+/// Attach and expand share one seat, so their centres land on one line and
+/// their glyphs draw at the same optical size. A couple of points under the
+/// send disc: they are the row's quiet marks, and the disc is the one control
+/// that closes it.
+const COMPOSER_SLIM_ROW_CONTROL_SIZE: f32 = 30.0;
+/// The filled disc that sends from the slim bar.
+///
+/// The row's tallest control, and the only saturated mark on the surface, so
+/// it is the figure the bar's height is built around.
+const COMPOSER_SLIM_PRIMARY_ACTION_SIZE: f32 = 32.0;
 /// The one-line bar's corner radius.
 ///
-/// It is larger than half the bar's height, so the two ends close into full
-/// semicircles and the bar reads as a pill rather than a rounded rectangle.
-/// The radius morphs from [`COMPOSER_SURFACE_RADIUS`] as the bar settles into
-/// its one-line shape, so the corners round off as the box becomes the bar.
-const COMPOSER_SLIM_SURFACE_RADIUS: f32 = 26.0;
+/// Half the bar's height, so both ends close into full semicircles and the
+/// bar reads as a pill rather than a rounded rectangle. The radius morphs from
+/// [`COMPOSER_SURFACE_RADIUS`] as the bar settles into its one-line shape, so
+/// the corners round off as the box becomes the bar.
+const COMPOSER_SLIM_SURFACE_RADIUS: f32 = COMPOSER_SLIM_SURFACE_HEIGHT / 2.0;
 /// The insets a slim bar keeps from its own edges. The full box pads by `px_3`;
 /// a one-line bar reads as a pill, so its padding is tighter.
 const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
@@ -4245,6 +4276,69 @@ fn composer_surface_background(is_dark: bool) -> Hsla {
     theme::semantic_color("composer-surface", is_dark)
 }
 
+/// The fill the Composer's own surface paints.
+///
+/// The authored plate sits just a few points above the page, which is right
+/// for a card that a hairline and a shadow already separate. The Composer is
+/// the one surface the reader types into, and on a dark page that faint a
+/// step left the box reading as a hole with a caret in it. Lifting the plate
+/// toward the foreground by a few points gives the box a body of its own
+/// without turning it into a second card. A light appearance already fades
+/// its raised plates over the wallpaper, and the authored white is already
+/// the page, so it keeps the authored color and leans on the hairline.
+fn composer_surface_fill(is_dark: bool) -> Hsla {
+    let surface = composer_surface_background(is_dark);
+    if is_dark {
+        motion::mix(surface, theme::semantic_color("foreground", is_dark), 0.055)
+    } else {
+        surface
+    }
+}
+
+/// A glyph on the Composer's slim row.
+///
+/// The row's utility controls seat two quiet marks and one filled disc, so
+/// their glyphs draw a couple of points under the button's own size and in the
+/// muted ink rather than the foreground: at a full 30px frame a 16px mark read
+/// as a third action competing with the send disc. The kit's `.icon(...)` API
+/// sizes its glyph at three quarters of the button, which is why these are
+/// children instead.
+fn composer_row_glyph(icon: Icon, cx: &App) -> AnyElement {
+    icon.size(px(15.0))
+        .text_color(cx.theme().muted_foreground.opacity(0.86))
+        .into_any_element()
+}
+
+/// A glyph on the footer's instrument row.
+///
+/// The same ink as the bar's marks, a point under the bar's own size, so the
+/// instruments read as the caption they are: present, nameable on hover, and
+/// never competing with the surface above.
+fn composer_footer_glyph(icon: Icon, size: f32, cx: &App) -> AnyElement {
+    icon.size(px(size))
+        .text_color(cx.theme().muted_foreground.opacity(0.92))
+        .into_any_element()
+}
+
+/// The hairline around the Composer's surface.
+///
+/// The theme's `border` is a ten-percent rule, which is the right weight
+/// between two plates and too quiet for the one edge that has to say where the
+/// box begins. The Composer draws its own edge a little stronger on a dark
+/// page; a light page keeps the theme's line, which already has more contrast
+/// against the white plate. A focused pane still takes the ring, because the
+/// keyboard's owner has to be the loudest thing on the page.
+fn composer_surface_border(is_dark: bool, focused: bool, cx: &App) -> Hsla {
+    if focused {
+        return cx.theme().ring;
+    }
+    if is_dark {
+        cx.theme().foreground.opacity(0.14)
+    } else {
+        cx.theme().border
+    }
+}
+
 /// How much room a composer gives itself.
 ///
 /// The two densities are the same composer at two heights, not two widgets: the
@@ -4305,12 +4399,13 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
 /// column — never from the density this frame is about to choose.
 ///
 /// Every control the slim row seats beside the text has a fixed width: attach
-/// and expand 28 each, the send action 28, four 8px gaps, the row's 10px
-/// insets and the surface's hairlines. The run-configuration trigger varies —
-/// 32px when compact, up to 240px otherwise — so the bar's input is never
-/// wider than this figure. Estimating on the narrow side is deliberate: a
-/// draft the estimate calls one line is one line on the real bar too, so the
-/// bar cannot bounce back to the box on the next frame.
+/// and expand are [`COMPOSER_SLIM_ROW_CONTROL_SIZE`] each, the send action is
+/// [`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`], the gaps and the insets are the
+/// row's own. The run-configuration trigger varies — 32px when compact, up to
+/// 240px otherwise — so the bar's input is never wider than this figure.
+/// Estimating on the narrow side is deliberate: a draft the estimate calls one
+/// line is one line on the real bar too, so the bar cannot bounce back to the
+/// box on the next frame.
 fn composer_slim_input_width(
     pane_width: f32,
     content_max_width: Option<f32>,
@@ -4330,9 +4425,9 @@ fn composer_slim_input_width(
         - 2.0 * COMPOSER_SLIM_HORIZONTAL_PADDING
         - 2.0
         - 4.0 * 8.0
-        - 28.0
-        - 28.0
-        - 28.0
+        - COMPOSER_SLIM_ROW_CONTROL_SIZE
+        - COMPOSER_SLIM_ROW_CONTROL_SIZE
+        - COMPOSER_SLIM_PRIMARY_ACTION_SIZE
         - trigger)
         .max(120.0)
 }
@@ -66288,28 +66383,36 @@ impl VibexWorkbench {
                 && option.selection.auth_source == desired.auth_source
                 && option.selection.model == desired.model
         });
-        let selected_provider_model_label = runtime_provider_model_label(selected_option, &desired);
+        // The bar names the model, and only the model. The account a turn runs
+        // as is a fact about the run configuration, not about the model, and
+        // putting it on the bar as `account / model` spent half the chip on a
+        // prefix the reader never chose and left a long model name truncated
+        // from the left. The trigger therefore shows the bare model name; the
+        // full `account / model` pair still names itself in the tooltip and in
+        // the panel's own rows.
+        let trigger_model_label = runtime_model_label(selected_option, &desired);
         // The trigger names the run configuration, not just the model: the
         // reasoning level rides beside the model name so the reader can see
         // the whole choice without opening the panel. It is its own element,
-        // not part of one label: a long provider/model name truncates itself
-        // and must not eat the depth on the way out.
+        // not part of one label: a long model name truncates itself and must
+        // not eat the depth on the way out.
         let effort_label = projection
             .reasoning_efforts
             .iter()
             .find(|choice| choice.value == runtime_reasoning_effort_value(Some(&desired)))
             .map(|choice| choice.label.clone());
         let trigger_label = match &effort_label {
-            Some(effort) => format!("{selected_provider_model_label} · {effort}"),
-            None => selected_provider_model_label.clone(),
+            Some(effort) => format!("{trigger_model_label} · {effort}"),
+            None => trigger_model_label.clone(),
         };
+        // The chip shows the model; the tooltip is where the account earns
+        // its place, named as its own line beside the model and depth rather
+        // than folded into the label the listener reads at a glance.
+        let account_label = runtime_selection_account_label(selected_option, &desired);
         let tooltip = format!(
-            "{}: {trigger_label}",
-            locale::text(
-                "Authentication source / Model",
-                "认证方式 / 模型",
-                "認證方式 / 模型",
-            )
+            "{}: {trigger_label}\n{}: {account_label}",
+            locale::text("Model", "模型", "模型"),
+            locale::text("Authentication source", "认证方式", "認證方式"),
         );
         let model_icon = desired
             .model_id()
@@ -66328,7 +66431,7 @@ impl VibexWorkbench {
             });
         let content = runtime_selector_dropdown_content_parts(
             model_icon,
-            selected_provider_model_label,
+            trigger_model_label,
             effort_label,
             compact,
             cx,
@@ -67042,12 +67145,21 @@ impl VibexWorkbench {
         }
     }
 
-    fn render_composer_terminal_menu(&mut self, size: f32, cx: &mut Context<Self>) -> AnyElement {
+    fn render_composer_terminal_menu(
+        &mut self,
+        size: f32,
+        glyph: f32,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
         Button::new("composer-terminal-menu")
             .ghost()
             .compact()
             .size(px(size))
-            .icon(IconName::SquareTerminal)
+            .child(composer_footer_glyph(
+                Icon::new(IconName::SquareTerminal),
+                glyph,
+                cx,
+            ))
             .tooltip(self.composer_terminal_action_label())
             .disabled(self.agent_action_pending || self.view_session_id.is_none())
             .on_click(cx.listener(|this, _, window, cx| {
@@ -79270,12 +79382,17 @@ impl VibexWorkbench {
         };
         let session_id = self.view_session_id.clone();
         let controls_enabled = enabled && !self.agent_action_pending;
-        let mut leading = h_flex().min_w_0().items_center().gap_1p5();
+        // The left half is a caption, not a control: the mark is a hair under
+        // the instrument glyphs beside it and both parts take the muted ink,
+        // so the line names the session without competing with the surface
+        // above it or the instruments on its own right.
+        let caption_ink = cx.theme().muted_foreground.opacity(0.92);
+        let mut leading = h_flex().min_w_0().items_center().gap(px(6.0));
         if let Some(identity) = agent_identity {
             leading = leading.child(agent_brand_icon(
                 &identity,
-                px(14.0),
-                Some(cx.theme().foreground.opacity(0.62)),
+                px(COMPOSER_FOOTER_MARK_SIZE),
+                Some(caption_ink),
             ));
         }
         if let Some(name) = project_name {
@@ -79284,7 +79401,8 @@ impl VibexWorkbench {
                     .min_w_0()
                     .truncate()
                     .text_xs()
-                    .text_color(cx.theme().foreground.opacity(0.62))
+                    .font_medium()
+                    .text_color(caption_ink)
                     .child(name),
             );
         }
@@ -79298,9 +79416,14 @@ impl VibexWorkbench {
                     MessageScheduleTarget::Session(session_id),
                     controls_enabled,
                     COMPOSER_FOOTER_CONTROL_SIZE,
+                    COMPOSER_FOOTER_GLYPH_SIZE,
                     cx,
                 ))
-                .child(self.render_composer_terminal_menu(COMPOSER_FOOTER_CONTROL_SIZE, cx))
+                .child(self.render_composer_terminal_menu(
+                    COMPOSER_FOOTER_CONTROL_SIZE,
+                    COMPOSER_FOOTER_GLYPH_SIZE,
+                    cx,
+                ))
                 .child(button_with_aria_label(
                     Button::new("open-session-usage")
                         .ghost()
@@ -79323,6 +79446,10 @@ impl VibexWorkbench {
             .debug_selector(|| "composer-footer".to_string())
             .w_full()
             .min_w_0()
+            // Both halves share one baseline: the row is as tall as its
+            // instruments, and the caption centres on them instead of
+            // floating below the surface's radius.
+            .min_h(px(COMPOSER_FOOTER_CONTROL_SIZE))
             .items_center()
             .justify_between()
             .gap_2()
@@ -79433,7 +79560,7 @@ impl VibexWorkbench {
         // The composer shares the content spine with the timeline above it.
         let content_insets = self.session_content_insets();
         let is_dark = cx.theme().is_dark();
-        let composer_background = composer_surface_background(is_dark);
+        let composer_background = composer_surface_fill(is_dark);
         let composer_collaboration = self.render_composer_collaboration(cx);
         let composer_plan = self.render_composer_plan(cx);
         // The goal row rides the queued-message surface whenever that panel is
@@ -79655,10 +79782,14 @@ impl VibexWorkbench {
         // The cascade seats on exactly one of the two layouts, so the branch
         // that mounts it takes it out of the slot.
         let mut runtime_controls_cascade = Some(runtime_controls_cascade);
-        // A slim bar seats the action on its own row, where 28 px matches the
-        // controls beside it; the full box seats it in the trailing column, where
-        // 32 px matches the two stacked buttons above it.
-        let primary_action_size = if composer_is_slim { 28.0 } else { 32.0 };
+        // The slim bar closes its row with the disc the bar is built around,
+        // while the full box seats a 32px action that matches the corner
+        // button above.
+        let primary_action_size = if composer_is_slim {
+            COMPOSER_SLIM_PRIMARY_ACTION_SIZE
+        } else {
+            32.0
+        };
         let primary_action = if session_running {
             Button::new("interrupt-agent")
                 .danger()
@@ -79680,18 +79811,59 @@ impl VibexWorkbench {
                 .on_click(cx.listener(|this, _, window, cx| this.interrupt_session(window, cx)))
                 .into_any_element()
         } else {
+            // The send disc is the one saturated control on the surface, and
+            // the kit's disabled wash paints it at a tenth of the accent, which
+            // on a dark page leaves a flat grey hole where the reader expects
+            // the button. So the disc keeps its own fill — quiet until there is
+            // something to send, bright once there is — while the button stays
+            // disabled exactly as before: the press is what is gated, not the
+            // picture.
+            let send_ready = can_send && enabled && !self.agent_action_pending;
+            let send_fill = if send_ready {
+                cx.theme().foreground
+            } else {
+                motion::mix(cx.theme().foreground, composer_background, 0.62)
+            };
+            let send_ink = if send_ready {
+                cx.theme().background
+            } else {
+                cx.theme().foreground.opacity(0.5)
+            };
+            let send_loading = self.agent_action_pending || self.agent_turn_pending;
             Button::new("send-agent-message")
-                .primary()
+                // The variant owns the hover and active washes as well as the
+                // rest fill: a direct `.hover(...)` on a Button collides with
+                // the kit's own hover slot and panics.
+                .custom(
+                    ButtonCustomVariant::new(cx)
+                        .color(send_fill)
+                        .foreground(send_ink)
+                        .hover(motion::mix(send_fill, cx.theme().background, 0.12))
+                        .active(motion::mix(send_fill, cx.theme().background, 0.2)),
+                )
                 .compact()
                 .size(px(primary_action_size))
                 .rounded(px(primary_action_size / 2.0))
-                .icon(IconName::ArrowUp)
+                .bg(send_fill)
+                // The arrow is a child at a fixed size rather than the button's
+                // icon: the kit draws an icon at three quarters of its button,
+                // and a 24px arrow inside a 32px disc filled the circle edge to
+                // edge instead of sitting in it. A pending send drops the arrow
+                // and lets the button mount its own spinner in that place, so
+                // the disc never shows two marks at once.
+                .when(!send_loading, |button| {
+                    button.child(
+                        Icon::new(IconName::ArrowUp)
+                            .size(px(16.0))
+                            .text_color(send_ink),
+                    )
+                })
                 .tooltip(if self.composer_message_schedule().is_some() {
                     locale::text("Schedule message", "定时发送", "定時傳送")
                 } else {
                     locale::text("Send message", "发送消息", "傳送訊息")
                 })
-                .loading(self.agent_action_pending || self.agent_turn_pending)
+                .loading(send_loading)
                 .disabled(!can_send || !enabled)
                 .on_click(cx.listener(|this, _, window, cx| this.submit_composer(window, cx)))
                 .into_any_element()
@@ -79998,11 +80170,11 @@ impl VibexWorkbench {
                             // focus ring every focused control wears, while the
                             // pane frame stays quiet. The single-session column
                             // has no pane to mark and keeps the hairline.
-                            .border_color(if pane_focused {
-                                cx.theme().ring
-                            } else {
-                                cx.theme().border
-                            })
+                            .border_color(composer_surface_border(
+                                is_dark,
+                                pane_focused,
+                                cx,
+                            ))
                             .bg(composer_background)
                             .when(composer_extension_visible, |this| {
                                 this.shadow(vec![
@@ -80054,7 +80226,7 @@ impl VibexWorkbench {
                                             this.flex_1()
                                                 .items_center()
                                                 .px(px(COMPOSER_SLIM_HORIZONTAL_PADDING))
-                                                .py(px(6.0))
+                                                .py(px(COMPOSER_SLIM_ROW_VERTICAL_PADDING))
                                         } else {
                                             // The trailing column is taller than
                                             // two text rows, so the row reserves
@@ -80323,8 +80495,15 @@ impl VibexWorkbench {
                                                 Button::new("choose-composer-attachments")
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(primary_action_size))
-                                                    .icon(IconName::Plus)
+                                                    .size(px(COMPOSER_SLIM_ROW_CONTROL_SIZE))
+                                                    .rounded(px(
+                                                        COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
+                                                    ))
+                                                    .child(composer_row_glyph(
+                                                        Icon::default()
+                                                            .path("icons/vibex/paperclip.svg"),
+                                                        cx,
+                                                    ))
                                                     .tooltip(locale::text(
                                                         "Add attachments",
                                                         "添加附件",
@@ -80343,12 +80522,18 @@ impl VibexWorkbench {
                                                 Button::new("toggle-composer-expanded")
                                                     .ghost()
                                                     .compact()
-                                                    .size(px(primary_action_size))
-                                                    .icon(if self.composer_expanded {
-                                                        IconName::Minimize
-                                                    } else {
-                                                        IconName::Maximize
-                                                    })
+                                                    .size(px(COMPOSER_SLIM_ROW_CONTROL_SIZE))
+                                                    .rounded(px(
+                                                        COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0,
+                                                    ))
+                                                    .child(composer_row_glyph(
+                                                        if self.composer_expanded {
+                                                            Icon::new(IconName::Minimize)
+                                                        } else {
+                                                            Icon::new(IconName::Maximize)
+                                                        },
+                                                        cx,
+                                                    ))
                                                     .tooltip(if self.composer_expanded {
                                                         locale::text(
                                                             "Collapse input",
@@ -80440,7 +80625,12 @@ impl VibexWorkbench {
                                                     .ghost()
                                                     .compact()
                                                     .size(px(primary_action_size))
-                                                    .icon(IconName::Plus)
+                                                    .rounded(px(primary_action_size / 2.0))
+                                                    .child(composer_row_glyph(
+                                                        Icon::default()
+                                                            .path("icons/vibex/paperclip.svg"),
+                                                        cx,
+                                                    ))
                                                     .tooltip(locale::text(
                                                         "Add attachments",
                                                         "添加附件",
@@ -88977,6 +89167,38 @@ fn runtime_attribution_line(attribution: &str) -> String {
         .join(SEPARATOR)
 }
 
+/// The model a selection names, without the account it runs as.
+///
+/// The run-configuration trigger is a chip on the Composer's bar, where the
+/// model name is the part the reader scans for; the account is the same for
+/// most of a session's life and is reported in the tooltip and in the panel.
+/// Both branches read the catalogue when it describes the selection, because
+/// the catalogue's labels are the names the reader chose.
+fn runtime_model_label(
+    option: Option<&SessionRuntimeOption>,
+    selection: &SessionRuntimeSelection,
+) -> String {
+    option
+        .map(|option| option.model_label.clone())
+        .unwrap_or_else(|| runtime_model_selection_label(&selection.model))
+}
+
+/// The account a selection runs as, named for a tooltip.
+///
+/// The catalogue's own auth-source label is the name the reader gave the
+/// Provider Profile; a selection the catalogue has not described yet falls
+/// back to the kind, as the chip's composed label does.
+fn runtime_selection_account_label(
+    option: Option<&SessionRuntimeOption>,
+    selection: &SessionRuntimeSelection,
+) -> String {
+    option
+        .map(|option| {
+            runtime_auth_source_selection_label(&selection.auth_source, &option.auth_source_label)
+        })
+        .unwrap_or_else(|| runtime_auth_source_placeholder_label(&selection.auth_source))
+}
+
 fn runtime_provider_model_label(
     option: Option<&SessionRuntimeOption>,
     selection: &SessionRuntimeSelection,
@@ -90902,6 +91124,14 @@ fn tabular_numerals() -> FontFeatures {
     FontFeatures(Arc::new(vec![("tnum".to_string(), 1)]))
 }
 
+/// The usage ring on the footer.
+///
+/// The ring is a readout, not a control: it draws at three quarters of the
+/// button that carries it, in muted ink, so the footer's three instruments
+/// read as one quiet group rather than three buttons of the same weight. The
+/// centre is left empty — the percentage lives in the tooltip and the panel —
+/// because a number inside a 22px ring at this size is unreadable and the ring
+/// itself already says the fraction.
 fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, size: f32, cx: &mut App) -> AnyElement {
     let is_dark = cx.theme().is_dark();
     let context_fraction = usage.and_then(context_window_usage_fraction);
@@ -91018,7 +91248,12 @@ fn render_cache_token_ring(usage: Option<&AgentTokenUsage>, size: f32, cx: &mut 
         .items_center()
         .justify_center()
         .child(
+            // The ring draws a little inside its button: `ProgressCircle`
+            // paints at three quarters of the square it is given, which lands
+            // the readout at 16px and leaves it visibly quieter than the two
+            // instrument glyphs beside it.
             ProgressCircle::new("composer-cache-token-ring-progress")
+                .size(px(size))
                 .value(context_percent)
                 .color(progress_color),
         )
@@ -117879,6 +118114,14 @@ mod tests {
             runtime_provider_model_label(None, &option.selection),
             "provider_codex / codex_model"
         );
+        // The bar's chip names the model alone: the account it runs as is
+        // reported beside it in the tooltip, not in front of the name the reader
+        // scans for.
+        assert_eq!(
+            runtime_model_label(Some(&option), &option.selection),
+            "Codex model"
+        );
+        assert_eq!(runtime_model_label(None, &option.selection), "codex_model");
     }
 
     /// The notice that explains a normalized mode names the catalogue's label,
@@ -124098,17 +124341,43 @@ mod tests {
         assert_eq!(COMPOSER_TRAILING_STACK_HEIGHT, 30.0);
         assert_eq!(COMPOSER_FULL_INPUT_ROW_MIN_HEIGHT, 96.0);
         assert_eq!(COMPOSER_FULL_SURFACE_MIN_HEIGHT, 142.0);
-        // The line under the surface keeps its own controls and insets.
-        assert_eq!(COMPOSER_FOOTER_CONTROL_SIZE, 24.0);
-        assert_eq!(COMPOSER_FOOTER_GAP, 4.0);
-        assert_eq!(COMPOSER_FOOTER_TOP_PADDING, 6.0);
+        // The line under the surface keeps its own controls and insets: a
+        // caption's row, so its instruments are a size under the bar's own.
+        assert_eq!(COMPOSER_FOOTER_CONTROL_SIZE, 22.0);
+        assert_eq!(COMPOSER_FOOTER_GAP, 6.0);
+        assert_eq!(COMPOSER_FOOTER_TOP_PADDING, 8.0);
+        assert_eq!(COMPOSER_FOOTER_MARK_SIZE, 13.0);
+        assert_eq!(COMPOSER_FOOTER_GLYPH_SIZE, 14.0);
+        // The footer's marks stay under half the bar's controls; a caption
+        // that reaches the surface's own size stops being one.
+        const { assert!(COMPOSER_FOOTER_GLYPH_SIZE < COMPOSER_SLIM_ROW_CONTROL_SIZE / 2.0) };
+        const {
+            assert!(
+                COMPOSER_FOOTER_CONTROL_SIZE < COMPOSER_SLIM_ROW_CONTROL_SIZE,
+                "the footer's instruments stay quieter than the bar's controls"
+            );
+        }
         assert_eq!(COMPOSER_QUEUE_HEADER_HEIGHT, 36.0);
         assert_eq!(COMPOSER_QUEUE_ROW_HEIGHT, 28.0);
         assert_eq!(COMPOSER_SURFACE_RADIUS, 20.0);
         // The one-line bar is a pill: its radius is larger than half its
         // height, so both ends close into full semicircles.
-        assert_eq!(COMPOSER_SLIM_SURFACE_RADIUS, 26.0);
-        assert_eq!(COMPOSER_SLIM_SURFACE_HEIGHT, 46.0);
+        assert_eq!(COMPOSER_SLIM_SURFACE_RADIUS, 24.0);
+        // The bar is the tallest control on its row plus the row's own inset
+        // and the surface's hairline.
+        assert_eq!(COMPOSER_SLIM_ROW_CONTROL_SIZE, 30.0);
+        assert_eq!(COMPOSER_SLIM_PRIMARY_ACTION_SIZE, 32.0);
+        assert_eq!(COMPOSER_SLIM_ROW_VERTICAL_PADDING, 7.0);
+        assert_eq!(COMPOSER_SLIM_SURFACE_HEIGHT, 48.0);
+        // The bar's height is its row, its inset and its hairline, so the
+        // three have to agree or the pill's ends stop meeting the text.
+        assert_eq!(
+            COMPOSER_SLIM_SURFACE_HEIGHT,
+            2.0 * COMPOSER_SLIM_ROW_VERTICAL_PADDING
+                + COMPOSER_SLIM_PRIMARY_ACTION_SIZE
+                + COMPOSER_SURFACE_HAIRLINE,
+            "the bar's height is its row, its inset and its hairline"
+        );
         const {
             assert!(
                 COMPOSER_SLIM_SURFACE_RADIUS >= COMPOSER_SLIM_SURFACE_HEIGHT / 2.0,
@@ -126399,9 +126668,9 @@ mod tests {
     fn composer_slim_input_width_is_a_property_of_the_pane_not_the_density() {
         let wide = composer_slim_input_width(1200.0, None, 24.0, false, true);
         // 1200 - 48 inset = 1152 surface; minus insets/hairlines/four 8px
-        // gaps and the fixed controls (attach 28 + expand 28 + send 28) and
+        // gaps and the fixed controls (attach 30 + expand 30 + send 32) and
         // the 240px trigger.
-        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 84.0 - 240.0);
+        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
         // The compact trigger frees the label's width for the draft.
         let compact = composer_slim_input_width(1200.0, None, 24.0, true, true);
         assert_eq!(compact, wide + 240.0 - 32.0);
@@ -126411,7 +126680,7 @@ mod tests {
         // The session content cap bounds the surface, and a sliver of a pane
         // still leaves the probe a usable width instead of a negative one.
         let capped = composer_slim_input_width(4000.0, Some(1024.0), 24.0, false, true);
-        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 84.0 - 240.0);
+        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
         assert!(composer_slim_input_width(200.0, None, 0.0, false, true) >= 120.0);
     }
 

@@ -28104,16 +28104,6 @@ pub static COPY_ROWS: &[CopyRow] = &[
         ru: "Тип",
     },
     CopyRow {
-        en: "Type / for commands or quick phrases, @ to reference files and sessions or delegate to an Agent, $ for skills, ↑/↓ to fill from history",
-        ja: "コマンドまたはクイックフレーズの場合は「/」を入力し、ファイルおよびセッションを参照するかエージェントに委任するには「@」を入力し、スキルの場合は「$」を入力し、履歴から入力するには「↑/↓」を入力します。",
-        ko: "명령 또는 빠른 문구의 경우 /를 입력하고, 파일 및 세션을 참조하거나 에이전트에 위임하려면 @를 입력하고, 기술의 경우 $를 입력하고, 기록에서 채우려면 ↑/↓를 입력하세요.",
-        de: "Geben Sie / für Befehle oder Kurzphrasen ein, @ zum Referenzieren von Dateien und Sitzungen oder zum Delegieren an einen Agenten, $ für Fertigkeiten und ↑/↓ zum Ausfüllen aus dem Verlauf",
-        fr: "Tapez / pour les commandes ou les phrases rapides, @ pour référencer des fichiers et des sessions ou déléguer à un agent, $ pour les compétences, ↑/↓ pour remplir à partir de l'historique",
-        es: "Escriba / para comandos o frases rápidas, @ para hacer referencia a archivos y sesiones o delegar a un Agente, $ para habilidades, ↑/↓ para completar desde el historial",
-        pt_br: "Digite / para comandos ou frases rápidas, @ para referenciar arquivos e sessões ou delegar a um Agente, $ para habilidades, ↑/↓ para preencher a partir do histórico",
-        ru: "Введите / для команд или быстрых фраз, @ для ссылки на файлы и сеансы или делегирования агенту, $ для навыков, ↑/↓ для заполнения из истории",
-    },
-    CopyRow {
         en: "Type a command…",
         ja: "コマンドを入力してください…",
         ko: "명령을 입력하세요…",
@@ -28132,6 +28122,16 @@ pub static COPY_ROWS: &[CopyRow] = &[
         es: "Escriba una fecha límite como AAAA-MM-DD HH:MM:SS.",
         pt_br: "Digite um prazo como AAAA-MM-DD HH:MM:SS.",
         ru: "Введите крайний срок в формате ГГГГ-ММ-ДД ЧЧ:ММ:СС.",
+    },
+    CopyRow {
+        en: "Type a message, or / for commands",
+        ja: "メッセージを入力、または / でコマンドを呼び出す",
+        ko: "메시지를 입력하거나 / 로 명령 호출",
+        de: "Nachricht eingeben oder mit / Befehle aufrufen",
+        fr: "Saisissez un message, ou / pour les commandes",
+        es: "Escribe un mensaje, o / para los comandos",
+        pt_br: "Digite uma mensagem, ou / para os comandos",
+        ru: "Введите сообщение или / для команд",
     },
     CopyRow {
         en: "Type a path to attach it",
