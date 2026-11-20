@@ -19,7 +19,7 @@ use vibex_nsh_ui::screens::session::{
     self, AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
     PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, RuntimeChoiceView,
     RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    TimelineEntry,
+    TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
@@ -192,6 +192,13 @@ fn RuntimeShell() -> impl IntoElement {
         label: "Default".to_owned(),
         selected: false,
     }]);
+    host.token_usage = signal(Some(TokenUsageView {
+        percent: Some(42),
+        used: 42_000,
+        size: 100_000,
+        input: 10_000,
+        output: 2_000,
+    }));
     let runtime_open = signal(false);
     let close = runtime_open;
     host.runtime_open = runtime_open;
@@ -248,6 +255,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_features = signal(Vec::new());
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
+    let token_usage = signal(None);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -558,6 +566,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         runtime_features,
         runtime_open,
         runtime_busy,
+        token_usage,
         on_open_runtime: Rc::new(|| {}),
         on_close_runtime: Rc::new(|| {}),
         on_choose_runtime: Rc::new(|_| {}),
@@ -711,6 +720,7 @@ fn the_composer_opens_the_runtime_choices() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Claude 4").unwrap();
+    app.wait_for("42%").unwrap();
     app.press("Claude 4").unwrap();
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();

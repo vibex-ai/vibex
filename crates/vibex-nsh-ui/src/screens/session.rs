@@ -161,6 +161,17 @@ pub struct RuntimeFeatureView {
     pub values: Vec<RuntimeChoiceView>,
 }
 
+/// What the runtime last reported about the session's token use.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct TokenUsageView {
+    /// Context used, as a percentage, when the runtime reports both numbers.
+    pub percent: Option<u8>,
+    pub used: u64,
+    pub size: u64,
+    pub input: u64,
+    pub output: u64,
+}
+
 /// The answer a permission card offers.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PermissionChoice {
@@ -368,6 +379,8 @@ pub struct SessionHost {
     pub runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
     pub runtime_modes: Signal<Vec<RuntimeChoiceView>>,
     pub runtime_features: Signal<Vec<RuntimeFeatureView>>,
+    /// The session's token use, when the runtime reports it.
+    pub token_usage: Signal<Option<TokenUsageView>>,
     pub runtime_open: Signal<bool>,
     pub runtime_busy: Signal<bool>,
     pub on_open_runtime: Action,
@@ -1784,6 +1797,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let runtime_reasoning = host.runtime_reasoning;
     let runtime_modes = host.runtime_modes;
     let runtime_features = host.runtime_features;
+    let token_usage = host.token_usage;
     let on_open_runtime = host.on_open_runtime.clone();
     let running = computed(move || {
         let Some(active) = active.get() else {
@@ -1836,6 +1850,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     runtime_reasoning,
                     runtime_modes,
                     runtime_features,
+                    token_usage,
                     on_open_runtime.clone(),
                 )
             }
@@ -1924,6 +1939,7 @@ fn runtime_chip_row(
     reasoning: Signal<Vec<RuntimeChoiceView>>,
     modes: Signal<Vec<RuntimeChoiceView>>,
     features: Signal<Vec<RuntimeFeatureView>>,
+    token_usage: Signal<Option<TokenUsageView>>,
     on_open: Action,
 ) -> impl IntoElement {
     view()
@@ -2000,6 +2016,93 @@ fn runtime_chip_row(
                 }
             },
         ))
+        .child(when(
+            move || token_usage.get().is_some(),
+            move || token_chip(token_usage),
+        ))
+}
+
+fn token_chip(usage: Signal<Option<TokenUsageView>>) -> impl IntoElement {
+    button()
+        .on_press(move || {
+            let usage = usage.get_untracked();
+            spawn(async move {
+                let body = token_usage_detail(usage.as_ref());
+                let _ = nsh_base::alert_dialog()
+                    .title(copy::text(
+                        "Token usage",
+                        "Token 使用情况",
+                        "Token 使用情況",
+                    ))
+                    .description(body)
+                    .show()
+                    .await;
+            });
+        })
+        .min_h(px(28.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_dim)
+        .active(|style| style.opacity(0.8))
+        .child(
+            text(move || match usage.get() {
+                Some(usage) => usage
+                    .percent
+                    .map(|percent| format!("{percent}%"))
+                    .unwrap_or_else(|| compact_tokens(usage.input + usage.output)),
+                None => "–".to_owned(),
+            })
+            .text_size(px(theme::font_micro()))
+            .text_color(move || match usage.get() {
+                Some(usage) => match usage.percent {
+                    Some(percent) if percent > 90 => theme::accent_red(),
+                    Some(percent) if percent >= 70 => theme::color_token("warning"),
+                    _ => theme::text_muted(),
+                },
+                None => theme::text_muted(),
+            }),
+        )
+}
+
+fn token_usage_detail(usage: Option<&TokenUsageView>) -> String {
+    let Some(usage) = usage else {
+        return copy::text(
+            "The runtime has not reported token usage yet.",
+            "运行时尚未上报 token 使用情况。",
+            "執行環境尚未回報 Token 使用情況。",
+        )
+        .to_owned();
+    };
+    if let Some(percent) = usage.percent.filter(|_| usage.size > 0) {
+        format!(
+            "{} {percent}% · {} / {}",
+            copy::text("Context used", "上下文已用", "上下文已用"),
+            compact_tokens(usage.used),
+            compact_tokens(usage.size)
+        )
+    } else {
+        format!(
+            "{} {} · {} {}",
+            copy::text("Input", "输入", "輸入"),
+            compact_tokens(usage.input),
+            copy::text("Output", "输出", "輸出"),
+            compact_tokens(usage.output)
+        )
+    }
+}
+
+fn compact_tokens(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        format!("{:.1}m", tokens as f64 / 1_000_000.0)
+    } else if tokens >= 1_000 {
+        format!("{:.1}k", tokens as f64 / 1_000.0)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn chip_button(label: impl Fn() -> String + 'static, on_press: Action) -> ButtonElement {

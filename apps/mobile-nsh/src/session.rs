@@ -26,7 +26,7 @@ use vibex_backend::{
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, AgentNotificationKind,
-    AgentSessionRuntimeSelectionState, AgentSessionState, ApprovalResponder,
+    AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage, ApprovalResponder,
     CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField, ElicitationFieldKind,
     ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
     ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
@@ -55,6 +55,7 @@ use vibex_nsh_ui::{
         PermissionChoice, PermissionOption, QuestionAnswer, QuestionField, QuestionFieldKind,
         QuestionOption, QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
         RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry,
+        TokenUsageView,
     },
     screens::terminal::TerminalChoice,
 };
@@ -177,6 +178,7 @@ pub struct SessionService {
     runtime_features: Signal<Vec<RuntimeFeatureView>>,
     runtime_open: Signal<bool>,
     runtime_busy: Signal<bool>,
+    token_usage: Signal<Option<TokenUsageView>>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -293,6 +295,7 @@ impl SessionService {
             runtime_features: signal(Vec::new()),
             runtime_open: signal(false),
             runtime_busy: signal(false),
+            token_usage: signal(None),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -468,6 +471,7 @@ impl SessionService {
             runtime_features: self.runtime_features,
             runtime_open: self.runtime_open,
             runtime_busy: self.runtime_busy,
+            token_usage: self.token_usage,
             on_open_runtime: {
                 let service = self.clone();
                 Rc::new(move || service.open_runtime())
@@ -991,6 +995,11 @@ impl SessionService {
                         sessions.insert(0, row);
                     }
                 });
+                if self.active.get_untracked().as_deref() == Some(session.id.as_str())
+                    && let Ok(session_id) = VibexSessionId::parse(session.id.as_str())
+                {
+                    self.refresh_token_usage(&session_id);
+                }
             }
             BackendEvent::SessionsRemoved(removed) => {
                 self.note_online();
@@ -1121,7 +1130,9 @@ impl SessionService {
         self.runtime_features.set(Vec::new());
         self.runtime_open.set(false);
         self.runtime_busy.set(false);
+        self.token_usage.set(None);
         self.refresh_runtime(&session_id);
+        self.refresh_token_usage(&session_id);
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -1517,6 +1528,27 @@ impl SessionService {
             .borrow_mut()
             .replace_authoritative(session_id.clone(), page.items);
         self.publish();
+        self.refresh_token_usage(session_id);
+    }
+
+    /// Reads the session's live token counters.
+    fn refresh_token_usage(&self, session_id: &VibexSessionId) {
+        let session_id = session_id.clone();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let requested = session_id.clone();
+            let result =
+                background(async move { backend.session_token_usage(requested).await }).await;
+            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+                return;
+            }
+            match result {
+                Ok(Ok(Some(usage))) => service.token_usage.set(Some(token_usage_view(usage))),
+                Ok(Ok(None)) => service.token_usage.set(None),
+                _ => {}
+            }
+        });
     }
 
     /// Reads the page above the transcript and splices it in.
@@ -3607,6 +3639,25 @@ fn load_drafts() -> BTreeMap<String, String> {
     Storage::get_item(DRAFTS_KEY)
         .and_then(|text| serde_json::from_str(&text).ok())
         .unwrap_or_default()
+}
+
+fn token_usage_view(usage: AgentTokenUsage) -> TokenUsageView {
+    let percent = match (
+        usage.context_window_used_tokens,
+        usage.context_window_size_tokens,
+    ) {
+        (Some(used), Some(size)) if size > 0 => {
+            Some(((used.saturating_mul(100) / size).min(100)) as u8)
+        }
+        _ => None,
+    };
+    TokenUsageView {
+        percent,
+        used: usage.context_window_used_tokens.unwrap_or_default(),
+        size: usage.context_window_size_tokens.unwrap_or_default(),
+        input: usage.input_tokens.unwrap_or_default(),
+        output: usage.output_tokens.unwrap_or_default(),
+    }
 }
 
 /// The attachments a user row carried, from the items behind it.
