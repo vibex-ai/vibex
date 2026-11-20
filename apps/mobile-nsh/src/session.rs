@@ -53,7 +53,7 @@ use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
     screens::files::{FileEntry, FilePreview, FilePreviewKindView},
-    screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
+    screens::git::{BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
         AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalControl, GoalPhaseView,
@@ -202,6 +202,9 @@ pub struct SessionService {
     git_amend: Signal<bool>,
     git_push_after: Signal<bool>,
     git_remote_busy: Signal<bool>,
+    git_branches: Signal<Vec<BranchRow>>,
+    git_branch_menu: Signal<bool>,
+    git_history_ref: Rc<RefCell<Option<String>>>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
     git_commit_detail: Signal<Option<CommitDetailPreview>>,
@@ -370,6 +373,9 @@ impl SessionService {
             git_amend: signal(false),
             git_push_after: signal(false),
             git_remote_busy: signal(false),
+            git_branches: signal(Vec::new()),
+            git_branch_menu: signal(false),
+            git_history_ref: Rc::new(RefCell::new(None)),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
             git_commit_detail: signal(None),
@@ -589,6 +595,20 @@ impl SessionService {
             git_amend: self.git_amend,
             git_push_after: self.git_push_after,
             git_remote_busy: self.git_remote_busy,
+            git_branches: self.git_branches,
+            git_branch_menu: self.git_branch_menu,
+            on_open_git_branches: {
+                let service = self.clone();
+                Rc::new(move || service.open_git_branches())
+            },
+            on_close_git_branches: {
+                let service = self.clone();
+                Rc::new(move || service.git_branch_menu.set(false))
+            },
+            on_select_git_branch: {
+                let service = self.clone();
+                Rc::new(move |name: &str| service.select_git_branch(name))
+            },
             on_toggle_git_amend: {
                 let service = self.clone();
                 Rc::new(move || service.git_amend.update(|amend| *amend = !*amend))
@@ -857,6 +877,10 @@ impl SessionService {
             on_create_session: {
                 let service = self.clone();
                 Rc::new(move || service.create_new_session())
+            },
+            on_create_temporary_session: {
+                let service = self.clone();
+                Rc::new(move || service.create_temporary_session())
             },
             on_session_menu: {
                 let service = self.clone();
@@ -2680,6 +2704,15 @@ impl SessionService {
             {
                 entries.push(live_turn_entry(turn));
             }
+            let files = turn
+                .process_rows
+                .iter()
+                .filter(|row| row.kind == vibex_desktop_model::TimelineRowKind::FileOperation)
+                .map(|row| row.title.clone())
+                .collect::<Vec<_>>();
+            if !files.is_empty() {
+                entries.push(changes_entry(turn, &files));
+            }
         }
         let latest_ended_normally = turns
             .last()
@@ -3822,6 +3855,87 @@ impl SessionService {
         });
     }
 
+    fn create_temporary_session(&self) {
+        if self.new_busy.get_untracked() {
+            return;
+        }
+        let Some(runtime_id) = self.new_runtime.get_untracked() else {
+            return;
+        };
+        let Ok(index) = runtime_id.parse::<usize>() else {
+            return;
+        };
+        let option = self
+            .runtime_options
+            .borrow()
+            .iter()
+            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
+            .nth(index)
+            .cloned();
+        let Some(option) = option else {
+            return;
+        };
+        self.new_busy.set(true);
+        self.new_error.set(None);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        let workspaces = self.workspace_backend.clone();
+        spawn(async move {
+            let root =
+                background(async move { workspaces.ensure_temporary_session_root().await }).await;
+            let root = match root {
+                Ok(Ok(root)) => root,
+                Ok(Err(error)) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(error_text(&error)));
+                    return;
+                }
+                Err(error) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(
+                        format!("creating the temporary root did not finish: {error}").into(),
+                    ));
+                    return;
+                }
+            };
+            let request = CreateAgentSessionRequest {
+                runtime: option.selection,
+                workspace_root: root,
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                title: {
+                    let title = service.new_title.get_untracked().trim().to_owned();
+                    (!title.is_empty()).then_some(title)
+                },
+                safety: None,
+                session_id: Some(VibexSessionId::new()),
+                defer_runtime_materialization: false,
+                tools: Default::default(),
+            };
+            let result =
+                background(
+                    async move { backend.create_session(MutationRequest::new(request)).await },
+                )
+                .await;
+            service.new_busy.set(false);
+            match result {
+                Ok(Ok(session)) => {
+                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
+                    service.new_session_open.set(false);
+                    service.refresh();
+                    service.open(session.id.as_str());
+                    if !prompt.is_empty() {
+                        let attachments = service.new_attachments.get_untracked();
+                        service.deliver(prompt, attachments, Vec::new(), false);
+                    }
+                }
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("creating the session did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
     /// Opens the workspace's terminal full-screen over the shell.
     fn open_terminal(&self) {
         if self.terminal_open.get_untracked() {
@@ -4354,6 +4468,7 @@ impl SessionService {
         self.git_diff.set(None);
         self.git_amend.set(false);
         self.git_push_after.set(false);
+        self.load_git_branches();
         self.refresh_git();
     }
 
@@ -4487,6 +4602,48 @@ impl SessionService {
     }
 
     /// Commits what is staged with the message in the composer.
+    fn open_git_branches(&self) {
+        self.git_branch_menu.set(true);
+        self.load_git_branches();
+    }
+
+    fn load_git_branches(&self) {
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move { git.git_branch_list(workspace).await }).await;
+            match result {
+                Ok(Ok(list)) => service.git_branches.set(
+                    list.branches
+                        .into_iter()
+                        .map(|branch| BranchRow {
+                            name: branch.name,
+                            current: branch.current,
+                            detail: branch
+                                .upstream
+                                .filter(|upstream| !upstream.trim().is_empty())
+                                .unwrap_or_default(),
+                        })
+                        .collect(),
+                ),
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("reading the branches did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn select_git_branch(&self, name: &str) {
+        *self.git_history_ref.borrow_mut() = Some(name.to_owned());
+        self.git_branch_menu.set(false);
+        self.load_git_history();
+    }
+
     /// Fetches, pulls or pushes the open workspace's branch.
     fn git_remote(&self, kind: GitRemoteActionKind) {
         if self.git_remote_busy.get_untracked() {
@@ -4595,12 +4752,13 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
+            let ref_name = service.git_history_ref.borrow().clone();
             let result = background(async move {
                 git.git_history(GitHistoryRequest {
                     workspace_id: workspace,
                     limit: Some(40),
                     before_commit: None,
-                    ref_name: None,
+                    ref_name,
                     author: None,
                     query: None,
                     authored_after_ms: None,
@@ -5452,6 +5610,30 @@ fn process_header(turn: &TimelineConversationTurn, expanded: bool) -> TimelineEn
         turn_id: turn.id.clone(),
         process_count: turn.process_rows.len(),
         expanded,
+        expandable: false,
+        attachments: Vec::new(),
+        last_sequence: 0,
+        started_at_ms: turn.started_at_ms,
+        ended_at_ms: turn.ended_at_ms.unwrap_or(0),
+        complete: turn.complete,
+    }
+}
+
+fn changes_entry(turn: &TimelineConversationTurn, files: &[String]) -> TimelineEntry {
+    TimelineEntry {
+        id: format!("turn-changes:{}", turn.id),
+        kind: EntryKind::Changes,
+        title: format!(
+            "{} {}",
+            files.len(),
+            copy::text("files changed", "个文件已更改", "個檔案已變更")
+        ),
+        body: files.join("\n"),
+        meta: String::new(),
+        streaming: false,
+        turn_id: turn.id.clone(),
+        process_count: 0,
+        expanded: false,
         expandable: false,
         attachments: Vec::new(),
         last_sequence: 0,

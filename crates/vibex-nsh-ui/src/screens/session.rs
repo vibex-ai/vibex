@@ -91,6 +91,8 @@ pub enum EntryKind {
     Notice,
     /// A failure.
     Error,
+    /// The turn's changed files, summarized.
+    Changes,
     /// A permission request or its resolution.
     Permission,
     /// A question request or its resolution.
@@ -587,6 +589,7 @@ pub struct SessionHost {
     pub new_title: Signal<String>,
     pub new_prompt: Signal<String>,
     pub new_attachments: Signal<Vec<AttachmentItem>>,
+    pub on_create_temporary_session: Action,
     pub on_attach_new_image: Action,
     pub on_attach_new_file: Action,
     pub on_remove_new_attachment: Rc<dyn Fn(&str)>,
@@ -625,6 +628,11 @@ pub struct SessionHost {
     pub git_amend: Signal<bool>,
     pub git_push_after: Signal<bool>,
     pub git_remote_busy: Signal<bool>,
+    pub git_branches: Signal<Vec<crate::screens::git::BranchRow>>,
+    pub git_branch_menu: Signal<bool>,
+    pub on_open_git_branches: Action,
+    pub on_close_git_branches: Action,
+    pub on_select_git_branch: Rc<dyn Fn(&str)>,
     pub on_toggle_git_amend: Action,
     pub on_toggle_git_push_after: Action,
     pub on_git_push: Action,
@@ -723,6 +731,11 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         amend: host.git_amend,
         push_after: host.git_push_after,
         remote_busy: host.git_remote_busy,
+        branches: host.git_branches,
+        branch_menu: host.git_branch_menu,
+        on_open_branches: host.on_open_git_branches.clone(),
+        on_close_branches: host.on_close_git_branches.clone(),
+        on_select_branch: host.on_select_git_branch.clone(),
         on_toggle_amend: host.on_toggle_git_amend.clone(),
         on_toggle_push_after: host.on_toggle_git_push_after.clone(),
         on_push: host.on_git_push.clone(),
@@ -881,6 +894,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             error: host.new_error,
             on_close: host.on_close_new_session.clone(),
             on_create: host.on_create_session.clone(),
+            on_create_temporary: host.on_create_temporary_session.clone(),
             title: host.new_title,
             prompt: host.new_prompt,
             attachments: host.new_attachments,
@@ -1410,6 +1424,10 @@ fn entry_element(
             move || error_card(body),
         ))
         .child(when(
+            move || kind.with(|kind| *kind == Some(EntryKind::Changes)),
+            move || changes_card(title, body),
+        ))
+        .child(when(
             move || {
                 kind.with(|kind| matches!(kind, Some(EntryKind::Permission | EntryKind::Question)))
             },
@@ -1754,6 +1772,42 @@ fn tool_card(
             text(move || body.get())
                 .text_size(px(theme::font_caption()))
                 .line_height(theme::line_height_for(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
+}
+
+fn changes_card(title: Memo<String>, body: Memo<String>) -> impl IntoElement {
+    view()
+        .w_full()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .p(px(theme::SPACING_MD))
+        .gap(px(theme::SPACING_XS))
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(
+                    svg(icon(include_str!("../../assets/icons/file-text.svg")))
+                        .w(px(theme::ICON_SM))
+                        .h(px(theme::ICON_SM))
+                        .text_color(theme::text_muted),
+                )
+                .child(
+                    text(move || title.get())
+                        .flex_1()
+                        .text_size(px(theme::font_detail()))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::foreground),
+                ),
+        )
+        .child(
+            text(move || body.get())
+                .text_size(px(theme::font_micro()))
+                .line_height(theme::line_height_for(theme::font_micro()))
                 .text_color(theme::text_secondary),
         )
 }

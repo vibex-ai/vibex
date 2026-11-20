@@ -46,6 +46,7 @@ pub struct NewSessionHost {
     pub error: Signal<Option<SharedString>>,
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
+    pub on_create_temporary: Rc<dyn Fn()>,
     /// The session's optional title, first message and its attachments.
     pub title: Signal<String>,
     pub prompt: Signal<String>,

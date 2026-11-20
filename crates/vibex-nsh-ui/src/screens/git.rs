@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::{ButtonElement, button};
+use nsh_base::{ButtonElement, SheetEvent, button, sheet};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{
@@ -16,6 +16,14 @@ use crate::{
 
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
+
+/// One local branch in the branch sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct BranchRow {
+    pub name: String,
+    pub current: bool,
+    pub detail: String,
+}
 
 /// One changed path in the status list.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -74,6 +82,11 @@ pub struct GitHost {
     pub amend: Signal<bool>,
     pub push_after: Signal<bool>,
     pub remote_busy: Signal<bool>,
+    pub branches: Signal<Vec<BranchRow>>,
+    pub branch_menu: Signal<bool>,
+    pub on_open_branches: Rc<dyn Fn()>,
+    pub on_close_branches: Rc<dyn Fn()>,
+    pub on_select_branch: Rc<dyn Fn(&str)>,
     pub on_toggle_amend: Rc<dyn Fn()>,
     pub on_toggle_push_after: Rc<dyn Fn()>,
     pub on_push: Rc<dyn Fn()>,
@@ -165,6 +178,14 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             )
                         })
                         .child({
+                            let on_open_branches = host.on_open_branches.clone();
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/menu.svg")),
+                                copy::text("Branches", "分支", "分支"),
+                                move || on_open_branches(),
+                            )
+                        })
+                        .child({
                             let on_toggle_history = host.on_toggle_history.clone();
                             action::icon_button(
                                 icon(include_str!("../../assets/icons/history.svg")),
@@ -186,6 +207,12 @@ pub fn git(host: GitHost) -> impl IntoElement {
             let detail = commit_detail;
             move || commit_detail_view(detail)
         }))
+        .child(branch_sheet(
+            host.branch_menu,
+            host.branches,
+            host.on_close_branches.clone(),
+            host.on_select_branch.clone(),
+        ))
         .child(when(
             move || commit_detail.get().is_none() && show_history.get(),
             {
@@ -530,6 +557,76 @@ fn commit_bar(
                     || message.with(|message| message.trim().is_empty())
             })
             .disabled_style(|style| style.opacity(0.4)),
+        )
+}
+
+fn branch_sheet(
+    open: Signal<bool>,
+    branches: Signal<Vec<BranchRow>>,
+    on_close: Rc<dyn Fn()>,
+    on_select: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .max_h(px(480.0))
+                .gap(px(theme::SPACING_XS))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Branches", "分支", "分支"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(each(
+                    move || branches.get(),
+                    |branch| branch.name.clone(),
+                    move |branch, _| {
+                        let on_select = on_select.clone();
+                        button()
+                            .w_full()
+                            .min_h(px(44.0))
+                            .px(px(theme::SPACING_SM))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::background_dim)
+                            .active(|style| style.opacity(0.8))
+                            .on_press(move || on_select(&branch.get_untracked().name))
+                            .child(
+                                text(move || {
+                                    let branch = branch.get();
+                                    if branch.current {
+                                        format!("✓ {}", branch.name)
+                                    } else {
+                                        branch.name
+                                    }
+                                })
+                                .flex_1()
+                                .truncate()
+                                .text_size(px(theme::font_body()))
+                                .text_color(theme::foreground),
+                            )
+                            .child(
+                                text(move || branch.get().detail)
+                                    .truncate()
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_muted),
+                            )
+                    },
+                )),
         )
 }
 

@@ -13,7 +13,9 @@ use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView};
-use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
+use vibex_nsh_ui::screens::git::{
+    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
+};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalPhaseView, GoalView,
@@ -179,6 +181,7 @@ fn TurnShell() -> impl IntoElement {
         header,
         tool,
         permission,
+        entry("c1", EntryKind::Changes, "1 files changed", "src/main.rs"),
         entry("a1", EntryKind::Agent, "Claude", "Done"),
     ]);
     session::session(host)
@@ -359,6 +362,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let git_amend = signal(false);
     let git_push_after = signal(false);
     let git_remote_busy = signal(false);
+    let git_branches = signal(vec![BranchRow {
+        name: "main".to_owned(),
+        current: true,
+        detail: "origin/main".to_owned(),
+    }]);
+    let git_branch_menu = signal(false);
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
     let token_usage = signal(None);
@@ -835,6 +844,11 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         git_amend,
         git_push_after,
         git_remote_busy,
+        git_branches,
+        git_branch_menu,
+        on_open_git_branches: Rc::new(move || git_branch_menu.set(true)),
+        on_close_git_branches: Rc::new(move || git_branch_menu.set(false)),
+        on_select_git_branch: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),
         on_git_push: Rc::new(|| {}),
@@ -866,6 +880,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_busy,
         new_error,
         on_create_session,
+        on_create_temporary_session: Rc::new(|| {}),
         new_worktree_branch,
         new_base_ref,
         new_title,
@@ -989,6 +1004,7 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     app.wait_for("Worked for 2s").unwrap();
     assert!(app.screen().shows("cargo test"));
     assert!(app.screen().shows("Detail"));
+    assert!(app.screen().shows("1 files changed"));
     assert!(app.screen().shows("Run cargo test?"));
     assert!(app.screen().shows("Allowed"));
     assert!(app.screen().shows("photo.jpg"));
@@ -1226,6 +1242,16 @@ fn a_markdown_file_is_drawn_as_markdown() {
     app.wait_for("README.md").unwrap();
     app.press("README.md").unwrap();
     app.wait_for("Hello").unwrap();
+}
+
+#[test]
+fn the_git_branch_sheet_lists_local_branches() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("role:button[Branches]").unwrap();
+    app.wait_for("origin/main").unwrap();
 }
 
 #[test]
