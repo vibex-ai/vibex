@@ -102,6 +102,9 @@ static CAMERA_PHOTO: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 static NEW_SESSION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
+/// The APK URL waiting for the Android host to download and install.
+static UPDATE_URL: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// Text another app shared into Vibex, waiting for the engine to take it.
 static SHARED_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
@@ -260,6 +263,33 @@ pub fn set_camera_photo(path: &str) {
 /// Takes the camera photo path, if one is waiting.
 pub fn take_camera_photo() -> Option<String> {
     CAMERA_PHOTO
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+}
+
+/// Queues the install of the update at `url`.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host installs updates")
+)]
+pub fn request_update_install(url: &str) {
+    let url = url.trim();
+    if url.is_empty() {
+        return;
+    }
+    *UPDATE_URL
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(url.to_owned());
+}
+
+/// Takes the pending update URL.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host takes it")
+)]
+pub fn take_update_url() -> Option<String> {
+    UPDATE_URL
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
 }

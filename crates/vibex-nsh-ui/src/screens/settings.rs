@@ -60,6 +60,7 @@ pub struct SettingsHost {
     pub on_show_generation_status: Rc<dyn Fn(bool)>,
     pub on_show_reasoning: Rc<dyn Fn(bool)>,
     pub on_auto_continue: Rc<dyn Fn(bool)>,
+    pub on_install_update: Rc<dyn Fn(&str)>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_reconnect: Rc<dyn Fn()>,
     pub on_switch_runtime: Rc<dyn Fn()>,
@@ -252,7 +253,7 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                         }
                     }))
                     .child(notifications_sheet(notifications_open, host.clone()))
-                    .child(about_sheet(about_open))
+                    .child(about_sheet(about_open, host.on_install_update.clone()))
                     .child({
                         let on_close = on_close.clone();
                         action::secondary(
@@ -505,8 +506,9 @@ fn notifications_sheet(open: Signal<bool>, host: SettingsHost) -> impl IntoEleme
         )
 }
 
-fn about_sheet(open: Signal<bool>) -> impl IntoElement {
+fn about_sheet(open: Signal<bool>, on_install_update: Rc<dyn Fn(&str)>) -> impl IntoElement {
     let update_status = signal(None::<SharedString>);
+    let update_url = signal(None::<String>);
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -567,6 +569,17 @@ fn about_sheet(open: Signal<bool>) -> impl IntoElement {
                                             .nth(1)
                                             .and_then(|rest| rest.split('"').nth(1))
                                             .map(str::to_owned);
+                                        let url = body
+                                            .match_indices("\"browser_download_url\"")
+                                            .filter_map(|(index, _)| {
+                                                let rest = &body[index + 22..];
+                                                let value = rest.split('"').nth(1)?;
+                                                value
+                                                    .ends_with(".apk")
+                                                    .then(|| value.to_owned())
+                                            })
+                                            .next();
+                                        update_url.set(url);
                                         match tag {
                                             Some(tag) => {
                                                 let tag = tag.trim_start_matches('v');
@@ -621,6 +634,23 @@ fn about_sheet(open: Signal<bool>) -> impl IntoElement {
                     text(move || update_status.get().unwrap_or_default())
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_secondary)
+                }))
+                .child(when(move || update_url.get().is_some(), {
+                    let on_install_update = on_install_update.clone();
+                    move || {
+                        let on_install_update = on_install_update.clone();
+                        action::secondary(
+                            copy::text("Install update", "安装更新", "安裝更新"),
+                            icon(include_str!("../../assets/icons/check.svg")),
+                            false,
+                            move || {
+                                if let Some(url) = update_url.get_untracked() {
+                                    on_install_update(&url);
+                                }
+                            },
+                        )
+                        .w_full()
+                    }
                 }))
                 .child(
                     action::secondary(

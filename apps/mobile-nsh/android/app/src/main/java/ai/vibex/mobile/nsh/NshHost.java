@@ -25,6 +25,9 @@ public final class NshHost {
     /** A launcher shortcut asked for a new session. */
     public static native void nativeNewSession();
 
+    /** The APK URL the host should download and install, or null. */
+    public static native String nativeTakeUpdateUrl();
+
     /** Text another app shared into Vibex. */
     public static native void nativeShareText(String value);
 

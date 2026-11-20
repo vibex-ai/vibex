@@ -333,6 +333,7 @@ fn settings_host(
                 service.set_show_reasoning(enabled);
             }
         }),
+        on_install_update: Rc::new(crate::host::request_update_install),
         on_auto_continue: Rc::new(move |enabled| {
             settings_for_auto_continue.set_auto_continue(enabled);
             if let Some(service) = services_for_auto_continue.get_untracked() {

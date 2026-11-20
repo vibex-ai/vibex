@@ -1,7 +1,12 @@
 package com.longbridge.nsh;
 
 import android.app.Activity;
+import android.app.DownloadManager;
+import android.content.BroadcastReceiver;
+import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
+import android.os.Environment;
 import android.net.Uri;
 import android.provider.MediaStore;
 import android.os.Bundle;
@@ -32,6 +37,9 @@ public final class MainActivity extends Activity {
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean scanning;
     private String cameraPath;
+    private long updateDownloadId = -1;
+    private String updateApkPath;
+    private BroadcastReceiver updateReceiver;
 
     private final Runnable poll = new Runnable() {
         @Override
@@ -46,6 +54,10 @@ public final class MainActivity extends Activity {
                 lanDiscovery.stop();
             } else if (request == 4) {
                 openCamera();
+            }
+            String updateUrl = NshHost.nativeTakeUpdateUrl();
+            if (updateUrl != null) {
+                downloadUpdate(updateUrl);
             }
             int connectionService = NshHost.nativeTakeConnectionService();
             if (connectionService == 1) {
@@ -82,11 +94,55 @@ public final class MainActivity extends Activity {
         }
         view.runRustApp("nsh");
         DevActivity.systemBars(this);
+        updateReceiver = new BroadcastReceiver() {
+            @Override
+            public void onReceive(Context context, Intent intent) {
+                long id = intent.getLongExtra(DownloadManager.EXTRA_DOWNLOAD_ID, -1);
+                if (id == updateDownloadId && updateApkPath != null) {
+                    installApk(updateApkPath);
+                }
+            }
+        };
+        registerReceiver(updateReceiver, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
         handler.post(poll);
     }
 
     private void openScanner() {
         startActivityForResult(new Intent(this, ScannerActivity.class), SCAN_REQUEST);
+    }
+
+    private void downloadUpdate(String url) {
+        try {
+            File directory = new File(getExternalFilesDir(Environment.DIRECTORY_DOWNLOADS), "updates");
+            if (!directory.exists() && !directory.mkdirs()) {
+                return;
+            }
+            File apk = new File(directory, "vibex-update.apk");
+            updateApkPath = apk.getAbsolutePath();
+            DownloadManager.Request request = new DownloadManager.Request(Uri.parse(url));
+            request.setTitle("Vibex update");
+            request.setMimeType("application/vnd.android.package-archive");
+            request.setDestinationUri(Uri.fromFile(apk));
+            request.setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED);
+            DownloadManager manager = (DownloadManager) getSystemService(Context.DOWNLOAD_SERVICE);
+            updateDownloadId = manager.enqueue(request);
+        } catch (Exception error) {
+            updateDownloadId = -1;
+            updateApkPath = null;
+        }
+    }
+
+    private void installApk(String path) {
+        try {
+            File apk = new File(path);
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", apk);
+            Intent intent = new Intent(Intent.ACTION_VIEW);
+            intent.setDataAndType(uri, "application/vnd.android.package-archive");
+            intent.addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION | Intent.FLAG_ACTIVITY_NEW_TASK);
+            startActivity(intent);
+        } catch (Exception error) {
+            // The user can still install from the release page.
+        }
     }
 
     private void openCamera() {
@@ -185,6 +241,10 @@ public final class MainActivity extends Activity {
     @Override
     protected void onDestroy() {
         handler.removeCallbacks(poll);
+        if (updateReceiver != null) {
+            unregisterReceiver(updateReceiver);
+            updateReceiver = null;
+        }
         if (lanDiscovery != null) {
             lanDiscovery.stop();
         }

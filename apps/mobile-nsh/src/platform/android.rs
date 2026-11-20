@@ -94,6 +94,24 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeCameraPhoto(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// The pending update APK URL, or null.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeUpdateUrl(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+) -> jni::sys::jstring {
+    let Some(url) = crate::host::take_update_url() else {
+        return std::ptr::null_mut();
+    };
+    let mut out = std::ptr::null_mut();
+    env.with_env(|env| -> jni::errors::Result<()> {
+        out = env.new_string(url)?.into_raw();
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>();
+    out
+}
+
 /// Records a launcher shortcut asking for a new session.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeNewSession(
