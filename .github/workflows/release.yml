@@ -350,6 +350,12 @@ jobs:
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
+    # The mobile client still builds on the gpui-pre platform layer while the
+    # desktop moved to gpui-fast, so `cargo ndk` cannot compile the shared UI
+    # crates for a phone. Mobile packaging is therefore opt-in until that layer
+    # is ported: set the repository variable VIBEX_MOBILE_RELEASES_ENABLED to
+    # true to publish Android and iOS again.
+    if: ${{ vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -422,6 +428,9 @@ jobs:
   mobile-ios:
     name: Mobile iOS release artifact
     needs: release-meta
+    # See mobile-android: the Apple packages are withheld for the same reason
+    # and the same repository variable turns them back on.
+    if: ${{ vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
     timeout-minutes: 120
@@ -480,7 +489,11 @@ jobs:
       # event; see the dispatch step at the end of it.
       actions: write
     needs: [release-meta, desktop, server-linux, server-macos, mobile-android, mobile-ios]
-    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && needs.mobile-android.result == 'success' && needs.mobile-ios.result == 'success' }}
+    # A mobile job that was not asked to run is `skipped`, not `success`: the
+    # desktop, server and container artifacts must still publish while mobile
+    # packaging is switched off. A mobile job that actually ran and failed still
+    # holds the release, which is what "a partial build never publishes" means.
+    if: ${{ always() && needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped') }}
     runs-on: ubuntu-24.04
     steps:
       # The release body compares the published tag against the previous one and

@@ -3991,7 +3991,7 @@ checksum = "85701631a9bbecf47e6d19f145e85e57767e7c50f7192d5b1bf65b5ef43cb373"
 
 [[package]]
 name = "gpui-tokio"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "gpui-fast",
@@ -10143,7 +10143,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "vibex-agent"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -10164,7 +10164,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-acp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "agent-client-protocol-schema",
  "async-trait",
@@ -10192,7 +10192,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-claude"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -10203,7 +10203,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-agent-codex"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -10214,7 +10214,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-app-update"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -10236,7 +10236,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-backend"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -10253,7 +10253,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-backup"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "rusqlite",
  "serde",
@@ -10265,7 +10265,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-brands"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "image",
  "resvg 0.46.0",
@@ -10273,7 +10273,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-browser"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -10300,7 +10300,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-client"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "serde",
@@ -10320,7 +10320,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-computer"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -10341,7 +10341,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-config-switch"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs 6.0.0",
  "flate2",
@@ -10363,7 +10363,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-content"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "pdfium-render",
  "quick-xml 0.41.0",
@@ -10378,7 +10378,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "base64",
  "js-sys",
@@ -10394,7 +10394,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-db"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "dirs 6.0.0",
  "rusqlite",
@@ -10406,7 +10406,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -10472,7 +10472,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop-model"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "serde",
  "serde_json",
@@ -10486,7 +10486,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-desktop-runtime"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "base64",
@@ -10538,7 +10538,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-diagnostics"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "serde",
@@ -10556,7 +10556,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-fs"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "ignore",
  "regex",
@@ -10569,7 +10569,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-git"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "fs2",
  "serde",
@@ -10580,7 +10580,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-im-channel"
-version = "0.1.6"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -10604,14 +10604,14 @@ dependencies = [
 
 [[package]]
 name = "vibex-installer-env"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "windows-sys 0.59.0",
 ]
 
 [[package]]
 name = "vibex-mobile"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "android-activity",
  "base64",
@@ -10648,7 +10648,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-model-catalog"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "reqwest",
  "serde",
@@ -10659,7 +10659,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-model-gateway"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "base64",
@@ -10681,7 +10681,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-relay"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -10698,7 +10698,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-relay-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "futures-util",
@@ -10716,7 +10716,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-remote"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "axum",
@@ -10750,7 +10750,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-remote-client"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "base64",
@@ -10787,7 +10787,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-server"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "libc",
  "qrcode",
@@ -10809,7 +10809,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-terminal"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "alacritty_terminal",
  "libc",
@@ -10823,7 +10823,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-terminal-ui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "alacritty_terminal",
  "serde",
@@ -10832,7 +10832,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-tui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "chrono",
@@ -10869,7 +10869,7 @@ dependencies = [
 
 [[package]]
 name = "vibex-ui"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "gpui-component",
  "gpui-fast",
