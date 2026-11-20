@@ -449,6 +449,9 @@ pub struct SessionHost {
     pub pinned: Signal<Vec<String>>,
     pub unread: Signal<Vec<String>>,
     pub auto_continue_sessions: Signal<Vec<String>>,
+    pub sidebar_project_order: Signal<Vec<String>>,
+    pub sidebar_workspace_order: Signal<Vec<(String, Vec<String>)>>,
+    pub sidebar_session_order: Signal<Vec<String>>,
     pub on_set_session_auto_continue: SessionToggle,
     pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
     pub folder_open: Signal<bool>,
@@ -4178,6 +4181,9 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let pinned = host.pinned;
     let sidebar_sections = host.sidebar_sections;
     let unread = host.unread;
+    let project_order = host.sidebar_project_order;
+    let workspace_order = host.sidebar_workspace_order;
+    let session_order = host.sidebar_session_order;
     let folder_open = host.folder_open;
     let folder_name = host.folder_name;
     let on_open_folder = host.on_open_folder.clone();
@@ -4464,7 +4470,15 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 })
                                 .child(each(
                                     move || {
-                                        drawer_groups(sessions, query, host.pinned, hidden_sessions)
+                                        drawer_groups(
+                                            sessions,
+                                            query,
+                                            host.pinned,
+                                            hidden_sessions,
+                                            project_order,
+                                            workspace_order,
+                                            session_order,
+                                        )
                                     },
                                     |group| group.id.clone(),
                                     move |group, _| {
@@ -4624,10 +4638,16 @@ fn drawer_groups(
     query: Signal<String>,
     pinned: Signal<Vec<String>>,
     hidden: Memo<Vec<String>>,
+    project_order: Signal<Vec<String>>,
+    workspace_order: Signal<Vec<(String, Vec<String>)>>,
+    session_order: Signal<Vec<String>>,
 ) -> Vec<DrawerGroup> {
     sessions.with(|sessions| {
         let pinned_ids = pinned.get_untracked();
         let hidden_ids = hidden.get_untracked();
+        let project_rank = project_order.get_untracked();
+        let workspace_rank = workspace_order.get_untracked();
+        let session_rank = session_order.get_untracked();
         let query = query.with(|query| query.trim().to_lowercase());
         let _ = &query;
         let mut groups: Vec<DrawerGroup> = Vec::new();
@@ -4661,6 +4681,11 @@ fn drawer_groups(
             }
         }
         for group in &mut groups {
+            let workspace_ranks = workspace_rank
+                .iter()
+                .find(|(project, _)| project == &group.id)
+                .map(|(_, workspaces)| workspaces.clone())
+                .unwrap_or_default();
             let mut sessions = group
                 .rows
                 .drain(..)
@@ -4669,7 +4694,18 @@ fn drawer_groups(
                     DrawerRow::Header { .. } => None,
                 })
                 .collect::<Vec<_>>();
-            sessions.sort_by_key(|session| !pinned_ids.iter().any(|id| id == &session.id));
+            sessions.sort_by_key(|session| {
+                let pinned = !pinned_ids.iter().any(|id| id == &session.id);
+                let workspace_rank = workspace_ranks
+                    .iter()
+                    .position(|id| id == &session.workspace_id)
+                    .unwrap_or(usize::MAX);
+                let rank = session_rank
+                    .iter()
+                    .position(|id| id == &session.id)
+                    .unwrap_or(usize::MAX);
+                (pinned, workspace_rank, rank)
+            });
             group.count = sessions.len();
             let mut rows = Vec::new();
             let mut current: Option<String> = None;
@@ -4695,6 +4731,12 @@ fn drawer_groups(
             }
             group.rows = rows;
         }
+        groups.sort_by_key(|group| {
+            project_rank
+                .iter()
+                .position(|id| id == &group.id)
+                .unwrap_or(usize::MAX)
+        });
         groups
     })
 }
