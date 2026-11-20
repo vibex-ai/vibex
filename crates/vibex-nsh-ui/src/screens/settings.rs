@@ -70,6 +70,7 @@ pub struct SettingsHost {
 /// The sheet.
 pub fn settings(host: SettingsHost) -> impl IntoElement {
     let open = host.open;
+    let about_open = signal(false);
     let on_close = host.on_close.clone();
     let on_close_sheet = on_close.clone();
     sheet()
@@ -212,7 +213,16 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                             }))
                             .child(value_row(copy::text("License", "许可", "授權"), || {
                                 "AGPL-3.0-or-later".to_owned()
-                            })),
+                            }))
+                            .child({
+                                action::secondary(
+                                    copy::text("About Vibex", "关于 Vibex", "關於 Vibex"),
+                                    icon(include_str!("../../assets/icons/vibex-mark.svg")),
+                                    false,
+                                    move || about_open.set(true),
+                                )
+                                .w_full()
+                            }),
                     ))
                     .child(when(move || !host.saved.with(|saved| saved.is_empty()), {
                         let on_clear = host.on_clear_runtimes.clone();
@@ -231,6 +241,7 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                             .w_full()
                         }
                     }))
+                    .child(about_sheet(about_open))
                     .child({
                         let on_close = on_close.clone();
                         action::secondary(
@@ -424,6 +435,53 @@ fn toggle_row(
                 move || on_toggle(!enabled.get_untracked()),
             )
             .accessibility_label(label),
+        )
+}
+
+fn about_sheet(open: Signal<bool>) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event {
+                open.set(*next);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("About Vibex", "关于 Vibex", "關於 Vibex"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(value_row(copy::text("Version", "版本", "版本"), || {
+                    format!("Vibex {}", env!("CARGO_PKG_VERSION"))
+                }))
+                .child(value_row(copy::text("License", "许可", "授權"), || {
+                    "AGPL-3.0-or-later".to_owned()
+                }))
+                .child(
+                    text(copy::text(
+                        "A local-first AI coding workbench. The runtime owns the work; this phone is its client.",
+                        "本地优先的 AI 编程工作台。运行时拥有工作，这台手机是它的客户端。",
+                        "本地優先的 AI 編程工作台。執行環境擁有工作，這台手機是它的客戶端。",
+                    ))
+                    .text_size(px(theme::font_caption()))
+                    .line_height(theme::line_height_for(theme::font_caption()))
+                    .text_color(theme::text_secondary),
+                )
+                .child(
+                    text("github.com/peatboy/vibex")
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                ),
         )
 }
 

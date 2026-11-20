@@ -774,6 +774,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_replace_message: Rc::new(|_| {}),
         on_send_queued: Rc::new(|_| {}),
         on_remove_queued: Rc::new(|_| {}),
+        on_move_queued: Rc::new(|_, _| {}),
         on_clear_queue: Rc::new(|| {}),
         on_toggle_queue_paused: Rc::new(|| {}),
         on_open_history: Rc::new(|| {}),
@@ -968,6 +969,8 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("Pause"));
     assert!(app.screen().shows("Queued · 1"));
     assert!(app.screen().shows("Hold this (+1)"));
+    assert!(app.screen().shows("↑"));
+    assert!(app.screen().shows("↓"));
     app.press("Claude 4").unwrap();
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();

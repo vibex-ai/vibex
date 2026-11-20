@@ -792,6 +792,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |id: u64| service.remove_queued(id))
             },
+            on_move_queued: {
+                let service = self.clone();
+                Rc::new(move |id: u64, delta: isize| service.move_queued(id, delta))
+            },
             on_clear_queue: {
                 let service = self.clone();
                 Rc::new(move || service.clear_queue())
@@ -2428,6 +2432,27 @@ impl SessionService {
         self.publish_queue();
         self.persist_queues();
         self.deliver(message.text, message.attachments, message.mentions, false);
+    }
+
+    fn move_queued(&self, id: u64, delta: isize) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let mut queues = self.queue.borrow_mut();
+        let Some(queue) = queues.get_mut(&active) else {
+            return;
+        };
+        let Some(index) = queue.iter().position(|message| message.id == id) else {
+            return;
+        };
+        let target = index as isize + delta;
+        if target < 0 || target >= queue.len() as isize {
+            return;
+        }
+        queue.swap(index, target as usize);
+        drop(queues);
+        self.publish_queue();
+        self.persist_queues();
     }
 
     fn remove_queued(&self, id: u64) {

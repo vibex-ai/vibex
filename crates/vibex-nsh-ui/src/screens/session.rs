@@ -500,6 +500,7 @@ pub struct SessionHost {
 
     pub on_send_queued: Rc<dyn Fn(u64)>,
     pub on_remove_queued: Rc<dyn Fn(u64)>,
+    pub on_move_queued: Rc<dyn Fn(u64, isize)>,
     pub on_clear_queue: Action,
     pub on_toggle_queue_paused: Action,
     pub on_open_history: Action,
@@ -2410,6 +2411,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let queue_paused = host.queue_paused;
     let on_send_queued = host.on_send_queued.clone();
     let on_remove_queued = host.on_remove_queued.clone();
+    let on_move_queued = host.on_move_queued.clone();
     let on_clear_queue = host.on_clear_queue.clone();
     let on_toggle_queue_paused = host.on_toggle_queue_paused.clone();
     let editing = host.editing;
@@ -2535,6 +2537,7 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     queue_paused,
                     on_send_queued.clone(),
                     on_remove_queued.clone(),
+                    on_move_queued.clone(),
                     on_clear_queue.clone(),
                     on_toggle_queue_paused.clone(),
                 )
@@ -2659,6 +2662,7 @@ fn queue_card(
     paused: Signal<bool>,
     on_send: Rc<dyn Fn(u64)>,
     on_remove: Rc<dyn Fn(u64)>,
+    on_move: Rc<dyn Fn(u64, isize)>,
     on_clear: Action,
     on_toggle_paused: Action,
 ) -> impl IntoElement {
@@ -2730,6 +2734,14 @@ fn queue_card(
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_secondary),
                     )
+                    .child({
+                        let on_move = on_move.clone();
+                        move || small_action("↑", move || on_move(id, -1))
+                    }())
+                    .child({
+                        let on_move = on_move.clone();
+                        move || small_action("↓", move || on_move(id, 1))
+                    }())
                     .child(small_action(
                         copy::text("Send", "发送", "傳送"),
                         move || send(id),
