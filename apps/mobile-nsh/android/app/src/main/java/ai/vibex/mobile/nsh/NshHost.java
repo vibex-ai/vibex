@@ -16,6 +16,9 @@ public final class NshHost {
     /** A pairing link the camera read. */
     public static native void nativeScanResult(String value);
 
+    /** A launcher shortcut asked for a new session. */
+    public static native void nativeNewSession();
+
     /** Text another app shared into Vibex. */
     public static native void nativeShareText(String value);
 

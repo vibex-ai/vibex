@@ -67,6 +67,7 @@ public final class MainActivity extends Activity {
         if (state == null) {
             view.handleUrlSchemeIntent(getIntent());
             readSharedText(getIntent());
+            readShortcut(getIntent());
         }
         view.runRustApp("nsh");
         DevActivity.systemBars(this);
@@ -111,6 +112,14 @@ public final class MainActivity extends Activity {
             view.handleUrlSchemeIntent(intent);
         }
         readSharedText(intent);
+        readShortcut(intent);
+    }
+
+    private void readShortcut(Intent intent) {
+        if (intent != null
+                && "ai.vibex.mobile.nsh.NEW_SESSION".equals(intent.getAction())) {
+            NshHost.nativeNewSession();
+        }
     }
 
     private void readSharedText(Intent intent) {
