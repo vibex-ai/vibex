@@ -172,6 +172,14 @@ pub struct TokenUsageView {
     pub output: u64,
 }
 
+/// A prompt waiting for the running turn to settle.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct QueuedMessageView {
+    pub id: u64,
+    pub text: String,
+    pub attachment_count: usize,
+}
+
 /// One prompt already sent, for the composer's history sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ComposerHistoryEntry {
@@ -450,6 +458,13 @@ pub struct SessionHost {
     /// The prompts already sent in this session.
     pub history: Signal<Vec<ComposerHistoryEntry>>,
     pub history_open: Signal<bool>,
+    /// Prompts written ahead of a running turn.
+    pub queued: Signal<Vec<QueuedMessageView>>,
+    pub queue_paused: Signal<bool>,
+    pub on_send_queued: Rc<dyn Fn(u64)>,
+    pub on_remove_queued: Rc<dyn Fn(u64)>,
+    pub on_clear_queue: Action,
+    pub on_toggle_queue_paused: Action,
     pub on_open_history: Action,
     pub on_close_history: Action,
     pub on_recall_history: Rc<dyn Fn(&str)>,
@@ -1278,6 +1293,25 @@ fn message_actions(
         }))
 }
 
+fn small_action_reactive(
+    label: impl Fn() -> &'static str + 'static,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .on_press(on_press)
+        .min_h(px(28.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .active(|style| style.opacity(0.7))
+        .child(
+            text(label)
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted),
+        )
+}
+
 fn small_action(label: &'static str, on_press: impl Fn() + 'static) -> ButtonElement {
     button()
         .on_press(on_press)
@@ -1881,6 +1915,12 @@ fn composer(host: SessionHost) -> impl IntoElement {
     let token_usage = host.token_usage;
     let plan = host.plan;
     let goal = host.goal;
+    let queued = host.queued;
+    let queue_paused = host.queue_paused;
+    let on_send_queued = host.on_send_queued.clone();
+    let on_remove_queued = host.on_remove_queued.clone();
+    let on_clear_queue = host.on_clear_queue.clone();
+    let on_toggle_queue_paused = host.on_toggle_queue_paused.clone();
     let on_goal_control = host.on_goal_control.clone();
     let plan_open = signal(false);
     let on_open_runtime = host.on_open_runtime.clone();
@@ -1927,6 +1967,18 @@ fn composer(host: SessionHost) -> impl IntoElement {
             move || !attachments.with(|attachments| attachments.is_empty()),
             move || attachment_chips(attachments, on_remove_attachment.clone()),
         ))
+        .child(when(move || !queued.with(|queued| queued.is_empty()), {
+            move || {
+                queue_card(
+                    queued,
+                    queue_paused,
+                    on_send_queued.clone(),
+                    on_remove_queued.clone(),
+                    on_clear_queue.clone(),
+                    on_toggle_queue_paused.clone(),
+                )
+            }
+        }))
         .child(when(move || goal.get().is_some(), {
             let on_goal_control = on_goal_control.clone();
             move || goal_bar(goal, on_goal_control.clone())
@@ -2022,6 +2074,95 @@ fn composer(host: SessionHost) -> impl IntoElement {
         .child(when(
             move || keyboard_height().0 == 0.0,
             || view().h(safe_area().bottom),
+        ))
+}
+
+/// The prompts written ahead of the running turn.
+fn queue_card(
+    queued: Signal<Vec<QueuedMessageView>>,
+    paused: Signal<bool>,
+    on_send: Rc<dyn Fn(u64)>,
+    on_remove: Rc<dyn Fn(u64)>,
+    on_clear: Action,
+    on_toggle_paused: Action,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .p(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    text(move || {
+                        format!(
+                            "{} · {}",
+                            copy::text("Queued", "队列", "佇列"),
+                            queued.with(|queued| queued.len())
+                        )
+                    })
+                    .flex_1()
+                    .text_size(px(theme::font_caption()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .text_color(theme::text_secondary),
+                )
+                .child(small_action_reactive(
+                    move || {
+                        if paused.get_untracked() {
+                            copy::text("Resume", "继续", "繼續")
+                        } else {
+                            copy::text("Pause", "暂停", "暫停")
+                        }
+                    },
+                    move || on_toggle_paused(),
+                ))
+                .child(small_action(
+                    copy::text("Clear", "清空", "清空"),
+                    move || on_clear(),
+                )),
+        )
+        .child(each(
+            move || queued.get(),
+            |message| message.id,
+            move |message, _| {
+                let id = message.with(|message| message.id);
+                let send = on_send.clone();
+                let remove = on_remove.clone();
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .child(
+                        text(move || {
+                            message.with(|message| {
+                                if message.attachment_count > 0 {
+                                    format!("{} (+{})", message.text, message.attachment_count)
+                                } else {
+                                    message.text.clone()
+                                }
+                            })
+                        })
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_secondary),
+                    )
+                    .child(small_action(
+                        copy::text("Send", "发送", "傳送"),
+                        move || send(id),
+                    ))
+                    .child(small_action(
+                        copy::text("Remove", "移除", "移除"),
+                        move || remove(id),
+                    ))
+            },
         ))
 }
 

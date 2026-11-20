@@ -18,8 +18,9 @@ use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalPhaseView, GoalView,
     PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
-    PlanStepView, PlanView, QuestionField, QuestionFieldKind, RuntimeChoiceView, RuntimeOptionView,
-    RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry, TokenUsageView,
+    PlanStepView, PlanView, QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView,
+    RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
+    TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
@@ -228,6 +229,11 @@ fn RuntimeShell() -> impl IntoElement {
         can_resume: false,
         can_clear: true,
     }));
+    host.queued = signal(vec![QueuedMessageView {
+        id: 1,
+        text: "Hold this".to_owned(),
+        attachment_count: 1,
+    }]);
     let runtime_open = signal(false);
     let close = runtime_open;
     host.runtime_open = runtime_open;
@@ -289,6 +295,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let goal = signal(None);
     let history = signal(Vec::new());
     let history_open = signal(false);
+    let queued = signal(Vec::new());
+    let queue_paused = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -604,6 +612,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         goal,
         history,
         history_open,
+        queued,
+        queue_paused,
+        on_send_queued: Rc::new(|_| {}),
+        on_remove_queued: Rc::new(|_| {}),
+        on_clear_queue: Rc::new(|| {}),
+        on_toggle_queue_paused: Rc::new(|| {}),
         on_open_history: Rc::new(|| {}),
         on_close_history: Rc::new(|| {}),
         on_recall_history: Rc::new(|_| {}),
@@ -765,6 +779,8 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("Ship P1"));
     assert!(app.screen().shows("Current plan"));
     assert!(app.screen().shows("Pause"));
+    assert!(app.screen().shows("Queued · 1"));
+    assert!(app.screen().shows("Hold this (+1)"));
     app.press("Claude 4").unwrap();
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();

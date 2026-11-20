@@ -54,9 +54,9 @@ use vibex_nsh_ui::{
         AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalControl, GoalPhaseView,
         GoalView, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
         PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
-        QuestionOption, QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
-        RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry,
-        TokenUsageView,
+        QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
+        RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
+        TimelineEntry, TokenUsageView,
     },
     screens::terminal::TerminalChoice,
 };
@@ -72,6 +72,14 @@ const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 /// The wait before the first reconnect attempt, and its ceiling.
 const RECONNECT_MIN_MS: u64 = 500;
 const RECONNECT_MAX_MS: u64 = 15_000;
+
+/// A prompt held behind the running turn.
+#[derive(Clone, Debug)]
+struct QueuedMessage {
+    id: u64,
+    text: String,
+    attachments: Vec<AttachmentItem>,
+}
 
 /// The session shell's state and actions.
 #[derive(Clone)]
@@ -184,6 +192,11 @@ pub struct SessionService {
     goal: Signal<Option<GoalView>>,
     history: Signal<Vec<ComposerHistoryEntry>>,
     history_open: Signal<bool>,
+    queue: Rc<RefCell<BTreeMap<String, Vec<QueuedMessage>>>>,
+    queue_seq: Rc<Cell<u64>>,
+    queue_paused_sessions: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    queued: Signal<Vec<QueuedMessageView>>,
+    queue_paused: Signal<bool>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -305,6 +318,11 @@ impl SessionService {
             goal: signal(None),
             history: signal(Vec::new()),
             history_open: signal(false),
+            queue: Rc::new(RefCell::new(BTreeMap::new())),
+            queue_seq: Rc::new(Cell::new(0)),
+            queue_paused_sessions: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            queued: signal(Vec::new()),
+            queue_paused: signal(false),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -485,6 +503,24 @@ impl SessionService {
             goal: self.goal,
             history: self.history,
             history_open: self.history_open,
+            queued: self.queued,
+            queue_paused: self.queue_paused,
+            on_send_queued: {
+                let service = self.clone();
+                Rc::new(move |id: u64| service.send_queued(id))
+            },
+            on_remove_queued: {
+                let service = self.clone();
+                Rc::new(move |id: u64| service.remove_queued(id))
+            },
+            on_clear_queue: {
+                let service = self.clone();
+                Rc::new(move || service.clear_queue())
+            },
+            on_toggle_queue_paused: {
+                let service = self.clone();
+                Rc::new(move || service.toggle_queue_paused())
+            },
             on_open_history: {
                 let service = self.clone();
                 Rc::new(move || service.open_history())
@@ -1031,6 +1067,12 @@ impl SessionService {
                     && let Ok(session_id) = VibexSessionId::parse(session.id.as_str())
                 {
                     self.refresh_token_usage(&session_id);
+                    if !matches!(
+                        session.state,
+                        AgentSessionState::Running | AgentSessionState::Initializing
+                    ) {
+                        self.flush_queue();
+                    }
                 }
             }
             BackendEvent::SessionsRemoved(removed) => {
@@ -1163,6 +1205,7 @@ impl SessionService {
         self.runtime_open.set(false);
         self.runtime_busy.set(false);
         self.token_usage.set(None);
+        self.publish_queue();
         self.refresh_runtime(&session_id);
         self.refresh_token_usage(&session_id);
         let service = self.clone();
@@ -1563,13 +1606,9 @@ impl SessionService {
         });
     }
 
-    /// Sends `text` to the open session and replaces the transcript with the
-    /// authority's answer.
+    /// Sends `text` to the open session, or queues it while a turn is live.
     fn send(&self, text: &str) {
         let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
         let text = text.trim().to_owned();
@@ -1577,9 +1616,170 @@ impl SessionService {
         if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
             return;
         }
+        if self.turn_live() {
+            self.enqueue(active, text, attachments);
+            return;
+        }
+        self.deliver(text, attachments, true);
+    }
+
+    fn turn_live(&self) -> bool {
+        let Some(active) = self.active.get_untracked() else {
+            return false;
+        };
+        self.session_states
+            .borrow()
+            .get(&active)
+            .is_some_and(|state| {
+                matches!(
+                    state,
+                    AgentSessionState::Running | AgentSessionState::Initializing
+                )
+            })
+    }
+
+    fn enqueue(&self, session: String, text: String, attachments: Vec<AttachmentItem>) {
+        let id = self.queue_seq.get().wrapping_add(1);
+        self.queue_seq.set(id);
+        self.queue
+            .borrow_mut()
+            .entry(session.clone())
+            .or_default()
+            .push(QueuedMessage {
+                id,
+                text: text.clone(),
+                attachments,
+            });
+        self.draft.set(String::new());
+        self.attachments.set(Vec::new());
+        self.publish_queue();
+        crate::settings::haptic(nsh_core::Haptic::Selection);
+    }
+
+    fn publish_queue(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            self.queued.set(Vec::new());
+            self.queue_paused.set(false);
+            return;
+        };
+        self.queued.set(
+            self.queue
+                .borrow()
+                .get(&active)
+                .map(|queue| {
+                    queue
+                        .iter()
+                        .map(|message| QueuedMessageView {
+                            id: message.id,
+                            text: message.text.clone(),
+                            attachment_count: message.attachments.len(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default(),
+        );
+        self.queue_paused
+            .set(self.queue_paused_sessions.borrow().contains(&active));
+    }
+
+    fn send_queued(&self, id: u64) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let message = {
+            let mut queue = self.queue.borrow_mut();
+            let Some(queue) = queue.get_mut(&active) else {
+                return;
+            };
+            let Some(index) = queue.iter().position(|message| message.id == id) else {
+                return;
+            };
+            queue.remove(index)
+        };
+        self.publish_queue();
+        self.deliver(message.text, message.attachments, false);
+    }
+
+    fn remove_queued(&self, id: u64) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        if let Some(queue) = self.queue.borrow_mut().get_mut(&active) {
+            queue.retain(|message| message.id != id);
+        }
+        self.publish_queue();
+    }
+
+    fn clear_queue(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        self.queue.borrow_mut().remove(&active);
+        self.publish_queue();
+    }
+
+    fn toggle_queue_paused(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let mut paused = self.queue_paused_sessions.borrow_mut();
+        if !paused.remove(&active) {
+            paused.insert(active);
+        }
+        drop(paused);
+        self.publish_queue();
+    }
+
+    fn flush_queue(&self) {
+        if self.queue_paused.get_untracked() || self.turn_live() || self.sending.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let message = {
+            let mut queue = self.queue.borrow_mut();
+            let Some(queue) = queue.get_mut(&active) else {
+                return;
+            };
+            if queue.is_empty() {
+                return;
+            }
+            queue.remove(0)
+        };
+        self.publish_queue();
+        self.deliver(message.text, message.attachments, false);
+    }
+
+    fn requeue(&self, text: String, attachments: Vec<AttachmentItem>) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let id = self.queue_seq.get().wrapping_add(1);
+        self.queue_seq.set(id);
+        self.queue.borrow_mut().entry(active).or_default().insert(
+            0,
+            QueuedMessage {
+                id,
+                text,
+                attachments,
+            },
+        );
+        self.publish_queue();
+    }
+
+    fn deliver(&self, text: String, attachments: Vec<AttachmentItem>, from_composer: bool) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
         self.sending.set(true);
         self.error.set(None);
         let sent_text = text.clone();
+        let retry_text = text.clone();
+        let retry_attachments = attachments.clone();
         let sent_attachment_ids = attachments
             .iter()
             .map(|item| item.id.clone())
@@ -1601,26 +1801,37 @@ impl SessionService {
             service.sending.set(false);
             match result {
                 Ok(Ok(page)) => {
-                    // Clear only what was sent: text and pictures the reader
-                    // added while the request was in flight are theirs.
-                    if service.draft.get_untracked() == sent_text {
-                        service.draft.set(String::new());
+                    if from_composer {
+                        if service.draft.get_untracked() == sent_text {
+                            service.draft.set(String::new());
+                        }
+                        service.attachments.update(|items| {
+                            items.retain(|item| !sent_attachment_ids.contains(&item.id))
+                        });
                     }
-                    service.attachments.update(|items| {
-                        items.retain(|item| !sent_attachment_ids.contains(&item.id))
-                    });
                     service.stash_draft();
                     service.persist_drafts();
                     service.apply_page(&session_id, page);
                     crate::settings::haptic(nsh_core::Haptic::Notification(
                         nsh_core::HapticNotification::Success,
                     ));
+                    service.flush_queue();
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("sending the message did not finish: {error}"),
-                )),
+                Ok(Err(error)) => {
+                    if !from_composer {
+                        service.requeue(retry_text, retry_attachments);
+                    }
+                    service.fail(&error);
+                }
+                Err(error) => {
+                    if !from_composer {
+                        service.requeue(retry_text, retry_attachments);
+                    }
+                    service.fail(&BackendError::failed(
+                        "session_task_failed",
+                        format!("sending the message did not finish: {error}"),
+                    ));
+                }
             }
         });
     }
