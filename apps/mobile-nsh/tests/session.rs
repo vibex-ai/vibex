@@ -12,7 +12,7 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::connecting::ConnectionState;
-use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView};
+use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView, FileSearchRow};
 use vibex_nsh_ui::screens::git::{
     BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeConflictRow,
     WorktreeOperationRow, WorktreeRow,
@@ -557,6 +557,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         },
     ]);
     let files_preview = signal(None::<FilePreview>);
+    let files_search = signal(vec![FileSearchRow {
+        path: "src/main.rs".to_owned(),
+        name: "main.rs".to_owned(),
+        line: Some(3),
+        snippet: "hello".to_owned(),
+    }]);
     let files_error = signal(None::<SharedString>);
     let files_content = signal(String::new());
     let files_dirty = signal(false);
@@ -968,6 +974,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         files_open,
         files_path,
         files_entries,
+        files_search,
+        on_search_files: Rc::new(|_| {}),
         files_preview,
         files_error,
         on_open_files: Rc::new(move || files_open.set(true)),
@@ -1487,6 +1495,16 @@ fn GitShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.git_open.set(true);
     session::session(host)
+}
+
+#[test]
+fn the_file_browser_searches_content() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("role:button[Search files]").unwrap();
+    app.wait_for("main.rs:3").unwrap();
 }
 
 #[test]

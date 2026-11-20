@@ -23,6 +23,15 @@ pub struct FileEntry {
     pub directory: bool,
 }
 
+/// One file content search result.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct FileSearchRow {
+    pub path: String,
+    pub name: String,
+    pub line: Option<u32>,
+    pub snippet: String,
+}
+
 /// An opened file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePreview {
@@ -53,6 +62,8 @@ pub struct FilesHost {
     /// The directory being listed ("" is the workspace root).
     pub path: Signal<String>,
     pub entries: Signal<Vec<FileEntry>>,
+    pub search: Signal<Vec<FileSearchRow>>,
+    pub on_search: Rc<dyn Fn(&str)>,
     /// The file being read, when one is open.
     pub file: Signal<Option<FilePreview>>,
     pub error: Signal<Option<SharedString>>,
@@ -88,6 +99,11 @@ pub fn files(host: FilesHost) -> impl IntoElement {
     let on_back = host.on_back.clone();
     let on_close = host.on_close.clone();
     let entries = host.entries;
+    let search = host.search;
+    let search_open = signal(false);
+    let search_query = signal(String::new());
+    let on_search = host.on_search.clone();
+    let on_open_file = host.on_open_file.clone();
     let file = host.file;
     let error = host.error;
     let dirty = host.dirty;
@@ -151,6 +167,13 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                             },
                         ))
                         .child({
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/search.svg")),
+                                copy::text("Search files", "搜索文件", "搜尋檔案"),
+                                move || search_open.update(|open| *open = !*open),
+                            )
+                        })
+                        .child({
                             let on_close = on_close.clone();
                             action::icon_button(
                                 icon(include_str!("../../assets/icons/x.svg")),
@@ -174,10 +197,80 @@ pub fn files(host: FilesHost) -> impl IntoElement {
             move || file.get().is_some(),
             move || file_preview(file, host.content, dirty),
         ))
+        .child(when(move || search_open.get(), {
+            let on_search = on_search.clone();
+            let on_open_file = on_open_file.clone();
+            move || {
+                view()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .child(
+                        view()
+                            .px(px(theme::SPACING_LG))
+                            .py(px(theme::SPACING_XS))
+                            .child(
+                                nsh_base::input()
+                                    .value(move || search_query.get())
+                                    .on_change({
+                                        let on_search = on_search.clone();
+                                        move |text: &str| {
+                                            search_query.set(text.to_owned());
+                                            on_search(text);
+                                        }
+                                    })
+                                    .placeholder(copy::text("Search files", "搜索文件", "搜尋檔案"))
+                                    .h(px(theme::TOUCH_TARGET)),
+                            ),
+                    )
+                    .child(file_search_list(search, on_open_file.clone()))
+            }
+        }))
         .child(when(
-            move || file.get().is_none(),
-            move || file_list(entries, host.on_open_dir.clone(), host.on_open_file.clone()),
+            move || !search_open.get() && file.get().is_none(),
+            move || file_list(entries, host.on_open_dir.clone(), on_open_file.clone()),
         ))
+}
+
+fn file_search_list(
+    rows: Signal<Vec<FileSearchRow>>,
+    on_open_file: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    scroll()
+        .flex_1()
+        .child(view().w_full().flex_col().child(each(
+            move || rows.get(),
+            |row| row.path.clone(),
+            move |row, _| {
+                let on_open_file = on_open_file.clone();
+                button()
+                    .on_press(move || on_open_file(&row.get_untracked().path))
+                    .w_full()
+                    .px(px(theme::SPACING_LG))
+                    .py(px(theme::SPACING_XS))
+                    .flex_col()
+                    .items_start()
+                    .border_b_1()
+                    .border_b_color(theme::border_subtle)
+                    .child(
+                        text(move || {
+                            let row = row.get();
+                            match row.line {
+                                Some(line) => format!("{}:{line}", row.name),
+                                None => row.name,
+                            }
+                        })
+                        .text_size(px(theme::font_body()))
+                        .text_color(theme::foreground),
+                    )
+                    .child(
+                        text(move || row.get().snippet)
+                            .truncate()
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted),
+                    )
+            },
+        )))
 }
 
 fn file_list(

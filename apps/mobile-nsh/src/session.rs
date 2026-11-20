@@ -34,16 +34,16 @@ use vibex_core::{
     ElicitationAnswerValue, ElicitationField, ElicitationFieldKind, ElicitationRequest,
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
-    FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
-    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
-    GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeConflictResolveRequest,
-    GitWorktreeConflictVersion, GitWorktreeCreateRequest, GitWorktreeDiscardRequest,
-    GitWorktreeMergeRequest, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
-    GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
-    OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, RemoteSidebarItemKind,
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
+    FileSearchRequest, FileTreeRequest, ForkAgentSessionRequest, GitChangeKind,
+    GitCommitDetailRequest, GitCommitRequest, GitDiffRequest, GitHistoryRequest,
+    GitManagedWorktreeRecord, GitManagedWorktreeStatus, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeArchiveRequest,
+    GitWorktreeConflictResolveRequest, GitWorktreeConflictVersion, GitWorktreeCreateRequest,
+    GitWorktreeDiscardRequest, GitWorktreeMergeRequest, GitWorktreeOperationRequest,
+    GitWorktreeOperationStatus, GitWorktreeRestoreRequest, GoalAction, GoalPhase,
+    MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
+    RemoteSidebarItemKind, RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
     RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
     RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
     SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
@@ -58,7 +58,7 @@ use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
-    screens::files::{FileEntry, FilePreview, FilePreviewKindView},
+    screens::files::{FileEntry, FilePreview, FilePreviewKindView, FileSearchRow},
     screens::git::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
         WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
@@ -209,6 +209,7 @@ pub struct SessionService {
     files_open: Signal<bool>,
     files_path: Signal<String>,
     files_entries: Signal<Vec<FileEntry>>,
+    files_search: Signal<Vec<FileSearchRow>>,
     files_preview: Signal<Option<FilePreview>>,
     files_error: Signal<Option<SharedString>>,
     files_workspace: Rc<RefCell<Option<WorkspaceId>>>,
@@ -409,6 +410,7 @@ impl SessionService {
             files_open: signal(false),
             files_path: signal(String::new()),
             files_entries: signal(Vec::new()),
+            files_search: signal(Vec::new()),
             files_preview: signal(None),
             files_error: signal(None),
             files_workspace: Rc::new(RefCell::new(None)),
@@ -761,6 +763,11 @@ impl SessionService {
             files_open: self.files_open,
             files_path: self.files_path,
             files_entries: self.files_entries,
+            files_search: self.files_search,
+            on_search_files: {
+                let service = self.clone();
+                Rc::new(move |query: &str| service.search_files(query))
+            },
             files_preview: self.files_preview,
             files_error: self.files_error,
             files_content: self.files_content,
@@ -5025,6 +5032,53 @@ impl SessionService {
         self.files_preview.set(None);
         self.files_error.set(None);
         *self.files_current.borrow_mut() = None;
+    }
+
+    fn search_files(&self, query: &str) {
+        let query = query.trim().to_owned();
+        if query.is_empty() {
+            self.files_search.set(Vec::new());
+            return;
+        }
+        let service = self.clone();
+        let file_backend = self.file_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                return;
+            };
+            let result = background(async move {
+                file_backend
+                    .search_files(FileSearchRequest {
+                        workspace_id: workspace,
+                        query,
+                        include_content: true,
+                        case_sensitive: false,
+                        whole_word: false,
+                        regex: false,
+                        limit: Some(50),
+                    })
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(results)) => service.files_search.set(
+                    results
+                        .into_iter()
+                        .map(|result| FileSearchRow {
+                            path: result.path,
+                            name: result.name,
+                            line: result.line,
+                            snippet: result.snippet.unwrap_or_default(),
+                        })
+                        .collect(),
+                ),
+                Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
+                Err(error) => service.files_error.set(Some(
+                    format!("searching the files did not finish: {error}").into(),
+                )),
+            }
+        });
     }
 
     /// Lists `path` (the workspace root when empty).
