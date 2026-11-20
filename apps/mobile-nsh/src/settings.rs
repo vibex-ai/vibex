@@ -44,7 +44,7 @@ pub fn keep_screen_on() -> bool {
     KEEP_SCREEN_ON.load(Ordering::Relaxed)
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct StoredSettings {
     #[serde(default)]
@@ -57,6 +57,18 @@ struct StoredSettings {
     keep_screen_on: bool,
     #[serde(default = "default_font_scale")]
     font_scale: u32,
+}
+
+impl Default for StoredSettings {
+    fn default() -> Self {
+        Self {
+            appearance: String::new(),
+            language: String::new(),
+            haptics: default_haptics(),
+            keep_screen_on: false,
+            font_scale: default_font_scale(),
+        }
+    }
 }
 
 /// The preferences the app can act on today, as signals the screens read.
@@ -97,7 +109,7 @@ impl SettingsState {
             language: signal(LanguagePreference::from_storage(&stored.language)),
             haptics: signal(stored.haptics),
             keep_screen_on: signal(stored.keep_screen_on),
-            font_scale: signal(stored.font_scale),
+            font_scale: signal(normalized_font_scale(stored.font_scale)),
             revision: signal(0),
         };
         if imported {
@@ -161,6 +173,7 @@ impl SettingsState {
 
     /// Chooses a text-size step and keeps it.
     pub fn set_font_scale(&self, percent: u32) {
+        let percent = normalized_font_scale(percent);
         if self.font_scale.get_untracked() == percent {
             return;
         }
@@ -199,6 +212,13 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
                 .unwrap_or_else(default_font_scale),
         }
     }
+}
+
+fn normalized_font_scale(percent: u32) -> u32 {
+    *vibex_nsh_ui::theme::FONT_SCALE_STEPS
+        .iter()
+        .min_by_key(|step| step.abs_diff(percent))
+        .unwrap_or(&100)
 }
 
 fn appearance_from_storage(value: &str) -> Appearance {

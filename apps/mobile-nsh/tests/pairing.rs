@@ -109,7 +109,7 @@ fn settings_steps_the_text_size() {
     app.press("role:button[Settings]").unwrap();
     app.wait_for("Text size").unwrap();
     app.press("role:button[Change]").unwrap();
-    app.wait_for("Smallest").unwrap();
+    app.wait_for("Large").unwrap();
     app.press("role:button[Change]").unwrap();
-    app.wait_for("Compact").unwrap();
+    app.wait_for("Smallest").unwrap();
 }
