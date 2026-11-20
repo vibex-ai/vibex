@@ -390,6 +390,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         can_archive: true,
         can_restore: false,
         can_merge: true,
+        can_discard: false,
     }]);
     let worktree_menu = signal(false);
     let worktree_busy = signal(false);
@@ -904,6 +905,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_close_worktrees: Rc::new(move || worktree_menu.set(false)),
         on_archive_worktree: Rc::new(|_| {}),
         on_merge_worktree: Rc::new(|_| {}),
+        on_discard_worktree: Rc::new(|_| {}),
         on_restore_worktree: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),

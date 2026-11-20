@@ -35,6 +35,7 @@ pub struct WorktreeRow {
     pub can_archive: bool,
     pub can_restore: bool,
     pub can_merge: bool,
+    pub can_discard: bool,
 }
 
 /// One changed path in the status list.
@@ -107,6 +108,7 @@ pub struct GitHost {
     pub on_close_worktrees: Rc<dyn Fn()>,
     pub on_archive_worktree: Rc<dyn Fn(&str)>,
     pub on_merge_worktree: Rc<dyn Fn(&str)>,
+    pub on_discard_worktree: Rc<dyn Fn(&str)>,
     pub on_restore_worktree: Rc<dyn Fn(&str)>,
     pub on_toggle_amend: Rc<dyn Fn()>,
     pub on_toggle_push_after: Rc<dyn Fn()>,
@@ -250,6 +252,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             host.on_close_worktrees.clone(),
             host.on_archive_worktree.clone(),
             host.on_merge_worktree.clone(),
+            host.on_discard_worktree.clone(),
             host.on_restore_worktree.clone(),
         ))
         .child(when(
@@ -608,6 +611,7 @@ fn worktree_sheet(
     on_close: Rc<dyn Fn()>,
     on_archive: Rc<dyn Fn(&str)>,
     on_merge: Rc<dyn Fn(&str)>,
+    on_discard: Rc<dyn Fn(&str)>,
     on_restore: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     sheet()
@@ -734,6 +738,29 @@ fn worktree_sheet(
                                                 )
                                         },
                                     ))
+                                    .child(when(move || worktree.get().can_discard, {
+                                        let on_discard = on_discard.clone();
+                                        let id = worktree.get_untracked().id;
+                                        move || {
+                                            let on_discard = on_discard.clone();
+                                            let id = id.clone();
+                                            button()
+                                                .on_press(move || {
+                                                    if !busy.get_untracked() {
+                                                        on_discard(&id);
+                                                    }
+                                                })
+                                                .min_h(px(28.0))
+                                                .px(px(theme::SPACING_SM))
+                                                .items_center()
+                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .child(
+                                                    text(copy::text("Discard", "丢弃", "丟棄"))
+                                                        .text_size(px(theme::font_micro()))
+                                                        .text_color(theme::accent_red),
+                                                )
+                                        }
+                                    }))
                                     .child(when(
                                         move || worktree.get().can_restore,
                                         move || {

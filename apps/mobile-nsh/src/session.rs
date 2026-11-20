@@ -36,15 +36,15 @@ use vibex_core::{
     FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
     GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
-    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest, GitWorktreeMergeRequest,
-    GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
-    OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
-    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest,
+    GitWorktreeDiscardRequest, GitWorktreeMergeRequest, GitWorktreeRestoreRequest, GoalAction,
+    GoalPhase, MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
     TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
     TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
     WorkspaceId, unix_timestamp_ms,
@@ -665,6 +665,10 @@ impl SessionService {
             on_merge_worktree: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.merge_worktree(id))
+            },
+            on_discard_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.discard_worktree(id))
             },
             on_restore_worktree: {
                 let service = self.clone();
@@ -4950,6 +4954,12 @@ impl SessionService {
                             can_restore: worktree.status == GitManagedWorktreeStatus::Archived,
                             can_merge: worktree.status == GitManagedWorktreeStatus::Active
                                 && worktree.target_workspace_id.is_some(),
+                            can_discard: matches!(
+                                worktree.status,
+                                GitManagedWorktreeStatus::Archived
+                                    | GitManagedWorktreeStatus::Merged
+                                    | GitManagedWorktreeStatus::Failed
+                            ),
                         })
                         .collect();
                     *service.worktree_records.borrow_mut() = snapshot.managed_worktrees;
@@ -5027,6 +5037,92 @@ impl SessionService {
                             "The runtime did not allow archiving this worktree.",
                             "运行时不允许归档这个 Worktree。",
                             "執行環境不允許封存這個 Worktree。",
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        format!("checking the worktree did not finish: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn discard_worktree(&self, id: &str) {
+        let Some(record) = self
+            .worktree_records
+            .borrow()
+            .iter()
+            .find(|worktree| worktree.worktree_id.as_str() == id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let request = GitWorktreeDiscardRequest {
+                workspace_id: workspace.clone(),
+                worktree_path: record.worktree_path.clone(),
+                force: true,
+                delete_branch: false,
+                expected_head: record.head.clone(),
+                preflight_revision: None,
+            };
+            let preflight_git = git.clone();
+            let preflight =
+                background(
+                    async move { preflight_git.git_worktree_discard_preflight(request).await },
+                )
+                .await;
+            match preflight {
+                Ok(Ok(preflight)) if preflight.allowed => {
+                    let request = GitWorktreeDiscardRequest {
+                        workspace_id: workspace,
+                        worktree_path: record.worktree_path.clone(),
+                        force: true,
+                        delete_branch: false,
+                        expected_head: record.head.clone(),
+                        preflight_revision: Some(preflight.revision),
+                    };
+                    let result = background(async move {
+                        git.git_worktree_discard(MutationRequest::new(request))
+                            .await
+                    })
+                    .await;
+                    service.worktree_busy.set(false);
+                    match result {
+                        Ok(Ok(_)) => service.load_worktrees(),
+                        Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                        Err(error) => service.worktree_error.set(Some(
+                            format!("discarding the worktree did not finish: {error}").into(),
+                        )),
+                    }
+                }
+                Ok(Ok(_)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        copy::text(
+                            "The runtime did not allow discarding this worktree.",
+                            "运行时不允许丢弃这个 Worktree。",
+                            "執行環境不允許丟棄這個 Worktree。",
                         )
                         .into(),
                     ));
