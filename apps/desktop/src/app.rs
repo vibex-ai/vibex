@@ -1149,6 +1149,13 @@ const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_TRANSITION_DURATION: Duration = Duration::from_millis(140);
 const AGENT_TIMELINE_SCROLL_IDLE_DELAY: Duration = Duration::from_millis(160);
+/// How many rows a window may have and still be measured in one pass.
+///
+/// Below this the whole window is laid out once, so every row's height is exact
+/// before the reader scrolls into it; above it the list keeps measuring only what
+/// it paints, because laying out a long transcript at once is the cost a virtual
+/// list exists to avoid.
+const TIMELINE_MEASURE_ALL_MAX_ROWS: usize = 128;
 /// How far short of the bottom a closing disclosure may land and still hand the
 /// live edge back. A spring stops inside its tolerance, and measured heights
 /// are rounded up, so the last frame can sit a pixel or two off.
@@ -33314,6 +33321,16 @@ impl VibexWorkbench {
         // frame seeds again and its layout keeps the result.
         if width > px(0.0) && !width_changed {
             self.timeline_list_hint_width = Some(width);
+        }
+        // One hint for every row is only a stand-in, and the first time a row is
+        // laid out its real height replaces it. For the row under the reader that
+        // is a move: the anchor sits a distance into a box that just changed size.
+        // A window small enough to lay out in one pass is measured that way, so
+        // the rows are exact before the reader scrolls into them. Long windows
+        // keep the visible-only layout, where the cost of exactness is the whole
+        // transcript.
+        if rows <= TIMELINE_MEASURE_ALL_MAX_ROWS {
+            let _ = self.timeline_scroll.clone().measure_all();
         }
     }
 
