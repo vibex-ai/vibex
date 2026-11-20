@@ -199,6 +199,8 @@ fn FolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
+        parent_id: None,
+        depth: 0,
         collapsed: false,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
@@ -213,6 +215,8 @@ fn GroupShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Group,
+        parent_id: None,
+        depth: 0,
         collapsed: false,
         id: "group-1".to_owned(),
         name: "Pair".to_owned(),
@@ -227,6 +231,8 @@ fn CollapsedFolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
+        parent_id: None,
+        depth: 0,
         collapsed: true,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
@@ -802,6 +808,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         folder_open,
         folder_name,
         on_open_folder: Rc::new(move || folder_open.set(true)),
+        on_open_subfolder: Rc::new(|_| {}),
         on_close_folder: Rc::new(move || folder_open.set(false)),
         on_create_folder: Rc::new(|| {}),
         on_rename_folder: Rc::new(|_, _| {}),

@@ -197,6 +197,8 @@ pub enum SidebarSectionKind {
 pub struct SidebarSectionView {
     pub kind: SidebarSectionKind,
     pub id: String,
+    pub parent_id: Option<String>,
+    pub depth: usize,
     pub collapsed: bool,
     pub name: String,
     pub session_ids: Vec<String>,
@@ -447,6 +449,7 @@ pub struct SessionHost {
     pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
     pub folder_open: Signal<bool>,
     pub folder_name: Signal<String>,
+    pub on_open_subfolder: Rc<dyn Fn(&str)>,
     pub on_open_folder: Action,
     pub on_close_folder: Action,
     pub on_create_folder: Action,
@@ -4139,6 +4142,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let folder_open = host.folder_open;
     let folder_name = host.folder_name;
     let on_open_folder = host.on_open_folder.clone();
+    let on_open_subfolder = host.on_open_subfolder.clone();
     let on_close_folder = host.on_close_folder.clone();
     let on_create_folder = host.on_create_folder.clone();
     let on_rename_folder = host.on_rename_folder.clone();
@@ -4330,6 +4334,15 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                     folder_rename,
                     on_rename_folder.clone(),
                     on_delete_folder.clone(),
+                    {
+                        let on_open_subfolder = on_open_subfolder.clone();
+                        Rc::new(move || {
+                            if let Some(id) = folder_actions.get_untracked() {
+                                folder_actions.set(None);
+                                on_open_subfolder(&id);
+                            }
+                        })
+                    },
                 ))
                 .child(folder_sheet(
                     folder_open,
@@ -4869,6 +4882,7 @@ fn folder_actions_sheet(
     name: Signal<String>,
     on_rename: FolderNameAction,
     on_delete: Rc<dyn Fn(&str)>,
+    on_new_subfolder: Action,
 ) -> impl IntoElement {
     let open = computed(move || action.get().is_some());
     sheet()
@@ -4897,6 +4911,16 @@ fn folder_actions_sheet(
                     name,
                     copy::text("Folder name", "文件夹名称", "資料夾名稱"),
                 ))
+                .child({
+                    let on_new_subfolder = on_new_subfolder.clone();
+                    action::secondary(
+                        copy::text("New subfolder", "新建子文件夹", "新增子資料夾"),
+                        icon(include_str!("../../assets/icons/folder.svg")),
+                        false,
+                        move || on_new_subfolder(),
+                    )
+                    .w_full()
+                })
                 .child({
                     let on_rename = on_rename.clone();
                     action::primary(
@@ -5009,7 +5033,10 @@ fn sidebar_section(
             view()
                 .w_full()
                 .min_h(px(30.0))
-                .px(px(theme::SPACING_XS))
+                .pl(px(
+                    theme::SPACING_XS + section.with(|section| section.depth as f32) * 10.0
+                ))
+                .pr(px(theme::SPACING_XS))
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_XS))

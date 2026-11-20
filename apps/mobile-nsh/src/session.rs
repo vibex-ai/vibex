@@ -164,6 +164,7 @@ pub struct SessionService {
     sidebar_sections: Signal<Vec<SidebarSectionView>>,
     folder_open: Signal<bool>,
     folder_name: Signal<String>,
+    folder_parent: Signal<Option<String>>,
     move_open: Signal<Option<String>>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
@@ -360,6 +361,7 @@ impl SessionService {
             sidebar_sections: signal(Vec::new()),
             folder_open: signal(false),
             folder_name: signal(String::new()),
+            folder_parent: signal(None),
             move_open: signal(None),
             sessions: signal(Vec::new()),
             active: signal(None),
@@ -598,7 +600,17 @@ impl SessionService {
             folder_name: self.folder_name,
             on_open_folder: {
                 let service = self.clone();
-                Rc::new(move || service.folder_open.set(true))
+                Rc::new(move || {
+                    service.folder_parent.set(None);
+                    service.folder_open.set(true);
+                })
+            },
+            on_open_subfolder: {
+                let service = self.clone();
+                Rc::new(move |parent: &str| {
+                    service.folder_parent.set(Some(parent.to_owned()));
+                    service.folder_open.set(true);
+                })
             },
             on_close_folder: {
                 let service = self.clone();
@@ -4107,7 +4119,7 @@ impl SessionService {
                 name,
                 project_id: None,
                 workspace_id: None,
-                parent_folder_id: None,
+                parent_folder_id: service.folder_parent.get_untracked(),
             };
             let result = background(async move {
                 sidebar
@@ -4133,6 +4145,26 @@ impl SessionService {
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
         self.pinned.set(snapshot.pinned_session_ids.clone());
         let mut sections = Vec::new();
+        let mut folder_parents: BTreeMap<String, String> = BTreeMap::new();
+        for placement in &snapshot.placements {
+            if placement.item.kind == RemoteSidebarItemKind::Folder
+                && let Some(parent) = placement.parent_folder_id.as_ref()
+            {
+                folder_parents.insert(placement.item.id.clone(), parent.clone());
+            }
+        }
+        let folder_depth = |id: &str| {
+            let mut depth = 0;
+            let mut current = id;
+            while let Some(parent) = folder_parents.get(current) {
+                depth += 1;
+                current = parent;
+                if depth > 8 {
+                    break;
+                }
+            }
+            depth
+        };
         let mut folder_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
         for placement in &snapshot.placements {
             if placement.item.kind == RemoteSidebarItemKind::Session
@@ -4148,6 +4180,8 @@ impl SessionService {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Folder,
                 id: folder.id.clone(),
+                parent_id: folder_parents.get(&folder.id).cloned(),
+                depth: folder_depth(&folder.id),
                 collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
                 name: folder.name.clone(),
                 session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
@@ -4157,6 +4191,8 @@ impl SessionService {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Group,
                 id: group.id.clone(),
+                parent_id: folder_parents.get(&group.id).cloned(),
+                depth: 0,
                 collapsed: snapshot.collapsed_group_ids.contains(&group.id),
                 name: group.name.clone(),
                 session_ids: group.member_session_ids.clone(),
