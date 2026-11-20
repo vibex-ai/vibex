@@ -33293,13 +33293,28 @@ impl VibexWorkbench {
         let content_width = session_content_max_width(self.ui_state.session.content_width)
             .unwrap_or(AGENT_CONTENT_STANDARD_MAX_WIDTH);
         let mut row_sizes = Vec::with_capacity(turns.len());
-        for turn in turns.iter() {
+        let last_index = turns.len().saturating_sub(1);
+        let same_shape = self.timeline_row_sizes.len() == turns.len();
+        for (index, turn) in turns.iter().enumerate() {
             // Measured turns already know their real extent; re-estimating them
             // would rescan every row body for nothing.
-            let height = match self.timeline_measured_turn_heights.get(&turn.id).copied() {
+            let mut height = match self.timeline_measured_turn_heights.get(&turn.id).copied() {
                 Some(measured) => measured,
                 None => self.estimated_timeline_turn_height_cached(turn),
             };
+            // The turn that is still streaming only grows. An estimate replaced by
+            // a measurement can be shorter, and taking that drop moves everything
+            // below it up by the difference — on a long turn, a third of a screen
+            // in the middle of a read. The row keeps its height until the turn is
+            // over, which is also the only point its extent can legitimately
+            // settle.
+            if index == last_index
+                && same_shape
+                && !timeline_turn_finished(turn)
+                && let Some(previous) = self.timeline_row_sizes.get(index)
+            {
+                height = height.max(f32::from(previous.height));
+            }
             row_sizes.push(size(px(content_width), px(height)));
         }
         // The table is current for this projection whichever way the comparison
