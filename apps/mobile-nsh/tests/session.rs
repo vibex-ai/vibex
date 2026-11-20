@@ -553,6 +553,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let new_busy = signal(false);
     let new_error = signal(None::<SharedString>);
     let new_worktree_branch = signal(String::new());
+    let new_base_ref = signal(String::new());
     let on_create_worktree_session = Rc::new(move || {
         if new_worktree_branch.get_untracked().trim().is_empty() {
             return;
@@ -803,6 +804,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_error,
         on_create_session,
         new_worktree_branch,
+        new_base_ref,
         new_title,
         new_prompt,
         on_create_worktree_session,

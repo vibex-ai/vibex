@@ -46,8 +46,9 @@ pub struct NewSessionHost {
     /// The session's optional title and first message.
     pub title: Signal<String>,
     pub prompt: Signal<String>,
-    /// A branch name for a new worktree.
+    /// A branch name and optional base ref for a new worktree.
     pub worktree_branch: Signal<String>,
+    pub base_ref: Signal<String>,
     pub on_create_worktree: Rc<dyn Fn()>,
 }
 
@@ -121,6 +122,14 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                             )
                         }),
                 )
+                .child(crate::ui::field::text_field(
+                    host.base_ref,
+                    copy::text(
+                        "Base ref (optional)",
+                        "基准引用（可选）",
+                        "基準參照（選填）",
+                    ),
+                ))
                 .child(section_label(copy::text(
                     "Agent and model",
                     "Agent 与模型",

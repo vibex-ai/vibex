@@ -564,6 +564,7 @@ pub struct SessionHost {
     pub new_error: Signal<Option<SharedString>>,
     pub on_create_session: Action,
     pub new_worktree_branch: Signal<String>,
+    pub new_base_ref: Signal<String>,
     pub new_title: Signal<String>,
     pub new_prompt: Signal<String>,
     pub on_create_worktree_session: Action,
@@ -839,6 +840,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             title: host.new_title,
             prompt: host.new_prompt,
             worktree_branch: host.new_worktree_branch,
+            base_ref: host.new_base_ref,
             on_create_worktree: host.on_create_worktree_session.clone(),
         }))
 }

@@ -215,6 +215,7 @@ pub struct SessionService {
     new_workspace: Signal<Option<String>>,
     new_runtime: Signal<Option<String>>,
     new_worktree_branch: Signal<String>,
+    new_base_ref: Signal<String>,
     new_title: Signal<String>,
     new_prompt: Signal<String>,
     new_busy: Signal<bool>,
@@ -370,6 +371,7 @@ impl SessionService {
             new_workspace: signal(None),
             new_runtime: signal(None),
             new_worktree_branch: signal(String::new()),
+            new_base_ref: signal(String::new()),
             new_title: signal(String::new()),
             new_prompt: signal(String::new()),
             new_busy: signal(false),
@@ -592,6 +594,7 @@ impl SessionService {
             new_workspace: self.new_workspace,
             new_runtime: self.new_runtime,
             new_worktree_branch: self.new_worktree_branch,
+            new_base_ref: self.new_base_ref,
             new_title: self.new_title,
             new_prompt: self.new_prompt,
             new_busy: self.new_busy,
@@ -3105,7 +3108,10 @@ impl SessionService {
                 git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
                     workspace_id: base,
                     branch_name: branch,
-                    base_ref: None,
+                    base_ref: {
+                        let base = service.new_base_ref.get_untracked().trim().to_owned();
+                        (!base.is_empty()).then_some(base)
+                    },
                     name: None,
                     worktree_path: None,
                     target_workspace_id: None,
@@ -3153,6 +3159,7 @@ impl SessionService {
                     let prompt = service.new_prompt.get_untracked().trim().to_owned();
                     service.new_session_open.set(false);
                     service.new_worktree_branch.set(String::new());
+                    service.new_base_ref.set(String::new());
                     service.refresh();
                     service.open(session.id.as_str());
                     if !prompt.is_empty() {
