@@ -68,6 +68,19 @@ const TIMELINE_LIMIT: u32 = 200;
 
 /// Where the per-session composer drafts are kept.
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
+/// Where the newest transcript window of the last few sessions is kept.
+const TIMELINE_CACHE_KEY: &str = "vibex.mobile.timeline.v1";
+/// At most this many conversations are cached.
+const TIMELINE_CACHE_SESSIONS: usize = 4;
+
+/// One session's cached transcript window.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct CachedTimeline {
+    saved_at_ms: i64,
+    has_older: bool,
+    items: Vec<vibex_core::TimelineItem>,
+}
 
 /// The wait before the first reconnect attempt, and its ceiling.
 const RECONNECT_MIN_MS: u64 = 500;
@@ -1257,6 +1270,7 @@ impl SessionService {
         self.editing.set(false);
         *self.edit_state.borrow_mut() = None;
         self.publish_queue();
+        self.load_cached_timeline(&session_id);
         self.refresh_runtime(&session_id);
         self.refresh_token_usage(&session_id);
         let service = self.clone();
@@ -1991,11 +2005,66 @@ impl SessionService {
     /// Projects a fetched page into the shell's rows.
     fn apply_page(&self, session_id: &VibexSessionId, page: TimelinePage) {
         self.has_older.set(page.has_older);
+        let has_older = page.has_older;
         self.model
             .borrow_mut()
             .replace_authoritative(session_id.clone(), page.items);
         self.publish();
+        self.save_cached_timeline(session_id, has_older);
         self.refresh_token_usage(session_id);
+    }
+
+    fn cache_key(&self, session_id: &VibexSessionId) -> String {
+        format!("{}:{}", self.host_id(), session_id.as_str())
+    }
+
+    fn load_cached_timeline(&self, session_id: &VibexSessionId) {
+        let Some(cached) = load_timeline_cache().remove(&self.cache_key(session_id)) else {
+            return;
+        };
+        self.has_older.set(cached.has_older);
+        self.model
+            .borrow_mut()
+            .replace_authoritative(session_id.clone(), cached.items);
+        self.publish();
+    }
+
+    fn save_cached_timeline(&self, session_id: &VibexSessionId, has_older: bool) {
+        if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        let items = self.model.borrow().items.clone();
+        if items.is_empty() {
+            return;
+        }
+        let mut cache = load_timeline_cache();
+        cache.insert(
+            self.cache_key(session_id),
+            CachedTimeline {
+                saved_at_ms: unix_timestamp_ms(),
+                has_older,
+                items,
+            },
+        );
+        let keys = cache
+            .iter()
+            .map(|(key, entry)| (key.clone(), entry.saved_at_ms))
+            .collect::<Vec<_>>();
+        let mut sorted = keys;
+        sorted.sort_by_key(|(_, saved_at)| *saved_at);
+        while cache.len() > TIMELINE_CACHE_SESSIONS {
+            if let Some((oldest, _)) = sorted.first()
+                && let Some(removed) = cache.remove(oldest)
+            {
+                let _ = removed;
+                sorted.remove(0);
+            } else {
+                break;
+            }
+        }
+        if let Ok(text) = serde_json::to_string(&cache) {
+            let _ = Storage::set_item(TIMELINE_CACHE_KEY, text);
+        }
     }
 
     /// Reads the session's live token counters.
@@ -2042,12 +2111,14 @@ impl SessionService {
             match result {
                 Ok(Ok(page)) => {
                     service.has_older.set(page.has_older);
+                    let has_older = page.has_older;
                     service.model.borrow_mut().prepend_authoritative_page(
                         &session_id,
                         &page.items,
                         page.leading_turn_start,
                     );
                     service.publish();
+                    service.save_cached_timeline(&session_id, has_older);
                 }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -4171,6 +4242,13 @@ fn default_option_label(response: PermissionResponseKind) -> &'static str {
         }
         PermissionResponseKind::Deny => copy::text("Deny", "拒绝", "拒絕"),
     }
+}
+
+/// The cached transcript windows kept on this phone.
+fn load_timeline_cache() -> BTreeMap<String, CachedTimeline> {
+    Storage::get_item(TIMELINE_CACHE_KEY)
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 /// The per-session composer drafts kept on this phone.
