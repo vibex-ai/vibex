@@ -22,7 +22,8 @@ use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 use vibex_backend::{
     AgentBackend, BackendError, BackendEvent, BackendProjection, BackendResult, FileBackend,
-    GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
+    GitBackend, MutationRequest, SidebarBackend, TerminalBackend, WorkspaceBackend,
+    WorkspaceSummary,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
@@ -41,7 +42,8 @@ use vibex_core::{
     GitWorktreeMergeRequest, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
     GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
     OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest, RequestId,
+    PermissionResponseKind, PlanStepStatus, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationSnapshot, RenameAgentSessionRequest, RequestId,
     ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
     RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
     SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
@@ -157,6 +159,8 @@ pub struct SessionService {
     file_backend: Arc<dyn FileBackend>,
     git_backend: Arc<dyn GitBackend>,
     workspace_backend: Arc<dyn WorkspaceBackend>,
+    sidebar_backend: Arc<dyn SidebarBackend>,
+    sidebar_snapshot: Rc<RefCell<RemoteSidebarOrganizationSnapshot>>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     pinned: Signal<Vec<String>>,
@@ -336,6 +340,7 @@ impl SessionService {
         let file_backend: Arc<dyn FileBackend> = backend.clone();
         let git_backend: Arc<dyn GitBackend> = backend.clone();
         let workspace_backend: Arc<dyn WorkspaceBackend> = backend.clone();
+        let sidebar_backend: Arc<dyn SidebarBackend> = backend.clone();
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let loaded = load_queues();
@@ -346,6 +351,8 @@ impl SessionService {
             file_backend,
             git_backend,
             workspace_backend,
+            sidebar_backend,
+            sidebar_snapshot: Rc::new(RefCell::new(Default::default())),
             sessions: signal(Vec::new()),
             active: signal(None),
             pinned: signal(load_pins()),
@@ -1256,6 +1263,12 @@ impl SessionService {
                     .and_then(Result::ok)
                     .unwrap_or_default();
                 *self.workspace_records.borrow_mut() = spaces.clone();
+                let sidebar = self.sidebar_backend.clone();
+                if let Ok(Ok(snapshot)) =
+                    background(async move { sidebar.sidebar_organization().await }).await
+                {
+                    self.apply_sidebar(snapshot);
+                }
                 let rows = sessions
                     .iter()
                     .map(|session| summary(session, &spaces))
@@ -3851,17 +3864,51 @@ impl SessionService {
     }
 
     pub fn toggle_pin(&self, id: &str) {
-        self.pinned.update(|pinned| {
-            if let Some(index) = pinned.iter().position(|candidate| candidate == id) {
-                pinned.remove(index);
-            } else {
-                pinned.push(id.to_owned());
+        let pinned = !self
+            .pinned
+            .get_untracked()
+            .iter()
+            .any(|candidate| candidate == id);
+        let revision = self.sidebar_snapshot.borrow().revision;
+        let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        let session_id = id.to_owned();
+        spawn(async move {
+            let mutation = RemoteSidebarOrganizationMutation::SetSessionPinned {
+                session_id: session_id.clone(),
+                pinned,
+            };
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => service.apply_sidebar(snapshot),
+                Ok(Err(error)) => {
+                    service.fail(&error);
+                }
+                Err(error) => {
+                    service.fail(&BackendError::failed(
+                        "session_pin_task_failed",
+                        format!("changing the pin did not finish: {error}"),
+                    ));
+                }
             }
         });
+    }
+
+    fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
+        self.pinned.set(snapshot.pinned_session_ids.clone());
+        *self.sidebar_snapshot.borrow_mut() = snapshot;
+        self.persist_pins();
+    }
+
+    fn persist_pins(&self) {
         if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
             let _ = Storage::set_item(PINS_KEY, text);
         }
-        self.session_actions.set(None);
     }
 
     /// Archives the session the actions sheet is open on.
