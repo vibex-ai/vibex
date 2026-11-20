@@ -478,6 +478,22 @@ fn about_sheet(open: Signal<bool>) -> impl IntoElement {
                     .text_color(theme::text_secondary),
                 )
                 .child(
+                    action::secondary(
+                        copy::text("Release notes", "发布说明", "發佈說明"),
+                        icon(include_str!("../../assets/icons/history.svg")),
+                        false,
+                        || {
+                            spawn(async {
+                                let _ = nsh_core::element::open_url(
+                                    "https://github.com/peatboy/vibex/releases",
+                                )
+                                .await;
+                            });
+                        },
+                    )
+                    .w_full(),
+                )
+                .child(
                     text("github.com/peatboy/vibex")
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
