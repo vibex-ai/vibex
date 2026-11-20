@@ -368,6 +368,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let team_busy = signal(false);
     let team_error = signal(None::<SharedString>);
     let attachment_preview = signal(None::<AttachmentItem>);
+    let show_token_usage = signal(true);
+    let show_plan_goal = signal(true);
+    let show_generation_status = signal(true);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -726,6 +729,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         attachment_preview,
         on_open_attachment: Rc::new(|_| {}),
         on_close_attachment: Rc::new(|| {}),
+        show_token_usage,
+        show_plan_goal,
+        show_generation_status,
         plan,
         goal,
         history,
@@ -1140,6 +1146,8 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("hello from the pty").unwrap();
+    assert!(app.screen().shows("Esc"));
+    assert!(app.screen().shows("Ctrl+C"));
 }
 
 #[test]

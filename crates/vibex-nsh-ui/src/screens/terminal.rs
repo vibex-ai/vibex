@@ -125,6 +125,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .on_title_change(move |title: &SharedString| on_title(title))
                 .flex_1(),
         )
+        .child(terminal_keys(host.on_data.clone()))
         .child(terminal_sheet(
             terminal_menu,
             terminals,
@@ -132,6 +133,64 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             host.on_select_terminal.clone(),
             host.on_new_terminal.clone(),
         ))
+}
+
+fn terminal_keys(on_data: Rc<dyn Fn(&str)>) -> impl IntoElement {
+    let keys: &[(&str, &str)] = &[
+        ("Esc", "\u{1b}"),
+        ("Tab", "\t"),
+        ("Ctrl+C", "\u{3}"),
+        ("Ctrl+D", "\u{4}"),
+        ("↑", "\u{1b}[A"),
+        ("↓", "\u{1b}[B"),
+        ("←", "\u{1b}[D"),
+        ("→", "\u{1b}[C"),
+    ];
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_SM))
+        .py(px(theme::SPACING_XS))
+        .border_t_1()
+        .border_t_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            view()
+                .flex_1()
+                .flex_row()
+                .gap(px(theme::SPACING_XS))
+                .child(each(
+                    move || {
+                        keys.iter()
+                            .map(|(label, _)| label.to_string())
+                            .collect::<Vec<_>>()
+                    },
+                    |label| label.clone(),
+                    move |label, _| {
+                        let on_data = on_data.clone();
+                        let sequence = keys
+                            .iter()
+                            .find(|(candidate, _)| *candidate == label.get_untracked())
+                            .map(|(_, sequence)| *sequence)
+                            .unwrap_or_default();
+                        button()
+                            .on_press(move || on_data(sequence))
+                            .min_h(px(32.0))
+                            .px(px(theme::SPACING_SM))
+                            .items_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::background_dim)
+                            .active(|style| style.opacity(0.7))
+                            .child(
+                                text(move || SharedString::from(label.get_untracked()))
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_secondary),
+                            )
+                    },
+                )),
+        )
 }
 
 /// The list of the workspace's terminals, with New terminal.
