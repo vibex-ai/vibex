@@ -12,7 +12,10 @@ use nsh_base::{
 };
 use nsh_core::{element::ImageSrc, prelude::*};
 
-use crate::{copy, theme, ui::action};
+use crate::{
+    copy, theme,
+    ui::{action, field},
+};
 
 /// One of the workspace's terminals.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -55,6 +58,19 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let terminals = host.terminals;
     let title = host.title;
     let error = host.error;
+    let term_ref = host.term_ref;
+    let find_open = signal(false);
+    let find_query = signal(String::new());
+    let find_count = computed(move || {
+        let query = find_query.with(|query| query.trim().to_owned());
+        if query.is_empty() {
+            return 0;
+        }
+        term_ref
+            .api::<TerminalApi>()
+            .map(|api| api.text().matches(&query).count())
+            .unwrap_or(0)
+    });
     view()
         .flex_1()
         .bg(theme::background)
@@ -107,6 +123,13 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             )
                         })
                         .child({
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/search.svg")),
+                                copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
+                                move || find_open.update(|open| *open = !*open),
+                            )
+                        })
+                        .child({
                             let on_open_menu = host.on_open_menu.clone();
                             action::icon_button(
                                 icon(include_str!("../../assets/icons/menu.svg")),
@@ -116,6 +139,38 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         }),
                 ),
         )
+        .child(when(move || find_open.get(), {
+            move || {
+                view()
+                    .w_full()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_XS))
+                    .px(px(theme::SPACING_SM))
+                    .py(px(theme::SPACING_XS))
+                    .border_b_1()
+                    .border_b_color(theme::border_subtle)
+                    .bg(theme::background_card)
+                    .child(
+                        field::text_field(
+                            find_query,
+                            copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
+                        )
+                        .flex_1(),
+                    )
+                    .child(
+                        text(move || {
+                            format!(
+                                "{} {}",
+                                find_count.get(),
+                                copy::text("matches", "个匹配", "個匹配")
+                            )
+                        })
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                    )
+            }
+        }))
         .child(when(
             move || error.get().is_some(),
             move || {

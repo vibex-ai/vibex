@@ -1447,6 +1447,9 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     assert!(app.screen().shows("Esc"));
     assert!(app.screen().shows("Ctrl+C"));
     app.press("role:button[Copy terminal]").unwrap();
+    app.press("role:button[Find in terminal]").unwrap();
+    app.type_text("text:Find in terminal", "hello").unwrap();
+    app.wait_for("1 matches").unwrap();
 }
 
 #[test]
