@@ -6,7 +6,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::button;
+use nsh_base::{ButtonElement, button};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
@@ -67,6 +67,14 @@ pub struct GitHost {
     /// The commit message being written.
     pub message: Signal<String>,
     pub committing: Signal<bool>,
+    /// Whether the next commit amends the last one, and whether it pushes after.
+    pub amend: Signal<bool>,
+    pub push_after: Signal<bool>,
+    pub remote_busy: Signal<bool>,
+    pub on_toggle_amend: Rc<dyn Fn()>,
+    pub on_toggle_push_after: Rc<dyn Fn()>,
+    pub on_push: Rc<dyn Fn()>,
+    pub on_pull: Rc<dyn Fn()>,
     /// The commit history, on its own view.
     pub history: Signal<Vec<CommitRow>>,
     pub show_history: Signal<bool>,
@@ -183,6 +191,26 @@ pub fn git(host: GitHost) -> impl IntoElement {
             },
         ))
         .child(when(
+            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
+            {
+                let on_toggle_amend = host.on_toggle_amend.clone();
+                let on_toggle_push_after = host.on_toggle_push_after.clone();
+                let on_push = host.on_push.clone();
+                let on_pull = host.on_pull.clone();
+                move || {
+                    git_tools(
+                        host.amend,
+                        host.push_after,
+                        host.remote_busy,
+                        on_toggle_amend.clone(),
+                        on_toggle_push_after.clone(),
+                        on_push.clone(),
+                        on_pull.clone(),
+                    )
+                }
+            },
+        ))
+        .child(when(
             move || commit_detail.get().is_none() && !show_history.get() && error.get().is_some(),
             move || {
                 text(move || error.get().unwrap_or_default())
@@ -199,7 +227,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
                 let message = host.message;
                 let committing = host.committing;
                 let on_commit = host.on_commit.clone();
-                move || commit_bar(staged, message, committing, on_commit.clone())
+                move || commit_bar(staged, message, committing, host.amend, on_commit.clone())
             },
         ))
         .child(when(
@@ -369,10 +397,96 @@ fn change_row(
 }
 
 /// The message field and the Commit action.
+fn git_tools(
+    amend: Signal<bool>,
+    push_after: Signal<bool>,
+    busy: Signal<bool>,
+    on_toggle_amend: Rc<dyn Fn()>,
+    on_toggle_push_after: Rc<dyn Fn()>,
+    on_push: Rc<dyn Fn()>,
+    on_pull: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_XS))
+        .border_b_1()
+        .border_b_color(theme::border_subtle)
+        .child(tool_button(
+            || copy::text("Pull", "拉取", "拉取"),
+            {
+                let on_pull = on_pull.clone();
+                move || on_pull()
+            },
+            move || busy.get(),
+        ))
+        .child(tool_button(
+            || copy::text("Push", "推送", "推送"),
+            {
+                let on_push = on_push.clone();
+                move || on_push()
+            },
+            move || busy.get(),
+        ))
+        .child(tool_button(
+            move || {
+                if amend.get() {
+                    copy::text("Amending", "修补提交", "修補提交")
+                } else {
+                    copy::text("Amend", "修补提交", "修補提交")
+                }
+            },
+            move || on_toggle_amend(),
+            move || busy.get(),
+        ))
+        .child(tool_button(
+            move || {
+                if push_after.get() {
+                    copy::text("Push after ✓", "提交后推送 ✓", "提交後推送 ✓")
+                } else {
+                    copy::text("Push after", "提交后推送", "提交後推送")
+                }
+            },
+            move || on_toggle_push_after(),
+            move || busy.get(),
+        ))
+}
+
+fn tool_button(
+    label: impl Fn() -> &'static str + 'static,
+    on_press: impl Fn() + 'static,
+    busy: impl Fn() -> bool + 'static,
+) -> ButtonElement {
+    button()
+        .on_press(move || {
+            if !busy() {
+                on_press();
+            }
+        })
+        .min_h(px(32.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::border_subtle)
+        .bg(theme::background_dim)
+        .active(|style| style.opacity(0.7))
+        .child(
+            text(label)
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_secondary),
+        )
+}
+
 fn commit_bar(
     staged: Signal<u32>,
     message: Signal<String>,
     committing: Signal<bool>,
+    amend: Signal<bool>,
     on_commit: Rc<dyn Fn()>,
 ) -> impl IntoElement {
     view()
@@ -393,7 +507,13 @@ fn commit_bar(
         )
         .child(
             action::primary(
-                copy::text("Commit", "提交", "提交"),
+                move || {
+                    if amend.get() {
+                        copy::text("Amend", "修补提交", "修補提交")
+                    } else {
+                        copy::text("Commit", "提交", "提交")
+                    }
+                },
                 icon(include_str!("../../assets/icons/check.svg")),
                 {
                     let on_commit = on_commit.clone();
@@ -402,7 +522,7 @@ fn commit_bar(
             )
             .disabled(move || {
                 committing.get()
-                    || staged.with(|staged| *staged == 0)
+                    || (staged.with(|staged| *staged == 0) && !amend.get())
                     || message.with(|message| message.trim().is_empty())
             })
             .disabled_style(|style| style.opacity(0.4)),

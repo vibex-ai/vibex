@@ -311,6 +311,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_reasoning = signal(Vec::new());
     let runtime_modes = signal(Vec::new());
     let runtime_features = signal(Vec::new());
+    let git_amend = signal(false);
+    let git_push_after = signal(false);
+    let git_remote_busy = signal(false);
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
     let token_usage = signal(None);
@@ -739,6 +742,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         git_staged,
         git_message,
         git_committing,
+        git_amend,
+        git_push_after,
+        git_remote_busy,
+        on_toggle_git_amend: Rc::new(|| {}),
+        on_toggle_git_push_after: Rc::new(|| {}),
+        on_git_push: Rc::new(|| {}),
+        on_git_pull: Rc::new(|| {}),
         git_history,
         git_show_history,
         git_commit_detail,
@@ -1071,6 +1081,9 @@ fn the_git_surface_lists_changes_and_shows_a_diff() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("src/main.rs").unwrap();
+    for tool in ["Pull", "Push", "Amend", "Push after"] {
+        assert!(app.screen().shows(tool), "the Git tools offer {tool}");
+    }
     app.press("src/main.rs").unwrap();
     app.wait_for("diff --git a/src/main.rs b/src/main.rs")
         .unwrap();

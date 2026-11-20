@@ -31,16 +31,17 @@ use vibex_core::{
     ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
     ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
     ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
-    GitDiffRequest, GitHistoryRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
-    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
-    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
-    WorkspaceId, unix_timestamp_ms,
+    GitDiffRequest, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
+    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GoalAction, GoalPhase,
+    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
+    PermissionResolution, PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest,
+    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
+    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
+    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -158,6 +159,9 @@ pub struct SessionService {
     git_staged: Signal<u32>,
     git_message: Signal<String>,
     git_committing: Signal<bool>,
+    git_amend: Signal<bool>,
+    git_push_after: Signal<bool>,
+    git_remote_busy: Signal<bool>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
     git_commit_detail: Signal<Option<CommitDetailPreview>>,
@@ -303,6 +307,9 @@ impl SessionService {
             git_staged: signal(0),
             git_message: signal(String::new()),
             git_committing: signal(false),
+            git_amend: signal(false),
+            git_push_after: signal(false),
+            git_remote_busy: signal(false),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
             git_commit_detail: signal(None),
@@ -500,6 +507,25 @@ impl SessionService {
             git_staged: self.git_staged,
             git_message: self.git_message,
             git_committing: self.git_committing,
+            git_amend: self.git_amend,
+            git_push_after: self.git_push_after,
+            git_remote_busy: self.git_remote_busy,
+            on_toggle_git_amend: {
+                let service = self.clone();
+                Rc::new(move || service.git_amend.update(|amend| *amend = !*amend))
+            },
+            on_toggle_git_push_after: {
+                let service = self.clone();
+                Rc::new(move || service.git_push_after.update(|push| *push = !*push))
+            },
+            on_git_push: {
+                let service = self.clone();
+                Rc::new(move || service.git_remote(GitRemoteActionKind::Push))
+            },
+            on_git_pull: {
+                let service = self.clone();
+                Rc::new(move || service.git_remote(GitRemoteActionKind::Pull))
+            },
             git_history: self.git_history,
             git_show_history: self.git_show_history,
             git_commit_detail: self.git_commit_detail,
@@ -3548,6 +3574,8 @@ impl SessionService {
         self.terminal_open.set(false);
         self.git_open.set(true);
         self.git_diff.set(None);
+        self.git_amend.set(false);
+        self.git_push_after.set(false);
         self.refresh_git();
     }
 
@@ -3681,6 +3709,47 @@ impl SessionService {
     }
 
     /// Commits what is staged with the message in the composer.
+    /// Fetches, pulls or pushes the open workspace's branch.
+    fn git_remote(&self, kind: GitRemoteActionKind) {
+        if self.git_remote_busy.get_untracked() {
+            return;
+        }
+        self.git_remote_busy.set(true);
+        self.git_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.git_remote_busy.set(false);
+                return;
+            };
+            let result = background(async move {
+                git.git_remote_action(MutationRequest::new(GitRemoteActionRequest {
+                    workspace_id: workspace,
+                    kind,
+                    remote: None,
+                    branch: None,
+                }))
+                .await
+            })
+            .await;
+            service.git_remote_busy.set(false);
+            match result {
+                Ok(Ok(result)) => {
+                    if let Some(status) = result.status_after {
+                        service.apply_git_status(status);
+                    }
+                    service.refresh_git();
+                }
+                Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
+                Err(error) => service.git_error.set(Some(
+                    format!("the remote action did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
     fn commit_changes(&self) {
         if self.git_committing.get_untracked() {
             return;
@@ -3691,6 +3760,8 @@ impl SessionService {
         }
         self.git_committing.set(true);
         self.git_error.set(None);
+        let amend = self.git_amend.get_untracked();
+        let push_after = self.git_push_after.get_untracked();
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
@@ -3704,8 +3775,8 @@ impl SessionService {
                     workspace_id: workspace,
                     message,
                     paths: Vec::new(),
-                    amend: false,
-                    push_after: false,
+                    amend,
+                    push_after,
                 }))
                 .await
             })
@@ -3714,6 +3785,8 @@ impl SessionService {
             match result {
                 Ok(Ok(_)) => {
                     service.git_message.set(String::new());
+                    service.git_amend.set(false);
+                    service.git_push_after.set(false);
                     service.refresh_git();
                 }
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
