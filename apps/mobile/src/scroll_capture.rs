@@ -100,11 +100,3 @@ impl Element for CaptureScrollWheel {
         self.child.paint(window, cx);
     }
 }
-
-impl IntoElement for CaptureScrollWheel {
-    type Element = Self;
-
-    fn into_element(self) -> Self::Element {
-        self
-    }
-}
