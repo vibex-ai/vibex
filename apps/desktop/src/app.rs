@@ -66754,14 +66754,14 @@ impl VibexWorkbench {
                 && option.selection.auth_source == desired.auth_source
                 && option.selection.model == desired.model
         });
-        // The bar names the model, and only the model. The account a turn runs
-        // as is a fact about the run configuration, not about the model, and
-        // putting it on the bar as `account / model` spent half the chip on a
-        // prefix the reader never chose and left a long model name truncated
-        // from the left. The trigger therefore shows the bare model name; the
-        // full `account / model` pair still names itself in the tooltip and in
-        // the panel's own rows.
-        let trigger_model_label = runtime_model_label(selected_option, &desired);
+        // The bar names the supplier and the model together, the way the home
+        // page's chip does: two Providers can serve one model name, and a bar
+        // that showed only the model left the reader unable to tell which one a
+        // turn would run as. The pair is the same `supplier/model` the tooltip
+        // and the panel's rows use, so one selection reads the same everywhere.
+        // A long pair truncates inside the chip's own cap; the reasoning level
+        // beside it keeps its width.
+        let trigger_model_label = runtime_provider_model_label(selected_option, &desired);
         // The trigger names the run configuration, not just the model: the
         // reasoning level rides beside the model name so the reader can see
         // the whole choice without opening the panel. It is its own element,
@@ -66776,9 +66776,9 @@ impl VibexWorkbench {
             Some(effort) => format!("{trigger_model_label} · {effort}"),
             None => trigger_model_label.clone(),
         };
-        // The chip shows the model; the tooltip is where the account earns
-        // its place, named as its own line beside the model and depth rather
-        // than folded into the label the listener reads at a glance.
+        // The tooltip spells the pair out in words, and names the account on
+        // its own line, so a truncated chip still leaves the whole selection
+        // readable on hover.
         let account_label = runtime_selection_account_label(selected_option, &desired);
         let tooltip = format!(
             "{}: {trigger_label}\n{}: {account_label}",
@@ -89676,7 +89676,7 @@ fn runtime_provider_model_label(
     option
         .map(|option| {
             format!(
-                "{} / {}",
+                "{}/{}",
                 runtime_auth_source_selection_label(
                     &selection.auth_source,
                     &option.auth_source_label,
@@ -89692,7 +89692,7 @@ fn runtime_provider_model_label(
             // a name the reader chose, so the route's own label and the model
             // part are shown instead of the addresses.
             format!(
-                "{} / {}",
+                "{}/{}",
                 runtime_auth_source_placeholder_label(&selection.auth_source),
                 runtime_model_selection_label(&selection.model)
             )
@@ -114903,10 +114903,10 @@ mod tests {
     fn composer_footer_marks_share_one_seat_and_one_optical_size() {
         let source = include_str!("app.rs");
         assert_eq!(COMPOSER_FOOTER_GLYPH_SIZE - COMPOSER_FOOTER_RING_SIZE, 1.0);
-        assert!(COMPOSER_FOOTER_RING_SIZE < COMPOSER_FOOTER_CONTROL_SIZE);
+        const { assert!(COMPOSER_FOOTER_RING_SIZE < COMPOSER_FOOTER_CONTROL_SIZE) };
         assert_eq!(PROGRESS_CIRCLE_DRAWN_SCALE, 0.75);
-        assert!(COMPOSER_FOCUSED_INPUT_RING_MIX > 0.5);
-        assert!(COMPOSER_FOCUSED_INPUT_RING_MIX < 1.0);
+        const { assert!(COMPOSER_FOCUSED_INPUT_RING_MIX > 0.5) };
+        const { assert!(COMPOSER_FOCUSED_INPUT_RING_MIX < 1.0) };
 
         let footer = source
             .split_once("    fn render_composer_footer(")
@@ -114995,8 +114995,8 @@ mod tests {
     #[test]
     fn composer_surface_controls_answer_the_pointer_with_one_ink() {
         let source = include_str!("app.rs");
-        assert!(COMPOSER_ROW_INSTRUMENT_REST_INK < COMPOSER_INSTRUMENT_HOVER_INK);
-        assert!(COMPOSER_ROW_INSTRUMENT_REST_INK > COMPOSER_FOOTER_INSTRUMENT_REST_INK);
+        const { assert!(COMPOSER_ROW_INSTRUMENT_REST_INK < COMPOSER_INSTRUMENT_HOVER_INK) };
+        const { assert!(COMPOSER_ROW_INSTRUMENT_REST_INK > COMPOSER_FOOTER_INSTRUMENT_REST_INK) };
         assert_eq!(
             COMPOSER_SURFACE_GLYPH_SIZE * 2.0,
             COMPOSER_SLIM_ROW_CONTROL_SIZE
@@ -118920,15 +118920,15 @@ mod tests {
 
         assert_eq!(
             runtime_provider_model_label(Some(&option), &option.selection),
-            "Codex profile / Codex model"
+            "Codex profile/Codex model"
         );
         assert_eq!(
             runtime_provider_model_label(None, &option.selection),
-            "provider_codex / codex_model"
+            "provider_codex/codex_model"
         );
-        // The bar's chip names the model alone: the account it runs as is
-        // reported beside it in the tooltip, not in front of the name the reader
-        // scans for.
+        // The bare model label still exists for the surfaces that show a model
+        // without its supplier; the Composer's and the home page's chips use the
+        // pair above.
         assert_eq!(
             runtime_model_label(Some(&option), &option.selection),
             "Codex model"
@@ -127789,6 +127789,11 @@ mod tests {
             .expect("the cascade should remain inspectable");
         assert!(cascade.contains("runtime_selector_dropdown_content_parts("));
         assert!(cascade.contains("effort_label"));
+        // The chip names the same `supplier/model` pair the home page's chip
+        // and the panel's rows do: two Providers can serve one model name, and
+        // a bare model left the reader guessing which one a turn would run as.
+        assert!(cascade.contains("runtime_provider_model_label("));
+        assert!(!cascade.contains("let trigger_model_label = runtime_model_label("));
 
         let parts = source
             .split_once("fn runtime_selector_dropdown_content_parts(")

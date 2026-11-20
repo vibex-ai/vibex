@@ -986,13 +986,16 @@ semicircles. The row's fixed widths are what `composer_slim_input_width`
 subtracts, so a new control there must be added to that figure as well, or the
 density probe wraps a line later than the painted bar does.
 
-The run-configuration chip names the model, never `account / model`: the
-account is a fact about the run configuration rather than about the model,
-and a prefix in front of the name the reader scans for both crowded the chip
-and truncated the model from the left. The bare model name comes from
-`runtime_model_label`; the catalogue's full `account / model` pair stays
-available to the panel and to the tooltip, which reports the model and the
-authentication source on separate lines.
+The run-configuration chip names the **supplier and the model together** —
+`provider/model` — through `runtime_provider_model_label`, the same pair the
+home page's chip and the panel's rows use. A bare model name was ambiguous: two
+Providers can serve one model, and a chip that showed only the model left the
+reader unable to tell which one a turn would run as. An Agent account reads
+`Agent account/model`, because there the Agent is the account; a Provider
+Profile keeps the name its owner gave it, and a route shows its own label. The
+pair truncates inside the chip's 240px cap while the thinking depth beside it
+keeps its width, and the tooltip spells the pair out and names the account on
+its own line, so a clipped chip still leaves the whole selection readable.
 
 The surface's fill is `composer-surface` lifted a few points toward the
 foreground in a dark appearance (`composer_surface_fill`). The authored plate
