@@ -591,3 +591,88 @@ done. Making rows survive a scroll needs a cache the run can reuse across
 frames, which `AnyElement` cannot be — it is consumed by drawing — so that would
 mean a virtual list that owns the rows, i.e. the `MessageScroller` migration in
 §7.1, and it would only pay for the rows it does *not* have to rebuild.
+
+## 9. Why the transcript bounced, and what keeps it still
+
+The transcript "jumped" for months with every fix chasing a different theory. It
+was five separate faults, each with its own signature in the `TLSCROLL` trace
+(`VIBEX_TIMELINE_TRACE`), and each now has a test. Read this before touching
+`sync_timeline_list_rows`, `scroll_timeline_to_latest`, or the anchor capture.
+
+### 9.1 One hint for every row is a stand-in, not a height
+
+`ListState::reset_with_uniform_height` is the only seeding entry point, so every
+unmeasured row starts at one height. The first layout of a row replaces that with
+its real height. If the reader's anchor is *inside* that row, their place was a
+distance into a box that just changed size, so the row re-normalizes the anchor
+and the viewport moves. Signature: `top=A:x → top=B:y` with `B > A`, a few hundred
+pixels, on the *first* pass over a session, going *up* (rows below are never the
+problem — their correction happens below the fold).
+
+Two things shrink it to nothing: seed with the **mean** of the table (its product
+with the row count is the table's own total, unlike the median), and measure a
+window of up to `TIMELINE_MEASURE_ALL_MAX_ROWS` in one pass when it is seeded, so
+the rows are exact before the reader reaches them. Longer windows keep the
+visible-only layout, because laying out a transcript at once is the cost the
+virtual list exists to avoid.
+
+### 9.2 A pane animating its width re-seeds every frame
+
+A width change wipes the list's hints, so the sync re-seeded — including on every
+frame of a session-opening animation (0 → 360 → 508 → … → 1080 in one capture,
+one seed per frame). Each seed rebuilt the whole document from one hint and
+re-derived the anchor from it. The sync now splices the count into a
+width-changing frame and seeds once, on the frame the width holds still.
+Signature: `seeds` climbing every frame while `width` walks.
+
+### 9.3 A page above is spliced, never rebuilt
+
+An older page landing above the reader used to take the same reset, dropping
+every measured row and re-deriving them from a hint — a perturbation the size of
+the page, corrected row by row afterwards. `splice(0..0, added)` inserts the rows
+and shifts the anchor by their count, so the reader keeps their row and every
+measurement survives. Appends still take the reset: a new row at the bottom needs
+a hint before the live edge can be placed against it.
+
+### 9.4 The end anchor is not a position
+
+`scroll_to_end` anchors *past* the last row. That anchor has no row and no
+distance into one, and its reported offset is the whole document — a viewport
+beyond the last offset the list can travel. Reading `offset_in_item` off it
+records the *top* of the last row as the reader's place; a guard comparing the
+offset against the bare maximum calls every frame at the bottom a clamp (the
+bottom already runs a padding past it). Capture it as the bottom of the last row
+and skip it in the clamp guard.
+
+### 9.5 The live edge has two representations, one padding apart
+
+The end anchor paints by walking back from the last row; the layout's fill branch
+derives a row anchor and counts the list's padding, placing the same content one
+padding band lower. A frame alternating between them is a padding-sized bounce.
+The list is put in its own tail mode at the live edge, left when the reader
+scrolls away, and paused when the composer changes the viewport so a taller
+composer lifts the composer and not the conversation.
+
+### 9.6 A streaming row only grows
+
+An estimate replaced by a measurement is often shorter, and the drop moves
+everything below the row up by the difference — a third of a screen mid-read. The
+streaming last row holds its height until its turn finishes; every other row
+takes its measurement immediately.
+
+### 9.7 The tests that pin it
+
+| Test | Invariant |
+| --- | --- |
+| `a_fresh_transcript_scrolls_up_by_what_the_wheel_asked` | A session's first scroll up moves by the wheel, and the row under the viewport travels with it |
+| `scrolling_a_long_transcript_moves_by_the_requested_distance` | Every step moves exactly as far as it was asked |
+| `a_streaming_turn_does_not_rock_the_live_edge` | Growth may only move the live edge toward the end |
+| `a_streaming_turn_below_does_not_move_a_reader_who_scrolled_up` | A stream below never moves a reader above |
+| `a_reseeded_transcript_is_as_tall_as_its_rows` | A seeded document matches its table |
+| `an_older_page_above_the_reader_keeps_their_place` | A spliced page leaves the reader's row and distance alone |
+| `a_turn_arriving_while_scrolled_up_keeps_the_readers_place` | An appended turn leaves the anchor alone |
+
+The residual, known and accepted: the padding band of §9.5 is worth ~30px at the
+moment the reader leaves or re-enters the live edge, and the trace reports
+`unexplained` for wheel events that the list correctly ignores at the end of the
+document.
