@@ -2964,6 +2964,16 @@ fn queue_card(
                     .flex_row()
                     .items_center()
                     .gap(px(theme::SPACING_XS))
+                    .on_pan_end({
+                        let on_move = on_move.clone();
+                        move |event: &PanEvent| {
+                            if event.translation.y.0 < -28.0 {
+                                on_move(id, -1);
+                            } else if event.translation.y.0 > 28.0 {
+                                on_move(id, 1);
+                            }
+                        }
+                    })
                     .child(
                         text(move || {
                             message.with(|message| {
