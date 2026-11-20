@@ -5148,9 +5148,22 @@ fn a_streaming_turn_does_not_rock_the_live_edge(cx: &mut TestAppContext) {
         for _ in 0..2 {
             draw_disclosure_frame(cx);
         }
-        let now = workbench.read_with(cx, |workbench, _| {
-            workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y
+        let (now, extent, table) = workbench.read_with(cx, |workbench, _| {
+            (
+                workbench.timeline_scroll.scroll_px_offset_for_scrollbar().y,
+                workbench.timeline_scroll.max_offset_for_scrollbar().y
+                    + workbench.timeline_scroll.viewport_bounds().size.height,
+                workbench
+                    .timeline_row_sizes
+                    .iter()
+                    .map(|row| row.height)
+                    .sum::<Pixels>(),
+            )
         });
+        assert!(
+            extent >= table * 0.9,
+            "chunk {chunk}: the list holds {extent:?} of the table's {table:?}"
+        );
         assert!(
             now <= last + slack,
             "chunk {chunk} rocked the live edge: {last:?} -> {now:?} (viewport {viewport:?})"

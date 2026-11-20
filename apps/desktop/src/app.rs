@@ -33089,8 +33089,29 @@ impl VibexWorkbench {
             .iter()
             .map(|row| row.height)
             .sum::<Pixels>();
+        // Where the painted rows disagree with the table, name them: the table
+        // decides what this view asks the list for, and the list decides what can
+        // be scrolled to, so a row they disagree about is a document whose end is
+        // not where either of them says it is.
+        let mut mismatched = String::new();
+        if (table - (max_offset + viewport)).abs() > table * 0.05 {
+            for (ix, row) in self.timeline_row_sizes.iter().enumerate() {
+                if let Some(painted) = self
+                    .timeline_scroll
+                    .bounds_for_item(ix)
+                    .map(|bounds| bounds.size.height)
+                    && (painted - row.height).abs() > px(4.0)
+                {
+                    mismatched.push_str(&format!(
+                        "{ix}:{:.0}/{:.0} ",
+                        f32::from(row.height),
+                        f32::from(painted)
+                    ));
+                }
+            }
+        }
         let line = format!(
-            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} top={}:{} tail={} layers={} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
+            "TLSCROLL n={} offset={offset:?} observed={observed:?} expected={expected:?} unexplained={unexplained:?} at_edge={at_edge} follow={} rows={} count={} width={:?} viewport={viewport:?} max={max_offset:?} sum={table:?} mism=[{mismatched}] top={}:{} tail={} layers={} seeds={} hintw={} settle={} anim={} hang={} pending_anchor={} pending_latest={} pending_reveal={:?}",
             self.timeline_trace.frames,
             self.timeline_follow.following_bottom,
             self.timeline_row_sizes.len(),
