@@ -10,7 +10,7 @@
 //! (`apps/mobile/src/theme.rs`). They stay here while the GPUI client is still
 //! shipping, so a screen migrated to `nsh` keeps the numbers its pair has.
 
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::cell::Cell;
 
 use nsh_core::prelude::*;
 
@@ -62,17 +62,21 @@ pub const FONT_WORDMARK: f32 = 36.0;
 /// The text-size steps the Settings page offers, as percentages of the ladder.
 pub const FONT_SCALE_STEPS: [u32; 4] = [80, 90, 100, 115];
 
-/// The text-size step every font on the ladder is drawn at.
-static FONT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
+thread_local! {
+    /// The text-size step every font on the ladder is drawn at. One device
+    /// draws its one app on one engine thread; tests run several apps on
+    /// their own threads.
+    static FONT_SCALE_PERCENT: Cell<u32> = const { Cell::new(100) };
+}
 
 /// Applies a text-size step to every font the screens read.
 pub fn set_font_scale_percent(percent: u32) {
-    FONT_SCALE_PERCENT.store(percent.clamp(75, 150), Ordering::Relaxed);
+    FONT_SCALE_PERCENT.with(|cell| cell.set(percent.clamp(75, 150)));
 }
 
 /// The text-size step in use.
 pub fn font_scale_percent() -> u32 {
-    FONT_SCALE_PERCENT.load(Ordering::Relaxed)
+    FONT_SCALE_PERCENT.with(Cell::get)
 }
 
 fn scaled_font(base: f32) -> f32 {
