@@ -1566,6 +1566,12 @@ fn composer(host: SessionHost) -> impl IntoElement {
                     }
                 })),
         )
+        // `pb_keyboard` covers the keyboard while it is up; with it down the
+        // composer still has to clear the home indicator.
+        .child(when(
+            move || keyboard_height().0 == 0.0,
+            || view().h(safe_area().bottom),
+        ))
 }
 
 /// The pending attachments, each removable.

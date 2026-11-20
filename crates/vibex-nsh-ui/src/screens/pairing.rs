@@ -164,7 +164,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     let nearby_open = signal(false);
     let switcher = host.switcher;
     let spinner = signal(SharedString::from("◐"));
-    {
+    if !crate::motion::reduce_motion() {
         spawn(async move {
             let frames = ["◐", "◓", "◑", "◒"];
             let mut index = 0;

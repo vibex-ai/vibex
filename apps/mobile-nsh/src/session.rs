@@ -331,6 +331,9 @@ impl SessionService {
 
     /// Reconnects when the app comes back to the foreground.
     pub fn resume(&self) {
+        // A stream that survived the background may still have missed events;
+        // read the list again and let the loop retry as soon as it can.
+        self.retry_now.set(true);
         if self.connection.get_untracked() == ConnectionState::Online {
             self.refresh();
         } else {

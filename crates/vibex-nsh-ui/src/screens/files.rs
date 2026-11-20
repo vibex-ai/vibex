@@ -80,6 +80,7 @@ pub fn files(host: FilesHost) -> impl IntoElement {
         .flex_1()
         .bg(theme::background)
         .flex_col()
+        .pb_safe_area()
         .child(
             view()
                 .w_full()

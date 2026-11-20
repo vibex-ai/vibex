@@ -29,6 +29,7 @@
 //!   keyboards and selection are the platform's.
 
 pub mod copy;
+pub mod motion;
 pub mod screens;
 pub mod theme;
 pub mod ui;

@@ -228,6 +228,7 @@ fn settings_host(
     let haptics = settings.haptics;
     let keep_screen_on = settings.keep_screen_on;
     let font_scale = settings.font_scale;
+    let reduce_motion = settings.reduce_motion;
     let notifications = settings.notifications;
     let notify_completed = settings.notify_completed;
     let notify_needs_input = settings.notify_needs_input;
@@ -237,6 +238,7 @@ fn settings_host(
     let settings_for_haptics = settings.clone();
     let settings_for_screen = settings.clone();
     let settings_for_text = settings.clone();
+    let settings_for_motion = settings.clone();
     let settings_for_notifications = settings.clone();
     let settings_for_completed = settings.clone();
     let settings_for_needs_input = settings.clone();
@@ -250,6 +252,7 @@ fn settings_host(
         haptics,
         keep_screen_on,
         font_scale,
+        reduce_motion,
         notifications,
         notify_completed,
         notify_needs_input,
@@ -270,6 +273,9 @@ fn settings_host(
         }),
         on_font_scale: Rc::new(move |percent| {
             settings_for_text.set_font_scale(percent);
+        }),
+        on_reduce_motion: Rc::new(move |reduce| {
+            settings_for_motion.set_reduce_motion(reduce);
         }),
         on_notifications: Rc::new(move |enabled| {
             settings_for_notifications.set_notifications(enabled);

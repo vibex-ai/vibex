@@ -28,6 +28,8 @@ pub struct SettingsHost {
     pub keep_screen_on: Signal<bool>,
     /// The text-size step, as a percentage of the ladder.
     pub font_scale: Signal<u32>,
+    /// Whether the app skips its own motion.
+    pub reduce_motion: Signal<bool>,
     /// The notification master switch and its three categories.
     pub notifications: Signal<bool>,
     pub notify_completed: Signal<bool>,
@@ -42,6 +44,7 @@ pub struct SettingsHost {
     pub on_haptics: Rc<dyn Fn(bool)>,
     pub on_keep_screen_on: Rc<dyn Fn(bool)>,
     pub on_font_scale: Rc<dyn Fn(u32)>,
+    pub on_reduce_motion: Rc<dyn Fn(bool)>,
     pub on_notifications: Rc<dyn Fn(bool)>,
     pub on_notify_completed: Rc<dyn Fn(bool)>,
     pub on_notify_needs_input: Rc<dyn Fn(bool)>,

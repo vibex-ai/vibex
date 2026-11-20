@@ -96,6 +96,8 @@ struct StoredSettings {
     keep_screen_on: bool,
     #[serde(default = "default_font_scale")]
     font_scale: u32,
+    #[serde(default)]
+    reduce_motion: bool,
     #[serde(default = "default_true")]
     notifications: bool,
     #[serde(default = "default_true")]
@@ -114,6 +116,7 @@ impl Default for StoredSettings {
             haptics: default_haptics(),
             keep_screen_on: false,
             font_scale: default_font_scale(),
+            reduce_motion: false,
             notifications: true,
             notify_completed: true,
             notify_needs_input: true,
@@ -135,6 +138,8 @@ pub struct SettingsState {
     pub keep_screen_on: Signal<bool>,
     /// The text-size step, as a percentage of the ladder.
     pub font_scale: Signal<u32>,
+    /// Whether the app skips its own motion.
+    pub reduce_motion: Signal<bool>,
     /// The notification master switch and its three categories.
     pub notifications: Signal<bool>,
     pub notify_completed: Signal<bool>,
@@ -166,6 +171,7 @@ impl SettingsState {
             haptics: signal(stored.haptics),
             keep_screen_on: signal(stored.keep_screen_on),
             font_scale: signal(normalized_font_scale(stored.font_scale)),
+            reduce_motion: signal(stored.reduce_motion),
             notifications: signal(stored.notifications),
             notify_completed: signal(stored.notify_completed),
             notify_needs_input: signal(stored.notify_needs_input),
@@ -188,6 +194,7 @@ impl SettingsState {
         KEEP_SCREEN_ON.store(self.keep_screen_on.get_untracked(), Ordering::Relaxed);
         vibex_nsh_ui::theme::set_font_scale_percent(self.font_scale.get_untracked());
         self.refresh_notifications();
+        vibex_nsh_ui::motion::set_reduce_motion(self.reduce_motion.get_untracked());
     }
 
     /// Chooses an appearance and keeps it.
@@ -209,6 +216,16 @@ impl SettingsState {
         copy::set_preference(language);
         self.revision
             .update(|revision| *revision = revision.wrapping_add(1));
+        self.persist();
+    }
+
+    /// Chooses whether the app skips its own motion.
+    pub fn set_reduce_motion(&self, reduce: bool) {
+        if self.reduce_motion.get_untracked() == reduce {
+            return;
+        }
+        self.reduce_motion.set(reduce);
+        vibex_nsh_ui::motion::set_reduce_motion(reduce);
         self.persist();
     }
 
@@ -292,6 +309,7 @@ impl SettingsState {
             haptics: self.haptics.get_untracked(),
             keep_screen_on: self.keep_screen_on.get_untracked(),
             font_scale: self.font_scale.get_untracked(),
+            reduce_motion: self.reduce_motion.get_untracked(),
             notifications: self.notifications.get_untracked(),
             notify_completed: self.notify_completed.get_untracked(),
             notify_needs_input: self.notify_needs_input.get_untracked(),
@@ -313,6 +331,7 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
             font_scale: settings
                 .font_scale_percent
                 .unwrap_or_else(default_font_scale),
+            reduce_motion: false,
             notifications: true,
             notify_completed: true,
             notify_needs_input: true,
