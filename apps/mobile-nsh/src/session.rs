@@ -173,6 +173,8 @@ pub struct SessionService {
     new_workspace: Signal<Option<String>>,
     new_runtime: Signal<Option<String>>,
     new_worktree_branch: Signal<String>,
+    new_title: Signal<String>,
+    new_prompt: Signal<String>,
     new_busy: Signal<bool>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Rc<RefCell<Vec<WorkspaceSummary>>>,
@@ -315,6 +317,8 @@ impl SessionService {
             new_workspace: signal(None),
             new_runtime: signal(None),
             new_worktree_branch: signal(String::new()),
+            new_title: signal(String::new()),
+            new_prompt: signal(String::new()),
             new_busy: signal(false),
             new_error: signal(None),
             workspace_records: Rc::new(RefCell::new(Vec::new())),
@@ -509,6 +513,8 @@ impl SessionService {
             new_workspace: self.new_workspace,
             new_runtime: self.new_runtime,
             new_worktree_branch: self.new_worktree_branch,
+            new_title: self.new_title,
+            new_prompt: self.new_prompt,
             new_busy: self.new_busy,
             new_error: self.new_error,
             resolving: self.resolving,
@@ -2717,7 +2723,10 @@ impl SessionService {
                 runtime: option.selection,
                 workspace_root: worktree.workspace.root_path,
                 workspace_mode: worktree.workspace.mode,
-                title: None,
+                title: {
+                    let title = service.new_title.get_untracked().trim().to_owned();
+                    (!title.is_empty()).then_some(title)
+                },
                 safety: None,
                 session_id: Some(VibexSessionId::new()),
                 defer_runtime_materialization: false,
@@ -2731,10 +2740,14 @@ impl SessionService {
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
+                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
                     service.new_session_open.set(false);
                     service.new_worktree_branch.set(String::new());
                     service.refresh();
                     service.open(session.id.as_str());
+                    if !prompt.is_empty() {
+                        service.send(&prompt);
+                    }
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -2906,6 +2919,8 @@ impl SessionService {
         self.terminal_open.set(false);
         self.new_session_open.set(true);
         self.new_error.set(None);
+        self.new_title.set(String::new());
+        self.new_prompt.set(String::new());
         self.new_busy.set(true);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
@@ -3009,7 +3024,10 @@ impl SessionService {
                 runtime: option.selection,
                 workspace_root: workspace.workspace.root_path.clone(),
                 workspace_mode: workspace.workspace.mode,
-                title: None,
+                title: {
+                    let title = service.new_title.get_untracked().trim().to_owned();
+                    (!title.is_empty()).then_some(title)
+                },
                 safety: None,
                 session_id: Some(VibexSessionId::new()),
                 defer_runtime_materialization: false,
@@ -3023,9 +3041,13 @@ impl SessionService {
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
+                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
                     service.new_session_open.set(false);
                     service.refresh();
                     service.open(session.id.as_str());
+                    if !prompt.is_empty() {
+                        service.send(&prompt);
+                    }
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(

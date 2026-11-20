@@ -43,6 +43,9 @@ pub struct NewSessionHost {
     pub error: Signal<Option<SharedString>>,
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
+    /// The session's optional title and first message.
+    pub title: Signal<String>,
+    pub prompt: Signal<String>,
     /// A branch name for a new worktree.
     pub worktree_branch: Signal<String>,
     pub on_create_worktree: Rc<dyn Fn()>,
@@ -74,6 +77,18 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
+                .child(crate::ui::field::text_field(
+                    host.title,
+                    copy::text("Title (optional)", "标题（可选）", "標題（選填）"),
+                ))
+                .child(crate::ui::field::text_field(
+                    host.prompt,
+                    copy::text(
+                        "First message (optional)",
+                        "第一条消息（可选）",
+                        "第一則訊息（選填）",
+                    ),
+                ))
                 .child(section_label(copy::text("Workspace", "工作区", "工作區")))
                 .child(choice_list(
                     host.workspaces,
