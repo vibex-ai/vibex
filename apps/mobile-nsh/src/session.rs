@@ -36,16 +36,17 @@ use vibex_core::{
     FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
     GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitRemoteActionKind,
     GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
-    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
-    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
-    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
-    TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
-    WorkspaceId, unix_timestamp_ms,
+    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, OpenWorkspaceRequest,
+    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
+    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
+    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
+    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
+    SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest, TeamTaskAction,
+    TeamTaskControlRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
+    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
+    UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceId,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -224,6 +225,7 @@ pub struct SessionService {
     new_runtime: Signal<Option<String>>,
     new_worktree_branch: Signal<String>,
     new_base_ref: Signal<String>,
+    new_project_path: Signal<String>,
     new_title: Signal<String>,
     new_prompt: Signal<String>,
     new_attachments: Signal<Vec<AttachmentItem>>,
@@ -278,6 +280,8 @@ pub struct SessionService {
     show_plan_goal: Signal<bool>,
     show_generation_status: Signal<bool>,
     show_reasoning: Signal<bool>,
+    auto_continue: Signal<bool>,
+    auto_continue_armed: Rc<Cell<bool>>,
     find_open: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
@@ -396,6 +400,7 @@ impl SessionService {
             new_runtime: signal(None),
             new_worktree_branch: signal(String::new()),
             new_base_ref: signal(String::new()),
+            new_project_path: signal(String::new()),
             new_title: signal(String::new()),
             new_prompt: signal(String::new()),
             new_attachments: signal(Vec::new()),
@@ -438,6 +443,8 @@ impl SessionService {
             show_plan_goal: signal(crate::settings::show_plan_goal()),
             show_generation_status: signal(crate::settings::show_generation_status()),
             show_reasoning: signal(crate::settings::show_reasoning()),
+            auto_continue: signal(crate::settings::auto_continue()),
+            auto_continue_armed: Rc::new(Cell::new(false)),
             find_open: signal(false),
             plan: signal(None),
             goal: signal(None),
@@ -744,6 +751,14 @@ impl SessionService {
             show_plan_goal: self.show_plan_goal,
             show_generation_status: self.show_generation_status,
             show_reasoning: self.show_reasoning,
+            auto_continue: self.auto_continue,
+            on_toggle_auto_continue: {
+                let service = self.clone();
+                Rc::new(move || {
+                    let next = !service.auto_continue.get_untracked();
+                    service.auto_continue.set(next);
+                })
+            },
             find_open: self.find_open,
             on_toggle_find: {
                 let service = self.clone();
@@ -893,6 +908,11 @@ impl SessionService {
             on_create_temporary_session: {
                 let service = self.clone();
                 Rc::new(move || service.create_temporary_session())
+            },
+            new_project_path: self.new_project_path,
+            on_open_project: {
+                let service = self.clone();
+                Rc::new(move || service.open_project())
             },
             on_session_menu: {
                 let service = self.clone();
@@ -1936,6 +1956,14 @@ impl SessionService {
         self.publish();
     }
 
+    pub fn set_auto_continue(&self, enabled: bool) {
+        self.auto_continue.set(enabled);
+        if !enabled {
+            self.auto_continue_armed.set(false);
+        }
+        self.publish();
+    }
+
     fn open_team(&self) {
         self.team_open.set(true);
         self.refresh_team();
@@ -2756,6 +2784,16 @@ impl SessionService {
         self.plan.set(plan);
         self.goal.set(goal);
         self.needs_continue.set(needs_continue);
+        if !needs_continue {
+            self.auto_continue_armed.set(false);
+        } else if self.auto_continue.get_untracked() && !self.auto_continue_armed.get() {
+            self.auto_continue_armed.set(true);
+            let service = self.clone();
+            spawn(async move {
+                timer(Duration::from_secs(2)).await;
+                service.continue_turn();
+            });
+        }
         self.editable_sequence.set(editable);
         self.refresh_pending();
     }
@@ -3889,6 +3927,68 @@ impl SessionService {
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
                     format!("creating the session did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn open_project(&self) {
+        let path = self.new_project_path.get_untracked().trim().to_owned();
+        if path.is_empty() || self.new_busy.get_untracked() {
+            return;
+        }
+        self.new_busy.set(true);
+        self.new_error.set(None);
+        let service = self.clone();
+        let workspaces = self.workspace_backend.clone();
+        spawn(async move {
+            let open_workspaces = workspaces.clone();
+            let opened = background(async move {
+                open_workspaces
+                    .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
+                        root_path: path,
+                        mode: None,
+                    }))
+                    .await
+            })
+            .await;
+            let opened = match opened {
+                Ok(Ok(workspace)) => workspace,
+                Ok(Err(error)) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(error_text(&error)));
+                    return;
+                }
+                Err(error) => {
+                    service.new_busy.set(false);
+                    service.new_error.set(Some(
+                        format!("opening the project did not finish: {error}").into(),
+                    ));
+                    return;
+                }
+            };
+            let spaces = background(async move { workspaces.list_workspaces().await }).await;
+            service.new_busy.set(false);
+            match spaces {
+                Ok(Ok(spaces)) => {
+                    let choices = spaces
+                        .iter()
+                        .map(|space| WorkspaceChoice {
+                            id: space.workspace.id.as_str().to_owned(),
+                            name: space.project.name.clone(),
+                            detail: space.workspace.root_path.clone(),
+                        })
+                        .collect::<Vec<_>>();
+                    service
+                        .new_workspace
+                        .set(Some(opened.workspace.id.as_str().to_owned()));
+                    service.new_workspaces.set(choices);
+                    *service.workspace_records.borrow_mut() = spaces;
+                    service.new_project_path.set(String::new());
+                }
+                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
+                Err(error) => service.new_error.set(Some(
+                    format!("listing the projects did not finish: {error}").into(),
                 )),
             }
         });

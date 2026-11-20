@@ -40,6 +40,7 @@ pub struct SettingsHost {
     pub show_plan_goal: Signal<bool>,
     pub show_generation_status: Signal<bool>,
     pub show_reasoning: Signal<bool>,
+    pub auto_continue: Signal<bool>,
     /// The connected runtime's label, when there is one.
     pub runtime: Signal<Option<SharedString>>,
     /// The runtimes this phone saved, for the runtime actions.
@@ -58,6 +59,7 @@ pub struct SettingsHost {
     pub on_show_plan_goal: Rc<dyn Fn(bool)>,
     pub on_show_generation_status: Rc<dyn Fn(bool)>,
     pub on_show_reasoning: Rc<dyn Fn(bool)>,
+    pub on_auto_continue: Rc<dyn Fn(bool)>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_reconnect: Rc<dyn Fn()>,
     pub on_switch_runtime: Rc<dyn Fn()>,
@@ -172,6 +174,15 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                                 copy::text("Show reasoning", "显示思考过程", "顯示思考過程"),
                                 host.show_reasoning,
                                 host.on_show_reasoning.clone(),
+                            ))
+                            .child(toggle_row(
+                                copy::text(
+                                    "Continue paused turns",
+                                    "自动继续暂停的回合",
+                                    "自動繼續暫停的回合",
+                                ),
+                                host.auto_continue,
+                                host.on_auto_continue.clone(),
                             )),
                     ))
                     .child(section(

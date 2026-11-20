@@ -237,6 +237,7 @@ fn settings_host(
     let show_plan_goal = settings.show_plan_goal;
     let show_generation_status = settings.show_generation_status;
     let show_reasoning = settings.show_reasoning;
+    let auto_continue = settings.auto_continue;
     let settings_for_appearance = settings.clone();
     let settings_for_language = settings.clone();
     let settings_for_haptics = settings.clone();
@@ -251,10 +252,12 @@ fn settings_host(
     let settings_for_plan = settings.clone();
     let settings_for_generation = settings.clone();
     let settings_for_reasoning = settings.clone();
+    let settings_for_auto_continue = settings.clone();
     let services_for_token = services;
     let services_for_plan = services;
     let services_for_generation = services;
     let services_for_reasoning = services;
+    let services_for_auto_continue = services;
     let pairing_for_disconnect = pairing.clone();
     let pairing_for_clear = pairing.clone();
     SettingsHost {
@@ -273,6 +276,7 @@ fn settings_host(
         show_plan_goal,
         show_generation_status,
         show_reasoning,
+        auto_continue,
         runtime: pairing.connected_label(),
         saved: pairing.saved(),
         on_appearance: Rc::new(move |appearance| {
@@ -327,6 +331,12 @@ fn settings_host(
             settings_for_reasoning.set_show_reasoning(enabled);
             if let Some(service) = services_for_reasoning.get_untracked() {
                 service.set_show_reasoning(enabled);
+            }
+        }),
+        on_auto_continue: Rc::new(move |enabled| {
+            settings_for_auto_continue.set_auto_continue(enabled);
+            if let Some(service) = services_for_auto_continue.get_untracked() {
+                service.set_auto_continue(enabled);
             }
         }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),

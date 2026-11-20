@@ -391,6 +391,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let show_generation_status = signal(true);
     let find_open = signal(false);
     let show_reasoning = signal(true);
+    let auto_continue = signal(false);
     let plan = signal(None);
     let goal = signal(None);
     let history = signal(Vec::new());
@@ -616,6 +617,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let new_error = signal(None::<SharedString>);
     let new_worktree_branch = signal(String::new());
     let new_base_ref = signal(String::new());
+    let new_project_path = signal(String::new());
     let on_create_worktree_session = Rc::new(move || {
         if new_worktree_branch.get_untracked().trim().is_empty() {
             return;
@@ -756,6 +758,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         show_generation_status,
         find_open,
         show_reasoning,
+        auto_continue,
+        on_toggle_auto_continue: Rc::new(|| {}),
         on_toggle_find: Rc::new(move || find_open.update(|open| *open = !*open)),
         plan,
         goal,
@@ -894,6 +898,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_error,
         on_create_session,
         on_create_temporary_session: Rc::new(|| {}),
+        new_project_path,
+        on_open_project: Rc::new(|| {}),
         new_worktree_branch,
         new_base_ref,
         new_title,

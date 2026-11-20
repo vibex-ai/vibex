@@ -32,6 +32,8 @@ static SHOW_PLAN_GOAL: AtomicBool = AtomicBool::new(true);
 static SHOW_GENERATION_STATUS: AtomicBool = AtomicBool::new(true);
 /// Whether the transcript shows the Agent's reasoning rows.
 static SHOW_REASONING: AtomicBool = AtomicBool::new(true);
+/// Whether a paused turn continues on its own.
+static AUTO_CONTINUE: AtomicBool = AtomicBool::new(false);
 
 /// The notification categories the reader wants; master, completed, needs
 /// input and failure are bits of one byte, read on the event path.
@@ -82,6 +84,10 @@ pub fn show_generation_status() -> bool {
 
 pub fn show_reasoning() -> bool {
     SHOW_REASONING.load(Ordering::Relaxed)
+}
+
+pub fn auto_continue() -> bool {
+    AUTO_CONTINUE.load(Ordering::Relaxed)
 }
 
 /// Plays `haptic` when the reader left feedback on.
@@ -139,6 +145,8 @@ struct StoredSettings {
     show_generation_status: bool,
     #[serde(default = "default_true")]
     show_reasoning: bool,
+    #[serde(default)]
+    auto_continue: bool,
 }
 
 impl Default for StoredSettings {
@@ -158,6 +166,7 @@ impl Default for StoredSettings {
             show_plan_goal: true,
             show_generation_status: true,
             show_reasoning: true,
+            auto_continue: false,
         }
     }
 }
@@ -187,6 +196,7 @@ pub struct SettingsState {
     pub show_plan_goal: Signal<bool>,
     pub show_generation_status: Signal<bool>,
     pub show_reasoning: Signal<bool>,
+    pub auto_continue: Signal<bool>,
     /// Bumped on every language change: the root rebuilds the copy in place.
     pub revision: Signal<u64>,
 }
@@ -222,6 +232,7 @@ impl SettingsState {
             show_plan_goal: signal(stored.show_plan_goal),
             show_generation_status: signal(stored.show_generation_status),
             show_reasoning: signal(stored.show_reasoning),
+            auto_continue: signal(stored.auto_continue),
             revision: signal(0),
         };
         if imported {
@@ -360,6 +371,12 @@ impl SettingsState {
         self.persist();
     }
 
+    pub fn set_auto_continue(&self, enabled: bool) {
+        self.auto_continue.set(enabled);
+        AUTO_CONTINUE.store(enabled, Ordering::Relaxed);
+        self.persist();
+    }
+
     pub fn set_notify_failed(&self, enabled: bool) {
         self.notify_failed.set(enabled);
         self.refresh_notifications();
@@ -394,6 +411,7 @@ impl SettingsState {
             show_plan_goal: self.show_plan_goal.get_untracked(),
             show_generation_status: self.show_generation_status.get_untracked(),
             show_reasoning: self.show_reasoning.get_untracked(),
+            auto_continue: self.auto_continue.get_untracked(),
         };
         if let Ok(text) = serde_json::to_string(&stored) {
             let _ = Storage::set_item(SETTINGS_KEY, text);
@@ -420,6 +438,7 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
             show_plan_goal: true,
             show_generation_status: true,
             show_reasoning: true,
+            auto_continue: false,
         }
     }
 }

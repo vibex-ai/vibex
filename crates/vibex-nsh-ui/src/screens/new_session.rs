@@ -47,6 +47,9 @@ pub struct NewSessionHost {
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
     pub on_create_temporary: Rc<dyn Fn()>,
+    /// A path to open as a project before choosing it.
+    pub project_path: Signal<String>,
+    pub on_open_project: Rc<dyn Fn()>,
     /// The session's optional title, first message and its attachments.
     pub title: Signal<String>,
     pub prompt: Signal<String>,
