@@ -35,10 +35,11 @@ use vibex_core::{
     RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
-    RemoteAgentTimelineItemFetchResponse, RemoteAgentUnarchiveSessionResponse,
-    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
-    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
-    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentTimelineItemFetchResponse, RemoteAgentTurnIndexFetchResponse,
+    RemoteAgentUnarchiveSessionResponse, RemoteAgentUsageStatisticsResponse, RemoteAuditAction,
+    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
+    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
+    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
@@ -5386,6 +5387,18 @@ async fn dispatch_agent_request(
             )?;
             let item = manager.fetch_timeline_item(request.request).await?;
             serde_json::to_value(RemoteAgentTimelineItemFetchResponse { item })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::FetchTurnIndex(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let index = manager.fetch_turn_index(request.request).await?;
+            serde_json::to_value(RemoteAgentTurnIndexFetchResponse { index })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::GetTimelineDisplaySettings(request) => {

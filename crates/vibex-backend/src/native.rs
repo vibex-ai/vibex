@@ -513,6 +513,21 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn fetch_turn_index(
+        &self,
+        request: vibex_core::FetchTurnIndexRequest,
+    ) -> BackendFuture<'_, vibex_core::TimelineTurnIndex> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .fetch_turn_index(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn get_timeline_display_settings(
         &self,
     ) -> BackendFuture<'_, vibex_core::AgentTimelineDisplaySettings> {

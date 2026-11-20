@@ -1152,6 +1152,38 @@ const AGENT_TURN_PREVIEW_CARD_MIN_WIDTH: f32 = 248.0;
 const AGENT_TURN_PREVIEW_CARD_VIEWPORT_INSET: f32 = 80.0;
 const AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT: usize = 2;
 const AGENT_TURN_PREVIEW_RAIL_TRANSITION_DURATION: Duration = Duration::from_millis(160);
+/// The thinnest a rail slot may get before the lane stops compressing and
+/// scrolls instead. Below this a tick is not aimable, and a history strip the
+/// pointer cannot address is not a navigation aid.
+const AGENT_TURN_PREVIEW_MIN_SLOT_PITCH: f32 = 3.0;
+/// The most slots the rail draws.
+///
+/// A conversation longer than this is sampled rather than truncated: each tick
+/// keeps its real turn and number, so the strip still covers the whole history
+/// while its frame cost stops growing with the conversation.
+const AGENT_TURN_PREVIEW_MAX_SLOTS: usize = 600;
+/// How many turns one page of the session's turn index carries.
+///
+/// The index is a label and an identity per turn, so a page is cheap; five
+/// hundred turns open a conversation's whole reach in a handful of reads while
+/// keeping one answer small enough for a paired client.
+const AGENT_TURN_INDEX_PAGE_TURNS: u32 = 500;
+/// How many pages a cold index read walks before it settles for what it has.
+///
+/// Eight pages put four thousand turns on the strip, far past what a reader
+/// navigates by hand. A longer conversation keeps exact numbering through
+/// `total_turns`; only turns below the budget go without a slot.
+const AGENT_TURN_INDEX_MAX_PAGES: usize = 8;
+/// How many turns one page of a rail jump may reach back over.
+///
+/// A jump is a gesture, not a background prefetch: the reader is waiting for
+/// the turn they clicked, so a page reaches as far as the store can serve
+/// contiguously instead of a screenful.
+const AGENT_RAIL_TURN_JUMP_TURNS: u32 = 200;
+/// How many pages a jump may read before it stops chasing the turn.
+const AGENT_RAIL_TURN_JUMP_MAX_STEPS: usize = 32;
+/// How many rail cards' prompt texts are kept for turns the window lacks.
+const AGENT_RAIL_PREVIEW_TEXT_CACHE: usize = 64;
 const AGENT_TIMELINE_NEAR_BOTTOM_THRESHOLD_PX: f32 = 96.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_REVEAL_THRESHOLD_PX: f32 = 240.0;
 const AGENT_TIMELINE_BOTTOM_CONTROL_HEIGHT_PX: f32 = 32.0;
@@ -3562,6 +3594,29 @@ async fn fetch_timeline_page_before(
     before_sequence: i64,
     contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    fetch_timeline_page_before_window(
+        runtime,
+        session_id,
+        before_sequence,
+        contiguous,
+        AGENT_TIMELINE_TURN_WINDOW,
+    )
+    .await
+}
+
+/// One page of history below `before_sequence`, over `turns` conversational
+/// turns.
+///
+/// The turn count is what a reader gesture may spend: a scroll extends the
+/// window by a screenful, while a rail jump reaches over as much history as it
+/// has to in one answer.
+async fn fetch_timeline_page_before_window(
+    runtime: Arc<DesktopRuntime>,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+    contiguous: bool,
+    turns: u32,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     runtime
         .agent()
         .fetch_timeline(FetchTimelineRequest {
@@ -3569,7 +3624,7 @@ async fn fetch_timeline_page_before(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(turns.max(1)),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -3582,6 +3637,24 @@ async fn fetch_timeline_page_before_via_backend(
     before_sequence: i64,
     contiguous: bool,
 ) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
+    fetch_timeline_page_before_via_backend_window(
+        backend,
+        session_id,
+        before_sequence,
+        contiguous,
+        AGENT_TIMELINE_TURN_WINDOW,
+    )
+    .await
+}
+
+/// Authority-agnostic twin of [`fetch_timeline_page_before_window`].
+async fn fetch_timeline_page_before_via_backend_window(
+    backend: BackendFacade,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+    contiguous: bool,
+    turns: u32,
+) -> vibex_core::VibexResult<vibex_core::TimelinePage> {
     backend
         .agent()
         .fetch_timeline(FetchTimelineRequest {
@@ -3589,7 +3662,7 @@ async fn fetch_timeline_page_before_via_backend(
             after_sequence: None,
             before_sequence: Some(before_sequence),
             limit: AGENT_TIMELINE_FETCH_PAGE_LIMIT,
-            max_turns: (!contiguous).then_some(AGENT_TIMELINE_TURN_WINDOW),
+            max_turns: (!contiguous).then_some(turns.max(1)),
             max_bytes: Some(AGENT_TIMELINE_WINDOW_BYTES),
         })
         .await
@@ -12082,6 +12155,28 @@ pub struct VibexWorkbench {
     session_search_scan_generation: u64,
     session_search_scan_task: Option<Task<()>>,
     pending_session_search_jump: Option<SessionSearchTarget>,
+    /// The session's user-turn index, which is what the conversation rail
+    /// numbers its slots from. `None` until the read lands, and the rail falls
+    /// back to the loaded window while it is missing.
+    rail_turn_index: Option<Rc<RailTurnIndex>>,
+    /// Whether a turn-index read is travelling. One at a time: a second read
+    /// for the same session would answer the same page.
+    rail_turn_index_loading: bool,
+    /// The session whose turn-index read the authority declined.
+    ///
+    /// A backend that does not serve the read would answer the same refusal on
+    /// every frame, so the rail stops asking for that session and stays on the
+    /// turns the window holds. Keyed by session so the next conversation, or
+    /// the real id of a session first shown optimistically, asks again.
+    rail_turn_index_failed: Option<VibexSessionId>,
+    /// Prompt texts read back for rail cards of turns the window does not
+    /// hold, keyed by the turn's user-row sequence.
+    rail_turn_preview_text: HashMap<i64, String>,
+    /// Turns whose prompt text is already travelling, so a pointer moving
+    /// across a slot does not ask twice.
+    rail_turn_preview_in_flight: BTreeSet<i64>,
+    /// The turn a rail click asked for, while history pages toward it.
+    pending_rail_turn_jump: Option<RailTurnJump>,
     session_search_highlight_item_id: Option<String>,
     session_search_highlight_query: Option<String>,
     /// Which occurrence inside the active row the find bar is on, so stepping
@@ -12850,6 +12945,7 @@ impl VibexWorkbench {
         session_id: VibexSessionId,
         before_sequence: i64,
         generation: u64,
+        turns: u32,
         cx: &mut Context<Self>,
     ) -> bool {
         let runtime = self.local_authority();
@@ -12861,8 +12957,14 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             match runtime {
                 Some(runtime) => {
-                    fetch_timeline_page_before(runtime, request_session_id, before_sequence, false)
-                        .await
+                    fetch_timeline_page_before_window(
+                        runtime,
+                        request_session_id,
+                        before_sequence,
+                        false,
+                        turns,
+                    )
+                    .await
                 }
                 None => {
                     let Some(backend) = backend else {
@@ -12871,11 +12973,12 @@ impl VibexWorkbench {
                             "no Agent authority is available to read older history",
                         ));
                     };
-                    fetch_timeline_page_before_via_backend(
+                    fetch_timeline_page_before_via_backend_window(
                         backend,
                         request_session_id,
                         before_sequence,
                         false,
+                        turns,
                     )
                     .await
                 }
@@ -12891,12 +12994,26 @@ impl VibexWorkbench {
                     )),
                 };
                 let _ = entity.update(cx, |this, cx| {
-                    this.finish_older_timeline_load(
+                    let merged = this.finish_older_timeline_load(
                         &session_id,
                         before_sequence,
                         generation,
                         outcome,
                     );
+                    // A rail jump asked for this page; its completion is what
+                    // moves the chase one step closer to the clicked turn.
+                    if merged {
+                        this.advance_rail_turn_jump(cx);
+                    } else if this
+                        .pending_rail_turn_jump
+                        .as_ref()
+                        .is_some_and(|jump| jump.session_id == session_id)
+                    {
+                        // The page did not land — a cursor the authority does
+                        // not understand, or a read that failed — so the chase
+                        // ends instead of reading the same page forever.
+                        this.pending_rail_turn_jump = None;
+                    }
                     cx.notify();
                 });
             },
@@ -12912,13 +13029,17 @@ impl VibexWorkbench {
     /// happens to be borrowed now: a page that a session switch superseded has
     /// no other path to a release, so a view that kept one would believe a read
     /// is still travelling and never prefetch its history again.
+    ///
+    /// Returns whether a page was really merged: a superseded, refused, or
+    /// failed read changes nothing, and the rail jump that asked for the page
+    /// must not chase it again.
     fn finish_older_timeline_load(
         &mut self,
         session_id: &VibexSessionId,
         before_sequence: i64,
         generation: u64,
         outcome: vibex_core::VibexResult<vibex_core::TimelinePage>,
-    ) {
+    ) -> bool {
         if self.selected_session_id.as_ref() != Some(session_id)
             || self.session_generation != generation
         {
@@ -12926,14 +13047,14 @@ impl VibexWorkbench {
             // describes a window this view may already have replaced — but the
             // slot it spent still belongs to the view it was read for.
             self.release_older_timeline_in_flight(session_id);
-            return;
+            return false;
         }
         self.timeline_older_in_flight = self.timeline_older_in_flight.saturating_sub(1);
         let page = match outcome {
             Ok(page) => page,
             Err(error) => {
                 self.agent_error = Some(format!("{}: {}", error.code, error.message));
-                return;
+                return false;
             }
         };
         if page.session_id != *session_id
@@ -12946,7 +13067,7 @@ impl VibexWorkbench {
             // again would return the same page forever, so the projection
             // stops claiming there is history below it.
             self.timeline_has_older = false;
-            return;
+            return false;
         }
         let added_history = !page.items.is_empty();
         let leading_turn_start = page.leading_turn_start;
@@ -12980,6 +13101,7 @@ impl VibexWorkbench {
         self.conversation_turns_cache_key = None;
         self.timeline_scroll_anchor_pending = true;
         self.rebuild_timeline_sizes();
+        added_history
     }
 
     /// Releases one older-page slot on the view that asked for the page.
@@ -13032,8 +13154,13 @@ impl VibexWorkbench {
         let Some(session_id) = self.timeline.session_id.clone() else {
             return;
         };
-        if !self.load_older_agent_timeline(session_id, before_sequence, self.session_generation, cx)
-        {
+        if !self.load_older_agent_timeline(
+            session_id,
+            before_sequence,
+            self.session_generation,
+            AGENT_TIMELINE_TURN_WINDOW,
+            cx,
+        ) {
             return;
         }
         self.timeline_older_in_flight += 1;
@@ -14066,6 +14193,12 @@ impl VibexWorkbench {
             session_search_scan_generation: 0,
             session_search_scan_task: None,
             pending_session_search_jump: None,
+            rail_turn_index: None,
+            rail_turn_index_loading: false,
+            rail_turn_index_failed: None,
+            rail_turn_preview_text: HashMap::new(),
+            rail_turn_preview_in_flight: BTreeSet::new(),
+            pending_rail_turn_jump: None,
             session_search_highlight_item_id: None,
             session_search_highlight_query: None,
             conversation_find_active_match_ordinal: 0,
@@ -31328,6 +31461,10 @@ impl VibexWorkbench {
             self.clear_child_agent_context();
         }
         self.session_generation = self.session_generation.saturating_add(1);
+        // The rail's index, its card texts and a pending jump all describe the
+        // session that was on screen; a sequence from it must never address a
+        // turn in the next one.
+        self.reset_rail_turn_index();
         let generation = self.session_generation;
         let previous_session_id = self.selected_session_id.clone();
         self.selected_session_id = Some(session_id.clone());
@@ -65521,8 +65658,13 @@ impl VibexWorkbench {
     /// card still answers the pointer. Without that gutter the rail falls back
     /// to revealing itself from the pane edge, which is the only place left for
     /// it.
+    ///
+    /// `index` is the session's turn index, which is what lets the rail number
+    /// and label turns the window does not hold. Without it the rail falls back
+    /// to the loaded turns, which is the shape it had before the read existed.
     fn render_agent_turn_preview_rail(
         &mut self,
+        index: Option<&RailTurnIndex>,
         turns: &[Rc<TimelineConversationTurn>],
         pinned: bool,
         cx: &mut Context<Self>,
@@ -65551,17 +65693,24 @@ impl VibexWorkbench {
             _ => "Empty message",
         };
 
-        // The rail only builds its entries while it is on screen, so a revealed
-        // one does not scale the frame cost with conversation length before the
-        // pointer reaches it. Continuation turns never open a slot: the rail
-        // numbers only the user turns that own them.
+        // The rail only builds its slots while it is on screen, and a
+        // conversation long enough to overshoot the lane is sampled rather than
+        // truncated, so an unrevealed rail costs one empty vector and a
+        // revealed one costs a bounded number of element trees. Continuation
+        // turns never open a slot: the rail numbers only the user turns that
+        // own them.
         let rail_revealed = pinned || self.turn_preview_rail_visible;
         let rail_entries = if rail_revealed {
             agent_turn_preview_rail_entries(turns)
         } else {
             Vec::new()
         };
-        let rail_turn_count = rail_entries.len();
+        let rail_slots = if rail_revealed {
+            agent_turn_preview_rail_slots(index, turns)
+        } else {
+            Vec::new()
+        };
+        let rail_turn_count = rail_slots.len();
         let active_index = self
             .turn_preview_active_index
             .filter(|index| *index < rail_turn_count);
@@ -65571,7 +65720,7 @@ impl VibexWorkbench {
         // the conversation as it scrolls instead of waiting for a hover. A rail
         // that is not on screen has no slot to light, so it does not walk the
         // row table either.
-        let visible_slots = if rail_entries.is_empty() {
+        let visible_slots = if rail_slots.is_empty() {
             0..0
         } else {
             let visible_rows = timeline_visible_row_range(
@@ -65582,221 +65731,271 @@ impl VibexWorkbench {
                 self.timeline_list_padding_top_px,
                 f32::from(self.timeline_scroll.viewport_bounds().size.height),
             );
-            agent_turn_preview_rail_visible_slots(&rail_entries, visible_rows)
+            let visible_turns = agent_turn_preview_rail_visible_slots(&rail_entries, visible_rows);
+            agent_turn_preview_rail_slot_range(&rail_entries, &rail_slots, visible_turns)
         };
-        let items = rail_entries
-            .iter()
-            .enumerate()
-            .map(|(preview_index, entry)| {
-                let turn_number = entry.turn_number;
-                let row_index = entry.turn_index;
-                let turn = &turns[row_index];
-                let label = format!("#{turn_number}");
-                let title = agent_turn_preview_title(turn, &label);
-                let aria_label = match locale {
-                    locale::ResolvedLocale::En => {
-                        format!("Jump to turn {turn_number}: {title}")
-                    }
-                    locale::ResolvedLocale::ZhCn => {
-                        format!("跳转到第 {turn_number} 轮：{title}")
-                    }
-                    locale::ResolvedLocale::ZhTw => {
-                        format!("跳轉到第 {turn_number} 輪：{title}")
-                    }
-                    _ => {
-                        format!("Jump to turn {turn_number}: {title}")
-                    }
-                };
-                let hovered = active_index == Some(preview_index);
-                // The pointer owns one slot outright: the longest, brightest
-                // bar and the preview card that goes with it. Every slot the
-                // viewport shows keeps the reading emphasis instead of fading
-                // with its distance to the pointer, otherwise scrolling across
-                // a turn boundary would light one turn and dim the other the
-                // reader can see just as well. That emphasis is a reading
-                // marker rather than a second selection, so it stays well under
-                // the pointer's brightness: on screen for orientation, never
-                // competing with the slot the pointer is actually on.
-                let (line_width, line_height, line_color) = if hovered {
-                    (26.4, 2.88, foreground)
-                } else if visible_slots.contains(&preview_index) {
-                    (23.2, 2.88, foreground.opacity(0.5))
-                } else {
-                    match active_index.map(|active| active.abs_diff(preview_index)) {
-                        Some(1) => (20.0, 2.24, muted_foreground.opacity(0.48)),
-                        Some(2) => (16.8, 2.24, muted_foreground.opacity(0.34)),
-                        _ => (14.4, 2.24, muted_foreground.opacity(0.24)),
-                    }
-                };
-
-                let preview_card = hovered.then(|| {
-                    let content = agent_turn_preview_content(turn, &label, empty_message);
-                    let card_shadow = if is_dark {
-                        vec![
-                            gpui::BoxShadow::new(px(0.0), px(8.0), gpui::black().opacity(0.24))
-                                .blur_radius(px(22.0)),
-                        ]
-                    } else {
-                        vec![
-                            gpui::BoxShadow::new(px(0.0), px(1.0), background.opacity(0.70)),
-                            gpui::BoxShadow::new(px(0.0), px(8.0), foreground.opacity(0.10))
-                                .blur_radius(px(24.0)),
-                        ]
+        // One slot per turn of the conversation, not per turn of the window.
+        // The lane spreads what fits and, once a slot would be too thin to aim
+        // at, stops compressing and scrolls instead: a conversation with
+        // hundreds of turns still opens every one of them to the pointer.
+        let lane_height = f32::from(self.timeline_scroll.viewport_bounds().size.height);
+        let slot_pitch = if rail_turn_count <= 1 {
+            AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT
+        } else {
+            (lane_height / rail_turn_count as f32).clamp(
+                AGENT_TURN_PREVIEW_MIN_SLOT_PITCH,
+                AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT,
+            )
+        };
+        let rail_scrolls = rail_turn_count as f32 * slot_pitch > lane_height + 0.5;
+        // Reading the prompt back for the card is a detail read, one turn at a
+        // time: the index carries a label, the message itself stays in the
+        // store until a slot is actually pointed at.
+        let items = {
+            let preview_text = &self.rail_turn_preview_text;
+            rail_slots
+                .iter()
+                .enumerate()
+                .map(|(preview_index, slot)| {
+                    let turn_number = slot.turn_number;
+                    let sequence = slot.sequence;
+                    let label = format!("#{turn_number}");
+                    let loaded_turn = slot
+                        .loaded_turn_index
+                        .and_then(|turn_index| turns.get(turn_index));
+                    let loaded = loaded_turn.is_some();
+                    let (title, message, file_paths) = match loaded_turn {
+                        Some(turn) => {
+                            let content = agent_turn_preview_content(turn, &label, empty_message);
+                            (content.title, content.message, content.file_paths)
+                        }
+                        // A turn the window does not hold still has a label and,
+                        // once the pointer has asked for it, its prompt text.
+                        None => {
+                            let slot_title = slot
+                                .index_position
+                                .and_then(|position| {
+                                    index.and_then(|index| index.entries.get(position))
+                                })
+                                .map(|entry| entry.title.as_str())
+                                .unwrap_or_default();
+                            let title = (!slot_title.is_empty())
+                                .then(|| compact_agent_turn_preview_message(slot_title))
+                                .filter(|title| !title.is_empty())
+                                .unwrap_or_else(|| label.clone());
+                            let message = preview_text
+                                .get(&sequence)
+                                .map(|text| compact_agent_turn_preview_message(text))
+                                .unwrap_or_default();
+                            (title, message, Vec::new())
+                        }
                     };
-                    let remaining_file_count = content
-                        .file_paths
-                        .len()
-                        .saturating_sub(AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT);
-                    let file_items = content
-                        .file_paths
-                        .iter()
-                        .take(AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT)
-                        .map(|path| {
+                    let aria_label = match locale {
+                        locale::ResolvedLocale::En => {
+                            format!("Jump to turn {turn_number}: {title}")
+                        }
+                        locale::ResolvedLocale::ZhCn => {
+                            format!("跳转到第 {turn_number} 轮：{title}")
+                        }
+                        locale::ResolvedLocale::ZhTw => {
+                            format!("跳轉到第 {turn_number} 輪：{title}")
+                        }
+                        _ => {
+                            format!("Jump to turn {turn_number}: {title}")
+                        }
+                    };
+                    let hovered = active_index == Some(preview_index);
+                    // The pointer owns one slot outright: the longest, brightest
+                    // bar and the preview card that goes with it. Every slot the
+                    // viewport shows keeps the reading emphasis instead of fading
+                    // with its distance to the pointer, otherwise scrolling across
+                    // a turn boundary would light one turn and dim the other the
+                    // reader can see just as well. That emphasis is a reading
+                    // marker rather than a second selection, so it stays well under
+                    // the pointer's brightness: on screen for orientation, never
+                    // competing with the slot the pointer is actually on.
+                    let (line_width, line_height, line_color) = if hovered {
+                        (26.4, 2.88, foreground)
+                    } else if visible_slots.contains(&preview_index) {
+                        (23.2, 2.88, foreground.opacity(0.5))
+                    } else {
+                        match active_index.map(|active| active.abs_diff(preview_index)) {
+                            Some(1) => (20.0, 2.24, muted_foreground.opacity(0.48)),
+                            Some(2) => (16.8, 2.24, muted_foreground.opacity(0.34)),
+                            _ => (14.4, 2.24, muted_foreground.opacity(0.24)),
+                        }
+                    };
+
+                    let preview_card = hovered.then(|| {
+                        let card_shadow = if is_dark {
+                            vec![
+                                gpui::BoxShadow::new(px(0.0), px(8.0), gpui::black().opacity(0.24))
+                                    .blur_radius(px(22.0)),
+                            ]
+                        } else {
+                            vec![
+                                gpui::BoxShadow::new(px(0.0), px(1.0), background.opacity(0.70)),
+                                gpui::BoxShadow::new(px(0.0), px(8.0), foreground.opacity(0.10))
+                                    .blur_radius(px(24.0)),
+                            ]
+                        };
+                        let remaining_file_count = file_paths
+                            .len()
+                            .saturating_sub(AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT);
+                        let file_items = file_paths
+                            .iter()
+                            .take(AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT)
+                            .map(|path| {
+                                h_flex()
+                                    .min_w_0()
+                                    .max_w(px(112.0))
+                                    .items_center()
+                                    .gap(px(5.0))
+                                    .child(
+                                        Icon::default()
+                                            .path("icons/vibex/file-code.svg")
+                                            .size(px(12.0))
+                                            .text_color(muted_foreground),
+                                    )
+                                    .child(
+                                        div()
+                                            .min_w_0()
+                                            .text_ellipsis()
+                                            .child(agent_file_display_name(path)),
+                                    )
+                                    .into_any_element()
+                            })
+                            .collect::<Vec<_>>();
+                        let file_summary = (!file_items.is_empty()).then(|| {
                             h_flex()
+                                .w_full()
                                 .min_w_0()
-                                .max_w(px(112.0))
                                 .items_center()
-                                .gap(px(5.0))
-                                .child(
-                                    Icon::default()
-                                        .path("icons/vibex/file-code.svg")
-                                        .size(px(12.0))
-                                        .text_color(muted_foreground),
-                                )
-                                .child(
-                                    div()
-                                        .min_w_0()
-                                        .text_ellipsis()
-                                        .child(agent_file_display_name(path)),
-                                )
-                                .into_any_element()
-                        })
-                        .collect::<Vec<_>>();
-                    let file_summary = (!file_items.is_empty()).then(|| {
-                        h_flex()
-                            .w_full()
+                                .gap(px(12.0))
+                                .pt(px(2.0))
+                                .overflow_hidden()
+                                .text_xs()
+                                .line_height(gpui::relative(1.45))
+                                .text_color(muted_foreground)
+                                .children(file_items)
+                                .when(remaining_file_count > 0, |this| {
+                                    this.child(
+                                        div().flex_none().child(format!("+{remaining_file_count}")),
+                                    )
+                                })
+                        });
+                        let card_anchor_y = if file_summary.is_some() { -64.0 } else { -53.0 };
+                        let card = v_flex()
+                            .relative()
+                            .w(px(card_width))
                             .min_w_0()
-                            .items_center()
-                            .gap(px(12.0))
-                            .pt(px(2.0))
-                            .overflow_hidden()
-                            .text_xs()
-                            .line_height(gpui::relative(1.45))
-                            .text_color(muted_foreground)
-                            .children(file_items)
-                            .when(remaining_file_count > 0, |this| {
+                            .gap(px(4.0))
+                            .rounded(px(14.0))
+                            .border_1()
+                            .border_color(if is_dark {
+                                border.opacity(0.0)
+                            } else {
+                                border.opacity(0.72)
+                            })
+                            .bg(card_background)
+                            .px(px(10.0))
+                            .py(px(12.0))
+                            .text_color(foreground)
+                            .shadow(card_shadow)
+                            .child(
+                                div()
+                                    .w_full()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .line_clamp(1)
+                                    .text_sm()
+                                    .line_height(gpui::relative(1.4))
+                                    .font_weight(FontWeight(550.0))
+                                    .child(title.clone()),
+                            )
+                            .when(!message.is_empty(), |this| {
                                 this.child(
-                                    div().flex_none().child(format!("+{remaining_file_count}")),
+                                    div()
+                                        .w_full()
+                                        .min_w_0()
+                                        .overflow_hidden()
+                                        .whitespace_normal()
+                                        .line_clamp(3)
+                                        .text_sm()
+                                        .line_height(gpui::relative(1.5))
+                                        .text_color(muted_foreground)
+                                        .child(message.clone()),
                                 )
                             })
-                    });
-                    let card_anchor_y = if file_summary.is_some() { -64.0 } else { -53.0 };
-                    let card = v_flex()
-                        .relative()
-                        .w(px(card_width))
-                        .min_w_0()
-                        .gap(px(4.0))
-                        .rounded(px(14.0))
-                        .border_1()
-                        .border_color(if is_dark {
-                            border.opacity(0.0)
-                        } else {
-                            border.opacity(0.72)
-                        })
-                        .bg(card_background)
-                        .px(px(10.0))
-                        .py(px(12.0))
-                        .text_color(foreground)
-                        .shadow(card_shadow)
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .line_clamp(1)
-                                .text_sm()
-                                .line_height(gpui::relative(1.4))
-                                .font_weight(FontWeight(550.0))
-                                .child(content.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .w_full()
-                                .min_w_0()
-                                .overflow_hidden()
-                                .whitespace_normal()
-                                .line_clamp(3)
-                                .text_sm()
-                                .line_height(gpui::relative(1.5))
-                                .text_color(muted_foreground)
-                                .child(content.message.clone()),
-                        )
-                        .when_some(file_summary, |this, summary| this.child(summary));
-                    // No entrance transition of its own. The card is mounted
-                    // inside the hovered slot, so moving to the next tick
-                    // unmounts it there and mounts it again under that slot's
-                    // id — an id-keyed oneshot would restart from transparent
-                    // on every switch and read as the card blinking instead of
-                    // its content changing. The rail's own reveal still brings
-                    // the first card in; afterwards a switch is a plain swap.
-                    div()
-                        .absolute()
-                        .top_1_2()
-                        .left(px(36.8))
-                        .child(div().relative().top(px(card_anchor_y)).child(card))
-                });
-
-                h_flex()
-                    .id(format!("turn-preview-{preview_index}"))
-                    .relative()
-                    .w_full()
-                    .min_w_0()
-                    .items_center()
-                    .justify_start()
-                    .when(rail_turn_count == 1, |this| this.h(px(32.0)).flex_none())
-                    .when(rail_turn_count > 1, |this| {
-                        this.flex_1()
-                            .min_h_0()
-                            .max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))
-                    })
-                    .cursor_pointer()
-                    .focusable()
-                    .tab_stop(true)
-                    .role(Role::Button)
-                    .aria_label(aria_label)
-                    .focus_visible(move |style| style.bg(ring.opacity(0.08)))
-                    .on_hover(cx.listener(move |this, hovered, _, cx| {
-                        this.set_turn_preview_active_index(preview_index, *hovered, cx)
-                    }))
-                    .on_click(cx.listener(move |this, _, _, cx| {
-                        this.timeline_scroll_wheel_idle_task = None;
-                        this.timeline_follow.set_following_bottom(false);
-                        this.timeline_scroll_to_latest_pending = false;
-                        this.timeline_scroll_anchor_pending = false;
-                        this.timeline_scroll.scroll_to_reveal_item(row_index);
-                        cx.notify();
-                    }))
-                    .child(
+                            .when_some(file_summary, |this, summary| this.child(summary));
+                        // No entrance transition of its own. The card is mounted
+                        // inside the hovered slot, so moving to the next tick
+                        // unmounts it there and mounts it again under that slot's
+                        // id — an id-keyed oneshot would restart from transparent
+                        // on every switch and read as the card blinking instead of
+                        // its content changing. The rail's own reveal still brings
+                        // the first card in; afterwards a switch is a plain swap.
                         div()
-                            .debug_selector(move || format!("turn-preview-tick-{preview_index}"))
-                            .ml(px(5.6))
-                            .w(px(line_width))
-                            .h(px(line_height))
-                            .flex_none()
-                            .rounded_full()
-                            .bg(line_color),
-                    )
-                    .when_some(preview_card, |this, card| this.child(card))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
+                            .absolute()
+                            .top_1_2()
+                            .left(px(36.8))
+                            .child(div().relative().top(px(card_anchor_y)).child(card))
+                    });
+
+                    h_flex()
+                        .id(format!("turn-preview-{preview_index}"))
+                        .relative()
+                        .w_full()
+                        .min_w_0()
+                        .items_center()
+                        .justify_start()
+                        .when(rail_turn_count == 1, |this| this.h(px(32.0)).flex_none())
+                        .when(rail_turn_count > 1, |this| {
+                            this.h(px(slot_pitch))
+                                .max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))
+                                .flex_none()
+                        })
+                        .cursor_pointer()
+                        .focusable()
+                        .tab_stop(true)
+                        .role(Role::Button)
+                        .aria_label(aria_label)
+                        .focus_visible(move |style| style.bg(ring.opacity(0.08)))
+                        .on_hover(cx.listener(move |this, hovered, _, cx| {
+                            this.set_turn_preview_active_index(preview_index, *hovered, cx);
+                            if *hovered && !loaded {
+                                this.request_rail_turn_preview_text(sequence, cx);
+                            }
+                        }))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.activate_rail_turn(sequence, cx);
+                        }))
+                        .child(
+                            div()
+                                .debug_selector(move || {
+                                    format!("turn-preview-tick-{preview_index}")
+                                })
+                                .ml(px(5.6))
+                                .w(px(line_width))
+                                .h(px(line_height))
+                                .flex_none()
+                                .rounded_full()
+                                .bg(line_color),
+                        )
+                        .when_some(preview_card, |this, card| this.child(card))
+                        .into_any_element()
+                })
+                .collect::<Vec<_>>()
+        };
 
         let list = v_flex()
+            .id("agent-turn-preview-rail-list")
             .relative()
             .size_full()
             .min_h_0()
-            .justify_center()
             .gap_0()
+            .when(!rail_scrolls, |this| this.justify_center())
+            .when(rail_scrolls, |this| this.overflow_y_scroll())
             .children(items);
         // A pinned rail is a standing surface, not a reveal: it is on screen
         // from the first frame, so only the hover-revealed one animates in.
@@ -65810,6 +66009,7 @@ impl VibexWorkbench {
                 .apply(list, "agent-turn-preview-rail-open")
                 .into_any_element()
         };
+
         let navigation_label = match locale {
             locale::ResolvedLocale::En => "Conversation turn preview",
             locale::ResolvedLocale::ZhCn => "对话轮次预览",
@@ -66502,14 +66702,392 @@ impl VibexWorkbench {
             return None;
         }
         let turns = self.conversation_turns_cached();
-        if !turns
+        let loaded_turns = turns
             .iter()
-            .any(|turn| agent_turn_preview_rail_numbers_turn(turn))
-        {
+            .any(|turn| agent_turn_preview_rail_numbers_turn(turn));
+        // The index is what makes the rail the conversation's map rather than
+        // the window's. It is asked for here because this is the first frame
+        // that needs it; the read itself runs off the frame.
+        self.sync_rail_turn_index(cx);
+        let index = self
+            .rail_turn_index
+            .clone()
+            .filter(|index| self.timeline.session_id.as_ref() == Some(&index.session_id));
+        if !loaded_turns && index.as_ref().is_none_or(|index| index.entries.is_empty()) {
             return None;
         }
         let pinned = self.session_content_insets().rail_pinned;
-        Some(self.render_agent_turn_preview_rail(turns.as_slice(), pinned, cx))
+        Some(self.render_agent_turn_preview_rail(index.as_deref(), turns.as_slice(), pinned, cx))
+    }
+
+    /// Keeps the rail's turn index in step with the session on screen.
+    ///
+    /// The index is read once per session and refreshed by one page once the
+    /// window shows a turn newer than the index covers. Both the text cache and
+    /// a pending jump describe one session's turns, so a switch drops them
+    /// rather than letting a sequence from another conversation resolve.
+    fn sync_rail_turn_index(&mut self, cx: &mut Context<Self>) {
+        if !self.ui_state.session.turn_preview_rail {
+            return;
+        }
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            return;
+        };
+        if self
+            .rail_turn_index
+            .as_ref()
+            .is_some_and(|index| index.session_id != session_id)
+        {
+            self.reset_rail_turn_index();
+        }
+        if self.rail_turn_index_loading
+            || self
+                .rail_turn_index_failed
+                .as_ref()
+                .is_some_and(|failed| failed == &session_id)
+        {
+            return;
+        }
+        let newest_loaded = self
+            .conversation_turns_cached()
+            .iter()
+            .rev()
+            .find_map(|turn| turn.user_row.as_ref().map(|row| row.first_sequence));
+        if self.rail_turn_index.is_none() {
+            self.load_rail_turn_index(session_id, false, cx);
+            return;
+        }
+        let stale = self.rail_turn_index.as_ref().is_some_and(|index| {
+            newest_loaded.is_some_and(|sequence| {
+                index
+                    .newest_sequence()
+                    .is_none_or(|newest| newest < sequence)
+            })
+        });
+        if stale {
+            self.load_rail_turn_index(session_id, true, cx);
+        }
+    }
+
+    /// Drops what only describes the session that was on screen.
+    fn reset_rail_turn_index(&mut self) {
+        self.rail_turn_index = None;
+        self.rail_turn_index_loading = false;
+        self.rail_turn_index_failed = None;
+        self.rail_turn_preview_text.clear();
+        self.rail_turn_preview_in_flight.clear();
+        self.pending_rail_turn_jump = None;
+    }
+
+    /// Reads the session's turn index, or its newest page for a refresh.
+    ///
+    /// A cold read walks pages until the conversation is covered or the read
+    /// budget is spent; a refresh reads one page, because only turns above the
+    /// last one the index holds can be missing. A failed read leaves the rail on
+    /// what it already had: the index is an aid, and a conversation must still
+    /// render without one.
+    fn load_rail_turn_index(
+        &mut self,
+        session_id: VibexSessionId,
+        refresh_only: bool,
+        cx: &mut Context<Self>,
+    ) {
+        let runtime = self.local_authority();
+        let backend = self.backend.clone();
+        if runtime.is_none() && backend.is_none() {
+            return;
+        }
+        let generation = self.session_generation;
+        let request_session_id = session_id.clone();
+        self.rail_turn_index_loading = true;
+        let page_budget = if refresh_only {
+            1
+        } else {
+            AGENT_TURN_INDEX_MAX_PAGES
+        };
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let mut pages = Vec::new();
+            let mut before_sequence = None;
+            let mut has_older = true;
+            while has_older && pages.len() < page_budget {
+                let request = vibex_core::FetchTurnIndexRequest {
+                    session_id: request_session_id.clone(),
+                    before_sequence,
+                    limit: AGENT_TURN_INDEX_PAGE_TURNS,
+                };
+                let page = match runtime.clone() {
+                    Some(runtime) => runtime.agent().fetch_turn_index(request).await,
+                    None => {
+                        let Some(backend) = backend.clone() else {
+                            return Err(vibex_core::VibexError::storage(
+                                "timeline_authority_missing",
+                                "no Agent authority is available to read the turn index",
+                            ));
+                        };
+                        backend
+                            .agent()
+                            .fetch_turn_index(request)
+                            .await
+                            .map_err(|error| {
+                                vibex_core::VibexError::storage(error.code, error.message)
+                            })
+                    }
+                }?;
+                if page.session_id != request_session_id {
+                    return Err(vibex_core::VibexError::storage(
+                        "turn_index_session_mismatch",
+                        "the turn index belongs to another session",
+                    ));
+                }
+                has_older = page.has_older;
+                before_sequence = page.entries.first().map(|entry| entry.sequence);
+                pages.push(page);
+                if refresh_only || before_sequence.is_none() {
+                    break;
+                }
+            }
+            // Pages arrive newest first; the conversation does not.
+            let total_turns = pages.first().map_or(0, |page| page.total_turns);
+            let mut combined = vibex_core::TimelineTurnIndex {
+                session_id: request_session_id,
+                entries: Vec::new(),
+                has_older,
+                total_turns,
+            };
+            for page in pages.into_iter().rev() {
+                combined.entries.extend(page.entries);
+            }
+            Ok(combined)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = match runner.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => Err(vibex_core::VibexError::storage(
+                        "timeline_read_task_failed",
+                        error.to_string(),
+                    )),
+                };
+                let _ = entity.update(cx, |this, cx| {
+                    this.rail_turn_index_loading = false;
+                    if this.session_generation != generation
+                        || this.timeline.session_id.as_ref() != Some(&session_id)
+                    {
+                        return;
+                    }
+                    // A read that failed leaves the rail on what it has and
+                    // stops it from asking again this session: the authority
+                    // that refused once will refuse every frame.
+                    let Ok(page) = outcome else {
+                        this.rail_turn_index_failed = Some(session_id);
+                        return;
+                    };
+                    let mut index = this
+                        .rail_turn_index
+                        .take()
+                        .map(Rc::unwrap_or_clone)
+                        .unwrap_or_else(|| RailTurnIndex {
+                            session_id: session_id.clone(),
+                            entries: Vec::new(),
+                            total_turns: 0,
+                        });
+                    index.merge_page(page);
+                    this.rail_turn_index = Some(Rc::new(index));
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Reads the prompt behind a rail card whose turn the window does not hold.
+    ///
+    /// The index carries one line per turn, which is enough to aim with and not
+    /// enough to read. This is the same detail-on-demand trade the timeline
+    /// makes for tool output: the body arrives when a pointer asks for it.
+    fn request_rail_turn_preview_text(&mut self, sequence: i64, cx: &mut Context<Self>) {
+        if self.rail_turn_preview_text.contains_key(&sequence)
+            || !self.rail_turn_preview_in_flight.insert(sequence)
+        {
+            return;
+        }
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            self.rail_turn_preview_in_flight.remove(&sequence);
+            return;
+        };
+        let request = vibex_core::FetchTimelineItemRequest {
+            session_id: session_id.clone(),
+            sequence,
+        };
+        let runtime = self.local_authority();
+        let backend = self.backend.clone();
+        let generation = self.session_generation;
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            match runtime {
+                Some(runtime) => runtime.agent().fetch_timeline_item(request).await,
+                None => {
+                    let Some(backend) = backend else {
+                        return Err(vibex_core::VibexError::storage(
+                            "timeline_authority_missing",
+                            "no Agent authority is available to read a turn preview",
+                        ));
+                    };
+                    backend
+                        .agent()
+                        .fetch_timeline_item(request)
+                        .await
+                        .map_err(|error| vibex_core::VibexError::storage(error.code, error.message))
+                }
+            }
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = match runner.await {
+                    Ok(outcome) => outcome,
+                    Err(error) => Err(vibex_core::VibexError::storage(
+                        "timeline_read_task_failed",
+                        error.to_string(),
+                    )),
+                };
+                let _ = entity.update(cx, |this, cx| {
+                    this.rail_turn_preview_in_flight.remove(&sequence);
+                    if this.session_generation != generation
+                        || this.timeline.session_id.as_ref() != Some(&session_id)
+                    {
+                        return;
+                    }
+                    let Ok(item) = outcome else {
+                        return;
+                    };
+                    let vibex_core::TimelinePayload::UserMessage(payload) = &item.payload else {
+                        return;
+                    };
+                    if this.rail_turn_preview_text.len() >= AGENT_RAIL_PREVIEW_TEXT_CACHE {
+                        this.rail_turn_preview_text.clear();
+                    }
+                    this.rail_turn_preview_text.insert(
+                        sequence,
+                        vibex_core::user_message_display_text(&payload.text, &payload.attachments),
+                    );
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
+    /// Activates a rail slot: scrolls to the turn, or pages history to it.
+    ///
+    /// A window holds a bounded number of turns, so a slot for a turn above it
+    /// has nothing to scroll to yet. The rail still answers: the window walks
+    /// back a page at a time until the turn it was asked for is in the
+    /// projection, then scrolls to it. Reading forward from there is the same
+    /// scroll the reader would have made.
+    fn activate_rail_turn(&mut self, sequence: i64, cx: &mut Context<Self>) {
+        self.timeline_scroll_wheel_idle_task = None;
+        self.timeline_follow.set_following_bottom(false);
+        self.timeline_scroll_to_latest_pending = false;
+        self.timeline_scroll_anchor_pending = false;
+        if self.scroll_to_rail_turn(sequence) {
+            self.pending_rail_turn_jump = None;
+            cx.notify();
+            return;
+        }
+        let Some(session_id) = self.timeline.session_id.clone() else {
+            return;
+        };
+        self.pending_rail_turn_jump = Some(RailTurnJump {
+            session_id,
+            sequence,
+            steps: 0,
+        });
+        self.advance_rail_turn_jump(cx);
+    }
+
+    /// Scrolls the timeline to the turn a rail slot names, when it is loaded.
+    fn scroll_to_rail_turn(&mut self, sequence: i64) -> bool {
+        let turns = self.conversation_turns_cached();
+        let Some(turn_index) = turns.iter().position(|turn| {
+            turn.user_row
+                .as_ref()
+                .is_some_and(|row| row.first_sequence == sequence)
+        }) else {
+            return false;
+        };
+        self.timeline_scroll.scroll_to_reveal_item(turn_index);
+        true
+    }
+
+    /// Moves a pending rail jump one page closer.
+    ///
+    /// Returns whether the jump landed. A page already travelling is left to
+    /// finish — its completion calls back here — and a target the store cannot
+    /// produce ends the chase instead of reading forever.
+    fn advance_rail_turn_jump(&mut self, cx: &mut Context<Self>) -> bool {
+        let Some(jump) = self.pending_rail_turn_jump.as_ref() else {
+            return false;
+        };
+        let session_id = jump.session_id.clone();
+        let sequence = jump.sequence;
+        let steps = jump.steps;
+        if self.timeline.session_id.as_ref() != Some(&session_id)
+            || self.selected_session_id.as_ref() != Some(&session_id)
+        {
+            self.pending_rail_turn_jump = None;
+            return false;
+        }
+        if self.scroll_to_rail_turn(sequence) {
+            self.pending_rail_turn_jump = None;
+            self.timeline_scroll_anchor_pending = false;
+            cx.notify();
+            return true;
+        }
+        if self.timeline_older_in_flight > 0
+            || self.agent_loading
+            || self.timeline_load_updates.upgrade().is_some()
+        {
+            return false;
+        }
+        if steps >= AGENT_RAIL_TURN_JUMP_MAX_STEPS || !self.timeline_has_older {
+            self.pending_rail_turn_jump = None;
+            return false;
+        }
+        let Some(before_sequence) = self.timeline.items.first().map(|item| item.sequence) else {
+            self.pending_rail_turn_jump = None;
+            return false;
+        };
+        // The index knows how many turns sit between the window's oldest and
+        // the one that was clicked, so a near jump reads a short page and a far
+        // one reads the largest page the store will serve.
+        let turns = {
+            let loaded_turns = self.conversation_turns_cached();
+            let oldest_loaded = loaded_turns
+                .iter()
+                .find_map(|turn| turn.user_row.as_ref().map(|row| row.first_sequence));
+            oldest_loaded
+                .and_then(|oldest| {
+                    let index = self.rail_turn_index.as_ref()?;
+                    let target = index
+                        .entries
+                        .partition_point(|entry| entry.sequence < sequence);
+                    let window = index
+                        .entries
+                        .partition_point(|entry| entry.sequence < oldest);
+                    Some(window.saturating_sub(target) as u32 + 1)
+                })
+                .unwrap_or(AGENT_RAIL_TURN_JUMP_TURNS)
+                .clamp(1, AGENT_RAIL_TURN_JUMP_TURNS)
+        };
+        let generation = self.session_generation;
+        if !self.load_older_agent_timeline(session_id, before_sequence, generation, turns, cx) {
+            self.pending_rail_turn_jump = None;
+            return false;
+        }
+        self.timeline_older_in_flight += 1;
+        if let Some(jump) = self.pending_rail_turn_jump.as_mut() {
+            jump.steps += 1;
+        }
+        false
     }
 
     fn render_runtime_controls(
@@ -83444,16 +84022,71 @@ fn agent_turn_preview_rail_numbers_turn(turn: &TimelineConversationTurn) -> bool
     turn.user_row.is_some()
 }
 
-/// One slot of the session preview rail: the conversation turn to scroll to and
-/// the number the rail shows for it.
+/// The session's user-turn index as the rail holds it.
+///
+/// One `Rc` so a frame borrows it instead of copying it: the rail is rebuilt on
+/// every render, and a four-thousand-turn index is not something to clone per
+/// frame.
+#[derive(Clone)]
+struct RailTurnIndex {
+    session_id: VibexSessionId,
+    entries: Vec<vibex_core::TimelineTurnIndexEntry>,
+    total_turns: usize,
+}
+
+impl RailTurnIndex {
+    /// The newest user sequence the index covers.
+    fn newest_sequence(&self) -> Option<i64> {
+        self.entries.last().map(|entry| entry.sequence)
+    }
+
+    /// Merges a freshly read page into the index.
+    ///
+    /// A refresh reads only the newest page, so the merge keeps every older
+    /// entry and takes the page's entries above them. A cold read is the same
+    /// operation with nothing held yet.
+    fn merge_page(&mut self, page: vibex_core::TimelineTurnIndex) {
+        if self.entries.is_empty() {
+            self.entries = page.entries;
+        } else {
+            let page_oldest = page.entries.first().map(|entry| entry.sequence);
+            let keep = page_oldest
+                .map(|sequence| {
+                    self.entries
+                        .partition_point(|entry| entry.sequence < sequence)
+                })
+                .unwrap_or(self.entries.len());
+            self.entries.truncate(keep);
+            self.entries.extend(page.entries);
+        }
+        self.total_turns = self.total_turns.max(page.total_turns);
+    }
+}
+
+/// A rail click that has to page history before it can land.
+struct RailTurnJump {
+    session_id: VibexSessionId,
+    /// The user-row sequence of the turn the reader asked for.
+    sequence: i64,
+    /// Pages read so far, so a target the store cannot produce ends the chase
+    /// instead of holding the reader in a read loop.
+    steps: usize,
+}
+
+/// One numbered turn of the window the reader has loaded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct AgentTurnPreviewRailEntry {
     /// Index of the turn inside the rendered conversation, which is also its
     /// virtual-list row. It survives the numbering filter so activating an entry
     /// still scrolls to the turn it previews.
     turn_index: usize,
-    /// One-based number shown in the rail, counted over user turns only.
+    /// Ordinal of the turn inside the loaded window. The rail numbers its slots
+    /// against the whole conversation through the turn index; this keeps the
+    /// window itself addressable.
     turn_number: usize,
+    /// The user row's sequence, which is the identity the turn index and the
+    /// loaded projection share.
+    sequence: i64,
 }
 
 fn agent_turn_preview_rail_entries(
@@ -83464,16 +84097,151 @@ fn agent_turn_preview_rail_entries(
         .enumerate()
         .filter(|(_, turn)| agent_turn_preview_rail_numbers_turn(turn))
         .enumerate()
-        .map(
-            |(number_index, (turn_index, _))| AgentTurnPreviewRailEntry {
+        .filter_map(|(number_index, (turn_index, turn))| {
+            let sequence = turn.user_row.as_ref()?.first_sequence;
+            Some(AgentTurnPreviewRailEntry {
                 turn_index,
                 turn_number: number_index + 1,
-            },
-        )
+                sequence,
+            })
+        })
         .collect()
 }
 
-/// The rail slots whose turn the timeline viewport shows.
+/// One slot the rail draws: a turn of the conversation, numbered against the
+/// whole session rather than against whatever window happens to be loaded.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentTurnPreviewRailSlot {
+    /// The turn's user-row sequence — the same identity a turn index entry
+    /// carries, which is how a slot finds its rows when they are loaded and how
+    /// activating it asks the window to page back to it when they are not.
+    sequence: i64,
+    /// One-based number over every user turn the session holds.
+    turn_number: usize,
+    /// Position of the turn in the index, when the index named it.
+    ///
+    /// A position rather than a copied label: the rail is rebuilt every frame,
+    /// and a conversation-long index is not something to clone per frame.
+    index_position: Option<usize>,
+    /// Position of the turn in the loaded window, when it is loaded.
+    loaded_turn_index: Option<usize>,
+}
+
+/// Builds the rail's slots from the turn index.
+///
+/// The index is the authority: a window holds a bounded number of turns, so
+/// numbering from it would renumber the conversation every time the reader
+/// scrolled. `total_turns` offsets the page a client holds, which is what keeps
+/// `#12` meaning the twelfth prompt of the session even when the index itself
+/// is only a page. A turn the window shows but the index does not (an
+/// optimistic prompt, or one sent after the index was read) is appended after
+/// the index's newest entry so the rail never loses a turn to a race.
+fn agent_turn_preview_rail_slots(
+    index: Option<&RailTurnIndex>,
+    turns: &[Rc<TimelineConversationTurn>],
+) -> Vec<AgentTurnPreviewRailSlot> {
+    let loaded = agent_turn_preview_rail_entries(turns);
+    let loaded_by_sequence = loaded
+        .iter()
+        .map(|entry| (entry.sequence, entry.turn_index))
+        .collect::<BTreeMap<_, _>>();
+    let Some(index) = index else {
+        // No index yet: the window is all the rail knows, so it numbers what it
+        // can see and grows into the real count once the read lands.
+        return loaded
+            .iter()
+            .map(|entry| AgentTurnPreviewRailSlot {
+                sequence: entry.sequence,
+                turn_number: entry.turn_number,
+                index_position: None,
+                loaded_turn_index: Some(entry.turn_index),
+            })
+            .collect();
+    };
+    let covered = index.total_turns.saturating_sub(index.entries.len());
+    let mut slots = index
+        .entries
+        .iter()
+        .enumerate()
+        .map(|(position, entry)| AgentTurnPreviewRailSlot {
+            sequence: entry.sequence,
+            turn_number: covered + position + 1,
+            index_position: Some(position),
+            loaded_turn_index: loaded_by_sequence.get(&entry.sequence).copied(),
+        })
+        .collect::<Vec<_>>();
+    let newest_indexed = index.entries.last().map(|entry| entry.sequence);
+    for entry in loaded
+        .iter()
+        .filter(|entry| newest_indexed.is_none_or(|newest| entry.sequence > newest))
+    {
+        slots.push(AgentTurnPreviewRailSlot {
+            sequence: entry.sequence,
+            turn_number: index.total_turns + slots.len() - index.entries.len() + 1,
+            index_position: None,
+            loaded_turn_index: Some(entry.turn_index),
+        });
+    }
+    sample_agent_turn_preview_rail_slots(slots)
+}
+
+/// Bounds the slots the rail draws while keeping them spread over the history.
+///
+/// Every slot the rail holds is one element tree, and the rail is rebuilt on
+/// every frame. Past [`AGENT_TURN_PREVIEW_MAX_SLOTS`] the strip keeps every
+/// n-th turn instead of dropping the older ones: a sampled tick still carries
+/// its real number and still activates its real turn, so the rail remains a map
+/// of the whole conversation rather than of its tail.
+fn sample_agent_turn_preview_rail_slots(
+    slots: Vec<AgentTurnPreviewRailSlot>,
+) -> Vec<AgentTurnPreviewRailSlot> {
+    if slots.len() <= AGENT_TURN_PREVIEW_MAX_SLOTS {
+        return slots;
+    }
+    let stride = slots.len().div_ceil(AGENT_TURN_PREVIEW_MAX_SLOTS);
+    let newest = slots.last().copied();
+    let mut sampled = slots.into_iter().step_by(stride).collect::<Vec<_>>();
+    if let Some(newest) = newest
+        && sampled.last().map(|slot| slot.sequence) != Some(newest.sequence)
+        && sampled.len() < AGENT_TURN_PREVIEW_MAX_SLOTS + 1
+    {
+        sampled.push(newest);
+    }
+    sampled
+}
+
+/// The rail slots that stand for the turns the timeline viewport shows.
+///
+/// The window knows which of its rows are on screen; the rail knows every turn
+/// of the session. The two meet on the sequence, so the emphasis a scrolled
+/// viewport paints is the same band whether or not the rest of the history has
+/// been read.
+fn agent_turn_preview_rail_slot_range(
+    loaded: &[AgentTurnPreviewRailEntry],
+    slots: &[AgentTurnPreviewRailSlot],
+    visible: Range<usize>,
+) -> Range<usize> {
+    if visible.is_empty() || slots.is_empty() {
+        return 0..0;
+    }
+    let Some(first) = loaded.get(visible.start) else {
+        return 0..0;
+    };
+    let Some(last) = loaded.get(visible.end - 1) else {
+        return 0..0;
+    };
+    let start = slots.partition_point(|slot| slot.sequence < first.sequence);
+    let end = slots.partition_point(|slot| slot.sequence <= last.sequence);
+    if start == end {
+        // A sampled strip can leave the viewport's turns between two ticks.
+        // The band still has a position, so light the tick that stands for it
+        // instead of leaving the rail with no reading marker at all.
+        return start.saturating_sub(1)..start;
+    }
+    start..end
+}
+
+/// The loaded turns whose rows the timeline viewport shows.
 ///
 /// A slot owns every row from its own turn down to the row before the next
 /// numbered turn: a continuation turn carries no slot of its own, so the rows
@@ -134815,7 +135583,7 @@ mod tests {
         assert!(renderer.contains("AGENT_TURN_PREVIEW_VISIBLE_FILE_COUNT"));
         assert!(renderer.contains("format!(\"+{remaining_file_count}\")"));
         assert!(renderer.contains("let rail_revealed = pinned || self.turn_preview_rail_visible;"));
-        assert!(renderer.contains("let items = rail_entries"));
+        assert!(renderer.contains("let items = {"));
         assert!(renderer.contains(".max_h(px(AGENT_TURN_PREVIEW_ITEM_MAX_HEIGHT))"));
         assert!(renderer.contains(".justify_center()"));
         assert!(renderer.contains(".gap_0()"));
@@ -134826,6 +135594,14 @@ mod tests {
     /// A continuation turn has the shape auto-continue produces: response items
     /// only, no user row.
     fn rail_preview_turn(id: &str, has_user_row: bool) -> Rc<TimelineConversationTurn> {
+        rail_preview_turn_at(id, 1, has_user_row)
+    }
+
+    fn rail_preview_turn_at(
+        id: &str,
+        sequence: i64,
+        has_user_row: bool,
+    ) -> Rc<TimelineConversationTurn> {
         let user_row = has_user_row.then(|| TimelineRow {
             id: format!("{id}:user"),
             kind: TimelineRowKind::UserMessage,
@@ -134835,8 +135611,8 @@ mod tests {
             turn_failed: false,
             turn_pending_permission: false,
             conclusion: false,
-            first_sequence: 1,
-            last_sequence: 1,
+            first_sequence: sequence,
+            last_sequence: sequence,
             timestamp_ms: 1_700_000_000_000,
             title: "prompt".into(),
             body: "prompt".into(),
@@ -134884,10 +135660,12 @@ mod tests {
                 AgentTurnPreviewRailEntry {
                     turn_index: 0,
                     turn_number: 1,
+                    sequence: 1,
                 },
                 AgentTurnPreviewRailEntry {
                     turn_index: 3,
                     turn_number: 2,
+                    sequence: 1,
                 },
             ]
         );
@@ -134931,6 +135709,7 @@ mod tests {
                 .map(|(number_index, turn_index)| AgentTurnPreviewRailEntry {
                     turn_index: *turn_index,
                     turn_number: number_index + 1,
+                    sequence: (*turn_index + 1) as i64,
                 })
                 .collect::<Vec<_>>()
         };
@@ -134953,6 +135732,105 @@ mod tests {
         assert_eq!(
             agent_turn_preview_rail_visible_slots(&entries(&[5]), 0..3),
             0..0
+        );
+    }
+
+    /// The rail numbers the conversation, not the window.
+    ///
+    /// A window is bounded, so numbering from it renamed every turn whenever
+    /// the reader scrolled. The index says where the loaded turns sit in the
+    /// whole session, and a turn the window does not hold still gets a slot
+    /// with its label — which is what the rail is for.
+    #[test]
+    fn turn_preview_rail_numbers_the_whole_session_not_the_window() {
+        let turns = vec![
+            rail_preview_turn_at("turn:4", 40, true),
+            rail_preview_turn_at("turn:5", 50, true),
+        ];
+        let index = RailTurnIndex {
+            session_id: VibexSessionId::new(),
+            entries: (1..=5)
+                .map(|number| vibex_core::TimelineTurnIndexEntry {
+                    turn_id: format!("turn:{number}"),
+                    sequence: number * 10,
+                    timestamp_ms: number,
+                    title: format!("prompt {number}"),
+                })
+                .collect(),
+            total_turns: 5,
+        };
+
+        let slots = agent_turn_preview_rail_slots(Some(&index), &turns);
+        assert_eq!(
+            slots
+                .iter()
+                .map(|slot| slot.turn_number)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4, 5]
+        );
+        assert_eq!(slots[0].index_position, Some(0));
+        assert_eq!(index.entries[0].title, "prompt 1");
+        assert_eq!(slots[0].loaded_turn_index, None);
+        assert_eq!(slots[3].loaded_turn_index, Some(0));
+        assert_eq!(slots[4].loaded_turn_index, Some(1));
+
+        // The viewport shows the loaded turns 4 and 5, so the rail lights
+        // exactly those two slots — the ones it numbered from the index.
+        let loaded = agent_turn_preview_rail_entries(&turns);
+        let visible = agent_turn_preview_rail_visible_slots(&loaded, 0..2);
+        assert_eq!(
+            agent_turn_preview_rail_slot_range(&loaded, &slots, visible),
+            3..5
+        );
+
+        // A turn that arrived after the index was read — an optimistic prompt —
+        // still gets a slot, numbered after what the index covers.
+        let turns = vec![
+            rail_preview_turn_at("turn:5", 50, true),
+            rail_preview_turn_at("turn:optimistic", 60, true),
+        ];
+        let slots = agent_turn_preview_rail_slots(Some(&index), &turns);
+        assert_eq!(slots.len(), 6);
+        assert_eq!(slots[5].turn_number, 6);
+        assert_eq!(slots[5].loaded_turn_index, Some(1));
+    }
+
+    /// A conversation too long to draw is sampled, never truncated.
+    ///
+    /// The rail is rebuilt every frame, so a five-thousand-turn strip has to
+    /// stop being five thousand element trees. What it must not do is drop the
+    /// older half: every remaining tick keeps its own number and turn, and the
+    /// first and last turns are both still on the strip.
+    #[test]
+    fn turn_preview_rail_samples_a_long_history_instead_of_dropping_it() {
+        let index = RailTurnIndex {
+            session_id: VibexSessionId::new(),
+            entries: (1..=5_000)
+                .map(|number| vibex_core::TimelineTurnIndexEntry {
+                    turn_id: format!("turn:{number}"),
+                    sequence: number,
+                    timestamp_ms: number,
+                    title: format!("prompt {number}"),
+                })
+                .collect(),
+            total_turns: 5_000,
+        };
+
+        let slots = agent_turn_preview_rail_slots(Some(&index), &[]);
+        assert!(slots.len() <= AGENT_TURN_PREVIEW_MAX_SLOTS + 1);
+        assert_eq!(slots.first().map(|slot| slot.turn_number), Some(1));
+        assert_eq!(slots.last().map(|slot| slot.turn_number), Some(5_000));
+        assert!(
+            slots
+                .windows(2)
+                .all(|pair| pair[0].sequence < pair[1].sequence),
+            "sampling preserves conversation order"
+        );
+        assert!(
+            slots
+                .windows(2)
+                .all(|pair| pair[1].turn_number > pair[0].turn_number),
+            "every slot keeps the number of the turn it stands for"
         );
     }
 

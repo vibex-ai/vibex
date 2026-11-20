@@ -89,7 +89,8 @@ use vibex_core::{
     RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineDisplaySettingsRequest,
     RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchRequest,
     RemoteAgentTimelineFetchResponse, RemoteAgentTimelineItemFetchRequest,
-    RemoteAgentTimelineItemFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentTimelineItemFetchResponse, RemoteAgentTurnIndexFetchRequest,
+    RemoteAgentTurnIndexFetchResponse, RemoteAgentUnarchiveSessionResponse,
     RemoteAgentVerifyAuthContextRequest, RemoteAuditListRequest, RemoteAuditRecord,
     RemoteAuthProof, RemoteCreatePairingCodeRequest, RemoteCreatePairingCodeResponse,
     RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDeepLinkResolution,
@@ -1275,6 +1276,29 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentTimelineItemFetchResponse>(value)?.item)
+        })
+    }
+
+    fn fetch_turn_index(
+        &self,
+        request: vibex_core::FetchTurnIndexRequest,
+    ) -> BackendFuture<'_, vibex_core::TimelineTurnIndex> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::FetchTurnIndex(RemoteAgentTurnIndexFetchRequest {
+                auth: this.auth(),
+                request,
+            });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::Standard,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentTurnIndexFetchResponse>(value)?.index)
         })
     }
 

@@ -12,12 +12,13 @@ use vibex_core::{
     AgentTimelineDisplaySettings, AgentTokenUsage, AgentUsageStatistics,
     AgentUsageStatisticsRequest, CancelAgentSessionRuntimeSwitchRequest, ContinueAgentTurnRequest,
     CreateAgentSessionRequest, FetchTimelineItemRequest, FetchTimelineRequest,
-    ForkAgentSessionRequest, GetMessageSubmissionRequest, MessageSubmissionState,
-    ProviderConfiguredModel, ProviderProfile, RemoteDeepLinkResolution, RenameAgentSessionRequest,
-    ReplaceUserMessagePayload, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeSessionEvent, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
-    SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest, SteerAgentMessageResult,
-    TimelineItem, TimelineLiveEvent, TimelinePage, VibexSessionId,
+    FetchTurnIndexRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
+    MessageSubmissionState, ProviderConfiguredModel, ProviderProfile, RemoteDeepLinkResolution,
+    RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
+    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
+    SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
+    SteerAgentMessageResult, TimelineItem, TimelineLiveEvent, TimelinePage, TimelineTurnIndex,
+    VibexSessionId,
 };
 
 use crate::{BackendBound, BackendFuture, BackendResult, MutationRequest};
@@ -285,6 +286,25 @@ pub trait AgentBackend: BackendBound {
             Err(crate::BackendError::unsupported(
                 "agent_timeline_item_unavailable",
                 "Tool detail is unavailable on this backend",
+            ))
+        })
+    }
+
+    /// Reads one page of a session's user-turn index.
+    ///
+    /// The navigation read behind a conversation's turn list: every user turn,
+    /// in order, with a bounded label and no window payload. A backend that
+    /// cannot answer it leaves a client on the turns its loaded window holds,
+    /// which is what it showed before the index existed.
+    fn fetch_turn_index(
+        &self,
+        request: FetchTurnIndexRequest,
+    ) -> BackendFuture<'_, TimelineTurnIndex> {
+        let _ = request;
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_turn_index_unavailable",
+                "the session's turn index is unavailable on this backend",
             ))
         })
     }

@@ -23,11 +23,12 @@ use vibex_core::{
     CreateAgentSessionRequest, CreateTerminalSessionRequest, DelegationExecution,
     DelegationRuntimeSummary, DelegationTaskEventKind, DelegationTaskPhase, ElicitationRequest,
     ExecutionOutcome, ExecutionResultRange, FetchTimelineItemRequest, FetchTimelineRequest,
-    ForkAgentSessionRequest, GoalChangeKind, GoalPayload, GoalSnapshot, LocalHistoryImportResult,
-    LocalHistoryScanResult, LocalHistorySelection, LocalHistoryTimelineEntry, McpSecretTarget,
-    McpServer, McpServerSecretReference, McpServerTransportKind, MessageAttachment,
-    MessageProvenance, MessageSubmissionId, PermissionRequest, ProjectId, PromptKind, PromptStatus,
-    ProviderBinding, ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
+    FetchTurnIndexRequest, ForkAgentSessionRequest, GoalChangeKind, GoalPayload, GoalSnapshot,
+    LocalHistoryImportResult, LocalHistoryScanResult, LocalHistorySelection,
+    LocalHistoryTimelineEntry, McpSecretTarget, McpServer, McpServerSecretReference,
+    McpServerTransportKind, MessageAttachment, MessageProvenance, MessageSubmissionId,
+    PermissionRequest, ProjectId, PromptKind, PromptStatus, ProviderBinding,
+    ProviderBindingMetadata, ProviderCapabilities, ProviderCapabilitiesResponse,
     ProviderDefaultScopeKind, ProviderKind, ProviderNativeBinding, ProviderProfile,
     ProviderProfileDefaultScope, ProviderProfileId, ProviderProfileStatus,
     RenameAgentSessionRequest, ResolveElicitationRequest, ResolvePermissionRequest, RetryPhase,
@@ -35,7 +36,7 @@ use vibex_core::{
     SessionRuntimeSelection, SessionRuntimeSelectionStatus, SteerAgentMessageRequest,
     SteerAgentMessageResult, SteerMessageOutcome, SystemNoticeLevel, SystemNoticePayload,
     TimelineErrorPayload, TimelineItem, TimelineLiveEvent, TimelinePage, TimelinePayload,
-    TimelinePayloadDepth, TimelineRedactionState, TimelineSource, TransportKind,
+    TimelinePayloadDepth, TimelineRedactionState, TimelineSource, TimelineTurnIndex, TransportKind,
     TurnExecutionAttribution, UsageExecutionId, UserMessageDelivery, UserMessagePayload,
     VibexError, VibexExecutionId, VibexOperationId, VibexResult, VibexSessionId, VibexUseRef,
     VibexUseToolHost, WorkspaceId, agent_id_for_provider_kind,
@@ -2966,6 +2967,44 @@ impl AgentManager {
                     "the requested timeline item no longer exists",
                 ))
             }
+            Err(error) => {
+                // A connection that cannot serve this read is not worth
+                // keeping; the next call starts from a fresh one.
+                *reader = None;
+                Err(error)
+            }
+        }
+    }
+
+    /// Reads one page of a session's user-turn index.
+    ///
+    /// The navigation read of a conversation: turn count, order, and one
+    /// bounded label per turn, read from the user-message rows alone. A window
+    /// is bounded by design, so this is what lets a client number and name the
+    /// turns its window does not hold — including over Remote v2, where reading
+    /// the whole history is exactly what the windowed timeline exists to avoid.
+    pub async fn fetch_turn_index(
+        &self,
+        request: FetchTurnIndexRequest,
+    ) -> VibexResult<TimelineTurnIndex> {
+        let mut reader = self
+            .timeline_reader
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if reader.is_none() {
+            *reader = Some(self.open_migrated()?);
+        }
+        let conn = reader
+            .as_ref()
+            .expect("the timeline reader was opened just above");
+        let index = TimelineRepository::fetch_turn_index(
+            conn,
+            &request.session_id,
+            request.before_sequence,
+            request.limit,
+        );
+        match index {
+            Ok(index) => Ok(index),
             Err(error) => {
                 // A connection that cannot serve this read is not worth
                 // keeping; the next call starts from a fresh one.

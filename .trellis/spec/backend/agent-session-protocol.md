@@ -1919,6 +1919,26 @@ restore must page forward from `afterSequence = 0`, or from the `endSequence` of
 a cache known to have `hasOlder = false` and `startSequence <= 1`, until
 `hasNewer = false`.
 
+### User-Turn Index
+
+A window is bounded, so it cannot say how many turns a session holds, number
+them, or label the ones above it. `FetchTurnIndexRequest` is that read: one
+entry per user-message row — the turn id the projection gives it, its sequence,
+its timestamp, and a bounded first-line label — paged from the newest end with
+`beforeSequence`, plus a `totalTurns` count so a page can be numbered against
+the whole session. The sequence is the identity clients match loaded turns
+against and address a jump with.
+
+- Served natively by the timeline repository and over Remote v2 as
+  `fetch_turn_index`; it requires the same `ReadAgentSession` authorization as
+  every other timeline read.
+- It carries no window payload and never substitutes for one: the label is a
+  navigation aid, and the message body is
+  `FetchTimelineItemRequest { sequence }`.
+- A client whose backend cannot answer the read falls back to numbering the
+  turns its loaded window holds; the index is an aid, never a precondition for
+  rendering a conversation.
+
 ## Timeline Attach and Replay
 
 Live timeline subscriptions use an explicit attach flow, not an implicit

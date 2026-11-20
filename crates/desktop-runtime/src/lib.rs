@@ -988,6 +988,13 @@ impl AgentHandle {
     ) -> VibexResult<vibex_core::TimelineItem> {
         self.manager.fetch_timeline_item(request).await
     }
+
+    pub async fn fetch_turn_index(
+        &self,
+        request: vibex_core::FetchTurnIndexRequest,
+    ) -> VibexResult<vibex_core::TimelineTurnIndex> {
+        self.manager.fetch_turn_index(request).await
+    }
 }
 
 #[derive(Clone)]

@@ -1767,6 +1767,116 @@ fn timeline_page_starts_at_turn_start_default() -> bool {
     true
 }
 
+/// How much of a prompt a turn index entry keeps.
+///
+/// An entry exists to label a navigation slot, not to re-serve the message: the
+/// body is read back from the timeline item when a reader opens the turn. One
+/// hundred and sixty characters cover what a card shows without making a
+/// thousand-turn index cost a megabyte.
+pub const TIMELINE_TURN_INDEX_TITLE_MAX_CHARS: usize = 160;
+
+/// One user turn as a navigation index entry.
+///
+/// The timeline is read as windows, so a client that only holds the newest
+/// window cannot number or even name the turns above it. This is the cheap
+/// answer to that: every user message the session holds, in order, with just
+/// enough to address and label it. A turn's identity in the conversation
+/// projection is `turn:<user item id>`, and [`Self::turn_id`] repeats it so a
+/// reader can match an entry against the rows it may already hold.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineTurnIndexEntry {
+    /// The turn id the conversation projection gives the turn.
+    pub turn_id: String,
+    /// The sequence of the turn's user row. This is the addressing key: a
+    /// window read can be asked for from here, and a loaded turn is matched
+    /// back to its entry by it.
+    pub sequence: i64,
+    /// When the user row was recorded.
+    pub timestamp_ms: i64,
+    /// The first line of the prompt, bounded to
+    /// [`TIMELINE_TURN_INDEX_TITLE_MAX_CHARS`]. Empty for a row whose payload
+    /// carried no readable text.
+    pub title: String,
+}
+
+impl TimelineTurnIndexEntry {
+    /// The entry one stored user message projects to.
+    pub fn from_user_message(
+        item_id: TimelineItemId,
+        sequence: i64,
+        timestamp_ms: i64,
+        payload: &UserMessagePayload,
+    ) -> Self {
+        Self {
+            turn_id: format!("turn:{item_id}"),
+            sequence,
+            timestamp_ms,
+            title: timeline_turn_index_title(&user_message_display_text(
+                &payload.text,
+                &payload.attachments,
+            )),
+        }
+    }
+}
+
+/// The label a turn index entry carries for a prompt.
+///
+/// A prompt is often a pasted document or a stack trace, so the first line is
+/// what names the turn. Whitespace is folded because the label is rendered on
+/// one line, and the tail is cut rather than kept: the card clamps anyway, and
+/// the index exists to stay small.
+fn timeline_turn_index_title(text: &str) -> String {
+    let line = text.lines().find(|line| !line.trim().is_empty());
+    let line = line.unwrap_or_default().trim();
+    let mut title = String::with_capacity(line.len().min(TIMELINE_TURN_INDEX_TITLE_MAX_CHARS));
+    let mut pending_space = false;
+    let mut truncated = false;
+    let mut written = 0_usize;
+    for character in line.chars() {
+        if character.is_whitespace() {
+            pending_space = !title.is_empty();
+            continue;
+        }
+        if written >= TIMELINE_TURN_INDEX_TITLE_MAX_CHARS {
+            truncated = true;
+            break;
+        }
+        written += 1;
+        if pending_space {
+            title.push(' ');
+            pending_space = false;
+        }
+        title.push(character);
+    }
+    if truncated {
+        title.pop();
+        title.push('…');
+    }
+    title
+}
+
+/// One page of a session's turn index.
+///
+/// Pages are read from the newest end, so a client that only needs orientation
+/// pays for a page and not for the archive. Entries inside a page stay in
+/// conversation order.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TimelineTurnIndex {
+    pub session_id: VibexSessionId,
+    /// Oldest first.
+    pub entries: Vec<TimelineTurnIndexEntry>,
+    /// Whether the session holds user turns below this page's oldest entry.
+    pub has_older: bool,
+    /// How many user turns the session holds in total.
+    ///
+    /// A page can be numbered against the whole conversation instead of
+    /// against itself, which is what keeps a rail's numbers stable while the
+    /// older pages are still travelling.
+    pub total_turns: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct TimelineLiveEvent {

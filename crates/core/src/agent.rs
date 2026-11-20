@@ -969,6 +969,24 @@ pub struct FetchTimelineItemRequest {
     pub sequence: i64,
 }
 
+/// Reads a page of a session's user-turn index.
+///
+/// A timeline window is bounded, so it cannot answer how many turns a session
+/// holds or what the turns above it are about. This is that read: one row per
+/// user message, ordered, without any of the payload a window carries. Pages
+/// are addressed from the newest end because that is where a reader starts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FetchTurnIndexRequest {
+    pub session_id: VibexSessionId,
+    /// Return the page ending just below this sequence. `None` reads the
+    /// newest page.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub before_sequence: Option<i64>,
+    /// How many turns the page may carry.
+    pub limit: u32,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ResolvePermissionRequest {

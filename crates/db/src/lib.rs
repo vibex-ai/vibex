@@ -47,10 +47,11 @@ use vibex_core::{
     ScheduledTaskStatus, ScheduledTaskUpdateRequest, Skill, SkillAgentMatrix, SkillCreateRequest,
     SkillId, SkillProviderMatrix, SkillStatus, TerminalId, TerminalSession, TimelineItem,
     TimelineItemId, TimelineItemKind, TimelinePage, TimelinePayload, TimelinePayloadDepth,
-    TimelineRedactionState, TimelineSequenceGap, TimelineSource, TimelineTurnStart,
-    TurnExecutionAttribution, UserMessagePayload, VibexError, VibexExecutionId, VibexResult,
-    VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord, agent_id_for_provider_kind,
-    legacy_status_for_phase, phase_for_legacy_status, unix_timestamp_ms,
+    TimelineRedactionState, TimelineSequenceGap, TimelineSource, TimelineTurnIndex,
+    TimelineTurnIndexEntry, TimelineTurnStart, TurnExecutionAttribution, UserMessagePayload,
+    VibexError, VibexExecutionId, VibexResult, VibexSessionId, WorkspaceId, WorkspaceMode,
+    WorkspaceRecord, agent_id_for_provider_kind, legacy_status_for_phase, phase_for_legacy_status,
+    unix_timestamp_ms,
 };
 
 mod im;
@@ -9352,6 +9353,134 @@ impl TimelineRepository {
             )),
             None => Ok(None),
         }
+    }
+
+    /// How many user turns a session's timeline is made of.
+    ///
+    /// One user-message row opens one conversational turn, so the count is the
+    /// turn count a navigation index numbers against. Kept separate from
+    /// [`Self::fetch_turn_index`] so a page can be numbered while the older
+    /// pages are still being read.
+    pub fn count_user_turns(conn: &Connection, session_id: &VibexSessionId) -> VibexResult<usize> {
+        let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+        conn.query_row(
+            "
+            SELECT COUNT(*) FROM agent_timeline_items
+            WHERE session_id = ?1 AND kind = ?2
+            ",
+            params![session_id.as_str(), user_message],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|count| count.max(0) as usize)
+        .map_err(storage_err(
+            "timeline_turn_index_count_failed",
+            "failed to count the session's user turns",
+        ))
+    }
+
+    /// Reads one page of a session's user-turn index.
+    ///
+    /// This is the read a navigation rail uses instead of the loaded window. It
+    /// touches one indexed range — `(session_id, sequence)` over the
+    /// user-message kind — and carries one bounded label per turn, so a
+    /// conversation of any length can be listed without opening a single
+    /// payload-heavy window.
+    ///
+    /// The page is addressed from the newest end and returned in conversation
+    /// order: the newest `limit` turns below `before_sequence`, oldest first.
+    pub fn fetch_turn_index(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        before_sequence: Option<i64>,
+        limit: u32,
+    ) -> VibexResult<TimelineTurnIndex> {
+        let user_message = enum_to_db(&TimelineItemKind::UserMessage)?;
+        let limit = limit.clamp(1, 1_000) as i64;
+        let total_turns = Self::count_user_turns(conn, session_id)?;
+        let mut stmt = conn
+            .prepare_cached(
+                "
+                SELECT sequence, timeline_item_id, timestamp_ms, payload_json
+                FROM agent_timeline_items
+                WHERE session_id = ?1
+                    AND kind = ?2
+                    AND (?3 IS NULL OR sequence < ?3)
+                ORDER BY sequence DESC
+                LIMIT ?4
+                ",
+            )
+            .map_err(storage_err(
+                "timeline_turn_index_failed",
+                "failed to prepare the turn index read",
+            ))?;
+        // One extra row proves the page was cut, which is what `has_older`
+        // reports; it is dropped before the page is handed back.
+        let rows = stmt
+            .query_map(
+                params![
+                    session_id.as_str(),
+                    user_message,
+                    before_sequence,
+                    limit + 1
+                ],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, String>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                    ))
+                },
+            )
+            .map_err(storage_err(
+                "timeline_turn_index_failed",
+                "failed to query the turn index",
+            ))?;
+        let mut entries = Vec::with_capacity(limit as usize + 1);
+        for row in rows {
+            let (sequence, item_id, timestamp_ms, payload_json) = row.map_err(storage_err(
+                "timeline_turn_index_failed",
+                "failed to read the turn index",
+            ))?;
+            let item_id = TimelineItemId::parse(item_id).map_err(|error| {
+                VibexError::storage(
+                    "timeline_turn_index_decode_failed",
+                    format!("failed to parse a turn index item id: {error}"),
+                )
+            })?;
+            // A row whose payload a peer redacted still occupies its turn: the
+            // number has to stay, only the label is gone.
+            let entry = match json_from_db_sql::<TimelinePayload>(payload_json) {
+                Ok(TimelinePayload::UserMessage(payload)) => {
+                    TimelineTurnIndexEntry::from_user_message(
+                        item_id,
+                        sequence,
+                        timestamp_ms,
+                        &payload,
+                    )
+                }
+                _ => TimelineTurnIndexEntry {
+                    turn_id: format!("turn:{item_id}"),
+                    sequence,
+                    timestamp_ms,
+                    title: String::new(),
+                },
+            };
+            entries.push(entry);
+        }
+        let has_older = entries.len() as i64 > limit;
+        if has_older {
+            entries.truncate(limit as usize);
+        }
+        // The read is newest-first so the LIMIT keeps the newest page; the
+        // conversation it describes runs the other way.
+        entries.reverse();
+        Ok(TimelineTurnIndex {
+            session_id: session_id.clone(),
+            entries,
+            has_older,
+            total_turns,
+        })
     }
 
     /// The newest user message a session recorded, when it has one.
@@ -26150,6 +26279,115 @@ mod tests {
             }
         }
         (conn, session.id, starts, temp)
+    }
+
+    /// The turn index answers the whole conversation from user rows alone.
+    ///
+    /// It is the read a navigation rail needs: turn count, order, and one label
+    /// per turn, without touching the assistant and tool rows that make a window
+    /// expensive. Pages come back oldest first and address the next one from
+    /// the oldest entry they carried.
+    #[test]
+    fn the_turn_index_numbers_the_session_without_reading_its_windows() {
+        let (conn, session_id, starts, temp) = turn_boundary_fixture(
+            "timeline-turn-index",
+            &[(2, true), (2, true), (2, true), (2, true)],
+        );
+
+        let newest = TimelineRepository::fetch_turn_index(&conn, &session_id, None, 2).unwrap();
+        assert_eq!(newest.total_turns, 4);
+        assert!(newest.has_older);
+        assert_eq!(
+            newest
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![starts[2], starts[3]],
+            "the page is the newest turns, in conversation order"
+        );
+        assert_eq!(newest.entries[0].title, "question-2");
+        assert_eq!(newest.entries[1].title, "question-3");
+        assert!(
+            newest.entries[0].turn_id.starts_with("turn:timeline_"),
+            "an entry names the turn the projection gives the user row"
+        );
+        assert!(newest.entries[0].timestamp_ms > 0);
+
+        let older =
+            TimelineRepository::fetch_turn_index(&conn, &session_id, Some(starts[2]), 2).unwrap();
+        assert_eq!(older.total_turns, 4);
+        assert!(!older.has_older);
+        assert_eq!(
+            older
+                .entries
+                .iter()
+                .map(|entry| entry.sequence)
+                .collect::<Vec<_>>(),
+            vec![starts[0], starts[1]]
+        );
+
+        // A page that already holds the whole conversation says so, which is how
+        // a client knows it can number every turn from one read.
+        let whole = TimelineRepository::fetch_turn_index(&conn, &session_id, None, 100).unwrap();
+        assert_eq!(whole.entries.len(), 4);
+        assert!(!whole.has_older);
+
+        cleanup_db(temp);
+    }
+
+    /// A turn index label is the prompt's first line, folded onto one line.
+    #[test]
+    fn a_turn_index_label_is_the_first_line_of_the_prompt() {
+        let temp = temp_db_path("timeline-turn-index-label");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-turn-index-label",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "labels".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Idle,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "\n\n  fix   the   rail\nand then some".into(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let index = TimelineRepository::fetch_turn_index(&conn, &session.id, None, 10).unwrap();
+        assert_eq!(index.entries.len(), 1);
+        assert_eq!(index.entries[0].title, "fix the rail");
+
+        cleanup_db(temp);
     }
 
     /// A page never hands a turn over in pieces.

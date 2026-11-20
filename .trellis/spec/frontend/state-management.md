@@ -2352,14 +2352,29 @@ RuntimeMenuPlacement { anchor, height, trigger_offset }
 - Turn-preview summaries use a strict UTF-8 source budget (8 KiB), node budget,
   and workspace-resource budget. The full selected-session timeline remains
   authoritative; only the compact preview is truncated and bounded.
-- A compact Turn preview rail may derive one button per stable `turnId` from the
-  visible row projection. Only turns anchored by a user message are numbered: a
-  continuation turn — auto-continue, or an explicit continue after a failed turn
-  — carries no user message and belongs to the user turn that triggered it, so
-  the rail folds it into that turn instead of giving it a slot and a number of
-  its own. Activating a preview only scrolls the virtual list to that row and
-  marks the reader away from the bottom; it must not mutate timeline items, turn
-  grouping, or authoritative cursor state.
+- A compact Turn preview rail derives one slot per user turn from the session's
+  turn index (`FetchTurnIndexRequest`), not from the loaded window. The window
+  is bounded, so numbering from it renamed turns on every scroll and could not
+  show a turn the reader had not loaded; the index carries the turn count and a
+  bounded label per turn, paged from the newest end and refreshed by one page
+  once a turn newer than the index appears. Only turns anchored by a user
+  message are numbered: a continuation turn — auto-continue, or an explicit
+  continue after a failed turn — carries no user message and belongs to the user
+  turn that triggered it, so the rail folds it into that turn instead of giving
+  it a slot and a number of its own. Slots beyond the drawn bound are sampled,
+  never truncated: a sampled slot keeps the real turn and number it stands for,
+  so the strip still covers the whole conversation while its per-frame element
+  cost stays bounded.
+- Activating a slot scrolls the virtual list to that turn when the window holds
+  it and marks the reader away from the bottom. A turn above the window is
+  reached by paging history toward it — one bounded page per read, then the same
+  scroll once it lands; the read is a reader gesture, so the bottom-follow
+  prefetch gate does not refuse it. Activation must not mutate timeline items,
+  turn grouping, or authoritative cursor state.
+- A slot for a turn the window does not hold is labelled from the index and
+  reads its prompt back on demand. The index label is one line, so it is used
+  as the card's title and not repeated as its body; the body is the detail read
+  for that turn's sequence.
 - The rail reports the reader's position as well as the pointer's. Every slot
   whose turn the timeline viewport currently shows is lit, resolved from the
   scroll handle the virtual list tracks plus the row-height table — the same

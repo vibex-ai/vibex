@@ -106,7 +106,7 @@ use crate::terminal::{
 use crate::time::unix_timestamp_ms;
 use crate::timeline::{TimelineItem, TimelinePage};
 use crate::workspace::{OpenWorkspaceRequest, ProjectWorkspaceSummary};
-use crate::{FetchTimelineItemRequest, MessageAttachment, VibexUseMention};
+use crate::{FetchTimelineItemRequest, FetchTurnIndexRequest, MessageAttachment, VibexUseMention};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -549,6 +549,7 @@ pub enum RemoteAgentOperationKind {
     ForkSession,
     FetchTimeline,
     FetchTimelineItem,
+    FetchTurnIndex,
     GetTimelineDisplaySettings,
     ResolveOpaqueLocator,
     ListRuntimeOptions,
@@ -738,6 +739,25 @@ pub struct RemoteAgentTimelineItemFetchRequest {
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentTimelineItemFetchResponse {
     pub item: TimelineItem,
+}
+
+/// Reads a page of a session's user-turn index over Remote v2.
+///
+/// The paired client's turn list needs every turn of a conversation, and the
+/// windowed timeline deliberately never holds every turn. This read is the
+/// cheap answer: user-message rows only, bounded labels, paged from the newest
+/// end.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTurnIndexFetchRequest {
+    pub auth: RemoteAuthProof,
+    pub request: FetchTurnIndexRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentTurnIndexFetchResponse {
+    pub index: crate::TimelineTurnIndex,
 }
 
 /// The desktop resolves a push/deep-link locator after the client has
@@ -1430,6 +1450,7 @@ pub enum RemoteAgentRequest {
     DeleteSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     FetchTimelineItem(RemoteAgentTimelineItemFetchRequest),
+    FetchTurnIndex(RemoteAgentTurnIndexFetchRequest),
     GetTimelineDisplaySettings(RemoteAgentTimelineDisplaySettingsRequest),
     ResolveOpaqueLocator(RemoteAgentDeepLinkResolveRequest),
     ListRuntimeOptions(RemoteAgentRuntimeOptionsRequest),
@@ -1496,6 +1517,7 @@ impl RemoteAgentRequest {
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::FetchTimelineItem(_) => RemoteAgentOperationKind::FetchTimelineItem,
+            Self::FetchTurnIndex(_) => RemoteAgentOperationKind::FetchTurnIndex,
             Self::GetTimelineDisplaySettings(_) => {
                 RemoteAgentOperationKind::GetTimelineDisplaySettings
             }
@@ -5743,6 +5765,55 @@ mod tests {
             "auth-token-returned-once"
         );
         assert!(!format!("{request:?}").contains("auth-token-returned-once"));
+    }
+
+    /// The turn index read is its own operation, tagged like the rest.
+    ///
+    /// A client that only knows the window read asks for the index by name; the
+    /// tag is what the desktop answers, so it is frozen here rather than being
+    /// derived from the request's shape.
+    #[test]
+    fn remote_turn_index_fetch_serializes_with_a_stable_tag() {
+        let request = RemoteAgentRequest::FetchTurnIndex(RemoteAgentTurnIndexFetchRequest {
+            auth: RemoteAuthProof {
+                device_id: DeviceId::new(),
+                auth_token: "turn-index-token".to_string(),
+            },
+            request: FetchTurnIndexRequest {
+                session_id: VibexSessionId::new(),
+                before_sequence: Some(42),
+                limit: 500,
+            },
+        });
+
+        let json = serde_json::to_value(&request).unwrap();
+
+        assert_eq!(
+            request.operation_kind(),
+            RemoteAgentOperationKind::FetchTurnIndex
+        );
+        assert_eq!(json["type"], "fetch_turn_index");
+        assert_eq!(json["data"]["request"]["beforeSequence"], 42);
+        assert_eq!(json["data"]["request"]["limit"], 500);
+        assert_eq!(json["data"]["auth"]["authToken"], "turn-index-token");
+        assert!(!format!("{request:?}").contains("turn-index-token"));
+
+        let older = serde_json::to_value(RemoteAgentRequest::FetchTurnIndex(
+            RemoteAgentTurnIndexFetchRequest {
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "token".to_string(),
+                },
+                request: FetchTurnIndexRequest {
+                    session_id: VibexSessionId::new(),
+                    before_sequence: None,
+                    limit: 500,
+                },
+            },
+        ))
+        .unwrap();
+        // A newest page carries no cursor at all rather than a null one.
+        assert!(older["data"]["request"].get("beforeSequence").is_none());
     }
 
     #[test]
