@@ -197,6 +197,7 @@ pub enum SidebarSectionKind {
 pub struct SidebarSectionView {
     pub kind: SidebarSectionKind,
     pub id: String,
+    pub collapsed: bool,
     pub name: String,
     pub session_ids: Vec<String>,
 }
@@ -389,7 +390,7 @@ pub struct AttachmentItem {
 type OpenPath = Rc<dyn Fn(&str)>;
 
 /// Opens a path's diff, staged or not.
-type OpenDiff = Rc<dyn Fn(&str, bool)>;
+type OpenDiff = CollapseAction;
 
 /// Opens the actions sheet for a session, with its id and title.
 type SessionMenu = FolderNameAction;
@@ -408,6 +409,7 @@ type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 type BatchAction = Rc<dyn Fn(&[String])>;
 type FolderNameAction = Rc<dyn Fn(&str, &str)>;
 type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
+type CollapseAction = Rc<dyn Fn(&str, bool)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -451,6 +453,8 @@ pub struct SessionHost {
     pub on_delete_folder: Rc<dyn Fn(&str)>,
     pub on_rename_group: FolderNameAction,
     pub on_delete_group: Rc<dyn Fn(&str)>,
+    pub on_toggle_folder_collapsed: CollapseAction,
+    pub on_toggle_group_collapsed: CollapseAction,
     pub on_create_group: CreateGroupAction,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
@@ -4036,6 +4040,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let group_rename = signal(String::new());
     let on_rename_group = host.on_rename_group.clone();
     let on_delete_group = host.on_delete_group.clone();
+    let on_toggle_folder_collapsed = host.on_toggle_folder_collapsed.clone();
+    let on_toggle_group_collapsed = host.on_toggle_group_collapsed.clone();
     let group_open = signal(false);
     let group_name = signal(String::new());
     let on_create_group = host.on_create_group.clone();
@@ -4236,6 +4242,20 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                     Rc::new(move |id: &str, name: &str| {
                                                         folder_rename.set(name.to_owned());
                                                         folder_actions.set(Some(id.to_owned()));
+                                                    })
+                                                },
+                                                {
+                                                    let callback =
+                                                        on_toggle_folder_collapsed.clone();
+                                                    Rc::new(move |id: &str, collapsed: bool| {
+                                                        callback(id, collapsed)
+                                                    })
+                                                },
+                                                {
+                                                    let callback =
+                                                        on_toggle_group_collapsed.clone();
+                                                    Rc::new(move |id: &str, collapsed: bool| {
+                                                        callback(id, collapsed)
                                                     })
                                                 },
                                                 {
@@ -4730,6 +4750,8 @@ fn sidebar_section(
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     on_folder_menu: FolderNameAction,
+    on_folder_collapse: CollapseAction,
+    on_group_collapse: CollapseAction,
     on_group_menu: FolderNameAction,
     open: Signal<bool>,
     select_mode: Signal<bool>,
@@ -4756,6 +4778,35 @@ fn sidebar_section(
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_XS))
+                .child({
+                    let on_folder_collapse = on_folder_collapse.clone();
+                    let on_group_collapse = on_group_collapse.clone();
+                    button()
+                        .on_press(move || {
+                            let section = section.get_untracked();
+                            let next = !section.collapsed;
+                            if section.kind == SidebarSectionKind::Folder {
+                                on_folder_collapse(&section.id, next);
+                            } else {
+                                on_group_collapse(&section.id, next);
+                            }
+                        })
+                        .min_h(px(24.0))
+                        .min_w(px(24.0))
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            text(move || {
+                                if section.with(|section| section.collapsed) {
+                                    "▸"
+                                } else {
+                                    "▾"
+                                }
+                            })
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted),
+                        )
+                })
                 .child(
                     text(move || section.with(|section| section.name.clone()))
                         .flex_1()
@@ -4797,21 +4848,28 @@ fn sidebar_section(
                         )
                 }),
         )
-        .child(each(
-            move || rows.get(),
-            |session| session.id.clone(),
-            move |session, _| {
-                let session_signal = signal(session.get_untracked());
-                session_row(
-                    session_signal,
-                    active,
-                    on_select.clone(),
-                    on_menu.clone(),
-                    open,
-                    select_mode,
-                    selected,
-                    pinned,
-                )
+        .child(when(
+            move || !section.with(|section| section.collapsed),
+            move || {
+                let on_select = on_select.clone();
+                let on_menu = on_menu.clone();
+                view().w_full().flex_col().gap(px(2.0)).child(each(
+                    move || rows.get(),
+                    |session| session.id.clone(),
+                    move |session, _| {
+                        let session_signal = signal(session.get_untracked());
+                        session_row(
+                            session_signal,
+                            active,
+                            on_select.clone(),
+                            on_menu.clone(),
+                            open,
+                            select_mode,
+                            selected,
+                            pinned,
+                        )
+                    },
+                ))
             },
         ))
 }

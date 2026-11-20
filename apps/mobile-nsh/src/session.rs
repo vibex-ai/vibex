@@ -622,6 +622,26 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.delete_group(id))
             },
+            on_toggle_folder_collapsed: {
+                let service = self.clone();
+                Rc::new(move |id: &str, collapsed: bool| {
+                    service.sidebar_mutation(
+                        RemoteSidebarOrganizationMutation::SetFolderCollapsed {
+                            folder_id: id.to_owned(),
+                            collapsed,
+                        },
+                    )
+                })
+            },
+            on_toggle_group_collapsed: {
+                let service = self.clone();
+                Rc::new(move |id: &str, collapsed: bool| {
+                    service.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupCollapsed {
+                        group_id: id.to_owned(),
+                        collapsed,
+                    })
+                })
+            },
             on_create_group: {
                 let service = self.clone();
                 Rc::new(move |name: &str, members: &[String]| service.create_group(name, members))
@@ -4075,6 +4095,7 @@ impl SessionService {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Folder,
                 id: folder.id.clone(),
+                collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
                 name: folder.name.clone(),
                 session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
             });
@@ -4083,6 +4104,7 @@ impl SessionService {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Group,
                 id: group.id.clone(),
+                collapsed: snapshot.collapsed_group_ids.contains(&group.id),
                 name: group.name.clone(),
                 session_ids: group.member_session_ids.clone(),
             });

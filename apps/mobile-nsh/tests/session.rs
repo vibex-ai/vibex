@@ -199,6 +199,7 @@ fn FolderShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
+        collapsed: false,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
         session_ids: vec!["s2".to_owned()],
@@ -212,9 +213,24 @@ fn GroupShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Group,
+        collapsed: false,
         id: "group-1".to_owned(),
         name: "Pair".to_owned(),
         session_ids: vec!["s1".to_owned(), "s2".to_owned()],
+    }]);
+    session::session(host)
+}
+
+/// A shell with a collapsed authority folder.
+#[component]
+fn CollapsedFolderShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sidebar_sections.set(vec![SidebarSectionView {
+        kind: SidebarSectionKind::Folder,
+        collapsed: true,
+        id: "folder-1".to_owned(),
+        name: "Work".to_owned(),
+        session_ids: vec!["s2".to_owned()],
     }]);
     session::session(host)
 }
@@ -791,6 +807,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_delete_folder: Rc::new(|_| {}),
         on_rename_group: Rc::new(|_, _| {}),
         on_delete_group: Rc::new(|_| {}),
+        on_toggle_folder_collapsed: Rc::new(|_, _| {}),
+        on_toggle_group_collapsed: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
@@ -1177,6 +1195,17 @@ fn selected_sessions_can_become_a_group() {
     app.wait_for("1 selected").unwrap();
     app.press("Group").unwrap();
     app.wait_for("Group name").unwrap();
+}
+
+#[test]
+fn a_collapsed_folder_hides_its_sessions() {
+    let mut config = EngineConfig::new(Root::of::<CollapsedFolderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Work").unwrap();
+    assert!(!app.screen().shows("Fix the tests"));
 }
 
 #[test]
