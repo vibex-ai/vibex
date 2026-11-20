@@ -825,6 +825,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_arm_entry: Rc::new(|_| {}),
         attachments,
         on_attach_image,
+        on_attach_camera: Rc::new(|| {}),
         on_attach_file: Rc::new(|| {}),
         on_remove_attachment,
         resolving,

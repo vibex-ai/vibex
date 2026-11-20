@@ -467,6 +467,7 @@ pub struct SessionHost {
     /// Files and photos waiting to be sent with the message.
     pub attachments: Signal<Vec<AttachmentItem>>,
     pub on_attach_image: Action,
+    pub on_attach_camera: Action,
     pub on_attach_file: Action,
     pub on_remove_attachment: Rc<dyn Fn(&str)>,
     /// Starts a new session in the open session's workspace.
@@ -2709,6 +2710,14 @@ fn composer(host: SessionHost) -> impl IntoElement {
                         icon(include_str!("../../assets/icons/image.svg")),
                         copy::text("Attach a photo", "附加照片", "附加照片"),
                         move || on_attach_image(),
+                    )
+                })
+                .child({
+                    let on_attach_camera = host.on_attach_camera.clone();
+                    action::icon_button(
+                        icon(include_str!("../../assets/icons/circle-plus.svg")),
+                        copy::text("Take a photo", "拍照", "拍照"),
+                        move || on_attach_camera(),
                     )
                 })
                 .child({

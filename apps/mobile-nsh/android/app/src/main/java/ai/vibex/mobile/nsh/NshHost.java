@@ -16,6 +16,12 @@ public final class NshHost {
     /** A pairing link the camera read. */
     public static native void nativeScanResult(String value);
 
+    /** Tells the app that the host can open a camera. */
+    public static native void nativeSetCameraAvailable(boolean available);
+
+    /** The path of a photo the camera host wrote. */
+    public static native void nativeCameraPhoto(String path);
+
     /** A launcher shortcut asked for a new session. */
     public static native void nativeNewSession();
 

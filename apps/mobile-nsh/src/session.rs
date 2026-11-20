@@ -946,6 +946,10 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.attach_images())
             },
+            on_attach_camera: {
+                let service = self.clone();
+                Rc::new(move || service.attach_camera())
+            },
             on_attach_file: {
                 let service = self.clone();
                 Rc::new(move || service.attach_files())
@@ -3322,6 +3326,47 @@ impl SessionService {
     }
 
     /// Picks photos and keeps them as attachments for the next message.
+    fn attach_camera(&self) {
+        self.error.set(None);
+        if !crate::host::request_camera() {
+            self.fail_text(copy::text(
+                "The camera is unavailable on this host.",
+                "当前宿主无法使用相机。",
+                "目前宿主無法使用相機。",
+            ));
+        }
+    }
+
+    /// Reads the photo the host wrote and turns it into an attachment.
+    pub fn attach_camera_photo(&self, path: String) {
+        let bytes = match std::fs::read(&path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.fail_text(&format!(
+                    "{}: {error}",
+                    copy::text("reading the photo failed", "读取照片失败", "讀取照片失敗")
+                ));
+                return;
+            }
+        };
+        let seq = self.attachment_seq.get().wrapping_add(1);
+        self.attachment_seq.set(seq);
+        let label = path.rsplit('/').next().unwrap_or("photo.jpg").to_owned();
+        let mime_type = "image/jpeg".to_owned();
+        let uri = format!(
+            "data:{mime_type};base64,{}",
+            base64::engine::general_purpose::STANDARD.encode(bytes)
+        );
+        self.attachments.update(|items| {
+            items.push(AttachmentItem {
+                id: format!("attachment-{seq}"),
+                label,
+                mime_type,
+                uri,
+            });
+        });
+    }
+
     fn attach_images(&self) {
         self.error.set(None);
         let service = self.clone();

@@ -2,11 +2,17 @@ package com.longbridge.nsh;
 
 import android.app.Activity;
 import android.content.Intent;
+import android.net.Uri;
+import android.provider.MediaStore;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
 
 import ai.vibex.mobile.nsh.NshHost;
+
+import androidx.core.content.FileProvider;
+
+import java.io.File;
 
 /**
  * The Vibex host: mounts the Rust app into an {@link NshView} and lends it the
@@ -19,11 +25,13 @@ import ai.vibex.mobile.nsh.NshHost;
  */
 public final class MainActivity extends Activity {
     private static final int SCAN_REQUEST = 42;
+    private static final int CAMERA_REQUEST = 43;
 
     private NshView view;
     private LanDiscovery lanDiscovery;
     private final Handler handler = new Handler(Looper.getMainLooper());
     private boolean scanning;
+    private String cameraPath;
 
     private final Runnable poll = new Runnable() {
         @Override
@@ -36,6 +44,8 @@ public final class MainActivity extends Activity {
                 lanDiscovery.start();
             } else if (request == 3) {
                 lanDiscovery.stop();
+            } else if (request == 4) {
+                openCamera();
             }
             int connectionService = NshHost.nativeTakeConnectionService();
             if (connectionService == 1) {
@@ -59,6 +69,7 @@ public final class MainActivity extends Activity {
         DevActivity.edgeToEdge(this);
         NshHost.nativeSetDeviceName(android.os.Build.MODEL);
         NshHost.nativeSetScannerAvailable(true);
+        NshHost.nativeSetCameraAvailable(true);
         NshHost.nativeSetDiscoveryAvailable(true);
         lanDiscovery = new LanDiscovery(this, NshHost::nativeDiscoveryEvent);
         view = new NshView(this);
@@ -78,9 +89,34 @@ public final class MainActivity extends Activity {
         startActivityForResult(new Intent(this, ScannerActivity.class), SCAN_REQUEST);
     }
 
+    private void openCamera() {
+        try {
+            File directory = new File(getCacheDir(), "camera");
+            if (!directory.exists() && !directory.mkdirs()) {
+                return;
+            }
+            File photo = new File(directory, "shot-" + System.currentTimeMillis() + ".jpg");
+            cameraPath = photo.getAbsolutePath();
+            Uri uri = FileProvider.getUriForFile(this, getPackageName() + ".files", photo);
+            Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
+            intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
+            intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            startActivityForResult(intent, CAMERA_REQUEST);
+        } catch (Exception error) {
+            cameraPath = null;
+        }
+    }
+
     @Override
     protected void onActivityResult(int requestCode, int resultCode, Intent data) {
         super.onActivityResult(requestCode, resultCode, data);
+        if (requestCode == CAMERA_REQUEST) {
+            if (resultCode == RESULT_OK && cameraPath != null) {
+                NshHost.nativeCameraPhoto(cameraPath);
+            }
+            cameraPath = null;
+            return;
+        }
         if (requestCode != SCAN_REQUEST) {
             return;
         }

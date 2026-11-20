@@ -70,6 +70,30 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeScanResult(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// Records that the host can open a camera for attachments.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetCameraAvailable(
+    _env: *mut c_void,
+    _class: *mut c_void,
+    available: jni::sys::jboolean,
+) {
+    crate::host::set_camera_available(available);
+}
+
+/// Reports the path of a photo the host's camera wrote.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeCameraPhoto(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    value: JString<'_>,
+) {
+    env.with_env(|_| -> jni::errors::Result<()> {
+        crate::host::set_camera_photo(&value.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// Records a launcher shortcut asking for a new session.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeNewSession(

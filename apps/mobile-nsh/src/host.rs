@@ -92,6 +92,12 @@ pub fn discovery_available() -> bool {
     DISCOVERY_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Whether the host can open a camera for attachments.
+static CAMERA_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The photo the camera host wrote, waiting for the engine to read it.
+static CAMERA_PHOTO: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// A launcher shortcut asked for a new session.
 static NEW_SESSION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -212,6 +218,52 @@ pub fn share_text(text: &str) {
         .unwrap_or_else(|error| error.into_inner()) = Some(text.to_owned());
 }
 
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host sets this")
+)]
+pub fn set_camera_available(available: bool) {
+    CAMERA_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn camera_available() -> bool {
+    CAMERA_AVAILABLE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Asks the host to open its camera.
+pub fn request_camera() -> bool {
+    if !camera_available() {
+        return false;
+    }
+    requests()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push_back(HostRequest::Camera);
+    true
+}
+
+/// Records the path of the photo the camera host wrote.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host sets this")
+)]
+pub fn set_camera_photo(path: &str) {
+    if path.is_empty() {
+        return;
+    }
+    *CAMERA_PHOTO
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(path.to_owned());
+}
+
+/// Takes the camera photo path, if one is waiting.
+pub fn take_camera_photo() -> Option<String> {
+    CAMERA_PHOTO
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+}
+
 /// Records a launcher shortcut asking for a new session.
 #[cfg_attr(
     not(target_os = "android"),
@@ -253,6 +305,8 @@ pub enum HostRequest {
     DiscoveryStart,
     /// Stop looking.
     DiscoveryStop,
+    /// Open the camera for an attachment.
+    Camera,
 }
 
 impl HostRequest {
@@ -262,6 +316,7 @@ impl HostRequest {
             HostRequest::Scan => 1,
             HostRequest::DiscoveryStart => 2,
             HostRequest::DiscoveryStop => 3,
+            HostRequest::Camera => 4,
         }
     }
 }

@@ -379,6 +379,11 @@ fn start_back_poller(
             {
                 service.receive_shared_text(text);
             }
+            if let Some(path) = host::take_camera_photo()
+                && let Some(service) = services.get_untracked()
+            {
+                service.attach_camera_photo(path);
+            }
             if host::take_new_session_request()
                 && let Some(service) = services.get_untracked()
             {
