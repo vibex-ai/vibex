@@ -167,8 +167,11 @@ The Android path was exercised on a Linux machine with `nsh` 0.6.0, the
 Android SDK (platform/build-tools 35) and NDK 27.2: `nsh package` produced a
 debug-signed universal APK (arm64-v8a, armeabi-v7a, x86_64). A build of the
 same app installs and opens the pairing page and its Link sheet on an API 35
-x86_64 emulator, and the universal APK installs and launches there too. A store release needs `--keystore`; iOS still needs macOS and Xcode,
-so both the iOS build and its packaging script remain unverified here.
+x86_64 emulator, and the universal APK installs and launches there too. The
+custom host was rebuilt with `nsh` 0.6.1 — crates, embed AAR and all three
+ABIs — and still packages a release APK. A store release needs `--keystore`;
+iOS still needs macOS and Xcode, so both the iOS build and its packaging
+script remain unverified here.
 
 ## Tests
 

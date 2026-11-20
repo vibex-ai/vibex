@@ -52,7 +52,7 @@ if [[ ! -f "$android/app/libs/nsh.aar" ]]; then
     if [[ ! -f "$zip" ]]; then
         echo "downloading the nsh embed AAR"
         curl -fsSL -o "$zip" \
-            "https://github.com/longbridge/nsh/releases/download/v0.6.0/nsh-embed-android.zip"
+            "https://github.com/longbridge/nsh/releases/download/v0.6.1/nsh-embed-android.zip"
     fi
     work="$(mktemp -d)"
     trap 'rm -rf "$work"' EXIT

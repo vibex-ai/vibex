@@ -79,9 +79,11 @@ anything that needs a runtime or a phone are listed at the bottom.
   gallery pick, and the "not a Vibex pairing code" path), the host→app scan
   result, the photo picker's QR decode and the Find sheet (browsing started)
   were exercised; the universal APK
-  (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too. A real QR
-  decode and a desktop approving the zero-config code still need a phone and a
-  desktop on one LAN.
+  (arm64-v8a, armeabi-v7a, x86_64) installed and launched there too. The
+  custom host was rebuilt afterwards with `nsh` 0.6.1 (crates, embed AAR and
+  all three ABIs) and still packages; the emulator exercises above were run on
+  0.6.0. A real QR decode and a desktop approving the zero-config code still
+  need a phone and a desktop on one LAN.
 - iOS still has no Xcode, so the iOS platform crate and `build-ios.sh` remain
   uncompiled and unrun.
 - No reachable runtime: pairing, sending, terminal frames, Git and file writes
