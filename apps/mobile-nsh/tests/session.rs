@@ -16,10 +16,10 @@ use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
-    self, AttachmentItem, CommandEntry, EntryKind, GoalPhaseView, GoalView, PendingPermission,
-    PendingQuestion, PermissionChoice, PermissionOption, PlanStepState, PlanStepView, PlanView,
-    QuestionField, QuestionFieldKind, RuntimeChoiceView, RuntimeOptionView, RuntimeSummaryView,
-    SessionHost, SessionState, SessionSummary, TimelineEntry, TokenUsageView,
+    self, AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalPhaseView, GoalView,
+    PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
+    PlanStepView, PlanView, QuestionField, QuestionFieldKind, RuntimeChoiceView, RuntimeOptionView,
+    RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
@@ -157,6 +157,18 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell with earlier prompts to recall.
+#[component]
+fn HistoryShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.history = signal(vec![ComposerHistoryEntry {
+        id: "h1".to_owned(),
+        text: "Ship it".to_owned(),
+    }]);
+    host.history_open = signal(true);
+    session::session(host)
+}
+
 /// A shell whose session has a runtime to change.
 #[component]
 fn RuntimeShell() -> impl IntoElement {
@@ -275,6 +287,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let token_usage = signal(None);
     let plan = signal(None);
     let goal = signal(None);
+    let history = signal(Vec::new());
+    let history_open = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -588,6 +602,11 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         token_usage,
         plan,
         goal,
+        history,
+        history_open,
+        on_open_history: Rc::new(|| {}),
+        on_close_history: Rc::new(|| {}),
+        on_recall_history: Rc::new(|_| {}),
         on_goal_control: Rc::new(|_| {}),
         on_open_runtime: Rc::new(|| {}),
         on_close_runtime: Rc::new(|| {}),
@@ -750,6 +769,15 @@ fn the_composer_opens_the_runtime_choices() {
     app.wait_for("Agent and model").unwrap();
     app.wait_for("Reasoning").unwrap();
     app.wait_for("Codex · GPT-5").unwrap();
+}
+
+#[test]
+fn the_history_sheet_lists_earlier_prompts() {
+    let mut config = EngineConfig::new(Root::of::<HistoryShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Earlier messages").unwrap();
+    assert!(app.screen().shows("Ship it"));
 }
 
 #[test]

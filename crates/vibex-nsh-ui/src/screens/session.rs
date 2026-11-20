@@ -172,6 +172,13 @@ pub struct TokenUsageView {
     pub output: u64,
 }
 
+/// One prompt already sent, for the composer's history sheet.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ComposerHistoryEntry {
+    pub id: String,
+    pub text: String,
+}
+
 /// What one step of the Agent's plan is doing.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PlanStepState {
@@ -440,6 +447,13 @@ pub struct SessionHost {
     /// The Agent's current plan and the session's goal.
     pub plan: Signal<Option<PlanView>>,
     pub goal: Signal<Option<GoalView>>,
+    /// The prompts already sent in this session.
+    pub history: Signal<Vec<ComposerHistoryEntry>>,
+    pub history_open: Signal<bool>,
+    pub on_open_history: Action,
+    pub on_close_history: Action,
+    pub on_recall_history: Rc<dyn Fn(&str)>,
+
     pub on_goal_control: Rc<dyn Fn(GoalControl)>,
     pub runtime_open: Signal<bool>,
     pub runtime_busy: Signal<bool>,
@@ -721,6 +735,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
         }))
         .child(composer(host.clone()))
         .child(runtime_sheet(host.clone()))
+        .child(history_sheet(host.clone()))
         .child(drawer(host.clone(), drawer_open))
         .child(session_actions_sheet(
             host.session_actions,
@@ -751,6 +766,7 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
     let refresh = host.on_refresh.clone();
+    let on_open_history = host.on_open_history.clone();
     view()
         .w_full()
         .pt_safe_area()
@@ -768,6 +784,11 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
                     icon(include_str!("../../assets/icons/menu.svg")),
                     copy::text("Sessions", "会话", "工作階段"),
                     move || drawer_open.set(true),
+                ))
+                .child(action::icon_button(
+                    icon(include_str!("../../assets/icons/history.svg")),
+                    copy::text("Earlier messages", "历史消息", "歷史訊息"),
+                    move || on_open_history(),
                 ))
                 .child(
                     text(move || {
@@ -2420,6 +2441,88 @@ fn chip_button(label: impl Fn() -> String + 'static, on_press: Action) -> Button
             text(label)
                 .text_size(px(theme::font_micro()))
                 .text_color(theme::text_secondary),
+        )
+}
+
+/// The prompts already sent, one tap from the composer.
+fn history_sheet(host: SessionHost) -> impl IntoElement {
+    let open = host.history_open;
+    let history = host.history;
+    let on_close = host.on_close_history.clone();
+    let on_close_sheet = on_close.clone();
+    let on_recall = host.on_recall_history.clone();
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close_sheet();
+            }
+        })
+        .child(
+            scroll().max_h(px(520.0)).child(
+                view()
+                    .w_full()
+                    .gap(px(theme::SPACING_SM))
+                    .p(px(theme::SPACING_MD))
+                    .pb_safe_area_plus(px(theme::SPACING_LG))
+                    .bg(theme::background_card)
+                    .rounded_t(px(16.0))
+                    .child(
+                        text(copy::text("Earlier messages", "历史消息", "歷史訊息"))
+                            .text_size(px(theme::font_heading()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    )
+                    .child(when(
+                        move || history.with(|history| history.is_empty()),
+                        || {
+                            text(copy::text(
+                                "No earlier prompts in this session.",
+                                "这个会话还没有更早的消息。",
+                                "這個工作階段還沒有更早的訊息。",
+                            ))
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::text_muted)
+                        },
+                    ))
+                    .child(each(
+                        move || history.get(),
+                        |entry| entry.id.clone(),
+                        move |entry, _| {
+                            let recall = entry.with(|entry| entry.text.clone());
+                            let on_recall = on_recall.clone();
+                            button()
+                                .on_press(move || on_recall(&recall))
+                                .w_full()
+                                .min_h(px(44.0))
+                                .px(px(theme::SPACING_MD))
+                                .py(px(theme::SPACING_XS))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .active(|style| style.bg(theme::background_dim()))
+                                .items_start()
+                                .child(
+                                    text(move || entry.with(|entry| entry.text.clone()))
+                                        .max_h(px(64.0))
+                                        .truncate()
+                                        .text_size(px(theme::font_body()))
+                                        .text_color(theme::text_secondary),
+                                )
+                        },
+                    ))
+                    .child({
+                        let on_close = on_close.clone();
+                        action::secondary(
+                            copy::text("Close", "关闭", "關閉"),
+                            icon(include_str!("../../assets/icons/x.svg")),
+                            false,
+                            move || on_close(),
+                        )
+                        .w_full()
+                    }),
+            ),
         )
 }
 

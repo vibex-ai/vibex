@@ -51,10 +51,10 @@ use vibex_nsh_ui::{
     screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
-        AttachmentItem, CommandEntry, EntryKind, GoalControl, GoalPhaseView, GoalView,
-        PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
-        PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
-        QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
+        AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalControl, GoalPhaseView,
+        GoalView, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
+        PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
+        QuestionOption, QuestionResponse, RuntimeChoiceView, RuntimeFeatureView, RuntimeOptionView,
         RuntimeSummaryView, SessionHost, SessionState, SessionSummary, TimelineEntry,
         TokenUsageView,
     },
@@ -182,6 +182,8 @@ pub struct SessionService {
     token_usage: Signal<Option<TokenUsageView>>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
+    history: Signal<Vec<ComposerHistoryEntry>>,
+    history_open: Signal<bool>,
     /// Notification id -> session id, for a press that arrives later.
     notification_sessions: Rc<RefCell<BTreeMap<String, String>>>,
     /// Bumped when the service stops, so its notification reader ends.
@@ -301,6 +303,8 @@ impl SessionService {
             token_usage: signal(None),
             plan: signal(None),
             goal: signal(None),
+            history: signal(Vec::new()),
+            history_open: signal(false),
             notification_sessions: Rc::new(RefCell::new(BTreeMap::new())),
             notification_generation: Rc::new(Cell::new(0)),
             on_disconnect,
@@ -479,6 +483,23 @@ impl SessionService {
             token_usage: self.token_usage,
             plan: self.plan,
             goal: self.goal,
+            history: self.history,
+            history_open: self.history_open,
+            on_open_history: {
+                let service = self.clone();
+                Rc::new(move || service.open_history())
+            },
+            on_close_history: {
+                let service = self.clone();
+                Rc::new(move || service.history_open.set(false))
+            },
+            on_recall_history: {
+                let service = self.clone();
+                Rc::new(move |text: &str| {
+                    service.draft.set(text.to_owned());
+                    service.history_open.set(false);
+                })
+            },
             on_goal_control: {
                 let service = self.clone();
                 Rc::new(move |control: GoalControl| service.control_goal(control))
@@ -1157,6 +1178,33 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    /// Collects the session's earlier prompts and opens the history sheet.
+    fn open_history(&self) {
+        let model = self.model.borrow();
+        let mut history = Vec::new();
+        for turn in model.turns().iter().rev() {
+            let Some(item) = turn.user_item.as_ref() else {
+                continue;
+            };
+            let TimelinePayload::UserMessage(message) = &item.payload else {
+                continue;
+            };
+            if message.text.trim().is_empty() {
+                continue;
+            }
+            history.push(ComposerHistoryEntry {
+                id: item.id.as_str().to_owned(),
+                text: message.text.clone(),
+            });
+            if history.len() >= 50 {
+                break;
+            }
+        }
+        drop(model);
+        self.history.set(history);
+        self.history_open.set(true);
     }
 
     /// Opens the runtime sheet, loading its choices when they are not held.
