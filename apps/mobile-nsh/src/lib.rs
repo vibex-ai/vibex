@@ -99,7 +99,7 @@ pub fn App() -> impl IntoElement {
         boot_connection,
         attempt,
     );
-    start_back_poller(settings_open, services);
+    start_back_poller(pairing.clone(), settings_open, services);
 
     let open_settings: Rc<dyn Fn()> = {
         let open = settings_open;
@@ -259,12 +259,18 @@ fn settings_host(
 ///
 /// The Android host asks `host::nativeBack` synchronously; the engine thread
 /// consumes the press here, where the app's state lives.
-fn start_back_poller(settings_open: Signal<bool>, services: Signal<Option<Rc<SessionService>>>) {
+fn start_back_poller(
+    pairing: PairingService,
+    settings_open: Signal<bool>,
+    services: Signal<Option<Rc<SessionService>>>,
+) {
     spawn(async move {
         loop {
             timer(Duration::from_millis(100)).await;
             let service = services.get_untracked();
+            let switcher = pairing.switcher().get_untracked();
             let intercept = settings_open.get_untracked()
+                || switcher
                 || service
                     .as_ref()
                     .is_some_and(|service| service.back_intercept());
@@ -274,6 +280,8 @@ fn start_back_poller(settings_open: Signal<bool>, services: Signal<Option<Rc<Ses
             }
             if settings_open.get_untracked() {
                 settings_open.set(false);
+            } else if switcher {
+                pairing.close_switcher();
             } else if let Some(service) = service {
                 service.handle_back();
             }
