@@ -20,8 +20,8 @@ use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 use vibex_backend::{
-    AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, GitBackend,
-    MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
+    AgentBackend, BackendError, BackendEvent, BackendProjection, BackendResult, FileBackend,
+    GitBackend, MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandTrigger, ApprovalResponder, CreateAgentSessionRequest,
@@ -158,6 +158,7 @@ pub struct SessionService {
     on_switch_runtime: Rc<dyn Fn()>,
     on_open_settings: Rc<dyn Fn()>,
     on_runtime_renamed: Rc<dyn Fn(&str)>,
+    on_device_renamed: Rc<dyn Fn(&str)>,
 }
 
 impl SessionService {
@@ -168,6 +169,7 @@ impl SessionService {
         on_switch_runtime: Rc<dyn Fn()>,
         on_open_settings: Rc<dyn Fn()>,
         on_runtime_renamed: Rc<dyn Fn(&str)>,
+        on_device_renamed: Rc<dyn Fn(&str)>,
     ) -> BackendResult<Self> {
         let backend = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
@@ -255,6 +257,7 @@ impl SessionService {
             on_switch_runtime,
             on_open_settings,
             on_runtime_renamed,
+            on_device_renamed,
         };
         service.start_connection();
         service.start_draft_saver();
@@ -838,15 +841,32 @@ impl SessionService {
                 }
                 self.refresh();
             }
-            BackendEvent::ProjectionInvalidated(_) => {
-                self.refresh();
-            }
+            BackendEvent::ProjectionInvalidated(projection) => match projection {
+                BackendProjection::Files => {
+                    if self.files_open.get_untracked() {
+                        match self.files_current.borrow().clone() {
+                            Some(path) => self.open_file(path),
+                            None => self.load_dir(self.files_path.get_untracked()),
+                        }
+                    }
+                }
+                BackendProjection::Git => {
+                    if self.git_open.get_untracked() {
+                        self.refresh_git();
+                    }
+                }
+                // The sidebar, management and usage projections are all
+                // answered by the session list on this phone.
+                _ => self.refresh(),
+            },
             BackendEvent::RuntimeRenamed(renamed) => {
                 let name = renamed.display_name.clone();
                 self.runtime.set(Some(name.clone().into()));
                 (self.on_runtime_renamed)(&name);
             }
-            BackendEvent::DeviceRenamed(_) => {}
+            BackendEvent::DeviceRenamed(renamed) => {
+                (self.on_device_renamed)(&renamed.display_name);
+            }
             BackendEvent::Disconnected => {
                 self.connection.set(ConnectionState::Connecting);
             }

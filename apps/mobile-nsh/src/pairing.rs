@@ -950,6 +950,28 @@ impl PairingService {
         }
     }
 
+    /// Applies the name the runtime gave this phone to the saved row.
+    pub fn rename_device(&self, display_name: &str) {
+        let Some(name) = vibex_core::normalize_remote_display_name(display_name) else {
+            return;
+        };
+        let Some(connected) = self.connected.get_untracked() else {
+            return;
+        };
+        let id = connected.bundle.host_id().to_owned();
+        {
+            let mut meta = self.meta.borrow_mut();
+            meta.entry(id.clone()).or_default().device_name = Some(name.clone());
+        }
+        self.save_meta();
+        if let Some(mut details) = self.details.get_untracked()
+            && details.id == id
+        {
+            details.device_name = Some(name);
+            self.details.set(Some(details));
+        }
+    }
+
     fn last_host_id(&self) -> Option<String> {
         std::fs::read_to_string(&self.last_host_path)
             .ok()

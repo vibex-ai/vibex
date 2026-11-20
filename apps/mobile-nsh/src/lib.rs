@@ -347,12 +347,17 @@ fn install_service_effect(
             let pairing = pairing.clone();
             Rc::new(move |name: &str| pairing.rename_connected(name))
         };
+        let device_renamed: Rc<dyn Fn(&str)> = {
+            let pairing = pairing.clone();
+            Rc::new(move |name: &str| pairing.rename_device(name))
+        };
         let built = SessionService::new(
             &runtime.bundle,
             disconnect,
             switch_runtime,
             open_settings,
             runtime_renamed,
+            device_renamed,
         );
         match built {
             Ok(service) => {
