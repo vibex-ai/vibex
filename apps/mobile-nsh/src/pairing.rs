@@ -30,7 +30,7 @@ use vibex_nsh_ui::{
     copy,
     screens::pairing::{NearbyRuntime, PairingHost, RuntimeStatus, SavedRuntime},
 };
-use vibex_remote_client::ZeroConfigLanPairingSession;
+use vibex_remote_client::{ClientDeviceIdentity, ZeroConfigLanPairingSession};
 
 /// The name this phone pairs under until the host reports the platform's own.
 const DEVICE_NAME: &str = "Vibex Mobile";
@@ -66,6 +66,10 @@ pub struct ConnectedRuntime {
 #[derive(Clone)]
 pub struct PairingService {
     store: Rc<PairingStore>,
+    /// The app's data directory, for the identity file the old client wrote.
+    data_dir: PathBuf,
+    /// The install-wide identity presented when re-pairing.
+    identity: Rc<RefCell<Option<ClientDeviceIdentity>>>,
     bundles: Rc<RefCell<Vec<MobileCredentialBundle>>>,
     saved: Signal<Vec<SavedRuntime>>,
     nearby: Signal<Vec<NearbyRuntime>>,
@@ -95,10 +99,57 @@ impl PairingService {
     /// Loads the saved runtimes and starts their reachability probes.
     pub fn new(data_dir: PathBuf) -> Self {
         let store = Rc::new(PairingStore::new(data_dir.join(STORE_FILE)));
-        let (bundles, error) = match store.load() {
-            Ok(bundles) => (bundles, None),
-            Err(error) => (Vec::new(), Some(error_text(&error))),
+        let mut meta: BTreeMap<String, HostMeta> =
+            std::fs::read_to_string(data_dir.join(META_FILE))
+                .ok()
+                .and_then(|text| serde_json::from_str(&text).ok())
+                .unwrap_or_default();
+        let mut error = None;
+        let mut bundles = match store.load() {
+            Ok(bundles) => bundles,
+            Err(load_error) => {
+                error = Some(error_text(&load_error));
+                Vec::new()
+            }
         };
+        if bundles.is_empty()
+            && error.is_none()
+            && let Some(imported) = crate::migration::import_hosts(&data_dir)
+        {
+            for host in &imported.hosts {
+                let mut bundle = host.bundle.clone();
+                if let Some(name) = host
+                    .name_override
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|name| !name.is_empty())
+                {
+                    bundle.display_name = Some(name.to_owned());
+                }
+                let id = bundle.host_id().to_owned();
+                meta.insert(
+                    id,
+                    HostMeta {
+                        added_at_ms: host.added_at_ms,
+                        last_connected_at_ms: host.last_connected_at_ms.unwrap_or(0),
+                        device_name: None,
+                    },
+                );
+                bundles.push(bundle);
+            }
+            if let Some(last) = imported.last_host.as_deref() {
+                let _ = std::fs::write(data_dir.join(LAST_HOST_FILE), last);
+            }
+            if let Err(save_error) = store.save(&bundles) {
+                error = Some(error_text(&save_error));
+            }
+            if let Ok(text) = serde_json::to_string(&meta) {
+                let _ = std::fs::write(data_dir.join(META_FILE), text);
+            }
+        }
+        let identity = Rc::new(RefCell::new(crate::migration::import_identity(
+            &data_dir, &bundles,
+        )));
         let saved = signal(
             bundles
                 .iter()
@@ -113,17 +164,14 @@ impl PairingService {
         );
         let service = Self {
             store,
+            data_dir: data_dir.clone(),
+            identity,
             bundles: Rc::new(RefCell::new(bundles)),
             saved,
             nearby: signal(Vec::new()),
             details: signal(None),
             rename_draft: signal(String::new()),
-            meta: Rc::new(RefCell::new(
-                std::fs::read_to_string(data_dir.join(META_FILE))
-                    .ok()
-                    .and_then(|text| serde_json::from_str(&text).ok())
-                    .unwrap_or_default(),
-            )),
+            meta: Rc::new(RefCell::new(meta)),
             meta_path: data_dir.join(META_FILE),
             last_host_path: data_dir.join(LAST_HOST_FILE),
             switcher: signal(false),
@@ -560,9 +608,14 @@ impl PairingService {
         spawn(async move {
             let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
             // The claim is network I/O: run it on the runtime's threads, not
-            // on the engine thread that renders.
+            // on the engine thread that renders. Presenting the install's
+            // identity keeps a re-pair on the runtime's existing device row.
+            let previous_identity = service.identity.borrow().clone();
             let result =
-                background(async move { claim_entry(entry, server, device, None).await }).await;
+                background(
+                    async move { claim_entry(entry, server, device, previous_identity).await },
+                )
+                .await;
             let result = match result {
                 Ok(result) => result,
                 Err(error) => Err(BackendError::failed(
@@ -582,6 +635,13 @@ impl PairingService {
                     let id = paired.bundle.host_id().to_owned();
                     self.meta.borrow_mut().entry(id).or_default().added_at_ms = unix_timestamp_ms();
                     self.save_meta();
+                    if let Ok(identity) = ClientDeviceIdentity::from_private_key_base64(
+                        paired.bundle.record.auth.device_id.clone(),
+                        &paired.bundle.identity_private_key,
+                    ) {
+                        *self.identity.borrow_mut() = Some(identity);
+                        crate::migration::save_identity(&self.data_dir, &paired.bundle);
+                    }
                     self.set_bundles(bundles);
                     self.busy.set(false);
                     self.connect(paired.bundle);

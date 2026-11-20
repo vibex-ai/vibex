@@ -139,7 +139,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             })
                             .flex_1()
                             .truncate()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(px(theme::font_heading()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         )
@@ -187,7 +187,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_SM))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
             },
         ))
@@ -291,7 +291,7 @@ fn change_row(
                             .unwrap_or_default()
                     })
                     .w(px(16.0))
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(px(theme::font_micro()))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(move || {
                         change
@@ -309,7 +309,7 @@ fn change_row(
                     })
                     .flex_1()
                     .truncate()
-                    .text_size(px(theme::FONT_DETAIL))
+                    .text_size(px(theme::font_detail()))
                     .text_color(theme::foreground),
                 )
                 .child(
@@ -320,7 +320,7 @@ fn change_row(
                             })
                         })
                     })
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(px(theme::font_micro()))
                     .text_color(theme::text_muted),
                 )
                 .child(when(
@@ -329,7 +329,7 @@ fn change_row(
                     },
                     || {
                         text("●")
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(px(theme::font_micro()))
                             .text_color(theme::color_token("chart-1"))
                     },
                 )),
@@ -361,7 +361,7 @@ fn change_row(
                             copy::text("Stage", "暂存", "暫存")
                         }
                     })
-                    .text_size(px(theme::FONT_MICRO))
+                    .text_size(px(theme::font_micro()))
                     .text_color(theme::text_secondary),
                 )
         })
@@ -461,7 +461,7 @@ fn history_row(
                     .unwrap_or_default()
             })
             .truncate()
-            .text_size(px(theme::FONT_DETAIL))
+            .text_size(px(theme::font_detail()))
             .text_color(theme::foreground),
         )
         .child(
@@ -473,7 +473,7 @@ fn history_row(
                 })
             })
             .truncate()
-            .text_size(px(theme::FONT_MICRO))
+            .text_size(px(theme::font_micro()))
             .text_color(theme::text_muted),
         )
 }
@@ -490,8 +490,8 @@ fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
                 });
                 view().px(px(theme::SPACING_LG)).child(
                     text(move || line.get())
-                        .text_size(px(theme::FONT_MICRO))
-                        .line_height(theme::line_height_for(theme::FONT_MICRO))
+                        .text_size(px(theme::font_micro()))
+                        .line_height(theme::line_height_for(theme::font_micro()))
                         .text_color(theme::foreground),
                 )
             },
@@ -539,7 +539,7 @@ fn diff_view(
         .child(
             text(move || title.get())
                 .px(px(theme::SPACING_LG))
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
         .child(line_list(lines))
@@ -549,7 +549,7 @@ fn diff_view(
                 "差异超过预览上限。",
                 "差異超過預覽上限。",
             ))
-            .text_size(px(theme::FONT_MICRO))
+            .text_size(px(theme::font_micro()))
             .text_color(theme::text_muted)
         }))
         .child(when(move || !staged.get(), {
@@ -593,7 +593,7 @@ fn diff_view(
                     })
                     .child(
                         text(copy::text("Revert changes", "还原改动", "還原改動"))
-                            .text_size(px(theme::FONT_DETAIL))
+                            .text_size(px(theme::font_detail()))
                             .text_color(theme::accent_red),
                     )
             }
@@ -628,7 +628,7 @@ fn commit_detail_view(detail: Signal<Option<CommitDetailPreview>>) -> impl IntoE
                     "补丁超过预览上限。",
                     "補丁超過預覽上限。",
                 ))
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted)
             },
         ))

@@ -102,3 +102,14 @@ fn the_chosen_language_survives_a_restart() {
     app.press("role:button[设置]").unwrap();
     app.wait_for("外观").unwrap();
 }
+
+#[test]
+fn settings_steps_the_text_size() {
+    let (mut app, _directory) = start();
+    app.press("role:button[Settings]").unwrap();
+    app.wait_for("Text size").unwrap();
+    app.press("role:button[Change]").unwrap();
+    app.wait_for("Smallest").unwrap();
+    app.press("role:button[Change]").unwrap();
+    app.wait_for("Compact").unwrap();
+}

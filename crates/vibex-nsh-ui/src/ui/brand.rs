@@ -22,7 +22,7 @@ pub fn mark(size: f32) -> impl IntoElement {
 /// The launch lockup: the mark and the product word, side by side, as the
 /// pairing and connecting pages show it.
 pub fn wordmark() -> impl IntoElement {
-    let size = theme::FONT_WORDMARK;
+    let size = theme::font_wordmark();
     let mark = theme::wordmark_mark(size);
     view()
         .flex_row()

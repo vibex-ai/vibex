@@ -210,7 +210,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     move || busy.get(),
                     move || {
                         text(copy::text("Pairing...", "配对中…", "配對中…"))
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(px(theme::font_caption()))
                             .text_color(theme::text_muted)
                     },
                 ))
@@ -319,7 +319,7 @@ fn details_sheet(host: PairingHost) -> impl IntoElement {
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Runtime details", "运行时详情", "執行環境詳情"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -480,12 +480,12 @@ fn details_field(label: &'static str, value: impl Fn() -> String + 'static) -> i
         .gap(px(2.0))
         .child(
             text(label)
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
         .child(
             text(value)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(theme::foreground),
         )
 }
@@ -493,7 +493,7 @@ fn details_field(label: &'static str, value: impl Fn() -> String + 'static) -> i
 /// The last action's failure, worded for the person holding the phone.
 fn error_message(error: Signal<Option<SharedString>>) -> impl IntoElement {
     text(move || error.get().unwrap_or_default())
-        .text_size(px(theme::FONT_CAPTION))
+        .text_size(px(theme::font_caption()))
         .text_color(theme::accent_red)
 }
 
@@ -632,7 +632,7 @@ fn saved_row(
                         text(move || spinner.get())
                             .w(px(8.0))
                             .flex_shrink_0()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(px(theme::font_micro()))
                             .text_color(theme::text_muted)
                     },
                 ))
@@ -651,7 +651,7 @@ fn saved_row(
                     text(move || runtime.get().name)
                         .flex_1()
                         .truncate()
-                        .text_size(px(theme::FONT_BODY))
+                        .text_size(px(theme::font_body()))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::text_secondary),
                 )
@@ -674,7 +674,7 @@ fn saved_row(
                 .on_press(move || on_details(&runtime.get_untracked().id))
                 .child(
                     text("⋯")
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .text_color(theme::text_muted),
                 )
         })
@@ -708,7 +708,7 @@ fn manual_sheet(
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Link a runtime", "链接运行时", "連結執行環境"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -718,7 +718,7 @@ fn manual_sheet(
                         "粘贴配对码或链接",
                         "貼上配對碼或連結",
                     ))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::text_muted),
                 )
                 .child(when(
@@ -728,7 +728,7 @@ fn manual_sheet(
                             .gap(px(theme::SPACING_XS))
                             .child(
                                 text(copy::text("Server address", "服务器地址", "伺服器位址"))
-                                    .text_size(px(theme::FONT_CAPTION))
+                                    .text_size(px(theme::font_caption()))
                                     .text_color(theme::text_muted),
                             )
                             .child(field::text_field(server, "https://desktop.example:8443"))
@@ -756,7 +756,7 @@ fn manual_sheet(
                         "请粘贴完整的一行，包含 vibex:// 前缀",
                         "請貼上完整的一行，包含 vibex:// 前綴",
                     ))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::text_muted),
                 )
                 .child({
@@ -818,7 +818,7 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Nearby", "附近", "附近"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -835,7 +835,7 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                                     "请在电脑上确认这组代码",
                                     "請在電腦上確認這組代碼",
                                 ))
-                                .text_size(px(theme::FONT_CAPTION))
+                                .text_size(px(theme::font_caption()))
                                 .text_color(theme::text_muted),
                             )
                             .child(
@@ -861,7 +861,7 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                     || {
                         view().h(px(56.0)).items_center().justify_center().child(
                             text(copy::text("Searching...", "正在搜索…", "正在搜尋…"))
-                                .text_size(px(theme::FONT_DETAIL))
+                                .text_size(px(theme::font_detail()))
                                 .text_color(theme::text_muted),
                         )
                     },
@@ -912,18 +912,18 @@ fn nearby_row(
                 .child(
                     text(move || runtime.get().name)
                         .truncate()
-                        .text_size(px(theme::FONT_DETAIL))
+                        .text_size(px(theme::font_detail()))
                         .text_color(theme::foreground),
                 )
                 .child(
                     text(copy::text("Same Wi-Fi", "同一 Wi-Fi", "同一個 Wi-Fi"))
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
                 ),
         )
         .child(
             text(copy::text("Pair", "配对", "配對"))
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::foreground),
         )

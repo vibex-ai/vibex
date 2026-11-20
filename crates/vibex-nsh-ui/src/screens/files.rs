@@ -106,7 +106,7 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                             text(title)
                                 .flex_1()
                                 .truncate()
-                                .text_size(px(theme::FONT_HEADING))
+                                .text_size(px(theme::font_heading()))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
                         )
@@ -139,7 +139,7 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_SM))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
             },
         ))
@@ -227,7 +227,7 @@ fn file_row(
             })
             .flex_1()
             .truncate()
-            .text_size(px(theme::FONT_BODY))
+            .text_size(px(theme::font_body()))
             .text_color(theme::foreground),
         )
 }
@@ -271,7 +271,7 @@ fn file_preview(
                     "文件超过预览上限。",
                     "檔案超過預覽上限。",
                 ))
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted)
             },
         ))

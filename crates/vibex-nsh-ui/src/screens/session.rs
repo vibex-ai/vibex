@@ -520,7 +520,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
                     let error = host.error;
                     move || {
                         text(move || error.get().unwrap_or_default())
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(px(theme::font_caption()))
                             .text_color(theme::accent_red)
                             .px(px(theme::SPACING_LG))
                             .pb(px(theme::SPACING_SM))
@@ -626,7 +626,7 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
                     })
                     .flex_1()
                     .truncate()
-                    .text_size(px(theme::FONT_HEADING))
+                    .text_size(px(theme::font_heading()))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::foreground),
                 )
@@ -687,7 +687,7 @@ fn connection_banner(
             })
             .flex_1()
             .truncate()
-            .text_size(px(theme::FONT_CAPTION))
+            .text_size(px(theme::font_caption()))
             .text_color(theme::text_secondary),
         )
         .child(
@@ -729,7 +729,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
             move || {
                 view().flex_1().items_center().justify_center().child(
                     text(move || error.get().unwrap_or_default())
-                        .text_size(px(theme::FONT_BODY))
+                        .text_size(px(theme::font_body()))
                         .text_color(theme::accent_red),
                 )
             },
@@ -762,7 +762,7 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
 fn empty_hint(message: &'static str) -> impl IntoElement {
     view().flex_1().items_center().justify_center().child(
         text(message)
-            .text_size(px(theme::FONT_DETAIL))
+            .text_size(px(theme::font_detail()))
             .text_color(theme::text_muted),
     )
 }
@@ -827,8 +827,8 @@ fn user_bubble(body: Memo<String>) -> impl IntoElement {
             .py(px(theme::SPACING_SM))
             .child(
                 text(move || body.get())
-                    .text_size(px(theme::FONT_BODY))
-                    .line_height(theme::line_height_for(theme::FONT_BODY))
+                    .text_size(px(theme::font_body()))
+                    .line_height(theme::line_height_for(theme::font_body()))
                     .text_color(theme::foreground),
             ),
     )
@@ -846,7 +846,7 @@ fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -
                 .gap(px(theme::SPACING_XS))
                 .child(
                     text(move || title.get())
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(px(theme::font_micro()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::text_muted),
                 )
@@ -854,7 +854,7 @@ fn agent_prose(title: Memo<String>, body: Memo<String>, streaming: Memo<bool>) -
                     move || streaming.get(),
                     || {
                         text("…")
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(px(theme::font_micro()))
                             .text_color(theme::text_muted)
                     },
                 )),
@@ -880,13 +880,13 @@ fn muted_prose(label: &'static str, body: Memo<String>) -> impl IntoElement {
         .gap(px(theme::SPACING_XS))
         .child(
             text(label)
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
         .child(
             text(move || body.get())
-                .text_size(px(theme::FONT_DETAIL))
-                .line_height(theme::line_height_for(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
+                .line_height(theme::line_height_for(theme::font_detail()))
                 .text_color(theme::text_secondary),
         )
 }
@@ -909,20 +909,20 @@ fn tool_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> imp
                     text(move || title.get())
                         .flex_1()
                         .truncate()
-                        .text_size(px(theme::FONT_DETAIL))
+                        .text_size(px(theme::font_detail()))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(theme::foreground),
                 )
                 .child(
                     text(move || meta.get())
-                        .text_size(px(theme::FONT_MICRO))
+                        .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
                 ),
         )
         .child(
             text(move || body.get())
-                .text_size(px(theme::FONT_CAPTION))
-                .line_height(theme::line_height_for(theme::FONT_CAPTION))
+                .text_size(px(theme::font_caption()))
+                .line_height(theme::line_height_for(theme::font_caption()))
                 .text_color(theme::text_secondary),
         )
 }
@@ -936,7 +936,7 @@ fn error_card(body: Memo<String>) -> impl IntoElement {
         .p(px(theme::SPACING_MD))
         .child(
             text(move || body.get())
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(theme::accent_red),
         )
 }
@@ -1008,14 +1008,14 @@ fn command_row(
         .active(|style| style.opacity(0.85))
         .child(
             text(move || command.get().label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::foreground),
         )
         .child(
             text(move || command.get().description)
                 .truncate()
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
 }
@@ -1069,13 +1069,13 @@ fn permission_card(
         .bg(theme::background_card)
         .child(
             text(request.title)
-                .text_size(px(theme::FONT_BODY))
+                .text_size(px(theme::font_body()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::foreground),
         )
         .children(request.details.into_iter().map(|detail| {
             text(detail)
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(px(theme::font_caption()))
                 .text_color(theme::text_secondary)
         }))
         .child(
@@ -1121,14 +1121,14 @@ fn question_card(
         let placeholder = title.clone();
         let mut column = view().w_full().gap(px(2.0)).child(
             text(title)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::foreground),
         );
         if let Some(description) = description {
             column = column.child(
                 text(description)
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::text_muted),
             );
         }
@@ -1254,13 +1254,13 @@ fn question_card(
         .bg(theme::background_card)
         .child(
             text(request.title)
-                .text_size(px(theme::FONT_BODY))
+                .text_size(px(theme::font_body()))
                 .font_weight(FontWeight::SEMIBOLD)
                 .text_color(theme::foreground),
         )
         .child(
             text(request.message)
-                .text_size(px(theme::FONT_CAPTION))
+                .text_size(px(theme::font_caption()))
                 .text_color(theme::text_secondary),
         )
         // A question can carry more fields than a phone's card can show at
@@ -1278,7 +1278,7 @@ fn question_card(
             move || error.get().is_some(),
             move || {
                 text(move || error.get().unwrap_or_default())
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
             },
         ))
@@ -1342,7 +1342,7 @@ fn choice_button(label: String, value: String, selected: Signal<Option<String>>)
         .justify_center()
         .child(
             text(label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(move || {
                     if selected.with(|selected| selected.as_deref() == Some(text_value.as_str())) {
                         theme::foreground()
@@ -1391,7 +1391,7 @@ fn multi_button(label: String, value: String, chosen: Signal<Vec<String>>) -> Bu
         .justify_center()
         .child(
             text(label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(move || {
                     if chosen.with(|chosen| chosen.contains(&text_value)) {
                         theme::foreground()
@@ -1428,7 +1428,7 @@ fn boolean_button(label: String, value: bool, selected: Signal<Option<bool>>) ->
         .justify_center()
         .child(
             text(label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(move || {
                     if selected.with(|selected| *selected == Some(value)) {
                         theme::foreground()
@@ -1605,12 +1605,12 @@ fn attachment_chip(
         })
         .child(
             text(move || item.with(|item| item.label.clone()))
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_secondary),
         )
         .child(
             text("×")
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
 }
@@ -1646,7 +1646,7 @@ fn session_actions_sheet(
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Session", "会话", "工作階段"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -1776,7 +1776,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                         .into()
                                 })
                             })
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(px(theme::font_caption()))
                             .text_color(theme::text_muted),
                         )
                         .child(
@@ -1901,7 +1901,7 @@ fn session_row(
                         .child(
                             text(move || session.get().title.clone())
                                 .truncate()
-                                .text_size(px(theme::FONT_BODY))
+                                .text_size(px(theme::font_body()))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(move || {
                                     let id = session.get().id;
@@ -1919,7 +1919,7 @@ fn session_row(
                                 format!("{} · {}", session.agent, session.meta)
                             })
                             .truncate()
-                            .text_size(px(theme::FONT_MICRO))
+                            .text_size(px(theme::font_micro()))
                             .text_color(theme::text_muted),
                         ),
                 ),
@@ -1938,7 +1938,7 @@ fn session_row(
                 })
                 .child(
                     text("⋯")
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .text_color(theme::text_muted),
                 )
         })

@@ -88,7 +88,7 @@ pub fn connecting(host: ConnectingHost) -> impl IntoElement {
                             copy::text("Desktop is unavailable", "桌面端不可用", "桌面版無法使用")
                         }
                     })
-                    .text_size(px(theme::FONT_DETAIL))
+                    .text_size(px(theme::font_detail()))
                     .text_color(theme::text_secondary),
                 ),
         )
@@ -97,7 +97,7 @@ pub fn connecting(host: ConnectingHost) -> impl IntoElement {
             move || {
                 text(move || error.get().unwrap_or_default())
                     .max_w(px(320.0))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
             },
         ))

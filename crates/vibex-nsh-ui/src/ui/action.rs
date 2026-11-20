@@ -79,7 +79,7 @@ fn action(
         )
         .child(
             text(label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .font_weight(if primary {
                     FontWeight::SEMIBOLD
                 } else {

@@ -87,7 +87,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             })
                             .flex_1()
                             .truncate()
-                            .text_size(px(theme::FONT_HEADING))
+                            .text_size(px(theme::font_heading()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         )
@@ -107,7 +107,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
                     .py(px(theme::SPACING_SM))
-                    .text_size(px(theme::FONT_CAPTION))
+                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
             },
         ))
@@ -161,7 +161,7 @@ fn terminal_sheet(
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Terminals", "终端", "終端"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -184,12 +184,12 @@ fn terminal_sheet(
                             .child(
                                 text(move || terminal.get().title)
                                     .truncate()
-                                    .text_size(px(theme::FONT_DETAIL))
+                                    .text_size(px(theme::font_detail()))
                                     .text_color(theme::foreground),
                             )
                             .child(
                                 text(move || terminal.get().status)
-                                    .text_size(px(theme::FONT_MICRO))
+                                    .text_size(px(theme::font_micro()))
                                     .text_color(theme::text_muted),
                             )
                     },

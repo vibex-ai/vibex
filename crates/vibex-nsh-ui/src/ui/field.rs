@@ -32,7 +32,7 @@ pub fn text_field_with(
         .caret_color(theme::primary)
         .h(px(theme::TOUCH_TARGET))
         .px(px(theme::SPACING_MD))
-        .text_size(px(theme::FONT_BODY))
+        .text_size(px(theme::font_body()))
         .text_color(theme::foreground)
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()

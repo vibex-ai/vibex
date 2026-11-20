@@ -20,6 +20,7 @@
 
 mod discovery;
 mod host;
+mod migration;
 mod pairing;
 mod platform;
 mod session;
@@ -78,9 +79,10 @@ pub fn App() -> impl IntoElement {
     // The app's own data directory. A host that keeps no files for the app
     // (the web) gets a temporary one, so the page still works there.
     let data = data_dir().unwrap_or_else(|| std::env::temp_dir().join("vibex-mobile-nsh"));
-    let pairing = PairingService::new(data);
+    migration::migrate_drafts(&data);
+    let pairing = PairingService::new(data.clone());
     host::start(pairing.clone());
-    let settings = SettingsState::new();
+    let settings = SettingsState::new(&data);
     settings.apply();
 
     let connected = pairing.connected();
@@ -224,10 +226,12 @@ fn settings_host(
     let language = settings.language;
     let haptics = settings.haptics;
     let keep_screen_on = settings.keep_screen_on;
+    let font_scale = settings.font_scale;
     let settings_for_appearance = settings.clone();
     let settings_for_language = settings.clone();
     let settings_for_haptics = settings.clone();
     let settings_for_screen = settings.clone();
+    let settings_for_text = settings.clone();
     let pairing_for_disconnect = pairing.clone();
     let pairing_for_clear = pairing.clone();
     SettingsHost {
@@ -236,6 +240,7 @@ fn settings_host(
         language,
         haptics,
         keep_screen_on,
+        font_scale,
         runtime: pairing.connected_label(),
         on_appearance: Rc::new(move |appearance| {
             settings_for_appearance.set_appearance(appearance);
@@ -248,6 +253,9 @@ fn settings_host(
         }),
         on_keep_screen_on: Rc::new(move |enabled| {
             settings_for_screen.set_keep_screen_on(enabled);
+        }),
+        on_font_scale: Rc::new(move |percent| {
+            settings_for_text.set_font_scale(percent);
         }),
         on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
         on_clear_runtimes: Rc::new(move || pairing_for_clear.clear_runtimes()),

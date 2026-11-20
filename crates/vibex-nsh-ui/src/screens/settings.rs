@@ -26,12 +26,15 @@ pub struct SettingsHost {
     pub haptics: Signal<bool>,
     /// Whether a running turn or the terminal holds the display awake.
     pub keep_screen_on: Signal<bool>,
+    /// The text-size step, as a percentage of the ladder.
+    pub font_scale: Signal<u32>,
     /// The connected runtime's label, when there is one.
     pub runtime: Signal<Option<SharedString>>,
     pub on_appearance: Rc<dyn Fn(Appearance)>,
     pub on_language: Rc<dyn Fn(copy::LanguagePreference)>,
     pub on_haptics: Rc<dyn Fn(bool)>,
     pub on_keep_screen_on: Rc<dyn Fn(bool)>,
+    pub on_font_scale: Rc<dyn Fn(u32)>,
     pub on_disconnect: Rc<dyn Fn()>,
     pub on_clear_runtimes: Rc<dyn Fn()>,
     pub on_close: Rc<dyn Fn()>,
@@ -62,7 +65,7 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("Settings", "设置", "設定"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -74,6 +77,10 @@ pub fn settings(host: SettingsHost) -> impl IntoElement {
                 .child(section(
                     copy::text("Language", "语言", "語言"),
                     language_choices(host.language, host.on_language.clone()),
+                ))
+                .child(section(
+                    copy::text("Text", "文字", "文字"),
+                    text_size_row(host.font_scale, host.on_font_scale.clone()),
                 ))
                 .child(section(
                     copy::text("Feedback", "反馈", "回饋"),
@@ -223,6 +230,34 @@ fn language_choices(
         }))
 }
 
+fn text_size_row(percent: Signal<u32>, on_font_scale: Rc<dyn Fn(u32)>) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .child(view().flex_1().child(value_row(
+            copy::text("Text size", "文字大小", "文字大小"),
+            move || font_scale_label(percent.get()).to_owned(),
+        )))
+        .child(action::secondary(
+            copy::text("Change", "调整", "調整"),
+            icon(include_str!("../../assets/icons/check.svg")),
+            false,
+            move || on_font_scale(theme::next_font_scale_percent(percent.get_untracked())),
+        ))
+}
+
+fn font_scale_label(percent: u32) -> &'static str {
+    match percent {
+        80 => copy::text("Smallest", "最小", "最小"),
+        90 => copy::text("Compact", "紧凑", "緊湊"),
+        100 => copy::text("Standard", "标准", "標準"),
+        115 => copy::text("Large", "较大", "較大"),
+        _ => copy::text("Standard", "标准", "標準"),
+    }
+}
+
 fn toggle_row(
     label: &'static str,
     enabled: Signal<bool>,
@@ -258,7 +293,7 @@ fn section(label: &'static str, body: impl IntoElement) -> impl IntoElement {
 
 fn section_label(label: &'static str) -> impl IntoElement {
     text(label)
-        .text_size(px(theme::FONT_MICRO))
+        .text_size(px(theme::font_micro()))
         .font_weight(FontWeight::SEMIBOLD)
         .text_color(theme::text_muted)
 }
@@ -272,13 +307,13 @@ fn value_row(label: &'static str, value: impl Fn() -> String + 'static) -> impl 
         .gap(px(theme::SPACING_SM))
         .child(
             text(label)
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(theme::foreground),
         )
         .child(
             text(value)
                 .truncate()
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(theme::text_muted),
         )
 }

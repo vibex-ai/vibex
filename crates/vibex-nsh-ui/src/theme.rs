@@ -10,6 +10,8 @@
 //! (`apps/mobile/src/theme.rs`). They stay here while the GPUI client is still
 //! shipping, so a screen migrated to `nsh` keeps the numbers its pair has.
 
+use std::sync::atomic::{AtomicU32, Ordering};
+
 use nsh_core::prelude::*;
 
 pub use nsh_base::theme;
@@ -56,6 +58,78 @@ pub const FONT_MICRO: f32 = 13.0;
 pub const FONT_DISPLAY: f32 = 30.0;
 /// The product wordmark.
 pub const FONT_WORDMARK: f32 = 36.0;
+
+/// The text-size steps the Settings page offers, as percentages of the ladder.
+pub const FONT_SCALE_STEPS: [u32; 4] = [80, 90, 100, 115];
+
+/// The text-size step every font on the ladder is drawn at.
+static FONT_SCALE_PERCENT: AtomicU32 = AtomicU32::new(100);
+
+/// Applies a text-size step to every font the screens read.
+pub fn set_font_scale_percent(percent: u32) {
+    FONT_SCALE_PERCENT.store(percent.clamp(75, 150), Ordering::Relaxed);
+}
+
+/// The text-size step in use.
+pub fn font_scale_percent() -> u32 {
+    FONT_SCALE_PERCENT.load(Ordering::Relaxed)
+}
+
+fn scaled_font(base: f32) -> f32 {
+    base * font_scale_percent() as f32 / 100.0
+}
+
+/// The page title at the current text-size step.
+pub fn font_title() -> f32 {
+    scaled_font(FONT_TITLE)
+}
+
+/// A section heading at the current text-size step.
+pub fn font_heading() -> f32 {
+    scaled_font(FONT_HEADING)
+}
+
+/// Body copy at the current text-size step.
+pub fn font_body() -> f32 {
+    scaled_font(FONT_BODY)
+}
+
+/// Detail copy at the current text-size step.
+pub fn font_detail() -> f32 {
+    scaled_font(FONT_DETAIL)
+}
+
+/// Captions at the current text-size step.
+pub fn font_caption() -> f32 {
+    scaled_font(FONT_CAPTION)
+}
+
+/// Supporting copy at the current text-size step.
+pub fn font_micro() -> f32 {
+    scaled_font(FONT_MICRO)
+}
+
+/// Large numerals at the current text-size step.
+pub fn font_display() -> f32 {
+    scaled_font(FONT_DISPLAY)
+}
+
+/// The wordmark at the current text-size step.
+pub fn font_wordmark() -> f32 {
+    scaled_font(FONT_WORDMARK)
+}
+
+/// The step after `current`, wrapping at the top; an off-ladder value snaps to
+/// the nearest step so the row always names a rung.
+pub fn next_font_scale_percent(current: u32) -> u32 {
+    match FONT_SCALE_STEPS.iter().position(|step| *step == current) {
+        Some(index) => FONT_SCALE_STEPS[(index + 1) % FONT_SCALE_STEPS.len()],
+        None => *FONT_SCALE_STEPS
+            .iter()
+            .min_by_key(|step| step.abs_diff(current))
+            .unwrap_or(&100),
+    }
+}
 
 /// The line-height ratio the phone uses for wrapped body copy.
 pub const LINE_HEIGHT_RATIO: f32 = 1.45;

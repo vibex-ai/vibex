@@ -6,7 +6,10 @@
 //! color-scheme command, and language through the copy resolver both clients
 //! share.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::{
+    path::Path,
+    sync::atomic::{AtomicBool, Ordering},
+};
 
 use nsh_core::{platform::Appearance, prelude::*, storage::Storage};
 use serde::{Deserialize, Serialize};
@@ -32,6 +35,10 @@ fn default_haptics() -> bool {
     true
 }
 
+fn default_font_scale() -> u32 {
+    100
+}
+
 /// Whether the reader asked the screen to stay awake during work.
 pub fn keep_screen_on() -> bool {
     KEEP_SCREEN_ON.load(Ordering::Relaxed)
@@ -48,6 +55,8 @@ struct StoredSettings {
     haptics: bool,
     #[serde(default)]
     keep_screen_on: bool,
+    #[serde(default = "default_font_scale")]
+    font_scale: u32,
 }
 
 /// The preferences the app can act on today, as signals the screens read.
@@ -61,23 +70,40 @@ pub struct SettingsState {
     pub haptics: Signal<bool>,
     /// Whether a running turn or the terminal holds the display awake.
     pub keep_screen_on: Signal<bool>,
+    /// The text-size step, as a percentage of the ladder.
+    pub font_scale: Signal<u32>,
     /// Bumped on every language change: the root rebuilds the copy in place.
     pub revision: Signal<u64>,
 }
 
 impl SettingsState {
     /// Reads the stored preferences and publishes them.
-    pub fn new() -> Self {
-        let stored = Storage::get_item(SETTINGS_KEY)
-            .and_then(|text| serde_json::from_str::<StoredSettings>(&text).ok())
-            .unwrap_or_default();
-        Self {
+    ///
+    /// A phone that ran the GPUI client has its appearance and language in
+    /// `app-settings.json`; when this app has no settings yet, that file is
+    /// read once and written into the new store.
+    pub fn new(data_dir: &Path) -> Self {
+        let stored_text = Storage::get_item(SETTINGS_KEY);
+        let imported = stored_text.is_none();
+        let stored =
+            match stored_text.and_then(|text| serde_json::from_str::<StoredSettings>(&text).ok()) {
+                Some(stored) => stored,
+                None => crate::migration::import_settings(data_dir)
+                    .map(StoredSettings::from)
+                    .unwrap_or_default(),
+            };
+        let state = Self {
             appearance: signal(appearance_from_storage(&stored.appearance)),
             language: signal(LanguagePreference::from_storage(&stored.language)),
             haptics: signal(stored.haptics),
             keep_screen_on: signal(stored.keep_screen_on),
+            font_scale: signal(stored.font_scale),
             revision: signal(0),
+        };
+        if imported {
+            state.persist();
         }
+        state
     }
 
     /// Puts the stored preferences into effect. Called once, before the first
@@ -88,6 +114,7 @@ impl SettingsState {
         copy::set_preference(self.language.get_untracked());
         HAPTICS_ENABLED.store(self.haptics.get_untracked(), Ordering::Relaxed);
         KEEP_SCREEN_ON.store(self.keep_screen_on.get_untracked(), Ordering::Relaxed);
+        vibex_nsh_ui::theme::set_font_scale_percent(self.font_scale.get_untracked());
     }
 
     /// Chooses an appearance and keeps it.
@@ -132,15 +159,44 @@ impl SettingsState {
         self.persist();
     }
 
+    /// Chooses a text-size step and keeps it.
+    pub fn set_font_scale(&self, percent: u32) {
+        if self.font_scale.get_untracked() == percent {
+            return;
+        }
+        self.font_scale.set(percent);
+        vibex_nsh_ui::theme::set_font_scale_percent(percent);
+        // Type is read while the tree is built, so a step change rebuilds the
+        // surface the same way a language change does.
+        self.revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+        self.persist();
+    }
+
     fn persist(&self) {
         let stored = StoredSettings {
             appearance: appearance_to_storage(self.appearance.get_untracked()).to_owned(),
             language: self.language.get_untracked().to_storage().to_owned(),
             haptics: self.haptics.get_untracked(),
             keep_screen_on: self.keep_screen_on.get_untracked(),
+            font_scale: self.font_scale.get_untracked(),
         };
         if let Ok(text) = serde_json::to_string(&stored) {
             let _ = Storage::set_item(SETTINGS_KEY, text);
+        }
+    }
+}
+
+impl From<crate::migration::ImportedSettings> for StoredSettings {
+    fn from(settings: crate::migration::ImportedSettings) -> Self {
+        Self {
+            appearance: settings.theme.unwrap_or_default(),
+            language: settings.language.unwrap_or_default(),
+            haptics: settings.haptics.unwrap_or_else(default_haptics),
+            keep_screen_on: settings.keep_screen_on.unwrap_or_default(),
+            font_scale: settings
+                .font_scale_percent
+                .unwrap_or_else(default_font_scale),
         }
     }
 }

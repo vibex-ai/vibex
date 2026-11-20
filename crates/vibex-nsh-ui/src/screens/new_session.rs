@@ -70,7 +70,7 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                 .rounded_t(px(16.0))
                 .child(
                     text(copy::text("New session", "新建会话", "新增工作階段"))
-                        .text_size(px(theme::FONT_HEADING))
+                        .text_size(px(theme::font_heading()))
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
@@ -121,7 +121,7 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                     move || error.get().is_some(),
                     move || {
                         text(move || error.get().unwrap_or_default())
-                            .text_size(px(theme::FONT_CAPTION))
+                            .text_size(px(theme::font_caption()))
                             .text_color(theme::accent_red)
                     },
                 ))
@@ -148,7 +148,7 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
 
 fn section_label(label: &'static str) -> impl IntoElement {
     text(label)
-        .text_size(px(theme::FONT_MICRO))
+        .text_size(px(theme::font_micro()))
         .text_color(theme::text_muted)
 }
 
@@ -212,13 +212,13 @@ where
         .child(
             text(move || value.get().0)
                 .truncate()
-                .text_size(px(theme::FONT_DETAIL))
+                .text_size(px(theme::font_detail()))
                 .text_color(theme::foreground),
         )
         .child(
             text(move || value.get().1)
                 .truncate()
-                .text_size(px(theme::FONT_MICRO))
+                .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
 }
