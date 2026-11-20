@@ -280,6 +280,9 @@ pub struct SessionHost {
     pub draft: Signal<String>,
     pub sending: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
+    /// Whether the transcript has older history, and a read of it is running.
+    pub has_older: Signal<bool>,
+    pub loading_older: Signal<bool>,
     /// Where the connection to the runtime stands.
     pub connection: Signal<ConnectionState>,
     /// Why the last connection attempt failed, when it did.
@@ -317,6 +320,8 @@ pub struct SessionHost {
     pub on_open_settings: Action,
     /// Opens or closes one turn's working rows.
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
+    /// Reads the page above the transcript.
+    pub on_load_older: Action,
     /// Forks the conversation through a row's sequence.
     pub on_fork: Rc<dyn Fn(i64)>,
     /// The terminal surface, when it is open over the shell.
@@ -731,6 +736,9 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
     let error = host.error;
     let on_toggle_turn = host.on_toggle_turn.clone();
     let on_fork = host.on_fork.clone();
+    let has_older = host.has_older;
+    let loading_older = host.loading_older;
+    let on_load_older = host.on_load_older.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -761,27 +769,69 @@ fn timeline_view(host: SessionHost) -> impl IntoElement {
         .child(when(
             move || timeline.with(|entries| !entries.is_empty()),
             move || {
-                virtual_list(move || timeline.with(|entries| entries.len()), {
-                    let on_toggle_turn = on_toggle_turn.clone();
-                    let on_fork = on_fork.clone();
-                    move |at: Position| {
-                        entry_row(at, timeline, on_toggle_turn.clone(), on_fork.clone())
-                    }
-                })
-                .keys(move || {
-                    timeline.with(|entries| {
-                        entries
-                            .iter()
-                            .map(|entry| entry.id.clone())
-                            .collect::<Vec<_>>()
-                    })
-                })
-                .estimated_item_size(px(72.0))
-                // A chat opens at its newest message and stays there while a
-                // reply streams in, unless the reader has scrolled up.
-                .alignment(ListAlignment::Bottom)
-                .follow_end(px(120.0))
-                .flex_1()
+                view()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .flex_col()
+                    .child(when(move || has_older.get(), {
+                        let on_load_older = on_load_older.clone();
+                        move || {
+                            let on_load_older = on_load_older.clone();
+                            button()
+                                .on_press(move || {
+                                    if !loading_older.get_untracked() {
+                                        on_load_older();
+                                    }
+                                })
+                                .w_full()
+                                .min_h(px(36.0))
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    text(move || {
+                                        if loading_older.get() {
+                                            copy::text(
+                                                "Loading earlier...",
+                                                "正在加载更早的消息…",
+                                                "正在載入更早的訊息…",
+                                            )
+                                        } else {
+                                            copy::text(
+                                                "Load earlier messages",
+                                                "加载更早的消息",
+                                                "載入更早的訊息",
+                                            )
+                                        }
+                                    })
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::text_muted),
+                                )
+                        }
+                    }))
+                    .child(
+                        virtual_list(move || timeline.with(|entries| entries.len()), {
+                            let on_toggle_turn = on_toggle_turn.clone();
+                            let on_fork = on_fork.clone();
+                            move |at: Position| {
+                                entry_row(at, timeline, on_toggle_turn.clone(), on_fork.clone())
+                            }
+                        })
+                        .keys(move || {
+                            timeline.with(|entries| {
+                                entries
+                                    .iter()
+                                    .map(|entry| entry.id.clone())
+                                    .collect::<Vec<_>>()
+                            })
+                        })
+                        .estimated_item_size(px(72.0))
+                        // A chat opens at its newest message and stays there
+                        // while a reply streams in, unless the reader scrolled
+                        // up.
+                        .alignment(ListAlignment::Bottom)
+                        .follow_end(px(120.0))
+                        .flex_1(),
+                    )
             },
         ))
 }

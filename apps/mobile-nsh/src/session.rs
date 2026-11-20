@@ -147,6 +147,9 @@ pub struct SessionService {
     connection: Signal<ConnectionState>,
     /// Why the last connection attempt failed, when it did.
     connection_error: Signal<Option<SharedString>>,
+    /// Whether the transcript has older history, and a read of it is running.
+    has_older: Signal<bool>,
+    loading_older: Signal<bool>,
     /// The service lives until its runtime is replaced.
     alive: Rc<Cell<bool>>,
     /// A retry asked for by the page, consumed by the connection loop.
@@ -258,6 +261,8 @@ impl SessionService {
             model: Rc::new(RefCell::new(TimelineModel::default())),
             connection: signal(ConnectionState::Connecting),
             connection_error: signal(None),
+            has_older: signal(false),
+            loading_older: signal(false),
             alive: Rc::new(Cell::new(true)),
             retry_now: Rc::new(Cell::new(false)),
             drafts: Rc::new(RefCell::new(load_drafts())),
@@ -365,6 +370,8 @@ impl SessionService {
             error: self.error,
             connection: self.connection,
             connection_error: self.connection_error,
+            has_older: self.has_older,
+            loading_older: self.loading_older,
             on_retry: {
                 let service = self.clone();
                 Rc::new(move || service.retry())
@@ -433,6 +440,10 @@ impl SessionService {
             on_toggle_turn: {
                 let service = self.clone();
                 Rc::new(move |turn_id: &str| service.toggle_turn(turn_id))
+            },
+            on_load_older: {
+                let service = self.clone();
+                Rc::new(move || service.load_older())
             },
             on_fork: {
                 let service = self.clone();
@@ -1036,6 +1047,8 @@ impl SessionService {
         self.terminal_menu.set(false);
         self.active.set(Some(session_id.as_str().to_owned()));
         self.timeline.set(Vec::new());
+        self.has_older.set(false);
+        self.loading_older.set(false);
         self.pending.set(None);
         self.question.set(None);
         *self.question_request.borrow_mut() = None;
@@ -1123,10 +1136,51 @@ impl SessionService {
 
     /// Projects a fetched page into the shell's rows.
     fn apply_page(&self, session_id: &VibexSessionId, page: TimelinePage) {
+        self.has_older.set(page.has_older);
         self.model
             .borrow_mut()
             .replace_authoritative(session_id.clone(), page.items);
         self.publish();
+    }
+
+    /// Reads the page above the transcript and splices it in.
+    fn load_older(&self) {
+        if self.loading_older.get_untracked() || !self.has_older.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active) else {
+            return;
+        };
+        let Some(before) = self.model.borrow().items.first().map(|item| item.sequence) else {
+            self.has_older.set(false);
+            return;
+        };
+        self.loading_older.set(true);
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            let result = background(fetch_older(backend, session_id.clone(), before)).await;
+            service.loading_older.set(false);
+            match result {
+                Ok(Ok(page)) => {
+                    service.has_older.set(page.has_older);
+                    service.model.borrow_mut().prepend_authoritative_page(
+                        &session_id,
+                        &page.items,
+                        page.leading_turn_start,
+                    );
+                    service.publish();
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_task_failed",
+                    format!("reading older history did not finish: {error}"),
+                )),
+            }
+        });
     }
 
     /// Re-projects the kept model into the shell's rows.
@@ -2842,6 +2896,23 @@ impl SessionService {
 }
 
 /// Lists the sessions and fetches one page of a session's timeline.
+async fn fetch_older(
+    backend: Arc<dyn AgentBackend>,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+) -> BackendResult<TimelinePage> {
+    backend
+        .fetch_timeline(FetchTimelineRequest {
+            session_id,
+            after_sequence: None,
+            before_sequence: Some(before_sequence),
+            limit: TIMELINE_LIMIT,
+            max_turns: None,
+            max_bytes: None,
+        })
+        .await
+}
+
 async fn fetch_page(
     backend: Arc<dyn AgentBackend>,
     session_id: VibexSessionId,

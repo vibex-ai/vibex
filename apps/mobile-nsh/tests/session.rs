@@ -156,6 +156,14 @@ fn TurnShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A transcript that knows it has older history.
+#[component]
+fn OlderShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.has_older = signal(true);
+    session::session(host)
+}
+
 /// The same shell while its runtime is unreachable and its transcript is on
 /// screen: the conversation stays, with a reconnecting strip.
 #[component]
@@ -187,6 +195,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let error = signal(None::<SharedString>);
     let connection = signal(ConnectionState::Online);
     let connection_error = signal(None::<SharedString>);
+    let has_older = signal(false);
+    let loading_older = signal(false);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -488,6 +498,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         error,
         connection,
         connection_error,
+        has_older,
+        loading_older,
         on_retry: Rc::new(|| {}),
         runtime,
         pending,
@@ -511,6 +523,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_settings: Rc::new(|| {}),
         on_toggle_turn: Rc::new(|_| {}),
         on_fork: Rc::new(|_| {}),
+        on_load_older: Rc::new(|| {}),
         terminal_open,
         terminal_title,
         terminal_error,
@@ -626,6 +639,14 @@ fn a_dropped_connection_keeps_the_transcript_and_offers_retry() {
     app.wait_for("Desktop is unavailable").unwrap();
     assert!(app.screen().shows("Morning. The build is green."));
     assert!(app.screen().shows("Retry"));
+}
+
+#[test]
+fn older_history_offers_its_read() {
+    let mut config = EngineConfig::new(Root::of::<OlderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Load earlier messages").unwrap();
 }
 
 #[test]
