@@ -34,19 +34,20 @@ use vibex_core::{
     ElicitationRequestStatus, ElicitationResolution, ElicitationResolutionAction,
     FetchTimelineItemRequest, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
     FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
-    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitRemoteActionKind,
-    GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
-    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, OpenWorkspaceRequest,
-    PermissionRequest, PermissionRequestStatus, PermissionResolution, PermissionResponseKind,
-    PlanStepStatus, RenameAgentSessionRequest, RequestId, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeModelSelection, RuntimeOptionAvailability,
-    RuntimeSelectionInteraction, SendAgentMessageRequest, SessionRuntimeFeatureKind,
-    SessionRuntimeOption, SessionRuntimeOptionCatalog, SessionRuntimeSelection,
-    SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest, TeamTaskAction,
-    TeamTaskControlRequest, TerminalCreateRequest, TerminalId, TerminalResizeRequest,
-    TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage, TimelinePayload,
-    UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef, WorkspaceId,
-    unix_timestamp_ms,
+    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitManagedWorktreeRecord,
+    GitManagedWorktreeStatus, GitRemoteActionKind, GitRemoteActionRequest, GitStageRequest,
+    GitStatusSummary, GitWorktreeArchiveRequest, GitWorktreeCreateRequest,
+    GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
+    OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
+    PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
+    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
+    TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
@@ -54,7 +55,9 @@ use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
     screens::files::{FileEntry, FilePreview, FilePreviewKindView},
-    screens::git::{BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
+    screens::git::{
+        BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeRow,
+    },
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
         AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalControl, GoalPhaseView,
@@ -209,6 +212,11 @@ pub struct SessionService {
     git_branches: Signal<Vec<BranchRow>>,
     git_branch_menu: Signal<bool>,
     git_history_ref: Rc<RefCell<Option<String>>>,
+    worktrees: Signal<Vec<WorktreeRow>>,
+    worktree_menu: Signal<bool>,
+    worktree_busy: Signal<bool>,
+    worktree_error: Signal<Option<SharedString>>,
+    worktree_records: Rc<RefCell<Vec<GitManagedWorktreeRecord>>>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
     git_commit_detail: Signal<Option<CommitDetailPreview>>,
@@ -388,6 +396,11 @@ impl SessionService {
             git_branches: signal(Vec::new()),
             git_branch_menu: signal(false),
             git_history_ref: Rc::new(RefCell::new(None)),
+            worktrees: signal(Vec::new()),
+            worktree_menu: signal(false),
+            worktree_busy: signal(false),
+            worktree_error: signal(None),
+            worktree_records: Rc::new(RefCell::new(Vec::new())),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
             git_commit_detail: signal(None),
@@ -632,6 +645,26 @@ impl SessionService {
             on_select_git_branch: {
                 let service = self.clone();
                 Rc::new(move |name: &str| service.select_git_branch(name))
+            },
+            worktrees: self.worktrees,
+            worktree_menu: self.worktree_menu,
+            worktree_busy: self.worktree_busy,
+            worktree_error: self.worktree_error,
+            on_open_worktrees: {
+                let service = self.clone();
+                Rc::new(move || service.open_worktrees())
+            },
+            on_close_worktrees: {
+                let service = self.clone();
+                Rc::new(move || service.worktree_menu.set(false))
+            },
+            on_archive_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.archive_worktree(id))
+            },
+            on_restore_worktree: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.restore_worktree(id))
             },
             on_toggle_git_amend: {
                 let service = self.clone();
@@ -4828,6 +4861,213 @@ impl SessionService {
     }
 
     /// Commits what is staged with the message in the composer.
+    fn open_worktrees(&self) {
+        self.worktree_menu.set(true);
+        self.load_worktrees();
+    }
+
+    fn load_worktrees(&self) {
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let result =
+                background(async move { git.git_worktree_snapshot(workspace).await }).await;
+            service.worktree_busy.set(false);
+            match result {
+                Ok(Ok(snapshot)) => {
+                    let rows = snapshot
+                        .managed_worktrees
+                        .iter()
+                        .map(|worktree| WorktreeRow {
+                            id: worktree.worktree_id.as_str().to_owned(),
+                            branch: worktree
+                                .branch
+                                .clone()
+                                .or_else(|| worktree.target_branch.clone())
+                                .unwrap_or_default(),
+                            path: worktree.worktree_path.clone(),
+                            status: worktree_status_label(worktree.status).to_owned(),
+                            can_archive: worktree.status == GitManagedWorktreeStatus::Active,
+                            can_restore: worktree.status == GitManagedWorktreeStatus::Archived,
+                        })
+                        .collect();
+                    *service.worktree_records.borrow_mut() = snapshot.managed_worktrees;
+                    service.worktrees.set(rows);
+                }
+                Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                Err(error) => service.worktree_error.set(Some(
+                    format!("reading the worktrees did not finish: {error}").into(),
+                )),
+            }
+        });
+    }
+
+    fn archive_worktree(&self, id: &str) {
+        let Some(record) = self
+            .worktree_records
+            .borrow()
+            .iter()
+            .find(|worktree| worktree.worktree_id.as_str() == id)
+            .cloned()
+        else {
+            return;
+        };
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let archive = GitWorktreeArchiveRequest {
+                workspace_id: workspace.clone(),
+                worktree_path: record.worktree_path.clone(),
+                expected_head: record.head.clone(),
+                preflight_revision: None,
+            };
+            let preflight_git = git.clone();
+            let preflight =
+                background(
+                    async move { preflight_git.git_worktree_archive_preflight(archive).await },
+                )
+                .await;
+            match preflight {
+                Ok(Ok(preflight)) if preflight.allowed => {
+                    let request = GitWorktreeArchiveRequest {
+                        workspace_id: workspace,
+                        worktree_path: record.worktree_path.clone(),
+                        expected_head: record.head.clone(),
+                        preflight_revision: Some(preflight.revision),
+                    };
+                    let result = background(async move {
+                        git.git_worktree_archive(MutationRequest::new(request))
+                            .await
+                    })
+                    .await;
+                    service.worktree_busy.set(false);
+                    match result {
+                        Ok(Ok(_)) => service.load_worktrees(),
+                        Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                        Err(error) => service.worktree_error.set(Some(
+                            format!("archiving the worktree did not finish: {error}").into(),
+                        )),
+                    }
+                }
+                Ok(Ok(_)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        copy::text(
+                            "The runtime did not allow archiving this worktree.",
+                            "运行时不允许归档这个 Worktree。",
+                            "執行環境不允許封存這個 Worktree。",
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        format!("checking the worktree did not finish: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn restore_worktree(&self, id: &str) {
+        let Ok(worktree_id) = RequestId::parse(id) else {
+            return;
+        };
+        if self.worktree_busy.get_untracked() {
+            return;
+        }
+        self.worktree_busy.set(true);
+        self.worktree_error.set(None);
+        let service = self.clone();
+        let git = self.git_backend.clone();
+        let agent = self.backend.clone();
+        spawn(async move {
+            let Some(workspace) = service.workspace(&agent).await else {
+                service.worktree_busy.set(false);
+                return;
+            };
+            let restore = GitWorktreeRestoreRequest {
+                workspace_id: workspace.clone(),
+                worktree_id: worktree_id.clone(),
+                preflight_revision: None,
+            };
+            let preflight_git = git.clone();
+            let preflight =
+                background(
+                    async move { preflight_git.git_worktree_restore_preflight(restore).await },
+                )
+                .await;
+            match preflight {
+                Ok(Ok(preflight)) if preflight.allowed => {
+                    let request = GitWorktreeRestoreRequest {
+                        workspace_id: workspace,
+                        worktree_id,
+                        preflight_revision: Some(preflight.revision),
+                    };
+                    let result = background(async move {
+                        git.git_worktree_restore(MutationRequest::new(request))
+                            .await
+                    })
+                    .await;
+                    service.worktree_busy.set(false);
+                    match result {
+                        Ok(Ok(_)) => service.load_worktrees(),
+                        Ok(Err(error)) => service.worktree_error.set(Some(error_text(&error))),
+                        Err(error) => service.worktree_error.set(Some(
+                            format!("restoring the worktree did not finish: {error}").into(),
+                        )),
+                    }
+                }
+                Ok(Ok(_)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        copy::text(
+                            "The runtime did not allow restoring this worktree.",
+                            "运行时不允许恢复这个 Worktree。",
+                            "執行環境不允許還原這個 Worktree。",
+                        )
+                        .into(),
+                    ));
+                }
+                Ok(Err(error)) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.worktree_busy.set(false);
+                    service.worktree_error.set(Some(
+                        format!("checking the worktree did not finish: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
     fn open_git_branches(&self) {
         self.git_branch_menu.set(true);
         self.load_git_branches();
@@ -5208,6 +5448,23 @@ async fn send_and_refetch(
         }))
         .await?;
     fetch_page(backend, session_id).await
+}
+
+fn worktree_status_label(status: GitManagedWorktreeStatus) -> &'static str {
+    match status {
+        GitManagedWorktreeStatus::Active => copy::text("Active", "使用中", "使用中"),
+        GitManagedWorktreeStatus::Archiving => copy::text("Archiving", "归档中", "封存中"),
+        GitManagedWorktreeStatus::Archived => copy::text("Archived", "已归档", "已封存"),
+        GitManagedWorktreeStatus::Restoring => copy::text("Restoring", "恢复中", "還原中"),
+        GitManagedWorktreeStatus::Discarding => copy::text("Discarding", "丢弃中", "丟棄中"),
+        GitManagedWorktreeStatus::Merged => copy::text("Merged", "已合并", "已合併"),
+        GitManagedWorktreeStatus::Discarded => copy::text("Discarded", "已丢弃", "已丟棄"),
+        GitManagedWorktreeStatus::Failed => copy::text("Failed", "失败", "失敗"),
+        GitManagedWorktreeStatus::NeedsAttention => {
+            copy::text("Needs attention", "需要处理", "需要處理")
+        }
+        GitManagedWorktreeStatus::Unknown => copy::text("Unknown", "未知", "未知"),
+    }
 }
 
 fn team_phase_label(phase: DelegationTaskPhase) -> &'static str {

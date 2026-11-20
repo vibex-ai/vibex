@@ -14,7 +14,7 @@ use nsh_testing::Headless;
 use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView};
 use vibex_nsh_ui::screens::git::{
-    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
+    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeRow,
 };
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
@@ -382,6 +382,17 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         detail: "origin/main".to_owned(),
     }]);
     let git_branch_menu = signal(false);
+    let worktrees = signal(vec![WorktreeRow {
+        id: "wt1".to_owned(),
+        branch: "feature/tree".to_owned(),
+        path: "/tmp/vibex-tree".to_owned(),
+        status: "Active".to_owned(),
+        can_archive: true,
+        can_restore: false,
+    }]);
+    let worktree_menu = signal(false);
+    let worktree_busy = signal(false);
+    let worktree_error = signal(None::<SharedString>);
     let runtime_open = signal(false);
     let runtime_busy = signal(false);
     let token_usage = signal(None);
@@ -883,6 +894,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_git_branches: Rc::new(move || git_branch_menu.set(true)),
         on_close_git_branches: Rc::new(move || git_branch_menu.set(false)),
         on_select_git_branch: Rc::new(|_| {}),
+        worktrees,
+        worktree_menu,
+        worktree_busy,
+        worktree_error,
+        on_open_worktrees: Rc::new(move || worktree_menu.set(true)),
+        on_close_worktrees: Rc::new(move || worktree_menu.set(false)),
+        on_archive_worktree: Rc::new(|_| {}),
+        on_restore_worktree: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),
         on_git_push: Rc::new(|| {}),
@@ -1303,6 +1322,16 @@ fn a_markdown_file_is_drawn_as_markdown() {
     app.wait_for("README.md").unwrap();
     app.press("README.md").unwrap();
     app.wait_for("Hello").unwrap();
+}
+
+#[test]
+fn the_git_worktree_sheet_lists_managed_worktrees() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("role:button[Worktrees]").unwrap();
+    app.wait_for("/tmp/vibex-tree").unwrap();
 }
 
 #[test]
