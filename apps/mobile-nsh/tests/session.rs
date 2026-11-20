@@ -1,0 +1,867 @@
+//! The session shell's flows, rendered headlessly through the real engine.
+//!
+//! The shell is mounted with a fixture host here: the drawer opens, a session
+//! opens its transcript, and the composer sends. The app's own wiring to the
+//! remote backend is tested where that backend is available; these tests keep
+//! the screen's behavior fixed as it grows.
+
+use std::rc::Rc;
+
+use nsh_base::{Terminal, TerminalApi};
+use nsh_core::prelude::*;
+use nsh_engine::{EngineConfig, Root};
+use nsh_testing::Headless;
+use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
+use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
+use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
+use vibex_nsh_ui::screens::session::{
+    self, AttachmentItem, CommandEntry, EntryKind, PendingPermission, PendingQuestion,
+    PermissionChoice, PermissionOption, QuestionField, QuestionFieldKind, SessionHost,
+    SessionState, SessionSummary, TimelineEntry,
+};
+use vibex_nsh_ui::screens::terminal::TerminalChoice;
+
+fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
+    TimelineEntry {
+        id: id.to_owned(),
+        kind,
+        title: title.to_owned(),
+        body: body.to_owned(),
+        meta: String::new(),
+        streaming: false,
+    }
+}
+
+fn sessions() -> Vec<SessionSummary> {
+    vec![
+        SessionSummary {
+            id: "s1".to_owned(),
+            title: "Good morning".to_owned(),
+            agent: "Claude".to_owned(),
+            meta: "2m".to_owned(),
+            state: SessionState::Idle,
+        },
+        SessionSummary {
+            id: "s2".to_owned(),
+            title: "Fix the tests".to_owned(),
+            agent: "Codex".to_owned(),
+            meta: "1h".to_owned(),
+            state: SessionState::Idle,
+        },
+    ]
+}
+
+fn transcript(session: &str) -> Vec<TimelineEntry> {
+    match session {
+        "s1" => vec![
+            entry("s1:1", EntryKind::User, "", "Good morning"),
+            entry(
+                "s1:2",
+                EntryKind::Agent,
+                "Claude",
+                "Morning. The build is green.",
+            ),
+            entry("s1:3", EntryKind::Tool, "cargo test", "Running 412 tests"),
+        ],
+        _ => vec![entry("s2:1", EntryKind::User, "", "Please fix the tests")],
+    }
+}
+
+/// The shell over a fixture that behaves like the app's service for the parts
+/// these tests cover.
+#[component]
+fn Shell() -> impl IntoElement {
+    session::session(host_with(None, None))
+}
+
+/// The same shell with a permission waiting for an answer.
+#[component]
+fn PermissionShell() -> impl IntoElement {
+    session::session(host_with(
+        Some(PendingPermission {
+            request_id: "req_1".to_owned(),
+            title: "Run cargo test?".to_owned(),
+            details: vec!["Command: cargo test".to_owned()],
+            options: vec![
+                PermissionOption {
+                    id: "approve".to_owned(),
+                    label: "Allow".to_owned(),
+                    choice: PermissionChoice::Allow,
+                },
+                PermissionOption {
+                    id: "deny".to_owned(),
+                    label: "Deny".to_owned(),
+                    choice: PermissionChoice::Deny,
+                },
+            ],
+        }),
+        None,
+    ))
+}
+
+/// The same shell with a question waiting for typed answers.
+#[component]
+fn QuestionShell() -> impl IntoElement {
+    session::session(host_with(
+        None,
+        Some(PendingQuestion {
+            request_id: "req_q".to_owned(),
+            title: "Which branch?".to_owned(),
+            message: "Pick the branch the Agent should work on.".to_owned(),
+            fields: vec![QuestionField {
+                id: "branch".to_owned(),
+                title: "Branch".to_owned(),
+                description: None,
+                required: true,
+                kind: QuestionFieldKind::Text { default: None },
+            }],
+        }),
+    ))
+}
+
+fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
+    let sessions = signal(sessions());
+    let active = signal(Some("s1".to_owned()));
+    let timeline = signal(transcript("s1"));
+    let draft = signal(String::new());
+    let sending = signal(false);
+    let error = signal(None::<SharedString>);
+    let runtime = signal(Some(SharedString::from("desktop · reachable")));
+    let pending = signal(pending);
+    let question = signal(question);
+    let resolving = signal(false);
+    let commands = signal(Vec::new());
+    let mentions = signal(Vec::new());
+    let attachments = signal(Vec::new());
+    let on_attach_image = Rc::new(move || {
+        attachments.update(|items| {
+            items.push(AttachmentItem {
+                id: "attachment-1".to_owned(),
+                label: "photo.jpg".to_owned(),
+                mime_type: "image/jpeg".to_owned(),
+                uri: "data:image/jpeg;base64,".to_owned(),
+            });
+        });
+    });
+    let on_remove_attachment = Rc::new(move |id: &str| {
+        attachments.update(|items| items.retain(|item| item.id != id));
+    });
+    let terminal_open = signal(false);
+    let terminal_title = signal(Some(SharedString::from("Terminal")));
+    let terminal_error = signal(None::<SharedString>);
+    let terminal_ref = component_ref::<Terminal>();
+    let terminal_choices = signal(vec![
+        TerminalChoice {
+            id: "t1".to_owned(),
+            title: "Terminal".to_owned(),
+            status: "running".to_owned(),
+        },
+        TerminalChoice {
+            id: "t2".to_owned(),
+            title: "Build".to_owned(),
+            status: "running".to_owned(),
+        },
+    ]);
+    let terminal_menu = signal(false);
+    let on_select_terminal = Rc::new(move |id: &str| {
+        if let Some(choice) = terminal_choices.with(|choices| {
+            choices
+                .iter()
+                .find(|choice| choice.id == id)
+                .map(|choice| choice.title.clone())
+        }) {
+            terminal_title.set(Some(choice.into()));
+            terminal_menu.set(false);
+        }
+    });
+    let files_open = signal(false);
+    let files_path = signal(String::new());
+    let files_entries = signal(vec![
+        FileEntry {
+            path: "src".to_owned(),
+            name: "src".to_owned(),
+            directory: true,
+        },
+        FileEntry {
+            path: "README.md".to_owned(),
+            name: "README.md".to_owned(),
+            directory: false,
+        },
+    ]);
+    let files_preview = signal(None::<FilePreview>);
+    let files_error = signal(None::<SharedString>);
+    let files_content = signal(String::new());
+    let files_dirty = signal(false);
+    let files_saving = signal(false);
+    let on_open_dir = Rc::new(move |path: &str| {
+        files_path.set(path.to_owned());
+        files_entries.set(vec![FileEntry {
+            path: "src/main.rs".to_owned(),
+            name: "main.rs".to_owned(),
+            directory: false,
+        }]);
+    });
+    let on_open_file = Rc::new(move |path: &str| {
+        files_preview.set(Some(FilePreview {
+            title: path.rsplit('/').next().unwrap_or(path).to_owned(),
+            body: String::new(),
+            truncated: false,
+            language: "rust".to_owned(),
+        }));
+        files_content.set("edited".to_owned());
+        files_dirty.set(true);
+    });
+    let on_save_file = Rc::new(move || {
+        files_content.set("saved".to_owned());
+        files_dirty.set(false);
+    });
+    let on_files_back = Rc::new(move || files_preview.set(None));
+    let git_open = signal(false);
+    let git_branch = signal(Some(SharedString::from("main")));
+    let git_changes = signal(vec![GitChangeRow {
+        path: "src/main.rs".to_owned(),
+        status: "M".to_owned(),
+        staged: false,
+        additions: 3,
+        deletions: 1,
+    }]);
+    let git_diff = signal(None::<GitDiffPreview>);
+    let git_error = signal(None::<SharedString>);
+    let on_open_git_diff = Rc::new(move |path: &str, _staged: bool| {
+        git_diff.set(Some(GitDiffPreview {
+            title: path.to_owned(),
+            body: "diff --git a/src/main.rs b/src/main.rs".to_owned(),
+            truncated: false,
+            path: path.to_owned(),
+            staged: false,
+        }));
+    });
+    let on_git_back = Rc::new(move || git_diff.set(None));
+    let git_staged = signal(1_u32);
+    let git_message = signal(String::new());
+    let git_committing = signal(false);
+    let git_history = signal(vec![CommitRow {
+        hash: "abc123".to_owned(),
+        short_hash: "abc123".to_owned(),
+        subject: "Initial commit".to_owned(),
+        detail: "Ada".to_owned(),
+    }]);
+    let git_show_history = signal(false);
+    let git_commit_detail = signal(None::<CommitDetailPreview>);
+    let on_open_git_commit = Rc::new(move |hash: &str| {
+        git_commit_detail.set(Some(CommitDetailPreview {
+            title: hash.to_owned(),
+            body: "commit detail body".to_owned(),
+            truncated: false,
+        }));
+    });
+    let on_revert_git = Rc::new(move |_path: &str| git_diff.set(None));
+    let on_commit_git = Rc::new(move || {
+        if !git_message.get_untracked().trim().is_empty() {
+            git_message.set(String::new());
+        }
+    });
+    let on_toggle_git_history = Rc::new(move || {
+        git_show_history.set(!git_show_history.get_untracked());
+    });
+    let on_stage = Rc::new(move |path: &str| {
+        git_changes.update(|changes| {
+            if let Some(change) = changes.iter_mut().find(|change| change.path == path) {
+                change.staged = true;
+            }
+        });
+    });
+    let on_unstage = Rc::new(move |path: &str| {
+        git_changes.update(|changes| {
+            if let Some(change) = changes.iter_mut().find(|change| change.path == path) {
+                change.staged = false;
+            }
+        });
+    });
+    let session_actions = signal(None::<String>);
+    let session_rename = signal(String::new());
+    let session_busy = signal(false);
+    let on_session_menu = Rc::new(move |id: &str, title: &str| {
+        session_rename.set(title.to_owned());
+        session_actions.set(Some(id.to_owned()));
+    });
+    let on_rename_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        let title = session_rename.get_untracked();
+        sessions.update(|sessions| {
+            if let Some(session) = sessions.iter_mut().find(|session| session.id == id) {
+                session.title = title.clone();
+            }
+        });
+        session_actions.set(None);
+    });
+    let on_archive_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        sessions.update(|sessions| sessions.retain(|session| session.id != id));
+        session_actions.set(None);
+    });
+    let on_delete_session = Rc::new(move || {
+        let Some(id) = session_actions.get_untracked() else {
+            return;
+        };
+        sessions.update(|sessions| sessions.retain(|session| session.id != id));
+        session_actions.set(None);
+    });
+    let new_session_open = signal(false);
+    let new_workspaces = signal(vec![WorkspaceChoice {
+        id: "w1".to_owned(),
+        name: "Vibex".to_owned(),
+        detail: "/code/vibex".to_owned(),
+    }]);
+    let new_runtimes = signal(vec![RuntimeChoice {
+        id: "0".to_owned(),
+        title: "Claude · Sonnet".to_owned(),
+        detail: "Subscription".to_owned(),
+    }]);
+    let new_workspace = signal(Some("w1".to_owned()));
+    let new_runtime = signal(Some("0".to_owned()));
+    let new_busy = signal(false);
+    let new_error = signal(None::<SharedString>);
+    let new_worktree_branch = signal(String::new());
+    let on_create_worktree_session = Rc::new(move || {
+        if new_worktree_branch.get_untracked().trim().is_empty() {
+            return;
+        }
+        sessions.update(|sessions| {
+            sessions.insert(
+                0,
+                SessionSummary {
+                    id: "s4".to_owned(),
+                    title: "Worktree session".to_owned(),
+                    agent: "Claude".to_owned(),
+                    meta: "now".to_owned(),
+                    state: SessionState::Idle,
+                },
+            );
+        });
+        active.set(Some("s4".to_owned()));
+        timeline.set(transcript("s4"));
+        new_session_open.set(false);
+    });
+    let on_create_session = Rc::new(move || {
+        sessions.update(|sessions| {
+            sessions.insert(
+                0,
+                SessionSummary {
+                    id: "s3".to_owned(),
+                    title: "Created session".to_owned(),
+                    agent: "Claude".to_owned(),
+                    meta: "now".to_owned(),
+                    state: SessionState::Idle,
+                },
+            );
+        });
+        active.set(Some("s3".to_owned()));
+        timeline.set(transcript("s3"));
+        new_session_open.set(false);
+    });
+
+    let select = Rc::new(move |id: &str| {
+        active.set(Some(id.to_owned()));
+        timeline.set(transcript(id));
+    });
+    let send = Rc::new(move |text: &str| {
+        let sequence = timeline.with(|timeline| timeline.len() + 1);
+        timeline.update(|timeline| {
+            timeline.push(entry(
+                &format!("sent:{sequence}"),
+                EntryKind::User,
+                "",
+                text,
+            ))
+        });
+    });
+    let on_permission = Rc::new(move |_: &str, _: PermissionChoice| {
+        pending.set(None);
+    });
+    let on_question = Rc::new(move |_: &str, _| {
+        question.set(None);
+    });
+    let on_mention_query = Rc::new(move |_: &str| {
+        mentions.set(vec![CommandEntry {
+            id: "file:src/main.rs".to_owned(),
+            label: "src/main.rs".to_owned(),
+            description: "Workspace file".to_owned(),
+            insertion: "@src/main.rs ".to_owned(),
+        }]);
+    });
+    let on_command_query = Rc::new(move |_: &str| {
+        commands.set(vec![CommandEntry {
+            id: "review".to_owned(),
+            label: "Review changes".to_owned(),
+            description: "Ask the Agent to review the working tree".to_owned(),
+            insertion: "/review ".to_owned(),
+        }]);
+    });
+    let on_open_terminal = Rc::new(move || terminal_open.set(true));
+    let on_close_terminal = Rc::new(move || terminal_open.set(false));
+    let on_new_session = Rc::new(move || new_session_open.set(true));
+    let on_interrupt = Rc::new(move || {
+        sessions.update(|sessions| {
+            if let Some(session) = sessions.first_mut() {
+                session.state = SessionState::Idle;
+            }
+        });
+    });
+    SessionHost {
+        sessions,
+        active,
+        timeline,
+        draft,
+        sending,
+        error,
+        runtime,
+        pending,
+        question,
+        commands,
+        mentions,
+        attachments,
+        on_attach_image,
+        on_attach_file: Rc::new(|| {}),
+        on_remove_attachment,
+        resolving,
+        on_select: select,
+        on_send: send,
+        on_refresh: Rc::new(|| {}),
+        on_disconnect: Rc::new(|| {}),
+        on_permission,
+        on_question,
+        on_command_query,
+        on_mention_query,
+        on_new_session,
+        terminal_open,
+        terminal_title,
+        terminal_error,
+        terminal_ref,
+        on_open_terminal,
+        on_close_terminal,
+        on_terminal_data: Rc::new(|_| {}),
+        on_terminal_resize: Rc::new(|_, _| {}),
+        on_terminal_title: Rc::new(|_| {}),
+        on_interrupt,
+        on_switch_runtime: Rc::new(|| {}),
+        terminal_choices,
+        terminal_menu,
+        on_terminal_menu: Rc::new(move || terminal_menu.set(true)),
+        on_close_terminal_menu: Rc::new(move || terminal_menu.set(false)),
+        on_select_terminal,
+        on_new_terminal: Rc::new(|| {}),
+        files_open,
+        files_path,
+        files_entries,
+        files_preview,
+        files_error,
+        on_open_files: Rc::new(move || files_open.set(true)),
+        on_close_files: Rc::new(move || files_open.set(false)),
+        on_open_dir,
+        on_open_file,
+        on_files_back,
+        files_content,
+        files_dirty,
+        files_saving,
+        on_save_file,
+        git_open,
+        git_branch,
+        git_changes,
+        git_diff,
+        git_error,
+        on_open_git: Rc::new(move || git_open.set(true)),
+        on_close_git: Rc::new(move || git_open.set(false)),
+        on_open_git_diff,
+        on_stage_git: on_stage,
+        on_unstage_git: on_unstage,
+        git_staged,
+        git_message,
+        git_committing,
+        git_history,
+        git_show_history,
+        git_commit_detail,
+        on_commit_git,
+        on_toggle_git_history,
+        on_open_git_commit,
+        on_revert_git,
+        on_git_back,
+        on_refresh_git: Rc::new(|| {}),
+        session_actions,
+        session_rename,
+        session_busy,
+        on_session_menu,
+        on_close_session_actions: Rc::new(|| {}),
+        on_rename_session,
+        on_archive_session,
+        on_delete_session,
+        new_session_open,
+        new_workspaces,
+        new_runtimes,
+        new_workspace,
+        new_runtime,
+        new_busy,
+        new_error,
+        on_create_session,
+        new_worktree_branch,
+        on_create_worktree_session,
+        on_close_new_session: Rc::new(move || new_session_open.set(false)),
+    }
+}
+
+fn start() -> Headless {
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    // A tall phone: the transcript's rows all mount in the list's window.
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app
+}
+
+#[test]
+fn the_shell_opens_on_the_first_session() {
+    let app = start();
+    assert!(app.screen().shows("Vibex") || app.screen().shows("Good morning"));
+    assert!(app.screen().shows("Morning. The build is green."));
+    assert!(app.screen().shows("cargo test"));
+}
+
+#[test]
+fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
+    app.press("Fix the tests").unwrap();
+    app.wait_for("Please fix the tests").unwrap();
+    app.wait_for_gone(
+        "Morning. The build is green.",
+        std::time::Duration::from_secs(5),
+    )
+    .unwrap();
+}
+
+#[test]
+fn the_composer_appends_what_was_sent() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "Ship it").unwrap();
+    app.press("role:button[Send]").unwrap();
+    app.wait_for("Ship it").unwrap();
+    assert_eq!(
+        app.screen().input_text("text:Message the Agent…").unwrap(),
+        Some("")
+    );
+}
+
+/// The app switches to the shell inside a `when` region; that branch creates
+/// the session service, which makes signals and starts a task. This keeps that
+/// pattern covered even though a real runtime is not reachable from a test.
+#[component]
+fn Branch() -> impl IntoElement {
+    let connected = signal(false);
+    view()
+        .flex_1()
+        .child(
+            nsh_base::button()
+                .on_press(move || connected.set(!connected.get_untracked()))
+                .child(text("toggle")),
+        )
+        .child(when(
+            move || connected.get(),
+            || {
+                let name = signal("Laptop");
+                spawn(async move {
+                    name.set("Laptop, reachable");
+                });
+                view().child(text(move || name.get()))
+            },
+        ))
+}
+
+#[test]
+fn a_branch_may_build_a_service_and_start_its_task() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<Branch>())).unwrap();
+    app.wait_for("toggle").unwrap();
+    app.press("toggle").unwrap();
+    app.wait_for("Laptop, reachable").unwrap();
+}
+
+#[test]
+fn a_permission_card_is_answered_and_leaves() {
+    let mut config = EngineConfig::new(Root::of::<PermissionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Run cargo test?").unwrap();
+    app.press("role:button[Allow]").unwrap();
+    app.wait_for_gone("Run cargo test?", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn a_question_collects_an_answer_and_leaves() {
+    let mut config = EngineConfig::new(Root::of::<QuestionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Which branch?").unwrap();
+    app.type_text("text:Branch", "main").unwrap();
+    app.press("role:button[Submit]").unwrap();
+    app.wait_for_gone("Which branch?", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn the_slash_palette_inserts_a_command() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "/").unwrap();
+    app.wait_for("Review changes").unwrap();
+    app.press("Review changes").unwrap();
+    app.wait_for("text:/review ").unwrap();
+}
+
+#[test]
+fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Fix the tests").unwrap();
+    app.press("role:button[New session]").unwrap();
+    app.wait_for("Claude · Sonnet").unwrap();
+    app.press("role:button[Create]").unwrap();
+    app.wait_for("Created session").unwrap();
+}
+
+/// The shell with its terminal open; it writes a line into the terminal after
+/// the first frame, as the runtime's snapshot would.
+#[component]
+fn TerminalShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.terminal_open.set(true);
+    let terminal_ref = host.terminal_ref;
+    set_timeout(std::time::Duration::from_millis(50), move || {
+        if let Some(api) = terminal_ref.api::<TerminalApi>() {
+            api.write("hello from the pty\n".to_owned());
+        }
+    });
+    session::session(host)
+}
+
+#[test]
+fn the_terminal_opens_and_shows_the_programs_output() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
+}
+
+#[test]
+fn the_at_palette_inserts_a_workspace_reference() {
+    let mut app = start();
+    app.type_text("text:Message the Agent…", "@src").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("src/main.rs").unwrap();
+    app.wait_for("text:@src/main.rs ").unwrap();
+}
+
+/// The shell with its files surface open.
+#[component]
+fn FilesShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.files_open.set(true);
+    session::session(host)
+}
+
+#[test]
+fn the_files_surface_lists_a_directory_and_reads_a_file() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("src").unwrap();
+    app.wait_for("main.rs").unwrap();
+    app.press("main.rs").unwrap();
+    app.wait_for("role:button[Save]").unwrap();
+}
+
+/// The shell with its Git surface open.
+#[component]
+fn GitShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.git_open.set(true);
+    session::session(host)
+}
+
+#[test]
+fn the_git_surface_lists_changes_and_shows_a_diff() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("src/main.rs").unwrap();
+    app.wait_for("diff --git a/src/main.rs b/src/main.rs")
+        .unwrap();
+}
+
+#[test]
+fn a_git_change_can_be_staged_from_the_surface() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("Stage").unwrap();
+    app.wait_for("Unstage").unwrap();
+}
+
+#[test]
+fn the_git_surface_commits_and_shows_history() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Commit").unwrap();
+    app.type_text("text:Commit message", "init").unwrap();
+    app.press("role:button[Commit]").unwrap();
+    // The composer clears when the commit is accepted.
+    app.wait_for("text:Commit message").unwrap();
+    app.press("role:button[History]").unwrap();
+    app.wait_for("Initial commit").unwrap();
+}
+
+#[test]
+fn a_files_save_follows_the_edited_state() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("src").unwrap();
+    app.wait_for("main.rs").unwrap();
+    app.press("main.rs").unwrap();
+    app.wait_for("role:button[Save]").unwrap();
+    assert!(app.screen().enabled("role:button[Save]").unwrap());
+}
+
+#[test]
+fn a_history_row_opens_the_commit_detail() {
+    let mut config = EngineConfig::new(Root::of::<GitShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Commit").unwrap();
+    app.press("role:button[History]").unwrap();
+    app.wait_for("Initial commit").unwrap();
+    app.press("Initial commit").unwrap();
+    app.wait_for("commit detail body").unwrap();
+}
+
+#[test]
+fn a_photo_can_be_attached_and_removed() {
+    let mut app = start();
+    app.press("role:button[Attach a photo]").unwrap();
+    app.wait_for("photo.jpg").unwrap();
+    app.press("photo.jpg").unwrap();
+    app.wait_until(
+        "the chip leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "photo.jpg"),
+    )
+    .unwrap();
+}
+
+/// The shell with a single session, so the drawer's action button is unique.
+#[component]
+fn OneSessionShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.set(vec![SessionSummary {
+        id: "s1".to_owned(),
+        title: "Fix the tests".to_owned(),
+        agent: "Claude".to_owned(),
+        meta: "2m".to_owned(),
+        state: SessionState::Running,
+    }]);
+    session::session(host)
+}
+
+#[test]
+fn a_session_can_be_renamed_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.wait_for("role:button[Rename]").unwrap();
+    app.type_text("text:Fix the tests", " v2").unwrap();
+    app.press("role:button[Rename]").unwrap();
+    app.wait_for("Fix the tests v2").unwrap();
+}
+
+#[test]
+fn a_session_can_be_archived_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.press("role:button[Archive]").unwrap();
+    app.wait_until(
+        "the row leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_session_can_be_deleted_from_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.press("role:button[Delete]").unwrap();
+    app.wait_until(
+        "the row leaves",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_running_turn_can_be_stopped_from_the_composer() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Stop]").unwrap();
+    app.press("role:button[Stop]").unwrap();
+    app.wait_for("role:button[Send]").unwrap();
+}
+
+#[test]
+fn the_terminal_list_switches_between_terminals() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Terminals]").unwrap();
+    app.press("role:button[Terminals]").unwrap();
+    app.wait_for("Build").unwrap();
+    app.press("Build").unwrap();
+    app.wait_until(
+        "the title follows",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().contains(&"Build"),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_new_worktree_session_can_be_started_from_the_sheet() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New session]").unwrap();
+    app.wait_for("text:Branch name").unwrap();
+    app.type_text("text:Branch name", "feat/mobile").unwrap();
+    app.press("role:button[Create worktree]").unwrap();
+    app.wait_for("Worktree session").unwrap();
+}

@@ -1,0 +1,47 @@
+plugins {
+    id 'com.android.application'
+}
+
+android {
+    namespace 'ai.vibex.mobile.nsh'
+    compileSdk 35
+
+    defaultConfig {
+        applicationId 'ai.vibex.mobile.nsh'
+        minSdk 26
+        targetSdk 35
+        versionCode 1
+        versionName '0.1.9'
+    }
+
+    buildTypes {
+        release {
+            minifyEnabled false
+            signingConfig signingConfigs.debug
+        }
+    }
+
+    compileOptions {
+        sourceCompatibility JavaVersion.VERSION_17
+        targetCompatibility JavaVersion.VERSION_17
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = false
+        }
+    }
+}
+
+configurations.all {
+    // zxing-android-embedded 4.3 carries old kotlin-stdlib-jdk7/8 artifacts
+    // whose classes moved into kotlin-stdlib; keep the newer one only.
+    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk7'
+    exclude group: 'org.jetbrains.kotlin', module: 'kotlin-stdlib-jdk8'
+}
+
+dependencies {
+    implementation files('libs/nsh.aar')
+    implementation 'androidx.appcompat:appcompat:1.7.0'
+    implementation 'com.journeyapps:zxing-android-embedded:4.3.0'
+}

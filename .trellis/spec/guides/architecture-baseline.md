@@ -13,8 +13,14 @@ runtime core:
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Full GPUI workbench over the authoritative `DesktopRuntime` |
 | Headless server | `apps/server` | The same `DesktopRuntime` as a daemon (`vibex-server`) for cloud deployment |
-| Native mobile | `apps/mobile` | iOS/Android GPUI remote client and compact GUI composition |
+| Native mobile (GPUI) | `apps/mobile` | iOS/Android GPUI remote client and compact GUI composition |
+| Native mobile (nsh) | `apps/mobile-nsh` | iOS/Android Native Shell client: platform views over the same remote projections |
 | Self-hosted Relay | `apps/relay-server` | Encrypted frame transport only |
+
+The GPUI mobile client is the shipping one until the Native Shell client
+reaches parity screen by screen. Both are clients of the same authority and
+the same projections; neither owns state. A screen may exist in both while it
+migrates, and the pair must share copy, palette and behavior.
 
 ## Authority Invariant
 
@@ -52,6 +58,13 @@ becomes a second authority or database.
    controllers, and shell composition. Views do not own transport or authority.
 6. `crates/vibex-remote-client` owns pairing, reconnect, synchronization, and
    Direct/Tailnet/Relay transport. Relay never becomes a second database.
+7. `crates/vibex-nsh-ui` owns the Native Shell UI layer (tokens, styled controls,
+   screens). It depends on `nsh-core` and `nsh-base` only, never on GPUI, and it
+   holds no transport or authority: the app's host seams supply both.
+8. `crates/vibex-mobile-pairing` owns the phone's pairing core: entry
+   classification, credential claims, the credential schema and the on-device
+   store. It is platform-neutral (no GPUI, no nsh) and shared by the mobile
+   clients; it never becomes an authority, only a client that claims a grant.
 
 ## Session Presentation Contract
 
@@ -74,6 +87,38 @@ terminal-first workflow, copy a separate domain component family, or silently
 drop approval/error states.
 
 ## Native Platform Boundary
+
+### Native Shell (nsh) mobile client
+
+`apps/mobile-nsh` is a Rust app for Native Shell (`nsh`): `nsh.json` names this
+crate's root component, and `nsh` mounts each platform's own views (UIKit on
+iOS, Android views on Android) over the engine. The UI layer is
+`crates/vibex-nsh-ui`; the app crate holds only the root, the host seams and the
+theme generation.
+
+- The palette is generated into `apps/mobile-nsh/theme.json` from
+  `crates/vibex-ui/theme/tokens.json`, so both clients read one token source.
+- Native behavior is the point of the move: text input, selection, scrolling,
+  navigation and the keyboard are the platform's. Screens keep the phone's
+  information architecture, copy and spacing ladder, not pixel-identical
+  rendering.
+- The app stays a client: camera, clipboard, discovery and the remote transport
+  arrive through the host seams, never as local authority. Attachments are the
+  exception that proves it: `nsh`'s own picker (`pick_images`, `pick_files`)
+  hands the app bytes, which travel to the authoritative runtime as `data:`
+  URLs rather than being read from a phone path.
+- Files are edited with `nsh`'s `Editor` (highlighting in the language the
+  runtime reports) and written with a revision guard; Git status, staging,
+  commit, revert and commit detail call the same backend contracts the desktop
+  workbench uses. Branch switching is absent because the backend exposes no
+  checkout call.
+- The platform names the phone for pairing (`nativeSetDeviceName` /
+  `vibex_mobile_nsh_set_device_name`), and packaging is `nsh package` behind
+  `apps/mobile-nsh/scripts/build-{android,ios}.sh`.
+- The UI layer is written to be reusable if the desktop moves to `nsh`'s GPUI
+  backend; it must not assume a phone-only composition.
+
+### GPUI mobile client
 
 `apps/mobile` is a Rust crate with `cdylib`, `staticlib`, and `rlib` outputs.
 It builds its platform through `apps/mobile/src/platform.rs`, which wraps the
