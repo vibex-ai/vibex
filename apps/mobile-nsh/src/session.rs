@@ -2072,6 +2072,7 @@ impl SessionService {
         self.files_open.set(false);
         self.files_preview.set(None);
         self.files_error.set(None);
+        *self.files_current.borrow_mut() = None;
     }
 
     /// Lists `path` (the workspace root when empty).
@@ -2079,6 +2080,7 @@ impl SessionService {
         self.files_path.set(path.clone());
         self.files_preview.set(None);
         self.files_error.set(None);
+        *self.files_current.borrow_mut() = None;
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
@@ -2590,6 +2592,11 @@ impl SessionService {
 
     /// Re-reads the open session's transcript without clearing it.
     fn reload(&self, session_id: &VibexSessionId) {
+        // A lagged stream may name a session the reader is not on; its page
+        // must not replace the open transcript.
+        if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
         let service = self.clone();
         let backend = self.backend.clone();
         let session_id = session_id.clone();
