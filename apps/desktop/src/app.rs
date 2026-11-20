@@ -11529,6 +11529,16 @@ pub struct VibexWorkbench {
     /// consumed by the terminal page on the frame it renders, after the
     /// surface has registered its focus handle.
     session_terminal_focus_request: Option<String>,
+    /// The conversation whose composer should take the keyboard once its pane
+    /// renders.
+    ///
+    /// Selecting a pane is a selection of the session inside it, so the caret
+    /// has to follow the pane: without this the click moved the focus ring and
+    /// stopped there, and typing needed a second click on the textarea. The
+    /// request names the session because the composer that has to adopt the
+    /// caret is built one render after the click, while that session's view is
+    /// borrowed.
+    session_group_composer_focus_request: Option<String>,
     /// The session page's terminal render boundary, created on first use.
     session_terminal_view: Option<Entity<SessionTerminalView>>,
     /// The terminal session whose restart is in flight, so its button can say so.
@@ -13685,6 +13695,7 @@ impl VibexWorkbench {
             session_terminal_surfaces: BTreeMap::new(),
             active_session_terminal_ids: BTreeSet::new(),
             session_terminal_focus_request: None,
+            session_group_composer_focus_request: None,
             session_terminal_view: None,
             terminal_session_restart_pending: None,
             session_terminal_error: None,
@@ -56935,6 +56946,23 @@ impl VibexWorkbench {
         self.queue_ui_state();
     }
 
+    /// Asks the pane that just took the keyboard to hand it to its content.
+    ///
+    /// A terminal pane takes the keyboard into its own grid; a conversation
+    /// pane puts the caret back into its composer. Both surfaces are built by
+    /// that pane's next render, so the request is remembered rather than acted
+    /// on here, and each surface consumes the request that names it.
+    fn request_session_group_pane_keyboard(&mut self, session_id: &str) {
+        if self
+            .registered_session(session_id)
+            .is_some_and(AgentSession::is_terminal)
+        {
+            self.session_terminal_focus_request = Some(session_id.to_string());
+        } else {
+            self.session_group_composer_focus_request = Some(session_id.to_string());
+        }
+    }
+
     fn focus_session_group_pane(&mut self, group_id: &str, pane_id: &str, cx: &mut Context<Self>) {
         let active = self
             .ui_state
@@ -56951,6 +56979,9 @@ impl VibexWorkbench {
             .is_some_and(|group| group.focus_pane(pane_id));
         if changed {
             self.queue_ui_state();
+        }
+        if changed && let Some(session_id) = active.as_deref() {
+            self.request_session_group_pane_keyboard(session_id);
         }
         if let Some(session_id) = active
             && let Ok(session_id) = VibexSessionId::parse(&session_id)
@@ -56989,6 +57020,9 @@ impl VibexWorkbench {
             });
         if changed {
             self.queue_ui_state();
+        }
+        if changed {
+            self.request_session_group_pane_keyboard(session_id);
         }
         if let Ok(session_id) = VibexSessionId::parse(session_id)
             && self.selected_session_id.as_ref() != Some(&session_id)
@@ -79630,6 +79664,27 @@ impl VibexWorkbench {
         pane_focused: bool,
     ) -> AnyElement {
         let composer_input = self.ensure_composer_input(window, cx);
+        // A pane selection hands the keyboard to the pane's content, and the
+        // caret is how a conversation pane shows it. The composer only exists
+        // once this pane's session view is borrowed, so the click leaves a
+        // request and this frame is where it lands. The request is one shot:
+        // the pane stays selected for many frames, and re-focusing on each of
+        // them would take the caret away from whatever else the reader picked
+        // inside the pane.
+        let composer_focus_requested = pane_focused
+            && enabled
+            && self.view_session_id.as_ref().is_some_and(|session_id| {
+                self.session_group_composer_focus_request.as_deref() == Some(session_id.as_str())
+            });
+        if composer_focus_requested {
+            self.session_group_composer_focus_request = None;
+            if !self.composer_terminal_mode {
+                let input = composer_input.clone();
+                cx.defer_in(window, move |_, window, cx| {
+                    input.update(cx, |input, cx| input.focus(window, cx));
+                });
+            }
+        }
         if self.composer_terminal_mode {
             return self.render_composer_terminal(cx);
         }
@@ -136696,6 +136751,47 @@ mod tests {
         assert!(source.contains(
             "self.render_session_terminal_page_for_session(session, true, false, window, cx)"
         ));
+    }
+
+    /// Selecting a pane hands the keyboard to the conversation inside it.
+    ///
+    /// A click on an unselected pane focuses that pane, and the composer it
+    /// shows is where the caret then has to land. The request is stored by the
+    /// click and consumed by the pane's composer on the frame that builds its
+    /// textarea, because that textarea does not exist before the render.
+    #[test]
+    fn a_selected_group_pane_puts_the_caret_back_in_its_composer() {
+        let source = include_str!("app.rs");
+
+        // Selecting a pane asks for the keyboard, naming the session the pane
+        // shows rather than the pane itself: the composer is built per session.
+        let focus_pane = source
+            .split_once("    fn focus_session_group_pane(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_group_tab("))
+            .map(|(body, _)| body)
+            .expect("pane focus should remain inspectable");
+        assert!(focus_pane.contains("self.request_session_group_pane_keyboard(session_id)"));
+
+        // A terminal pane takes the keyboard into its grid; a conversation
+        // pane puts the caret back into its composer.
+        let request = source
+            .split_once("    fn request_session_group_pane_keyboard(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn focus_session_group_pane("))
+            .map(|(body, _)| body)
+            .expect("the keyboard hand-off should remain inspectable");
+        assert!(request.contains("self.session_terminal_focus_request = Some"));
+        assert!(request.contains("self.session_group_composer_focus_request = Some"));
+
+        // The composer adopts the request and clears it, so a pane that stays
+        // selected keeps the caret where the reader put it afterwards.
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+        assert!(composer.contains("self.session_group_composer_focus_request.as_deref()"));
+        assert!(composer.contains("self.session_group_composer_focus_request = None;"));
+        assert!(composer.contains("input.update(cx, |input, cx| input.focus(window, cx));"));
     }
 
     /// A group pane's strip is the preview strip's sibling: the same metrics,
