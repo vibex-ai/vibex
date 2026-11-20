@@ -2673,18 +2673,7 @@ impl SessionService {
             return;
         };
         let snapshot = self.sidebar_snapshot.borrow();
-        self.queued.set(
-            snapshot
-                .queued_sends
-                .iter()
-                .filter(|message| message.session_id == active)
-                .map(|message| QueuedMessageView {
-                    id: message.message_id,
-                    text: message.text.clone(),
-                    attachment_count: message.attachments.len(),
-                })
-                .collect(),
-        );
+        self.queued.set(queued_views(&snapshot, &active));
         self.queue_paused
             .set(snapshot.paused_queue_session_ids.contains(&active));
     }
@@ -6808,6 +6797,22 @@ fn load_pins() -> Vec<String> {
         .unwrap_or_default()
 }
 
+fn queued_views(
+    snapshot: &RemoteSidebarOrganizationSnapshot,
+    session_id: &str,
+) -> Vec<QueuedMessageView> {
+    snapshot
+        .queued_sends
+        .iter()
+        .filter(|message| message.session_id == session_id)
+        .map(|message| QueuedMessageView {
+            id: message.message_id,
+            text: message.text.clone(),
+            attachment_count: message.attachments.len(),
+        })
+        .collect()
+}
+
 /// The cached transcript windows kept on this phone.
 fn load_timeline_cache() -> BTreeMap<String, CachedTimeline> {
     Storage::get_item(TIMELINE_CACHE_KEY)
@@ -7146,5 +7151,48 @@ mod tests {
         assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..split]), "a");
         assert_eq!(decode_terminal_bytes(&mut pending, &bytes[split..]), "😀");
         assert!(pending.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod queue_view_tests {
+    use super::*;
+
+    #[test]
+    fn queued_views_keep_only_the_open_session() {
+        let snapshot = RemoteSidebarOrganizationSnapshot {
+            queued_sends: vec![
+                vibex_core::RemoteQueuedSend {
+                    message_id: 1,
+                    session_id: "a".to_owned(),
+                    text: "first".to_owned(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                },
+                vibex_core::RemoteQueuedSend {
+                    message_id: 2,
+                    session_id: "b".to_owned(),
+                    text: "other".to_owned(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                },
+                vibex_core::RemoteQueuedSend {
+                    message_id: 3,
+                    session_id: "a".to_owned(),
+                    text: "third".to_owned(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    scheduled_at_ms: None,
+                },
+            ],
+            ..RemoteSidebarOrganizationSnapshot::default()
+        };
+        let views = queued_views(&snapshot, "a");
+        assert_eq!(views.len(), 2);
+        assert_eq!(views[0].id, 1);
+        assert_eq!(views[1].id, 3);
+        assert_eq!(views[1].text, "third");
     }
 }

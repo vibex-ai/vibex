@@ -126,7 +126,8 @@ A successful claim or a tapped saved runtime opens the session shell:
   history; Worktrees are listed and archived, restored, merged or discarded
   through the runtime's preflight calls.
 
-Attachments, `@`-mentions, the prompt queue, scheduled sends, session search,
+Attachments, `@`-mentions, the prompt queue and scheduled sends (both owned by
+SidebarBackend), session search,
 Sidebar folders/groups and the Android host integrations are covered by the
 headless and unit suites where the backend is a fixture. The shell's tests
 mount it over that fixture; live answer, terminal, Sidebar and Git paths are

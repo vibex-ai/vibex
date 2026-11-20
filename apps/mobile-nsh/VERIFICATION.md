@@ -77,9 +77,9 @@ anything that needs a runtime or a phone are listed at the bottom.
 | --- | --- | --- | --- |
 | Turn grouping, tool detail, permission/question cards | `screens/session.rs` | headless turn/fold/permission tests | long transcripts, real permission kinds |
 | Find, edit, older pages, transcript cache | `screens/session.rs`, `session.rs` | headless search; cache and paging compile-level | large histories, cache quota |
-| Runtime picker, token use, plan/goal, queue, history, continue | `screens/session.rs`, `session.rs` | headless chips, bars, queue, history, continue | live runtime selection and queue authority |
+| Runtime picker, token use, plan/goal, queue, history, continue | `screens/session.rs`, `session.rs` | headless chips, bars, queue, history, continue; queue projection unit test | live runtime selection, queue and scheduled authority |
 | Composer triggers and structured mentions | `/`, `@`, `$` palettes | slash/at/dollar headless tests | live command execution and mentions |
-| Scheduled send, camera, attachments | `session.rs`, Android host | compile/headless UI only | real timer, camera, plugin install |
+| Scheduled send, camera, attachments | `session.rs`, Android host | compile/headless UI only; schedule now uses the Sidebar mutation | real runtime timer, camera, plugin install |
 | Sidebar folders/groups/pin/unread/order/collapse | `session.rs`, `screens/session.rs` | folder/group actions and collapse headless tests | SidebarBackend mutations on a live desktop |
 | Files content search, Markdown/image preview | `screens/files.rs`, `session.rs` | file search and Markdown headless tests | large trees, binary assets |
 | Git branch checkout, Worktree lifecycle | `screens/git.rs`, shared backend | compile + list tests | checkout, merge/discard/conflict on a real repo |
