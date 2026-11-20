@@ -12,7 +12,7 @@ use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use vibex_nsh_ui::screens::connecting::ConnectionState;
-use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
+use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView};
 use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
@@ -404,14 +404,25 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }]);
     });
     let on_open_file = Rc::new(move |path: &str| {
+        let markdown = path.ends_with(".md");
         files_preview.set(Some(FilePreview {
             title: path.rsplit('/').next().unwrap_or(path).to_owned(),
-            body: String::new(),
+            body: if markdown {
+                "# Hello".to_owned()
+            } else {
+                String::new()
+            },
             truncated: false,
-            language: "rust".to_owned(),
+            language: if markdown { "markdown" } else { "rust" }.to_owned(),
+            kind: if markdown {
+                FilePreviewKindView::Markdown
+            } else {
+                FilePreviewKindView::Text
+            },
+            image_uri: None,
         }));
-        files_content.set("edited".to_owned());
-        files_dirty.set(true);
+        files_content.set(if markdown { "# Hello" } else { "edited" }.to_owned());
+        files_dirty.set(!markdown);
     });
     let on_save_file = Rc::new(move || {
         files_content.set("saved".to_owned());
@@ -1073,6 +1084,16 @@ fn GitShell() -> impl IntoElement {
     let host = host_with(None, None);
     host.git_open.set(true);
     session::session(host)
+}
+
+#[test]
+fn a_markdown_file_is_drawn_as_markdown() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("README.md").unwrap();
+    app.wait_for("Hello").unwrap();
 }
 
 #[test]

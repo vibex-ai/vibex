@@ -7,7 +7,10 @@
 
 use std::rc::Rc;
 
-use nsh_base::{button, editor};
+use nsh_base::{
+    button, editor,
+    text_view::{MarkdownOptions, text_view},
+};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{copy, theme, ui::action};
@@ -28,6 +31,19 @@ pub struct FilePreview {
     pub truncated: bool,
     /// The language the runtime reported, for highlighting.
     pub language: String,
+    /// The face the runtime says the file wants.
+    pub kind: FilePreviewKindView,
+    /// A `data:` URL for an image, when one was read.
+    pub image_uri: Option<String>,
+}
+
+/// How a file's preview is drawn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FilePreviewKindView {
+    Text,
+    Markdown,
+    Image,
+    Binary,
 }
 
 /// What the browser may do, and the state it shows.
@@ -111,19 +127,29 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
                         )
-                        .child(when(move || file.get().is_some(), {
-                            let on_save = host.on_save.clone();
+                        .child(when(
                             move || {
-                                let on_save = on_save.clone();
-                                action::icon_button(
-                                    icon(include_str!("../../assets/icons/check.svg")),
-                                    copy::text("Save", "保存", "儲存"),
-                                    move || on_save(),
-                                )
-                                .disabled(move || !dirty.get() || saving.get())
-                                .disabled_style(|style| style.opacity(0.35))
-                            }
-                        }))
+                                file.get().is_some_and(|file| {
+                                    matches!(
+                                        file.kind,
+                                        FilePreviewKindView::Text | FilePreviewKindView::Markdown
+                                    )
+                                })
+                            },
+                            {
+                                let on_save = host.on_save.clone();
+                                move || {
+                                    let on_save = on_save.clone();
+                                    action::icon_button(
+                                        icon(include_str!("../../assets/icons/check.svg")),
+                                        copy::text("Save", "保存", "儲存"),
+                                        move || on_save(),
+                                    )
+                                    .disabled(move || !dirty.get() || saving.get())
+                                    .disabled_style(|style| style.opacity(0.35))
+                                }
+                            },
+                        ))
                         .child({
                             let on_close = on_close.clone();
                             action::icon_button(
@@ -246,24 +272,81 @@ fn file_preview(
         .gap(px(theme::SPACING_XS))
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
-        .child(
-            editor()
-                .value(move || Some(content.get().into()))
-                .language(move || {
-                    file.with(|file| {
-                        file.as_ref()
-                            .map(|file| SharedString::from(file.language.clone()))
-                            .filter(|language| !language.is_empty())
+        .child(when(
+            move || {
+                file.with(|file| {
+                    file.as_ref()
+                        .is_some_and(|file| file.kind == FilePreviewKindView::Markdown)
+                })
+            },
+            move || {
+                scroll().flex_1().child(
+                    view().p(px(theme::SPACING_MD)).child(
+                        text_view()
+                            .markdown(move || Some(content.get().into()))
+                            .options(MarkdownOptions::default)
+                            .selectable(true),
+                    ),
+                )
+            },
+        ))
+        .child(when(
+            move || {
+                file.with(|file| {
+                    file.as_ref()
+                        .is_some_and(|file| file.kind == FilePreviewKindView::Image)
+                })
+            },
+            move || {
+                view().flex_1().items_center().justify_center().child(
+                    image(move || {
+                        ImageSrc::from(file.with(|file| {
+                            file.as_ref()
+                                .and_then(|file| file.image_uri.clone())
+                                .unwrap_or_default()
+                        }))
+                    })
+                    .w_full()
+                    .object_fit(nsh_core::ResizeMode::Contain),
+                )
+            },
+        ))
+        .child(when(
+            move || {
+                file.with(|file| {
+                    file.as_ref().is_some_and(|file| {
+                        matches!(
+                            file.kind,
+                            FilePreviewKindView::Text | FilePreviewKindView::Binary
+                        )
                     })
                 })
-                .test_id("file-content")
-                .on_change(move |value: &SharedString| {
-                    content.set(value.to_string());
-                    dirty.set(true);
-                })
-                .flex_1()
-                .min_h(px(240.0)),
-        )
+            },
+            move || {
+                editor()
+                    .value(move || Some(content.get().into()))
+                    .language(move || {
+                        file.with(|file| {
+                            file.as_ref()
+                                .map(|file| SharedString::from(file.language.clone()))
+                                .filter(|language| !language.is_empty())
+                        })
+                    })
+                    .test_id("file-content")
+                    .read_only(move || {
+                        file.with(|file| {
+                            file.as_ref()
+                                .is_some_and(|file| file.kind == FilePreviewKindView::Binary)
+                        })
+                    })
+                    .on_change(move |value: &SharedString| {
+                        content.set(value.to_string());
+                        dirty.set(true);
+                    })
+                    .flex_1()
+                    .min_h(px(240.0))
+            },
+        ))
         .child(when(
             move || truncated.get(),
             || {

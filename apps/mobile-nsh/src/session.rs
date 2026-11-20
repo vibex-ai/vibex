@@ -29,26 +29,26 @@ use vibex_core::{
     AgentNotificationKind, AgentSessionRuntimeSelectionState, AgentSessionState, AgentTokenUsage,
     ApprovalResponder, CreateAgentSessionRequest, ElicitationAnswerValue, ElicitationField,
     ElicitationFieldKind, ElicitationRequest, ElicitationRequestStatus, ElicitationResolution,
-    ElicitationResolutionAction, FetchTimelineRequest, FileReadRequest, FileTreeRequest,
-    ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest, GitCommitRequest,
-    GitDiffRequest, GitHistoryRequest, GitRemoteActionKind, GitRemoteActionRequest,
-    GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest, GoalAction, GoalPhase,
-    MessageAttachment, MessageProvenance, PermissionRequest, PermissionRequestStatus,
-    PermissionResolution, PermissionResponseKind, PlanStepStatus, RenameAgentSessionRequest,
-    RequestId, ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest,
-    TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest,
-    TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId, WorkspaceId,
-    unix_timestamp_ms,
+    ElicitationResolutionAction, FetchTimelineRequest, FilePreviewKind, FileReadRequest,
+    FileTreeRequest, ForkAgentSessionRequest, GitChangeKind, GitCommitDetailRequest,
+    GitCommitRequest, GitDiffRequest, GitHistoryRequest, GitRemoteActionKind,
+    GitRemoteActionRequest, GitStageRequest, GitStatusSummary, GitWorktreeCreateRequest,
+    GoalAction, GoalPhase, MessageAttachment, MessageProvenance, PermissionRequest,
+    PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TerminalCreateRequest, TerminalId, TerminalResizeRequest, TerminalSession, TerminalStatus,
+    TerminalWriteRequest, TimelinePage, TimelinePayload, UserMessageDelivery, VibexSessionId,
+    WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{TimelineConversationTurn, TimelineModel, TimelineRow};
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
-    screens::files::{FileEntry, FilePreview},
+    screens::files::{FileEntry, FilePreview, FilePreviewKindView},
     screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
     screens::session::{
@@ -3453,10 +3453,11 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
+            let read_workspace = workspace.clone();
             let result = background(async move {
                 file_backend
                     .read_file(FileReadRequest {
-                        workspace_id: workspace,
+                        workspace_id: read_workspace,
                         path,
                         max_bytes: Some(512 * 1024),
                     })
@@ -3465,6 +3466,34 @@ impl SessionService {
             .await;
             match result {
                 Ok(Ok(file)) => {
+                    let kind = match file.preview_kind {
+                        FilePreviewKind::Markdown => FilePreviewKindView::Markdown,
+                        FilePreviewKind::Image => FilePreviewKindView::Image,
+                        FilePreviewKind::Binary => FilePreviewKindView::Binary,
+                        FilePreviewKind::Text => FilePreviewKindView::Text,
+                    };
+                    let image_uri = if kind == FilePreviewKindView::Image {
+                        let image_backend = service.file_backend.clone();
+                        let image_path = file.path.clone();
+                        let image_workspace = workspace;
+                        background(async move {
+                            image_backend
+                                .read_file_bytes(image_workspace, image_path, 8 * 1024 * 1024)
+                                .await
+                        })
+                        .await
+                        .ok()
+                        .and_then(Result::ok)
+                        .map(|bytes| {
+                            format!(
+                                "data:{};base64,{}",
+                                image_mime(&file.name),
+                                base64::engine::general_purpose::STANDARD.encode(bytes)
+                            )
+                        })
+                    } else {
+                        None
+                    };
                     *service.files_current.borrow_mut() = Some(file.path);
                     *service.files_revision.borrow_mut() = Some(file.content_revision);
                     service
@@ -3476,6 +3505,8 @@ impl SessionService {
                         body: file.content.unwrap_or_default(),
                         truncated: file.truncated,
                         language: file.language.unwrap_or_default(),
+                        kind,
+                        image_uri,
                     }));
                 }
                 Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
@@ -3489,6 +3520,14 @@ impl SessionService {
     /// Writes the edited text back, guarded by the revision it was read at.
     fn save_file(&self) {
         if self.files_saving.get_untracked() {
+            return;
+        }
+        if self.files_preview.get_untracked().is_some_and(|file| {
+            !matches!(
+                file.kind,
+                FilePreviewKindView::Text | FilePreviewKindView::Markdown
+            )
+        }) {
             return;
         }
         let Some(path) = self.files_current.borrow().clone() else {
@@ -4336,6 +4375,22 @@ fn default_option_label(response: PermissionResponseKind) -> &'static str {
             copy::text("Always allow", "本会话始终允许", "本工作階段一律允許")
         }
         PermissionResponseKind::Deny => copy::text("Deny", "拒绝", "拒絕"),
+    }
+}
+
+fn image_mime(name: &str) -> &'static str {
+    match name
+        .rsplit('.')
+        .next()
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => "image/png",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "svg" => "image/svg+xml",
+        _ => "image/jpeg",
     }
 }
 
