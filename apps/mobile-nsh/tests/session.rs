@@ -1072,6 +1072,7 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
+    assert!(app.screen().shows("main"), "the workspace is a subheader");
     app.press("role:button[Search sessions]").unwrap();
     app.type_text("text:Search sessions", "zzz").unwrap();
     app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
@@ -1220,6 +1221,7 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
+    assert!(app.screen().shows("main"), "the workspace is a subheader");
     app.press("role:button[Search sessions]").unwrap();
     app.type_text("text:Search sessions", "zzz").unwrap();
     app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))

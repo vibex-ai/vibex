@@ -4223,7 +4223,23 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
 struct DrawerGroup {
     id: String,
     name: String,
-    sessions: Vec<SessionSummary>,
+    count: usize,
+    rows: Vec<DrawerRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum DrawerRow {
+    Header { id: String, name: String },
+    Session(SessionSummary),
+}
+
+impl DrawerRow {
+    fn key(&self) -> String {
+        match self {
+            DrawerRow::Header { id, .. } => format!("header:{id}"),
+            DrawerRow::Session(session) => session.id.clone(),
+        }
+    }
 }
 
 fn drawer_groups(
@@ -4249,7 +4265,7 @@ fn drawer_groups(
                 .iter_mut()
                 .find(|group| group.id == session.project_id)
             {
-                Some(group) => group.sessions.push(session.clone()),
+                Some(group) => group.rows.push(DrawerRow::Session(session.clone())),
                 None => groups.push(DrawerGroup {
                     id: session.project_id.clone(),
                     name: if session.project_name.trim().is_empty() {
@@ -4257,14 +4273,45 @@ fn drawer_groups(
                     } else {
                         session.project_name.clone()
                     },
-                    sessions: vec![session.clone()],
+                    count: 0,
+                    rows: vec![DrawerRow::Session(session.clone())],
                 }),
             }
         }
         for group in &mut groups {
-            group
-                .sessions
-                .sort_by_key(|session| !pinned_ids.iter().any(|id| id == &session.id));
+            let mut sessions = group
+                .rows
+                .drain(..)
+                .filter_map(|row| match row {
+                    DrawerRow::Session(session) => Some(session),
+                    DrawerRow::Header { .. } => None,
+                })
+                .collect::<Vec<_>>();
+            sessions.sort_by_key(|session| !pinned_ids.iter().any(|id| id == &session.id));
+            group.count = sessions.len();
+            let mut rows = Vec::new();
+            let mut current: Option<String> = None;
+            for session in sessions {
+                let key = if session.workspace_id.trim().is_empty() {
+                    session.workspace_label.clone()
+                } else {
+                    session.workspace_id.clone()
+                };
+                let label = if session.workspace_label.trim().is_empty() {
+                    copy::text("Workspace", "工作区", "工作區").to_owned()
+                } else {
+                    session.workspace_label.clone()
+                };
+                if current.as_ref() != Some(&key) {
+                    rows.push(DrawerRow::Header {
+                        id: format!("{}:{key}", group.id),
+                        name: label,
+                    });
+                    current = Some(key);
+                }
+                rows.push(DrawerRow::Session(session));
+            }
+            group.rows = rows;
         }
         groups
     })
@@ -4324,7 +4371,7 @@ fn drawer_group(
                         .text_color(theme::text_muted),
                 )
                 .child(
-                    text(move || group.with(|group| group.sessions.len().to_string()))
+                    text(move || group.with(|group| group.count.to_string()))
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::text_muted),
                 )
@@ -4334,21 +4381,37 @@ fn drawer_group(
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
                 view().w_full().flex_col().gap(px(2.0)).child(each(
-                    move || group.with(|group| group.sessions.clone()),
-                    |session| session.id.clone(),
-                    move |session, _| {
+                    move || group.with(|group| group.rows.clone()),
+                    |row| row.key(),
+                    move |row, _| {
                         let on_select = on_select.clone();
                         let on_menu = on_menu.clone();
-                        session_row(
-                            session,
-                            active,
-                            on_select,
-                            on_menu,
-                            open,
-                            select_mode,
-                            selected,
-                            pinned,
-                        )
+                        match row.get_untracked() {
+                            DrawerRow::Header { name, .. } => view()
+                                .w_full()
+                                .px(px(theme::SPACING_LG))
+                                .pt(px(4.0))
+                                .child(
+                                    text(name)
+                                        .text_size(px(theme::font_micro()))
+                                        .text_color(theme::text_muted),
+                                )
+                                .into_element(),
+                            DrawerRow::Session(session) => {
+                                let session = signal(session);
+                                session_row(
+                                    session,
+                                    active,
+                                    on_select,
+                                    on_menu,
+                                    open,
+                                    select_mode,
+                                    selected,
+                                    pinned,
+                                )
+                                .into_element()
+                            }
+                        }
                     },
                 ))
             }
@@ -4357,7 +4420,7 @@ fn drawer_group(
 
 #[allow(clippy::too_many_arguments)]
 fn session_row(
-    session: ReadSignal<SessionSummary>,
+    session: Signal<SessionSummary>,
     active: Signal<Option<String>>,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
