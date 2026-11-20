@@ -1,0 +1,289 @@
+//! The settings sheet: the app's small set of device preferences.
+//!
+//! The GPUI client keeps a full Settings centre; this sheet carries the rows
+//! the `nsh` client can act on today — appearance, language, the connected
+//! runtime and the About facts — with the same wording and order the phone
+//! uses. The values live in the app's settings store, so they survive a
+//! restart, and the sheet is reachable both from the pairing page and from the
+//! session drawer.
+
+use std::rc::Rc;
+
+use nsh_base::{SheetEvent, sheet};
+use nsh_core::{element::ImageSrc, platform::Appearance, prelude::*};
+
+use crate::{copy, theme, ui::action};
+
+/// What the settings sheet may do, and the state it shows.
+#[derive(Clone)]
+pub struct SettingsHost {
+    pub open: Signal<bool>,
+    /// The appearance the app is pinned to, or `System`.
+    pub appearance: Signal<Appearance>,
+    /// The language the app is pinned to, or `System`.
+    pub language: Signal<copy::LanguagePreference>,
+    /// Whether finished actions play the device's feedback.
+    pub haptics: Signal<bool>,
+    /// Whether a running turn or the terminal holds the display awake.
+    pub keep_screen_on: Signal<bool>,
+    /// The connected runtime's label, when there is one.
+    pub runtime: Signal<Option<SharedString>>,
+    pub on_appearance: Rc<dyn Fn(Appearance)>,
+    pub on_language: Rc<dyn Fn(copy::LanguagePreference)>,
+    pub on_haptics: Rc<dyn Fn(bool)>,
+    pub on_keep_screen_on: Rc<dyn Fn(bool)>,
+    pub on_disconnect: Rc<dyn Fn()>,
+    pub on_clear_runtimes: Rc<dyn Fn()>,
+    pub on_close: Rc<dyn Fn()>,
+}
+
+/// The sheet.
+pub fn settings(host: SettingsHost) -> impl IntoElement {
+    let open = host.open;
+    let on_close = host.on_close.clone();
+    let on_close_sheet = on_close.clone();
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(next, _) = event
+                && !next
+            {
+                on_close_sheet();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_MD))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Settings", "设置", "設定"))
+                        .text_size(px(theme::FONT_HEADING))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(runtime_section(host.clone()))
+                .child(section(
+                    copy::text("Appearance", "外观", "外觀"),
+                    appearance_choices(host.appearance, host.on_appearance.clone()),
+                ))
+                .child(section(
+                    copy::text("Language", "语言", "語言"),
+                    language_choices(host.language, host.on_language.clone()),
+                ))
+                .child(section(
+                    copy::text("Feedback", "反馈", "回饋"),
+                    view()
+                        .w_full()
+                        .flex_col()
+                        .gap(px(theme::SPACING_XS))
+                        .child(toggle_row(
+                            copy::text("Haptic feedback", "触感反馈", "觸感回饋"),
+                            host.haptics,
+                            host.on_haptics.clone(),
+                        ))
+                        .child(toggle_row(
+                            copy::text("Keep the screen on", "保持屏幕常亮", "保持螢幕常亮"),
+                            host.keep_screen_on,
+                            host.on_keep_screen_on.clone(),
+                        )),
+                ))
+                .child(section(
+                    copy::text("About", "关于", "關於"),
+                    view()
+                        .w_full()
+                        .gap(px(theme::SPACING_XS))
+                        .child(value_row(copy::text("Version", "版本", "版本"), || {
+                            concat!("Vibex ", env!("CARGO_PKG_VERSION")).to_owned()
+                        }))
+                        .child(value_row(copy::text("License", "许可", "授權"), || {
+                            "AGPL-3.0-or-later".to_owned()
+                        })),
+                ))
+                .child({
+                    let on_clear = host.on_clear_runtimes.clone();
+                    action::secondary(
+                        copy::text(
+                            "Remove saved runtimes",
+                            "移除已保存的运行时",
+                            "移除已儲存的執行環境",
+                        ),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || on_clear(),
+                    )
+                    .w_full()
+                })
+                .child({
+                    let on_close = on_close.clone();
+                    action::secondary(
+                        copy::text("Close", "关闭", "關閉"),
+                        icon(include_str!("../../assets/icons/x.svg")),
+                        false,
+                        move || on_close(),
+                    )
+                    .w_full()
+                }),
+        )
+}
+
+fn runtime_section(host: SettingsHost) -> impl IntoElement {
+    let runtime = host.runtime;
+    let on_disconnect = host.on_disconnect.clone();
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .child(section_label(copy::text("Runtime", "运行时", "執行環境")))
+        .child(value_row(
+            copy::text("Server", "服务器", "伺服器"),
+            move || {
+                runtime
+                    .get()
+                    .map(|label| label.to_string())
+                    .unwrap_or_else(|| copy::text("Not connected", "未连接", "未連線").to_owned())
+            },
+        ))
+        .child(when(
+            move || runtime.get().is_some(),
+            move || {
+                let on_disconnect = on_disconnect.clone();
+                action::secondary(
+                    copy::text("Disconnect", "断开连接", "中斷連線"),
+                    icon(include_str!("../../assets/icons/plug-zap.svg")),
+                    false,
+                    move || on_disconnect(),
+                )
+                .w_full()
+            },
+        ))
+}
+
+fn appearance_choices(
+    appearance: Signal<Appearance>,
+    on_appearance: Rc<dyn Fn(Appearance)>,
+) -> impl IntoElement {
+    let choices = [
+        (
+            Appearance::System,
+            copy::text("System", "跟随系统", "跟隨系統"),
+        ),
+        (Appearance::Light, copy::text("Light", "浅色", "淺色")),
+        (Appearance::Dark, copy::text("Dark", "深色", "深色")),
+    ];
+    view()
+        .flex_row()
+        .w_full()
+        .gap(px(theme::SPACING_SM))
+        .children(choices.into_iter().map({
+            let on_appearance = on_appearance.clone();
+            move |(choice, label)| {
+                let on_appearance = on_appearance.clone();
+                action::secondary(
+                    label,
+                    icon(include_str!("../../assets/icons/image.svg")),
+                    appearance.with(|current| *current == choice),
+                    move || on_appearance(choice),
+                )
+                .flex_1()
+            }
+        }))
+}
+
+fn language_choices(
+    language: Signal<copy::LanguagePreference>,
+    on_language: Rc<dyn Fn(copy::LanguagePreference)>,
+) -> impl IntoElement {
+    use copy::LanguagePreference as Choice;
+    let choices = [
+        (Choice::System, copy::text("System", "跟随系统", "跟隨系統")),
+        (Choice::English, "English"),
+        (Choice::SimplifiedChinese, "简体中文"),
+        (Choice::TraditionalChinese, "繁體中文"),
+    ];
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(theme::SPACING_XS))
+        .children(choices.into_iter().map({
+            let on_language = on_language.clone();
+            move |(choice, label)| {
+                let on_language = on_language.clone();
+                action::secondary(
+                    label,
+                    icon(include_str!("../../assets/icons/check.svg")),
+                    language.with(|current| *current == choice),
+                    move || on_language(choice),
+                )
+                .w_full()
+            }
+        }))
+}
+
+fn toggle_row(
+    label: &'static str,
+    enabled: Signal<bool>,
+    on_toggle: Rc<dyn Fn(bool)>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .child(view().flex_1().child(value_row(label, move || {
+            if enabled.get() {
+                copy::text("On", "开", "開").to_owned()
+            } else {
+                copy::text("Off", "关", "關").to_owned()
+            }
+        })))
+        .child(action::secondary(
+            copy::text("Toggle", "切换", "切換"),
+            icon(include_str!("../../assets/icons/check.svg")),
+            false,
+            move || on_toggle(!enabled.get_untracked()),
+        ))
+}
+
+fn section(label: &'static str, body: impl IntoElement) -> impl IntoElement {
+    view()
+        .w_full()
+        .gap(px(theme::SPACING_XS))
+        .child(section_label(label))
+        .child(body)
+}
+
+fn section_label(label: &'static str) -> impl IntoElement {
+    text(label)
+        .text_size(px(theme::FONT_MICRO))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::text_muted)
+}
+
+fn value_row(label: &'static str, value: impl Fn() -> String + 'static) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .justify_between()
+        .gap(px(theme::SPACING_SM))
+        .child(
+            text(label)
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::foreground),
+        )
+        .child(
+            text(value)
+                .truncate()
+                .text_size(px(theme::FONT_DETAIL))
+                .text_color(theme::text_muted),
+        )
+}
+
+/// An SVG from this crate's assets, drawn inline.
+fn icon(markup: &'static str) -> ImageSrc {
+    ImageSrc::svg_markup(markup)
+}

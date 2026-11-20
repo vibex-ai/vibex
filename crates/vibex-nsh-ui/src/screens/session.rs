@@ -23,7 +23,9 @@ use nsh_core::{
 };
 
 use crate::{
-    copy, theme,
+    copy,
+    screens::connecting::{self as connecting_screen, ConnectionState},
+    theme,
     ui::{action, brand, field},
 };
 
@@ -260,6 +262,12 @@ pub struct SessionHost {
     pub draft: Signal<String>,
     pub sending: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
+    /// Where the connection to the runtime stands.
+    pub connection: Signal<ConnectionState>,
+    /// Why the last connection attempt failed, when it did.
+    pub connection_error: Signal<Option<SharedString>>,
+    /// Asks the service to reconnect now.
+    pub on_retry: Action,
     /// The connected runtime's label, shown in the drawer.
     pub runtime: Signal<Option<SharedString>>,
     /// The permission the Agent waits on, shown above the composer.
@@ -287,6 +295,8 @@ pub struct SessionHost {
     pub on_remove_attachment: Rc<dyn Fn(&str)>,
     /// Starts a new session in the open session's workspace.
     pub on_new_session: Action,
+    /// Opens the settings sheet over the shell.
+    pub on_open_settings: Action,
     /// The terminal surface, when it is open over the shell.
     pub terminal_open: Signal<bool>,
     pub terminal_title: Signal<Option<SharedString>>,
@@ -370,7 +380,40 @@ pub struct SessionHost {
 }
 
 /// The session shell, or the terminal or files surface over it.
+///
+/// A connection that is not up yet (or came back down) shows the connecting
+/// page while there is no transcript to hold on to; once a transcript exists,
+/// the shell stays and a banner says the connection is being restored.
 pub fn session(host: SessionHost) -> impl IntoElement {
+    let connection = host.connection;
+    let timeline = host.timeline;
+    let error = host.connection_error;
+    let on_retry = host.on_retry.clone();
+    let on_switch_runtime = host.on_switch_runtime.clone();
+    let on_disconnect = host.on_disconnect.clone();
+    let shell_host = host.clone();
+    view().flex_1().bg(theme::background).child(
+        when(
+            move || {
+                connection.get() != ConnectionState::Online
+                    && timeline.with(|timeline| timeline.is_empty())
+            },
+            move || {
+                connecting_screen::connecting(connecting_screen::ConnectingHost {
+                    state: connection,
+                    error,
+                    on_retry: on_retry.clone(),
+                    on_switch_runtime: on_switch_runtime.clone(),
+                    on_disconnect: on_disconnect.clone(),
+                })
+            },
+        )
+        .otherwise(move || surfaces(shell_host.clone())),
+    )
+}
+
+/// The shell and the full-screen surfaces it can open over itself.
+fn surfaces(host: SessionHost) -> impl IntoElement {
     let terminal_open = host.terminal_open;
     let files_open = host.files_open;
     let git_open = host.git_open;
@@ -455,12 +498,19 @@ pub fn session(host: SessionHost) -> impl IntoElement {
 /// The shell proper: header, transcript, cards, composer and drawer.
 fn shell(host: SessionHost) -> impl IntoElement {
     let drawer_open = signal(false);
+    let connection = host.connection;
+    let connection_error = host.connection_error;
+    let on_retry = host.on_retry.clone();
 
     view()
         .flex_1()
         .bg(theme::background)
         .flex_col()
         .child(header(host.clone(), drawer_open))
+        .child(when(
+            move || connection.get() != ConnectionState::Online,
+            move || connection_banner(connection, connection_error, on_retry.clone()),
+        ))
         .child(
             view()
                 .flex_1()
@@ -585,6 +635,70 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
                     copy::text("Refresh", "刷新", "重新整理"),
                     move || refresh(),
                 )),
+        )
+}
+
+/// The strip under the header while the connection is being restored.
+///
+/// A transcript already on screen is the reader's, so a drop never replaces
+/// it with the connecting page; the strip says what happened and offers the
+/// retry the page would have.
+fn connection_banner(
+    connection: Signal<ConnectionState>,
+    error: Signal<Option<SharedString>>,
+    on_retry: Action,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_XS))
+        .border_b_1()
+        .border_b_color(theme::border_subtle)
+        .bg(theme::background_card)
+        .child(
+            view()
+                .w(px(8.0))
+                .h(px(8.0))
+                .flex_shrink_0()
+                .rounded(px(4.0))
+                .bg(move || match connection.get() {
+                    ConnectionState::Connecting => theme::color_token("warning"),
+                    ConnectionState::Online => theme::color_token("chart-1"),
+                    ConnectionState::Offline => theme::accent_red(),
+                }),
+        )
+        .child(
+            text(move || {
+                error.get().unwrap_or_else(|| {
+                    match connection.get() {
+                        ConnectionState::Connecting => {
+                            copy::text("Reconnecting...", "正在重新连接…", "正在重新連線…")
+                        }
+                        ConnectionState::Online => copy::text("Connected", "已连接", "已連線"),
+                        ConnectionState::Offline => {
+                            copy::text("Desktop is unavailable", "桌面端不可用", "桌面版無法使用")
+                        }
+                    }
+                    .into()
+                })
+            })
+            .flex_1()
+            .truncate()
+            .text_size(px(theme::FONT_CAPTION))
+            .text_color(theme::text_secondary),
+        )
+        .child(
+            action::secondary(
+                copy::text("Retry", "重试", "重試"),
+                icon(include_str!("../../assets/icons/refresh.svg")),
+                false,
+                move || on_retry(),
+            )
+            .disabled(move || connection.get() == ConnectionState::Connecting)
+            .disabled_style(|style| style.opacity(0.4)),
         )
 }
 
@@ -1149,7 +1263,17 @@ fn question_card(
                 .text_size(px(theme::FONT_CAPTION))
                 .text_color(theme::text_secondary),
         )
-        .children(elements)
+        // A question can carry more fields than a phone's card can show at
+        // once; the fields scroll while the title and the submit stay put.
+        .child(
+            scroll().max_h(px(280.0)).child(
+                view()
+                    .w_full()
+                    .flex_col()
+                    .gap(px(theme::SPACING_SM))
+                    .children(elements),
+            ),
+        )
         .child(when(
             move || error.get().is_some(),
             move || {
@@ -1348,11 +1472,14 @@ fn composer(host: SessionHost) -> impl IntoElement {
             }
             let text = draft.get_untracked();
             let text = text.trim();
-            if text.is_empty() {
+            // A picture or a file on its own is a prompt, the same way it is
+            // on the GPUI client; the send action is enabled for it.
+            if text.is_empty() && attachments.with(|items| items.is_empty()) {
                 return;
             }
+            // The service clears the field once the runtime accepted the
+            // message, so a failed send leaves the draft where it was.
             send(text);
-            draft.set(String::new());
         })
     };
     view()
@@ -1586,6 +1713,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_open_files = host.on_open_files.clone();
     let on_open_git = host.on_open_git.clone();
     let on_session_menu = host.on_session_menu.clone();
+    let on_open_settings = host.on_open_settings.clone();
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -1707,6 +1835,15 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                     let on_switch = on_switch_runtime.clone();
                                     move || on_switch()
                                 },
+                            )
+                            .w_full(),
+                        )
+                        .child(
+                            action::secondary(
+                                copy::text("Settings", "设置", "設定"),
+                                icon(include_str!("../../assets/icons/settings.svg")),
+                                false,
+                                move || on_open_settings(),
                             )
                             .w_full(),
                         )

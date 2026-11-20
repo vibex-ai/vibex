@@ -107,3 +107,40 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeSetDeviceName(
     })
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
+
+/// The Android back key: consumes it when a surface of the app can close.
+///
+/// The host calls this before `NshView.handleBack`, so a drawer, a file
+/// preview or the terminal closes before the activity does. The engine
+/// handles the press on its own thread through the app's poller.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeBack(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> jni::sys::jboolean {
+    if crate::host::back_intercept() {
+        crate::host::request_back();
+        1
+    } else {
+        0
+    }
+}
+
+/// The pending screen-awake change: -1 none, 0 off, 1 on. The host applies it
+/// to its window flag on its own UI loop.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeKeepScreenOn(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i32 {
+    crate::host::take_keep_screen_on()
+}
+
+/// The pending connection-service change: -1 none, 0 stop, 1 start.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeConnectionService(
+    _env: *mut c_void,
+    _class: *mut c_void,
+) -> i32 {
+    crate::host::take_connection_service()
+}

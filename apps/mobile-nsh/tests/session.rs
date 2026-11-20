@@ -11,6 +11,7 @@ use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
+use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview};
 use vibex_nsh_ui::screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview};
 use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
@@ -119,6 +120,28 @@ fn QuestionShell() -> impl IntoElement {
     ))
 }
 
+/// The same shell while its runtime is unreachable and its transcript is on
+/// screen: the conversation stays, with a reconnecting strip.
+#[component]
+fn OfflineTranscriptShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.connection = signal(ConnectionState::Offline);
+    host.connection_error = signal(None);
+    session::session(host)
+}
+
+/// The same shell while its runtime is unreachable.
+#[component]
+fn OfflineShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.connection = signal(ConnectionState::Offline);
+    host.connection_error = signal(Some(SharedString::from(
+        "The runtime could not be reached.",
+    )));
+    host.timeline = signal(Vec::new());
+    session::session(host)
+}
+
 fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
@@ -126,6 +149,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let draft = signal(String::new());
     let sending = signal(false);
     let error = signal(None::<SharedString>);
+    let connection = signal(ConnectionState::Online);
+    let connection_error = signal(None::<SharedString>);
     let runtime = signal(Some(SharedString::from("desktop · reachable")));
     let pending = signal(pending);
     let question = signal(question);
@@ -370,13 +395,19 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         timeline.set(transcript(id));
     });
     let send = Rc::new(move |text: &str| {
+        draft.set(String::new());
         let sequence = timeline.with(|timeline| timeline.len() + 1);
+        let body = if text.is_empty() {
+            "sent an attachment".to_owned()
+        } else {
+            text.to_owned()
+        };
         timeline.update(|timeline| {
             timeline.push(entry(
                 &format!("sent:{sequence}"),
                 EntryKind::User,
                 "",
-                text,
+                &body,
             ))
         });
     });
@@ -419,6 +450,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         draft,
         sending,
         error,
+        connection,
+        connection_error,
+        on_retry: Rc::new(|| {}),
         runtime,
         pending,
         question,
@@ -438,6 +472,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_command_query,
         on_mention_query,
         on_new_session,
+        on_open_settings: Rc::new(|| {}),
         terminal_open,
         terminal_title,
         terminal_error,
@@ -531,10 +566,47 @@ fn the_shell_opens_on_the_first_session() {
 }
 
 #[test]
+fn an_unreachable_runtime_shows_the_connecting_pages_ways_back() {
+    let mut config = EngineConfig::new(Root::of::<OfflineShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Desktop is unavailable").unwrap();
+    assert!(app.screen().shows("The runtime could not be reached."));
+    for action in ["Retry", "Switch runtime", "Disconnect"] {
+        assert!(
+            app.screen().shows(action),
+            "`{action}` is offered on the unavailable page"
+        );
+    }
+}
+
+#[test]
+fn a_dropped_connection_keeps_the_transcript_and_offers_retry() {
+    let mut config = EngineConfig::new(Root::of::<OfflineTranscriptShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Desktop is unavailable").unwrap();
+    assert!(app.screen().shows("Morning. The build is green."));
+    assert!(app.screen().shows("Retry"));
+}
+
+#[test]
+fn a_photo_alone_can_be_sent() {
+    let mut app = start();
+    app.press("role:button[Attach a photo]").unwrap();
+    app.press("role:button[Send]").unwrap();
+    app.wait_for("sent an attachment").unwrap();
+}
+
+#[test]
 fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
+    assert!(
+        app.screen().shows("Settings"),
+        "the drawer carries the way into settings"
+    );
     app.press("Fix the tests").unwrap();
     app.wait_for("Please fix the tests").unwrap();
     app.wait_for_gone(
@@ -626,6 +698,10 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
+    assert!(
+        app.screen().shows("Settings"),
+        "the drawer carries the way into settings"
+    );
     app.press("role:button[New session]").unwrap();
     app.wait_for("Claude · Sonnet").unwrap();
     app.press("role:button[Create]").unwrap();

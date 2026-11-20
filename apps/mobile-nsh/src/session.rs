@@ -11,12 +11,14 @@ use std::{
     collections::BTreeMap,
     rc::Rc,
     sync::Arc,
+    time::Duration,
 };
 
 use base64::Engine as _;
 use nsh_base::{Terminal, TerminalApi};
 use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::prelude::*;
+use nsh_core::storage::Storage;
 use vibex_backend::{
     AgentBackend, BackendError, BackendEvent, BackendResult, FileBackend, GitBackend,
     MutationRequest, TerminalBackend, WorkspaceBackend, WorkspaceSummary,
@@ -39,6 +41,7 @@ use vibex_desktop_model::TimelineModel;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
+    screens::connecting::ConnectionState,
     screens::files::{FileEntry, FilePreview},
     screens::git::{CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview},
     screens::new_session::{RuntimeChoice, WorkspaceChoice},
@@ -55,9 +58,18 @@ use crate::pairing::error_text;
 /// How many timeline items one read asks for.
 const TIMELINE_LIMIT: u32 = 200;
 
+/// Where the per-session composer drafts are kept.
+const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
+
+/// The wait before the first reconnect attempt, and its ceiling.
+const RECONNECT_MIN_MS: u64 = 500;
+const RECONNECT_MAX_MS: u64 = 15_000;
+
 /// The session shell's state and actions.
 #[derive(Clone)]
 pub struct SessionService {
+    /// The credential's host id, for the app's runtime bookkeeping.
+    bundle_host_id: Rc<String>,
     backend: Arc<dyn AgentBackend>,
     terminal_backend: Arc<dyn TerminalBackend>,
     file_backend: Arc<dyn FileBackend>,
@@ -130,8 +142,22 @@ pub struct SessionService {
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
+    /// Where the connection to the runtime stands.
+    connection: Signal<ConnectionState>,
+    /// Why the last connection attempt failed, when it did.
+    connection_error: Signal<Option<SharedString>>,
+    /// The service lives until its runtime is replaced.
+    alive: Rc<Cell<bool>>,
+    /// A retry asked for by the page, consumed by the connection loop.
+    retry_now: Rc<Cell<bool>>,
+    /// The composer draft of each session this phone has seen.
+    drafts: Rc<RefCell<BTreeMap<String, String>>>,
+    /// The serialized drafts last written, so an unchanged map is not rewritten.
+    drafts_snapshot: Rc<RefCell<String>>,
     on_disconnect: Rc<dyn Fn()>,
     on_switch_runtime: Rc<dyn Fn()>,
+    on_open_settings: Rc<dyn Fn()>,
+    on_runtime_renamed: Rc<dyn Fn(&str)>,
 }
 
 impl SessionService {
@@ -140,6 +166,8 @@ impl SessionService {
         bundle: &MobileCredentialBundle,
         on_disconnect: Rc<dyn Fn()>,
         on_switch_runtime: Rc<dyn Fn()>,
+        on_open_settings: Rc<dyn Fn()>,
+        on_runtime_renamed: Rc<dyn Fn(&str)>,
     ) -> BackendResult<Self> {
         let backend = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
@@ -149,6 +177,7 @@ impl SessionService {
         let backend: Arc<dyn AgentBackend> = backend;
         let runtime = bundle.host_label();
         let service = Self {
+            bundle_host_id: Rc::new(bundle.host_id().to_owned()),
             backend,
             terminal_backend,
             file_backend,
@@ -216,12 +245,91 @@ impl SessionService {
             runtime_options: Rc::new(RefCell::new(Vec::new())),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
+            connection: signal(ConnectionState::Connecting),
+            connection_error: signal(None),
+            alive: Rc::new(Cell::new(true)),
+            retry_now: Rc::new(Cell::new(false)),
+            drafts: Rc::new(RefCell::new(load_drafts())),
+            drafts_snapshot: Rc::new(RefCell::new(String::new())),
             on_disconnect,
             on_switch_runtime,
+            on_open_settings,
+            on_runtime_renamed,
         };
-        service.refresh();
-        service.subscribe();
+        service.start_connection();
+        service.start_draft_saver();
+        service.start_screen_policy();
         Ok(service)
+    }
+
+    /// Stops the service's tasks when its runtime is replaced.
+    pub fn shutdown(&self) {
+        self.alive.set(false);
+        crate::host::set_keep_screen_on(false);
+        self.terminal_generation
+            .set(self.terminal_generation.get().wrapping_add(1));
+        self.stash_draft();
+        self.persist_drafts();
+    }
+
+    /// The runtime this service speaks to.
+    pub fn host_id(&self) -> String {
+        (*self.bundle_host_id).clone()
+    }
+
+    /// Whether a surface of the shell can consume the system back key.
+    pub fn back_intercept(&self) -> bool {
+        self.session_actions.get_untracked().is_some()
+            || self.new_session_open.get_untracked()
+            || self.terminal_menu.get_untracked()
+            || self.terminal_open.get_untracked()
+            || self.files_open.get_untracked()
+            || self.git_open.get_untracked()
+    }
+
+    /// Closes the top-most surface the shell opened, if any.
+    pub fn handle_back(&self) -> bool {
+        if self.session_actions.get_untracked().is_some() {
+            self.session_actions.set(None);
+            return true;
+        }
+        if self.new_session_open.get_untracked() {
+            self.new_session_open.set(false);
+            return true;
+        }
+        if self.terminal_menu.get_untracked() {
+            self.terminal_menu.set(false);
+            return true;
+        }
+        if self.terminal_open.get_untracked() {
+            self.close_terminal();
+            return true;
+        }
+        if self.files_open.get_untracked() {
+            self.files_back();
+            return true;
+        }
+        if self.git_open.get_untracked() {
+            self.git_back();
+            return true;
+        }
+        false
+    }
+
+    /// Reconnects when the app comes back to the foreground.
+    pub fn resume(&self) {
+        if self.connection.get_untracked() == ConnectionState::Online {
+            self.refresh();
+        } else {
+            self.retry();
+        }
+    }
+
+    /// Asks the connection loop to try again now.
+    pub fn retry(&self) {
+        self.connection_error.set(None);
+        self.connection.set(ConnectionState::Connecting);
+        self.retry_now.set(true);
     }
 
     /// The shell's bindings and callbacks.
@@ -233,6 +341,12 @@ impl SessionService {
             draft: self.draft,
             sending: self.sending,
             error: self.error,
+            connection: self.connection,
+            connection_error: self.connection_error,
+            on_retry: {
+                let service = self.clone();
+                Rc::new(move || service.retry())
+            },
             runtime: self.runtime,
             pending: self.pending,
             question: self.question,
@@ -293,6 +407,7 @@ impl SessionService {
                 Rc::new(move || service.refresh())
             },
             on_disconnect: self.on_disconnect.clone(),
+            on_open_settings: self.on_open_settings.clone(),
             on_permission: {
                 let service = self.clone();
                 Rc::new(move |request_id: &str, choice: PermissionChoice| {
@@ -480,58 +595,198 @@ impl SessionService {
         }
     }
 
-    /// Reloads the session list, opening the newest session when none is open.
+    /// Reloads the session list without disturbing the live stream.
     fn refresh(&self) {
         let service = self.clone();
-        let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move { backend.list_sessions(false).await }).await;
-            match result {
-                Ok(Ok(sessions)) => {
-                    let rows = sessions.iter().map(summary).collect::<Vec<_>>();
-                    service.sessions.set(rows);
-                    if service.active.get_untracked().is_none()
-                        && let Some(first) = sessions.first()
-                    {
-                        service.open(first.id.as_str());
+            service.reload_sessions().await;
+        });
+    }
+
+    /// Opens the runtime's event stream and keeps it open.
+    ///
+    /// A phone that loses the desktop has to find it again by itself: the loop
+    /// re-subscribes with a capped backoff, refetches the session list on every
+    /// attempt, and leaves the connecting page (or the banner) up while it
+    /// does. The service's own tasks stop with it when the runtime is replaced.
+    fn start_connection(&self) {
+        let service = self.clone();
+        spawn(async move {
+            service.connection_loop().await;
+        });
+    }
+
+    async fn connection_loop(&self) {
+        let mut delay = RECONNECT_MIN_MS;
+        while self.alive.get() {
+            if self.retry_now.replace(false) {
+                delay = RECONNECT_MIN_MS;
+            }
+            self.connection.set(ConnectionState::Connecting);
+            let subscription = match self.backend.subscribe() {
+                Ok(subscription) => subscription,
+                Err(error) => {
+                    self.connection.set(ConnectionState::Offline);
+                    self.connection_error.set(Some(error_text(&error)));
+                    delay = (delay * 2).min(RECONNECT_MAX_MS);
+                    self.wait_before_retry(delay).await;
+                    continue;
+                }
+            };
+            let listed = self.reload_sessions().await;
+            if listed {
+                self.connection.set(ConnectionState::Online);
+                self.connection_error.set(None);
+            }
+            let mut got_event = false;
+            let mut subscription = subscription;
+            while self.alive.get() {
+                match subscription.next().await {
+                    Ok(Some(event)) => {
+                        got_event = true;
+                        let lost = matches!(event, BackendEvent::Disconnected);
+                        self.apply_event(event);
+                        if lost {
+                            break;
+                        }
+                    }
+                    _ => break,
+                }
+            }
+            if !self.alive.get() {
+                break;
+            }
+            self.connection.set(ConnectionState::Connecting);
+            // A stream that carried events gets a fresh, short delay; one that
+            // dropped at once backs off, as an unreachable runtime does.
+            delay = if got_event {
+                RECONNECT_MIN_MS
+            } else {
+                (delay * 2).min(RECONNECT_MAX_MS)
+            };
+            self.wait_before_retry(delay).await;
+        }
+    }
+
+    /// Sleeps `delay` in short slices so a retry the page asked for is heard.
+    async fn wait_before_retry(&self, delay: u64) {
+        let mut waited = 0;
+        while waited < delay && self.alive.get() {
+            timer(Duration::from_millis(500)).await;
+            waited += 500;
+            if self.retry_now.get() {
+                break;
+            }
+        }
+    }
+
+    /// Lists the runtime's sessions and keeps the open one if it still exists.
+    async fn reload_sessions(&self) -> bool {
+        let backend = self.backend.clone();
+        let result = background(async move { backend.list_sessions(false).await }).await;
+        match result {
+            Ok(Ok(sessions)) => {
+                let rows = sessions.iter().map(summary).collect::<Vec<_>>();
+                let active_exists = self.active.get_untracked().is_some_and(|active| {
+                    sessions.iter().any(|session| session.id.as_str() == active)
+                });
+                self.sessions.set(rows);
+                if !active_exists {
+                    if let Some(first) = sessions.first() {
+                        self.open(first.id.as_str());
+                    } else {
+                        self.active.set(None);
+                        self.timeline.set(Vec::new());
+                        *self.model.borrow_mut() = TimelineModel::default();
                     }
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("listing sessions did not finish: {error}"),
-                )),
+                self.connection.set(ConnectionState::Online);
+                self.connection_error.set(None);
+                true
+            }
+            Ok(Err(error)) => {
+                self.connection.set(ConnectionState::Offline);
+                self.connection_error.set(Some(error_text(&error)));
+                false
+            }
+            Err(error) => {
+                self.connection.set(ConnectionState::Offline);
+                self.connection_error.set(Some(
+                    format!("listing the sessions did not finish: {error}").into(),
+                ));
+                false
+            }
+        }
+    }
+
+    /// Keeps the per-session draft map on the device.
+    fn start_draft_saver(&self) {
+        let service = self.clone();
+        spawn(async move {
+            loop {
+                timer(Duration::from_secs(1)).await;
+                if !service.alive.get() {
+                    break;
+                }
+                service.stash_draft();
+                service.persist_drafts();
             }
         });
     }
 
-    /// Follows the runtime's event stream for the life of the shell.
-    ///
-    /// The stream is the authority's: a live timeline item is applied to the
-    /// same projection the last read filled, so a streamed reply grows in
-    /// place. A stream that ends re-syncs the list once; the backend
-    /// reconnects on its next call.
-    fn subscribe(&self) {
-        let subscription = match self.backend.subscribe() {
-            Ok(subscription) => subscription,
-            Err(_) => return,
-        };
+    /// Holds the display awake while a turn runs or the terminal is open, when
+    /// the reader asked for it.
+    fn start_screen_policy(&self) {
         let service = self.clone();
         spawn(async move {
-            let mut subscription = subscription;
-            // The stream ends (or the transport drops): one refresh re-syncs
-            // the list, and the backend reconnects on its next call.
-            while let Ok(Some(event)) = subscription.next().await {
-                service.apply_event(event);
+            loop {
+                timer(Duration::from_millis(500)).await;
+                if !service.alive.get() {
+                    break;
+                }
+                let running = service.sessions.with(|sessions| {
+                    sessions
+                        .iter()
+                        .any(|session| session.state == SessionState::Running)
+                });
+                let awake = crate::settings::keep_screen_on()
+                    && (running || service.terminal_open.get_untracked());
+                crate::host::set_keep_screen_on(awake);
             }
-            service.refresh();
         });
+    }
+
+    /// Moves the open composer's text into the draft map.
+    fn stash_draft(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let text = self.draft.get_untracked();
+        let mut drafts = self.drafts.borrow_mut();
+        if text.is_empty() {
+            drafts.remove(&active);
+        } else {
+            drafts.insert(active, text);
+        }
+    }
+
+    fn persist_drafts(&self) {
+        let Ok(text) = serde_json::to_string(&*self.drafts.borrow()) else {
+            return;
+        };
+        if *self.drafts_snapshot.borrow() == text {
+            return;
+        }
+        if Storage::set_item(DRAFTS_KEY, text.clone()).is_ok() {
+            *self.drafts_snapshot.borrow_mut() = text;
+        }
     }
 
     /// Applies one backend event to what the shell shows.
     fn apply_event(&self, event: BackendEvent) {
         match event {
             BackendEvent::Timeline(live) => {
+                self.note_online();
                 if self.active.get_untracked().as_deref() == Some(live.session_id.as_str()) {
                     let changed = self.model.borrow_mut().apply_live(live);
                     if changed {
@@ -540,6 +795,7 @@ impl SessionService {
                 }
             }
             BackendEvent::SessionUpdated(session) => {
+                self.note_online();
                 let row = summary(&session);
                 self.sessions.update(|sessions| {
                     if let Some(existing) =
@@ -552,12 +808,15 @@ impl SessionService {
                 });
             }
             BackendEvent::SessionsRemoved(removed) => {
+                self.note_online();
                 let ids = removed
                     .iter()
                     .map(|id| id.as_str().to_owned())
                     .collect::<Vec<_>>();
                 self.sessions
                     .update(|sessions| sessions.retain(|session| !ids.contains(&session.id)));
+                self.drafts.borrow_mut().retain(|id, _| !ids.contains(id));
+                self.persist_drafts();
                 let active = self.active.get_untracked();
                 if active.as_ref().is_some_and(|active| ids.contains(active)) {
                     self.active.set(None);
@@ -565,7 +824,40 @@ impl SessionService {
                     *self.model.borrow_mut() = TimelineModel::default();
                 }
             }
+            // A gap in the stream is not a reason to trust what is on screen:
+            // the projection has moved on without this phone, so both the list
+            // and the open transcript are read again.
+            BackendEvent::Lagged { refetch, .. } => {
+                self.connection.set(ConnectionState::Connecting);
+                if let Some(session_id) = refetch.session_id.clone() {
+                    self.reload(&session_id);
+                } else if let Some(active) = self.active.get_untracked()
+                    && let Ok(session_id) = VibexSessionId::parse(active)
+                {
+                    self.reload(&session_id);
+                }
+                self.refresh();
+            }
+            BackendEvent::ProjectionInvalidated(_) => {
+                self.refresh();
+            }
+            BackendEvent::RuntimeRenamed(renamed) => {
+                let name = renamed.display_name.clone();
+                self.runtime.set(Some(name.clone().into()));
+                (self.on_runtime_renamed)(&name);
+            }
+            BackendEvent::DeviceRenamed(_) => {}
+            BackendEvent::Disconnected => {
+                self.connection.set(ConnectionState::Connecting);
+            }
             _ => {}
+        }
+    }
+
+    fn note_online(&self) {
+        if self.connection.get_untracked() != ConnectionState::Online {
+            self.connection.set(ConnectionState::Online);
+            self.connection_error.set(None);
         }
     }
 
@@ -578,6 +870,27 @@ impl SessionService {
             ));
             return;
         };
+        // Each session owns its draft; switching saves the one being left
+        // behind and brings back what the new one had.
+        let previous = self.active.get_untracked();
+        if previous.as_deref() != Some(session_id.as_str()) {
+            self.stash_draft();
+            let stored = self
+                .drafts
+                .borrow()
+                .get(session_id.as_str())
+                .cloned()
+                .unwrap_or_default();
+            self.draft.set(stored);
+        }
+        // Files and Git belong to the session's workspace; a session in
+        // another worktree must not keep the previous one's paths or open
+        // surfaces.
+        *self.files_workspace.borrow_mut() = None;
+        self.files_open.set(false);
+        self.git_open.set(false);
+        self.terminal_open.set(false);
+        self.terminal_menu.set(false);
         self.active.set(Some(session_id.as_str().to_owned()));
         self.timeline.set(Vec::new());
         self.pending.set(None);
@@ -619,6 +932,11 @@ impl SessionService {
         }
         self.sending.set(true);
         self.error.set(None);
+        let sent_text = text.clone();
+        let sent_attachment_ids = attachments
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -636,8 +954,20 @@ impl SessionService {
             service.sending.set(false);
             match result {
                 Ok(Ok(page)) => {
-                    service.attachments.set(Vec::new());
+                    // Clear only what was sent: text and pictures the reader
+                    // added while the request was in flight are theirs.
+                    if service.draft.get_untracked() == sent_text {
+                        service.draft.set(String::new());
+                    }
+                    service.attachments.update(|items| {
+                        items.retain(|item| !sent_attachment_ids.contains(&item.id))
+                    });
+                    service.stash_draft();
+                    service.persist_drafts();
                     service.apply_page(&session_id, page);
+                    crate::settings::haptic(nsh_core::Haptic::Notification(
+                        nsh_core::HapticNotification::Success,
+                    ));
                 }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -771,6 +1101,7 @@ impl SessionService {
                 Ok(Ok(_)) => {
                     service.pending.set(None);
                     service.reload(&session_id);
+                    crate::settings::haptic(nsh_core::Haptic::Selection);
                 }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -837,6 +1168,7 @@ impl SessionService {
                 Ok(Ok(_)) => {
                     service.question.set(None);
                     service.reload(&session_id);
+                    crate::settings::haptic(nsh_core::Haptic::Selection);
                 }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -1007,7 +1339,10 @@ impl SessionService {
             })
             .await;
             match result {
-                Ok(Ok(true)) => service.refresh(),
+                Ok(Ok(true)) => {
+                    crate::settings::haptic(nsh_core::Haptic::Selection);
+                    service.refresh();
+                }
                 Ok(Ok(false)) => {}
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -1264,11 +1599,18 @@ impl SessionService {
     fn drop_session(&self, id: &str) {
         self.sessions
             .update(|sessions| sessions.retain(|s| s.id != id));
+        self.drafts.borrow_mut().remove(id);
+        self.persist_drafts();
         if self.active.get_untracked().as_deref() != Some(id) {
             return;
         }
         match self.sessions.get_untracked().first().map(|s| s.id.clone()) {
-            Some(next) => self.open(&next),
+            Some(next) => {
+                // The removed session is not the one whose draft the next
+                // open should save; clear the pointer first.
+                self.active.set(None);
+                self.open(&next);
+            }
             None => {
                 self.active.set(None);
                 self.timeline.set(Vec::new());
@@ -2245,12 +2587,18 @@ impl SessionService {
         self.sending.set(false);
         self.resolving.set(false);
         self.error.set(Some(error_text(error)));
+        crate::settings::haptic(nsh_core::Haptic::Notification(
+            nsh_core::HapticNotification::Error,
+        ));
     }
 
     fn fail_text(&self, message: &str) {
         self.sending.set(false);
         self.resolving.set(false);
         self.error.set(Some(message.to_owned().into()));
+        crate::settings::haptic(nsh_core::Haptic::Notification(
+            nsh_core::HapticNotification::Error,
+        ));
     }
 }
 
@@ -2566,6 +2914,13 @@ fn default_option_label(response: PermissionResponseKind) -> &'static str {
         }
         PermissionResponseKind::Deny => copy::text("Deny", "拒绝", "拒絕"),
     }
+}
+
+/// The per-session composer drafts kept on this phone.
+fn load_drafts() -> BTreeMap<String, String> {
+    Storage::get_item(DRAFTS_KEY)
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
 }
 
 fn entry_kind(kind: vibex_desktop_model::TimelineRowKind) -> EntryKind {

@@ -23,14 +23,20 @@ mod host;
 mod pairing;
 mod platform;
 mod session;
+mod settings;
 pub mod theme_gen;
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
-use nsh_core::prelude::*;
+use nsh_core::{platform::Lifecycle, prelude::*};
 use pairing::PairingService;
 use session::SessionService;
-use vibex_nsh_ui::screens::{pairing as pairing_screen, session as session_screen};
+use settings::SettingsState;
+use vibex_nsh_ui::screens::{
+    connecting::{self as connecting_screen, ConnectingHost, ConnectionState},
+    pairing as pairing_screen, session as session_screen,
+    settings::{self as settings_screen, SettingsHost},
+};
 
 /// The root the Android host mounts: the app with its theme and id.
 ///
@@ -61,55 +67,137 @@ fn native(registry: &mut Registry) {
 
 /// The app's root: pairing while no runtime is connected, the session shell
 /// once one is.
+///
+/// The pairing service, the settings and the session service are made once,
+/// outside the UI's reactive regions: a reconnection or a language change must
+/// not build a second store or a second event stream. An effect owns the
+/// session service's lifetime, and a dynamic region rebuilds the surface when
+/// the language changes, because the copy is resolved while the tree is built.
 #[component]
 pub fn App() -> impl IntoElement {
     // The app's own data directory. A host that keeps no files for the app
     // (the web) gets a temporary one, so the page still works there.
     let data = data_dir().unwrap_or_else(|| std::env::temp_dir().join("vibex-mobile-nsh"));
-    let service = PairingService::new(data);
-    host::start(service.clone());
-    let connected = service.connected();
-    let switcher = service.switcher();
-    let pairing_service = service.clone();
-    let switcher_service = service.clone();
-    let shell_service = service;
+    let pairing = PairingService::new(data);
+    host::start(pairing.clone());
+    let settings = SettingsState::new();
+    settings.apply();
+
+    let connected = pairing.connected();
+    let switcher = pairing.switcher();
+    let settings_open = signal(false);
+    let services = signal_with(None::<Rc<SessionService>>, SignalEquals::Never);
+    let service_error = signal(None::<SharedString>);
+    let boot_connection = signal(ConnectionState::Connecting);
+    let attempt = signal(0u64);
+
+    install_service_effect(
+        pairing.clone(),
+        settings_open,
+        services,
+        service_error,
+        boot_connection,
+        attempt,
+    );
+    start_back_poller(settings_open, services);
+
+    let open_settings: Rc<dyn Fn()> = {
+        let open = settings_open;
+        Rc::new(move || open.set(true))
+    };
+    let settings_host = settings_host(&pairing, &settings, settings_open);
 
     view()
         .flex_1()
         .relative()
         .bg(move || nsh_base::theme().background)
-        .child(when(
-            move || connected.get().is_none(),
+        .child(dynamic({
+            let pairing = pairing.clone();
+            let settings = settings.clone();
+            let open_settings = open_settings.clone();
             move || {
-                view()
-                    .flex_1()
-                    .child(pairing_screen::pairing(pairing_service.host()))
-                    .into_element()
+                // The copy is read while the tree is built, so the language is
+                // a rebuild of the surface rather than a value looked up per
+                // frame.
+                let _ = settings.revision.get();
+                root_view(
+                    pairing.clone(),
+                    open_settings.clone(),
+                    services,
+                    service_error,
+                    boot_connection,
+                    attempt,
+                    settings_host.clone(),
+                )
+            }
+        }))
+}
+
+/// Builds the surface for the current connection, language and switcher state.
+#[allow(clippy::too_many_arguments)]
+fn root_view(
+    pairing: PairingService,
+    open_settings: Rc<dyn Fn()>,
+    services: Signal<Option<Rc<SessionService>>>,
+    service_error: Signal<Option<SharedString>>,
+    boot_connection: Signal<ConnectionState>,
+    attempt: Signal<u64>,
+    settings_host: SettingsHost,
+) -> AnyElement {
+    let connected = pairing.connected();
+    let switcher = pairing.switcher();
+    let mut pairing_host = pairing.host();
+    pairing_host.on_open_settings = open_settings.clone();
+    let switcher_host = pairing_host.clone();
+    let connecting_actions = {
+        let pairing = pairing.clone();
+        let retry = attempt;
+        (
+            Rc::new(move || {
+                retry.update(|attempt| *attempt = attempt.wrapping_add(1));
+            }) as Rc<dyn Fn()>,
+            {
+                let pairing = pairing.clone();
+                Rc::new(move || pairing.open_switcher()) as Rc<dyn Fn()>
             },
-        ))
-        .child(when(
-            move || connected.get().is_some(),
+            {
+                let pairing = pairing.clone();
+                Rc::new(move || pairing.disconnect()) as Rc<dyn Fn()>
+            },
+        )
+    };
+
+    view()
+        .flex_1()
+        .relative()
+        .child(when(move || connected.get().is_none(), {
+            let pairing_host = pairing_host.clone();
+            move || pairing_screen::pairing(pairing_host.clone()).into_element()
+        }))
+        .child(dynamic({
+            let connecting_actions = connecting_actions.clone();
             move || {
-                let runtime = connected.get_untracked().expect("checked by the condition");
-                let disconnect: Rc<dyn Fn()> = {
-                    let service = shell_service.clone();
-                    Rc::new(move || service.disconnect())
+                let Some(runtime) = connected.get() else {
+                    return view().into_element();
                 };
-                let switch_runtime: Rc<dyn Fn()> = {
-                    let service = shell_service.clone();
-                    Rc::new(move || service.open_switcher())
-                };
-                match SessionService::new(&runtime.bundle, disconnect, switch_runtime) {
-                    Ok(sessions) => view()
-                        .flex_1()
-                        .child(session_screen::session(sessions.host()))
-                        .into_element(),
-                    Err(error) => disconnected_error(&error).into_element(),
+                let service = services.get();
+                match service {
+                    Some(service) if service.host_id() == runtime.bundle.host_id() => {
+                        session_screen::session(service.host()).into_element()
+                    }
+                    _ => connecting_screen::connecting(ConnectingHost {
+                        state: boot_connection,
+                        error: service_error,
+                        on_retry: connecting_actions.0.clone(),
+                        on_switch_runtime: connecting_actions.1.clone(),
+                        on_disconnect: connecting_actions.2.clone(),
+                    })
+                    .into_element(),
                 }
-            },
-        ))
-        .child(when(
-            move || switcher.get() && connected.get().is_some(),
+            }
+        }))
+        .child(when(move || switcher.get() && connected.get().is_some(), {
+            let switcher_host = switcher_host.clone();
             move || {
                 view()
                     .absolute()
@@ -118,22 +206,163 @@ pub fn App() -> impl IntoElement {
                     .w_full()
                     .h_full()
                     .bg(nsh_base::theme().background)
-                    .child(pairing_screen::pairing(switcher_service.host()))
+                    .child(pairing_screen::pairing(switcher_host.clone()))
                     .into_element()
-            },
-        ))
+            }
+        }))
+        .child(settings_screen::settings(settings_host))
+        .into_element()
 }
 
-/// What the phone shows when a connected runtime cannot build its backend.
-fn disconnected_error(error: &vibex_backend::BackendError) -> impl IntoElement {
-    view()
-        .flex_1()
-        .items_center()
-        .justify_center()
-        .p(px(24.0))
-        .child(
-            text(pairing::error_text(error))
-                .text_size(px(15.0))
-                .text_color(move || nsh_base::theme().destructive),
-        )
+/// Builds the settings sheet's host from the app's stores.
+fn settings_host(
+    pairing: &PairingService,
+    settings: &SettingsState,
+    open: Signal<bool>,
+) -> SettingsHost {
+    let appearance = settings.appearance;
+    let language = settings.language;
+    let haptics = settings.haptics;
+    let keep_screen_on = settings.keep_screen_on;
+    let settings_for_appearance = settings.clone();
+    let settings_for_language = settings.clone();
+    let settings_for_haptics = settings.clone();
+    let settings_for_screen = settings.clone();
+    let pairing_for_disconnect = pairing.clone();
+    let pairing_for_clear = pairing.clone();
+    SettingsHost {
+        open,
+        appearance,
+        language,
+        haptics,
+        keep_screen_on,
+        runtime: pairing.connected_label(),
+        on_appearance: Rc::new(move |appearance| {
+            settings_for_appearance.set_appearance(appearance);
+        }),
+        on_language: Rc::new(move |language| {
+            settings_for_language.set_language(language);
+        }),
+        on_haptics: Rc::new(move |enabled| {
+            settings_for_haptics.set_haptics(enabled);
+        }),
+        on_keep_screen_on: Rc::new(move |enabled| {
+            settings_for_screen.set_keep_screen_on(enabled);
+        }),
+        on_disconnect: Rc::new(move || pairing_for_disconnect.disconnect()),
+        on_clear_runtimes: Rc::new(move || pairing_for_clear.clear_runtimes()),
+        on_close: { Rc::new(move || open.set(false)) },
+    }
+}
+
+/// Watches the system back key and routes it to the surface the reader is on.
+///
+/// The Android host asks `host::nativeBack` synchronously; the engine thread
+/// consumes the press here, where the app's state lives.
+fn start_back_poller(settings_open: Signal<bool>, services: Signal<Option<Rc<SessionService>>>) {
+    spawn(async move {
+        loop {
+            timer(Duration::from_millis(100)).await;
+            let service = services.get_untracked();
+            let intercept = settings_open.get_untracked()
+                || service
+                    .as_ref()
+                    .is_some_and(|service| service.back_intercept());
+            host::set_back_intercept(intercept);
+            if !host::take_back() {
+                continue;
+            }
+            if settings_open.get_untracked() {
+                settings_open.set(false);
+            } else if let Some(service) = service {
+                service.handle_back();
+            }
+        }
+    });
+}
+
+/// Owns the session service: built once per connected runtime, rebuilt when a
+/// connection attempt failed at construction, resumed when the app returns to
+/// the foreground.
+fn install_service_effect(
+    pairing: PairingService,
+    settings_open: Signal<bool>,
+    services: Signal<Option<Rc<SessionService>>>,
+    service_error: Signal<Option<SharedString>>,
+    boot_connection: Signal<ConnectionState>,
+    attempt: Signal<u64>,
+) {
+    let last_attempt = stored(0u64);
+    effect(move || {
+        let attempt_now = attempt.get();
+        let connected = pairing.connected().get();
+        let lifecycle_now = lifecycle();
+        let existing = services.get_untracked();
+        let rebuilt = last_attempt.get() != attempt_now;
+        last_attempt.replace(attempt_now);
+
+        let Some(runtime) = connected else {
+            if let Some(service) = existing {
+                service.shutdown();
+                services.set(None);
+            }
+            host::set_connection_service(false);
+            service_error.set(None);
+            boot_connection.set(ConnectionState::Connecting);
+            return;
+        };
+
+        if existing
+            .as_ref()
+            .is_some_and(|service| service.host_id() == runtime.bundle.host_id())
+        {
+            if let Some(service) = existing {
+                if rebuilt {
+                    service.retry();
+                } else if lifecycle_now == Lifecycle::Active {
+                    service.resume();
+                }
+            }
+            return;
+        }
+
+        if let Some(service) = existing {
+            service.shutdown();
+            services.set(None);
+        }
+        host::set_connection_service(false);
+        service_error.set(None);
+        boot_connection.set(ConnectionState::Connecting);
+
+        let disconnect: Rc<dyn Fn()> = {
+            let pairing = pairing.clone();
+            Rc::new(move || pairing.disconnect())
+        };
+        let switch_runtime: Rc<dyn Fn()> = {
+            let pairing = pairing.clone();
+            Rc::new(move || pairing.open_switcher())
+        };
+        let open_settings: Rc<dyn Fn()> = { Rc::new(move || settings_open.set(true)) };
+        let runtime_renamed: Rc<dyn Fn(&str)> = {
+            let pairing = pairing.clone();
+            Rc::new(move |name: &str| pairing.rename_connected(name))
+        };
+        let built = SessionService::new(
+            &runtime.bundle,
+            disconnect,
+            switch_runtime,
+            open_settings,
+            runtime_renamed,
+        );
+        match built {
+            Ok(service) => {
+                services.set(Some(Rc::new(service)));
+                host::set_connection_service(true);
+            }
+            Err(error) => {
+                service_error.set(Some(pairing::error_text(&error)));
+                boot_connection.set(ConnectionState::Offline);
+            }
+        }
+    });
 }

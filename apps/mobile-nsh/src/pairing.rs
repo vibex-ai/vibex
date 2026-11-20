@@ -39,6 +39,9 @@ const DEVICE_NAME: &str = "Vibex Mobile";
 const STORE_FILE: &str = "pairing.json";
 /// The phone's own notes about saved runtimes (added and last connected).
 const META_FILE: &str = "hosts.json";
+/// The runtime the phone was last connected to, so a cold start can go
+/// straight back to it instead of asking which one to open.
+const LAST_HOST_FILE: &str = "last-runtime.txt";
 
 #[derive(Clone, Default, serde::Serialize, serde::Deserialize)]
 struct HostMeta {
@@ -70,6 +73,7 @@ pub struct PairingService {
     rename_draft: Signal<String>,
     meta: Rc<RefCell<std::collections::BTreeMap<String, HostMeta>>>,
     meta_path: PathBuf,
+    last_host_path: PathBuf,
     switcher: Signal<bool>,
     connected_label: Signal<Option<SharedString>>,
     busy: Signal<bool>,
@@ -121,6 +125,7 @@ impl PairingService {
                     .unwrap_or_default(),
             )),
             meta_path: data_dir.join(META_FILE),
+            last_host_path: data_dir.join(LAST_HOST_FILE),
             switcher: signal(false),
             connected_label: signal(None),
             busy: signal(false),
@@ -132,7 +137,9 @@ impl PairingService {
             nearby_code: signal(None),
             nearby_generation: Rc::new(Cell::new(0)),
         };
+        service.restore_last();
         service.probe_saved();
+        service.watch_reachability();
         service
     }
 
@@ -196,6 +203,7 @@ impl PairingService {
                 Rc::new(move || service.details.set(None))
             },
             on_pick_nearby: Rc::new(move |key| pick_nearby.start_nearby_pair(key)),
+            on_open_settings: Rc::new(|| {}),
             nearby_waiting: self.nearby_waiting,
             nearby_code: self.nearby_code,
             on_cancel_nearby: {
@@ -445,6 +453,11 @@ impl PairingService {
         self.switcher.set(false);
     }
 
+    /// The connected runtime's label, for the settings sheet.
+    pub fn connected_label(&self) -> Signal<Option<SharedString>> {
+        self.connected_label
+    }
+
     /// The runtime the page is connected to.
     pub fn connected(&self) -> Signal<Option<ConnectedRuntime>> {
         self.connected
@@ -457,8 +470,8 @@ impl PairingService {
         self.error.set(None);
     }
 
-    /// Removes every saved credential, after the native confirmation.
-    fn clear_runtimes(&self) {
+    /// Removes every saved credential; the settings sheet asks first.
+    pub fn clear_runtimes(&self) {
         let service = self.clone();
         spawn(async move {
             let answer = nsh_base::alert_dialog()
@@ -485,6 +498,7 @@ impl PairingService {
                 .iter()
                 .map(|bundle| bundle.host_id().to_owned())
                 .collect::<Vec<_>>();
+            let _ = std::fs::remove_file(&service.last_host_path);
             let mut remaining = service.bundles.borrow().clone();
             for id in ids {
                 if let Ok(bundles) = service.store.remove(&id) {
@@ -649,12 +663,27 @@ impl PairingService {
         };
         match self.store.upsert(bundle) {
             Ok(bundles) => {
-                let saved_name = bundles
+                let saved_bundle = bundles
                     .iter()
                     .find(|bundle| bundle.host_id() == host_id)
+                    .cloned();
+                let saved_name = saved_bundle
+                    .as_ref()
                     .map(|bundle| bundle.host_label())
                     .unwrap_or_default();
                 self.set_bundles(bundles);
+                if let Some(bundle) = saved_bundle
+                    && self
+                        .connected
+                        .get_untracked()
+                        .is_some_and(|connected| connected.bundle.host_id() == host_id)
+                {
+                    self.connected_label.set(Some(saved_name.clone().into()));
+                    self.connected.set(Some(ConnectedRuntime {
+                        label: saved_name.clone(),
+                        bundle,
+                    }));
+                }
                 self.rename_draft.set(saved_name.clone());
                 if let Some(mut details) = self.details.get_untracked()
                     && details.id == host_id
@@ -691,6 +720,13 @@ impl PairingService {
                 return;
             }
             let result = service.store.remove(&host_id);
+            if service
+                .last_host_id()
+                .as_deref()
+                .is_some_and(|last| last == host_id)
+            {
+                let _ = std::fs::remove_file(&service.last_host_path);
+            }
             match result {
                 Ok(bundles) => {
                     let was_connected = service
@@ -710,10 +746,30 @@ impl PairingService {
 
     /// Probes every saved runtime once, at startup.
     fn probe_saved(&self) {
+        let active = self
+            .connected
+            .get_untracked()
+            .map(|connected| connected.bundle.host_id().to_owned());
         let bundles = self.bundles.borrow().clone();
         for bundle in bundles {
+            if active.as_deref() == Some(bundle.host_id()) {
+                continue;
+            }
             self.spawn_probe(bundle, false);
         }
+    }
+
+    /// Keeps the saved runtimes' reachability fresh while the page is visible.
+    fn watch_reachability(&self) {
+        let service = self.clone();
+        spawn(async move {
+            loop {
+                nsh_core::element::timer(Duration::from_secs(20)).await;
+                if service.connected.get_untracked().is_none() || service.switcher.get_untracked() {
+                    service.probe_saved();
+                }
+            }
+        });
     }
 
     /// Probes the saved runtime with `host_id`.
@@ -810,12 +866,95 @@ impl PairingService {
             drop(meta);
             self.save_meta();
         }
+        self.show_connected(bundle, true);
+    }
+
+    /// Shows `bundle` as the connected runtime without treating it as a new
+    /// connection, so a cold start does not move the "last connected" clock.
+    fn restore(&self, bundle: MobileCredentialBundle) {
+        self.show_connected(bundle, false);
+    }
+
+    fn show_connected(&self, bundle: MobileCredentialBundle, remember: bool) {
+        if remember {
+            let _ = std::fs::write(&self.last_host_path, bundle.host_id());
+        }
         self.switcher.set(false);
+        let id = bundle.host_id().to_owned();
+        self.saved.update(|saved| {
+            if let Some(row) = saved.iter_mut().find(|row| row.id == id) {
+                row.status = RuntimeStatus::Reachable;
+            }
+        });
         self.connected_label.set(Some(bundle.host_label().into()));
         self.connected.set(Some(ConnectedRuntime {
             label: bundle.host_label(),
             bundle,
         }));
+    }
+
+    /// Reopens the runtime this phone was on when it last ran.
+    fn restore_last(&self) {
+        if self.connected.get_untracked().is_some() {
+            return;
+        }
+        let Ok(id) = std::fs::read_to_string(&self.last_host_path) else {
+            return;
+        };
+        let id = id.trim();
+        if id.is_empty() {
+            return;
+        }
+        let bundle = self
+            .bundles
+            .borrow()
+            .iter()
+            .find(|bundle| bundle.host_id() == id)
+            .cloned();
+        if let Some(bundle) = bundle {
+            self.restore(bundle);
+        }
+    }
+
+    /// Applies the runtime's new name to the credential and the page.
+    pub fn rename_connected(&self, display_name: &str) {
+        let Some(name) = vibex_core::normalize_remote_display_name(display_name) else {
+            return;
+        };
+        let connected = self.connected.get_untracked();
+        let mut updated = None;
+        {
+            let Some(connected) = connected else {
+                return;
+            };
+            let mut bundles = self.bundles.borrow_mut();
+            for bundle in bundles.iter_mut() {
+                if connected.bundle.host_id() == bundle.host_id() {
+                    if bundle.display_name.as_deref() == Some(name.as_str()) {
+                        break;
+                    }
+                    bundle.display_name = Some(name.clone());
+                    updated = Some(bundle.clone());
+                    break;
+                }
+            }
+        }
+        let Some(bundle) = updated else {
+            return;
+        };
+        if let Ok(bundles) = self.store.upsert(bundle.clone()) {
+            let label = bundle.host_label();
+            self.set_bundles(bundles);
+            self.connected_label.set(Some(label.clone().into()));
+            self.connected.set(Some(ConnectedRuntime { label, bundle }));
+        }
+    }
+
+    fn last_host_id(&self) -> Option<String> {
+        std::fs::read_to_string(&self.last_host_path)
+            .ok()
+            .map(|id| id.trim().to_owned())
+            .filter(|id| !id.is_empty())
     }
 
     fn save_meta(&self) {

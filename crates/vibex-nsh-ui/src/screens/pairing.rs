@@ -154,13 +154,14 @@ pub struct PairingHost {
     pub on_close_details: Action,
     /// Pair with a runtime discovery found.
     pub on_pick_nearby: Pick,
+    /// Opens the settings sheet over the page.
+    pub on_open_settings: Action,
 }
 
 /// The pairing page.
 pub fn pairing(host: PairingHost) -> impl IntoElement {
     let manual_open = signal(false);
     let nearby_open = signal(false);
-    let settings_open = signal(false);
     let switcher = host.switcher;
     let spinner = signal(SharedString::from("◐"));
     {
@@ -176,6 +177,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     }
     let draft = signal(String::new());
     let server = signal(String::new());
+    let on_open_settings = host.on_open_settings.clone();
 
     let saved = host.saved;
     let busy = host.busy;
@@ -186,7 +188,10 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .max_w(px(CARD_WIDTH))
         .flex_1()
         .flex_col()
-        .child(view().w_full().items_center().child(brand::wordmark()))
+        .child(when(
+            move || !switcher.get(),
+            || view().w_full().items_center().child(brand::wordmark()),
+        ))
         .child(when(move || saved.with(|saved| !saved.is_empty()), {
             let on_pick = host.on_pick_saved.clone();
             let on_details = host.on_show_details.clone();
@@ -240,15 +245,15 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .child(
             view()
                 .absolute()
-                .top(px(8.0))
+                .top_0()
                 .right(px(8.0))
+                .pt_safe_area()
                 .child(action::icon_button(
                     icon(include_str!("../../assets/icons/settings.svg")),
                     copy::text("Settings", "设置", "設定"),
-                    move || settings_open.set(true),
+                    move || on_open_settings(),
                 )),
         )
-        .child(settings_sheet(settings_open, host.clone()))
         .child(when(move || switcher.get(), {
             let on_close = host.on_close_switcher.clone();
             move || {
@@ -257,6 +262,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     .absolute()
                     .top_0()
                     .left(px(8.0))
+                    .pt_safe_area()
                     .child(action::icon_button(
                         icon(include_str!("../../assets/icons/chevron-left.svg")),
                         copy::text("Back", "返回", "返回"),
@@ -266,197 +272,24 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         }))
 }
 
-/// The switcher's footer: back to the session, the network search, or the
-/// clipboard fallback.
+/// The switcher's footer: the same three ways in the page itself offers.
+///
+/// The switcher is the pairing page over a live session; it keeps the page's
+/// primary actions and puts the way back in the header, as the GPUI client
+/// does, instead of inventing a "Switch" button that only closes the overlay.
 fn switcher_footer(
     host: PairingHost,
     manual_open: Signal<bool>,
     nearby_open: Signal<bool>,
 ) -> impl IntoElement {
-    let on_close = host.on_close_switcher.clone();
     view()
         .flex_row()
         .w_full()
         .gap(px(theme::SPACING_SM))
         .py(px(theme::SPACING_MD))
-        .child(
-            action::primary(
-                copy::text("Switch", "切换", "切換"),
-                icon(include_str!("../../assets/icons/refresh.svg")),
-                move || on_close(),
-            )
-            .flex_1(),
-        )
-        .child(
-            action::secondary(
-                copy::text("Network", "网络", "網路"),
-                icon(include_str!("../../assets/icons/wifi-outlined.svg")),
-                false,
-                move || nearby_open.set(true),
-            )
-            .flex_1(),
-        )
-        .child(
-            action::secondary(
-                copy::text("Clipboard", "剪贴板", "剪貼簿"),
-                icon(include_str!("../../assets/icons/clipboard-paste.svg")),
-                false,
-                move || manual_open.set(true),
-            )
-            .flex_1(),
-        )
-}
-
-/// The first screen's settings sheet: the facts this build can state today.
-fn settings_sheet(open: Signal<bool>, host: PairingHost) -> impl IntoElement {
-    let connected = host.connected_label;
-    let on_disconnect = host.on_disconnect.clone();
-    let on_clear = host.on_clear_runtimes.clone();
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = event {
-                open.set(*next);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .gap(px(theme::SPACING_SM))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Settings", "设置", "設定"))
-                        .text_size(px(theme::FONT_HEADING))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(when(move || connected.get().is_some(), {
-                    move || {
-                        let on_disconnect = on_disconnect.clone();
-                        view()
-                            .w_full()
-                            .gap(px(theme::SPACING_XS))
-                            .child(settings_row(
-                                copy::text("Runtime", "运行时", "執行環境"),
-                                copy::text("Connected", "已连接", "已連線"),
-                            ))
-                            .child(
-                                action::secondary(
-                                    copy::text("Disconnect", "断开连接", "中斷連線"),
-                                    icon(include_str!("../../assets/icons/plug-zap.svg")),
-                                    false,
-                                    move || on_disconnect(),
-                                )
-                                .w_full(),
-                            )
-                    }
-                }))
-                .child(settings_row(
-                    copy::text("Appearance", "外观", "外觀"),
-                    copy::text("System", "跟随系统", "跟隨系統"),
-                ))
-                .child(
-                    view()
-                        .flex_row()
-                        .gap(px(theme::SPACING_SM))
-                        .child(
-                            action::secondary(
-                                copy::text("System", "系统", "系統"),
-                                icon(include_str!("../../assets/icons/monitor.svg")),
-                                false,
-                                || {
-                                    nsh_core::element::set_color_scheme(
-                                        nsh_core::platform::Appearance::System,
-                                    )
-                                },
-                            )
-                            .flex_1(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Light", "浅色", "淺色"),
-                                icon(include_str!("../../assets/icons/image.svg")),
-                                false,
-                                || {
-                                    nsh_core::element::set_color_scheme(
-                                        nsh_core::platform::Appearance::Light,
-                                    )
-                                },
-                            )
-                            .flex_1(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Dark", "深色", "深色"),
-                                icon(include_str!("../../assets/icons/image.svg")),
-                                false,
-                                || {
-                                    nsh_core::element::set_color_scheme(
-                                        nsh_core::platform::Appearance::Dark,
-                                    )
-                                },
-                            )
-                            .flex_1(),
-                        ),
-                )
-                .child(settings_row(
-                    copy::text("Language", "语言", "語言"),
-                    copy::text("System", "跟随系统", "跟隨系統"),
-                ))
-                .child(settings_row(
-                    copy::text("Version", "版本", "版本"),
-                    concat!("Vibex ", env!("CARGO_PKG_VERSION")),
-                ))
-                .child(settings_row(
-                    copy::text("License", "许可", "授權"),
-                    "AGPL-3.0-or-later",
-                ))
-                .child({
-                    let on_clear = on_clear.clone();
-                    action::secondary(
-                        copy::text(
-                            "Remove saved runtimes",
-                            "移除已保存的运行时",
-                            "移除已儲存的執行環境",
-                        ),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || on_clear(),
-                    )
-                    .w_full()
-                })
-                .child(
-                    action::secondary(
-                        copy::text("Close", "关闭", "關閉"),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || open.set(false),
-                    )
-                    .w_full(),
-                ),
-        )
-}
-
-fn settings_row(label: &'static str, value: &'static str) -> impl IntoElement {
-    view()
-        .w_full()
-        .flex_row()
-        .items_center()
-        .justify_between()
-        .child(
-            text(label)
-                .text_size(px(theme::FONT_DETAIL))
-                .text_color(theme::foreground),
-        )
-        .child(
-            text(value)
-                .text_size(px(theme::FONT_DETAIL))
-                .text_color(theme::text_muted),
-        )
+        .child(scan_entry(host.clone()).flex_1())
+        .child(find_entry(host.busy, nearby_open).flex_1())
+        .child(link_entry(host.busy, manual_open).flex_1())
 }
 
 /// A saved runtime's details, as a sheet.
@@ -749,16 +582,21 @@ fn saved_runtimes(
     on_details: Rc<dyn Fn(&str)>,
     spinner: Signal<SharedString>,
 ) -> impl IntoElement {
-    view()
-        .flex_col()
-        .w_full()
-        .gap(px(theme::SPACING_SM))
-        .pt(px(theme::SPACING_XL))
-        .child(each(
-            move || saved.get(),
-            |runtime| runtime.id.clone(),
-            move |runtime, _| saved_row(runtime, on_pick.clone(), on_details.clone(), spinner),
-        ))
+    view().flex_col().w_full().pt(px(theme::SPACING_XL)).child(
+        scroll().max_h(px(280.0)).child(
+            view()
+                .flex_col()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .child(each(
+                    move || saved.get(),
+                    |runtime| runtime.id.clone(),
+                    move |runtime, _| {
+                        saved_row(runtime, on_pick.clone(), on_details.clone(), spinner)
+                    },
+                )),
+        ),
+    )
 }
 
 /// One saved runtime: a status dot, its name, and the display it runs on.

@@ -5,6 +5,8 @@
 //! a simulator. They are the start of the parity suite: every screen the
 //! migration moves over gets the flows its GPUI pair has.
 
+use std::path::Path;
+
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use tempfile::TempDir;
@@ -13,11 +15,16 @@ use tempfile::TempDir;
 /// cross between tests (or onto this machine's real store).
 fn start() -> (Headless, TempDir) {
     let directory = TempDir::new().unwrap();
-    let mut config = EngineConfig::new(Root::of::<vibex_mobile_nsh::App>());
-    config.data_dir = Some(directory.path().to_path_buf());
-    let mut app = Headless::start(config).unwrap();
-    app.wait_for("Scan").unwrap();
+    let app = start_at(directory.path());
     (app, directory)
+}
+
+fn start_at(directory: &Path) -> Headless {
+    let mut config = EngineConfig::new(Root::of::<vibex_mobile_nsh::App>());
+    config.data_dir = Some(directory.to_path_buf());
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("ibex").unwrap();
+    app
 }
 
 #[test]
@@ -61,4 +68,37 @@ fn a_bare_code_without_an_address_says_what_is_missing() {
     // piece of the entry is missing.
     app.wait_for("Enter the pairing code and the server address.")
         .unwrap();
+}
+
+#[test]
+fn settings_changes_the_language_and_survives_the_sheet() {
+    let (mut app, _directory) = start();
+    app.press("role:button[Settings]").unwrap();
+    app.wait_for("Appearance").unwrap();
+    assert!(app.screen().shows("Language"));
+    app.press("简体中文").unwrap();
+    // The whole surface is rebuilt in the chosen language, not just the row.
+    app.wait_for("设置").unwrap();
+    assert!(app.screen().shows("外观"));
+    app.press("关闭").unwrap();
+    app.wait_for_gone("外观", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn the_chosen_language_survives_a_restart() {
+    let directory = TempDir::new().unwrap();
+    {
+        let mut app = start_at(directory.path());
+        app.press("role:button[Settings]").unwrap();
+        app.wait_for("Appearance").unwrap();
+        app.press("简体中文").unwrap();
+        app.wait_for("设置").unwrap();
+    }
+    // The settings store is written on the engine's own thread; give it the
+    // moment the next launch would have spent before it reads the page.
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let mut app = start_at(directory.path());
+    app.press("role:button[设置]").unwrap();
+    app.wait_for("外观").unwrap();
 }

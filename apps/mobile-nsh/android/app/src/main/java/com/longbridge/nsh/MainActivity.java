@@ -37,6 +37,18 @@ public final class MainActivity extends Activity {
             } else if (request == 3) {
                 lanDiscovery.stop();
             }
+            int connectionService = NshHost.nativeTakeConnectionService();
+            if (connectionService == 1) {
+                ConnectionService.start(this);
+            } else if (connectionService == 0) {
+                ConnectionService.stop(this);
+            }
+            int awake = NshHost.nativeTakeKeepScreenOn();
+            if (awake == 1) {
+                getWindow().addFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            } else if (awake == 0) {
+                getWindow().clearFlags(android.view.WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
+            }
             handler.postDelayed(this, 200);
         }
     };
@@ -102,6 +114,12 @@ public final class MainActivity extends Activity {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
+        // A closeable surface of the Rust app owns the press first: the
+        // drawer, a file preview, the terminal, a sheet. Only when none is
+        // open does NshView get it, and the system last.
+        if (NshHost.nativeBack()) {
+            return;
+        }
         if (view == null || !view.handleBack()) {
             super.onBackPressed();
         }

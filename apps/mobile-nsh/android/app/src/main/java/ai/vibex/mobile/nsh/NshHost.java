@@ -19,6 +19,15 @@ public final class NshHost {
     /** One local-network discovery event, as the JSON contract describes. */
     public static native void nativeDiscoveryEvent(String value);
 
+    /** Whether the app has a surface the back key should close (true: consumed). */
+    public static native boolean nativeBack();
+
+    /** The pending connection-service change: -1 none, 0 stop, 1 start. */
+    public static native int nativeTakeConnectionService();
+
+    /** The pending screen-awake change: -1 none, 0 off, 1 on. */
+    public static native int nativeTakeKeepScreenOn();
+
     /** The next thing the app asks the host to do: 0 none, 1 scan, 2 find, 3 stop. */
     public static native int nativeTakeHostRequest();
 

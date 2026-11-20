@@ -95,6 +95,81 @@ pub fn discovery_available() -> bool {
 /// The name the platform reports for this phone, once the host sets it.
 static DEVICE_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+/// Whether the app has a surface the system back key should close before it
+/// leaves the app. The Android host reads it synchronously from its UI thread.
+static BACK_INTERCEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// A back press the host consumed and the engine has not handled yet.
+static BACK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The screen-awake state the app wants, and the change the host has not
+/// taken yet: -1 none, 0 off, 1 on.
+static KEEP_SCREEN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static KEEP_SCREEN_ON_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+/// The connection-service change the host has not taken yet: -1 none, 0 stop,
+/// 1 start. The service keeps the process runnable while the app is away.
+static CONNECTION_SERVICE_REQUEST: std::sync::atomic::AtomicI32 =
+    std::sync::atomic::AtomicI32::new(-1);
+
+/// Records whether the app has a sub-surface open.
+pub fn set_back_intercept(intercept: bool) {
+    BACK_INTERCEPT.store(intercept, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the host should consume the next back press.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host is the one with a back key")
+)]
+pub fn back_intercept() -> bool {
+    BACK_INTERCEPT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Records a consumed back press for the engine to handle.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host is the one with a back key")
+)]
+pub fn request_back() {
+    BACK_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Takes the pending back press, if there is one.
+pub fn take_back() -> bool {
+    BACK_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Asks the host to hold the display awake (a running turn, an open terminal).
+pub fn set_keep_screen_on(on: bool) {
+    KEEP_SCREEN_ON.store(on, std::sync::atomic::Ordering::Relaxed);
+    KEEP_SCREEN_ON_REQUEST.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pending screen-awake change: -1 none, 0 off, 1 on.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host is the one with a window")
+)]
+pub fn take_keep_screen_on() -> i32 {
+    KEEP_SCREEN_ON_REQUEST.swap(-1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Asks the host to keep the process runnable while the app is in the
+/// background.
+pub fn set_connection_service(on: bool) {
+    CONNECTION_SERVICE_REQUEST.store(if on { 1 } else { 0 }, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The pending connection-service change: -1 none, 0 stop, 1 start.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host owns the foreground service")
+)]
+pub fn take_connection_service() -> i32 {
+    CONNECTION_SERVICE_REQUEST.swap(-1, std::sync::atomic::Ordering::Relaxed)
+}
+
 /// Names the phone the way the platform does ("Pixel 8").
 ///
 /// The runtime keeps this name in its paired-device list; the phone's own
