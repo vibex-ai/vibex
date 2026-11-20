@@ -21,8 +21,8 @@ use nsh_core::platform::Lifecycle;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
 use vibex_backend::{
-    AgentBackend, BackendError, BackendEvent, BackendProjection, BackendResult, FileBackend,
-    GitBackend, MutationRequest, SidebarBackend, TerminalBackend, WorkspaceBackend,
+    AgentBackend, BackendError, BackendErrorKind, BackendEvent, BackendProjection, BackendResult,
+    FileBackend, GitBackend, MutationRequest, SidebarBackend, TerminalBackend, WorkspaceBackend,
     WorkspaceSummary,
 };
 use vibex_core::{
@@ -327,7 +327,7 @@ pub struct SessionService {
     queue_paused: Signal<bool>,
     schedule_open: Signal<bool>,
     scheduled: Signal<bool>,
-    schedule_generation: Rc<Cell<u64>>,
+    scheduled_message_id: Rc<RefCell<Option<u64>>>,
     editable_sequence: Signal<i64>,
     editing: Signal<bool>,
     edit_state: Rc<RefCell<Option<EditState>>>,
@@ -519,7 +519,7 @@ impl SessionService {
             queue_paused: signal(false),
             schedule_open: signal(false),
             scheduled: signal(false),
-            schedule_generation: Rc::new(Cell::new(0)),
+            scheduled_message_id: Rc::new(RefCell::new(None)),
             editable_sequence: signal(0),
             editing: signal(false),
             edit_state: Rc::new(RefCell::new(None)),
@@ -2605,32 +2605,87 @@ impl SessionService {
             return;
         }
         let mentions = self.armed_mentions_for(&text);
+        let due = unix_timestamp_ms() + (seconds as i64) * 1000;
+        let revision = self.sidebar_snapshot.borrow().revision;
         self.schedule_open.set(false);
-        self.scheduled.set(true);
-        let generation = self.schedule_generation.get().wrapping_add(1);
-        self.schedule_generation.set(generation);
         let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        let session_id = active.clone();
         spawn(async move {
-            timer(Duration::from_secs(seconds)).await;
-            if service.schedule_generation.get() != generation
-                || service.active.get_untracked().as_deref() != Some(active.as_str())
-            {
-                return;
+            let mutation = RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
+                session_id: session_id.clone(),
+                text: text.clone(),
+                attachments: attachments
+                    .iter()
+                    .map(|attachment| MessageAttachment {
+                        label: attachment.label.clone(),
+                        mime_type: Some(attachment.mime_type.clone()),
+                        uri: Some(attachment.uri.clone()),
+                        inline_text_offset: None,
+                    })
+                    .collect(),
+                mentions,
+                scheduled_at_ms: due,
+            };
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    service.apply_sidebar(snapshot);
+                    if service.draft.get_untracked() == text {
+                        service.draft.set(String::new());
+                        service.attachments.set(Vec::new());
+                    }
+                    service.armed_mentions.borrow_mut().clear();
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_schedule_task_failed",
+                    format!("scheduling the message did not finish: {error}"),
+                )),
             }
-            service.scheduled.set(false);
-            if service.draft.get_untracked() == text {
-                service.draft.set(String::new());
-                service.attachments.set(Vec::new());
-            }
-            service.armed_mentions.borrow_mut().clear();
-            service.deliver(text, attachments, mentions, false);
         });
     }
 
     fn cancel_scheduled(&self) {
-        self.schedule_generation
-            .set(self.schedule_generation.get().wrapping_add(1));
-        self.scheduled.set(false);
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Some(message_id) = *self.scheduled_message_id.borrow() else {
+            return;
+        };
+        let revision = self.sidebar_snapshot.borrow().revision;
+        let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        spawn(async move {
+            let mutation = RemoteSidebarOrganizationMutation::SetScheduledSend {
+                session_id: active,
+                message_id,
+                scheduled_at_ms: None,
+            };
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    service.scheduled.set(false);
+                    service.scheduled_message_id.borrow_mut().take();
+                    service.apply_sidebar(snapshot);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_schedule_task_failed",
+                    format!("cancelling the schedule did not finish: {error}"),
+                )),
+            }
+        });
     }
 
     fn enqueue(
@@ -4108,14 +4163,26 @@ impl SessionService {
             }
         });
         self.persist_pins();
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetSessionPinned {
+            session_id: id.to_owned(),
+            pinned,
+        });
+    }
+
+    fn create_folder(&self) {
+        let name = self.folder_name.get_untracked().trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
         let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
         let sidebar = self.sidebar_backend.clone();
-        let session_id = id.to_owned();
         spawn(async move {
-            let mutation = RemoteSidebarOrganizationMutation::SetSessionPinned {
-                session_id: session_id.clone(),
-                pinned,
+            let mutation = RemoteSidebarOrganizationMutation::CreateFolder {
+                name,
+                project_id: None,
+                workspace_id: None,
+                parent_folder_id: service.folder_parent.get_untracked(),
             };
             let result = background(async move {
                 sidebar
@@ -4124,18 +4191,101 @@ impl SessionService {
             })
             .await;
             match result {
-                Ok(Ok(snapshot)) => service.apply_sidebar(snapshot),
-                Ok(Err(error)) => {
-                    service.fail(&error);
+                Ok(Ok(snapshot)) => {
+                    service.folder_name.set(String::new());
+                    service.folder_open.set(false);
+                    service.apply_sidebar(snapshot);
                 }
-                Err(error) => {
-                    service.fail(&BackendError::failed(
-                        "session_pin_task_failed",
-                        format!("changing the pin did not finish: {error}"),
-                    ));
-                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_folder_task_failed",
+                    format!("creating the folder did not finish: {error}"),
+                )),
             }
         });
+    }
+
+    fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
+        self.pinned.set(snapshot.pinned_session_ids.clone());
+        self.unread.set(snapshot.unread_session_ids.clone());
+        let mut auto = snapshot
+            .auto_continue_session_ids
+            .iter()
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        for (id, enabled) in &snapshot.auto_continue_session_overrides {
+            if *enabled {
+                auto.insert(id.clone());
+            } else {
+                auto.remove(id);
+            }
+        }
+        self.auto_continue_sessions.set(auto.into_iter().collect());
+        let mut sections = Vec::new();
+        let mut folder_parents: BTreeMap<String, String> = BTreeMap::new();
+        for placement in &snapshot.placements {
+            if placement.item.kind == RemoteSidebarItemKind::Folder
+                && let Some(parent) = placement.parent_folder_id.as_ref()
+            {
+                folder_parents.insert(placement.item.id.clone(), parent.clone());
+            }
+        }
+        let folder_depth = |id: &str| {
+            let mut depth = 0;
+            let mut current = id;
+            while let Some(parent) = folder_parents.get(current) {
+                depth += 1;
+                current = parent;
+                if depth > 8 {
+                    break;
+                }
+            }
+            depth
+        };
+        let mut folder_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for placement in &snapshot.placements {
+            if placement.item.kind == RemoteSidebarItemKind::Session
+                && let Some(folder) = placement.parent_folder_id.as_ref()
+            {
+                folder_members
+                    .entry(folder.clone())
+                    .or_default()
+                    .push(placement.item.id.clone());
+            }
+        }
+        for folder in &snapshot.folders {
+            sections.push(SidebarSectionView {
+                kind: SidebarSectionKind::Folder,
+                pinned: false,
+                id: folder.id.clone(),
+                parent_id: folder_parents.get(&folder.id).cloned(),
+                depth: folder_depth(&folder.id),
+                collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
+                name: folder.name.clone(),
+                session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
+            });
+        }
+        for group in &snapshot.groups {
+            sections.push(SidebarSectionView {
+                kind: SidebarSectionKind::Group,
+                pinned: group.pinned,
+                id: group.id.clone(),
+                parent_id: folder_parents.get(&group.id).cloned(),
+                depth: 0,
+                collapsed: snapshot.collapsed_group_ids.contains(&group.id),
+                name: group.name.clone(),
+                session_ids: group.member_session_ids.clone(),
+            });
+        }
+        self.sidebar_sections.set(sections);
+        *self.sidebar_snapshot.borrow_mut() = snapshot;
+        self.persist_pins();
+    }
+
+    fn persist_pins(&self) {
+        if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
+            let _ = Storage::set_item(PINS_KEY, text);
+        }
     }
 
     fn rename_folder(&self, id: &str, name: &str) {
@@ -4284,18 +4434,39 @@ impl SessionService {
     }
 
     fn sidebar_mutation(&self, mutation: RemoteSidebarOrganizationMutation) {
+        self.sidebar_mutation_attempt(mutation, 1);
+    }
+
+    fn sidebar_mutation_attempt(&self, mutation: RemoteSidebarOrganizationMutation, retries: u8) {
         let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
         let sidebar = self.sidebar_backend.clone();
         spawn(async move {
+            let for_request = sidebar.clone();
+            let request = mutation.clone();
             let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
+                for_request
+                    .mutate_sidebar_organization(request, Some(revision))
                     .await
             })
             .await;
             match result {
                 Ok(Ok(snapshot)) => service.apply_sidebar(snapshot),
+                Ok(Err(error))
+                    if retries > 0
+                        && (error.kind == BackendErrorKind::Conflict
+                            || error.code.contains("stale_revision")) =>
+                {
+                    let refresh =
+                        background(async move { sidebar.sidebar_organization().await }).await;
+                    match refresh {
+                        Ok(Ok(snapshot)) => {
+                            service.apply_sidebar(snapshot);
+                            service.sidebar_mutation_attempt(mutation, retries - 1);
+                        }
+                        _ => service.fail(&error),
+                    }
+                }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
                     "session_sidebar_task_failed",
@@ -4303,125 +4474,6 @@ impl SessionService {
                 )),
             }
         });
-    }
-
-    fn create_folder(&self) {
-        let name = self.folder_name.get_untracked().trim().to_owned();
-        if name.is_empty() {
-            return;
-        }
-        let revision = self.sidebar_snapshot.borrow().revision;
-        let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
-        spawn(async move {
-            let mutation = RemoteSidebarOrganizationMutation::CreateFolder {
-                name,
-                project_id: None,
-                workspace_id: None,
-                parent_folder_id: service.folder_parent.get_untracked(),
-            };
-            let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
-                    .await
-            })
-            .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.folder_name.set(String::new());
-                    service.folder_open.set(false);
-                    service.apply_sidebar(snapshot);
-                }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_folder_task_failed",
-                    format!("creating the folder did not finish: {error}"),
-                )),
-            }
-        });
-    }
-
-    fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
-        self.pinned.set(snapshot.pinned_session_ids.clone());
-        self.unread.set(snapshot.unread_session_ids.clone());
-        let mut auto = snapshot
-            .auto_continue_session_ids
-            .iter()
-            .cloned()
-            .collect::<std::collections::BTreeSet<_>>();
-        for (id, enabled) in &snapshot.auto_continue_session_overrides {
-            if *enabled {
-                auto.insert(id.clone());
-            } else {
-                auto.remove(id);
-            }
-        }
-        self.auto_continue_sessions.set(auto.into_iter().collect());
-        let mut sections = Vec::new();
-        let mut folder_parents: BTreeMap<String, String> = BTreeMap::new();
-        for placement in &snapshot.placements {
-            if placement.item.kind == RemoteSidebarItemKind::Folder
-                && let Some(parent) = placement.parent_folder_id.as_ref()
-            {
-                folder_parents.insert(placement.item.id.clone(), parent.clone());
-            }
-        }
-        let folder_depth = |id: &str| {
-            let mut depth = 0;
-            let mut current = id;
-            while let Some(parent) = folder_parents.get(current) {
-                depth += 1;
-                current = parent;
-                if depth > 8 {
-                    break;
-                }
-            }
-            depth
-        };
-        let mut folder_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
-        for placement in &snapshot.placements {
-            if placement.item.kind == RemoteSidebarItemKind::Session
-                && let Some(folder) = placement.parent_folder_id.as_ref()
-            {
-                folder_members
-                    .entry(folder.clone())
-                    .or_default()
-                    .push(placement.item.id.clone());
-            }
-        }
-        for folder in &snapshot.folders {
-            sections.push(SidebarSectionView {
-                kind: SidebarSectionKind::Folder,
-                pinned: false,
-                id: folder.id.clone(),
-                parent_id: folder_parents.get(&folder.id).cloned(),
-                depth: folder_depth(&folder.id),
-                collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
-                name: folder.name.clone(),
-                session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
-            });
-        }
-        for group in &snapshot.groups {
-            sections.push(SidebarSectionView {
-                kind: SidebarSectionKind::Group,
-                pinned: group.pinned,
-                id: group.id.clone(),
-                parent_id: folder_parents.get(&group.id).cloned(),
-                depth: 0,
-                collapsed: snapshot.collapsed_group_ids.contains(&group.id),
-                name: group.name.clone(),
-                session_ids: group.member_session_ids.clone(),
-            });
-        }
-        self.sidebar_sections.set(sections);
-        *self.sidebar_snapshot.borrow_mut() = snapshot;
-        self.persist_pins();
-    }
-
-    fn persist_pins(&self) {
-        if let Ok(text) = serde_json::to_string(&self.pinned.get_untracked()) {
-            let _ = Storage::set_item(PINS_KEY, text);
-        }
     }
 
     /// Archives the session the actions sheet is open on.
