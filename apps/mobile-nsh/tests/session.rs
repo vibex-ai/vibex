@@ -406,6 +406,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let sidebar_sections = signal(Vec::new());
     let folder_open = signal(false);
     let folder_name = signal(String::new());
+    let move_open = signal(None::<String>);
     let timeline = signal(transcript("s1"));
     let draft = signal(String::new());
     let sending = signal(false);
@@ -810,6 +811,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_toggle_folder_collapsed: Rc::new(|_, _| {}),
         on_toggle_group_collapsed: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
+        move_open,
+        on_open_move: Rc::new(move || {
+            if let Some(id) = session_actions.get_untracked() {
+                move_open.set(Some(id));
+            }
+        }),
+        on_close_move: Rc::new(move || move_open.set(None)),
+        on_move_session: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,

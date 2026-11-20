@@ -410,6 +410,7 @@ type BatchAction = Rc<dyn Fn(&[String])>;
 type FolderNameAction = Rc<dyn Fn(&str, &str)>;
 type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
 type CollapseAction = Rc<dyn Fn(&str, bool)>;
+type MoveSessionAction = Rc<dyn Fn(&str, Option<&str>)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 
@@ -456,6 +457,10 @@ pub struct SessionHost {
     pub on_toggle_folder_collapsed: CollapseAction,
     pub on_toggle_group_collapsed: CollapseAction,
     pub on_create_group: CreateGroupAction,
+    pub move_open: Signal<Option<String>>,
+    pub on_open_move: Action,
+    pub on_close_move: Action,
+    pub on_move_session: MoveSessionAction,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
     pub timeline: Signal<Vec<TimelineEntry>>,
@@ -944,6 +949,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.session_busy,
             host.on_close_session_actions.clone(),
             host.on_rename_session.clone(),
+            host.on_open_move.clone(),
             host.pinned,
             host.on_toggle_pin.clone(),
             host.on_archive_session.clone(),
@@ -952,6 +958,12 @@ fn shell(host: SessionHost) -> impl IntoElement {
         .child(attachment_preview_sheet(
             host.attachment_preview,
             host.on_close_attachment.clone(),
+        ))
+        .child(move_session_sheet(
+            host.move_open,
+            host.sidebar_sections,
+            host.on_move_session.clone(),
+            host.on_close_move.clone(),
         ))
         .child(crate::screens::team::team(crate::screens::team::TeamHost {
             open: host.team_open,
@@ -3810,6 +3822,7 @@ fn session_actions_sheet(
     busy: Signal<bool>,
     on_close: Rc<dyn Fn()>,
     on_rename: Rc<dyn Fn()>,
+    on_move: Action,
     pinned: Signal<Vec<String>>,
     on_toggle_pin: Rc<dyn Fn(&str)>,
     on_archive: Rc<dyn Fn()>,
@@ -3863,6 +3876,16 @@ fn session_actions_sheet(
                             .disabled_style(|style| style.opacity(0.4))
                         }),
                 )
+                .child({
+                    let on_move = on_move.clone();
+                    action::secondary(
+                        copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
+                        icon(include_str!("../../assets/icons/folder.svg")),
+                        false,
+                        move || on_move(),
+                    )
+                    .w_full()
+                })
                 .child({
                     let on_toggle_pin = on_toggle_pin.clone();
                     action::secondary(
@@ -3918,6 +3941,91 @@ fn session_actions_sheet(
 }
 
 /// The session drawer, from the left edge.
+fn move_session_sheet(
+    open: Signal<Option<String>>,
+    sections: Signal<Vec<SidebarSectionView>>,
+    on_move: MoveSessionAction,
+    on_close: Action,
+) -> impl IntoElement {
+    let folders = computed(move || {
+        sections.with(|sections| {
+            sections
+                .iter()
+                .filter(|section| section.kind == SidebarSectionKind::Folder)
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+    });
+    sheet()
+        .open(move || Some(open.get().is_some()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_XS))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("Move to folder", "移动到文件夹", "移動到資料夾"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child({
+                    let on_move = on_move.clone();
+                    button()
+                        .on_press(move || {
+                            if let Some(id) = open.get_untracked() {
+                                on_move(&id, None);
+                            }
+                        })
+                        .w_full()
+                        .min_h(px(44.0))
+                        .px(px(theme::SPACING_SM))
+                        .items_center()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .bg(theme::background_dim)
+                        .child(
+                            text(copy::text("No folder", "不放入文件夹", "不放入資料夾"))
+                                .text_size(px(theme::font_body()))
+                                .text_color(theme::foreground),
+                        )
+                })
+                .child(each(
+                    move || folders.get(),
+                    |folder| folder.id.clone(),
+                    move |folder, _| {
+                        let on_move = on_move.clone();
+                        button()
+                            .on_press(move || {
+                                if let Some(id) = open.get_untracked() {
+                                    let folder = folder.get_untracked();
+                                    on_move(&id, Some(&folder.id));
+                                }
+                            })
+                            .w_full()
+                            .min_h(px(44.0))
+                            .px(px(theme::SPACING_SM))
+                            .items_center()
+                            .rounded(px(theme::RADIUS_CONTROL))
+                            .bg(theme::background_dim)
+                            .child(
+                                text(move || folder.get().name)
+                                    .text_size(px(theme::font_body()))
+                                    .text_color(theme::foreground),
+                            )
+                    },
+                )),
+        )
+}
+
 fn attachment_preview_sheet(
     preview: Signal<Option<AttachmentItem>>,
     close: Action,

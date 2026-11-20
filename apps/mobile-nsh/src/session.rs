@@ -164,6 +164,7 @@ pub struct SessionService {
     sidebar_sections: Signal<Vec<SidebarSectionView>>,
     folder_open: Signal<bool>,
     folder_name: Signal<String>,
+    move_open: Signal<Option<String>>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     pinned: Signal<Vec<String>>,
@@ -359,6 +360,7 @@ impl SessionService {
             sidebar_sections: signal(Vec::new()),
             folder_open: signal(false),
             folder_name: signal(String::new()),
+            move_open: signal(None),
             sessions: signal(Vec::new()),
             active: signal(None),
             pinned: signal(load_pins()),
@@ -645,6 +647,25 @@ impl SessionService {
             on_create_group: {
                 let service = self.clone();
                 Rc::new(move |name: &str, members: &[String]| service.create_group(name, members))
+            },
+            move_open: self.move_open,
+            on_open_move: {
+                let service = self.clone();
+                Rc::new(move || {
+                    if let Some(id) = service.session_actions.get_untracked() {
+                        service.move_open.set(Some(id));
+                    }
+                })
+            },
+            on_move_session: {
+                let service = self.clone();
+                Rc::new(move |id: &str, folder: Option<&str>| {
+                    service.move_session_to_folder(id, folder)
+                })
+            },
+            on_close_move: {
+                let service = self.clone();
+                Rc::new(move || service.move_open.set(None))
             },
             on_toggle_pin: {
                 let service = self.clone();
@@ -3975,6 +3996,27 @@ impl SessionService {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::DeleteFolder {
             folder_id: id.to_owned(),
         });
+    }
+
+    fn move_session_to_folder(&self, id: &str, folder: Option<&str>) {
+        let mutation = RemoteSidebarOrganizationMutation::MoveItems {
+            items: vec![vibex_core::RemoteSidebarItemRef {
+                kind: RemoteSidebarItemKind::Session,
+                id: id.to_owned(),
+            }],
+            anchor: folder.map(|folder| vibex_core::RemoteSidebarItemRef {
+                kind: RemoteSidebarItemKind::Folder,
+                id: folder.to_owned(),
+            }),
+            position: if folder.is_some() {
+                vibex_core::RemoteSidebarDropPosition::Into
+            } else {
+                vibex_core::RemoteSidebarDropPosition::After
+            },
+            project_id: None,
+        };
+        self.move_open.set(None);
+        self.sidebar_mutation(mutation);
     }
 
     fn rename_group(&self, id: &str, name: &str) {
