@@ -768,20 +768,21 @@ impl VibexWorkbench {
         );
         // A sized control is the Composer footer's instrument, so its glyph
         // answers the pointer the way the terminal beside it does: a step under
-        // the caption's ink at rest, the caption's own ink while the pointer is
-        // on the seat. A group rather than a hover listener, because the
-        // tooltip below already owns this button's one listener; the unsized
-        // variants belong to other surfaces and keep the kit's own icon ink.
-        let sized_group = size.map(|_| {
+        // the footer's resting ink, the foreground's ink while the pointer is on
+        // the seat. The fade listens on a wrapper around the popover trigger —
+        // the tooltip below owns the button's one hover listener — and the
+        // unsized variants belong to other surfaces and keep the kit's icon ink.
+        let sized_hover_key = size.map(|_| {
             format!(
                 "composer-footer-schedule:{}",
                 self.message_schedule_popover_id(&target)
             )
         });
         let sized_ink = size.map(|_| {
-            (
-                composer_instrument_rest_ink(COMPOSER_FOOTER_INSTRUMENT_REST_INK, cx),
-                composer_instrument_hover_ink(cx),
+            composer_instrument_ink(
+                sized_hover_key.as_deref().map_or(0.0, motion::hover_t),
+                COMPOSER_FOOTER_INSTRUMENT_REST_INK,
+                cx,
             )
         });
         let trigger = button_with_aria_label(
@@ -789,17 +790,15 @@ impl VibexWorkbench {
                 .small()
                 .ghost()
                 .compact()
-                .when_some(size.zip(sized_group).zip(sized_ink), |button, pair| {
-                    let (((size, glyph), group), (rest, hover)) = pair;
-                    button.size(px(size)).p(px(0.0)).group(group.clone()).child(
-                        composer_instrument_glyph(
+                .when_some(size.zip(sized_ink), |button, ((size, glyph), ink)| {
+                    button
+                        .size(px(size))
+                        .p(px(0.0))
+                        .child(composer_instrument_glyph(
                             Icon::default().path(CLOCK_ICON),
                             glyph,
-                            group,
-                            rest,
-                            hover,
-                        ),
-                    )
+                            ink,
+                        ))
                 })
                 .map(|button| {
                     if size.is_none() {
@@ -815,7 +814,11 @@ impl VibexWorkbench {
                 .disabled(!enabled),
             label,
         );
-        self.render_message_schedule_popover(target, trigger, cx)
+        let popover = self.render_message_schedule_popover(target, trigger, cx);
+        match sized_hover_key {
+            Some(key) => composer_instrument_hover_target(&key, cx.entity_id(), popover),
+            None => popover,
+        }
     }
 
     /// The element id the popover and its trigger share, per target.

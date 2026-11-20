@@ -945,28 +945,30 @@ because a stroke carries less weight than a solid mark), through
 `PROGRESS_CIRCLE_DRAWN_SCALE` rather than a bare `0.75`.
 
 Every instrument glyph — the footer's schedule and terminal, the surface's
-attach and expand — takes its two inks from `composer_instrument_glyph`: a rest
-step under the caption's muted ink (`composer_instrument_rest_ink`) and the
-caption's own ink while the pointer is on the control
-(`composer_instrument_hover_ink`). Do not paint a single static tone and lean on
-the button's hover background: the kit's `.icon(...)` tints with the button's
-foreground, and a ghost button keeps that foreground unchanged under the
+attach and expand — takes its ink from `composer_instrument_ink`: a rest step
+under the caption's muted ink while the pointer is elsewhere
+(`COMPOSER_FOOTER_INSTRUMENT_REST_INK` = 0.70, `COMPOSER_ROW_INSTRUMENT_REST_INK`
+= 0.78) and the foreground's near-white under the pointer
+(`COMPOSER_INSTRUMENT_HOVER_INK` = 0.92). Do not paint a single static tone and
+lean on the button's hover background: the kit's `.icon(...)` tints with the
+button's foreground, and a ghost button keeps that foreground unchanged under the
 pointer, so a mark that must be dim at rest and bright on hover has to be a
 tinted child. Such a child also needs the whole seat — a sized `Button` that
 carries children insets and clips it — hence the `p(px(0.0))`.
 
-The switch between the two inks rides a **hover group**, not a hover listener.
-Every one of these buttons carries a tooltip, the kit's tooltip already owns
-that button's single `on_hover`, and a second one panics at paint. The group
-(`COMPOSER_ATTACH_GROUP`, `COMPOSER_EXPAND_GROUP`, `COMPOSER_TERMINAL_GROUP`, and
-a per-session `composer-footer-schedule:<id>`) is read by the glyph's wrapper
-through `group_hover`, which also keeps the mark on the same beat as the button's
-own wash instead of half a beat behind it. Both densities of one control share
-one group: a density flip rebuilds the button under the pointer, and a renamed
-group would drop the highlight at the moment the reader is watching it. The
-footer's pair rests darker (`COMPOSER_FOOTER_INSTRUMENT_REST_INK` = 0.70) than
-the surface's own (`COMPOSER_ROW_INSTRUMENT_REST_INK` = 0.78) because they are
-rare actions a step below the box.
+The fade itself hangs on `composer_instrument_hover_target`, a div drawn **around**
+the button, never on the button. Every one of these buttons carries a tooltip,
+the kit's tooltip already owns that button's single `on_hover`, and a second one
+panics at paint; a group-based variant (`group_hover` on a `.group(...)` button)
+compiled and looked right but never fired on screen, which is why
+`composer_instrument_hover_wrapper_lifts_the_marks_ink` drives a real pointer
+across the seat and reads the fade store back. The wrapper's hitbox sits on the
+button's own bounds, so the fade starts and ends where the control does. Both
+densities of one control share one fade key (`COMPOSER_ATTACH_HOVER_KEY`,
+`COMPOSER_EXPAND_HOVER_KEY`, `COMPOSER_TERMINAL_HOVER_KEY`, and a per-session
+`composer-footer-schedule:<id>`): a density flip rebuilds the button under the
+pointer, and a renamed key would drop the highlight at the moment the reader is
+watching it.
 
 The slim row then reads attach → expand → run configuration → send, with no
 fold-menu: four separate controls fit because the row only seats two of them
