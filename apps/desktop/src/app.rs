@@ -6929,6 +6929,11 @@ impl SessionView {
             if content <= viewport {
                 self.timeline_scroll.scroll_to(gpui::ListOffset::default());
             } else {
+                // The list follows its own tail while the reader is on it: that is
+                // the only state in which it paints from the end anchor instead of
+                // re-deriving a row anchor one padding band lower every frame.
+                self.timeline_scroll
+                    .set_follow_mode(gpui::FollowMode::Tail);
                 self.timeline_scroll.scroll_to_end();
             }
         }
@@ -33180,6 +33185,12 @@ impl VibexWorkbench {
     /// to the document. The count and the hints therefore both come from the
     /// table; what the list measures while it draws replaces the hint row by row.
     fn sync_timeline_list_rows(&mut self) {
+        // Following is the list's decision as much as this view's: a list still in
+        // tail mode re-pins itself to the end on the next layout, which is a jump
+        // back to the bottom however the wheel got there.
+        if !self.timeline_follow.following_bottom && self.timeline_scroll.is_following_tail() {
+            self.timeline_scroll.pause_following_tail();
+        }
         let rows = self.timeline_row_sizes.len();
         let count = self.timeline_scroll.item_count();
         let width = self.timeline_scroll.viewport_bounds().size.width;
@@ -65932,7 +65943,18 @@ impl VibexWorkbench {
         self.resolve_timeline_rows_hang_from_bottom();
         // Both are taken here, outside the list's layout: the reveal runs inside
         // the list's prepaint and cannot read either of them there.
-        self.timeline_viewport = self.timeline_scroll.viewport_bounds();
+        // A viewport that shrank because the composer grew is not a reason to
+        // move the conversation: tail mode would re-pin the end and lift the
+        // content by the composer's own height. Pausing keeps the reader's rows
+        // where they are; the tail resumes when they return to the bottom.
+        let viewport = self.timeline_scroll.viewport_bounds();
+        if self.timeline_follow.following_bottom
+            && viewport.size.height != self.timeline_viewport.size.height
+            && self.timeline_scroll.is_following_tail()
+        {
+            self.timeline_scroll.pause_following_tail();
+        }
+        self.timeline_viewport = viewport;
         self.apply_pending_timeline_reveal();
         let content_max_width = session_content_max_width(self.ui_state.session.content_width);
         // The same insets keep the timeline, the composer and the banners
