@@ -42,13 +42,13 @@ use vibex_core::{
     GitWorktreeMergeRequest, GitWorktreeOperationRequest, GitWorktreeOperationStatus,
     GitWorktreeRestoreRequest, GoalAction, GoalPhase, MessageAttachment, MessageProvenance,
     OpenWorkspaceRequest, PermissionRequest, PermissionRequestStatus, PermissionResolution,
-    PermissionResponseKind, PlanStepStatus, RemoteSidebarOrganizationMutation,
-    RemoteSidebarOrganizationSnapshot, RenameAgentSessionRequest, RequestId,
-    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
-    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
-    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
-    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
-    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    PermissionResponseKind, PlanStepStatus, RemoteSidebarItemKind,
+    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
+    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
+    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
+    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
+    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
+    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
     TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
     TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
     WorkspaceId, unix_timestamp_ms,
@@ -70,7 +70,7 @@ use vibex_nsh_ui::{
         PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
         QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-        TimelineEntry, TokenUsageView,
+        SidebarSectionView, TimelineEntry, TokenUsageView,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -161,6 +161,9 @@ pub struct SessionService {
     workspace_backend: Arc<dyn WorkspaceBackend>,
     sidebar_backend: Arc<dyn SidebarBackend>,
     sidebar_snapshot: Rc<RefCell<RemoteSidebarOrganizationSnapshot>>,
+    sidebar_sections: Signal<Vec<SidebarSectionView>>,
+    folder_open: Signal<bool>,
+    folder_name: Signal<String>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     pinned: Signal<Vec<String>>,
@@ -353,6 +356,9 @@ impl SessionService {
             workspace_backend,
             sidebar_backend,
             sidebar_snapshot: Rc::new(RefCell::new(Default::default())),
+            sidebar_sections: signal(Vec::new()),
+            folder_open: signal(false),
+            folder_name: signal(String::new()),
             sessions: signal(Vec::new()),
             active: signal(None),
             pinned: signal(load_pins()),
@@ -585,6 +591,21 @@ impl SessionService {
             sessions: self.sessions,
             active: self.active,
             pinned: self.pinned,
+            sidebar_sections: self.sidebar_sections,
+            folder_open: self.folder_open,
+            folder_name: self.folder_name,
+            on_open_folder: {
+                let service = self.clone();
+                Rc::new(move || service.folder_open.set(true))
+            },
+            on_close_folder: {
+                let service = self.clone();
+                Rc::new(move || service.folder_open.set(false))
+            },
+            on_create_folder: {
+                let service = self.clone();
+                Rc::new(move || service.create_folder())
+            },
             on_toggle_pin: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.toggle_pin(id))
@@ -3899,8 +3920,71 @@ impl SessionService {
         });
     }
 
+    fn create_folder(&self) {
+        let name = self.folder_name.get_untracked().trim().to_owned();
+        if name.is_empty() {
+            return;
+        }
+        let revision = self.sidebar_snapshot.borrow().revision;
+        let service = self.clone();
+        let sidebar = self.sidebar_backend.clone();
+        spawn(async move {
+            let mutation = RemoteSidebarOrganizationMutation::CreateFolder {
+                name,
+                project_id: None,
+                workspace_id: None,
+                parent_folder_id: None,
+            };
+            let result = background(async move {
+                sidebar
+                    .mutate_sidebar_organization(mutation, Some(revision))
+                    .await
+            })
+            .await;
+            match result {
+                Ok(Ok(snapshot)) => {
+                    service.folder_name.set(String::new());
+                    service.folder_open.set(false);
+                    service.apply_sidebar(snapshot);
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "session_folder_task_failed",
+                    format!("creating the folder did not finish: {error}"),
+                )),
+            }
+        });
+    }
+
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
         self.pinned.set(snapshot.pinned_session_ids.clone());
+        let mut sections = Vec::new();
+        let mut folder_members: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        for placement in &snapshot.placements {
+            if placement.item.kind == RemoteSidebarItemKind::Session
+                && let Some(folder) = placement.parent_folder_id.as_ref()
+            {
+                folder_members
+                    .entry(folder.clone())
+                    .or_default()
+                    .push(placement.item.id.clone());
+            }
+        }
+        for folder in &snapshot.folders {
+            sections.push(SidebarSectionView {
+                id: folder.id.clone(),
+                name: folder.name.clone(),
+                session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
+            });
+        }
+        for group in &snapshot.groups {
+            sections.push(SidebarSectionView {
+                id: group.id.clone(),
+                name: group.name.clone(),
+                session_ids: group.member_session_ids.clone(),
+            });
+        }
+        self.sidebar_sections.set(sections);
         *self.sidebar_snapshot.borrow_mut() = snapshot;
         self.persist_pins();
     }

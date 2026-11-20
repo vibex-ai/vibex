@@ -23,7 +23,7 @@ use vibex_nsh_ui::screens::session::{
     PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
     PlanStepView, PlanView, QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView,
     RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    TimelineEntry, TokenUsageView,
+    SidebarSectionView, TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
@@ -190,6 +190,18 @@ fn TurnShell() -> impl IntoElement {
             "![shot](https://example.com/shot.png)\nDone",
         ),
     ]);
+    session::session(host)
+}
+
+/// A shell with one authority folder.
+#[component]
+fn FolderShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sidebar_sections.set(vec![SidebarSectionView {
+        id: "folder-1".to_owned(),
+        name: "Work".to_owned(),
+        session_ids: vec!["s2".to_owned()],
+    }]);
     session::session(host)
 }
 
@@ -361,6 +373,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
     let pinned = signal(Vec::new());
+    let sidebar_sections = signal(Vec::new());
+    let folder_open = signal(false);
+    let folder_name = signal(String::new());
     let timeline = signal(transcript("s1"));
     let draft = signal(String::new());
     let sending = signal(false);
@@ -752,6 +767,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         sessions,
         active,
         pinned,
+        sidebar_sections,
+        folder_open,
+        folder_name,
+        on_open_folder: Rc::new(move || folder_open.set(true)),
+        on_close_folder: Rc::new(move || folder_open.set(false)),
+        on_create_folder: Rc::new(|| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
         draft,
@@ -1125,6 +1146,27 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         std::time::Duration::from_secs(5),
     )
     .unwrap();
+}
+
+#[test]
+fn a_folder_can_be_named_from_the_drawer() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New folder]").unwrap();
+    app.wait_for("Folder name").unwrap();
+    app.type_text("text:Folder name", "Work").unwrap();
+    assert!(app.screen().shows("Create"));
+}
+
+#[test]
+fn a_sidebar_folder_groups_its_sessions() {
+    let mut config = EngineConfig::new(Root::of::<FolderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Work").unwrap();
+    assert!(app.screen().shows("Fix the tests"));
 }
 
 #[test]

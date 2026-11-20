@@ -186,6 +186,14 @@ pub struct TokenUsageView {
     pub output: u64,
 }
 
+/// One drawer section the authority arranged: a folder or a session group.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SidebarSectionView {
+    pub id: String,
+    pub name: String,
+    pub session_ids: Vec<String>,
+}
+
 /// A prompt waiting for the running turn to settle.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct QueuedMessageView {
@@ -424,6 +432,12 @@ pub struct SessionHost {
     pub sessions: Signal<Vec<SessionSummary>>,
     pub active: Signal<Option<String>>,
     pub pinned: Signal<Vec<String>>,
+    pub sidebar_sections: Signal<Vec<SidebarSectionView>>,
+    pub folder_open: Signal<bool>,
+    pub folder_name: Signal<String>,
+    pub on_open_folder: Action,
+    pub on_close_folder: Action,
+    pub on_create_folder: Action,
     pub on_toggle_pin: Rc<dyn Fn(&str)>,
 
     pub timeline: Signal<Vec<TimelineEntry>>,
@@ -3994,6 +4008,20 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
     let pinned = host.pinned;
+    let sidebar_sections = host.sidebar_sections;
+    let folder_open = host.folder_open;
+    let folder_name = host.folder_name;
+    let on_open_folder = host.on_open_folder.clone();
+    let on_close_folder = host.on_close_folder.clone();
+    let on_create_folder = host.on_create_folder.clone();
+    let hidden_sessions = computed(move || {
+        sidebar_sections.with(|sections| {
+            sections
+                .iter()
+                .flat_map(|section| section.session_ids.iter().cloned())
+                .collect::<Vec<_>>()
+        })
+    });
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
     let on_disconnect = host.on_disconnect.clone();
@@ -4039,6 +4067,14 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 }
                             },
                         ))
+                        .child({
+                            let on_open_folder = on_open_folder.clone();
+                            action::icon_button(
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                copy::text("New folder", "新建文件夹", "新增資料夾"),
+                                move || on_open_folder(),
+                            )
+                        })
                         .child(action::icon_button(
                             icon(include_str!("../../assets/icons/menu.svg")),
                             copy::text("Select sessions", "选择会话", "選取工作階段"),
@@ -4104,6 +4140,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             }))
                     }
                 }))
+                .child(folder_sheet(
+                    folder_open,
+                    folder_name,
+                    on_close_folder.clone(),
+                    on_create_folder.clone(),
+                ))
                 .child(
                     view().flex_1().min_h(px(0.0)).child(
                         scroll().flex_1().child(
@@ -4125,8 +4167,31 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             ))
                                     }
                                 }))
+                                .child({
+                                    let section_select = on_select.clone();
+                                    let section_menu = on_session_menu.clone();
+                                    each(
+                                        move || sidebar_sections.get(),
+                                        |section| section.id.clone(),
+                                        move |section, _| {
+                                            sidebar_section(
+                                                section,
+                                                sessions,
+                                                active,
+                                                section_select.clone(),
+                                                section_menu.clone(),
+                                                open,
+                                                select_mode,
+                                                selected,
+                                                pinned,
+                                            )
+                                        },
+                                    )
+                                })
                                 .child(each(
-                                    move || drawer_groups(sessions, query, host.pinned),
+                                    move || {
+                                        drawer_groups(sessions, query, host.pinned, hidden_sessions)
+                                    },
                                     |group| group.id.clone(),
                                     move |group, _| {
                                         let collapsed = collapsed_projects;
@@ -4283,13 +4348,18 @@ fn drawer_groups(
     sessions: Signal<Vec<SessionSummary>>,
     query: Signal<String>,
     pinned: Signal<Vec<String>>,
+    hidden: Memo<Vec<String>>,
 ) -> Vec<DrawerGroup> {
     sessions.with(|sessions| {
         let pinned_ids = pinned.get_untracked();
+        let hidden_ids = hidden.get_untracked();
         let query = query.with(|query| query.trim().to_lowercase());
         let _ = &query;
         let mut groups: Vec<DrawerGroup> = Vec::new();
         for session in sessions {
+            if hidden_ids.iter().any(|id| id == &session.id) {
+                continue;
+            }
             if !query.is_empty()
                 && !session.title.to_lowercase().contains(&query)
                 && !session.agent.to_lowercase().contains(&query)
@@ -4352,6 +4422,117 @@ fn drawer_groups(
         }
         groups
     })
+}
+
+fn folder_sheet(
+    open: Signal<bool>,
+    name: Signal<String>,
+    on_close: Action,
+    on_create: Action,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                on_close();
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .gap(px(theme::SPACING_SM))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(16.0))
+                .child(
+                    text(copy::text("New folder", "新建文件夹", "新增資料夾"))
+                        .text_size(px(theme::font_heading()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                )
+                .child(field::text_field(
+                    name,
+                    copy::text("Folder name", "文件夹名称", "資料夾名稱"),
+                ))
+                .child({
+                    let on_create = on_create.clone();
+                    action::primary(
+                        copy::text("Create", "创建", "建立"),
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        move || on_create(),
+                    )
+                    .w_full()
+                    .disabled(move || name.with(|name| name.trim().is_empty()))
+                    .disabled_style(|style| style.opacity(0.4))
+                }),
+        )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn sidebar_section(
+    section: ReadSignal<SidebarSectionView>,
+    sessions: Signal<Vec<SessionSummary>>,
+    active: Signal<Option<String>>,
+    on_select: Rc<dyn Fn(&str)>,
+    on_menu: SessionMenu,
+    open: Signal<bool>,
+    select_mode: Signal<bool>,
+    selected: Signal<Vec<String>>,
+    pinned: Signal<Vec<String>>,
+) -> impl IntoElement {
+    let rows = computed(move || {
+        let ids = section.with(|section| section.session_ids.clone());
+        sessions.with(|sessions| {
+            ids.iter()
+                .filter_map(|id| sessions.iter().find(|session| &session.id == id).cloned())
+                .collect::<Vec<_>>()
+        })
+    });
+    view()
+        .w_full()
+        .flex_col()
+        .gap(px(2.0))
+        .child(
+            view()
+                .w_full()
+                .min_h(px(30.0))
+                .px(px(theme::SPACING_XS))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(
+                    text(move || section.with(|section| section.name.clone()))
+                        .flex_1()
+                        .truncate()
+                        .text_size(px(theme::font_caption()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::text_muted),
+                )
+                .child(
+                    text(move || rows.with(|rows| rows.len().to_string()))
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                ),
+        )
+        .child(each(
+            move || rows.get(),
+            |session| session.id.clone(),
+            move |session, _| {
+                let session_signal = signal(session.get_untracked());
+                session_row(
+                    session_signal,
+                    active,
+                    on_select.clone(),
+                    on_menu.clone(),
+                    open,
+                    select_mode,
+                    selected,
+                    pinned,
+                )
+            },
+        ))
 }
 
 #[allow(clippy::too_many_arguments)]
