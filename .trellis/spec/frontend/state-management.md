@@ -309,8 +309,9 @@ theme::apply_appearance(appearance: &AppearanceUiState, backdrop: theme::Backdro
   alpha is a soft neutral dim over a dark page but a milky white sheet over a
   bright picture, which drains the image's color and contrast. Light therefore
   lets more of the image through, and the reader's own `dim_percent` veil is
-  what buys contrast on a picture that needs it. Scrollbar tracks and thumbs
-  are plates and fade with them.
+  what buys contrast on a picture that needs it. A scrollbar thumb is a plate
+  and fades with them; the track is not, because it paints nothing at all (see
+  the scrollbar rule in `component-guidelines.md`).
 - Ink, lines, status colors, selection plates, and the hairline an input is
   outlined with keep the authored color. A card keeps it in a dark appearance —
   where the page and the plates are already separated by tone — and fades in a

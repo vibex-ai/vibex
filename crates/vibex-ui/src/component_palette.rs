@@ -314,7 +314,18 @@ pub fn apply_component_palette(theme: &mut Theme, definition: &GpuiThemeDefiniti
         progress_bar = primary;
         slider_bar = primary;
         slider_thumb = primary_foreground;
-        scrollbar = background;
+        // The track paints nothing; it is the surface it lies on.
+        //
+        // One token paints every scrollbar in the product, and the panes they
+        // sit on differ: the page, the sidebar, a card, a popover, and a
+        // settings module each own their plate. A track authored as any one of
+        // them reads as a stripe of that plate inside all the others — a page
+        // colored lane through a sidebar list, another through the model
+        // picker. Only a color that adds nothing matches the pane in every
+        // place, and it composes with a wallpaper for free: the region paints
+        // its own veil, so an untouched track shows exactly that while the
+        // thumb stays opaque above it.
+        scrollbar = background.alpha(0.0);
         scrollbar_thumb = border;
         scrollbar_thumb_hover = muted_foreground;
         caret = primary;
@@ -637,6 +648,7 @@ mod tests {
                 ("list_active", role("accent")),
                 ("table_head", role("muted")),
                 ("table_row_border", role("border")),
+                ("scrollbar", role("background").alpha(0.0)),
                 ("scrollbar_thumb", role("border")),
                 ("caret", role("primary")),
                 ("skeleton", role("muted")),
@@ -661,6 +673,34 @@ mod tests {
             assert_eq!(
                 theme.selection.a, SELECTION_ALPHA,
                 "{}: selection must stay translucent",
+                definition.id
+            );
+        }
+    }
+
+    /// The track must add no color of its own.
+    ///
+    /// One token paints the scrollbar of every pane in the product, and those
+    /// panes do not share a plate: the page, the sidebar, a card, and a popover
+    /// are four different tones. A track authored as any one of them draws a
+    /// stripe of that tone inside the other three, which is what made the page
+    /// colored lane read as a seam through a sidebar list and the model picker.
+    /// Zero alpha is the only value that matches the pane it lies on in every
+    /// place, and it composes with a wallpaper too: the region has already
+    /// painted its own veil behind the bar.
+    #[test]
+    fn the_scrollbar_track_paints_no_plate_of_its_own() {
+        for definition in THEMES {
+            let mut theme = core_themed(definition);
+            apply_component_palette(&mut theme, definition);
+            assert_eq!(
+                theme.scrollbar.a, 0.0,
+                "{}: a scrollbar track is the pane it lies on, not a plate",
+                definition.id
+            );
+            assert!(
+                theme.scrollbar_thumb.a > 0.0,
+                "{}: the thumb is still what marks the position",
                 definition.id
             );
         }

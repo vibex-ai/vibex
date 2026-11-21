@@ -905,8 +905,8 @@ mod tests {
                 assert_eq!(theme.sidebar.a, surfaces.base);
                 assert_eq!(theme.group_box.a, surfaces.raised);
                 assert_eq!(
-                    theme.scrollbar.a, surfaces.raised,
-                    "{mode:?}: a scrollbar track is a plate, not an edge"
+                    theme.scrollbar.a, 0.0,
+                    "{mode:?}: a scrollbar track adds no color, so the pane it lies on shows through"
                 );
                 assert_eq!(
                     theme.foreground,

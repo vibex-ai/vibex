@@ -1903,6 +1903,17 @@ to sRGB, and emits `crates/vibex-ui/src/generated_tokens.rs`.
   status inks take the pole that contrasts most with their plate, hover and
   pressed plates mix toward the theme foreground, and `_light` swatches mix
   toward the theme background.
+- **A scrollbar track paints nothing; the thumb is the scrollbar.** One
+  `scrollbar` token paints the bar of every pane, and those panes are different
+  tones — the page, the sidebar, a card, a popover, a settings module. Authoring
+  the track as any one of them draws a stripe of that tone through the others,
+  which is what a page-colored lane across a sidebar list looked like. The
+  bridge therefore maps `scrollbar` to the theme background at zero alpha: the
+  track takes whatever plate it lies on, and over a wallpaper it shows the veil
+  the region already painted, so `let_wallpaper_through` must leave it alone
+  instead of giving it the raised alpha back. Keep the thumb opaque
+  (`scrollbar_thumb` ← `border`, `scrollbar_thumb_hover` ← `muted-foreground`);
+  it is what makes the position readable without a groove.
 
 Users can add their own palettes by dropping a theme file into the `themes`
 directory under the app home. A file names only the roles it changes;

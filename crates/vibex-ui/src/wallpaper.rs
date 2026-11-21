@@ -49,7 +49,8 @@ pub struct WallpaperSurfaces {
     /// sidebar, the title bar, the status bar, an accordion's body.
     pub base: f32,
     /// The panels and plates that sit on the page: group boxes, popovers, lists,
-    /// tables, tab bars, and the secondary/muted/scrollbar plates.
+    /// tables, tab bars, and the secondary/muted plates (and the scrollbar
+    /// thumb; its track paints no plate and so never fades).
     ///
     /// The page's alpha plus a step, because a plate paints on top of the page
     /// and the two compound: what reads as glass at one layer reads as a wash at
@@ -122,7 +123,11 @@ fn tier(role: &str) -> Option<Tier> {
         | "tab_bar_segmented"
         | "secondary"
         | "muted"
-        | "scrollbar"
+        // The scrollbar *track* is deliberately absent. It paints no color at
+        // all (see `component_palette::apply_component_palette`), so there is
+        // no plate to fade and nothing to veil: the pane behind it, already
+        // faded by this same pass, is what shows through. The thumb is still a
+        // plate and still fades here.
         | "scrollbar-thumb"
         | "scrollbar_thumb"
         | "scrollbar-thumb-hover"
@@ -198,7 +203,6 @@ pub fn let_wallpaper_through(theme: &mut Theme, is_dark: bool) {
         tab_bar_segmented,
         secondary,
         muted,
-        scrollbar,
         scrollbar_thumb,
         scrollbar_thumb_hover,
     );
@@ -260,8 +264,22 @@ mod tests {
             assert_eq!(theme.colors.title_bar.a, surfaces.base);
             assert_eq!(theme.colors.group_box.a, surfaces.raised);
             assert_eq!(theme.colors.popover.a, surfaces.raised);
-            assert_eq!(theme.colors.scrollbar.a, surfaces.raised);
             assert_eq!(theme.colors.scrollbar_thumb.a, surfaces.raised);
+            // The track is not a plate, so the pass leaves it alone. Giving it
+            // a raised alpha here is exactly what turned a transparent track
+            // back into the page-colored lane it used to be.
+            assert_eq!(
+                theme.colors.scrollbar.a, 1.0,
+                "the scrollbar track keeps the value the palette wrote"
+            );
+
+            let mut transparent_track = opaque_theme();
+            transparent_track.colors.scrollbar = white().alpha(0.0);
+            let_wallpaper_through(&mut transparent_track, is_dark);
+            assert_eq!(
+                transparent_track.colors.scrollbar.a, 0.0,
+                "a transparent track stays transparent over a wallpaper"
+            );
 
             // Ink, lines, accents, a selected row's plate, and the hairline a
             // field is outlined with are not containers.
