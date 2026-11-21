@@ -893,16 +893,17 @@ idea is what the atomic token replaced.
 
 The session and home Composers draw two densities from one renderer: a
 one-line bar and the full box. Keep the decision a pure function of what lives
-*inside* the surface — the draft's wrapped rows at the bar's own input width,
-whether attachments exist, and whether the input is expanded. The rows that
-ride *above* the box (continuation prompt, generation status, plan, goal,
-collaboration bar, queued messages) are siblings of the surface, not rows of
-it, and must never choose its density: a blank draft under an active plan is
-still the one-line bar, and rendering the full box there left an empty
-textarea with a reserved band under it. "Empty" means no characters at all: a
-draft of newlines has rows, and the bar cannot show a second row, so Enter in
-the slim bar has to move the surface to the full box instead of pushing the
-bar's controls down inside a 48px surface.
+*inside* the surface — the draft's wrapped rows at the bar's own input width
+(the width that slot actually painted; the row's fixed widths are only the
+pre-first-frame estimate), whether attachments exist, and whether the input is
+expanded. The rows that ride *above* the box (continuation prompt, generation
+status, plan, goal, collaboration bar, queued messages) are siblings of the
+surface, not rows of it, and must never choose its density: a blank draft under
+an active plan is still the one-line bar, and rendering the full box there left
+an empty textarea with a reserved band under it. "Empty" means no characters at
+all: a draft of newlines has rows, and the bar cannot show a second row, so
+Enter in the slim bar has to move the surface to the full box instead of
+pushing the bar's controls down inside a 48px surface.
 
 The surface itself carries only what edits the draft:
 
@@ -983,8 +984,13 @@ height is the disc plus its 7px inset above and below and the surface's hairline
 (`COMPOSER_SLIM_SURFACE_HEIGHT` = 48), and its radius is exactly half of it
 (`COMPOSER_SLIM_SURFACE_RADIUS`), which is what closes both ends into
 semicircles. The row's fixed widths are what `composer_slim_input_width`
-subtracts, so a new control there must be added to that figure as well, or the
-density probe wraps a line later than the painted bar does.
+subtracts when no bar has painted yet, so a new control there must be added to
+that figure as well. Prefer the width the input slot actually painted: the
+estimate was a few pixels wide at the wrap boundary — the run-configuration
+chip, its padding and device-pixel rounding all move — and a draft the estimate
+called one line wrapped inside the painted bar. That measurement lives on the
+row's own prepaint and is recorded only while the surface is the bar; the full
+box's input is wider, and reading it would flip the density back.
 
 The run-configuration chip names the **supplier and the model together** —
 `provider/model` — through `runtime_provider_model_label`, the same pair the

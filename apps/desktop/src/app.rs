@@ -1536,6 +1536,20 @@ const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
 /// bounds before it wraps. The density probe wraps at the same figure so its
 /// row count agrees with what the input will actually draw.
 const COMPOSER_INPUT_TEXT_INSET: f32 = 30.0;
+/// The widest the run-configuration chip can draw on the one-line bar.
+///
+/// The chip's label row caps itself at 224px and the ghost button pads it by
+/// 8px on each side, so 256 is the whole figure. The fallback estimate takes
+/// it in full: an estimate that under-counts this chip credits the bar's input
+/// with width the real input does not have, which is how a draft at the wrap
+/// boundary ended up wrapped inside the one-line bar.
+const COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH: f32 = 256.0;
+/// The widest the "enable this Agent" control can draw on a slim bar.
+///
+/// An imported session with no runtime selection yet seats a sentence, not a
+/// truncating chip, so the estimate gives it a generous bound instead of the
+/// zero width a missing trigger would suggest.
+const COMPOSER_SLIM_RUNTIME_ENABLE_WIDTH: f32 = 280.0;
 /// One line advance in the composer's input.
 ///
 /// The textarea's frame sets `line-height: 1.25rem` (20px at the root size),
@@ -2714,6 +2728,18 @@ struct ComposerGeometry {
     input_bounds: Option<Bounds<Pixels>>,
     surface_bounds: Option<Bounds<Pixels>>,
     runtime_trigger_bounds: Option<Bounds<Pixels>>,
+    /// The input slot's width, measured while the surface was the one-line bar,
+    /// paired with the surface width that frame painted.
+    ///
+    /// The density probe has to know how wide the bar's input will be before it
+    /// commits this frame's layout. The bar's run-configuration chip is the one
+    /// control whose width is not a constant, and estimating it left a few
+    /// pixels of slack: a draft at the wrap boundary was called one line by the
+    /// probe while the real input wrapped it. The bar measures its own input
+    /// slot instead, so the next frame's probe wraps at exactly the width the
+    /// input draws. A full box never overwrites the figure — its input is wider
+    /// and reading that would flip the density back to the bar.
+    slim_input_width: Option<(f32, f32)>,
 }
 
 #[derive(Debug, Clone)]
@@ -4651,32 +4677,40 @@ fn composer_wrapped_rows(input: &TextareaState, text: &str) -> usize {
     text.lines().count().max(1)
 }
 
-/// The width the one-line bar would give its input, from the pane's own
-/// column — never from the density this frame is about to choose.
+/// The width the one-line bar gives its input.
 ///
-/// Every control the slim row seats beside the text has a fixed width: attach
-/// and expand are [`COMPOSER_SLIM_ROW_CONTROL_SIZE`] each, the send action is
-/// [`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`], the gaps and the insets are the
-/// row's own. The run-configuration trigger varies — 32px when compact, up to
-/// 240px otherwise — so the bar's input is never wider than this figure.
-/// Estimating on the narrow side is deliberate: a draft the estimate calls one
-/// line is one line on the real bar too, so the bar cannot bounce back to the
-/// box on the next frame.
+/// The bar is one row, so its input is whatever the surface leaves after the
+/// controls beside the text: attach and expand are each
+/// [`COMPOSER_SLIM_ROW_CONTROL_SIZE`], the send action is
+/// [`COMPOSER_SLIM_PRIMARY_ACTION_SIZE`], the gaps are the row's own, and the
+/// run-configuration control is the one variable width the caller measures.
+///
+/// Two sources answer, in this order:
+///
+/// 1. The width the bar's own input slot painted last frame — measured while
+///    the surface WAS the bar, and paired with the surface width it was
+///    measured at. This is the exact figure: it includes the chip's real
+///    width and any device-pixel rounding. The fallback estimate was a few
+///    pixels too wide, and at the wrap boundary that was enough for the probe
+///    to call a draft one line while the real input wrapped it.
+/// 2. The estimate for a composer that has not painted a bar yet. It assumes
+///    every variable-width control at its widest, so it errs on the narrow
+///    side: a draft the estimate wraps is wrapped on the real bar too, and
+///    the box that follows is stable rather than a bounce.
 fn composer_slim_input_width(
-    pane_width: f32,
-    content_max_width: Option<f32>,
-    content_inset: f32,
-    compact_runtime_controls: bool,
-    has_runtime_selection: bool,
+    surface_width: f32,
+    runtime_control_width: f32,
+    measured: Option<(f32, f32)>,
 ) -> f32 {
-    let surface_width = timeline_content_width(Some(pane_width), content_max_width, content_inset);
-    let trigger = if !has_runtime_selection {
-        0.0
-    } else if compact_runtime_controls {
-        32.0
-    } else {
-        240.0
-    };
+    // A measurement taken at a different surface width belongs to a layout
+    // that no longer exists (a resize, a content-width change). Ignoring it
+    // keeps the probe from wrapping at a column the bar is not painting.
+    if let Some((measured_surface_width, input_width)) = measured
+        && input_width > 0.0
+        && (measured_surface_width - surface_width).abs() <= 0.5
+    {
+        return input_width;
+    }
     (surface_width
         - 2.0 * COMPOSER_SLIM_HORIZONTAL_PADDING
         - 2.0
@@ -4684,8 +4718,34 @@ fn composer_slim_input_width(
         - COMPOSER_SLIM_ROW_CONTROL_SIZE
         - COMPOSER_SLIM_ROW_CONTROL_SIZE
         - COMPOSER_SLIM_PRIMARY_ACTION_SIZE
-        - trigger)
+        - runtime_control_width)
         .max(120.0)
+}
+
+/// The width the slim row's run-configuration control takes, for the estimate.
+///
+/// The cascade's trigger is the row's one variable-width control: a 32px chip
+/// when the pane is compact, otherwise a chip whose label row caps itself at
+/// 224px before the ghost button's padding. An imported session with no
+/// selection yet draws the "enable this Agent" sentence instead, and that
+/// control does not truncate: the estimate gives it a generous bound rather
+/// than pretending the row has no runtime control at all.
+fn composer_slim_runtime_control_width(
+    compact_runtime_controls: bool,
+    has_runtime_selection: bool,
+    session_uninitialized: bool,
+) -> f32 {
+    if has_runtime_selection {
+        return if compact_runtime_controls {
+            32.0
+        } else {
+            COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH
+        };
+    }
+    if session_uninitialized && !compact_runtime_controls {
+        return COMPOSER_SLIM_RUNTIME_ENABLE_WIDTH;
+    }
+    0.0
 }
 
 /// How many rows the draft needs on the one-line bar's own input width.
@@ -4696,9 +4756,10 @@ fn composer_slim_input_width(
 /// the wrap boundary reads two rows in one density and one in the other, and
 /// the composer oscillates between them on every frame. This probe wraps the
 /// draft through its own display map at the width the SLIM row gives the
-/// input — a figure derived from the pane, not from the density being chosen —
-/// so the decision is a fixed point: a draft that fits the bar keeps the bar,
-/// and a draft that does not keeps the box, whose input is wider still.
+/// input — measured from the bar's own slot, or estimated from the pane for a
+/// composer that has not painted one — so the decision is a fixed point: a
+/// draft that fits the bar keeps the bar, and a draft that does not keeps the
+/// box, whose input is wider still.
 ///
 /// A draft carrying inline tokens (agent chips, attachment markers) falls
 /// back to the input's own count: the tokens' element widths live in the
@@ -80648,17 +80709,26 @@ impl VibexWorkbench {
         // Only a draft with no characters at all is the empty case. A draft
         // of newlines is not: it has rows, and those rows ask for the box.
         let composer_draft_is_empty = composer_draft.is_empty();
-        // The density reads the draft at the width the ONE-LINE bar would give
-        // it, measured from the pane's column rather than from either density's
-        // layout: reading the live input made a draft at the wrap boundary
-        // count two rows in the bar and one in the box, and the surface
-        // bounced between the densities on every frame.
-        let composer_slim_width = composer_slim_input_width(
-            composer_width,
+        let session_uninitialized = self.selected_session_runtime_uninitialized();
+        // The density reads the draft at the width the ONE-LINE bar gives its
+        // input: the width this pane's bar actually painted last frame, and the
+        // estimate from the pane's column for a composer that has not painted
+        // one yet. Reading the live input instead made a draft at the wrap
+        // boundary count two rows in the bar and one in the box, and the
+        // surface bounced between the densities on every frame.
+        let composer_surface_width = timeline_content_width(
+            Some(composer_width),
             content_max_width,
             content_insets.horizontal,
-            compact_runtime_controls,
-            runtime_projection.is_some(),
+        );
+        let composer_slim_width = composer_slim_input_width(
+            composer_surface_width,
+            composer_slim_runtime_control_width(
+                compact_runtime_controls,
+                runtime_projection.is_some(),
+                session_uninitialized,
+            ),
+            self.composer_geometry.slim_input_width,
         );
         // The textarea draws at the component's Medium input size: 0.875rem.
         let composer_probe_font = window.text_style().font();
@@ -80749,7 +80819,6 @@ impl VibexWorkbench {
         };
         let input_geometry_entity = cx.weak_entity();
         let surface_geometry_entity = cx.weak_entity();
-        let session_uninitialized = self.selected_session_runtime_uninitialized();
         let (runtime_controls_cascade, runtime_controls_other) =
             if let Some((desired, catalog, projection)) = runtime_projection {
                 // The reasoning levels, conversation modes and feature
@@ -81304,6 +81373,8 @@ impl VibexWorkbench {
                                             .on_prepaint({
                                                 let input_session = geometry_session.clone();
                                                 let input_morph_key = composer_morph_key.clone();
+                                                let input_is_slim = composer_is_slim;
+                                                let input_surface_width = composer_surface_width;
                                                 move |bounds, _, cx| {
                                                     let _ = input_geometry_entity.update(
                                                         cx,
@@ -81313,7 +81384,26 @@ impl VibexWorkbench {
                                                                     input_session.as_deref(),
                                                                     |geometry| {
                                                                         geometry.input_bounds =
-                                                                            Some(bounds)
+                                                                            Some(bounds);
+                                                                        // Only the bar's own
+                                                                        // measurement feeds the
+                                                                        // density probe: the full
+                                                                        // box's input is wider, and
+                                                                        // reading it would flip the
+                                                                        // answer back to the bar.
+                                                                        if input_is_slim {
+                                                                            let input_width =
+                                                                                f32::from(
+                                                                                    bounds
+                                                                                        .size
+                                                                                        .width,
+                                                                                );
+                                                                            geometry.slim_input_width =
+                                                                                Some((
+                                                                                    input_surface_width,
+                                                                                    input_width,
+                                                                                ));
+                                                                        }
                                                                     },
                                                                 );
                                                             if composer_measurement_wants_repaint(
@@ -128261,26 +128351,100 @@ mod tests {
         };
     }
 
-    /// The bar's input width comes from the pane's column and the controls
-    /// the bar seats beside the text — never from the density being chosen.
+    /// The bar's input width comes from the bar's own painted slot, and from
+    /// the pane's column plus the controls the row seats beside the text before
+    /// the bar has painted one — never from the density being chosen.
     #[test]
-    fn composer_slim_input_width_is_a_property_of_the_pane_not_the_density() {
-        let wide = composer_slim_input_width(1200.0, None, 24.0, false, true);
-        // 1200 - 48 inset = 1152 surface; minus insets/hairlines/four 8px
-        // gaps and the fixed controls (attach 30 + expand 30 + send 32) and
-        // the 240px trigger.
-        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
-        // The compact trigger frees the label's width for the draft.
-        let compact = composer_slim_input_width(1200.0, None, 24.0, true, true);
-        assert_eq!(compact, wide + 240.0 - 32.0);
-        // No runtime selection, no trigger at all.
-        let bare = composer_slim_input_width(1200.0, None, 24.0, false, false);
-        assert_eq!(bare, wide + 240.0);
-        // The session content cap bounds the surface, and a sliver of a pane
-        // still leaves the probe a usable width instead of a negative one.
-        let capped = composer_slim_input_width(4000.0, Some(1024.0), 24.0, false, true);
-        assert_eq!(capped, 1024.0 - 20.0 - 2.0 - 32.0 - 92.0 - 240.0);
-        assert!(composer_slim_input_width(200.0, None, 0.0, false, true) >= 120.0);
+    fn composer_slim_input_width_is_a_property_of_the_bar_not_the_density() {
+        let surface = 1152.0;
+        let trigger = COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH;
+        let wide = composer_slim_input_width(surface, trigger, None);
+        // Minus the row's insets, hairline, four 8px gaps, the fixed controls
+        // (attach 30 + expand 30 + send 32) and the widest runtime chip.
+        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - 256.0);
+        assert_eq!(
+            composer_slim_runtime_control_width(false, true, false),
+            COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH
+        );
+        // The compact chip frees the label's width for the draft.
+        let compact = composer_slim_input_width(
+            surface,
+            composer_slim_runtime_control_width(true, true, false),
+            None,
+        );
+        assert_eq!(compact, wide + 256.0 - 32.0);
+        // No runtime selection and nothing to enable: the row is just the text
+        // and the three fixed controls.
+        let bare = composer_slim_input_width(
+            surface,
+            composer_slim_runtime_control_width(false, false, false),
+            None,
+        );
+        assert_eq!(bare, wide + 256.0);
+        // An imported session's enable sentence is a control too, and it does
+        // not truncate.
+        let enabling = composer_slim_input_width(
+            surface,
+            composer_slim_runtime_control_width(false, false, true),
+            None,
+        );
+        assert_eq!(enabling, bare - COMPOSER_SLIM_RUNTIME_ENABLE_WIDTH);
+        // A sliver of a pane still leaves the probe a usable width instead of a
+        // negative one.
+        assert!(composer_slim_input_width(20.0, trigger, None) >= 120.0);
+        // The bar's own painted slot wins over every estimate, because it is
+        // the width the input will actually wrap at — the estimate was a few
+        // pixels wide, and a draft at the boundary wrapped inside the bar.
+        assert_eq!(
+            composer_slim_input_width(surface, trigger, Some((surface, 424.0))),
+            424.0
+        );
+        // A measurement from another surface width belongs to a layout that no
+        // longer exists: a resize has to re-estimate, not wrap at the old
+        // column.
+        assert_eq!(
+            composer_slim_input_width(surface, trigger, Some((surface + 64.0, 424.0))),
+            wide
+        );
+        // The measured width is trusted even when it is narrower than the
+        // estimate's floor: the bar's own layout is the truth.
+        assert_eq!(
+            composer_slim_input_width(surface, trigger, Some((surface, 80.0))),
+            80.0
+        );
+    }
+
+    /// The density probe wraps at the width the bar's own input painted.
+    ///
+    /// The estimate from the row's fixed widths was a few pixels wide at the
+    /// wrap boundary, so a draft the probe called one line wrapped inside the
+    /// painted bar. The bar therefore measures its own input slot, and the
+    /// probe prefers that figure. The measurement is recorded only while the
+    /// surface IS the bar: the full box's input is wider, and feeding it back
+    /// would flip the density to the bar and back on every frame.
+    #[test]
+    fn composer_density_wraps_at_the_bar_width_that_was_painted() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("the composer renderer should remain inspectable");
+        assert!(composer.contains("self.composer_geometry.slim_input_width,"));
+        assert!(composer.contains("let input_is_slim = composer_is_slim;"));
+        assert!(composer.contains("if input_is_slim {"));
+        assert!(composer.contains("geometry.slim_input_width ="));
+
+        let helper = source
+            .split_once("fn composer_slim_input_width(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n/// The width the slim row's run-configuration control")
+            })
+            .map(|(body, _)| body)
+            .expect("the bar width helper should remain inspectable");
+        assert!(helper.contains("measured: Option<(f32, f32)>"));
+        assert!(helper.contains("(measured_surface_width - surface_width).abs() <= 0.5"));
+        assert!(helper.contains("return input_width;"));
     }
 
     /// The reported failure: a draft that wraps to two rows on the slim bar's
