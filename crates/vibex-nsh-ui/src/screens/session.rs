@@ -4237,6 +4237,54 @@ fn attachment_preview_sheet(
         )
 }
 
+fn drawer_header_button(
+    icon: ImageSrc,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .size(px(40.0))
+        .rounded(px(20.0))
+        .items_center()
+        .justify_center()
+        .active(|style| style.opacity(0.6))
+        .child(
+            svg(icon)
+                .w(px(20.0))
+                .h(px(20.0))
+                .text_color(theme::foreground),
+        )
+}
+
+fn drawer_tool(
+    icon: ImageSrc,
+    label: &'static str,
+    active: bool,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .size(px(28.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .items_center()
+        .justify_center()
+        .bg(if active {
+            theme::background_dim()
+        } else {
+            theme::background_card().opacity(0.0)
+        })
+        .active(|style| style.opacity(0.65))
+        .child(
+            svg(icon)
+                .w(px(18.0))
+                .h(px(18.0))
+                .text_color(theme::text_secondary),
+        )
+}
+
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
@@ -4288,7 +4336,6 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     });
     let runtime = host.runtime;
     let on_select = host.on_select.clone();
-    let on_disconnect = host.on_disconnect.clone();
     let on_new_session = host.on_new_session.clone();
     let on_switch_runtime = host.on_switch_runtime.clone();
     let on_open_terminal = host.on_open_terminal.clone();
@@ -4315,38 +4362,124 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                 .pb_safe_area_plus(px(theme::SPACING_MD))
                 .child(
                     view()
+                        .h(px(56.0))
                         .px(px(theme::SPACING_LG))
-                        .pb(px(theme::SPACING_MD))
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .child(view().flex_1().child(brand::wordmark()))
-                        .child(action::icon_button(
-                            icon(include_str!("../../assets/icons/search.svg")),
-                            copy::text("Search sessions", "搜索会话", "搜尋工作階段"),
-                            move || {
-                                search_open.update(|open| *open = !*open);
-                                if !search_open.get_untracked() {
-                                    query.set(String::new());
-                                }
-                            },
-                        ))
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(1.0))
+                                .child(brand::mark(22.0))
+                                .child(
+                                    text("ibex")
+                                        .text_size(px(20.0))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::foreground),
+                                ),
+                        )
                         .child({
-                            let on_open_folder = on_open_folder.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/folder.svg")),
-                                copy::text("New folder", "新建文件夹", "新增資料夾"),
-                                move || on_open_folder(),
+                            let on_new_session = on_new_session.clone();
+                            drawer_header_button(
+                                icon(include_str!("../../assets/icons/plus.svg")),
+                                copy::text("New session", "新建会话", "新增工作階段"),
+                                move || on_new_session(),
                             )
                         })
-                        .child(action::icon_button(
-                            icon(include_str!("../../assets/icons/menu.svg")),
+                        .child(drawer_header_button(
+                            icon(include_str!("../../assets/icons/chevron-right.svg")),
+                            copy::text("Back to session", "返回会话", "返回工作階段"),
+                            move || open.set(false),
+                        )),
+                )
+                .child(
+                    view()
+                        .h(px(44.0))
+                        .flex_shrink_0()
+                        .px(px(theme::SPACING_LG))
+                        .border_b_1()
+                        .border_b_color(theme::border_subtle)
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .child(
+                            text(copy::text("Projects", "项目", "專案"))
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(theme::font_micro()))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::text_muted),
+                        )
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/folder.svg")),
+                            copy::text("Files", "文件", "檔案"),
+                            false,
+                            {
+                                let on_open_files = on_open_files.clone();
+                                move || on_open_files()
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/folder-plus.svg")),
+                            copy::text("New folder", "新建文件夹", "新增資料夾"),
+                            false,
+                            {
+                                let on_open_folder = on_open_folder.clone();
+                                move || on_open_folder()
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/list-checks.svg")),
                             copy::text("Select sessions", "选择会话", "選取工作階段"),
+                            false,
                             move || {
                                 let next = !select_mode.get_untracked();
                                 select_mode.set(next);
                                 if !next {
                                     selected.set(Vec::new());
+                                }
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/code-xml.svg")),
+                            copy::text("Changes", "变更", "變更"),
+                            false,
+                            {
+                                let on_open_git = on_open_git.clone();
+                                move || on_open_git()
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/terminal.svg")),
+                            copy::text("Terminal", "终端", "終端"),
+                            false,
+                            {
+                                let on_open_terminal = on_open_terminal.clone();
+                                move || on_open_terminal()
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/bot.svg")),
+                            copy::text("Team", "团队", "團隊"),
+                            false,
+                            {
+                                let on_open_team = host.on_open_team.clone();
+                                move || on_open_team()
+                            },
+                        ))
+                        .child(drawer_tool(
+                            icon(include_str!("../../assets/icons/search.svg")),
+                            copy::text("Search sessions", "搜索会话", "搜尋工作階段"),
+                            false,
+                            move || {
+                                search_open.update(|open| *open = !*open);
+                                if !search_open.get_untracked() {
+                                    query.set(String::new());
                                 }
                             },
                         )),
@@ -4583,6 +4716,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 active,
                                                 collapsed,
                                                 on_set_project_collapsed.clone(),
+                                                on_new_session.clone(),
                                                 on_select.clone(),
                                                 on_menu.clone(),
                                                 open,
@@ -4605,114 +4739,83 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                         .border_t_1()
                         .border_t_color(theme::border_subtle)
                         .px(px(theme::SPACING_LG))
-                        .pt(px(theme::SPACING_MD))
+                        .py(px(10.0))
+                        .flex_row()
+                        .items_center()
                         .gap(px(theme::SPACING_XS))
-                        .child(
-                            text(move || {
-                                runtime.get().unwrap_or_else(|| {
-                                    copy::text("No runtime", "未连接运行时", "未連線執行環境")
-                                        .into()
-                                })
-                            })
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::text_muted),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Changes", "变更", "變更"),
-                                icon(include_str!("../../assets/icons/history.svg")),
-                                false,
-                                {
-                                    let on_open_git = on_open_git.clone();
-                                    move || on_open_git()
-                                },
-                            )
-                            .w_full(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Files", "文件", "檔案"),
-                                icon(include_str!("../../assets/icons/folder.svg")),
-                                false,
-                                {
-                                    let on_open_files = on_open_files.clone();
-                                    move || on_open_files()
-                                },
-                            )
-                            .w_full(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Terminal", "终端", "終端"),
-                                icon(include_str!("../../assets/icons/terminal.svg")),
-                                false,
-                                {
-                                    let on_open_terminal = on_open_terminal.clone();
-                                    move || on_open_terminal()
-                                },
-                            )
-                            .w_full(),
-                        )
                         .child({
-                            let on_open_team = host.on_open_team.clone();
-                            action::secondary(
-                                copy::text("Team", "团队", "團隊"),
-                                icon(include_str!("../../assets/icons/bot.svg")),
-                                false,
-                                move || on_open_team(),
-                            )
-                            .w_full()
+                            let on_switch = on_switch_runtime.clone();
+                            button()
+                                .flex_1()
+                                .min_h(px(40.0))
+                                .min_w(px(0.0))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .active(|style| style.opacity(0.7))
+                                .accessibility_label(copy::text(
+                                    "Switch runtime",
+                                    "切换运行时",
+                                    "切換執行環境",
+                                ))
+                                .on_press(move || {
+                                    open.set(false);
+                                    on_switch()
+                                })
+                                .child(
+                                    view()
+                                        .w(px(8.0))
+                                        .h(px(8.0))
+                                        .flex_shrink_0()
+                                        .rounded(px(4.0))
+                                        .bg(move || {
+                                            if runtime.get().is_some() {
+                                                theme::color_token("chart-1")
+                                            } else {
+                                                theme::text_muted()
+                                            }
+                                        }),
+                                )
+                                .child(
+                                    text(move || {
+                                        runtime.get().unwrap_or_else(|| {
+                                            copy::text(
+                                                "No runtime",
+                                                "未连接运行时",
+                                                "未連線執行環境",
+                                            )
+                                            .into()
+                                        })
+                                    })
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_detail()))
+                                    .text_color(theme::text_secondary),
+                                )
                         })
-                        .child(
-                            action::primary(
-                                copy::text("New session", "新建会话", "新增工作階段"),
-                                icon(include_str!("../../assets/icons/circle-plus.svg")),
-                                {
-                                    let on_new_session = on_new_session.clone();
-                                    move || on_new_session()
-                                },
-                            )
-                            .w_full(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Switch runtime", "切换运行时", "切換執行環境"),
-                                icon(include_str!("../../assets/icons/refresh.svg")),
-                                false,
-                                {
-                                    let on_switch = on_switch_runtime.clone();
-                                    move || {
-                                        open.set(false);
-                                        on_switch()
-                                    }
-                                },
-                            )
-                            .w_full(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Settings", "设置", "設定"),
-                                icon(include_str!("../../assets/icons/settings.svg")),
-                                false,
-                                {
-                                    let on_open_settings = on_open_settings.clone();
-                                    move || {
-                                        open.set(false);
-                                        on_open_settings()
-                                    }
-                                },
-                            )
-                            .w_full(),
-                        )
-                        .child(
-                            action::secondary(
-                                copy::text("Disconnect", "断开连接", "中斷連線"),
-                                icon(include_str!("../../assets/icons/plug-zap.svg")),
-                                false,
-                                move || on_disconnect(),
-                            )
-                            .w_full(),
-                        ),
+                        .child({
+                            let on_open_settings = on_open_settings.clone();
+                            button()
+                                .size(px(40.0))
+                                .flex_shrink_0()
+                                .items_center()
+                                .justify_center()
+                                .rounded(px(20.0))
+                                .active(|style| style.opacity(0.6))
+                                .accessibility_label(copy::text("Settings", "设置", "設定"))
+                                .on_press(move || {
+                                    open.set(false);
+                                    on_open_settings()
+                                })
+                                .child(
+                                    svg(icon(include_str!("../../assets/icons/settings.svg")))
+                                        .w(px(20.0))
+                                        .h(px(20.0))
+                                        .text_color(theme::text_secondary),
+                                )
+                        }),
                 ),
         )
 }
@@ -5367,6 +5470,7 @@ fn drawer_group(
     active: Signal<Option<String>>,
     collapsed: Signal<Vec<String>>,
     on_project_collapse: SessionToggle,
+    on_new_session: Action,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     open: Signal<bool>,
@@ -5386,40 +5490,82 @@ fn drawer_group(
         .w_full()
         .flex_col()
         .gap(px(2.0))
-        .child({
-            let on_project_collapse = on_project_collapse.clone();
-            button()
-                .on_press(move || {
-                    let id = group.get_untracked().id;
-                    let collapsed_now = collapsed.with(|collapsed| collapsed.contains(&id));
-                    on_project_collapse(&id, !collapsed_now);
-                })
+        .child(
+            view()
                 .w_full()
-                .min_h(px(32.0))
-                .px(px(theme::SPACING_XS))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
-                .active(|style| style.opacity(0.8))
-                .child(
-                    text(move || if closed.get() { "▸" } else { "▾" })
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                )
-                .child(
-                    text(move || group.with(|group| group.name.clone()))
+                .gap(px(2.0))
+                .child({
+                    let on_project_collapse = on_project_collapse.clone();
+                    button()
+                        .on_press(move || {
+                            let id = group.get_untracked().id;
+                            let collapsed_now = collapsed.with(|collapsed| collapsed.contains(&id));
+                            on_project_collapse(&id, !collapsed_now);
+                        })
                         .flex_1()
-                        .truncate()
-                        .text_size(px(theme::font_caption()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_muted),
-                )
-                .child(
-                    text(move || group.with(|group| group.count.to_string()))
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                )
-        })
+                        .min_w(px(0.0))
+                        .h(px(40.0))
+                        .px(px(8.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .active(|style| style.opacity(0.8))
+                        .child(
+                            svg(icon(include_str!("../../assets/icons/folder.svg")))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted),
+                        )
+                        .child(
+                            text(move || group.with(|group| group.name.clone()))
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(theme::font_detail()))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::foreground),
+                        )
+                        .child(
+                            view()
+                                .flex_shrink_0()
+                                .rounded(px(9.0))
+                                .bg(theme::background_dim())
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .child(
+                                    text(move || group.with(|group| group.count.to_string()))
+                                        .text_size(px(theme::font_micro()))
+                                        .text_color(theme::text_muted),
+                                ),
+                        )
+                })
+                .child({
+                    let on_new_session = on_new_session.clone();
+                    button()
+                        .size(px(28.0))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .active(|style| style.opacity(0.65))
+                        .accessibility_label(copy::text(
+                            "New session here",
+                            "在此新建会话",
+                            "在此新增工作階段",
+                        ))
+                        .on_press(move || on_new_session())
+                        .child(
+                            svg(icon(include_str!("../../assets/icons/plus.svg")))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .text_color(theme::text_muted),
+                        )
+                }),
+        )
         .child(when(move || !closed.get(), {
             move || {
                 let on_select = on_select.clone();
@@ -5504,9 +5650,20 @@ fn session_row(
     on_move_relative: MoveRelative,
 ) -> impl IntoElement {
     let dragged = signal(false);
+    let is_active = move || {
+        let id = session.get().id;
+        active.with(|active| active.as_deref() == Some(id.as_str()))
+    };
     view()
         .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
+        .rounded(px(10.0))
+        .bg(move || {
+            if is_active() {
+                theme::background_dim()
+            } else {
+                theme::background_card().opacity(0.0)
+            }
+        })
         .flex_row()
         .items_center()
         .on_long_press(move || dragged.set(true))
@@ -5525,11 +5682,12 @@ fn session_row(
         .child(
             button()
                 .flex_1()
-                .px(px(theme::SPACING_MD))
-                .py(px(theme::SPACING_SM))
+                .min_w(px(0.0))
+                .h(px(48.0))
+                .px(px(8.0))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_SM))
+                .gap(px(10.0))
                 .active(|style| style.opacity(0.85))
                 .on_press(move || {
                     let id = session.get_untracked().id;
@@ -5579,11 +5737,31 @@ fn session_row(
                 ))
                 .child(
                     view()
-                        .w(px(8.0))
-                        .h(px(8.0))
+                        .w(px(24.0))
+                        .h(px(24.0))
                         .flex_shrink_0()
-                        .rounded(px(4.0))
-                        .bg(move || session.get().state.dot()),
+                        .relative()
+                        .items_center()
+                        .justify_center()
+                        .child(
+                            svg(icon(include_str!("../../assets/icons/bot.svg")))
+                                .w(px(17.0))
+                                .h(px(17.0))
+                                .text_color(theme::text_secondary),
+                        )
+                        .child(when(
+                            move || session.get().state != SessionState::Idle,
+                            move || {
+                                view()
+                                    .absolute()
+                                    .right(px(1.0))
+                                    .bottom(px(1.0))
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded(px(3.0))
+                                    .bg(move || session.get().state.dot())
+                            },
+                        )),
                 )
                 .child(when(
                     move || {
@@ -5596,64 +5774,52 @@ fn session_row(
                             .text_color(theme::text_muted)
                     },
                 ))
+                .child(when(
+                    move || {
+                        let id = session.get().id;
+                        unread.with(|unread| unread.iter().any(|candidate| candidate == &id))
+                    },
+                    || {
+                        view()
+                            .w(px(6.0))
+                            .h(px(6.0))
+                            .flex_shrink_0()
+                            .rounded(px(3.0))
+                            .bg(theme::accent_red())
+                    },
+                ))
                 .child(
-                    view()
+                    text(move || session.get().title.clone())
                         .flex_1()
                         .min_w(px(0.0))
-                        .gap(px(2.0))
-                        .child(when(
-                            move || {
-                                let id = session.get().id;
-                                unread
-                                    .with(|unread| unread.iter().any(|candidate| candidate == &id))
-                            },
-                            || {
-                                view()
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded(px(3.0))
-                                    .bg(theme::accent_red())
-                            },
-                        ))
-                        .child(
-                            text(move || session.get().title.clone())
-                                .truncate()
-                                .text_size(px(theme::font_body()))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(move || {
-                                    let id = session.get().id;
-                                    if active.with(|active| active.as_deref() == Some(id.as_str()))
-                                    {
-                                        theme::foreground()
-                                    } else {
-                                        theme::text_secondary()
-                                    }
-                                }),
-                        )
-                        .child(
-                            text(move || {
-                                let session = session.get();
-                                if session.workspace_label.trim().is_empty() {
-                                    format!("{} · {}", session.agent, session.meta)
-                                } else {
-                                    format!(
-                                        "{} · {} · {}",
-                                        session.agent, session.workspace_label, session.meta
-                                    )
-                                }
-                            })
-                            .truncate()
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted),
-                        ),
+                        .truncate()
+                        .text_size(px(theme::font_detail()))
+                        .font_weight(if is_active() {
+                            FontWeight::SEMIBOLD
+                        } else {
+                            FontWeight::MEDIUM
+                        })
+                        .text_color(move || {
+                            if is_active() {
+                                theme::foreground()
+                            } else {
+                                theme::text_secondary()
+                            }
+                        }),
+                )
+                .child(
+                    text(move || session.get().meta.clone())
+                        .flex_shrink_0()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
                 ),
         )
         .child(when(move || !select_mode.get(), {
             move || {
                 let on_menu = on_menu.clone();
                 button()
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .min_w(px(theme::TOUCH_TARGET))
+                    .size(px(36.0))
+                    .flex_shrink_0()
                     .items_center()
                     .justify_center()
                     .active(|style| style.opacity(0.7))
@@ -5663,9 +5829,12 @@ fn session_row(
                         on_menu(&session.id, &session.title);
                     })
                     .child(
-                        text("⋯")
-                            .text_size(px(theme::font_heading()))
-                            .text_color(theme::text_muted),
+                        svg(icon(include_str!(
+                            "../../assets/icons/ellipsis-vertical.svg"
+                        )))
+                        .w(px(16.0))
+                        .h(px(16.0))
+                        .text_color(theme::text_muted),
                     )
             }
         }))

@@ -1225,7 +1225,7 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
     assert!(
-        app.screen().shows("Settings"),
+        app.screen().enabled("role:button[Settings]").unwrap(),
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
@@ -1435,7 +1435,7 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
     assert!(
-        app.screen().shows("Settings"),
+        app.screen().enabled("role:button[Settings]").unwrap(),
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
