@@ -24,7 +24,7 @@ use crate::{
 };
 
 /// The page's top padding above the wordmark.
-const PAGE_TOP_PAD: f32 = 112.0;
+const PAGE_TOP_PAD: f32 = 152.0;
 /// The switcher opens over a live connection and carries no wordmark, so its
 /// rows start one step under the back button.
 const SWITCHER_TOP_PAD: f32 = 56.0;
