@@ -659,47 +659,26 @@ impl PairingService {
         self.error.set(None);
     }
 
-    /// Removes every saved credential; the settings sheet asks first.
+    /// Removes every saved credential; the settings page confirms first.
     pub fn clear_runtimes(&self) {
-        let service = self.clone();
-        spawn_detached(async move {
-            let answer = nsh_base::alert_dialog()
-                .title(copy::text(
-                    "Remove all saved runtimes?",
-                    "移除所有已保存的运行时？",
-                    "移除所有已儲存的執行環境？",
-                ))
-                .description(copy::text(
-                    "Every credential leaves this phone; pair again to reconnect.",
-                    "所有凭据都会从这台手机上删除，需要重新配对才能连接。",
-                    "所有憑證都會從這台手機上刪除，需要重新配對才能連線。",
-                ))
-                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                .destructive("remove", copy::text("Remove", "移除", "移除"))
-                .show()
-                .await;
-            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("remove")) {
-                return;
+        let ids = self
+            .bundles
+            .borrow()
+            .iter()
+            .map(|bundle| bundle.host_id().to_owned())
+            .collect::<Vec<_>>();
+        let _ = std::fs::remove_file(&self.last_host_path);
+        let mut remaining = self.bundles.borrow().clone();
+        for id in ids {
+            if let Ok(bundles) = self.store.remove(&id) {
+                remaining = bundles;
             }
-            let ids = service
-                .bundles
-                .borrow()
-                .iter()
-                .map(|bundle| bundle.host_id().to_owned())
-                .collect::<Vec<_>>();
-            let _ = std::fs::remove_file(&service.last_host_path);
-            let mut remaining = service.bundles.borrow().clone();
-            for id in ids {
-                if let Ok(bundles) = service.store.remove(&id) {
-                    remaining = bundles;
-                }
-            }
-            service.meta.borrow_mut().clear();
-            service.save_meta();
-            service.set_bundles(remaining);
-            service.details.set(None);
-            service.disconnect();
-        });
+        }
+        self.meta.borrow_mut().clear();
+        self.save_meta();
+        self.set_bundles(remaining);
+        self.details.set(None);
+        self.disconnect();
     }
 
     /// Claims `entry` (a link, or a code with `server`) on a background task.
