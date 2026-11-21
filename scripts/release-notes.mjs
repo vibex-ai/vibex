@@ -225,6 +225,21 @@ export function renderContext({ version, tag, from, commits, areas, headings, pu
 // strips them, so the page would render empty. --check rejects that.
 const PLACEHOLDER = /<!--[\s\S]*?-->/gu;
 
+// Strips HTML comments until the text stops changing.
+//
+// One pass is not enough: an opening `<!--` nested inside a comment survives
+// it, so `<!--<!--x-->-->` comes back as `-->` and a section that carries only
+// comments would still look non-empty to `--check`. Repeating the replacement
+// removes the leftovers a single pass creates.
+function stripComments(text) {
+  let stripped = text;
+  for (;;) {
+    const next = stripped.replace(PLACEHOLDER, "");
+    if (next === stripped) return stripped;
+    stripped = next;
+  }
+}
+
 export function checkNotes(document) {
   const problems = [];
   const heading = /^#[ \t]+Vibex[ \t]+v?\S+/mu.test(document);
@@ -235,7 +250,7 @@ export function checkNotes(document) {
     const start = match.index + match[0].length;
     const rest = document.slice(start);
     const next = /^##[ \t]/mu.exec(rest);
-    sections.set(match[1].toLocaleLowerCase("en-US"), (next ? rest.slice(0, next.index) : rest).replace(PLACEHOLDER, "").trim());
+    sections.set(match[1].toLocaleLowerCase("en-US"), stripComments(next ? rest.slice(0, next.index) : rest).trim());
   }
   for (const language of LANGUAGE_SECTIONS) {
     const body = sections.get(language.toLocaleLowerCase("en-US"));

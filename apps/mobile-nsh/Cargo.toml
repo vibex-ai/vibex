@@ -23,7 +23,7 @@ base64.workspace = true
 log.workspace = true
 mdns-sd.workspace = true
 image = { workspace = true, features = ["png", "jpeg"] }
-rqrr = "0.9"
+rqrr = "0.11"
 serde.workspace = true
 serde_json.workspace = true
 futures-channel.workspace = true
