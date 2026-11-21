@@ -37,6 +37,17 @@ pub const RADIUS_CONTROL: f32 = 8.0;
 /// The corner radius of a card: a saved runtime's row, a dialog.
 pub const RADIUS_CARD: f32 = 10.0;
 
+/// The corner radius of a bottom sheet's top edge.
+pub const RADIUS_SHEET: f32 = 22.0;
+
+/// How far a bottom sheet dims the page behind it.
+pub const SHEET_BACKDROP_OPACITY: f32 = 0.55;
+
+/// The pull handle at the top of a bottom sheet.
+pub const SHEET_GRABBER_WIDTH: f32 = 44.0;
+/// The pull handle's thickness.
+pub const SHEET_GRABBER_HEIGHT: f32 = 5.0;
+
 /// The minimum touch target the phone keeps for every pressable row.
 pub const TOUCH_TARGET: f32 = 44.0;
 

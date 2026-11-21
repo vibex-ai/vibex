@@ -738,12 +738,23 @@ fn manual_sheet(
         .grabber_style(|style| {
             style
                 .self_center()
-                .w(px(36.0))
-                .h(px(4.0))
-                .rounded(px(2.0))
-                .bg(theme::muted_foreground().opacity(0.45))
+                .w(px(theme::SHEET_GRABBER_WIDTH))
+                .h(px(theme::SHEET_GRABBER_HEIGHT))
+                .mt(px(theme::SPACING_SM))
+                .mb(px(theme::SPACING_XS))
+                .rounded(px(theme::SHEET_GRABBER_HEIGHT / 2.0))
+                .bg(theme::muted_foreground().opacity(0.55))
         })
-        .backdrop_style(|style| style.bg(nsh_core::color::black().opacity(0.72)))
+        .backdrop_style(|style| {
+            style.bg(nsh_core::color::black().opacity(theme::SHEET_BACKDROP_OPACITY))
+        })
+        .popup_style(|style| {
+            style
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .border_t_1()
+                .border_color(theme::border_default())
+                .bg(theme::background_card())
+        })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
                 open.set(*next);
@@ -753,8 +764,6 @@ fn manual_sheet(
             view()
                 .w_full()
                 .flex_col()
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
                 .child(sheet_header(
                     copy::text(
                         "Paste a code or link",
@@ -860,27 +869,14 @@ fn manual_sheet(
                         ))
                         .child({
                             let connect = connect.clone();
-                            action::primary(
-                                move || {
-                                    if busy.get() {
-                                        copy::text("Connecting…", "连接中…", "連線中…")
-                                    } else {
-                                        copy::text("Connect", "连接", "連線")
-                                    }
-                                },
-                                icon(include_str!("../../assets/icons/plug-zap.svg")),
-                                move || {
-                                    if busy.get_untracked() {
-                                        return;
-                                    }
-                                    let entry = draft.get_untracked();
-                                    let address = server.get_untracked();
-                                    connect(entry.trim(), address.trim());
-                                },
-                            )
-                            .w_full()
-                            .disabled(move || busy.get())
-                            .disabled_style(|style| style.opacity(0.6))
+                            connect_button(busy, move || {
+                                if busy.get_untracked() {
+                                    return;
+                                }
+                                let entry = draft.get_untracked();
+                                let address = server.get_untracked();
+                                connect(entry.trim(), address.trim());
+                            })
                         }),
                 ),
         )
@@ -905,12 +901,23 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>, clock: Signal<i64>) -> im
         .grabber_style(|style| {
             style
                 .self_center()
-                .w(px(36.0))
-                .h(px(4.0))
-                .rounded(px(2.0))
-                .bg(theme::muted_foreground().opacity(0.45))
+                .w(px(theme::SHEET_GRABBER_WIDTH))
+                .h(px(theme::SHEET_GRABBER_HEIGHT))
+                .mt(px(theme::SPACING_SM))
+                .mb(px(theme::SPACING_XS))
+                .rounded(px(theme::SHEET_GRABBER_HEIGHT / 2.0))
+                .bg(theme::muted_foreground().opacity(0.55))
         })
-        .backdrop_style(|style| style.bg(nsh_core::color::black().opacity(0.72)))
+        .backdrop_style(|style| {
+            style.bg(nsh_core::color::black().opacity(theme::SHEET_BACKDROP_OPACITY))
+        })
+        .popup_style(|style| {
+            style
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .border_t_1()
+                .border_color(theme::border_default())
+                .bg(theme::background_card())
+        })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
                 open.set(*next);
@@ -924,8 +931,6 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>, clock: Signal<i64>) -> im
             view()
                 .w_full()
                 .flex_col()
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
                 .child({
                     let on_retry = on_retry.clone();
                     sheet_header(
@@ -950,7 +955,6 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>, clock: Signal<i64>) -> im
                         .w_full()
                         .flex_col()
                         .px(px(theme::SPACING_MD))
-                        .pt(px(theme::SPACING_MD))
                         .pb_safe_area_plus(px(theme::SPACING_LG))
                         .child(when(
                             move || error.get().is_some() && !phase.with(NearbyPhase::retryable),
@@ -1255,12 +1259,23 @@ fn actions_sheet(host: PairingHost) -> impl IntoElement {
         .grabber_style(|style| {
             style
                 .self_center()
-                .w(px(36.0))
-                .h(px(4.0))
-                .rounded(px(2.0))
-                .bg(theme::muted_foreground().opacity(0.45))
+                .w(px(theme::SHEET_GRABBER_WIDTH))
+                .h(px(theme::SHEET_GRABBER_HEIGHT))
+                .mt(px(theme::SPACING_SM))
+                .mb(px(theme::SPACING_XS))
+                .rounded(px(theme::SHEET_GRABBER_HEIGHT / 2.0))
+                .bg(theme::muted_foreground().opacity(0.55))
         })
-        .backdrop_style(|style| style.bg(nsh_core::color::black().opacity(0.72)))
+        .backdrop_style(|style| {
+            style.bg(nsh_core::color::black().opacity(theme::SHEET_BACKDROP_OPACITY))
+        })
+        .popup_style(|style| {
+            style
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .border_t_1()
+                .border_color(theme::border_default())
+                .bg(theme::background_card())
+        })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event
                 && !next
@@ -1272,8 +1287,6 @@ fn actions_sheet(host: PairingHost) -> impl IntoElement {
             view()
                 .w_full()
                 .flex_col()
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
                 .p(px(theme::SPACING_SM))
                 .pb_safe_area_plus(px(theme::SPACING_SM))
                 .child(
@@ -1481,10 +1494,9 @@ fn rename_dialog(
                             .flex_row()
                             .gap(px(theme::SPACING_SM))
                             .child(
-                                action::secondary(
+                                dialog_secondary(
                                     copy::text("Cancel", "取消", "取消"),
                                     icon(include_str!("../../assets/icons/x.svg")),
-                                    false,
                                     {
                                         let close = close.clone();
                                         move || close()
@@ -1495,7 +1507,7 @@ fn rename_dialog(
                             .child({
                                 let rename = rename.clone();
                                 let close = close.clone();
-                                action::primary(
+                                dialog_primary(
                                     copy::text("Save", "保存", "儲存"),
                                     icon(include_str!("../../assets/icons/check.svg")),
                                     move || {
@@ -1585,10 +1597,9 @@ fn remove_dialog(
                             .justify_end()
                             .gap(px(theme::SPACING_SM))
                             .child(
-                                action::secondary(
+                                dialog_secondary(
                                     copy::text("Cancel", "取消", "取消"),
                                     icon(include_str!("../../assets/icons/x.svg")),
-                                    false,
                                     {
                                         let close = close.clone();
                                         move || close()
@@ -1598,7 +1609,7 @@ fn remove_dialog(
                             .child({
                                 let remove = remove.clone();
                                 let close = close.clone();
-                                action::destructive(
+                                dialog_destructive(
                                     copy::text("Remove", "移除", "移除"),
                                     icon(include_str!("../../assets/icons/trash-2.svg")),
                                     move || {
@@ -1865,13 +1876,22 @@ fn sheet_header(
         )
         .child(trailing)
         .child(
-            action::icon_button(
-                icon(include_str!("../../assets/icons/x.svg")),
-                copy::text("Close", "关闭", "關閉"),
-                on_close,
-            )
-            .disabled(move || busy.get())
-            .disabled_style(|style| style.opacity(0.4)),
+            button()
+                .size(px(theme::TOUCH_TARGET))
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .active(|style| style.opacity(0.65))
+                .accessibility_label(copy::text("Close", "关闭", "關閉"))
+                .on_press(on_close)
+                .disabled(move || busy.get())
+                .disabled_style(|style| style.opacity(0.4))
+                .child(
+                    svg(icon(include_str!("../../assets/icons/x.svg")))
+                        .w(px(theme::ICON_SM))
+                        .h(px(theme::ICON_SM))
+                        .text_color(theme::text_muted),
+                ),
         )
 }
 
@@ -1897,6 +1917,86 @@ fn retry_action(on_retry: Action) -> impl IntoElement {
                 .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::foreground),
+        )
+}
+
+/// A dialog's secondary action, at the GPUI client's dialog metrics.
+fn dialog_secondary(
+    label: &'static str,
+    icon: ImageSrc,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    dialog_button(label, icon, false, false, on_press)
+}
+
+/// A dialog's primary action.
+fn dialog_primary(
+    label: &'static str,
+    icon: ImageSrc,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    dialog_button(label, icon, true, false, on_press)
+}
+
+/// A dialog's destructive action: the same shape, in the error ink.
+fn dialog_destructive(
+    label: &'static str,
+    icon: ImageSrc,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    dialog_button(label, icon, false, true, on_press)
+}
+
+fn dialog_button(
+    label: &'static str,
+    icon: ImageSrc,
+    primary: bool,
+    destructive: bool,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let border = if primary {
+        theme::foreground
+    } else if destructive {
+        theme::accent_red
+    } else {
+        theme::border_default
+    };
+    let fill = if primary {
+        theme::foreground
+    } else {
+        theme::background_card
+    };
+    let content = if primary {
+        theme::background
+    } else if destructive {
+        theme::accent_red
+    } else {
+        theme::text_secondary
+    };
+    button()
+        .on_press(on_press)
+        .h(px(theme::TOUCH_TARGET))
+        .px(px(theme::SPACING_LG))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(border)
+        .bg(fill)
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_XS))
+        .active(|style| style.opacity(0.85))
+        .child(
+            svg(icon)
+                .w(px(theme::ICON_SM))
+                .h(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(content),
+        )
+        .child(
+            text(label)
+                .text_size(px(theme::font_body()))
+                .text_color(content),
         )
 }
 
@@ -1951,6 +2051,44 @@ fn nearby_message(message: impl Into<SharedString>, error: bool) -> impl IntoEle
                 theme::text_muted
             }),
     )
+}
+
+/// The manual sheet's one call to action, at the GPUI client's body size.
+fn connect_button(busy: Signal<bool>, on_press: impl Fn() + 'static) -> ButtonElement {
+    button()
+        .on_press(on_press)
+        .w_full()
+        .h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::action_primary)
+        .bg(theme::action_primary)
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .active(|style| style.opacity(0.85))
+        .disabled(move || busy.get())
+        .disabled_style(|style| style.opacity(0.6))
+        .child(
+            svg(icon(include_str!("../../assets/icons/plug-zap.svg")))
+                .w(px(theme::ICON_SM))
+                .h(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(theme::action_primary_label),
+        )
+        .child(
+            text(move || {
+                if busy.get() {
+                    copy::text("Connecting…", "连接中…", "連線中…")
+                } else {
+                    copy::text("Connect", "连接", "連線")
+                }
+            })
+            .text_size(px(theme::font_body()))
+            .font_weight(FontWeight::SEMIBOLD)
+            .text_color(theme::action_primary_label),
+        )
 }
 
 fn pairing_field_label(label: impl Fn() -> &'static str + 'static) -> impl IntoElement {
