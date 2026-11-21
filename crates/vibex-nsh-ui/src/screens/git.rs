@@ -170,7 +170,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
     let commit_detail = host.commit_detail;
     view()
         .flex_1()
-        .bg(theme::background)
+        .bg(theme::block_page())
         .flex_col()
         .pb_safe_area()
         .child(

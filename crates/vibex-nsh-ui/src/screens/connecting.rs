@@ -58,7 +58,7 @@ pub fn connecting(host: ConnectingHost) -> impl IntoElement {
         .relative()
         .items_center()
         .justify_center()
-        .bg(theme::background)
+        .bg(theme::block_page())
         .px(px(theme::SPACING_XL))
         .pt_safe_area()
         .pb_safe_area()

@@ -302,7 +302,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
             .w_full()
             .px(px(4.0))
             .pt(px(4.0))
-            .text_size(px(theme::font_micro()))
+            .text_size(px(theme::font_hint()))
             .text_color(subtitle_text),
         )
 }
@@ -647,7 +647,7 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
             ))
             .w_full()
             .px(px(16.0))
-            .text_size(px(theme::font_micro()))
+            .text_size(px(theme::font_hint()))
             .text_color(subtitle_text),
         )
 }
@@ -1245,7 +1245,7 @@ fn action_row(
                 )
                 .child(
                     text(detail)
-                        .text_size(px(theme::font_caption()))
+                        .text_size(px(theme::font_micro()))
                         .text_color(subtitle_text),
                 ),
         )
@@ -1295,7 +1295,7 @@ fn radio_row<T: Copy + PartialEq + 'static>(
                     move || detail.is_some(),
                     move || {
                         text(detail.unwrap_or_default())
-                            .text_size(px(theme::font_caption()))
+                            .text_size(px(theme::font_micro()))
                             .text_color(subtitle_text)
                     },
                 )),
@@ -1481,7 +1481,7 @@ fn label_block(label: &'static str, detail: &'static str) -> impl IntoElement {
         )
         .child(
             text(detail)
-                .text_size(px(theme::font_caption()))
+                .text_size(px(theme::font_micro()))
                 .text_color(subtitle_text),
         )
 }
@@ -1580,7 +1580,7 @@ fn card_shadow() -> BoxShadow {
         offset_y: px(3.0),
         blur: px(14.0),
         spread: px(0.0),
-        color: nsh_core::element::Color::rgba(0, 0, 0, 10),
+        color: nsh_core::element::Color::rgba(0, 0, 0, 6),
         inset: false,
     }
 }
@@ -1614,8 +1614,8 @@ fn footer_note(message: &'static str) -> impl IntoElement {
     text(message)
         .w_full()
         .px(px(16.0))
-        .text_size(px(theme::font_micro()))
-        .line_height(theme::line_height_for(theme::font_micro()))
+        .text_size(px(theme::font_hint()))
+        .line_height(theme::line_height_for(theme::font_hint()))
         .text_color(subtitle_text)
 }
 

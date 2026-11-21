@@ -32,9 +32,9 @@ use std::{rc::Rc, time::Duration};
 
 use nsh_core::{platform::Lifecycle, prelude::*};
 use pairing::PairingService;
-use vibex_nsh_ui::screens::settings::SettingsPage;
 use session::SessionService;
 use settings::SettingsState;
+use vibex_nsh_ui::screens::settings::SettingsPage;
 use vibex_nsh_ui::screens::{
     connecting::{self as connecting_screen, ConnectingHost, ConnectionState},
     pairing as pairing_screen, session as session_screen,
@@ -115,18 +115,12 @@ pub fn App() -> impl IntoElement {
             open.set(true);
         })
     };
-    let settings_host = settings_host(
-        &pairing,
-        &settings,
-        settings_open,
-        settings_page,
-        services,
-    );
+    let settings_host = settings_host(&pairing, &settings, settings_open, settings_page, services);
 
     view()
         .flex_1()
         .relative()
-        .bg(move || nsh_base::theme().background)
+        .bg(|| vibex_nsh_ui::theme::block_page())
         .child(dynamic({
             let pairing = pairing.clone();
             let settings = settings.clone();
@@ -221,7 +215,7 @@ fn root_view(
                     .left_0()
                     .w_full()
                     .h_full()
-                    .bg(nsh_base::theme().background)
+                    .bg(vibex_nsh_ui::theme::block_page())
                     .child(pairing_screen::pairing(switcher_host.clone()))
                     .into_element()
             }

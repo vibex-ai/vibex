@@ -157,7 +157,7 @@ fn task_row(
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(theme::border_subtle)
-        .bg(theme::background)
+        .bg(theme::block_page())
         .p(px(theme::SPACING_MD))
         .gap(px(theme::SPACING_XS))
         .child(

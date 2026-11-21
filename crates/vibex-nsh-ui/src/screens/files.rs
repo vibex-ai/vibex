@@ -110,7 +110,7 @@ pub fn files(host: FilesHost) -> impl IntoElement {
     let saving = host.saving;
     view()
         .flex_1()
-        .bg(theme::background)
+        .bg(theme::block_page())
         .flex_col()
         .pb_safe_area()
         .child(

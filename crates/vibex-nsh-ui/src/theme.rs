@@ -68,6 +68,8 @@ pub const FONT_DETAIL: f32 = 15.0;
 pub const FONT_CAPTION: f32 = 14.0;
 /// The smallest supporting copy.
 pub const FONT_MICRO: f32 = 13.0;
+/// Footer notes and the quietest captions.
+pub const FONT_HINT: f32 = 12.0;
 /// The large numerals of a verification code.
 pub const FONT_DISPLAY: f32 = 30.0;
 /// The product wordmark.
@@ -125,6 +127,11 @@ pub fn font_caption() -> f32 {
 /// Supporting copy at the current text-size step.
 pub fn font_micro() -> f32 {
     scaled_font(FONT_MICRO)
+}
+
+/// Footer notes at the current text-size step.
+pub fn font_hint() -> f32 {
+    scaled_font(FONT_HINT)
 }
 
 /// Large numerals at the current text-size step.
