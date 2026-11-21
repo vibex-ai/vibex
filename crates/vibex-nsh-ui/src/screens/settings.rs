@@ -46,13 +46,13 @@ impl SettingsPage {
 /// The page's outer gutter.
 const PAGE_GUTTER: f32 = 16.0;
 /// The gap between two cards.
-const CARD_GAP: f32 = 12.0;
+const CARD_GAP: f32 = 0.0;
 /// The corner radius of a card.
-const CARD_RADIUS: f32 = 18.0;
+const CARD_RADIUS: f32 = 20.0;
 /// The height of the title bar.
 const HEADER_HEIGHT: f32 = 56.0;
 /// The minimum height of a settings row.
-const ROW_MIN: f32 = 52.0;
+const ROW_MIN: f32 = 60.0;
 /// The leading icon tile and its glyph.
 const TILE: f32 = 30.0;
 const TILE_RADIUS: f32 = 9.0;
@@ -316,7 +316,8 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
     button()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_sm()
+        .shadow_md()
+        .mb(px(12.0))
         .bg(theme::block_surface)
         .px(px(theme::SPACING_LG))
         .py(px(14.0))
@@ -406,8 +407,8 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
         )
         .child(
             svg(icon(include_str!("../../assets/icons/chevron-right.svg")))
-                .w(px(theme::ICON_SM))
-                .h(px(theme::ICON_SM))
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
                 .flex_shrink_0()
                 .text_color(theme::text_muted),
         )
@@ -876,7 +877,8 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             view()
                 .w_full()
                 .rounded(px(CARD_RADIUS))
-                .shadow_sm()
+                .shadow_md()
+                .mb(px(12.0))
                 .bg(theme::block_surface)
                 .px(px(16.0))
                 .py(px(14.0))
@@ -1009,7 +1011,8 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_sm()
+        .shadow_md()
+        .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
         .child(
@@ -1156,7 +1159,8 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_sm()
+        .shadow_md()
+        .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
         .child(view().w_full().flex_col().children(rows))
@@ -1183,7 +1187,7 @@ fn index_row(
         .child(
             view().flex_1().min_w(px(0.0)).child(
                 text(title)
-                    .text_size(px(theme::font_detail()))
+                    .text_size(px(theme::font_body()))
                     .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::foreground),
             ),
@@ -1196,8 +1200,8 @@ fn index_row(
         )
         .child(
             svg(icon(include_str!("../../assets/icons/chevron-right.svg")))
-                .w(px(theme::ICON_SM))
-                .h(px(theme::ICON_SM))
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
                 .flex_shrink_0()
                 .text_color(theme::text_muted),
         )
@@ -1234,13 +1238,13 @@ fn action_row(
                 .flex_col()
                 .child(
                     text(title)
-                        .text_size(px(theme::font_detail()))
+                        .text_size(px(theme::font_body()))
                         .font_weight(FontWeight::MEDIUM)
                         .text_color(color),
                 )
                 .child(
                     text(detail)
-                        .text_size(px(theme::font_micro()))
+                        .text_size(px(theme::font_caption()))
                         .text_color(theme::text_muted),
                 ),
         )
@@ -1368,9 +1372,9 @@ fn step_button(
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
-        .w(px(36.0))
-        .h(px(36.0))
-        .rounded(px(8.0))
+        .w(px(40.0))
+        .h(px(40.0))
+        .rounded(px(10.0))
         .border_1()
         .border_color(theme::border_default)
         .bg(theme::block_inset)
@@ -1470,12 +1474,12 @@ fn label_block(label: &'static str, detail: &'static str) -> impl IntoElement {
         .flex_col()
         .child(
             text(label)
-                .text_size(px(theme::font_detail()))
+                .text_size(px(theme::font_body()))
                 .text_color(theme::foreground),
         )
         .child(
             text(detail)
-                .text_size(px(theme::font_micro()))
+                .text_size(px(theme::font_caption()))
                 .text_color(theme::text_muted),
         )
 }
@@ -1521,13 +1525,13 @@ fn nav_row(
         .child(
             text(label)
                 .flex_1()
-                .text_size(px(theme::font_detail()))
+                .text_size(px(theme::font_body()))
                 .text_color(theme::foreground),
         )
         .child(
             svg(icon(include_str!("../../assets/icons/chevron-right.svg")))
-                .w(px(theme::ICON_SM))
-                .h(px(theme::ICON_SM))
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
                 .flex_shrink_0()
                 .text_color(theme::text_muted),
         )
@@ -1555,7 +1559,10 @@ fn icon_tile(image: ImageSrc, danger: bool) -> impl IntoElement {
 }
 
 fn divider() -> impl IntoElement {
-    view().w_full().h(px(1.0)).bg(theme::border_subtle)
+    view()
+        .w_full()
+        .pl(px(16.0))
+        .child(view().w_full().h(px(1.0)).bg(theme::border_subtle))
 }
 
 fn footer_note(message: &'static str) -> impl IntoElement {
@@ -1571,7 +1578,7 @@ fn section_label(label: &'static str) -> impl IntoElement {
     text(label)
         .w_full()
         .py(px(8.0))
-        .text_size(px(theme::font_micro()))
+        .text_size(px(theme::font_caption()))
         .font_weight(FontWeight::MEDIUM)
         .text_color(theme::text_muted)
 }
