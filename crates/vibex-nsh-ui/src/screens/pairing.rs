@@ -291,16 +291,15 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
     let rename_open = host.rename_open;
     let remove_open = host.remove_open;
     let switcher = host.switcher;
-    let spinner = signal(SharedString::from("◐"));
+    let activity_phase = signal(0u32);
     let clock = signal(now_ms());
     if !crate::motion::reduce_motion() {
         spawn(async move {
-            let frames = ["◐", "◓", "◑", "◒"];
-            let mut index = 0;
+            let mut frame = 0;
             loop {
-                nsh_core::element::timer(std::time::Duration::from_millis(120)).await;
-                index = (index + 1) % frames.len();
-                spinner.set(SharedString::from(frames[index]));
+                nsh_core::element::timer(std::time::Duration::from_millis(100)).await;
+                frame = (frame + 1) % 8;
+                activity_phase.set(frame);
             }
         });
     }
@@ -347,7 +346,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     saved,
                     on_pick.clone(),
                     on_actions.clone(),
-                    spinner,
+                    activity_phase,
                     switcher,
                 )
             }
@@ -557,7 +556,7 @@ fn saved_runtimes(
     saved: Signal<Vec<SavedRuntime>>,
     on_pick: Rc<dyn Fn(&str)>,
     on_actions: Rc<dyn Fn(&str)>,
-    spinner: Signal<SharedString>,
+    activity_phase: Signal<u32>,
     switcher: Signal<bool>,
 ) -> impl IntoElement {
     view().flex_col().w_full().pb(px(theme::SPACING_MD)).child(
@@ -578,7 +577,7 @@ fn saved_runtimes(
                         move || saved.get(),
                         |runtime| runtime.id.clone(),
                         move |runtime, _| {
-                            saved_row(runtime, on_pick.clone(), on_actions.clone(), spinner)
+                            saved_row(runtime, on_pick.clone(), on_actions.clone(), activity_phase)
                         },
                     )),
             ),
@@ -590,7 +589,7 @@ fn saved_row(
     runtime: ReadSignal<SavedRuntime>,
     on_pick: Rc<dyn Fn(&str)>,
     on_actions: Rc<dyn Fn(&str)>,
-    spinner: Signal<SharedString>,
+    activity_phase: Signal<u32>,
 ) -> impl IntoElement {
     let accessible = format!(
         "{} · {} · {}",
@@ -623,14 +622,7 @@ fn saved_row(
                 .on_press(move || on_pick(&runtime.get_untracked().id))
                 .child(when(
                     move || runtime.get().status == RuntimeStatus::Probing,
-                    move || {
-                        text(move || spinner.get())
-                            .w(px(20.0))
-                            .flex_shrink_0()
-                            .text_center()
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted())
-                    },
+                    move || activity_indicator(activity_phase, theme::text_muted()),
                 ))
                 .child(when(
                     move || runtime.get().status != RuntimeStatus::Probing,
@@ -2107,6 +2099,55 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|elapsed| elapsed.as_millis() as i64)
         .unwrap_or(0)
+}
+
+/// The six-dot ring the old phone client uses while a runtime is asked.
+///
+/// The ring is a ring of six dots in a two-by-three cell, with one highlight
+/// walking it. The phase comes from a shared eight-frame clock, so every row
+/// that is probing moves together.
+fn activity_indicator(phase: Signal<u32>, color: Hsla) -> impl IntoElement {
+    // Ring order around the cell: left column down, right column up.
+    let dots = [
+        (0.0_f32, 0.0_f32),
+        (0.0, 1.0),
+        (0.0, 2.0),
+        (1.0, 2.0),
+        (1.0, 1.0),
+        (1.0, 0.0),
+    ];
+    let center = 10.0_f32;
+    let pitch = 5.2_f32;
+    let diameter = 3.2_f32;
+    view()
+        .w(px(20.0))
+        .h(px(20.0))
+        .flex_shrink_0()
+        .relative()
+        .children(
+            dots.into_iter()
+                .enumerate()
+                .map(move |(index, (column, row))| {
+                    let x = center + (column - 0.5) * pitch - diameter * 0.5;
+                    let y = center + (row - 1.0) * pitch - diameter * 0.5;
+                    view()
+                        .absolute()
+                        .left(px(x))
+                        .top(px(y))
+                        .w(px(diameter))
+                        .h(px(diameter))
+                        .rounded(px(diameter * 0.5))
+                        .bg(color)
+                        .opacity(move || {
+                            let head = phase.get() as f32 / 8.0 * 6.0;
+                            let offset = (index as f32 - head).rem_euclid(6.0);
+                            let distance = offset.min(6.0 - offset);
+                            let intensity =
+                                0.5 + 0.5 * (distance / 6.0 * std::f32::consts::TAU).cos();
+                            0.28 + 0.72 * intensity
+                        })
+                }),
+        )
 }
 
 /// An SVG from this crate's assets, drawn inline.
