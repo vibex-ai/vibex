@@ -889,9 +889,41 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         ))
 }
 
+thread_local! {
+    /// The mounted shell's drawer signal, for the platform back gesture.
+    static DRAWER_OPEN: std::cell::Cell<Option<Signal<bool>>> = const {
+        std::cell::Cell::new(None)
+    };
+}
+
+/// Whether the mounted session drawer is open.
+pub fn drawer_is_open() -> bool {
+    DRAWER_OPEN.with(|cell| cell.get().is_some_and(|open| open.get_untracked()))
+}
+
+/// Opens the mounted session drawer, if a shell is on screen.
+pub fn open_drawer() {
+    DRAWER_OPEN.with(|cell| {
+        if let Some(open) = cell.get() {
+            open.set(true);
+        }
+    });
+}
+
+/// Closes the mounted session drawer, if a shell is on screen.
+pub fn close_drawer() {
+    DRAWER_OPEN.with(|cell| {
+        if let Some(open) = cell.get() {
+            open.set(false);
+        }
+    });
+}
+
 /// The shell proper: header, transcript, cards, composer and drawer.
 fn shell(host: SessionHost) -> impl IntoElement {
     let drawer_open = signal(false);
+    DRAWER_OPEN.with(|cell| cell.set(Some(drawer_open)));
+    let edge_drag = nsh_core::element::animated_value(0.0);
     let connection = host.connection;
     let connection_error = host.connection_error;
     let on_retry = host.on_retry.clone();
@@ -981,8 +1013,11 @@ fn shell(host: SessionHost) -> impl IntoElement {
                 .top(px(0.0))
                 .bottom(px(0.0))
                 .w(px(24.0))
+                .pan_values(Some(&edge_drag), None)
+                .pan_enabled(true)
+                .on_pan_start(|_: &PanEvent| {})
                 .on_pan_end(move |event: &PanEvent| {
-                    if event.translation.x.0 > 40.0 {
+                    if !event.cancelled && event.translation.x.0 > 40.0 {
                         drawer_open.set(true);
                     }
                 }),
@@ -3908,6 +3943,55 @@ fn attachment_chip(
 
 /// Rename, archive or delete one session.
 #[allow(clippy::too_many_arguments)]
+fn sheet_grabber() -> impl IntoElement {
+    view()
+        .w(px(36.0))
+        .h(px(4.0))
+        .rounded(px(2.0))
+        .bg(theme::muted_foreground().opacity(0.4))
+}
+
+fn sheet_action(
+    label: impl IntoReactive<SharedString>,
+    icon: ImageSrc,
+    danger: bool,
+    disabled: Option<Signal<bool>>,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let ink: fn() -> Hsla = if danger {
+        theme::accent_red
+    } else {
+        theme::foreground
+    };
+    button()
+        .w_full()
+        .h(px(48.0))
+        .px(px(10.0))
+        .flex_row()
+        .items_center()
+        .gap(px(12.0))
+        .rounded(px(10.0))
+        .active(|style| style.bg(theme::background_dim()))
+        .disabled(move || disabled.is_some_and(|busy| busy.get()))
+        .disabled_style(|style| style.opacity(0.4))
+        .on_press(on_press)
+        .child(
+            svg(icon)
+                .w(px(18.0))
+                .h(px(18.0))
+                .flex_shrink_0()
+                .text_color(ink),
+        )
+        .child(
+            text(label)
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(theme::font_detail()))
+                .text_color(ink),
+        )
+}
+
 fn session_actions_sheet(
     actions: Signal<Option<String>>,
     rename: Signal<String>,
@@ -3936,16 +4020,21 @@ fn session_actions_sheet(
         .child(
             view()
                 .w_full()
-                .gap(px(theme::SPACING_SM))
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
                 .p(px(theme::SPACING_MD))
                 .pb_safe_area_plus(px(theme::SPACING_LG))
                 .bg(theme::background_card)
-                .rounded_t(px(16.0))
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
                 .child(
-                    text(copy::text("Session", "会话", "工作階段"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Session", "会话", "工作階段"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
                 )
                 .child(
                     view()
@@ -3970,97 +4059,106 @@ fn session_actions_sheet(
                             .disabled_style(|style| style.opacity(0.4))
                         }),
                 )
-                .child({
-                    let on_move = on_move.clone();
-                    action::secondary(
-                        copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
-                        icon(include_str!("../../assets/icons/folder.svg")),
-                        false,
-                        move || on_move(),
-                    )
-                    .w_full()
-                })
-                .child({
-                    let on_toggle_auto_continue = on_toggle_auto_continue.clone();
-                    action::secondary(
-                        move || {
-                            let enabled = actions.with(|id| {
-                                id.as_ref().is_some_and(|id| {
-                                    auto_continue.with(|sessions| {
-                                        sessions.iter().any(|candidate| candidate == id)
-                                    })
-                                })
-                            });
-                            if enabled {
-                                copy::text("Auto-continue on", "自动继续已开", "自動繼續已開")
-                            } else {
-                                copy::text("Auto-continue off", "自动继续已关", "自動繼續已關")
-                            }
-                        },
-                        icon(include_str!("../../assets/icons/send.svg")),
-                        false,
-                        move || {
-                            if let Some(id) = actions.get_untracked() {
-                                let enabled = auto_continue.with(|sessions| {
-                                    sessions.iter().any(|candidate| candidate == &id)
-                                });
-                                on_toggle_auto_continue(&id, !enabled);
-                            }
-                        },
-                    )
-                    .w_full()
-                })
-                .child({
-                    let on_toggle_pin = on_toggle_pin.clone();
-                    action::secondary(
-                        move || {
-                            let pinned = actions.with(|id| {
-                                id.as_ref().is_some_and(|id| {
-                                    pinned.with(|pinned| {
-                                        pinned.iter().any(|candidate| candidate == id)
-                                    })
-                                })
-                            });
-                            if pinned {
-                                copy::text("Unpin", "取消置顶", "取消置頂")
-                            } else {
-                                copy::text("Pin", "置顶", "置頂")
-                            }
-                        },
-                        icon(include_str!("../../assets/icons/check.svg")),
-                        false,
-                        move || {
-                            if let Some(id) = actions.get_untracked() {
-                                on_toggle_pin(&id);
-                            }
-                        },
-                    )
-                    .w_full()
-                })
-                .child({
-                    let on_archive = on_archive.clone();
-                    action::secondary(
-                        copy::text("Archive", "归档", "封存"),
-                        icon(include_str!("../../assets/icons/folder.svg")),
-                        false,
-                        move || on_archive(),
-                    )
-                    .w_full()
-                    .disabled(move || busy.get())
-                    .disabled_style(|style| style.opacity(0.4))
-                })
-                .child({
-                    let on_delete = on_delete.clone();
-                    action::secondary(
-                        copy::text("Delete", "删除", "刪除"),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || on_delete(),
-                    )
-                    .w_full()
-                    .disabled(move || busy.get())
-                    .disabled_style(|style| style.opacity(0.4))
-                }),
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .child({
+                            let on_move = on_move.clone();
+                            sheet_action(
+                                copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                None,
+                                move || on_move(),
+                            )
+                        })
+                        .child({
+                            let on_toggle_auto_continue = on_toggle_auto_continue.clone();
+                            sheet_action(
+                                move || {
+                                    let enabled = actions.with(|id| {
+                                        id.as_ref().is_some_and(|id| {
+                                            auto_continue.with(|sessions| {
+                                                sessions.iter().any(|candidate| candidate == id)
+                                            })
+                                        })
+                                    });
+                                    if enabled {
+                                        copy::text(
+                                            "Auto-continue on",
+                                            "自动继续已开",
+                                            "自動繼續已開",
+                                        )
+                                    } else {
+                                        copy::text(
+                                            "Auto-continue off",
+                                            "自动继续已关",
+                                            "自動繼續已關",
+                                        )
+                                    }
+                                },
+                                icon(include_str!("../../assets/icons/send.svg")),
+                                false,
+                                None,
+                                move || {
+                                    if let Some(id) = actions.get_untracked() {
+                                        let enabled = auto_continue.with(|sessions| {
+                                            sessions.iter().any(|candidate| candidate == &id)
+                                        });
+                                        on_toggle_auto_continue(&id, !enabled);
+                                    }
+                                },
+                            )
+                        })
+                        .child({
+                            let on_toggle_pin = on_toggle_pin.clone();
+                            sheet_action(
+                                move || {
+                                    let pinned = actions.with(|id| {
+                                        id.as_ref().is_some_and(|id| {
+                                            pinned.with(|pinned| {
+                                                pinned.iter().any(|candidate| candidate == id)
+                                            })
+                                        })
+                                    });
+                                    if pinned {
+                                        copy::text("Unpin", "取消置顶", "取消置頂")
+                                    } else {
+                                        copy::text("Pin", "置顶", "置頂")
+                                    }
+                                },
+                                icon(include_str!("../../assets/icons/check.svg")),
+                                false,
+                                None,
+                                move || {
+                                    if let Some(id) = actions.get_untracked() {
+                                        on_toggle_pin(&id);
+                                    }
+                                },
+                            )
+                        })
+                        .child({
+                            let on_archive = on_archive.clone();
+                            sheet_action(
+                                copy::text("Archive", "归档", "封存"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                Some(busy),
+                                move || on_archive(),
+                            )
+                        })
+                        .child({
+                            let on_delete = on_delete.clone();
+                            sheet_action(
+                                copy::text("Delete", "删除", "刪除"),
+                                icon(include_str!("../../assets/icons/x.svg")),
+                                true,
+                                Some(busy),
+                                move || on_delete(),
+                            )
+                        }),
+                ),
         )
 }
 
@@ -4314,6 +4412,7 @@ fn drawer_tool(
 }
 
 fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
+    let close_drag = nsh_core::element::animated_value(0.0);
     let sessions = host.sessions;
     let active = host.active;
     let collapsed_projects = host.collapsed_projects;
@@ -4384,8 +4483,17 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
             view()
                 .w_full()
                 .h_full()
+                .relative()
                 .flex_col()
                 .bg(theme::background_card)
+                .pan_values(Some(&close_drag), None)
+                .pan_enabled(move || open.get())
+                .on_pan_start(|_: &PanEvent| {})
+                .on_pan_end(move |event: &PanEvent| {
+                    if !event.cancelled && event.translation.x.0 < -50.0 {
+                        open.set(false);
+                    }
+                })
                 .pt_safe_area_plus(px(theme::SPACING_LG))
                 .pb_safe_area_plus(px(theme::SPACING_MD))
                 .child(
@@ -4844,6 +4952,22 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                         .text_color(theme::text_secondary),
                                 )
                         }),
+                )
+                .child(
+                    view()
+                        .absolute()
+                        .right(px(0.0))
+                        .top(px(0.0))
+                        .bottom(px(0.0))
+                        .w(px(24.0))
+                        .pan_values(Some(&close_drag), None)
+                        .pan_enabled(move || open.get())
+                        .on_pan_start(|_: &PanEvent| {})
+                        .on_pan_end(move |event: &PanEvent| {
+                            if !event.cancelled && event.translation.x.0 < -40.0 {
+                                open.set(false);
+                            }
+                        }),
                 ),
         )
 }
@@ -5009,16 +5133,21 @@ fn group_actions_sheet(
         .child(
             view()
                 .w_full()
-                .gap(px(theme::SPACING_SM))
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
                 .p(px(theme::SPACING_MD))
                 .pb_safe_area_plus(px(theme::SPACING_LG))
                 .bg(theme::background_card)
-                .rounded_t(px(16.0))
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
                 .child(
-                    text(copy::text("Session group", "会话分组", "工作階段分組"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Session group", "会话分组", "工作階段分組"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
                 )
                 .child(field::text_field(
                     name,
@@ -5040,41 +5169,46 @@ fn group_actions_sheet(
                     )
                     .w_full()
                 })
-                .child({
-                    let on_pin = on_pin.clone();
-                    action::secondary(
-                        copy::text("Pin group", "置顶分组", "置頂分組"),
-                        icon(include_str!("../../assets/icons/check.svg")),
-                        false,
-                        move || on_pin(),
-                    )
-                    .w_full()
-                })
-                .child({
-                    let on_members = on_members.clone();
-                    action::secondary(
-                        copy::text("Members", "成员", "成員"),
-                        icon(include_str!("../../assets/icons/bot.svg")),
-                        false,
-                        move || on_members(),
-                    )
-                    .w_full()
-                })
-                .child({
-                    let on_delete = on_delete.clone();
-                    action::secondary(
-                        copy::text("Delete", "删除", "刪除"),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || {
-                            if let Some(id) = action.get_untracked() {
-                                on_delete(&id);
-                                action.set(None);
-                            }
-                        },
-                    )
-                    .w_full()
-                }),
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .child({
+                            let on_pin = on_pin.clone();
+                            sheet_action(
+                                copy::text("Pin group", "置顶分组", "置頂分組"),
+                                icon(include_str!("../../assets/icons/check.svg")),
+                                false,
+                                None,
+                                move || on_pin(),
+                            )
+                        })
+                        .child({
+                            let on_members = on_members.clone();
+                            sheet_action(
+                                copy::text("Members", "成员", "成員"),
+                                icon(include_str!("../../assets/icons/bot.svg")),
+                                false,
+                                None,
+                                move || on_members(),
+                            )
+                        })
+                        .child({
+                            let on_delete = on_delete.clone();
+                            sheet_action(
+                                copy::text("Delete", "删除", "刪除"),
+                                icon(include_str!("../../assets/icons/x.svg")),
+                                true,
+                                None,
+                                move || {
+                                    if let Some(id) = action.get_untracked() {
+                                        on_delete(&id);
+                                        action.set(None);
+                                    }
+                                },
+                            )
+                        }),
+                ),
         )
 }
 
@@ -5238,31 +5372,26 @@ fn folder_actions_sheet(
         .child(
             view()
                 .w_full()
-                .gap(px(theme::SPACING_SM))
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
                 .p(px(theme::SPACING_MD))
                 .pb_safe_area_plus(px(theme::SPACING_LG))
                 .bg(theme::background_card)
-                .rounded_t(px(16.0))
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
                 .child(
-                    text(copy::text("Folder", "文件夹", "資料夾"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Folder", "文件夹", "資料夾"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
                 )
                 .child(field::text_field(
                     name,
                     copy::text("Folder name", "文件夹名称", "資料夾名稱"),
                 ))
-                .child({
-                    let on_new_subfolder = on_new_subfolder.clone();
-                    action::secondary(
-                        copy::text("New subfolder", "新建子文件夹", "新增子資料夾"),
-                        icon(include_str!("../../assets/icons/folder.svg")),
-                        false,
-                        move || on_new_subfolder(),
-                    )
-                    .w_full()
-                })
                 .child({
                     let on_rename = on_rename.clone();
                     action::primary(
@@ -5279,21 +5408,36 @@ fn folder_actions_sheet(
                     )
                     .w_full()
                 })
-                .child({
-                    let on_delete = on_delete.clone();
-                    action::secondary(
-                        copy::text("Delete", "删除", "刪除"),
-                        icon(include_str!("../../assets/icons/x.svg")),
-                        false,
-                        move || {
-                            if let Some(id) = action.get_untracked() {
-                                on_delete(&id);
-                                action.set(None);
-                            }
-                        },
-                    )
-                    .w_full()
-                }),
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .child({
+                            let on_new_subfolder = on_new_subfolder.clone();
+                            sheet_action(
+                                copy::text("New subfolder", "新建子文件夹", "新增子資料夾"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                None,
+                                move || on_new_subfolder(),
+                            )
+                        })
+                        .child({
+                            let on_delete = on_delete.clone();
+                            sheet_action(
+                                copy::text("Delete", "删除", "刪除"),
+                                icon(include_str!("../../assets/icons/x.svg")),
+                                true,
+                                None,
+                                move || {
+                                    if let Some(id) = action.get_untracked() {
+                                        on_delete(&id);
+                                        action.set(None);
+                                    }
+                                },
+                            )
+                        }),
+                ),
         )
 }
 
@@ -5376,18 +5520,27 @@ fn sidebar_section(
         .child(
             view()
                 .w_full()
-                .min_h(px(30.0))
+                .h(px(38.0))
                 .pl(px(
                     theme::SPACING_XS + section.with(|section| section.depth as f32) * 10.0
                 ))
                 .pr(px(theme::SPACING_XS))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(2.0))
                 .child({
                     let on_folder_collapse = on_folder_collapse.clone();
                     let on_group_collapse = on_group_collapse.clone();
                     button()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h(px(38.0))
+                        .px(px(8.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(8.0))
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .active(|style| style.opacity(0.8))
                         .on_press(move || {
                             let section = section.get_untracked();
                             let next = !section.collapsed;
@@ -5397,43 +5550,37 @@ fn sidebar_section(
                                 on_group_collapse(&section.id, next);
                             }
                         })
-                        .min_h(px(24.0))
-                        .min_w(px(24.0))
-                        .items_center()
-                        .justify_center()
                         .child(
-                            text(move || {
-                                if section.with(|section| section.collapsed) {
-                                    "▸"
-                                } else {
-                                    "▾"
-                                }
-                            })
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted),
+                            svg(icon(include_str!("../../assets/icons/folder.svg")))
+                                .w(px(16.0))
+                                .h(px(16.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted),
+                        )
+                        .child(when(
+                            move || section.with(|section| section.pinned),
+                            || {
+                                text("★")
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_muted)
+                            },
+                        ))
+                        .child(
+                            text(move || section.with(|section| section.name.clone()))
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(theme::font_detail()))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::foreground),
+                        )
+                        .child(
+                            text(move || rows.with(|rows| rows.len().to_string()))
+                                .flex_shrink_0()
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
                         )
                 })
-                .child(when(
-                    move || section.with(|section| section.pinned),
-                    || {
-                        text("★")
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted)
-                    },
-                ))
-                .child(
-                    text(move || section.with(|section| section.name.clone()))
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(theme::font_caption()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_muted),
-                )
-                .child(
-                    text(move || rows.with(|rows| rows.len().to_string()))
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                )
                 .child({
                     let on_folder_menu = on_folder_menu.clone();
                     let on_group_menu = on_group_menu.clone();
@@ -5451,14 +5598,19 @@ fn sidebar_section(
                             "文件夹操作",
                             "資料夾操作",
                         ))
-                        .min_h(px(28.0))
-                        .min_w(px(28.0))
+                        .size(px(28.0))
+                        .flex_shrink_0()
                         .items_center()
                         .justify_center()
+                        .rounded(px(theme::RADIUS_CONTROL))
+                        .active(|style| style.opacity(0.65))
                         .child(
-                            text("⋯")
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
+                            svg(icon(include_str!(
+                                "../../assets/icons/ellipsis-vertical.svg"
+                            )))
+                            .w(px(16.0))
+                            .h(px(16.0))
+                            .text_color(theme::text_muted),
                         )
                 }),
         )
@@ -5542,7 +5694,7 @@ fn drawer_group(
                         .rounded(px(theme::RADIUS_CONTROL))
                         .active(|style| style.opacity(0.8))
                         .child(
-                            svg(icon(include_str!("../../assets/icons/folder.svg")))
+                            svg(icon(include_str!("../../assets/icons/boxes.svg")))
                                 .w(px(16.0))
                                 .h(px(16.0))
                                 .flex_shrink_0()
@@ -5558,17 +5710,10 @@ fn drawer_group(
                                 .text_color(theme::foreground),
                         )
                         .child(
-                            view()
+                            text(move || group.with(|group| group.count.to_string()))
                                 .flex_shrink_0()
-                                .rounded(px(9.0))
-                                .bg(theme::background_dim())
-                                .px(px(6.0))
-                                .py(px(1.0))
-                                .child(
-                                    text(move || group.with(|group| group.count.to_string()))
-                                        .text_size(px(theme::font_micro()))
-                                        .text_color(theme::text_muted),
-                                ),
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
                         )
                 })
                 .child({

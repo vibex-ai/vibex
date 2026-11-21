@@ -388,9 +388,8 @@ fn start_back_poller(
             let intercept = settings_open.get_untracked()
                 || overlay
                 || switcher
-                || service
-                    .as_ref()
-                    .is_some_and(|service| service.back_intercept());
+                || service.is_some()
+                || session_screen::drawer_is_open();
             host::set_back_intercept(intercept);
             if let Some(text) = host::take_shared_text()
                 && let Some(service) = services.get_untracked()
@@ -420,8 +419,14 @@ fn start_back_poller(
                 }
             } else if switcher {
                 pairing.close_switcher();
+            } else if session_screen::drawer_is_open() {
+                session_screen::close_drawer();
             } else if let Some(service) = service {
-                service.handle_back();
+                if service.back_intercept() {
+                    service.handle_back();
+                } else {
+                    session_screen::open_drawer();
+                }
             }
         }
     });
