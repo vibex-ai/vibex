@@ -999,9 +999,13 @@ Providers can serve one model, and a chip that showed only the model left the
 reader unable to tell which one a turn would run as. An Agent account reads
 `Agent account/model`, because there the Agent is the account; a Provider
 Profile keeps the name its owner gave it, and a route shows its own label. The
-pair truncates inside the chip's 240px cap while the thinking depth beside it
+pair truncates inside the chip's 360px cap while the thinking depth beside it
 keeps its width, and the tooltip spells the pair out and names the account on
-its own line, so a clipped chip still leaves the whole selection readable.
+its own line, so a clipped chip still leaves the whole selection readable. The
+cap is one constant (`COMPOSER_RUNTIME_CHIP_MAX_WIDTH`), shared with the slim
+density estimate: the chip's content box is that figure less the ghost
+button's padding, so the row's label cap and the chip's own cap cannot drift
+apart.
 
 The surface's fill is `composer-surface` lifted a few points toward the
 foreground in a dark appearance (`composer_surface_fill`). The authored plate

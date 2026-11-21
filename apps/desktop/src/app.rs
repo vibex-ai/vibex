@@ -1536,14 +1536,22 @@ const COMPOSER_SLIM_HORIZONTAL_PADDING: f32 = 10.0;
 /// bounds before it wraps. The density probe wraps at the same figure so its
 /// row count agrees with what the input will actually draw.
 const COMPOSER_INPUT_TEXT_INSET: f32 = 30.0;
+/// The widest the run-configuration chip may draw, its own padding included.
+///
+/// The chip names `provider/model` beside the thinking depth. It used to stop
+/// at 240px, which cut most long provider/model pairs to an ellipsis even on a
+/// wide pane; 360px shows the whole pair in the common case and still leaves
+/// the input the larger share of the bar.
+const COMPOSER_RUNTIME_CHIP_MAX_WIDTH: f32 = 360.0;
+/// The chip's content box: the chip less the ghost button's `px_2` padding.
+const COMPOSER_RUNTIME_CHIP_CONTENT_MAX_WIDTH: f32 = COMPOSER_RUNTIME_CHIP_MAX_WIDTH - 2.0 * 8.0;
 /// The widest the run-configuration chip can draw on the one-line bar.
 ///
-/// The chip's label row caps itself at 224px and the ghost button pads it by
-/// 8px on each side, so 256 is the whole figure. The fallback estimate takes
-/// it in full: an estimate that under-counts this chip credits the bar's input
-/// with width the real input does not have, which is how a draft at the wrap
-/// boundary ended up wrapped inside the one-line bar.
-const COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH: f32 = 256.0;
+/// The density estimate has to credit the chip with every pixel it can take:
+/// an estimate that under-counts it credits the bar's input with width the real
+/// input does not have, which is how a draft at the wrap boundary ended up
+/// wrapped inside the one-line bar.
+const COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH: f32 = COMPOSER_RUNTIME_CHIP_MAX_WIDTH;
 /// The widest the "enable this Agent" control can draw on a slim bar.
 ///
 /// An imported session with no runtime selection yet seats a sentence, not a
@@ -4725,11 +4733,12 @@ fn composer_slim_input_width(
 /// The width the slim row's run-configuration control takes, for the estimate.
 ///
 /// The cascade's trigger is the row's one variable-width control: a 32px chip
-/// when the pane is compact, otherwise a chip whose label row caps itself at
-/// 224px before the ghost button's padding. An imported session with no
-/// selection yet draws the "enable this Agent" sentence instead, and that
-/// control does not truncate: the estimate gives it a generous bound rather
-/// than pretending the row has no runtime control at all.
+/// when the pane is compact, otherwise a chip capped at
+/// [`COMPOSER_RUNTIME_CHIP_MAX_WIDTH`] including the ghost button's padding.
+/// An imported session with no selection yet draws the "enable this Agent"
+/// sentence instead, and that control does not truncate: the estimate gives it
+/// a generous bound rather than pretending the row has no runtime control at
+/// all.
 fn composer_slim_runtime_control_width(
     compact_runtime_controls: bool,
     has_runtime_selection: bool,
@@ -67475,7 +67484,9 @@ impl VibexWorkbench {
             // A long provider/model name must not push the send action off a
             // narrow pane: the label truncates inside a bounded chip.
             .when(!compact, |this| {
-                this.flex_none().max_w(px(240.0)).overflow_hidden()
+                this.flex_none()
+                    .max_w(px(COMPOSER_RUNTIME_CHIP_CONTENT_MAX_WIDTH))
+                    .overflow_hidden()
             })
             .on_prepaint(move |bounds, _, cx| {
                 let _ = trigger_bounds_entity.update(cx, |this, cx| {
@@ -91386,10 +91397,12 @@ fn runtime_selector_dropdown_content_parts(
         // its label and the surrounding chip clips it. With a suffix the row
         // caps itself instead, so the flex layout shrinks the label and keeps
         // the suffix and the chevron at their full width.
-        // The trigger chip is capped at 240px including its own padding, so
-        // the label row keeps 224 of them.
+        // The chip and its content box share one cap: the ghost button's
+        // padding sits outside the content, and the density estimate reads the
+        // same total so the bar's input is never credited with the chip's
+        // width.
         let content = if has_suffix {
-            content.max_w(px(224.0))
+            content.max_w(px(COMPOSER_RUNTIME_CHIP_CONTENT_MAX_WIDTH))
         } else {
             content.flex_none()
         };
@@ -128361,7 +128374,13 @@ mod tests {
         let wide = composer_slim_input_width(surface, trigger, None);
         // Minus the row's insets, hairline, four 8px gaps, the fixed controls
         // (attach 30 + expand 30 + send 32) and the widest runtime chip.
-        assert_eq!(wide, 1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - 256.0);
+        assert_eq!(
+            wide,
+            1152.0 - 20.0 - 2.0 - 32.0 - 92.0 - COMPOSER_RUNTIME_CHIP_MAX_WIDTH
+        );
+        // The estimate and the chip share one cap: drift between them is how
+        // the probe wraps a line later than the painted bar.
+        assert_eq!(trigger, COMPOSER_RUNTIME_CHIP_MAX_WIDTH);
         assert_eq!(
             composer_slim_runtime_control_width(false, true, false),
             COMPOSER_SLIM_RUNTIME_TRIGGER_MAX_WIDTH
@@ -128372,7 +128391,7 @@ mod tests {
             composer_slim_runtime_control_width(true, true, false),
             None,
         );
-        assert_eq!(compact, wide + 256.0 - 32.0);
+        assert_eq!(compact, wide + COMPOSER_RUNTIME_CHIP_MAX_WIDTH - 32.0);
         // No runtime selection and nothing to enable: the row is just the text
         // and the three fixed controls.
         let bare = composer_slim_input_width(
@@ -128380,7 +128399,7 @@ mod tests {
             composer_slim_runtime_control_width(false, false, false),
             None,
         );
-        assert_eq!(bare, wide + 256.0);
+        assert_eq!(bare, wide + COMPOSER_RUNTIME_CHIP_MAX_WIDTH);
         // An imported session's enable sentence is a control too, and it does
         // not truncate.
         let enabling = composer_slim_input_width(
@@ -128752,7 +128771,7 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the two-part label should remain inspectable");
         assert!(parts.contains("has_suffix"));
-        assert!(parts.contains("max_w(px(224.0))"));
+        assert!(parts.contains("max_w(px(COMPOSER_RUNTIME_CHIP_CONTENT_MAX_WIDTH))"));
         // The name shrinks and truncates; the depth and the chevron keep their
         // width instead of being clipped off the end of the chip.
         assert!(parts.contains(".child(div().min_w_0().truncate().child(selected_label))"));
