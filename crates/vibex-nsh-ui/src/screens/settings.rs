@@ -48,7 +48,7 @@ const PAGE_GUTTER: f32 = 16.0;
 /// The gap between two cards.
 const CARD_GAP: f32 = 0.0;
 /// The corner radius of a card.
-const CARD_RADIUS: f32 = 20.0;
+const CARD_RADIUS: f32 = 16.0;
 /// The height of the title bar.
 const HEADER_HEIGHT: f32 = 56.0;
 /// The minimum height of a settings row.
@@ -228,7 +228,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         )
         .into_element(),
     );
-    app_rows.push(divider().into_element());
+    app_rows.push(divider_from(60.0).into_element());
     app_rows.push(
         index_row(
             icon(include_str!("../../assets/icons/globe.svg")),
@@ -238,7 +238,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         )
         .into_element(),
     );
-    app_rows.push(divider().into_element());
+    app_rows.push(divider_from(60.0).into_element());
     app_rows.push(
         index_row(
             icon(include_str!("../../assets/icons/message-square.svg")),
@@ -248,7 +248,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         )
         .into_element(),
     );
-    app_rows.push(divider().into_element());
+    app_rows.push(divider_from(60.0).into_element());
     app_rows.push(
         index_row(
             icon(include_str!("../../assets/icons/activity.svg")),
@@ -304,7 +304,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
             .px(px(4.0))
             .pt(px(4.0))
             .text_size(px(theme::font_micro()))
-            .text_color(theme::text_muted),
+            .text_color(subtle_text),
         )
 }
 
@@ -316,7 +316,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
     button()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_md()
+        .shadow([card_shadow()])
         .mb(px(12.0))
         .bg(theme::block_surface)
         .px(px(theme::SPACING_LG))
@@ -402,7 +402,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
                         }
                     })
                     .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted),
+                    .text_color(subtle_text),
                 ),
         )
         .child(
@@ -410,7 +410,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
                 .w(px(theme::ICON_MD))
                 .h(px(theme::ICON_MD))
                 .flex_shrink_0()
-                .text_color(theme::text_muted),
+                .text_color(subtle_icon),
         )
 }
 
@@ -439,7 +439,7 @@ fn runtime_page(host: SettingsHost) -> impl IntoElement {
                         move || on_reconnect()
                     },
                 ))
-                .child(divider())
+                .child(divider_from(60.0))
                 .child(action_row(
                     icon(include_str!("../../assets/icons/chevron-right.svg")),
                     copy::text("Switch runtime", "切换运行时", "切換執行環境"),
@@ -455,7 +455,7 @@ fn runtime_page(host: SettingsHost) -> impl IntoElement {
                         move || on_switch()
                     },
                 ))
-                .child(divider())
+                .child(divider_from(60.0))
                 .child(action_row(
                     icon(include_str!("../../assets/icons/plug-zap.svg")),
                     copy::text("Disconnect", "断开连接", "中斷連線"),
@@ -529,7 +529,7 @@ fn appearance_page(host: SettingsHost) -> impl IntoElement {
     let mut theme_rows: Vec<AnyElement> = Vec::new();
     for (index, (choice, label)) in choices.into_iter().enumerate() {
         if index > 0 {
-            theme_rows.push(divider().into_element());
+            theme_rows.push(divider_from(50.0).into_element());
         }
         theme_rows.push(
             radio_row(label, None, appearance, choice, {
@@ -620,7 +620,7 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
     let mut rows: Vec<AnyElement> = Vec::new();
     for (index, (choice, label, detail)) in choices.into_iter().enumerate() {
         if index > 0 {
-            rows.push(divider().into_element());
+            rows.push(divider_from(50.0).into_element());
         }
         rows.push(
             radio_row(label, detail, language, choice, {
@@ -649,7 +649,7 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
             .w_full()
             .px(px(16.0))
             .text_size(px(theme::font_micro()))
-            .text_color(theme::text_muted),
+            .text_color(subtle_text),
         )
 }
 
@@ -877,7 +877,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             view()
                 .w_full()
                 .rounded(px(CARD_RADIUS))
-                .shadow_md()
+                .shadow([card_shadow()])
                 .mb(px(12.0))
                 .bg(theme::block_surface)
                 .px(px(16.0))
@@ -923,7 +923,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                                 )
                             })
                             .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted),
+                            .text_color(subtle_text),
                         ),
                 ),
         )
@@ -1011,7 +1011,7 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_md()
+        .shadow([card_shadow()])
         .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
@@ -1052,7 +1052,7 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
                                 "所有憑證都會從這台手機上刪除",
                             ))
                             .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted),
+                            .text_color(subtle_text),
                         ),
                 ),
         )
@@ -1079,7 +1079,7 @@ fn clear_dialog(host: SettingsHost, open: Signal<bool>) -> impl IntoElement {
                         .w_full()
                         .max_w(px(360.0))
                         .rounded(px(24.0))
-                        .shadow_lg()
+                        .shadow([dialog_shadow()])
                         .bg(theme::block_surface)
                         .p(px(23.0))
                         .flex_col()
@@ -1159,7 +1159,7 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow_md()
+        .shadow([card_shadow()])
         .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
@@ -1195,15 +1195,15 @@ fn index_row(
         .child(
             text(value)
                 .flex_shrink_0()
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::text_muted),
+                .text_size(px(theme::font_body()))
+                .text_color(subtle_text),
         )
         .child(
             svg(icon(include_str!("../../assets/icons/chevron-right.svg")))
                 .w(px(theme::ICON_MD))
                 .h(px(theme::ICON_MD))
                 .flex_shrink_0()
-                .text_color(theme::text_muted),
+                .text_color(subtle_icon),
         )
 }
 
@@ -1245,7 +1245,7 @@ fn action_row(
                 .child(
                     text(detail)
                         .text_size(px(theme::font_caption()))
-                        .text_color(theme::text_muted),
+                        .text_color(subtle_text),
                 ),
         )
         .child(when(chevron, move || {
@@ -1256,7 +1256,7 @@ fn action_row(
                 .text_color(if danger {
                     theme::accent_red()
                 } else {
-                    theme::text_muted()
+                    subtle_icon()
                 })
         }))
 }
@@ -1294,8 +1294,8 @@ fn radio_row<T: Copy + PartialEq + 'static>(
                     move || detail.is_some(),
                     move || {
                         text(detail.unwrap_or_default())
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted)
+                            .text_size(px(theme::font_caption()))
+                            .text_color(subtle_text)
                     },
                 )),
         )
@@ -1352,7 +1352,7 @@ fn text_size_stepper(percent: Signal<u32>, on_font_scale: Rc<dyn Fn(u32)>) -> im
         .child(
             text(move || font_scale_label(percent.get()).to_owned())
                 .text_size(px(theme::font_caption()))
-                .text_color(theme::text_muted),
+                .text_color(subtle_text),
         )
         .child(step_button(
             "A−",
@@ -1449,7 +1449,7 @@ fn toggle_track(enabled: Signal<bool>) -> impl IntoElement {
                     if enabled.get() {
                         theme::background()
                     } else {
-                        theme::text_muted()
+                        subtle_icon()
                     }
                 })
                 .ml(move || px(if enabled.get() { 16.0 } else { 0.0 })),
@@ -1480,7 +1480,7 @@ fn label_block(label: &'static str, detail: &'static str) -> impl IntoElement {
         .child(
             text(detail)
                 .text_size(px(theme::font_caption()))
-                .text_color(theme::text_muted),
+                .text_color(subtle_text),
         )
 }
 
@@ -1495,8 +1495,8 @@ fn value_row(label: &'static str, value: impl Fn() -> String + 'static) -> impl 
         .child(
             text(value)
                 .flex_shrink_0()
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::text_muted),
+                .text_size(px(theme::font_body()))
+                .text_color(subtle_text),
         )
 }
 
@@ -1533,7 +1533,7 @@ fn nav_row(
                 .w(px(theme::ICON_MD))
                 .h(px(theme::ICON_MD))
                 .flex_shrink_0()
-                .text_color(theme::text_muted),
+                .text_color(subtle_icon),
         )
 }
 
@@ -1558,11 +1558,51 @@ fn icon_tile(image: ImageSrc, danger: bool) -> impl IntoElement {
         )
 }
 
+/// Supporting copy: one step lighter than the muted foreground.
+fn subtle_text() -> Hsla {
+    theme::muted_foreground().opacity(0.9)
+}
+
+/// A trailing chevron or a quiet glyph.
+fn subtle_icon() -> Hsla {
+    theme::muted_foreground().opacity(0.75)
+}
+
+/// The soft lift under a settings card: a wide, very low-opacity shadow.
+fn card_shadow() -> BoxShadow {
+    BoxShadow {
+        offset_x: px(0.0),
+        offset_y: px(3.0),
+        blur: px(14.0),
+        spread: px(0.0),
+        color: nsh_core::element::Color::rgba(0, 0, 0, 10),
+        inset: false,
+    }
+}
+
+/// The stronger lift under a dialog.
+fn dialog_shadow() -> BoxShadow {
+    BoxShadow {
+        offset_x: px(0.0),
+        offset_y: px(10.0),
+        blur: px(36.0),
+        spread: px(0.0),
+        color: nsh_core::element::Color::rgba(0, 0, 0, 32),
+        inset: false,
+    }
+}
+
 fn divider() -> impl IntoElement {
-    view()
-        .w_full()
-        .pl(px(16.0))
-        .child(view().w_full().h(px(1.0)).bg(theme::border_subtle))
+    divider_from(16.0)
+}
+
+fn divider_from(start: f32) -> impl IntoElement {
+    view().w_full().pl(px(start)).child(
+        view()
+            .w_full()
+            .h(px(1.0))
+            .bg(theme::border_subtle().opacity(0.35)),
+    )
 }
 
 fn footer_note(message: &'static str) -> impl IntoElement {
@@ -1571,7 +1611,7 @@ fn footer_note(message: &'static str) -> impl IntoElement {
         .px(px(16.0))
         .text_size(px(theme::font_micro()))
         .line_height(theme::line_height_for(theme::font_micro()))
-        .text_color(theme::text_muted)
+        .text_color(subtle_text)
 }
 
 fn section_label(label: &'static str) -> impl IntoElement {
@@ -1580,7 +1620,7 @@ fn section_label(label: &'static str) -> impl IntoElement {
         .py(px(8.0))
         .text_size(px(theme::font_caption()))
         .font_weight(FontWeight::MEDIUM)
-        .text_color(theme::text_muted)
+        .text_color(subtle_text)
 }
 
 fn navigate(page: Signal<SettingsPage>, target: SettingsPage) -> impl Fn() + 'static {
