@@ -55,8 +55,7 @@ const HEADER_HEIGHT: f32 = 56.0;
 const ROW_MIN: f32 = 60.0;
 /// The leading icon tile and its glyph.
 const TILE: f32 = 30.0;
-const TILE_RADIUS: f32 = 9.0;
-const TILE_ICON: f32 = 18.0;
+const TILE_ICON: f32 = 20.0;
 
 /// What the settings centre may do, and the state it shows.
 #[derive(Clone)]
@@ -304,7 +303,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
             .px(px(4.0))
             .pt(px(4.0))
             .text_size(px(theme::font_micro()))
-            .text_color(subtle_text),
+            .text_color(subtitle_text),
         )
 }
 
@@ -402,7 +401,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
                         }
                     })
                     .text_size(px(theme::font_micro()))
-                    .text_color(subtle_text),
+                    .text_color(subtitle_text),
                 ),
         )
         .child(
@@ -649,7 +648,7 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
             .w_full()
             .px(px(16.0))
             .text_size(px(theme::font_micro()))
-            .text_color(subtle_text),
+            .text_color(subtitle_text),
         )
 }
 
@@ -904,6 +903,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                     view()
                         .flex_1()
                         .flex_col()
+                        .gap(px(3.0))
                         .child(
                             text("Vibex")
                                 .text_size(px(theme::font_detail()))
@@ -923,7 +923,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                                 )
                             })
                             .text_size(px(theme::font_micro()))
-                            .text_color(subtle_text),
+                            .text_color(subtitle_text),
                         ),
                 ),
         )
@@ -1052,7 +1052,7 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
                                 "所有憑證都會從這台手機上刪除",
                             ))
                             .text_size(px(theme::font_micro()))
-                            .text_color(subtle_text),
+                            .text_color(subtitle_text),
                         ),
                 ),
         )
@@ -1236,6 +1236,7 @@ fn action_row(
                 .flex_1()
                 .min_w(px(0.0))
                 .flex_col()
+                .gap(px(3.0))
                 .child(
                     text(title)
                         .text_size(px(theme::font_body()))
@@ -1245,7 +1246,7 @@ fn action_row(
                 .child(
                     text(detail)
                         .text_size(px(theme::font_caption()))
-                        .text_color(subtle_text),
+                        .text_color(subtitle_text),
                 ),
         )
         .child(when(chevron, move || {
@@ -1295,7 +1296,7 @@ fn radio_row<T: Copy + PartialEq + 'static>(
                     move || {
                         text(detail.unwrap_or_default())
                             .text_size(px(theme::font_caption()))
-                            .text_color(subtle_text)
+                            .text_color(subtitle_text)
                     },
                 )),
         )
@@ -1472,6 +1473,7 @@ fn label_block(label: &'static str, detail: &'static str) -> impl IntoElement {
         .flex_1()
         .min_w(px(0.0))
         .flex_col()
+        .gap(px(3.0))
         .child(
             text(label)
                 .text_size(px(theme::font_body()))
@@ -1480,7 +1482,7 @@ fn label_block(label: &'static str, detail: &'static str) -> impl IntoElement {
         .child(
             text(detail)
                 .text_size(px(theme::font_caption()))
-                .text_color(subtle_text),
+                .text_color(subtitle_text),
         )
 }
 
@@ -1542,8 +1544,6 @@ fn icon_tile(image: ImageSrc, danger: bool) -> impl IntoElement {
         .w(px(TILE))
         .h(px(TILE))
         .flex_shrink_0()
-        .rounded(px(TILE_RADIUS))
-        .bg(theme::block_inset)
         .items_center()
         .justify_center()
         .child(
@@ -1561,6 +1561,11 @@ fn icon_tile(image: ImageSrc, danger: bool) -> impl IntoElement {
 /// Supporting copy: one step lighter than the muted foreground.
 fn subtle_text() -> Hsla {
     theme::muted_foreground().opacity(0.9)
+}
+
+/// Explanatory copy under a row title: one step lighter again.
+fn subtitle_text() -> Hsla {
+    theme::muted_foreground().opacity(0.8)
 }
 
 /// A trailing chevron or a quiet glyph.
@@ -1611,7 +1616,7 @@ fn footer_note(message: &'static str) -> impl IntoElement {
         .px(px(16.0))
         .text_size(px(theme::font_micro()))
         .line_height(theme::line_height_for(theme::font_micro()))
-        .text_color(subtle_text)
+        .text_color(subtitle_text)
 }
 
 fn section_label(label: &'static str) -> impl IntoElement {

@@ -217,15 +217,19 @@ pub fn background_card() -> Hsla {
 /// secondary grey behind them.
 pub fn block_page() -> Hsla {
     if background_card() == background() {
-        color_token("secondary")
+        color_token("secondary").mix(background(), 0.15)
     } else {
-        background()
+        background().mix(foreground(), 0.012)
     }
 }
 
 /// The filled block a settings group rests on.
 pub fn block_surface() -> Hsla {
-    background_card()
+    if background_card() == background() {
+        color_token("secondary").mix(background(), 0.7)
+    } else {
+        background_card().mix(foreground(), 0.02)
+    }
 }
 
 /// A well inside a block: a value preview, an icon tile, a switch track.
