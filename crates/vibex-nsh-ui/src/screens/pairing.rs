@@ -422,7 +422,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     let busy = host.busy;
                     move || {
                         let open_settings = open_settings.clone();
-                        action::icon_button(
+                        action::floating_icon(
                             icon(include_str!("../../assets/icons/settings.svg")),
                             copy::text("Settings", "设置", "設定"),
                             move || open_settings.as_ref()(),
@@ -527,10 +527,9 @@ fn scan_entry(host: PairingHost) -> ButtonElement {
 
 /// Find a runtime on the same network.
 fn find_entry(busy: Signal<bool>, nearby_open: Signal<bool>) -> ButtonElement {
-    action::secondary(
+    action::block(
         copy::text("Find", "查找", "尋找"),
         icon(include_str!("../../assets/icons/wifi-outlined.svg")),
-        false,
         move || nearby_open.set(true),
     )
     .disabled(move || busy.get())
@@ -539,10 +538,9 @@ fn find_entry(busy: Signal<bool>, nearby_open: Signal<bool>) -> ButtonElement {
 
 /// Paste a pairing link or type a code.
 fn link_entry(busy: Signal<bool>, manual_open: Signal<bool>) -> ButtonElement {
-    action::secondary(
+    action::block(
         copy::text("Link", "链接", "連結"),
         icon(include_str!("../../assets/icons/clipboard-paste.svg")),
-        false,
         move || manual_open.set(true),
     )
     .disabled(move || busy.get())

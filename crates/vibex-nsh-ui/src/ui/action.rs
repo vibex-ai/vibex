@@ -29,6 +29,67 @@ pub fn secondary(
     action(label, icon, false, selected, on_press)
 }
 
+/// An alternative action drawn as a filled block with no outline.
+///
+/// Page-level actions sit directly on the page, so they take the same block
+/// surface as a card instead of an outline that only reads on a card.
+pub fn block(
+    label: impl IntoReactive<SharedString>,
+    icon: ImageSrc,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let content: fn() -> Hsla = theme::text_secondary;
+    button()
+        .on_press(on_press)
+        .h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .bg(theme::block_surface)
+        .shadow_sm()
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .active(|style| style.opacity(0.85))
+        .focus_visible(|style| style.outline(px(2.0)).outline_color(theme::foreground))
+        .child(
+            svg(icon)
+                .w(px(theme::ICON_SM))
+                .h(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(content),
+        )
+        .child(
+            text(label)
+                .text_size(px(theme::font_detail()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(content),
+        )
+}
+
+/// An icon-only control floating on the page in its own circular block.
+pub fn floating_icon(
+    icon: ImageSrc,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .size(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::TOUCH_TARGET / 2.0))
+        .bg(theme::block_surface)
+        .shadow_sm()
+        .items_center()
+        .justify_center()
+        .active(|style| style.opacity(0.65))
+        .child(
+            svg(icon)
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
+                .text_color(theme::foreground),
+        )
+}
+
 /// A destructive action: the same shape as [`secondary`], in the error ink.
 pub fn destructive(
     label: impl IntoReactive<SharedString>,
