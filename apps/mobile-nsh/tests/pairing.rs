@@ -124,7 +124,14 @@ fn settings_offers_every_language_the_clients_ship() {
     app.wait_for("Appearance").unwrap();
     app.press("role:button[Language]").unwrap();
     app.wait_for("日本語").unwrap();
-    for language in ["한국어", "Deutsch", "Français", "Español", "Português (BR)", "Русский"] {
+    for language in [
+        "한국어",
+        "Deutsch",
+        "Français",
+        "Español",
+        "Português (BR)",
+        "Русский",
+    ] {
         assert!(app.screen().shows(language), "`{language}` is offered");
     }
 }
