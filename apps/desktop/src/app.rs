@@ -13731,7 +13731,15 @@ impl VibexWorkbench {
             .and_then(|id| VibexSessionId::parse(id).ok());
         let mut agent_subscriptions = vec![
             cx.observe(&home_arena, |_, _, cx| cx.notify()),
-            cx.observe(&session_companion, |_, _, cx| cx.notify()),
+            // The composer's lane draws itself: every pose it takes repaints the
+            // lane's own view, which is what keeps a running turn from
+            // rebuilding this page thirty times a second. Only the surface the
+            // page mounts — the strip, or the veil a duel draws over the page —
+            // makes the page rebuild.
+            cx.subscribe(
+                &session_companion,
+                |_, _, _: &crate::arena::SurfaceChanged, cx| cx.notify(),
+            ),
             // A won encounter unlocks its guardian's companion effect for good:
             // the victory is recorded the moment the duel ends, whether it was
             // fought on the home page or over a session.

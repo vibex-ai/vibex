@@ -16,12 +16,14 @@
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, ContentMask, Element, ElementId, GlobalElementId,
-    Hsla, InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, LineLayout,
+    Animation, App, Bounds, ContentMask, Element, ElementId, GlobalElementId, Hsla,
+    InspectorElementId, InteractiveElement as _, IntoElement, LayoutId, LineLayout,
     ParentElement as _, Pixels, Point, RenderOnce, SharedString, StyleRefinement, Styled,
     StyledText, TextAlign, Window, WrapBoundary, div, point, px, size,
 };
 use gpui_component::{ActiveTheme as _, Colorize as _, StyledExt as _};
+
+use crate::motion;
 
 /// Frames per second a running label's sweep is sampled at.
 ///
@@ -240,7 +242,7 @@ impl Styled for ShimmerText {
 }
 
 impl RenderOnce for ShimmerText {
-    fn render(self, _: &mut Window, cx: &mut App) -> impl IntoElement {
+    fn render(self, window: &mut Window, cx: &mut App) -> impl IntoElement {
         let id = self.id.unwrap_or_else(|| self.text.clone().into());
         let container = div().min_w_0().refine_style(&self.style);
 
@@ -252,32 +254,47 @@ impl RenderOnce for ShimmerText {
 
         // The selector marks the animated state only: a label that renders
         // static under reduced motion must not look mounted to a test.
-        let container = match self.debug_selector {
+        let selector = self.debug_selector.clone();
+        let mut container = match self.debug_selector {
             Some(selector) => container.debug_selector(move || selector.to_string()),
             None => container,
         };
 
         let tokens = cx.theme().semantic_tokens();
         let reverse = self.shimmer_style.reverse;
-        let shimmer = ShimmerGlyphs {
-            text: StyledText::new(self.text),
-            highlight_color: self.shimmer_style.highlight_color,
-            background: tokens.colors.background,
-            foreground: tokens.colors.foreground,
-            dark: cx.theme().is_dark(),
-            spread: self.shimmer_style.spread,
-            phase: 0.,
-        }
-        .with_animation(
-            id,
-            self.shimmer_style.animation(),
-            move |mut this, phase| {
-                this.phase = if reverse { 1. - phase } else { phase };
-                this
-            },
-        );
+        let text = self.text;
+        let highlight_color = self.shimmer_style.highlight_color;
+        let spread = self.shimmer_style.spread;
+        let background = tokens.colors.background;
+        let foreground = tokens.colors.foreground;
+        let dark = cx.theme().is_dark();
+        let animation = self.shimmer_style.animation();
+        let style = container.style().clone();
 
-        container.child(shimmer).into_any_element()
+        // The sweep rides a view of its own: a running title's frames repaint
+        // the label instead of the page the label sits in, which is what kept
+        // the sweep from reaching the workbench's frame budget (see
+        // `motion::AnimatedHost`). The label is part of the host's key because
+        // two labels can share an id — the id defaults to the text — and the
+        // host owns what it draws, so a shared one would share the words too.
+        let key = ElementId::NamedChild(std::sync::Arc::new(id.clone()), text.clone());
+        motion::animated_host(
+            window,
+            cx,
+            key,
+            motion::AnimatedHost::new(style, selector, id, animation, move |phase| {
+                ShimmerGlyphs {
+                    text: StyledText::new(text.clone()),
+                    highlight_color,
+                    background,
+                    foreground,
+                    dark,
+                    spread,
+                    phase: if reverse { 1. - phase } else { phase },
+                }
+                .into_any_element()
+            }),
+        )
     }
 }
 

@@ -8,7 +8,7 @@
 //! over the session page instead of the new-session page.
 
 use super::{
-    ArenaView, Awakened, art,
+    ArenaView, Awakened, SurfaceChanged, art,
     combat::{Boss, Guardian},
     copy,
     gait::{self, LANE_REACH, Shot},
@@ -20,8 +20,8 @@ use super::{
 use gpui::{
     Animation, AnimationExt as _, AnyElement, App, Bounds, Context, DismissEvent, Element,
     ElementId, Entity, EventEmitter, FocusHandle, GlobalElementId, Hsla, InspectorElementId,
-    IntoElement, LayoutId, Pixels, Style, Styled as _, Subscription, Window, div, fill, point,
-    prelude::*, px, size,
+    IntoElement, LayoutId, Pixels, Render, Style, Styled as _, Subscription, Window, div, fill,
+    point, prelude::*, px, size,
 };
 use gpui_component::{ElementExt as _, InteractiveElementExt as _, WindowExt as _, v_flex};
 use std::{
@@ -109,6 +109,7 @@ pub(crate) struct Companion {
     dismissal: Option<Subscription>,
 }
 impl EventEmitter<Awakened> for Companion {}
+impl EventEmitter<SurfaceChanged> for Companion {}
 impl Companion {
     pub(crate) fn new() -> Self {
         Self {
@@ -137,6 +138,7 @@ impl Companion {
         cx: &mut Context<Self>,
     ) {
         self.composer_focus = focus;
+        let riding = self.stage != Stage::Idle;
         let guardian = reward.and_then(Guardian::from_agent);
         if guardian != self.guardian {
             // A different Agent owns the composer now. The previous companion
@@ -157,6 +159,7 @@ impl Companion {
                 },
                 _ => Stage::Idle,
             };
+            self.note_surface(riding, cx);
             return;
         }
         match (running, self.stage) {
@@ -172,6 +175,17 @@ impl Companion {
             }
             (false, Stage::Roaming { .. }) => self.leave(cx),
         }
+        self.note_surface(riding, cx);
+    }
+    /// Tells the page when the lane itself appeared or left.
+    ///
+    /// Everything a pose does repaints the lane, which is a view of its own;
+    /// the page only has to rebuild when the strip it mounts, or the veil a duel
+    /// draws over it, begins or stops existing.
+    fn note_surface(&self, riding: bool, cx: &mut Context<Self>) {
+        if riding != (self.stage != Stage::Idle) {
+            cx.emit(SurfaceChanged);
+        }
     }
     /// Ends a duel without a result: the session it was opened over is gone.
     fn dismiss(&mut self, cx: &mut Context<Self>) {
@@ -181,6 +195,7 @@ impl Companion {
         self.dismissal = None;
         battle.update(cx, |view, cx| view.close(cx));
         cx.notify();
+        cx.emit(SurfaceChanged);
     }
     /// The session stopped: the companion leaves its lane its own way and is
     /// gone by the time the exit ends.
@@ -205,6 +220,7 @@ impl Companion {
                     companion.stage = Stage::Idle;
                     companion.sample.set(None);
                     cx.notify();
+                    cx.emit(SurfaceChanged);
                 }
             })
             .ok();
@@ -245,6 +261,7 @@ impl Companion {
                     focus.focus(window, cx);
                 }
                 cx.notify();
+                cx.emit(SurfaceChanged);
             },
         ));
         let initial_focus = battle.downgrade();
@@ -253,6 +270,7 @@ impl Companion {
             let _ = initial_focus.update(cx, |view, cx| view.resume(window, cx));
         });
         cx.notify();
+        cx.emit(SurfaceChanged);
     }
     fn battle(&self) -> Option<Entity<ArenaView>> {
         self.battle.clone()
@@ -321,9 +339,15 @@ fn placement(shot: &Shot, lane_width: f32, badge_width: f32, lane_height: f32) -
 /// this session has no reward to show, when its turn is not running, or when
 /// motion is reduced.
 ///
-/// The lane is built here as the strip it always was; where it is mounted — in
-/// flow, or absolutely above the composer's own edge — is the page's decision.
-/// `lane`, with the persisted best clear time for the reward's guardian.
+/// What is handed back is the companion's own view, not a strip built here:
+/// the lane asks for a frame thirty times a second for as long as the turn
+/// runs, and a frame it asked for used to rebuild the whole workbench —
+/// 8ms of `prepaint` on a quiet session, 50ms on a long one, which is what made
+/// the model stall and reappear further down its lane. As a view of its own it
+/// repaints the strip and the workbench around it is spliced from last frame.
+///
+/// Where the lane is mounted — in flow, or absolutely above the composer's own
+/// edge — is still the page's decision.
 ///
 /// The session page owns UI state, so it passes the record down rather than
 /// letting the arena read it: a duel opened over a session must show the same
@@ -344,68 +368,75 @@ pub(crate) fn lane_with_best(
         companion.best_ms = best_ms;
         companion.track(reward, running && !reduced, focus, cx)
     });
-    let (guardian, stage, frames, sample, lane_width) = {
-        let companion = state.read(cx);
-        if reduced || companion.battle().is_some() {
-            return None;
-        }
-        (
-            companion.guardian?,
-            companion.stage,
-            companion.frames.clone(),
-            companion.sample.clone(),
-            companion.lane_width.clone(),
-        )
-    };
-    let (motion, clock, id) = match stage {
-        Stage::Idle => return None,
-        Stage::Roaming { clock } => (Motion::Lane, clock, "composer-companion-roam"),
-        Stage::Leaving { clock, from } => {
-            (Motion::Leaving { from }, clock, "composer-companion-leave")
-        }
-    };
-    let executor = cx.background_executor().clone();
-    let measured = lane_width.clone();
-    let state = state.clone();
-    let geometry = fit(guardian);
-    let badge_width = geometry.width();
-    let badge = move |time: f32, opacity: f32, x: f32, y: f32| {
-        div()
-            .id("composer-companion")
-            .debug_selector(|| "composer-companion".into())
-            .absolute()
-            .left(px(x))
-            .top(px(y))
-            .cursor_pointer()
-            .aria_label(copy::companion_label(guardian))
-            .on_double_click({
-                let state = state.clone();
-                move |_, window, cx| {
-                    state.update(cx, |companion, cx| companion.open(window, cx));
-                }
-            })
-            .child(Badge {
-                guardian,
-                motion,
-                time,
-                opacity,
-                fit: geometry,
-                window_box: art::companion_box(guardian),
-                frames: frames.clone(),
-                sample: sample.clone(),
-            })
-    };
-    let lane = div()
-        .id("composer-companion-lane")
-        .debug_selector(|| "composer-companion-lane".into())
-        .relative()
-        .w_full()
-        .min_w_0()
-        .h(px(geometry.lane()))
-        .flex_none()
-        .overflow_hidden()
-        .on_prepaint(move |bounds, _, _| measured.set(bounds.size.width));
-    Some(
+    let companion = state.read(cx);
+    if reduced || companion.battle().is_some() || companion.stage == Stage::Idle {
+        return None;
+    }
+    Some(state.clone().into_any_element())
+}
+
+impl Render for Companion {
+    /// The lane, drawn as the animated strip it always was.
+    ///
+    /// This is a view so that the frames the animation asks for land here: the
+    /// animation element notifies the view it was built in, and a notified view
+    /// rebuilds; the page around it is drawn again from last frame. Every pose
+    /// below therefore costs a strip, not a workbench.
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let Some(guardian) = self.guardian else {
+            return div().into_any_element();
+        };
+        let (motion, clock, id) = match self.stage {
+            Stage::Idle => return div().into_any_element(),
+            Stage::Roaming { clock } => (Motion::Lane, clock, "composer-companion-roam"),
+            Stage::Leaving { clock, from } => {
+                (Motion::Leaving { from }, clock, "composer-companion-leave")
+            }
+        };
+        let executor = cx.background_executor().clone();
+        let frames = self.frames.clone();
+        let sample = self.sample.clone();
+        let lane_width = self.lane_width.clone();
+        let measured = lane_width.clone();
+        let state = cx.entity();
+        let geometry = fit(guardian);
+        let badge_width = geometry.width();
+        let badge = move |time: f32, opacity: f32, x: f32, y: f32| {
+            div()
+                .id("composer-companion")
+                .debug_selector(|| "composer-companion".into())
+                .absolute()
+                .left(px(x))
+                .top(px(y))
+                .cursor_pointer()
+                .aria_label(copy::companion_label(guardian))
+                .on_double_click({
+                    let state = state.clone();
+                    move |_, window, cx| {
+                        state.update(cx, |companion, cx| companion.open(window, cx));
+                    }
+                })
+                .child(Badge {
+                    guardian,
+                    motion,
+                    time,
+                    opacity,
+                    fit: geometry,
+                    window_box: art::companion_box(guardian),
+                    frames: frames.clone(),
+                    sample: sample.clone(),
+                })
+        };
+        let lane = div()
+            .id("composer-companion-lane")
+            .debug_selector(|| "composer-companion-lane".into())
+            .relative()
+            .w_full()
+            .min_w_0()
+            .h(px(geometry.lane()))
+            .flex_none()
+            .overflow_hidden()
+            .on_prepaint(move |bounds, _, _| measured.set(bounds.size.width));
         lane.with_animation(
             id,
             // The animation is only the frame ticker: the pose and the place
@@ -427,8 +458,8 @@ pub(crate) fn lane_with_best(
                 this.child(badge(time, shot.opacity, x, y))
             },
         )
-        .into_any_element(),
-    )
+        .into_any_element()
+    }
 }
 
 /// Wraps a session page so an open duel covers it, exactly as it does on the

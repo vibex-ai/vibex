@@ -34,6 +34,16 @@ pub(crate) struct Awakened {
     pub clear_ms: u64,
 }
 
+/// The companion's surface changed in a way the page around it has to answer.
+///
+/// The lane is a view of its own, so its poses repaint the lane and the page
+/// never hears about them — that is what keeps a running turn from rebuilding
+/// the whole workbench thirty times a second. What the page does have to answer
+/// is the surface appearing, leaving, or being covered by a duel: the mount, the
+/// unmount, and the veil are all built in the page's own render.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct SurfaceChanged;
+
 /// The guardian key an Agent's reward is stored under, if it has one.
 pub(crate) fn reward_key(agent_id: &str) -> Option<&'static str> {
     combat::Guardian::from_agent(agent_id).map(combat::Guardian::key)

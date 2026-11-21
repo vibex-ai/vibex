@@ -1116,6 +1116,23 @@ aggregates keep `primary` because their sessions can have different
 auto-continue settings. Waiting, error, and completion states keep their
 distinct symbols.
 
+### Every animated mark rides a view of its own
+
+`with_animation` asks the view it was built in for its next frame, and a
+notified view rebuilds itself. A mark built inline in `VibexWorkbench::render`
+therefore asked the workbench for a frame thirty times a second, and each of
+those frames rebuilt the page around the mark: `prepaint` alone measured 8ms on
+a short session and 50ms on a long one, so the mark's motion arrived as a stall
+and a jump instead of a move — the "animation stutters while fps is high" report
+was a frame budget problem, not a frame rate one. Mount the animated element
+through `motion::animated_host`, which keeps one `AnimatedHost` entity as element
+state (never `Window::use_keyed_state`, whose own observer notifies the creating
+view on every change and puts the frames straight back on the page), so the
+frames repaint a subtree the size of the mark and the page around it is drawn
+again from last frame. The composer companion is the same shape: `Companion`
+renders its own lane, and the page hears about it only through `SurfaceChanged` —
+the strip appearing or leaving, or a duel covering the page.
+
 The delegated-session disclosure follows the same rule of not claiming what the
 workbench does not know. A session row shows the chevron only when its children
 are known — from an ownership-tree node or a loaded branch page. A branch nobody

@@ -38,13 +38,16 @@
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
+use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use gpui::{
-    Animation, AnimationElement, App, ElementId, EntityId, Hsla, IntoElement, Rgba, SharedString,
-    Styled, Window, px,
+    Animation, AnimationElement, AnyElement, App, AppContext as _, Context, ElementId, Empty,
+    Entity, EntityId, Hsla, InteractiveElement as _, IntoElement, ParentElement as _, Render, Rgba,
+    SharedString, StyleRefinement, Styled, Window, div, px,
 };
+use gpui_component::StyledExt as _;
 
 pub use gpui::AnimationExt;
 
@@ -924,9 +927,199 @@ fn effective_reduced_motion(
     user_reduced_motion || inactive_window_pause(pause_inactive_animation, window_inactive)
 }
 
+// ---------------------------------------------------------------------------
+// Animated hosts
+// ---------------------------------------------------------------------------
+
+/// The element an animation wraps, rebuilt with the phase it is drawn at.
+type AnimatedBuild = Rc<dyn Fn(f32) -> AnyElement>;
+
+/// One decorative animation, mounted in a view of its own.
+///
+/// `with_animation` asks the view it was built in for its next frame — its
+/// scheduled re-render notifies [`Window::current_view`](gpui::Window) — and a
+/// view that was notified rebuilds itself, however deep inside it the animation
+/// sat. Built inline in the workbench's render, every animating mark (a live
+/// label's sweep, a running row's activity dot, the composer companion's lane)
+/// therefore asked for a workbench frame thirty times a second, and each of
+/// those frames rebuilt the whole page: `prepaint` alone measured 8ms on a quiet
+/// session and 50ms on a long one. A mark that costs its page that much does not
+/// move at 30fps; it moves in whatever gaps the page could afford, which is
+/// what "the animation stutters at high fps" looks like from the outside.
+///
+/// gpui draws a nested view again from last frame instead of rebuilding the view
+/// around it: notifying a child splices rather than walks. So the mark is
+/// mounted here, and the frames its animation asks for land on a subtree the
+/// size of the mark.
+///
+/// The wrapper the caller drew — `style` and `debug_selector` — moves onto the
+/// host's own root, so the swap moves nothing on screen.
+pub(crate) struct AnimatedHost {
+    style: StyleRefinement,
+    debug_selector: Option<SharedString>,
+    id: ElementId,
+    animation: Animation,
+    build: AnimatedBuild,
+}
+
+impl AnimatedHost {
+    pub(crate) fn new(
+        style: StyleRefinement,
+        debug_selector: Option<SharedString>,
+        id: ElementId,
+        animation: Animation,
+        build: impl Fn(f32) -> AnyElement + 'static,
+    ) -> Self {
+        Self {
+            style,
+            debug_selector,
+            id,
+            animation,
+            build: Rc::new(build),
+        }
+    }
+}
+
+impl Default for AnimatedHost {
+    fn default() -> Self {
+        Self {
+            style: StyleRefinement::default(),
+            debug_selector: None,
+            id: ElementId::Name("animated-host".into()),
+            animation: Animation::new(Duration::from_millis(1))
+                .repeat()
+                .with_max_fps(1.0),
+            build: Rc::new(|_| Empty.into_any_element()),
+        }
+    }
+}
+
+impl Render for AnimatedHost {
+    fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+        let mut slot = div().refine_style(&self.style);
+        if let Some(selector) = self.debug_selector.clone() {
+            slot = slot.debug_selector(move || selector.to_string());
+        }
+        let build = self.build.clone();
+        slot.with_animation(
+            self.id.clone(),
+            self.animation.clone(),
+            move |this, phase| this.child(build(phase)),
+        )
+    }
+}
+
+/// Mounts `host` as the view that owns its animation, under `key`.
+///
+/// The key is what keeps one entity across the parent's rebuilds — the same
+/// mark keeps the same host, and its phase with it. Along with the element, the
+/// host goes away, so a row that scrolls out of view leaves nothing behind.
+///
+/// This deliberately does not go through `Window::use_keyed_state`: that
+/// observes the state it hands out and notifies the view that created it
+/// whenever it changes, so every frame the host drew would notify the page and
+/// put the work this host exists to absorb straight back on it. Kept as element
+/// state instead, the host has one listener — its own animation — and the page
+/// hears nothing.
+pub(crate) fn animated_host(
+    window: &mut Window,
+    cx: &mut App,
+    key: impl Into<ElementId>,
+    host: AnimatedHost,
+) -> AnyElement {
+    let pending = Rc::new(RefCell::new(Some(host)));
+    let entity = window.with_global_id(key.into(), |global_id, window| {
+        window.with_element_state::<Entity<AnimatedHost>, _>(global_id, |state, _| {
+            let entity = match state {
+                Some(entity) => entity,
+                None => {
+                    let host = pending.borrow_mut().take().unwrap_or_default();
+                    cx.new(|_| host)
+                }
+            };
+            (entity.clone(), entity)
+        })
+    });
+    if let Some(host) = pending.borrow_mut().take() {
+        entity.update(cx, |view, _| *view = host);
+    }
+    entity.into_any_element()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use gpui::TestAppContext;
+
+    /// A mark's frames repaint the mark, not the page that holds it.
+    ///
+    /// This is the whole point of [`AnimatedHost`]: `with_animation` asks the
+    /// view it was built in for its next frame, so a mark built inline in the
+    /// workbench's render asked the workbench for thirty frames a second and got
+    /// a whole-page rebuild for each one — the cost that turns a steady swim
+    /// into a stall and a jump. Counting renders is the assertion: the page
+    /// keeps the one render it had, the host takes the mark's frame.
+    #[gpui::test]
+    fn an_animated_host_draws_its_frames_without_rebuilding_the_page(cx: &mut TestAppContext) {
+        struct Page {
+            renders: Rc<Cell<usize>>,
+            host: Entity<AnimatedHost>,
+        }
+        impl Render for Page {
+            fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
+                self.renders.set(self.renders.get() + 1);
+                div().size_full().child(self.host.clone())
+            }
+        }
+
+        let page_renders = Rc::new(Cell::new(0));
+        let mark_renders = Rc::new(Cell::new(0));
+        let marked = mark_renders.clone();
+        let host = cx.new(|_| {
+            AnimatedHost::new(
+                StyleRefinement::default().w(px(16.0)).h(px(16.0)),
+                None,
+                ElementId::Name("animated-mark".into()),
+                Animation::new(Duration::from_secs(1))
+                    .repeat()
+                    .with_max_fps(30.0),
+                move |_| {
+                    marked.set(marked.get() + 1);
+                    Empty.into_any_element()
+                },
+            )
+        });
+        let (_, cx) = cx.add_window_view({
+            let page_renders = page_renders.clone();
+            let host = host.clone();
+            move |_, _| Page {
+                renders: page_renders,
+                host,
+            }
+        });
+        cx.run_until_parked();
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+        let (page_before, mark_before) = (page_renders.get(), mark_renders.get());
+        assert!(mark_before > 0, "the mark draws at least once");
+
+        // The frame a mark's animation asks for, thirty times a second.
+        cx.update(|_, cx| host.update(cx, |_, cx| cx.notify()));
+        cx.update(|window, cx| {
+            let _ = window.draw(cx);
+        });
+
+        assert_eq!(
+            page_renders.get(),
+            page_before,
+            "the page is drawn again from last frame, not rebuilt"
+        );
+        assert!(
+            mark_renders.get() > mark_before,
+            "the mark's own frame is drawn"
+        );
+    }
 
     /// Stand-in owner for the fade store; the tests only care that a fade
     /// remembers which view to drive.

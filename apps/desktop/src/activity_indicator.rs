@@ -8,8 +8,8 @@ use std::f32::consts::{PI, TAU};
 use std::time::Duration;
 
 use gpui::{
-    Animation, AnimationExt as _, App, Bounds, ElementId, Hsla, IntoElement, ParentElement as _,
-    Pixels, RenderOnce, Styled as _, Window, canvas, div, fill, point, size,
+    Animation, App, Bounds, ElementId, Hsla, IntoElement, ParentElement as _, Pixels, RenderOnce,
+    Styled as _, Window, canvas, div, fill, point, size,
 };
 use gpui_component::ActiveTheme as _;
 use vibex_tui::glyphs::{self, GlyphTier};
@@ -139,7 +139,7 @@ impl RenderOnce for ActivityIndicator {
             Some(size) => slot.size(size),
             None => slot,
         };
-        let slot = slot.flex_none();
+        let mut slot = slot.flex_none();
         let color = color.unwrap_or(default_color);
         let render_mark = move |phase| match style {
             ActivityStyle::Timeline => timeline_mark(color, phase).into_any_element(),
@@ -150,12 +150,23 @@ impl RenderOnce for ActivityIndicator {
             return slot.child(render_mark(None)).into_any_element();
         }
 
-        slot.with_animation(
-            id,
-            Animation::new(cycle).repeat_synced().with_max_fps(max_fps),
-            move |this, phase| this.child(render_mark(Some(phase))),
+        // The mark rides a view of its own: its frames repaint a square, not the
+        // page the row sits in. Built inline, thirty frames a second rebuilt the
+        // whole workbench, which is what made a running mark's step visible as a
+        // jump rather than as motion (see `motion::AnimatedHost`).
+        let style = slot.style().clone();
+        motion::animated_host(
+            window,
+            cx,
+            id.clone(),
+            motion::AnimatedHost::new(
+                style,
+                None,
+                id,
+                Animation::new(cycle).repeat_synced().with_max_fps(max_fps),
+                move |phase| render_mark(Some(phase)),
+            ),
         )
-        .into_any_element()
     }
 }
 
