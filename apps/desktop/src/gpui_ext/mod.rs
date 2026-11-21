@@ -153,6 +153,27 @@ pub struct PinnedScrollbarBox<E> {
     outer: gpui::Stateful<gpui::Div>,
     scroller: E,
     bar: Option<gpui_base::Scrollbar>,
+    /// The id the bar's own view is keyed by.
+    ///
+    /// It has to be one per call site. Keyed state is global to the window, so a
+    /// single `"scrollbar-overlay"` key gave every pinned region in the window the
+    /// *same* overlay entity: the first region to render created it with its bar,
+    /// every other region's bar was built and dropped, and only one scrollbar in
+    /// the window could ever draw. That is how the transcript and the sidebar
+    /// both lost theirs.
+    overlay_key: gpui::ElementId,
+}
+
+/// The key one pinned region's bar view is stored under.
+///
+/// Derived from the call site's element id, so two regions under the same parent
+/// never share an overlay — and named, so it cannot collide with the region's own
+/// element state.
+fn scrollbar_overlay_key(site: &gpui::ElementId) -> gpui::ElementId {
+    gpui::ElementId::NamedChild(
+        std::sync::Arc::new(site.clone()),
+        gpui::SharedString::new_static("scrollbar-overlay"),
+    )
 }
 
 impl<E> PinnedScrollbarBox<E>
@@ -181,6 +202,7 @@ where
         // not share element state.
         let site = std::panic::Location::caller();
         let id = gpui::ElementId::CodeLocation(*site);
+        let overlay_key = scrollbar_overlay_key(&id);
         let outer = div()
             .id(id.clone())
             .relative()
@@ -196,6 +218,7 @@ where
             outer,
             scroller: scroller.flex_1().min_h_0().min_w_0(),
             bar: Some(bar),
+            overlay_key,
         }
     }
 }
@@ -258,8 +281,18 @@ where
             // sibling placed after the scroller, so it paints over the rows,
             // and `inset_0` pins it to the viewport while
             // `viewport_from_layout` makes it measure against the same box.
+            // The bar is rebuilt every frame from the live handle, so the view is
+            // handed this frame's bar rather than the one it was created with.
+            // Handing it over once — inside the `use_keyed_state` closure — left
+            // the view painting the placeholder it swaps in after rendering,
+            // which is a bar bound to an empty handle: no thumb, no scrollbar,
+            // from the second frame on.
             let overlay =
-                window.use_keyed_state("scrollbar-overlay", cx, |_, _| ScrollbarOverlay { bar });
+                window.use_keyed_state(self.overlay_key, cx, |_, _| ScrollbarOverlay { bar: None });
+            overlay.update(cx, |overlay, cx| {
+                overlay.bar = Some(bar);
+                cx.notify();
+            });
             outer = outer.child(
                 div()
                     .absolute()
@@ -280,20 +313,21 @@ where
 /// refused for as long as the fade runs — every scrolled frame. A view of its
 /// own moves the attribution off the scroller's owner.
 struct ScrollbarOverlay {
-    bar: gpui_base::Scrollbar,
+    /// This frame's bar, put back by [`PinnedScrollbarBox::render`] before the
+    /// view draws.
+    ///
+    /// `Scrollbar` is consumed by `render`, so it is taken here and left `None`
+    /// until the next frame fills it.
+    bar: Option<gpui_base::Scrollbar>,
 }
 
 impl gpui::Render for ScrollbarOverlay {
     fn render(&mut self, _: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
-        let bar = std::mem::replace(
-            &mut self.bar,
-            gpui_base::Scrollbar::new(&gpui::ScrollHandle::new()),
-        );
         div()
             .absolute()
             .inset_0()
             .debug_selector(|| "scrollbar-overlay".to_string())
-            .child(bar)
+            .children(self.bar.take())
     }
 }
 
@@ -454,6 +488,31 @@ mod tests {
     use gpui::AssetSource as _;
 
     use super::*;
+
+    /// Two pinned regions in one window must not share a bar view.
+    ///
+    /// Keyed state is global to the window, so one shared key meant one overlay
+    /// entity: the first region to render owned the bar and every other region's
+    /// bar was dropped — the transcript and the sidebar both lost theirs.
+    #[test]
+    fn each_pinned_region_keys_its_own_scrollbar_overlay() {
+        let first = overlay_key_at_call_site();
+        let second = overlay_key_at_call_site();
+        assert_ne!(first, second);
+        // The key is also distinct from the region's own element id, so the bar's
+        // view cannot collide with the viewport's element state.
+        assert_ne!(
+            first,
+            gpui::ElementId::CodeLocation(*std::panic::Location::caller())
+        );
+    }
+
+    #[track_caller]
+    fn overlay_key_at_call_site() -> gpui::ElementId {
+        scrollbar_overlay_key(&gpui::ElementId::CodeLocation(
+            *std::panic::Location::caller(),
+        ))
+    }
 
     /// An icon path that is not in the asset bundle resolves to nothing, with
     /// no error and no placeholder, so a missing registration would leave the
