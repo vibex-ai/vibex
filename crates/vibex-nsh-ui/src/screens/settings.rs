@@ -315,7 +315,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
     button()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow([card_shadow()])
+        .shadow_xs()
         .mb(px(12.0))
         .bg(theme::block_surface)
         .px(px(theme::SPACING_LG))
@@ -876,7 +876,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             view()
                 .w_full()
                 .rounded(px(CARD_RADIUS))
-                .shadow([card_shadow()])
+                .shadow_xs()
                 .mb(px(12.0))
                 .bg(theme::block_surface)
                 .px(px(16.0))
@@ -1011,7 +1011,7 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow([card_shadow()])
+        .shadow_xs()
         .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
@@ -1079,7 +1079,7 @@ fn clear_dialog(host: SettingsHost, open: Signal<bool>) -> impl IntoElement {
                         .w_full()
                         .max_w(px(360.0))
                         .rounded(px(24.0))
-                        .shadow([dialog_shadow()])
+                        .shadow_lg()
                         .bg(theme::block_surface)
                         .p(px(23.0))
                         .flex_col()
@@ -1159,7 +1159,7 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .shadow([card_shadow()])
+        .shadow_xs()
         .mb(px(12.0))
         .bg(theme::block_surface)
         .overflow_hidden()
@@ -1571,30 +1571,6 @@ fn subtitle_text() -> Hsla {
 /// A trailing chevron or a quiet glyph.
 fn subtle_icon() -> Hsla {
     theme::muted_foreground().opacity(0.75)
-}
-
-/// The soft lift under a settings card: a wide, very low-opacity shadow.
-fn card_shadow() -> BoxShadow {
-    BoxShadow {
-        offset_x: px(0.0),
-        offset_y: px(3.0),
-        blur: px(14.0),
-        spread: px(0.0),
-        color: nsh_core::element::Color::rgba(0, 0, 0, 6),
-        inset: false,
-    }
-}
-
-/// The stronger lift under a dialog.
-fn dialog_shadow() -> BoxShadow {
-    BoxShadow {
-        offset_x: px(0.0),
-        offset_y: px(10.0),
-        blur: px(36.0),
-        spread: px(0.0),
-        color: nsh_core::element::Color::rgba(0, 0, 0, 32),
-        inset: false,
-    }
 }
 
 fn divider() -> impl IntoElement {
