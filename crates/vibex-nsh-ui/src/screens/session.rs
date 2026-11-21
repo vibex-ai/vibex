@@ -31,8 +31,6 @@ use crate::{
 
 /// The height of the top bar, above the safe area.
 const HEADER_HEIGHT: f32 = 48.0;
-/// The drawer's width on a phone.
-const DRAWER_WIDTH: f32 = 300.0;
 
 /// How a session is doing, for the drawer's dot.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -900,6 +898,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
 
     view()
         .flex_1()
+        .relative()
         .bg(theme::block_page)
         .flex_col()
         .child(header(host.clone(), drawer_open))
@@ -975,6 +974,19 @@ fn shell(host: SessionHost) -> impl IntoElement {
         .child(runtime_sheet(host.clone()))
         .child(history_sheet(host.clone()))
         .child(drawer(host.clone(), drawer_open))
+        .child(
+            view()
+                .absolute()
+                .left(px(0.0))
+                .top(px(0.0))
+                .bottom(px(0.0))
+                .w(px(24.0))
+                .on_pan_end(move |event: &PanEvent| {
+                    if event.translation.x.0 > 40.0 {
+                        drawer_open.set(true);
+                    }
+                }),
+        )
         .child(session_actions_sheet(
             host.session_actions,
             host.session_rename,
@@ -4237,6 +4249,22 @@ fn attachment_preview_sheet(
         )
 }
 
+/// The mark a session's Agent wears in the drawer.
+fn agent_icon(agent: &str) -> &'static str {
+    let agent = agent.to_ascii_lowercase();
+    if agent.contains("claude") {
+        include_str!("../../assets/icons/claude.svg")
+    } else if agent.contains("codex") || agent.contains("openai") || agent.contains("gpt") {
+        include_str!("../../assets/icons/openai.svg")
+    } else if agent.contains("gemini") {
+        include_str!("../../assets/icons/gemini.svg")
+    } else if agent.contains("deepseek") {
+        include_str!("../../assets/icons/deepseek.svg")
+    } else {
+        include_str!("../../assets/icons/bot.svg")
+    }
+}
+
 fn drawer_header_button(
     icon: ImageSrc,
     label: &'static str,
@@ -4354,7 +4382,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
         })
         .child(
             view()
-                .w(px(DRAWER_WIDTH))
+                .w_full()
                 .h_full()
                 .flex_col()
                 .bg(theme::background_card)
@@ -5744,7 +5772,7 @@ fn session_row(
                         .items_center()
                         .justify_center()
                         .child(
-                            svg(icon(include_str!("../../assets/icons/bot.svg")))
+                            svg(icon(agent_icon(session.get_untracked().agent.as_str())))
                                 .w(px(17.0))
                                 .h(px(17.0))
                                 .text_color(theme::text_secondary),
