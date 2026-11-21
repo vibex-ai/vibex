@@ -40,11 +40,9 @@ fn the_pairing_page_shows_the_product_and_three_ways_in() {
 fn link_opens_the_manual_entry_sheet() {
     let (mut app, _directory) = start();
     app.press("role:button[Link]").unwrap();
-    app.wait_for("Link a runtime").unwrap();
     app.wait_for("Paste a code or link").unwrap();
-    // The connect action stays disabled until there is something to claim.
-    assert!(!app.screen().enabled("role:button[Connect]").unwrap());
-    app.type_text("text:vibex://…", "vibex://example").unwrap();
+    app.type_text("text:Pairing code or link", "vibex://example")
+        .unwrap();
     app.wait_for("Connect").unwrap();
     assert!(app.screen().enabled("role:button[Connect]").unwrap());
 }
@@ -53,20 +51,31 @@ fn link_opens_the_manual_entry_sheet() {
 fn find_opens_the_nearby_sheet() {
     let (mut app, _directory) = start();
     app.press("role:button[Find]").unwrap();
-    app.wait_for("Nearby").unwrap();
+    app.wait_for("Find on this network").unwrap();
     app.wait_for("Searching...").unwrap();
+}
+
+#[test]
+fn an_empty_entry_is_refused_with_the_copy_that_names_what_to_paste() {
+    let (mut app, _directory) = start();
+    app.press("role:button[Link]").unwrap();
+    app.wait_for("Paste a code or link").unwrap();
+    app.press("role:button[Connect]").unwrap();
+    app.wait_for("Paste the pairing code or link from the computer or the cloud runtime.")
+        .unwrap();
 }
 
 #[test]
 fn a_bare_code_without_an_address_says_what_is_missing() {
     let (mut app, _directory) = start();
     app.press("role:button[Link]").unwrap();
-    app.wait_for("Link a runtime").unwrap();
-    app.type_text("text:vibex://…", "123456").unwrap();
+    app.wait_for("Paste a code or link").unwrap();
+    app.type_text("text:Pairing code or link", "123456")
+        .unwrap();
     app.press("role:button[Connect]").unwrap();
-    // The claim is refused before any network call, and the page says which
+    // The claim is refused before any network call, and the sheet says which
     // piece of the entry is missing.
-    app.wait_for("Enter the pairing code and the server address.")
+    app.wait_for("Enter the server address as well as the pairing code.")
         .unwrap();
 }
 

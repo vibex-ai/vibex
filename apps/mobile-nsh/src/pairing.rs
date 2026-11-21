@@ -21,14 +21,17 @@ use futures_util::StreamExt as _;
 use nsh_core::picker::PickRequest;
 use nsh_core::prelude::*;
 use vibex_backend::{BackendError, BackendResult};
-use vibex_core::{RemoteLanPairingRequestState, unix_timestamp_ms};
+use vibex_core::{RemoteLanPairingRequestState, RemoteServerKind, unix_timestamp_ms};
 use vibex_mobile_pairing::{
     MobileCredentialBundle, MobilePairedRuntime, PairingStore, claim_entry,
-    claim_zero_config_lan_pairing, classify_entry,
+    claim_zero_config_lan_pairing, classify_entry, entry::is_pairing_link,
 };
 use vibex_nsh_ui::{
     copy,
-    screens::pairing::{NearbyRuntime, PairingHost, RuntimeStatus, SavedRuntime},
+    screens::pairing::{
+        HostDetails, NearbyPhase, NearbyRuntime, PairingHost, RuntimeKind, RuntimeStatus,
+        SavedRuntime,
+    },
 };
 use vibex_remote_client::{ClientDeviceIdentity, ZeroConfigLanPairingSession};
 
@@ -51,6 +54,8 @@ struct HostMeta {
     last_connected_at_ms: i64,
     #[serde(default)]
     device_name: Option<String>,
+    #[serde(default)]
+    server_kind: RemoteServerKind,
 }
 
 /// The runtime the page is connected to, once a claim or a probe succeeds.
@@ -73,7 +78,7 @@ pub struct PairingService {
     bundles: Rc<RefCell<Vec<MobileCredentialBundle>>>,
     saved: Signal<Vec<SavedRuntime>>,
     nearby: Signal<Vec<NearbyRuntime>>,
-    details: Signal<Option<vibex_nsh_ui::screens::pairing::HostDetails>>,
+    details: Signal<Option<HostDetails>>,
     rename_draft: Signal<String>,
     meta: Rc<RefCell<std::collections::BTreeMap<String, HostMeta>>>,
     meta_path: PathBuf,
@@ -87,12 +92,20 @@ pub struct PairingService {
     discovery: Rc<RefCell<Option<crate::discovery::Discovery>>>,
     /// What the browse found, by key (the service instance's full name).
     candidates: Rc<RefCell<BTreeMap<String, crate::discovery::Candidate>>>,
-    /// A nearby pairing session waits for the desktop's approval.
-    nearby_waiting: Signal<bool>,
-    /// The code the desktop shows, once the session started.
-    nearby_code: Signal<Option<SharedString>>,
+    /// What the nearby sheet shows.
+    nearby_phase: Signal<NearbyPhase>,
     /// Bumped to abandon the session's poll loop.
     nearby_generation: Rc<Cell<u64>>,
+    /// Bumped to abandon a discovery timeout.
+    discovery_generation: Rc<Cell<u64>>,
+    /// The runtime the phone is connected to, for the selected row.
+    active_id: Signal<Option<SharedString>>,
+    /// The runtime whose actions sheet is open.
+    actions_id: Signal<Option<SharedString>>,
+    /// The runtime whose rename or remove dialog is open.
+    dialog_id: Signal<Option<SharedString>>,
+    rename_open: Signal<bool>,
+    remove_open: Signal<bool>,
 }
 
 impl PairingService {
@@ -144,6 +157,7 @@ impl PairingService {
                         added_at_ms: host.added_at_ms,
                         last_connected_at_ms: host.last_connected_at_ms.unwrap_or(0),
                         device_name: None,
+                        server_kind: host.server_kind,
                     },
                 );
                 bundles.push(bundle);
@@ -158,18 +172,40 @@ impl PairingService {
                 let _ = std::fs::write(data_dir.join(META_FILE), text);
             }
         }
+        // A build before the kind was persisted may have imported the hosts
+        // without it; the old file still names it, so fill the gap rather than
+        // showing every runtime as the generic kind.
+        if let Some(imported) = crate::migration::import_hosts(&data_dir) {
+            for host in imported.hosts {
+                let entry = meta.entry(host.bundle.host_id().to_owned()).or_default();
+                if entry.server_kind == RemoteServerKind::Unknown {
+                    entry.server_kind = host.server_kind;
+                }
+                if entry.added_at_ms == 0 {
+                    entry.added_at_ms = host.added_at_ms;
+                }
+            }
+        }
         let identity = Rc::new(RefCell::new(crate::migration::import_identity(
             &data_dir, &bundles,
         )));
         let saved = signal(
             bundles
                 .iter()
-                .map(|bundle| SavedRuntime {
-                    id: bundle.host_id().to_owned(),
-                    name: bundle.host_label(),
-                    status: RuntimeStatus::Unreachable,
-                    address: bundle.record.server_url.clone(),
-                    server_id: bundle.expected_server_id.clone(),
+                .map(|bundle| {
+                    let id = bundle.host_id().to_owned();
+                    let kind = meta
+                        .get(&id)
+                        .map(|meta| runtime_kind(meta.server_kind))
+                        .unwrap_or(RuntimeKind::Unknown);
+                    SavedRuntime {
+                        id,
+                        name: bundle.host_label(),
+                        status: RuntimeStatus::Unreachable,
+                        kind,
+                        address: bundle.record.server_url.clone(),
+                        server_id: bundle.expected_server_id.clone(),
+                    }
                 })
                 .collect::<Vec<_>>(),
         );
@@ -192,9 +228,14 @@ impl PairingService {
             connected: signal(None),
             discovery: Rc::new(RefCell::new(None)),
             candidates: Rc::new(RefCell::new(BTreeMap::new())),
-            nearby_waiting: signal(false),
-            nearby_code: signal(None),
+            nearby_phase: signal(NearbyPhase::Searching),
             nearby_generation: Rc::new(Cell::new(0)),
+            discovery_generation: Rc::new(Cell::new(0)),
+            active_id: signal(None),
+            actions_id: signal(None),
+            dialog_id: signal(None),
+            rename_open: signal(false),
+            remove_open: signal(false),
         };
         service.restore_last();
         service.probe_saved();
@@ -213,6 +254,7 @@ impl PairingService {
         PairingHost {
             saved: self.saved,
             nearby: self.nearby,
+            nearby_phase: self.nearby_phase,
             busy: self.busy,
             error: self.error,
             on_scan: Rc::new(move || {
@@ -228,7 +270,39 @@ impl PairingService {
             on_connect: Rc::new(move |entry, server| connect.connect_entry(entry, server)),
             on_paste: Rc::new(move |draft| paste.paste(draft)),
             on_find: Rc::new(move || find.start_nearby()),
+            on_retry_nearby: {
+                let service = self.clone();
+                Rc::new(move || service.start_nearby())
+            },
             on_pick_saved: Rc::new(move |id| pick_saved.probe_runtime(id)),
+            actions_id: self.actions_id,
+            dialog_id: self.dialog_id,
+            rename_open: self.rename_open,
+            remove_open: self.remove_open,
+            on_show_actions: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.show_actions(id))
+            },
+            on_close_actions: {
+                let service = self.clone();
+                Rc::new(move || service.close_actions())
+            },
+            on_open_rename: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.open_rename(id))
+            },
+            on_close_rename: {
+                let service = self.clone();
+                Rc::new(move || service.close_rename())
+            },
+            on_open_remove: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.open_remove(id))
+            },
+            on_close_remove: {
+                let service = self.clone();
+                Rc::new(move || service.close_remove())
+            },
             details: self.details,
             on_show_details: {
                 let service = self.clone();
@@ -249,6 +323,7 @@ impl PairingService {
                 Rc::new(move || service.close_switcher())
             },
             connected_label: self.connected_label,
+            active_id: self.active_id,
             on_disconnect: {
                 let service = self.clone();
                 Rc::new(move || service.disconnect())
@@ -263,12 +338,7 @@ impl PairingService {
             },
             on_pick_nearby: Rc::new(move |key| pick_nearby.start_nearby_pair(key)),
             on_open_settings: Rc::new(|| {}),
-            nearby_waiting: self.nearby_waiting,
-            nearby_code: self.nearby_code,
-            on_cancel_nearby: {
-                let service = self.clone();
-                Rc::new(move || service.cancel_nearby())
-            },
+            on_open_platform_settings: Rc::new(crate::host::request_app_settings),
             on_stop_nearby: {
                 let service = self.clone();
                 Rc::new(move || service.stop_nearby())
@@ -278,10 +348,30 @@ impl PairingService {
 
     /// Starts browsing the local network and lists what it finds.
     fn start_nearby(&self) {
-        self.stop_nearby();
+        self.stop_browsing();
         self.nearby.set(Vec::new());
         self.candidates.borrow_mut().clear();
         self.error.set(None);
+        self.busy.set(false);
+        self.nearby_phase.set(NearbyPhase::Searching);
+        // A browse that finds nothing says so after the moment a person would
+        // have spent waiting, rather than looking busy forever.
+        let generation = self.discovery_generation.get().wrapping_add(1);
+        self.discovery_generation.set(generation);
+        {
+            let service = self.clone();
+            spawn_detached(async move {
+                nsh_core::element::timer(Duration::from_secs(3)).await;
+                if service.discovery_generation.get() != generation {
+                    return;
+                }
+                if matches!(service.nearby_phase.get_untracked(), NearbyPhase::Searching)
+                    && service.nearby.get_untracked().is_empty()
+                {
+                    service.nearby_phase.set(NearbyPhase::Empty);
+                }
+            });
+        }
         if crate::host::discovery_available() {
             // The custom host browses with Android's NSD; it answers through
             // the discovery events instead of the Rust mDNS daemon.
@@ -292,10 +382,14 @@ impl PairingService {
         match crate::discovery::start(sender) {
             Some(discovery) => *self.discovery.borrow_mut() = Some(discovery),
             None => {
-                self.fail_message(copy::text(
-                    "Local discovery could not start on this device.",
-                    "无法在此设备上开始局域网发现。",
-                    "無法在此裝置上開始區域網路探索。",
+                self.stop_browsing();
+                self.nearby_phase.set(NearbyPhase::Failed(
+                    copy::text(
+                        "Local discovery could not start on this device.",
+                        "无法在此设备上开始局域网发现。",
+                        "無法在此裝置上開始區域網路探索。",
+                    )
+                    .into(),
                 ));
                 return;
             }
@@ -303,6 +397,9 @@ impl PairingService {
         let service = self.clone();
         spawn(async move {
             while let Some(event) = events.next().await {
+                if service.discovery_generation.get() != generation {
+                    break;
+                }
                 match event {
                     crate::discovery::Event::Found(candidate) => {
                         service
@@ -322,20 +419,29 @@ impl PairingService {
                                 rows.push(row);
                             }
                         });
+                        if matches!(service.nearby_phase.get_untracked(), NearbyPhase::Empty) {
+                            service.nearby_phase.set(NearbyPhase::Searching);
+                        }
                     }
                     crate::discovery::Event::Lost(key) => {
                         service.candidates.borrow_mut().remove(&key);
                         service
                             .nearby
                             .update(|rows| rows.retain(|row| row.key != key));
+                        if service.nearby.get_untracked().is_empty() {
+                            service.nearby_phase.set(NearbyPhase::Empty);
+                        }
                     }
                     crate::discovery::Event::Failed => {
-                        service.fail_message(copy::text(
-                            "Local discovery stopped: the network would not advertise nearby runtimes.",
-                            "局域网发现已停止：网络没有播报附近的运行时。",
-                            "區域網路探索已停止：網路沒有廣播附近的執行環境。",
+                        service.stop_browsing();
+                        service.nearby_phase.set(NearbyPhase::Failed(
+                            copy::text(
+                                "Local discovery stopped: the network would not advertise nearby runtimes.",
+                                "局域网发现已停止：网络没有播报附近的运行时。",
+                                "區域網路探索已停止：網路沒有廣播附近的執行環境。",
+                            )
+                            .into(),
                         ));
-                        service.stop_nearby();
                         break;
                     }
                 }
@@ -343,56 +449,69 @@ impl PairingService {
         });
     }
 
-    /// Stops browsing and abandons any nearby session.
-    fn stop_nearby(&self) {
+    /// Stops the browse itself, leaving the phase (and any pairing session)
+    /// to the caller.
+    fn stop_browsing(&self) {
         if crate::host::discovery_available() {
             crate::host::request_discovery(false);
         }
         if let Some(discovery) = self.discovery.borrow_mut().take() {
             discovery.stop();
         }
+        self.discovery_generation
+            .set(self.discovery_generation.get().wrapping_add(1));
+    }
+
+    /// Stops browsing and abandons any nearby session.
+    fn stop_nearby(&self) {
+        self.stop_browsing();
         self.nearby_generation
             .set(self.nearby_generation.get().wrapping_add(1));
-        self.nearby_waiting.set(false);
-        self.nearby_code.set(None);
-        // Abandoning a nearby session also ends the "Pairing..." state the
-        // page shows: the task that would have cleared it has been cancelled
-        // by the generation bump, so nothing else would.
+        self.nearby_phase.set(NearbyPhase::Searching);
         self.busy.set(false);
     }
 
     /// Starts a zero-config session with a discovered runtime and waits for
     /// the desktop to approve the code it shows.
     fn start_nearby_pair(&self, key: &str) {
+        let phase = self.nearby_phase.get_untracked();
         log::debug!(
-            "nearby pair requested: key={key} waiting={} busy={} candidates={}",
-            self.nearby_waiting.get_untracked(),
+            "nearby pair requested: key={key} phase={phase:?} busy={} candidates={}",
             self.busy.get_untracked(),
             self.candidates.borrow().len()
         );
-        if self.nearby_waiting.get_untracked() || self.busy.get_untracked() {
+        if matches!(
+            phase,
+            NearbyPhase::Validating(_) | NearbyPhase::Waiting { .. }
+        ) || self.busy.get_untracked()
+        {
             return;
         }
         let Some(candidate) = self.candidates.borrow().get(key).cloned() else {
             log::warn!("nearby pair: no candidate for {key}");
-            self.fail_text(copy::text(
-                "This computer is no longer reachable. Search again.",
-                "这台电脑现在无法连接，请重新查找。",
-                "這台電腦現在無法連線，請重新尋找。",
+            self.nearby_phase.set(NearbyPhase::Failed(
+                copy::text(
+                    "This computer is no longer reachable. Search again.",
+                    "这台电脑现在无法连接，请重新查找。",
+                    "這台電腦現在無法連線，請重新尋找。",
+                )
+                .into(),
             ));
             return;
         };
         log::debug!("nearby pair: origins={:?}", candidate.origins);
+        self.stop_browsing();
         self.error.set(None);
         self.busy.set(true);
-        self.nearby_waiting.set(true);
-        self.nearby_code.set(None);
+        self.nearby_phase
+            .set(NearbyPhase::Validating(candidate.name.clone().into()));
         let generation = self.nearby_generation.get().wrapping_add(1);
         self.nearby_generation.set(generation);
         let service = self.clone();
         // Presenting the install's identity keeps a re-pair on the runtime's
         // existing device row, as the claim paths do.
         let previous_identity = self.identity.borrow().clone();
+        let name: SharedString = candidate.name.clone().into();
         spawn_detached(async move {
             let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
             let opened = crate::runtime::handle()
@@ -409,21 +528,23 @@ impl PairingService {
                 Ok(Ok(session)) => session,
                 Ok(Err(message)) => {
                     service.busy.set(false);
-                    service.nearby_waiting.set(false);
-                    service.fail_text(message);
+                    service.nearby_phase.set(NearbyPhase::Failed(message));
                     return;
                 }
                 Err(error) => {
                     service.busy.set(false);
-                    service.nearby_waiting.set(false);
-                    service.fail_text(format!("the nearby pairing did not start: {error}"));
+                    service.nearby_phase.set(NearbyPhase::Failed(
+                        format!("the nearby pairing did not start: {error}").into(),
+                    ));
                     return;
                 }
             };
             service.busy.set(false);
-            service
-                .nearby_code
-                .set(Some(format_code(session.verification_code())));
+            service.nearby_phase.set(NearbyPhase::Waiting {
+                name,
+                code: format_code(session.verification_code()),
+                expires_at_ms: session.expires_at_ms(),
+            });
             loop {
                 nsh_core::element::timer(Duration::from_millis(700)).await;
                 if service.nearby_generation.get() != generation {
@@ -438,9 +559,9 @@ impl PairingService {
                 let (returned, result) = match polled {
                     Ok(pair) => pair,
                     Err(error) => {
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
-                        service.fail_text(format!("the nearby pairing did not answer: {error}"));
+                        service.nearby_phase.set(NearbyPhase::Failed(
+                            format!("the nearby pairing did not answer: {error}").into(),
+                        ));
                         return;
                     }
                 };
@@ -449,9 +570,9 @@ impl PairingService {
                     Ok(status) => status,
                     Err(error) => {
                         log::warn!("nearby pair: poll failed: {}", error.code);
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
-                        service.fail(&error);
+                        service
+                            .nearby_phase
+                            .set(NearbyPhase::Failed(error_text(&error)));
                         return;
                     }
                 };
@@ -463,61 +584,40 @@ impl PairingService {
                                 claim_zero_config_lan_pairing(&mut session, status).await
                             })
                             .await;
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
                         match claimed {
                             Ok(claimed) => {
                                 service.stop_nearby();
                                 service.finish_claim(claimed)
                             }
-                            Err(error) => service
-                                .fail_text(format!("the nearby pairing did not finish: {error}")),
+                            Err(error) => service.nearby_phase.set(NearbyPhase::Failed(
+                                format!("the nearby pairing did not finish: {error}").into(),
+                            )),
                         }
                         return;
                     }
                     RemoteLanPairingRequestState::Rejected => {
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
-                        service.fail_message(copy::text(
-                            "The desktop declined this pairing.",
-                            "桌面端拒绝了这个配对请求。",
-                            "桌面版拒絕了這個配對請求。",
-                        ));
+                        service.nearby_phase.set(NearbyPhase::Rejected);
                         return;
                     }
                     RemoteLanPairingRequestState::Expired
                     | RemoteLanPairingRequestState::Claimed => {
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
-                        service.fail_message(copy::text(
-                            "This pairing expired. Find the computer again.",
-                            "这个配对请求已过期，请重新查找电脑。",
-                            "這個配對請求已過期，請重新尋找電腦。",
-                        ));
+                        service.nearby_phase.set(NearbyPhase::Expired);
                         return;
                     }
                     RemoteLanPairingRequestState::Unknown => {
-                        service.nearby_waiting.set(false);
-                        service.nearby_code.set(None);
-                        service.fail_message(copy::text(
-                            "The desktop returned an unknown pairing state.",
-                            "桌面端返回了未知的配对状态。",
-                            "桌面版傳回了未知的配對狀態。",
+                        service.nearby_phase.set(NearbyPhase::Failed(
+                            copy::text(
+                                "The desktop returned an unknown pairing state.",
+                                "桌面端返回了未知的配对状态。",
+                                "桌面版傳回了未知的配對狀態。",
+                            )
+                            .into(),
                         ));
                         return;
                     }
                 }
             }
         });
-    }
-
-    /// Abandons the nearby session; its poll loop stops on the next tick.
-    fn cancel_nearby(&self) {
-        self.nearby_generation
-            .set(self.nearby_generation.get().wrapping_add(1));
-        self.nearby_waiting.set(false);
-        self.nearby_code.set(None);
-        self.busy.set(false);
     }
 
     /// Whether the pairing page is showing as the runtime switcher.
@@ -552,8 +652,10 @@ impl PairingService {
 
     /// Leaves the connected runtime; the credential stays saved.
     pub fn disconnect(&self) {
+        self.switcher.set(false);
         self.connected.set(None);
         self.connected_label.set(None);
+        self.active_id.set(None);
         self.error.set(None);
     }
 
@@ -592,6 +694,8 @@ impl PairingService {
                     remaining = bundles;
                 }
             }
+            service.meta.borrow_mut().clear();
+            service.save_meta();
             service.set_bundles(remaining);
             service.details.set(None);
             service.disconnect();
@@ -636,7 +740,24 @@ impl PairingService {
             return;
         }
         // Parsed here as well so a missing code or address is answered at
-        // once, without a task and without leaving the sheet waiting.
+        // once, without a task and without leaving the sheet waiting. The
+        // wording names the missing piece, as the GPUI client's does.
+        if entry.trim().is_empty() {
+            self.fail_text(copy::text(
+                "Paste the pairing code or link from the computer or the cloud runtime.",
+                "请粘贴电脑或云端运行时给出的配对码或链接。",
+                "請貼上電腦或雲端執行階段提供的配對碼或連結。",
+            ));
+            return;
+        }
+        if !is_pairing_link(entry) && server.trim().is_empty() {
+            self.fail_text(copy::text(
+                "Enter the server address as well as the pairing code.",
+                "请同时填写服务器地址和配对码。",
+                "請同時填寫伺服器位址和配對碼。",
+            ));
+            return;
+        }
         if let Err(error) = classify_entry(entry, server) {
             self.fail(&error);
             return;
@@ -672,7 +793,12 @@ impl PairingService {
             Ok(paired) => match self.store.upsert(paired.bundle.clone()) {
                 Ok(bundles) => {
                     let id = paired.bundle.host_id().to_owned();
-                    self.meta.borrow_mut().entry(id).or_default().added_at_ms = unix_timestamp_ms();
+                    {
+                        let mut meta = self.meta.borrow_mut();
+                        let entry = meta.entry(id).or_default();
+                        entry.added_at_ms = unix_timestamp_ms();
+                        entry.server_kind = paired.server_kind;
+                    }
                     self.save_meta();
                     if let Ok(identity) = ClientDeviceIdentity::from_private_key_base64(
                         paired.bundle.record.auth.device_id.clone(),
@@ -714,6 +840,7 @@ impl PairingService {
 
     /// Shows one saved runtime's details.
     fn show_details(&self, host_id: &str) {
+        self.actions_id.set(None);
         let Some(bundle) = self
             .bundles
             .borrow()
@@ -725,17 +852,86 @@ impl PairingService {
         };
         let meta = self.meta.borrow().get(host_id).cloned().unwrap_or_default();
         self.rename_draft.set(bundle.host_label());
-        self.details
-            .set(Some(vibex_nsh_ui::screens::pairing::HostDetails {
-                id: host_id.to_owned(),
-                name: bundle.host_label(),
-                address: bundle.record.server_url.clone(),
-                server_id: bundle.expected_server_id.clone(),
-                device_name: meta.device_name.clone().or_else(crate::host::device_name),
-                last_connected: (meta.last_connected_at_ms > 0)
-                    .then(|| format_when(meta.last_connected_at_ms)),
-                added: (meta.added_at_ms > 0).then(|| format_when(meta.added_at_ms)),
-            }));
+        self.details.set(Some(HostDetails {
+            id: host_id.to_owned(),
+            name: bundle.host_label(),
+            kind: runtime_kind(meta.server_kind),
+            address: if vibex_core::is_official_relay_origin(&bundle.record.server_url) {
+                copy::text("Official relay", "官方中继服务", "官方中繼服務").to_owned()
+            } else {
+                bundle.record.server_url.clone()
+            },
+            server_id: bundle.expected_server_id.clone(),
+            device_name: meta.device_name.clone(),
+            last_connected: (meta.last_connected_at_ms > 0)
+                .then(|| last_connected_label(meta.last_connected_at_ms)),
+            added: (meta.added_at_ms > 0).then(|| added_label(meta.added_at_ms)),
+        }));
+    }
+
+    /// Seeds the rename field with a saved runtime's current name.
+    fn seed_rename(&self, host_id: &str) {
+        if let Some(bundle) = self
+            .bundles
+            .borrow()
+            .iter()
+            .find(|bundle| bundle.host_id() == host_id)
+        {
+            self.rename_draft.set(bundle.host_label());
+        }
+    }
+
+    fn show_actions(&self, host_id: &str) {
+        self.details.set(None);
+        self.actions_id.set(Some(host_id.to_owned().into()));
+    }
+
+    fn close_actions(&self) {
+        self.actions_id.set(None);
+    }
+
+    fn open_rename(&self, host_id: &str) {
+        self.seed_rename(host_id);
+        self.actions_id.set(None);
+        self.dialog_id.set(Some(host_id.to_owned().into()));
+        self.rename_open.set(true);
+    }
+
+    fn close_rename(&self) {
+        self.rename_open.set(false);
+        self.dialog_id.set(None);
+    }
+
+    fn open_remove(&self, host_id: &str) {
+        self.actions_id.set(None);
+        self.dialog_id.set(Some(host_id.to_owned().into()));
+        self.remove_open.set(true);
+    }
+
+    fn close_remove(&self) {
+        self.remove_open.set(false);
+        self.dialog_id.set(None);
+    }
+
+    /// Whether one of the runtime surfaces is over the page.
+    pub fn overlay_open(&self) -> bool {
+        self.remove_open.get_untracked()
+            || self.rename_open.get_untracked()
+            || self.details.get_untracked().is_some()
+            || self.actions_id.get_untracked().is_some()
+    }
+
+    /// Closes the topmost runtime surface, one step per press.
+    pub fn close_overlay(&self) {
+        if self.remove_open.get_untracked() {
+            self.close_remove();
+        } else if self.rename_open.get_untracked() {
+            self.close_rename();
+        } else if self.details.get_untracked().is_some() {
+            self.details.set(None);
+        } else {
+            self.close_actions();
+        }
     }
 
     /// Renames a saved runtime locally (the credential keeps the authority's
@@ -795,52 +991,36 @@ impl PairingService {
         }
     }
 
-    /// Removes a saved runtime after the native confirmation.
+    /// Removes a saved runtime; the page asks for confirmation first.
     fn remove_host(&self, host_id: &str) {
-        let host_id = host_id.to_owned();
-        let service = self.clone();
-        spawn_detached(async move {
-            let answer = nsh_base::alert_dialog()
-                .title(copy::text(
-                    "Remove this runtime?",
-                    "移除这个运行时？",
-                    "移除這個執行環境？",
-                ))
-                .description(copy::text(
-                    "Its credential leaves this phone; pair again to reconnect.",
-                    "它的凭据会从这台手机上删除，需要重新配对才能连接。",
-                    "它的憑證會從這台手機上刪除，需要重新配對才能連線。",
-                ))
-                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                .destructive("remove", copy::text("Remove", "移除", "移除"))
-                .show()
-                .await;
-            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("remove")) {
-                return;
-            }
-            let result = service.store.remove(&host_id);
-            if service
-                .last_host_id()
-                .as_deref()
-                .is_some_and(|last| last == host_id)
-            {
-                let _ = std::fs::remove_file(&service.last_host_path);
-            }
-            match result {
-                Ok(bundles) => {
-                    let was_connected = service
-                        .connected
-                        .get_untracked()
-                        .is_some_and(|connected| connected.bundle.host_id() == host_id);
-                    service.set_bundles(bundles);
-                    service.details.set(None);
-                    if was_connected {
-                        service.connected.set(None);
-                    }
+        let result = self.store.remove(host_id);
+        if self
+            .last_host_id()
+            .as_deref()
+            .is_some_and(|last| last == host_id)
+        {
+            let _ = std::fs::remove_file(&self.last_host_path);
+        }
+        match result {
+            Ok(bundles) => {
+                self.meta.borrow_mut().remove(host_id);
+                self.save_meta();
+                let was_connected = self
+                    .connected
+                    .get_untracked()
+                    .is_some_and(|connected| connected.bundle.host_id() == host_id);
+                self.set_bundles(bundles);
+                self.details.set(None);
+                self.dialog_id.set(None);
+                self.actions_id.set(None);
+                if was_connected {
+                    self.connected.set(None);
+                    self.connected_label.set(None);
+                    self.active_id.set(None);
                 }
-                Err(error) => service.fail(&error),
             }
-        });
+            Err(error) => self.fail(&error),
+        }
     }
 
     /// Probes every saved runtime once, at startup.
@@ -939,10 +1119,17 @@ impl PairingService {
                     .iter()
                     .find(|(previous_id, _)| *previous_id == id)
                     .map_or(RuntimeStatus::Unreachable, |(_, status)| *status);
+                let kind = self
+                    .meta
+                    .borrow()
+                    .get(&id)
+                    .map(|meta| runtime_kind(meta.server_kind))
+                    .unwrap_or(RuntimeKind::Unknown);
                 SavedRuntime {
                     id,
                     name: bundle.host_label(),
                     status,
+                    kind,
                     address: bundle.record.server_url.clone(),
                     server_id: bundle.expected_server_id.clone(),
                 }
@@ -982,6 +1169,7 @@ impl PairingService {
                 row.status = RuntimeStatus::Reachable;
             }
         });
+        self.active_id.set(Some(bundle.host_id().to_owned().into()));
         self.connected_label.set(Some(bundle.host_label().into()));
         self.connected.set(Some(ConnectedRuntime {
             label: bundle.host_label(),
@@ -1126,30 +1314,37 @@ impl PairingService {
                             nearby.push(NearbyRuntime { key, name });
                         }
                     });
+                    if matches!(self.nearby_phase.get_untracked(), NearbyPhase::Empty) {
+                        self.nearby_phase.set(NearbyPhase::Searching);
+                    }
                 } else {
                     log::warn!("discovery candidate without a usable address: key={key:?}");
                 }
             }
             HostEvent::DiscoveryRemoved { key } => {
+                self.candidates.borrow_mut().remove(&key);
                 self.nearby
                     .update(|nearby| nearby.retain(|nearby| nearby.key != key));
+                if self.nearby.get_untracked().is_empty() {
+                    self.nearby_phase.set(NearbyPhase::Empty);
+                }
             }
-            HostEvent::DiscoveryPermissionDenied => self.fail_text(copy::text(
-                "Local network access is needed to find nearby computers.",
-                "查找附近的电脑需要局域网权限。",
-                "尋找附近的電腦需要區域網路權限。",
-            )),
-            HostEvent::DiscoveryFailed(message) => self.fail_text(message),
+            HostEvent::DiscoveryPermissionDenied => {
+                self.stop_browsing();
+                self.busy.set(false);
+                self.nearby_phase.set(NearbyPhase::PermissionDenied);
+            }
+            HostEvent::DiscoveryFailed(message) => {
+                self.stop_browsing();
+                self.busy.set(false);
+                self.nearby_phase.set(NearbyPhase::Failed(message.into()));
+            }
         }
     }
 
     fn fail(&self, error: &BackendError) {
         self.busy.set(false);
         self.error.set(Some(error_text(error)));
-    }
-
-    fn fail_message(&self, message: &'static str) {
-        self.fail_text(message);
     }
 
     fn fail_text(&self, message: impl AsRef<str>) {
@@ -1259,14 +1454,73 @@ fn decode_qr_photo(bytes: &[u8]) -> Option<String> {
     None
 }
 
-/// A short, local reading of a millisecond timestamp.
-fn format_when(at_ms: i64) -> String {
+/// Maps the wire's runtime kind to the page's.
+fn runtime_kind(kind: RemoteServerKind) -> RuntimeKind {
+    match kind {
+        RemoteServerKind::Desktop => RuntimeKind::Desktop,
+        RemoteServerKind::Headless => RuntimeKind::Headless,
+        RemoteServerKind::Unknown => RuntimeKind::Unknown,
+    }
+}
+
+/// The age of `at_ms` in the units the details page uses.
+fn relative_age(at_ms: i64) -> (u64, u8) {
     let seconds = (unix_timestamp_ms() - at_ms).max(0) / 1000;
     match seconds {
-        0..=59 => copy::text("Just now", "刚刚", "剛剛").to_owned(),
-        60..=3599 => format!("{}m", seconds / 60),
-        3600..=86399 => format!("{}h", seconds / 3600),
-        _ => format!("{}d", seconds / 86400),
+        0..=59 => (0, 0),
+        60..=3599 => (seconds as u64 / 60, 1),
+        3600..=86399 => (seconds as u64 / 3600, 2),
+        _ => (seconds as u64 / 86400, 3),
+    }
+}
+
+/// The "Added …" line for a saved runtime.
+fn added_label(at_ms: i64) -> String {
+    let (value, unit) = relative_age(at_ms);
+    match copy::language() {
+        copy::Language::English => match unit {
+            0 => "Added just now".to_owned(),
+            1 => format!("Added {value}m ago"),
+            2 => format!("Added {value}h ago"),
+            _ => format!("Added {value}d ago"),
+        },
+        copy::Language::SimplifiedChinese => match unit {
+            0 => "添加时间：刚刚".to_owned(),
+            1 => format!("添加时间：{value} 分钟前"),
+            2 => format!("添加时间：{value} 小时前"),
+            _ => format!("添加时间：{value} 天前"),
+        },
+        copy::Language::TraditionalChinese => match unit {
+            0 => "新增時間：剛剛".to_owned(),
+            1 => format!("新增時間：{value} 分鐘前"),
+            2 => format!("新增時間：{value} 小時前"),
+            _ => format!("新增時間：{value} 天前"),
+        },
+    }
+}
+
+/// The "Last connected …" line for a saved runtime.
+fn last_connected_label(at_ms: i64) -> String {
+    let (value, unit) = relative_age(at_ms);
+    match copy::language() {
+        copy::Language::English => match unit {
+            0 => "Last connected just now".to_owned(),
+            1 => format!("Last connected {value}m ago"),
+            2 => format!("Last connected {value}h ago"),
+            _ => format!("Last connected {value}d ago"),
+        },
+        copy::Language::SimplifiedChinese => match unit {
+            0 => "上次连接：刚刚".to_owned(),
+            1 => format!("上次连接：{value} 分钟前"),
+            2 => format!("上次连接：{value} 小时前"),
+            _ => format!("上次连接：{value} 天前"),
+        },
+        copy::Language::TraditionalChinese => match unit {
+            0 => "上次連線：剛剛".to_owned(),
+            1 => format!("上次連線：{value} 分鐘前"),
+            2 => format!("上次連線：{value} 小時前"),
+            _ => format!("上次連線：{value} 天前"),
+        },
     }
 }
 

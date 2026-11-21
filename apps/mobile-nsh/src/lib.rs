@@ -349,7 +349,11 @@ fn settings_host(
         }),
         on_switch_runtime: {
             let pairing = pairing.clone();
-            Rc::new(move || pairing.open_switcher())
+            let open = open;
+            Rc::new(move || {
+                open.set(false);
+                pairing.open_switcher();
+            })
         },
         on_clear_runtimes: Rc::new(move || pairing_for_clear.clear_runtimes()),
         on_close: { Rc::new(move || open.set(false)) },
@@ -370,7 +374,9 @@ fn start_back_poller(
             timer(Duration::from_millis(100)).await;
             let service = services.get_untracked();
             let switcher = pairing.switcher().get_untracked();
+            let overlay = pairing.overlay_open();
             let intercept = settings_open.get_untracked()
+                || overlay
                 || switcher
                 || service
                     .as_ref()
@@ -394,7 +400,9 @@ fn start_back_poller(
             if !host::take_back() {
                 continue;
             }
-            if settings_open.get_untracked() {
+            if pairing.overlay_open() {
+                pairing.close_overlay();
+            } else if settings_open.get_untracked() {
                 settings_open.set(false);
             } else if switcher {
                 pairing.close_switcher();

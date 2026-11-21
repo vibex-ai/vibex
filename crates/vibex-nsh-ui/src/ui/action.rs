@@ -29,6 +29,41 @@ pub fn secondary(
     action(label, icon, false, selected, on_press)
 }
 
+/// A destructive action: the same shape as [`secondary`], in the error ink.
+pub fn destructive(
+    label: impl IntoReactive<SharedString>,
+    icon: ImageSrc,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let content: fn() -> Hsla = theme::accent_red;
+    button()
+        .on_press(on_press)
+        .h(px(theme::TOUCH_TARGET))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(theme::accent_red)
+        .bg(theme::background_dim)
+        .flex_row()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM))
+        .active(|style| style.opacity(0.85))
+        .focus_visible(|style| style.outline(px(2.0)).outline_color(theme::foreground))
+        .child(
+            svg(icon)
+                .w(px(theme::ICON_SM))
+                .h(px(theme::ICON_SM))
+                .flex_shrink_0()
+                .text_color(content),
+        )
+        .child(
+            text(label)
+                .text_size(px(theme::font_detail()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(content),
+        )
+}
+
 fn action(
     label: impl IntoReactive<SharedString>,
     icon: ImageSrc,

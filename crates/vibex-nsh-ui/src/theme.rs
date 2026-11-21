@@ -34,6 +34,9 @@ pub const SPACING_XL: f32 = 20.0;
 /// its GPUI pair, so the two clients stay hard to tell apart.
 pub const RADIUS_CONTROL: f32 = 8.0;
 
+/// The corner radius of a card: a saved runtime's row, a dialog.
+pub const RADIUS_CARD: f32 = 10.0;
+
 /// The minimum touch target the phone keeps for every pressable row.
 pub const TOUCH_TARGET: f32 = 44.0;
 

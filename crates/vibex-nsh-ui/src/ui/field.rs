@@ -21,6 +21,20 @@ pub fn text_field_with(
     placeholder: impl IntoReactive<String>,
     on_change: impl Fn(&str) + 'static,
 ) -> Input {
+    framed(text_field_flat_with(value, placeholder, on_change))
+}
+
+/// The same field without its own frame, for a row that draws one border
+/// around the field and the controls beside it.
+pub fn text_field_flat(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
+    text_field_flat_with(value, placeholder, |_text: &str| {})
+}
+
+fn text_field_flat_with(
+    value: Signal<String>,
+    placeholder: impl IntoReactive<String>,
+    on_change: impl Fn(&str) + 'static,
+) -> Input {
     input()
         .value(move || value.get())
         .on_change(move |text: &str| {
@@ -34,6 +48,10 @@ pub fn text_field_with(
         .px(px(theme::SPACING_MD))
         .text_size(px(theme::font_body()))
         .text_color(theme::foreground)
+}
+
+fn framed(field: Input) -> Input {
+    field
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(theme::border_default)

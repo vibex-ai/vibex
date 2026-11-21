@@ -16,6 +16,7 @@ use std::{
 
 use nsh_core::storage::Storage;
 use serde::{Deserialize, Serialize};
+use vibex_core::RemoteServerKind;
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_remote_client::ClientDeviceIdentity;
 
@@ -34,6 +35,7 @@ pub struct ImportedHost {
     pub name_override: Option<String>,
     pub added_at_ms: i64,
     pub last_connected_at_ms: Option<i64>,
+    pub server_kind: RemoteServerKind,
 }
 
 /// What the old hosts file carried.
@@ -61,6 +63,8 @@ struct LegacyHostEntry {
     added_at_ms: i64,
     #[serde(default)]
     last_connected_at_ms: Option<i64>,
+    #[serde(default)]
+    server_kind: RemoteServerKind,
 }
 
 #[derive(Deserialize)]
@@ -82,6 +86,7 @@ pub fn import_hosts(data_dir: &Path) -> Option<ImportedHosts> {
             name_override: None,
             added_at_ms: 0,
             last_connected_at_ms: None,
+            server_kind: RemoteServerKind::Unknown,
         });
     }
     if hosts.is_empty() {
@@ -138,6 +143,7 @@ fn read_hosts(path: &Path) -> Vec<ImportedHost> {
                 name_override: host.name_override,
                 added_at_ms: host.added_at_ms,
                 last_connected_at_ms: host.last_connected_at_ms,
+                server_kind: host.server_kind,
             })
             .collect();
     }
@@ -150,6 +156,7 @@ fn read_hosts(path: &Path) -> Vec<ImportedHost> {
                 name_override: None,
                 added_at_ms: 0,
                 last_connected_at_ms: None,
+                server_kind: RemoteServerKind::Unknown,
             })
             .collect();
     }

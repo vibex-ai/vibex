@@ -54,6 +54,8 @@ public final class MainActivity extends Activity {
                 lanDiscovery.stop();
             } else if (request == 4) {
                 openCamera();
+            } else if (request == 5) {
+                openAppSettings();
             }
             String updateUrl = NshHost.nativeTakeUpdateUrl();
             if (updateUrl != null) {
@@ -213,6 +215,12 @@ public final class MainActivity extends Activity {
         }
         readSharedText(intent);
         readShortcut(intent);
+    }
+
+    private void openAppSettings() {
+        Intent intent = new Intent(android.provider.Settings.ACTION_APPLICATION_DETAILS_SETTINGS);
+        intent.setData(android.net.Uri.fromParts("package", getPackageName(), null));
+        startActivity(intent);
     }
 
     private void readShortcut(Intent intent) {

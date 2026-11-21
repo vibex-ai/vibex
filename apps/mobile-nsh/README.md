@@ -192,7 +192,7 @@ Two layers:
   parser reads every token (including translucent and custom ones).
 - **Headless flows**: the root is mounted with `nsh`'s headless driver, with no
   simulator: the pairing page shows its three entries, the link sheet opens and
-  its connect action stays disabled until there is something to claim, a bare
+  an empty entry is refused with the copy that names what to paste, a bare
   code without an address is refused with the copy that says what is missing,
   and the nearby sheet opens. The session shell's flows are covered too: the
   drawer lists sessions, switching one swaps the transcript, a streaming

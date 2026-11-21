@@ -4681,7 +4681,10 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 false,
                                 {
                                     let on_switch = on_switch_runtime.clone();
-                                    move || on_switch()
+                                    move || {
+                                        open.set(false);
+                                        on_switch()
+                                    }
                                 },
                             )
                             .w_full(),

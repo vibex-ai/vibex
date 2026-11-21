@@ -339,6 +339,8 @@ pub enum HostRequest {
     DiscoveryStop,
     /// Open the camera for an attachment.
     Camera,
+    /// Open this app's system settings page (a denied local-network grant).
+    AppSettings,
 }
 
 impl HostRequest {
@@ -349,6 +351,7 @@ impl HostRequest {
             HostRequest::DiscoveryStart => 2,
             HostRequest::DiscoveryStop => 3,
             HostRequest::Camera => 4,
+            HostRequest::AppSettings => 5,
         }
     }
 }
@@ -372,6 +375,15 @@ pub fn request_scan() {
         .lock()
         .unwrap_or_else(|error| error.into_inner())
         .push_back(HostRequest::Scan);
+}
+
+/// Asks the shell to open this app's system settings page.
+#[allow(dead_code, reason = "an embedding host may still poll this queue")]
+pub fn request_app_settings() {
+    requests()
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .push_back(HostRequest::AppSettings);
 }
 
 /// Asks the shell to start or stop local-network discovery.
