@@ -792,6 +792,7 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
     let nearby = host.nearby;
     let waiting = host.nearby_waiting;
     let code = host.nearby_code;
+    let error = host.error;
     let on_find = host.on_find.clone();
     let on_pick = host.on_pick_nearby.clone();
     let on_cancel = host.on_cancel_nearby.clone();
@@ -822,6 +823,14 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                         .font_weight(FontWeight::SEMIBOLD)
                         .text_color(theme::foreground),
                 )
+                // A failed attempt explains itself here: the page's own error
+                // line sits behind this sheet, so a dialog that only said
+                // "Pairing..." and then went back to the list would look like
+                // the tap did nothing.
+                .child(when(
+                    move || error.get().is_some(),
+                    move || error_message(error),
+                ))
                 .child(when(
                     move || waiting.get(),
                     move || {
@@ -839,10 +848,14 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                                 .text_color(theme::text_muted),
                             )
                             .child(
-                                text(move || code.get().unwrap_or_default())
-                                    .text_size(px(32.0))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::foreground),
+                                text(move || {
+                                    code.get().unwrap_or_else(|| {
+                                        copy::text("Pairing...", "配对中…", "配對中…").into()
+                                    })
+                                })
+                                .text_size(px(32.0))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::foreground),
                             )
                             .child({
                                 let on_cancel = on_cancel.clone();
@@ -871,7 +884,7 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
                     move || {
                         each(move || nearby.get(), |runtime| runtime.key.clone(), {
                             let on_pick = on_pick.clone();
-                            move |runtime, _| nearby_row(runtime, on_pick.clone(), open)
+                            move |runtime, _| nearby_row(runtime, on_pick.clone())
                         })
                     }
                 })),
@@ -879,16 +892,14 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>) -> impl IntoElement {
 }
 
 /// One runtime discovery found.
-fn nearby_row(
-    runtime: ReadSignal<NearbyRuntime>,
-    on_pick: Rc<dyn Fn(&str)>,
-    open: Signal<bool>,
-) -> impl IntoElement {
+///
+/// Picking a runtime keeps the sheet open: the code the desktop asks the person
+/// to confirm is shown here, and the pairing task belongs to this sheet's
+/// owner, so closing it would cancel the claim and leave the page saying
+/// "Pairing..." with nothing behind it.
+fn nearby_row(runtime: ReadSignal<NearbyRuntime>, on_pick: Rc<dyn Fn(&str)>) -> impl IntoElement {
     button()
-        .on_press(move || {
-            on_pick(&runtime.get_untracked().key);
-            open.set(false);
-        })
+        .on_press(move || on_pick(&runtime.get_untracked().key))
         .w_full()
         .min_h(px(58.0))
         .flex_row()

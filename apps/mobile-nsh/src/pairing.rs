@@ -97,7 +97,18 @@ pub struct PairingService {
 
 impl PairingService {
     /// Loads the saved runtimes and starts their reachability probes.
+    ///
+    /// The state is created without an owner: the service outlives every page
+    /// that shows it, and the pairing work started here runs on its own (see
+    /// [`spawn_detached`]). A signal owned by the page that pressed "Pair" is
+    /// disposed the moment that page is replaced, and writing it from a task
+    /// that is still finishing the claim is what turned a successful pairing
+    /// into a black screen.
     pub fn new(data_dir: PathBuf) -> Self {
+        Owner::detached().run(|| Self::with_owner(data_dir))
+    }
+
+    fn with_owner(data_dir: PathBuf) -> Self {
         let store = Rc::new(PairingStore::new(data_dir.join(STORE_FILE)));
         let mut meta: BTreeMap<String, HostMeta> =
             std::fs::read_to_string(data_dir.join(META_FILE))
@@ -344,17 +355,34 @@ impl PairingService {
             .set(self.nearby_generation.get().wrapping_add(1));
         self.nearby_waiting.set(false);
         self.nearby_code.set(None);
+        // Abandoning a nearby session also ends the "Pairing..." state the
+        // page shows: the task that would have cleared it has been cancelled
+        // by the generation bump, so nothing else would.
+        self.busy.set(false);
     }
 
     /// Starts a zero-config session with a discovered runtime and waits for
     /// the desktop to approve the code it shows.
     fn start_nearby_pair(&self, key: &str) {
+        log::debug!(
+            "nearby pair requested: key={key} waiting={} busy={} candidates={}",
+            self.nearby_waiting.get_untracked(),
+            self.busy.get_untracked(),
+            self.candidates.borrow().len()
+        );
         if self.nearby_waiting.get_untracked() || self.busy.get_untracked() {
             return;
         }
         let Some(candidate) = self.candidates.borrow().get(key).cloned() else {
+            log::warn!("nearby pair: no candidate for {key}");
+            self.fail_text(copy::text(
+                "This computer is no longer reachable. Search again.",
+                "这台电脑现在无法连接，请重新查找。",
+                "這台電腦現在無法連線，請重新尋找。",
+            ));
             return;
         };
+        log::debug!("nearby pair: origins={:?}", candidate.origins);
         self.error.set(None);
         self.busy.set(true);
         self.nearby_waiting.set(true);
@@ -362,24 +390,27 @@ impl PairingService {
         let generation = self.nearby_generation.get().wrapping_add(1);
         self.nearby_generation.set(generation);
         let service = self.clone();
-        spawn(async move {
+        // Presenting the install's identity keeps a re-pair on the runtime's
+        // existing device row, as the claim paths do.
+        let previous_identity = self.identity.borrow().clone();
+        spawn_detached(async move {
             let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
-            let opened = background(async move {
-                ZeroConfigLanPairingSession::start(
-                    candidate.origin,
-                    &candidate.server_id,
-                    &candidate.server_key,
-                    &device,
+            let opened = crate::runtime::handle()
+                .spawn(
+                    async move { start_lan_session(&candidate, &device, previous_identity).await },
                 )
-                .await
-            })
-            .await;
+                .await;
+            // The sheet was closed (or the pick was cancelled) while this was
+            // in flight: leave the page alone and let the attempt expire.
+            if service.nearby_generation.get() != generation {
+                return;
+            }
             let mut session = match opened {
                 Ok(Ok(session)) => session,
-                Ok(Err(error)) => {
+                Ok(Err(message)) => {
                     service.busy.set(false);
                     service.nearby_waiting.set(false);
-                    service.fail(&error);
+                    service.fail_text(message);
                     return;
                 }
                 Err(error) => {
@@ -398,11 +429,12 @@ impl PairingService {
                 if service.nearby_generation.get() != generation {
                     return;
                 }
-                let polled = background(async move {
-                    let result = session.poll().await;
-                    (session, result)
-                })
-                .await;
+                let polled = crate::runtime::handle()
+                    .spawn(async move {
+                        let result = session.poll().await;
+                        (session, result)
+                    })
+                    .await;
                 let (returned, result) = match polled {
                     Ok(pair) => pair,
                     Err(error) => {
@@ -416,6 +448,7 @@ impl PairingService {
                 let status = match result {
                     Ok(status) => status,
                     Err(error) => {
+                        log::warn!("nearby pair: poll failed: {}", error.code);
                         service.nearby_waiting.set(false);
                         service.nearby_code.set(None);
                         service.fail(&error);
@@ -425,10 +458,11 @@ impl PairingService {
                 match status.state {
                     RemoteLanPairingRequestState::Pending => continue,
                     RemoteLanPairingRequestState::Approved => {
-                        let claimed = background(async move {
-                            claim_zero_config_lan_pairing(&mut session, status).await
-                        })
-                        .await;
+                        let claimed = crate::runtime::handle()
+                            .spawn(async move {
+                                claim_zero_config_lan_pairing(&mut session, status).await
+                            })
+                            .await;
                         service.nearby_waiting.set(false);
                         service.nearby_code.set(None);
                         match claimed {
@@ -526,7 +560,7 @@ impl PairingService {
     /// Removes every saved credential; the settings sheet asks first.
     pub fn clear_runtimes(&self) {
         let service = self.clone();
-        spawn(async move {
+        spawn_detached(async move {
             let answer = nsh_base::alert_dialog()
                 .title(copy::text(
                     "Remove all saved runtimes?",
@@ -574,13 +608,15 @@ impl PairingService {
     fn scan_photo(&self) {
         self.error.set(None);
         let service = self.clone();
-        spawn(async move {
+        spawn_detached(async move {
             let files = pick_images(PickRequest::new(false, 1)).await;
             let Some(file) = files.into_iter().next() else {
                 return;
             };
             let bytes = file.data.bytes().to_vec();
-            let decoded = background(async move { decode_qr_photo(&bytes) }).await;
+            let decoded = crate::runtime::handle()
+                .spawn(async move { decode_qr_photo(&bytes) })
+                .await;
             match decoded {
                 Ok(Some(link)) => service.scan_link(&link),
                 Ok(None) => service.fail_text(copy::text(
@@ -610,16 +646,14 @@ impl PairingService {
         let service = self.clone();
         let entry = entry.to_owned();
         let server = server.to_owned();
-        spawn(async move {
+        spawn_detached(async move {
             let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
             // The claim is network I/O: run it on the runtime's threads, not
             // on the engine thread that renders. Presenting the install's
             // identity keeps a re-pair on the runtime's existing device row.
             let previous_identity = service.identity.borrow().clone();
-            let result =
-                background(
-                    async move { claim_entry(entry, server, device, previous_identity).await },
-                )
+            let result = crate::runtime::handle()
+                .spawn(async move { claim_entry(entry, server, device, previous_identity).await })
                 .await;
             let result = match result {
                 Ok(result) => result,
@@ -660,7 +694,7 @@ impl PairingService {
     /// Reads the clipboard into the entry field the sheet passed.
     fn paste(&self, draft: Signal<String>) {
         let service = self.clone();
-        spawn(async move {
+        spawn_detached(async move {
             let text = clipboard_string().await;
             let text = text.trim();
             if text.is_empty() {
@@ -765,7 +799,7 @@ impl PairingService {
     fn remove_host(&self, host_id: &str) {
         let host_id = host_id.to_owned();
         let service = self.clone();
-        spawn(async move {
+        spawn_detached(async move {
             let answer = nsh_base::alert_dialog()
                 .title(copy::text(
                     "Remove this runtime?",
@@ -827,7 +861,7 @@ impl PairingService {
     /// Keeps the saved runtimes' reachability fresh while the page is visible.
     fn watch_reachability(&self) {
         let service = self.clone();
-        spawn(async move {
+        spawn_detached(async move {
             loop {
                 nsh_core::element::timer(Duration::from_secs(20)).await;
                 if service.connected.get_untracked().is_none() || service.switcher.get_untracked() {
@@ -857,10 +891,11 @@ impl PairingService {
         let service = self.clone();
         let id = bundle.host_id().to_owned();
         let probing = bundle.clone();
-        spawn(async move {
+        spawn_detached(async move {
             // A panicking probe is an unreachable runtime, not a crash of the
             // page: the row simply stays red.
-            let online = background(async move { probing.probe_online().await })
+            let online = crate::runtime::handle()
+                .spawn(async move { probing.probe_online().await })
                 .await
                 .unwrap_or(false);
             service.set_status(
@@ -1054,31 +1089,46 @@ impl PairingService {
             HostEvent::DiscoveryCandidate {
                 key,
                 name,
-                origin,
+                origins,
                 server_id,
                 server_key,
             } => {
-                if let (Some(origin), Some(server_id), Some(server_key)) =
-                    (origin, server_id, server_key)
+                // Android's NSD can resolve a service without its instance
+                // name, which would make every runtime share the empty key.
+                // The first origin is stable for as long as the record is.
+                let key = if key.trim().is_empty() {
+                    origins.first().cloned().unwrap_or_default()
+                } else {
+                    key
+                };
+                if let (Some(server_id), Some(server_key)) = (server_id, server_key)
+                    && !origins.is_empty()
                 {
                     self.candidates.borrow_mut().insert(
                         key.clone(),
                         crate::discovery::Candidate {
                             key: key.clone(),
                             name: name.clone(),
-                            origin,
+                            origins,
                             server_id,
                             server_key,
                         },
                     );
+                    // A resolve that carried no address cannot be paired with:
+                    // listing it would only offer a row whose "Pair" does
+                    // nothing. Android's NSD re-resolves the record, and that
+                    // event brings the address.
+                    self.nearby.update(|nearby| {
+                        if let Some(candidate) = nearby.iter_mut().find(|nearby| nearby.key == key)
+                        {
+                            candidate.name = name;
+                        } else {
+                            nearby.push(NearbyRuntime { key, name });
+                        }
+                    });
+                } else {
+                    log::warn!("discovery candidate without a usable address: key={key:?}");
                 }
-                self.nearby.update(|nearby| {
-                    if let Some(candidate) = nearby.iter_mut().find(|nearby| nearby.key == key) {
-                        candidate.name = name;
-                    } else {
-                        nearby.push(NearbyRuntime { key, name });
-                    }
-                });
             }
             HostEvent::DiscoveryRemoved { key } => {
                 self.nearby
@@ -1106,6 +1156,91 @@ impl PairingService {
         self.busy.set(false);
         self.error.set(Some(message.as_ref().to_owned().into()));
     }
+}
+
+/// Spawns engine work that must outlive the element that started it.
+///
+/// nsh runs a spawned task under the owner of the element whose handler called
+/// it, so a task started from a list row dies when the list is replaced — the
+/// pairing sheet does exactly that on press. These tasks report through the
+/// service's signals, and the service's generation counter is what abandons
+/// them, so they are spawned without an owner.
+fn spawn_detached(task: impl std::future::Future<Output = ()> + 'static) {
+    Owner::detached().run(|| {
+        spawn(task);
+    });
+}
+
+/// How long one advertised address gets before the next one is tried.
+const LAN_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(4);
+
+/// How long the whole set of addresses gets before the page says it could not
+/// reach this computer.
+const LAN_TOTAL_TIMEOUT: Duration = Duration::from_secs(12);
+
+/// Opens a zero-config session, trying every address the runtime advertised.
+///
+/// A runtime publishes each address of each interface it has — the LAN one, a
+/// VPN, a container bridge — and only the LAN one answers from the phone.
+/// Dialling a single arbitrary address is how "Find" sits on "Pairing..."
+/// while the desktop never sees a request, so each is tried in turn, the one
+/// on this phone's own subnet first.
+async fn start_lan_session(
+    candidate: &crate::discovery::Candidate,
+    device: &str,
+    identity: Option<ClientDeviceIdentity>,
+) -> Result<ZeroConfigLanPairingSession, SharedString> {
+    let mut last = None;
+    // Addresses that black-hole would otherwise add up: the whole search is
+    // bounded too, so a phone that cannot reach any of them says so promptly.
+    let deadline = tokio::time::Instant::now() + LAN_TOTAL_TIMEOUT;
+    for origin in candidate.origins.clone() {
+        let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let attempted = origin.clone();
+        let started = tokio::time::timeout(
+            remaining.min(LAN_ATTEMPT_TIMEOUT),
+            ZeroConfigLanPairingSession::start_with_identity(
+                origin,
+                &candidate.server_id,
+                &candidate.server_key,
+                device,
+                identity.clone(),
+            ),
+        )
+        .await;
+        match started {
+            Ok(Ok(session)) => {
+                log::info!("nearby pair: reached {attempted}");
+                return Ok(session);
+            }
+            Ok(Err(error)) => {
+                log::warn!("nearby pair: {attempted} failed: {}", error.code);
+                last = Some(error_text(&error));
+            }
+            Err(_) => {
+                log::warn!("nearby pair: {attempted} timed out");
+                last = Some(
+                    copy::text(
+                        "The computer did not answer on its local address.",
+                        "这台电脑的局域网地址没有响应。",
+                        "這台電腦的區域網路位址沒有回應。",
+                    )
+                    .into(),
+                )
+            }
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        copy::text(
+            "This computer did not advertise an address this phone can reach.",
+            "这台电脑没有播报手机能访问的地址。",
+            "這台電腦沒有廣播手機能存取的位址。",
+        )
+        .into()
+    }))
 }
 
 /// The page's wording for a pairing failure.
@@ -1204,5 +1339,29 @@ fn bounded(message: &str) -> SharedString {
         "Pairing failed.".into()
     } else {
         message.chars().take(160).collect::<String>().into()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candidate(origins: Vec<&str>) -> crate::discovery::Candidate {
+        crate::discovery::Candidate {
+            key: "desktop-test".to_owned(),
+            name: "Studio".to_owned(),
+            origins: origins.into_iter().map(str::to_owned).collect(),
+            server_id: "desktop-test".to_owned(),
+            server_key: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_owned(),
+        }
+    }
+
+    #[test]
+    fn every_advertised_address_is_tried_before_the_pairing_fails() {
+        // Two addresses that refuse immediately: the loop visits both and
+        // reports an error instead of waiting on the first one forever.
+        let candidate = candidate(vec!["http://127.0.0.1:1", "http://127.0.0.1:2"]);
+        let started = crate::runtime::block_on(start_lan_session(&candidate, "Test Phone", None));
+        assert!(started.is_err());
     }
 }

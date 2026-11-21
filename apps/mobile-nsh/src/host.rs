@@ -36,12 +36,14 @@ pub enum HostEvent {
     /// The camera read a pairing link or a server connection string.
     ScanResult(String),
     /// Discovery found a runtime. A zero-config runtime also carries the
-    /// origin and identity a pairing session needs; the simplified marker
+    /// origins and identity a pairing session needs; the simplified marker
     /// (old hosts, tests) leaves them empty.
     DiscoveryCandidate {
         key: String,
         name: String,
-        origin: Option<String>,
+        /// Every address the runtime advertised, best first. A host that only
+        /// reports one address sends a single entry.
+        origins: Vec<String>,
         server_id: Option<String>,
         server_key: Option<String>,
     },
@@ -454,6 +456,10 @@ enum DiscoveryMessage {
         service_instance: String,
         #[serde(default)]
         host: String,
+        /// Every IPv4 address the record resolved to, most reachable first.
+        /// Older hosts report one address in `host` instead.
+        #[serde(default)]
+        hosts: Vec<String>,
         #[serde(default)]
         port: u16,
         #[serde(default)]
@@ -480,6 +486,7 @@ pub fn parse_discovery(value: &str) -> HostEvent {
             name,
             service_instance,
             host,
+            hosts,
             port,
             txt,
         }) => {
@@ -500,9 +507,16 @@ pub fn parse_discovery(value: &str) -> HostEvent {
                 && txt.get("pairing").map(String::as_str) == Some("available")
                 && txt.get("protocol_min").map(String::as_str) == Some("2")
                 && txt.get("protocol_max").map(String::as_str) == Some("2");
-            let origin = zero_config
-                .then(|| format!("http://{host}:{port}"))
-                .filter(|_| !host.is_empty() && port != 0);
+            let mut reported = hosts;
+            reported.retain(|address| !address.trim().is_empty());
+            if reported.is_empty() && !host.trim().is_empty() {
+                reported.push(host);
+            }
+            let origins = if zero_config && port != 0 {
+                crate::discovery::origins_from_hosts(reported, port)
+            } else {
+                Vec::new()
+            };
             let server_id = zero_config.then(|| txt.get("server_id").cloned()).flatten();
             let server_key = zero_config
                 .then(|| txt.get("server_identity_public_key").cloned())
@@ -510,7 +524,7 @@ pub fn parse_discovery(value: &str) -> HostEvent {
             HostEvent::DiscoveryCandidate {
                 key,
                 name,
-                origin,
+                origins,
                 server_id,
                 server_key,
             }
@@ -546,11 +560,29 @@ mod tests {
             HostEvent::DiscoveryCandidate {
                 key: "desktop-1".to_owned(),
                 name: "Studio".to_owned(),
-                origin: None,
+                origins: Vec::new(),
                 server_id: None,
                 server_key: None,
             }
         );
+    }
+
+    #[test]
+    fn a_candidate_offers_every_reported_address() {
+        let json = r#"{"kind":"candidate","key":"desktop-1","port":1429,
+            "hosts":["172.17.0.1","192.168.0.105"],
+            "txt":{"mode":"zero_config","version":"1","pairing":"available",
+            "protocol_min":"2","protocol_max":"2","server_id":"desktop-1",
+            "server_identity_public_key":"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}}"#;
+        let HostEvent::DiscoveryCandidate { origins, .. } = parse_discovery(json) else {
+            panic!("a candidate");
+        };
+        assert_eq!(
+            origins.first().map(String::as_str),
+            Some("http://192.168.0.105:1429"),
+            "the LAN address is offered before a container bridge"
+        );
+        assert!(origins.contains(&"http://172.17.0.1:1429".to_owned()));
     }
 
     #[test]

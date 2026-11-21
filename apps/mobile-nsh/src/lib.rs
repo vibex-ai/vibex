@@ -23,6 +23,7 @@ mod host;
 mod migration;
 mod pairing;
 mod platform;
+mod runtime;
 mod session;
 mod settings;
 pub mod theme_gen;
@@ -474,14 +475,20 @@ fn install_service_effect(
             let pairing = pairing.clone();
             Rc::new(move |name: &str| pairing.rename_device(name))
         };
-        let built = SessionService::new(
-            &runtime.bundle,
-            disconnect,
-            switch_runtime,
-            open_settings,
-            runtime_renamed,
-            device_renamed,
-        );
+        // The shell's state must outlive this effect: the effect runs again
+        // whenever the connection, the attempt counter or the lifecycle
+        // changes, and a signal owned by the scope that created it would be
+        // disposed while the service's tasks are still writing it.
+        let built = Owner::detached().run(|| {
+            SessionService::new(
+                &runtime.bundle,
+                disconnect,
+                switch_runtime,
+                open_settings,
+                runtime_renamed,
+                device_renamed,
+            )
+        });
         match built {
             Ok(service) => {
                 services.set(Some(Rc::new(service)));

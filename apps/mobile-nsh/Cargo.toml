@@ -20,6 +20,7 @@ vibex-desktop-model = { path = "../../crates/desktop-model" }
 vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 base64.workspace = true
+log.workspace = true
 mdns-sd.workspace = true
 image = { workspace = true, features = ["png", "jpeg"] }
 rqrr = "0.9"
@@ -27,6 +28,8 @@ serde.workspace = true
 serde_json.workspace = true
 futures-channel.workspace = true
 futures-util.workspace = true
+# One pairing address attempt is bounded; `background` work is a Tokio task.
+tokio = { workspace = true, features = ["time"] }
 vibex-nsh-ui = { path = "../../crates/vibex-nsh-ui" }
 
 [target.'cfg(target_os = "ios")'.dependencies]

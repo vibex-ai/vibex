@@ -115,6 +115,9 @@ struct EditState {
 pub struct SessionService {
     /// The credential's host id, for the app's runtime bookkeeping.
     bundle_host_id: Rc<String>,
+    /// The concrete client, for the one call the traits do not expose:
+    /// establishing the route before the first operation.
+    web: Arc<vibex_remote_client::WebRemoteBackend>,
     backend: Arc<dyn AgentBackend>,
     terminal_backend: Arc<dyn TerminalBackend>,
     file_backend: Arc<dyn FileBackend>,
@@ -311,16 +314,17 @@ impl SessionService {
         on_runtime_renamed: Rc<dyn Fn(&str)>,
         on_device_renamed: Rc<dyn Fn(&str)>,
     ) -> BackendResult<Self> {
-        let backend = bundle.backend()?;
-        let terminal_backend: Arc<dyn TerminalBackend> = backend.clone();
-        let file_backend: Arc<dyn FileBackend> = backend.clone();
-        let git_backend: Arc<dyn GitBackend> = backend.clone();
-        let workspace_backend: Arc<dyn WorkspaceBackend> = backend.clone();
-        let sidebar_backend: Arc<dyn SidebarBackend> = backend.clone();
-        let backend: Arc<dyn AgentBackend> = backend;
+        let web = bundle.backend()?;
+        let terminal_backend: Arc<dyn TerminalBackend> = web.clone();
+        let file_backend: Arc<dyn FileBackend> = web.clone();
+        let git_backend: Arc<dyn GitBackend> = web.clone();
+        let workspace_backend: Arc<dyn WorkspaceBackend> = web.clone();
+        let sidebar_backend: Arc<dyn SidebarBackend> = web.clone();
+        let backend: Arc<dyn AgentBackend> = web.clone();
         let runtime = bundle.host_label();
         let service = Self {
             bundle_host_id: Rc::new(bundle.host_id().to_owned()),
+            web,
             backend,
             terminal_backend,
             file_backend,
@@ -1325,6 +1329,37 @@ impl SessionService {
                 delay = RECONNECT_MIN_MS;
             }
             self.connection.set(ConnectionState::Connecting);
+            // The transport's operations reuse a selected route; only
+            // `connect` opens one. Without it the first session list asks for a
+            // route that was never selected and comes back
+            // "remote_reselection_canceled".
+            let web = self.web.clone();
+            let connected = crate::runtime::handle()
+                .spawn(async move { web.connect().await })
+                .await;
+            if let Ok(Err(error)) = &connected {
+                log::warn!("session connect failed: {} ({})", error.code, error.message);
+            }
+            let failed = match &connected {
+                Ok(Ok(_)) => false,
+                Ok(Err(error)) => {
+                    self.connection.set(ConnectionState::Offline);
+                    self.connection_error.set(Some(error_text(error)));
+                    true
+                }
+                Err(error) => {
+                    self.connection.set(ConnectionState::Offline);
+                    self.connection_error.set(Some(
+                        format!("connecting to the runtime did not finish: {error}").into(),
+                    ));
+                    true
+                }
+            };
+            if failed {
+                delay = (delay * 2).min(RECONNECT_MAX_MS);
+                self.wait_before_retry(delay).await;
+                continue;
+            }
             let subscription = match self.backend.subscribe() {
                 Ok(subscription) => subscription,
                 Err(error) => {
@@ -1386,18 +1421,22 @@ impl SessionService {
     async fn reload_sessions(&self) -> bool {
         let backend = self.backend.clone();
         let workspaces = self.workspace_backend.clone();
-        let result = background(async move { backend.list_sessions(false).await }).await;
+        let result = crate::runtime::handle()
+            .spawn(async move { backend.list_sessions(false).await })
+            .await;
         match result {
             Ok(Ok(sessions)) => {
-                let spaces = background(async move { workspaces.list_workspaces().await })
+                let spaces = crate::runtime::handle()
+                    .spawn(async move { workspaces.list_workspaces().await })
                     .await
                     .ok()
                     .and_then(Result::ok)
                     .unwrap_or_default();
                 *self.workspace_records.borrow_mut() = spaces.clone();
                 let sidebar = self.sidebar_backend.clone();
-                if let Ok(Ok(snapshot)) =
-                    background(async move { sidebar.sidebar_organization().await }).await
+                if let Ok(Ok(snapshot)) = crate::runtime::handle()
+                    .spawn(async move { sidebar.sidebar_organization().await })
+                    .await
                 {
                     self.apply_sidebar(snapshot);
                 }
@@ -1427,6 +1466,7 @@ impl SessionService {
                 true
             }
             Ok(Err(error)) => {
+                log::warn!("session connect failed: {} ({})", error.code, error.message);
                 self.connection.set(ConnectionState::Offline);
                 self.connection_error.set(Some(error_text(&error)));
                 false
@@ -1770,7 +1810,9 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(fetch_page(backend, session_id.clone())).await;
+            let result = crate::runtime::handle()
+                .spawn(fetch_page(backend, session_id.clone()))
+                .await;
             match result {
                 Ok(Ok(page)) => service.apply_page(&session_id, page),
                 Ok(Err(error)) => service.fail(&error),
@@ -1822,9 +1864,9 @@ impl SessionService {
         spawn(async move {
             let selection_backend = backend.clone();
             let selection_id = session_id.clone();
-            let selection =
-                background(async move { selection_backend.runtime_selection(selection_id).await })
-                    .await;
+            let selection = crate::runtime::handle()
+                .spawn(async move { selection_backend.runtime_selection(selection_id).await })
+                .await;
             let selection = match selection {
                 Ok(Ok(state)) => state.desired,
                 Ok(Err(error)) => {
@@ -1842,30 +1884,31 @@ impl SessionService {
                 }
             };
             let request_session = session_id.clone();
-            let result = background(async move {
-                backend
-                    .replace_user_message(MutationRequest::new(
-                        vibex_core::ReplaceUserMessagePayload {
-                            user_sequence: edit.user_sequence,
-                            expected_end_sequence: edit.expected_end_sequence,
-                            message: SendAgentMessageRequest {
-                                session_id: request_session.clone(),
-                                message_idempotency_key: RequestId::new().into_string(),
-                                desired_runtime: selection,
-                                text,
-                                attachments: Vec::new(),
-                                mentions: Vec::new(),
-                                reasoning_effort: None,
-                                correlation_id: None,
-                                delivery: UserMessageDelivery::Prompt,
-                                prompt_context: None,
-                                provenance: MessageProvenance::HumanInput,
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .replace_user_message(MutationRequest::new(
+                            vibex_core::ReplaceUserMessagePayload {
+                                user_sequence: edit.user_sequence,
+                                expected_end_sequence: edit.expected_end_sequence,
+                                message: SendAgentMessageRequest {
+                                    session_id: request_session.clone(),
+                                    message_idempotency_key: RequestId::new().into_string(),
+                                    desired_runtime: selection,
+                                    text,
+                                    attachments: Vec::new(),
+                                    mentions: Vec::new(),
+                                    reasoning_effort: None,
+                                    correlation_id: None,
+                                    delivery: UserMessageDelivery::Prompt,
+                                    prompt_context: None,
+                                    provenance: MessageProvenance::HumanInput,
+                                },
                             },
-                        },
-                    ))
-                    .await
-            })
-            .await;
+                        ))
+                        .await
+                })
+                .await;
             service.sending.set(false);
             match result {
                 Ok(Ok(_)) => {
@@ -1934,12 +1977,13 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let requested = session_id.clone();
-            let result = background(async move {
-                let state = backend.runtime_selection(requested.clone()).await?;
-                let catalog = backend.list_runtime_options().await?;
-                Ok::<_, BackendError>((state, catalog))
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    let state = backend.runtime_selection(requested.clone()).await?;
+                    let catalog = backend.list_runtime_options().await?;
+                    Ok::<_, BackendError>((state, catalog))
+                })
+                .await;
             if let Ok(Ok((state, catalog))) = result {
                 service.apply_runtime(&session_id, state, catalog);
             }
@@ -2221,12 +2265,13 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .team_snapshot(TeamSnapshotRequest::new(session_id))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .team_snapshot(TeamSnapshotRequest::new(session_id))
+                        .await
+                })
+                .await;
             service.team_busy.set(false);
             match result {
                 Ok(Ok(snapshot)) => {
@@ -2285,17 +2330,18 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .control_team_task(MutationRequest::new(TeamTaskControlRequest {
-                        session_id,
-                        task_id,
-                        action,
-                        expected_revision: revision,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .control_team_task(MutationRequest::new(TeamTaskControlRequest {
+                            session_id,
+                            task_id,
+                            action,
+                            expected_revision: revision,
+                        }))
+                        .await
+                })
+                .await;
             service.team_busy.set(false);
             match result {
                 Ok(Ok(_)) => service.refresh_team(),
@@ -2319,15 +2365,16 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let request_session = session_id.clone();
-            let result = background(async move {
-                backend
-                    .continue_turn(MutationRequest::new(ContinueAgentTurnRequest {
-                        session_id: request_session,
-                        correlation_id: None,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .continue_turn(MutationRequest::new(ContinueAgentTurnRequest {
+                            session_id: request_session,
+                            correlation_id: None,
+                        }))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(_)) => service.reload(&session_id),
                 Ok(Err(error)) => service.fail(&error),
@@ -2356,18 +2403,19 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let target = session_id.clone();
-            let result = background(async move {
-                backend
-                    .control_goal(MutationRequest::new(AgentGoalControlRequest {
-                        session_id: target,
-                        action,
-                        objective: None,
-                        expected_revision: None,
-                        correlation_id: None,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .control_goal(MutationRequest::new(AgentGoalControlRequest {
+                            session_id: target,
+                            action,
+                            objective: None,
+                            expected_revision: None,
+                            correlation_id: None,
+                        }))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(result)) => {
                     if let Some(goal) = result.goal {
@@ -2408,21 +2456,22 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .set_desired_runtime(MutationRequest::new(
-                        SetDesiredAgentSessionRuntimeRequest {
-                            session_id: session_id.clone(),
-                            idempotency_key: RequestId::new().into_string(),
-                            expected_revision: state.session_revision,
-                            expected_selection_revision: state.selection_revision,
-                            desired,
-                            interaction: RuntimeSelectionInteraction::Seamless,
-                        },
-                    ))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .set_desired_runtime(MutationRequest::new(
+                            SetDesiredAgentSessionRuntimeRequest {
+                                session_id: session_id.clone(),
+                                idempotency_key: RequestId::new().into_string(),
+                                expected_revision: state.session_revision,
+                                expected_selection_revision: state.selection_revision,
+                                desired,
+                                interaction: RuntimeSelectionInteraction::Seamless,
+                            },
+                        ))
+                        .await
+                })
+                .await;
             service.runtime_busy.set(false);
             match result {
                 Ok(Ok(state)) => {
@@ -2511,24 +2560,25 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let request_session = session_id.clone();
-            let result = background(async move {
-                backend
-                    .execute_agent_command(MutationRequest::new(AgentCommandExecuteRequest {
-                        session_id: request_session,
-                        command_id: Some(entry.id),
-                        trigger: AgentCommandTrigger::Slash,
-                        source_kind: entry.source_kind,
-                        command_text: text,
-                        command_name: Some(name),
-                        arguments,
-                        prompt_id: entry.prompt_id,
-                        attachments: Vec::new(),
-                        reasoning_effort: None,
-                        correlation_id: None,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .execute_agent_command(MutationRequest::new(AgentCommandExecuteRequest {
+                            session_id: request_session,
+                            command_id: Some(entry.id),
+                            trigger: AgentCommandTrigger::Slash,
+                            source_kind: entry.source_kind,
+                            command_text: text,
+                            command_name: Some(name),
+                            arguments,
+                            prompt_id: entry.prompt_id,
+                            attachments: Vec::new(),
+                            reasoning_effort: None,
+                            correlation_id: None,
+                        }))
+                        .await
+                })
+                .await;
             service.sending.set(false);
             match result {
                 Ok(Ok(result)) => {
@@ -2586,12 +2636,13 @@ impl SessionService {
                 mentions,
                 scheduled_at_ms: due,
             };
-            let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    sidebar
+                        .mutate_sidebar_organization(mutation, Some(revision))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(snapshot)) => {
                     service.apply_sidebar(snapshot);
@@ -2626,12 +2677,13 @@ impl SessionService {
                 message_id,
                 scheduled_at_ms: None,
             };
-            let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    sidebar
+                        .mutate_sidebar_organization(mutation, Some(revision))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(snapshot)) => {
                     service.scheduled.set(false);
@@ -2673,12 +2725,13 @@ impl SessionService {
                     .collect(),
                 mentions,
             };
-            let result = background(async move {
-                sidebar
-                    .mutate_sidebar_organization(mutation, Some(revision))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    sidebar
+                        .mutate_sidebar_organization(mutation, Some(revision))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(snapshot)) => {
                     service.apply_sidebar(snapshot);
@@ -2821,14 +2874,15 @@ impl SessionService {
                     inline_text_offset: None,
                 })
                 .collect::<Vec<_>>();
-            let result = background(send_and_refetch(
-                backend,
-                session_id.clone(),
-                text,
-                sends,
-                mentions,
-            ))
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(send_and_refetch(
+                    backend,
+                    session_id.clone(),
+                    text,
+                    sends,
+                    mentions,
+                ))
+                .await;
             service.sending.set(false);
             match result {
                 Ok(Ok(page)) => {
@@ -2930,8 +2984,9 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let requested = session_id.clone();
-            let result =
-                background(async move { backend.session_token_usage(requested).await }).await;
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.session_token_usage(requested).await })
+                .await;
             if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
                 return;
             }
@@ -2962,7 +3017,9 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(fetch_older(backend, session_id.clone(), before)).await;
+            let result = crate::runtime::handle()
+                .spawn(fetch_older(backend, session_id.clone(), before))
+                .await;
             service.loading_older.set(false);
             match result {
                 Ok(Ok(page)) => {
@@ -3140,15 +3197,16 @@ impl SessionService {
         let backend = self.backend.clone();
         let row_id = row_id.to_owned();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .fetch_timeline_item(FetchTimelineItemRequest {
-                        session_id,
-                        sequence,
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .fetch_timeline_item(FetchTimelineItemRequest {
+                            session_id,
+                            sequence,
+                        })
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(item)) => {
                     let body = vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
@@ -3186,16 +3244,17 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .fork_session(MutationRequest::new(ForkAgentSessionRequest {
-                        source_session_id,
-                        through_sequence,
-                        expected_source_end_sequence: expected,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .fork_session(MutationRequest::new(ForkAgentSessionRequest {
+                            source_session_id,
+                            through_sequence,
+                            expected_source_end_sequence: expected,
+                        }))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(session)) => {
                     service.refresh();
@@ -3281,25 +3340,26 @@ impl SessionService {
         spawn(async move {
             let request_session = session_id.clone();
             let request_request = request_id.clone();
-            let result = background(async move {
-                backend
-                    .resolve_permission(MutationRequest::new(ResolvePermissionRequest {
-                        session_id: request_session.clone(),
-                        request_id: request_request.clone(),
-                        resolution: PermissionResolution {
-                            request_id: request_request,
-                            session_id: request_session,
-                            response,
-                            responder_device_id: None,
-                            provider_resolution_id: None,
-                            note: None,
-                            resolved_at_ms: unix_timestamp_ms(),
-                            responder: Some(ApprovalResponder::Human),
-                        },
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .resolve_permission(MutationRequest::new(ResolvePermissionRequest {
+                            session_id: request_session.clone(),
+                            request_id: request_request.clone(),
+                            resolution: PermissionResolution {
+                                request_id: request_request,
+                                session_id: request_session,
+                                response,
+                                responder_device_id: None,
+                                provider_resolution_id: None,
+                                note: None,
+                                resolved_at_ms: unix_timestamp_ms(),
+                                responder: Some(ApprovalResponder::Human),
+                            },
+                        }))
+                        .await
+                })
+                .await;
             service.resolving.set(false);
             match result {
                 Ok(Ok(_)) => {
@@ -3350,23 +3410,24 @@ impl SessionService {
         spawn(async move {
             let request_session = session_id.clone();
             let request_request = request_id.clone();
-            let result = background(async move {
-                backend
-                    .resolve_elicitation(MutationRequest::new(ResolveElicitationRequest {
-                        session_id: request_session.clone(),
-                        request_id: request_request.clone(),
-                        resolution: ElicitationResolution {
-                            request_id: request_request,
-                            session_id: request_session,
-                            action,
-                            answers,
-                            responder_device_id: None,
-                            resolved_at_ms: unix_timestamp_ms(),
-                        },
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .resolve_elicitation(MutationRequest::new(ResolveElicitationRequest {
+                            session_id: request_session.clone(),
+                            request_id: request_request.clone(),
+                            resolution: ElicitationResolution {
+                                request_id: request_request,
+                                session_id: request_session,
+                                action,
+                                answers,
+                                responder_device_id: None,
+                                resolved_at_ms: unix_timestamp_ms(),
+                            },
+                        }))
+                        .await
+                })
+                .await;
             service.resolving.set(false);
             match result {
                 Ok(Ok(_)) => {
@@ -3446,20 +3507,21 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .discover_agent_commands(AgentCommandDiscoverRequest {
-                        agent_id: None,
-                        provider_profile_id: None,
-                        session_id: Some(session_id),
-                        workspace_id: None,
-                        trigger: Some(AgentCommandTrigger::Slash),
-                        query: None,
-                        limit: Some(30),
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .discover_agent_commands(AgentCommandDiscoverRequest {
+                            agent_id: None,
+                            provider_profile_id: None,
+                            session_id: Some(session_id),
+                            workspace_id: None,
+                            trigger: Some(AgentCommandTrigger::Slash),
+                            query: None,
+                            limit: Some(30),
+                        })
+                        .await
+                })
+                .await;
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
                 service.commands.set(command_entries(discovery));
@@ -3652,20 +3714,21 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .discover_agent_commands(AgentCommandDiscoverRequest {
-                        agent_id: None,
-                        provider_profile_id: None,
-                        session_id: Some(session_id),
-                        workspace_id: None,
-                        trigger: Some(AgentCommandTrigger::Mention),
-                        query: None,
-                        limit: Some(40),
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .discover_agent_commands(AgentCommandDiscoverRequest {
+                            agent_id: None,
+                            provider_profile_id: None,
+                            session_id: Some(session_id),
+                            workspace_id: None,
+                            trigger: Some(AgentCommandTrigger::Mention),
+                            query: None,
+                            limit: Some(40),
+                        })
+                        .await
+                })
+                .await;
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
                 let entries = command_entries(discovery);
@@ -3689,20 +3752,21 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .discover_agent_commands(AgentCommandDiscoverRequest {
-                        agent_id: None,
-                        provider_profile_id: None,
-                        session_id: Some(session_id),
-                        workspace_id: None,
-                        trigger: Some(AgentCommandTrigger::Dollar),
-                        query: None,
-                        limit: Some(40),
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .discover_agent_commands(AgentCommandDiscoverRequest {
+                            agent_id: None,
+                            provider_profile_id: None,
+                            session_id: Some(session_id),
+                            workspace_id: None,
+                            trigger: Some(AgentCommandTrigger::Dollar),
+                            query: None,
+                            limit: Some(40),
+                        })
+                        .await
+                })
+                .await;
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
                 service.skills.set(command_entries(discovery));
@@ -3721,12 +3785,13 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .interrupt(MutationRequest::new(session_id.clone()))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .interrupt(MutationRequest::new(session_id.clone()))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(true)) => {
                     crate::settings::haptic(nsh_core::Haptic::Selection);
@@ -3793,22 +3858,23 @@ impl SessionService {
         let git = self.git_backend.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let created = background(async move {
-                git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
-                    workspace_id: base,
-                    branch_name: branch,
-                    base_ref: {
-                        let base = service.new_base_ref.get_untracked().trim().to_owned();
-                        (!base.is_empty()).then_some(base)
-                    },
-                    name: None,
-                    worktree_path: None,
-                    target_workspace_id: None,
-                    target_branch: None,
-                }))
-                .await
-            })
-            .await;
+            let created = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
+                        workspace_id: base,
+                        branch_name: branch,
+                        base_ref: {
+                            let base = service.new_base_ref.get_untracked().trim().to_owned();
+                            (!base.is_empty()).then_some(base)
+                        },
+                        name: None,
+                        worktree_path: None,
+                        target_workspace_id: None,
+                        target_branch: None,
+                    }))
+                    .await
+                })
+                .await;
             let worktree = match created {
                 Ok(Ok(created)) => created,
                 Ok(Err(error)) => {
@@ -3837,10 +3903,8 @@ impl SessionService {
                 defer_runtime_materialization: false,
                 tools: Default::default(),
             };
-            let result =
-                background(
-                    async move { backend.create_session(MutationRequest::new(request)).await },
-                )
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
             service.new_busy.set(false);
             match result {
@@ -3883,15 +3947,16 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .rename_session(MutationRequest::new(RenameAgentSessionRequest {
-                        session_id,
-                        title,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .rename_session(MutationRequest::new(RenameAgentSessionRequest {
+                            session_id,
+                            title,
+                        }))
+                        .await
+                })
+                .await;
             service.session_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
@@ -3922,10 +3987,11 @@ impl SessionService {
                     continue;
                 };
                 let call = backend.clone();
-                let result = background(async move {
-                    call.archive_session(MutationRequest::new(session_id)).await
-                })
-                .await;
+                let result = crate::runtime::handle()
+                    .spawn(
+                        async move { call.archive_session(MutationRequest::new(session_id)).await },
+                    )
+                    .await;
                 match result {
                     Ok(Ok(())) => service.drop_session(&id),
                     Ok(Err(error)) => service.fail(&error),
@@ -3948,10 +4014,11 @@ impl SessionService {
                     continue;
                 };
                 let call = backend.clone();
-                let result = background(async move {
-                    call.delete_session(MutationRequest::new(session_id)).await
-                })
-                .await;
+                let result = crate::runtime::handle()
+                    .spawn(
+                        async move { call.delete_session(MutationRequest::new(session_id)).await },
+                    )
+                    .await;
                 match result {
                     Ok(Ok(())) => service.drop_session(&id),
                     Ok(Err(error)) => service.fail(&error),
@@ -4310,12 +4377,13 @@ impl SessionService {
         spawn(async move {
             let for_request = sidebar.clone();
             let request = mutation.clone();
-            let result = background(async move {
-                for_request
-                    .mutate_sidebar_organization(request, Some(revision))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    for_request
+                        .mutate_sidebar_organization(request, Some(revision))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(snapshot)) => {
                     service.apply_sidebar(snapshot);
@@ -4328,8 +4396,9 @@ impl SessionService {
                         && (error.kind == BackendErrorKind::Conflict
                             || error.code.contains("stale_revision")) =>
                 {
-                    let refresh =
-                        background(async move { sidebar.sidebar_organization().await }).await;
+                    let refresh = crate::runtime::handle()
+                        .spawn(async move { sidebar.sidebar_organization().await })
+                        .await;
                     match refresh {
                         Ok(Ok(snapshot)) => {
                             service.apply_sidebar(snapshot);
@@ -4359,12 +4428,13 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .archive_session(MutationRequest::new(session_id))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .archive_session(MutationRequest::new(session_id))
+                        .await
+                })
+                .await;
             service.session_busy.set(false);
             match result {
                 Ok(Ok(())) => {
@@ -4410,12 +4480,13 @@ impl SessionService {
                 return;
             }
             service.session_busy.set(true);
-            let result = background(async move {
-                backend
-                    .delete_session(MutationRequest::new(session_id))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .delete_session(MutationRequest::new(session_id))
+                        .await
+                })
+                .await;
             service.session_busy.set(false);
             match result {
                 Ok(Ok(())) => {
@@ -4474,12 +4545,13 @@ impl SessionService {
         let workspaces = self.workspace_backend.clone();
         let catalog_backend = self.backend.clone();
         spawn(async move {
-            let result = background(async move {
-                let spaces = workspaces.list_workspaces().await?;
-                let catalog = catalog_backend.list_runtime_options().await?;
-                Ok::<_, BackendError>((spaces, catalog))
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    let spaces = workspaces.list_workspaces().await?;
+                    let catalog = catalog_backend.list_runtime_options().await?;
+                    Ok::<_, BackendError>((spaces, catalog))
+                })
+                .await;
             service.new_busy.set(false);
             match result {
                 Ok(Ok((spaces, catalog))) => {
@@ -4581,10 +4653,8 @@ impl SessionService {
                 defer_runtime_materialization: false,
                 tools: Default::default(),
             };
-            let result =
-                background(
-                    async move { backend.create_session(MutationRequest::new(request)).await },
-                )
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
             service.new_busy.set(false);
             match result {
@@ -4611,9 +4681,9 @@ impl SessionService {
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
         spawn(async move {
-            let result =
-                background(async move { workspaces.browse_authority_directories(path).await })
-                    .await;
+            let result = crate::runtime::handle()
+                .spawn(async move { workspaces.browse_authority_directories(path).await })
+                .await;
             match result {
                 Ok(Ok(listing)) => {
                     service.project_dirs.set(
@@ -4648,15 +4718,16 @@ impl SessionService {
         let workspaces = self.workspace_backend.clone();
         spawn(async move {
             let open_workspaces = workspaces.clone();
-            let opened = background(async move {
-                open_workspaces
-                    .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
-                        root_path: path,
-                        mode: None,
-                    }))
-                    .await
-            })
-            .await;
+            let opened = crate::runtime::handle()
+                .spawn(async move {
+                    open_workspaces
+                        .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
+                            root_path: path,
+                            mode: None,
+                        }))
+                        .await
+                })
+                .await;
             let opened = match opened {
                 Ok(Ok(workspace)) => workspace,
                 Ok(Err(error)) => {
@@ -4672,7 +4743,9 @@ impl SessionService {
                     return;
                 }
             };
-            let spaces = background(async move { workspaces.list_workspaces().await }).await;
+            let spaces = crate::runtime::handle()
+                .spawn(async move { workspaces.list_workspaces().await })
+                .await;
             service.new_busy.set(false);
             match spaces {
                 Ok(Ok(spaces)) => {
@@ -4725,8 +4798,9 @@ impl SessionService {
         let backend = self.backend.clone();
         let workspaces = self.workspace_backend.clone();
         spawn(async move {
-            let root =
-                background(async move { workspaces.ensure_temporary_session_root().await }).await;
+            let root = crate::runtime::handle()
+                .spawn(async move { workspaces.ensure_temporary_session_root().await })
+                .await;
             let root = match root {
                 Ok(Ok(root)) => root,
                 Ok(Err(error)) => {
@@ -4755,10 +4829,8 @@ impl SessionService {
                 defer_runtime_materialization: false,
                 tools: Default::default(),
             };
-            let result =
-                background(
-                    async move { backend.create_session(MutationRequest::new(request)).await },
-                )
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
             service.new_busy.set(false);
             match result {
@@ -4806,12 +4878,13 @@ impl SessionService {
         let terminal_backend = self.terminal_backend.clone();
         let opening = terminal_backend.clone();
         spawn(async move {
-            let result = background(async move {
-                let session = backend.open_session(active_id).await?;
-                let terminals = opening.list_terminals(session.workspace_id.clone()).await?;
-                Ok::<_, BackendError>((session.workspace_id, terminals))
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    let session = backend.open_session(active_id).await?;
+                    let terminals = opening.list_terminals(session.workspace_id.clone()).await?;
+                    Ok::<_, BackendError>((session.workspace_id, terminals))
+                })
+                .await;
             let (workspace, terminals) = match result {
                 Ok(Ok(opened)) => opened,
                 Ok(Err(error)) => {
@@ -4834,19 +4907,20 @@ impl SessionService {
                 service.attach_terminal(terminal.id.clone(), terminal.title.clone());
                 return;
             }
-            let created = background(async move {
-                terminal_backend
-                    .create_terminal(MutationRequest::new(TerminalCreateRequest {
-                        workspace_id: workspace,
-                        title: None,
-                        shell: None,
-                        cwd: None,
-                        rows: 24,
-                        cols: 80,
-                    }))
-                    .await
-            })
-            .await;
+            let created = crate::runtime::handle()
+                .spawn(async move {
+                    terminal_backend
+                        .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                            workspace_id: workspace,
+                            title: None,
+                            shell: None,
+                            cwd: None,
+                            rows: 24,
+                            cols: 80,
+                        }))
+                        .await
+                })
+                .await;
             match created {
                 Ok(Ok(terminal)) => {
                     service
@@ -4874,12 +4948,13 @@ impl SessionService {
         let service = self.clone();
         let terminal_backend = self.terminal_backend.clone();
         spawn(async move {
-            let snapshot = background({
-                let backend = terminal_backend.clone();
-                let id = id.clone();
-                async move { backend.terminal_snapshot(id).await }
-            })
-            .await;
+            let snapshot = crate::runtime::handle()
+                .spawn({
+                    let backend = terminal_backend.clone();
+                    let id = id.clone();
+                    async move { backend.terminal_snapshot(id).await }
+                })
+                .await;
             let snapshot = match snapshot {
                 Ok(Ok(snapshot)) => snapshot,
                 Ok(Err(error)) => {
@@ -4934,19 +5009,20 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let created = background(async move {
-                terminal_backend
-                    .create_terminal(MutationRequest::new(TerminalCreateRequest {
-                        workspace_id: workspace,
-                        title: None,
-                        shell: None,
-                        cwd: None,
-                        rows: 24,
-                        cols: 80,
-                    }))
-                    .await
-            })
-            .await;
+            let created = crate::runtime::handle()
+                .spawn(async move {
+                    terminal_backend
+                        .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                            workspace_id: workspace,
+                            title: None,
+                            shell: None,
+                            cwd: None,
+                            rows: 24,
+                            cols: 80,
+                        }))
+                        .await
+                })
+                .await;
             match created {
                 Ok(Ok(terminal)) => {
                     service
@@ -5005,15 +5081,16 @@ impl SessionService {
         let service = self.clone();
         let backend = self.terminal_backend.clone();
         spawn(async move {
-            let result = background(async move {
-                backend
-                    .write_terminal(MutationRequest::new(TerminalWriteRequest {
-                        terminal_id,
-                        data,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .write_terminal(MutationRequest::new(TerminalWriteRequest {
+                            terminal_id,
+                            data,
+                        }))
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
@@ -5050,16 +5127,17 @@ impl SessionService {
         };
         let backend = self.terminal_backend.clone();
         spawn(async move {
-            let _ = background(async move {
-                backend
-                    .resize_terminal(MutationRequest::new(TerminalResizeRequest {
-                        terminal_id,
-                        rows: rows.min(u32::from(u16::MAX)) as u16,
-                        cols: cols.min(u32::from(u16::MAX)) as u16,
-                    }))
-                    .await
-            })
-            .await;
+            let _ = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .resize_terminal(MutationRequest::new(TerminalResizeRequest {
+                            terminal_id,
+                            rows: rows.min(u32::from(u16::MAX)) as u16,
+                            cols: cols.min(u32::from(u16::MAX)) as u16,
+                        }))
+                        .await
+                })
+                .await;
         });
     }
 
@@ -5094,20 +5172,21 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move {
-                file_backend
-                    .search_files(FileSearchRequest {
-                        workspace_id: workspace,
-                        query,
-                        include_content: true,
-                        case_sensitive: false,
-                        whole_word: false,
-                        regex: false,
-                        limit: Some(50),
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    file_backend
+                        .search_files(FileSearchRequest {
+                            workspace_id: workspace,
+                            query,
+                            include_content: true,
+                            case_sensitive: false,
+                            whole_word: false,
+                            regex: false,
+                            limit: Some(50),
+                        })
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(results)) => service.files_search.set(
                     results
@@ -5150,17 +5229,18 @@ impl SessionService {
                 return;
             };
             let tree_path = if path.is_empty() { None } else { Some(path) };
-            let result = background(async move {
-                file_backend
-                    .file_tree(FileTreeRequest {
-                        workspace_id: workspace,
-                        path: tree_path,
-                        max_depth: Some(1),
-                        include_hidden: false,
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    file_backend
+                        .file_tree(FileTreeRequest {
+                            workspace_id: workspace,
+                            path: tree_path,
+                            max_depth: Some(1),
+                            include_hidden: false,
+                        })
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(entries)) => {
                     let mut rows = entries
@@ -5198,16 +5278,17 @@ impl SessionService {
                 return;
             };
             let read_workspace = workspace.clone();
-            let result = background(async move {
-                file_backend
-                    .read_file(FileReadRequest {
-                        workspace_id: read_workspace,
-                        path,
-                        max_bytes: Some(512 * 1024),
-                    })
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    file_backend
+                        .read_file(FileReadRequest {
+                            workspace_id: read_workspace,
+                            path,
+                            max_bytes: Some(512 * 1024),
+                        })
+                        .await
+                })
+                .await;
             match result {
                 Ok(Ok(file)) => {
                     let kind = match file.preview_kind {
@@ -5220,21 +5301,22 @@ impl SessionService {
                         let image_backend = service.file_backend.clone();
                         let image_path = file.path.clone();
                         let image_workspace = workspace;
-                        background(async move {
-                            image_backend
-                                .read_file_bytes(image_workspace, image_path, 8 * 1024 * 1024)
-                                .await
-                        })
-                        .await
-                        .ok()
-                        .and_then(Result::ok)
-                        .map(|bytes| {
-                            format!(
-                                "data:{};base64,{}",
-                                image_mime(&file.name),
-                                base64::engine::general_purpose::STANDARD.encode(bytes)
-                            )
-                        })
+                        crate::runtime::handle()
+                            .spawn(async move {
+                                image_backend
+                                    .read_file_bytes(image_workspace, image_path, 8 * 1024 * 1024)
+                                    .await
+                            })
+                            .await
+                            .ok()
+                            .and_then(Result::ok)
+                            .map(|bytes| {
+                                format!(
+                                    "data:{};base64,{}",
+                                    image_mime(&file.name),
+                                    base64::engine::general_purpose::STANDARD.encode(bytes)
+                                )
+                            })
                     } else {
                         None
                     };
@@ -5289,20 +5371,21 @@ impl SessionService {
                 service.files_saving.set(false);
                 return;
             };
-            let result = background(async move {
-                file_backend
-                    .write_file(MutationRequest::new(vibex_core::FileWriteRequest {
-                        workspace_id: workspace,
-                        path,
-                        content,
-                        create_if_missing: false,
-                        expected_revision: revision,
-                        encoding: None,
-                        line_ending: None,
-                    }))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    file_backend
+                        .write_file(MutationRequest::new(vibex_core::FileWriteRequest {
+                            workspace_id: workspace,
+                            path,
+                            content,
+                            create_if_missing: false,
+                            expected_revision: revision,
+                            encoding: None,
+                            line_ending: None,
+                        }))
+                        .await
+                })
+                .await;
             service.files_saving.set(false);
             match result {
                 Ok(Ok(file)) => {
@@ -5387,7 +5470,9 @@ impl SessionService {
                 ));
                 return;
             };
-            let result = background(async move { git.git_status(workspace).await }).await;
+            let result = crate::runtime::handle()
+                .spawn(async move { git.git_status(workspace).await })
+                .await;
             match result {
                 Ok(Ok(status)) => service.apply_git_status(status),
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
@@ -5435,15 +5520,16 @@ impl SessionService {
                 return;
             };
             let title = path.clone();
-            let result = background(async move {
-                git.git_diff(GitDiffRequest {
-                    workspace_id: workspace,
-                    path,
-                    staged,
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_diff(GitDiffRequest {
+                        workspace_id: workspace,
+                        path,
+                        staged,
+                    })
+                    .await
                 })
-                .await
-            })
-            .await;
+                .await;
             match result {
                 Ok(Ok(diff)) => service.git_diff.set(Some(GitDiffPreview {
                     title,
@@ -5470,18 +5556,19 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move {
-                let request = MutationRequest::new(GitStageRequest {
-                    workspace_id: workspace,
-                    paths: vec![path],
-                });
-                if stage {
-                    git.stage(request).await
-                } else {
-                    git.unstage(request).await
-                }
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    let request = MutationRequest::new(GitStageRequest {
+                        workspace_id: workspace,
+                        paths: vec![path],
+                    });
+                    if stage {
+                        git.stage(request).await
+                    } else {
+                        git.unstage(request).await
+                    }
+                })
+                .await;
             match result {
                 Ok(Ok(status)) => service.apply_git_status(status),
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
@@ -5512,8 +5599,9 @@ impl SessionService {
                 service.worktree_busy.set(false);
                 return;
             };
-            let result =
-                background(async move { git.git_worktree_snapshot(workspace).await }).await;
+            let result = crate::runtime::handle()
+                .spawn(async move { git.git_worktree_snapshot(workspace).await })
+                .await;
             service.worktree_busy.set(false);
             match result {
                 Ok(Ok(snapshot)) => {
@@ -5616,10 +5704,8 @@ impl SessionService {
                 preflight_revision: None,
             };
             let preflight_git = git.clone();
-            let preflight =
-                background(
-                    async move { preflight_git.git_worktree_archive_preflight(archive).await },
-                )
+            let preflight = crate::runtime::handle()
+                .spawn(async move { preflight_git.git_worktree_archive_preflight(archive).await })
                 .await;
             match preflight {
                 Ok(Ok(preflight)) if preflight.allowed => {
@@ -5629,11 +5715,12 @@ impl SessionService {
                         expected_head: record.head.clone(),
                         preflight_revision: Some(preflight.revision),
                     };
-                    let result = background(async move {
-                        git.git_worktree_archive(MutationRequest::new(request))
-                            .await
-                    })
-                    .await;
+                    let result = crate::runtime::handle()
+                        .spawn(async move {
+                            git.git_worktree_archive(MutationRequest::new(request))
+                                .await
+                        })
+                        .await;
                     service.worktree_busy.set(false);
                     match result {
                         Ok(Ok(_)) => service.load_worktrees(),
@@ -5696,11 +5783,12 @@ impl SessionService {
                     GitWorktreeConflictVersion::Target
                 },
             };
-            let result = background(async move {
-                git.git_worktree_resolve_conflict(MutationRequest::new(request))
-                    .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_worktree_resolve_conflict(MutationRequest::new(request))
+                        .await
+                })
+                .await;
             service.worktree_busy.set(false);
             match result {
                 Ok(Ok(_)) => service.load_worktrees(),
@@ -5744,16 +5832,17 @@ impl SessionService {
                 operation_id,
                 workspace_id: workspace,
             };
-            let result = background(async move {
-                if cont {
-                    git.git_worktree_continue_merge(MutationRequest::new(request))
-                        .await
-                } else {
-                    git.git_worktree_abort_merge(MutationRequest::new(request))
-                        .await
-                }
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    if cont {
+                        git.git_worktree_continue_merge(MutationRequest::new(request))
+                            .await
+                    } else {
+                        git.git_worktree_abort_merge(MutationRequest::new(request))
+                            .await
+                    }
+                })
+                .await;
             service.worktree_busy.set(false);
             match result {
                 Ok(Ok(_)) => service.load_worktrees(),
@@ -5797,10 +5886,8 @@ impl SessionService {
                 preflight_revision: None,
             };
             let preflight_git = git.clone();
-            let preflight =
-                background(
-                    async move { preflight_git.git_worktree_discard_preflight(request).await },
-                )
+            let preflight = crate::runtime::handle()
+                .spawn(async move { preflight_git.git_worktree_discard_preflight(request).await })
                 .await;
             match preflight {
                 Ok(Ok(preflight)) if preflight.allowed => {
@@ -5812,11 +5899,12 @@ impl SessionService {
                         expected_head: record.head.clone(),
                         preflight_revision: Some(preflight.revision),
                     };
-                    let result = background(async move {
-                        git.git_worktree_discard(MutationRequest::new(request))
-                            .await
-                    })
-                    .await;
+                    let result = crate::runtime::handle()
+                        .spawn(async move {
+                            git.git_worktree_discard(MutationRequest::new(request))
+                                .await
+                        })
+                        .await;
                     service.worktree_busy.set(false);
                     match result {
                         Ok(Ok(_)) => service.load_worktrees(),
@@ -5887,9 +5975,9 @@ impl SessionService {
                 preflight_revision: None,
             };
             let plan_git = git.clone();
-            let plan =
-                background(async move { plan_git.git_worktree_merge_plan(plan_request).await })
-                    .await;
+            let plan = crate::runtime::handle()
+                .spawn(async move { plan_git.git_worktree_merge_plan(plan_request).await })
+                .await;
             match plan {
                 Ok(Ok(plan)) if plan.preflight.allowed => {
                     let request = GitWorktreeMergeRequest {
@@ -5901,10 +5989,11 @@ impl SessionService {
                         expected_target_head: Some(plan.target_head.clone()),
                         preflight_revision: Some(plan.preflight.revision.clone()),
                     };
-                    let result = background(async move {
-                        git.git_worktree_merge(MutationRequest::new(request)).await
-                    })
-                    .await;
+                    let result = crate::runtime::handle()
+                        .spawn(async move {
+                            git.git_worktree_merge(MutationRequest::new(request)).await
+                        })
+                        .await;
                     service.worktree_busy.set(false);
                     match result {
                         Ok(Ok(_)) => service.load_worktrees(),
@@ -5962,10 +6051,8 @@ impl SessionService {
                 preflight_revision: None,
             };
             let preflight_git = git.clone();
-            let preflight =
-                background(
-                    async move { preflight_git.git_worktree_restore_preflight(restore).await },
-                )
+            let preflight = crate::runtime::handle()
+                .spawn(async move { preflight_git.git_worktree_restore_preflight(restore).await })
                 .await;
             match preflight {
                 Ok(Ok(preflight)) if preflight.allowed => {
@@ -5974,11 +6061,12 @@ impl SessionService {
                         worktree_id,
                         preflight_revision: Some(preflight.revision),
                     };
-                    let result = background(async move {
-                        git.git_worktree_restore(MutationRequest::new(request))
-                            .await
-                    })
-                    .await;
+                    let result = crate::runtime::handle()
+                        .spawn(async move {
+                            git.git_worktree_restore(MutationRequest::new(request))
+                                .await
+                        })
+                        .await;
                     service.worktree_busy.set(false);
                     match result {
                         Ok(Ok(_)) => service.load_worktrees(),
@@ -6026,7 +6114,9 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move { git.git_branch_list(workspace).await }).await;
+            let result = crate::runtime::handle()
+                .spawn(async move { git.git_branch_list(workspace).await })
+                .await;
             match result {
                 Ok(Ok(list)) => service.git_branches.set(
                     list.branches
@@ -6059,14 +6149,15 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move {
-                git.git_branch_checkout(MutationRequest::new(GitBranchCheckoutRequest {
-                    workspace_id: workspace,
-                    name,
-                }))
-                .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_branch_checkout(MutationRequest::new(GitBranchCheckoutRequest {
+                        workspace_id: workspace,
+                        name,
+                    }))
+                    .await
+                })
+                .await;
             match result {
                 Ok(Ok(status)) => {
                     service
@@ -6099,16 +6190,17 @@ impl SessionService {
                 service.git_remote_busy.set(false);
                 return;
             };
-            let result = background(async move {
-                git.git_remote_action(MutationRequest::new(GitRemoteActionRequest {
-                    workspace_id: workspace,
-                    kind,
-                    remote: None,
-                    branch: None,
-                }))
-                .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_remote_action(MutationRequest::new(GitRemoteActionRequest {
+                        workspace_id: workspace,
+                        kind,
+                        remote: None,
+                        branch: None,
+                    }))
+                    .await
+                })
+                .await;
             service.git_remote_busy.set(false);
             match result {
                 Ok(Ok(result)) => {
@@ -6145,17 +6237,18 @@ impl SessionService {
                 service.git_committing.set(false);
                 return;
             };
-            let result = background(async move {
-                git.commit(MutationRequest::new(GitCommitRequest {
-                    workspace_id: workspace,
-                    message,
-                    paths: Vec::new(),
-                    amend,
-                    push_after,
-                }))
-                .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.commit(MutationRequest::new(GitCommitRequest {
+                        workspace_id: workspace,
+                        message,
+                        paths: Vec::new(),
+                        amend,
+                        push_after,
+                    }))
+                    .await
+                })
+                .await;
             service.git_committing.set(false);
             match result {
                 Ok(Ok(_)) => {
@@ -6193,20 +6286,21 @@ impl SessionService {
                 return;
             };
             let ref_name = service.git_history_ref.borrow().clone();
-            let result = background(async move {
-                git.git_history(GitHistoryRequest {
-                    workspace_id: workspace,
-                    limit: Some(40),
-                    before_commit: None,
-                    ref_name,
-                    author: None,
-                    query: None,
-                    authored_after_ms: None,
-                    authored_before_ms: None,
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_history(GitHistoryRequest {
+                        workspace_id: workspace,
+                        limit: Some(40),
+                        before_commit: None,
+                        ref_name,
+                        author: None,
+                        query: None,
+                        authored_after_ms: None,
+                        authored_before_ms: None,
+                    })
+                    .await
                 })
-                .await
-            })
-            .await;
+                .await;
             match result {
                 Ok(Ok(history)) => service.git_history.set(
                     history
@@ -6239,15 +6333,16 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move {
-                git.git_commit_detail(GitCommitDetailRequest {
-                    workspace_id: workspace,
-                    commit_hash: hash,
-                    include_patch: true,
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_commit_detail(GitCommitDetailRequest {
+                        workspace_id: workspace,
+                        commit_hash: hash,
+                        include_patch: true,
+                    })
+                    .await
                 })
-                .await
-            })
-            .await;
+                .await;
             match result {
                 Ok(Ok(detail)) => {
                     let mut body = detail.summary.subject.clone();
@@ -6283,14 +6378,15 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
-            let result = background(async move {
-                git.git_revert(MutationRequest::new(GitStageRequest {
-                    workspace_id: workspace,
-                    paths: vec![path],
-                }))
-                .await
-            })
-            .await;
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    git.git_revert(MutationRequest::new(GitStageRequest {
+                        workspace_id: workspace,
+                        paths: vec![path],
+                    }))
+                    .await
+                })
+                .await;
             match result {
                 Ok(Ok(status)) => {
                     service.git_diff.set(None);
@@ -6333,7 +6429,9 @@ impl SessionService {
         let backend = self.backend.clone();
         let session_id = session_id.clone();
         spawn(async move {
-            let result = background(fetch_page(backend, session_id.clone())).await;
+            let result = crate::runtime::handle()
+                .spawn(fetch_page(backend, session_id.clone()))
+                .await;
             match result {
                 Ok(Ok(page)) => service.apply_page(&session_id, page),
                 Ok(Err(error)) => service.fail(&error),

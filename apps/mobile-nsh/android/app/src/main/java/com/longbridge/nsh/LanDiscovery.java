@@ -7,13 +7,19 @@ import android.content.pm.PackageManager;
 import android.net.nsd.NsdManager;
 import android.net.nsd.NsdServiceInfo;
 import android.os.Build;
+import android.util.Log;
 
+import org.json.JSONArray;
 import org.json.JSONObject;
 
 import java.net.Inet4Address;
 import java.net.InetAddress;
+import java.net.NetworkInterface;
 import java.nio.charset.StandardCharsets;
+import java.util.ArrayList;
+import java.util.Collections;
 import java.util.HashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -118,8 +124,20 @@ final class LanDiscovery {
 
     @SuppressWarnings("deprecation")
     private void resolve(NsdServiceInfo info) {
+        resolve(info, 0);
+    }
+
+    /**
+     * Resolves one found service.
+     *
+     * Android can report a resolution before the record's addresses are in
+     * hand; a candidate without an address is one the app cannot dial, so the
+     * record is resolved again rather than shown as an unusable row.
+     */
+    @SuppressWarnings("deprecation")
+    private void resolve(NsdServiceInfo info, int attempt) {
         String key = info.getServiceName();
-        if (pending.containsKey(key)) {
+        if (attempt == 0 && pending.containsKey(key)) {
             return;
         }
         NsdManager.ResolveListener resolver = new NsdManager.ResolveListener() {
@@ -131,6 +149,18 @@ final class LanDiscovery {
             @Override
             public void onServiceResolved(NsdServiceInfo resolved) {
                 pending.remove(key);
+                if (numericHosts(resolved).isEmpty() && attempt < 2) {
+                    new android.os.Handler(activity.getMainLooper())
+                            .postDelayed(
+                                    new Runnable() {
+                                        @Override
+                                        public void run() {
+                                            resolve(info, attempt + 1);
+                                        }
+                                    },
+                                    800);
+                    return;
+                }
                 emit("candidate", resolved, resolved.getAttributes());
             }
         };
@@ -149,7 +179,23 @@ final class LanDiscovery {
             event.put("serviceInstance", service == null ? "" : service.getServiceName());
             event.put("port", service == null ? 0 : service.getPort());
             event.put("interfaceScope", "");
-            event.put("host", numericHost(service));
+            // A runtime publishes every address of every interface it has, so
+            // the record is a list: the app tries them in order instead of
+            // dialling one arbitrary address (a container bridge or a VPN) and
+            // waiting on it.
+            List<String> hosts = numericHosts(service);
+            Log.i(
+                    "VibexNsd",
+                    "emit " + kind
+                            + " instance=" + (service == null ? "" : service.getServiceName())
+                            + " port=" + (service == null ? 0 : service.getPort())
+                            + " hosts=" + hosts);
+            JSONArray hostArray = new JSONArray();
+            for (String host : hosts) {
+                hostArray.put(host);
+            }
+            event.put("hosts", hostArray);
+            event.put("host", hosts.isEmpty() ? "" : hosts.get(0));
             JSONObject txt = new JSONObject();
             if (attributes != null) {
                 for (Map.Entry<String, byte[]> entry : attributes.entrySet()) {
@@ -164,25 +210,70 @@ final class LanDiscovery {
     }
 
     @SuppressWarnings("deprecation")
-    private static String numericHost(NsdServiceInfo service) {
+    private static List<String> numericHosts(NsdServiceInfo service) {
+        List<String> hosts = new ArrayList<>();
         if (service == null) {
-            return "";
+            return hosts;
         }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            String fallback = "";
             for (InetAddress address : service.getHostAddresses()) {
                 if (address instanceof Inet4Address) {
-                    return address.getHostAddress();
+                    hosts.add(address.getHostAddress());
                 }
-                if (fallback.isEmpty()) {
-                    fallback = address.getHostAddress();
-                }
-            }
-            if (!fallback.isEmpty()) {
-                return fallback;
             }
         }
-        InetAddress address = service.getHost();
-        return address == null ? "" : address.getHostAddress();
+        if (hosts.isEmpty()) {
+            InetAddress address = service.getHost();
+            if (address instanceof Inet4Address) {
+                hosts.add(address.getHostAddress());
+            }
+        }
+        List<String> localPrefixes = localPrefixes();
+        Collections.sort(hosts, (left, right) ->
+                Integer.compare(rank(left, localPrefixes), rank(right, localPrefixes)));
+        return hosts;
+    }
+
+    /** The /24 prefixes this phone has an address in, so its own LAN comes first. */
+    private static List<String> localPrefixes() {
+        List<String> prefixes = new ArrayList<>();
+        try {
+            for (NetworkInterface network : Collections.list(NetworkInterface.getNetworkInterfaces())) {
+                for (InetAddress address : Collections.list(network.getInetAddresses())) {
+                    if (!(address instanceof Inet4Address) || address.isLoopbackAddress()) {
+                        continue;
+                    }
+                    String text = address.getHostAddress();
+                    int dot = text.lastIndexOf('.');
+                    if (dot > 0) {
+                        prefixes.add(text.substring(0, dot + 1));
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Without the interfaces the order falls back to the private ranges.
+        }
+        return prefixes;
+    }
+
+    private static int rank(String address, List<String> localPrefixes) {
+        for (String prefix : localPrefixes) {
+            if (address.startsWith(prefix)) {
+                return 0;
+            }
+        }
+        if (address.startsWith("192.168.")) {
+            return 1;
+        }
+        if (address.startsWith("10.")) {
+            return 2;
+        }
+        if (address.startsWith("172.")) {
+            return 3;
+        }
+        if (address.startsWith("169.254.")) {
+            return 5;
+        }
+        return 4;
     }
 }
