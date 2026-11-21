@@ -760,7 +760,7 @@ pub fn session(host: SessionHost) -> impl IntoElement {
     let on_switch_runtime = host.on_switch_runtime.clone();
     let on_disconnect = host.on_disconnect.clone();
     let shell_host = host.clone();
-    view().flex_1().bg(theme::block_page()).child(
+    view().flex_1().bg(theme::block_page).child(
         when(
             move || {
                 connection.get() != ConnectionState::Online
@@ -869,7 +869,7 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
     let shell_host = host;
     view()
         .flex_1()
-        .bg(theme::block_page())
+        .bg(theme::block_page)
         .child(when(move || git_open.get(), {
             let git = git.clone();
             move || crate::screens::git::git(git.clone())
@@ -900,7 +900,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
 
     view()
         .flex_1()
-        .bg(theme::block_page())
+        .bg(theme::block_page)
         .flex_col()
         .child(header(host.clone(), drawer_open))
         .child(when(

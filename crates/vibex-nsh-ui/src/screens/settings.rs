@@ -133,7 +133,7 @@ fn page_shell(host: SettingsHost, page: SettingsPage) -> impl IntoElement {
         .absolute()
         .inset(px(0.0))
         .z_index(30)
-        .bg(theme::block_page())
+        .bg(theme::block_page)
         .flex_col()
         .child(header(host.clone(), page))
         .child(

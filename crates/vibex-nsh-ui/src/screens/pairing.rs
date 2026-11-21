@@ -388,7 +388,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .flex_1()
         .relative()
         .items_center()
-        .bg(theme::block_page())
+        .bg(theme::block_page)
         .px(px(theme::SPACING_XL))
         .pt_safe_area()
         .pb_safe_area_plus(px(theme::SPACING_LG))
@@ -1628,7 +1628,7 @@ fn details_page(host: PairingHost) -> impl IntoElement {
         .absolute()
         .inset(px(0.0))
         .z_index(10)
-        .bg(theme::block_page())
+        .bg(theme::block_page)
         .on_press(|| {})
         .child(when(move || details.get().is_some(), {
             let on_close = on_close.clone();

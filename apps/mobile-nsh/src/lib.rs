@@ -215,7 +215,7 @@ fn root_view(
                     .left_0()
                     .w_full()
                     .h_full()
-                    .bg(vibex_nsh_ui::theme::block_page())
+                    .bg(vibex_nsh_ui::theme::block_page)
                     .child(pairing_screen::pairing(switcher_host.clone()))
                     .into_element()
             }
