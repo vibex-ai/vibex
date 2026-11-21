@@ -168,25 +168,11 @@ fn body(host: SettingsHost, page: SettingsPage, confirm_clear: Signal<bool>) -> 
 }
 
 fn header(host: SettingsHost, page: SettingsPage) -> impl IntoElement {
-    let on_close = host.on_close.clone();
-    let on_back = host.page;
-    let back = move || {
-        let page = on_back;
-        button()
-            .size(px(40.0))
-            .flex_shrink_0()
-            .items_center()
-            .justify_center()
-            .rounded(px(20.0))
-            .active(|style| style.opacity(0.6))
-            .accessibility_label(copy::text("Back", "返回", "返回"))
-            .on_press(move || page.set(SettingsPage::Root))
-            .child(
-                svg(icon(include_str!("../../assets/icons/chevron-left.svg")))
-                    .w(px(22.0))
-                    .h(px(22.0))
-                    .text_color(theme::foreground),
-            )
+    let on_back: Rc<dyn Fn()> = if page == SettingsPage::Root {
+        host.on_close.clone()
+    } else {
+        let page = host.page;
+        Rc::new(move || page.set(SettingsPage::Root))
     };
     view().pt_safe_area().child(
         view()
@@ -196,11 +182,23 @@ fn header(host: SettingsHost, page: SettingsPage) -> impl IntoElement {
             .items_center()
             .gap(px(4.0))
             .px(px(8.0))
-            .child(if page == SettingsPage::Root {
-                view().w(px(40.0)).h(px(40.0)).into_element()
-            } else {
-                back().into_element()
-            })
+            .child(
+                button()
+                    .size(px(40.0))
+                    .flex_shrink_0()
+                    .items_center()
+                    .justify_center()
+                    .rounded(px(20.0))
+                    .active(|style| style.opacity(0.6))
+                    .accessibility_label(copy::text("Back", "返回", "返回"))
+                    .on_press(move || on_back())
+                    .child(
+                        svg(icon(include_str!("../../assets/icons/chevron-left.svg")))
+                            .w(px(22.0))
+                            .h(px(22.0))
+                            .text_color(theme::foreground),
+                    ),
+            )
             .child(
                 view().flex_1().items_center().child(
                     text(page.title())
@@ -210,23 +208,7 @@ fn header(host: SettingsHost, page: SettingsPage) -> impl IntoElement {
                         .text_color(theme::foreground),
                 ),
             )
-            .child(
-                button()
-                    .size(px(40.0))
-                    .flex_shrink_0()
-                    .items_center()
-                    .justify_center()
-                    .rounded(px(20.0))
-                    .active(|style| style.opacity(0.6))
-                    .accessibility_label(copy::text("Close", "关闭", "關閉"))
-                    .on_press(move || on_close())
-                    .child(
-                        svg(icon(include_str!("../../assets/icons/x.svg")))
-                            .w(px(22.0))
-                            .h(px(22.0))
-                            .text_color(theme::foreground),
-                    ),
-            ),
+            .child(view().w(px(40.0)).h(px(40.0))),
     )
 }
 
@@ -241,7 +223,6 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         index_row(
             icon(include_str!("../../assets/icons/palette.svg")),
             copy::text("Appearance", "外观", "外觀"),
-            copy::text("Theme and text", "主题与文字", "主題與文字"),
             move || appearance_label(appearance.get()).to_owned(),
             navigate(host.page, SettingsPage::Appearance),
         )
@@ -252,7 +233,6 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         index_row(
             icon(include_str!("../../assets/icons/globe.svg")),
             copy::text("Language", "语言", "語言"),
-            copy::text("Interface language", "界面语言", "介面語言"),
             move || language_label(language.get()).to_owned(),
             navigate(host.page, SettingsPage::Language),
         )
@@ -263,7 +243,6 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         index_row(
             icon(include_str!("../../assets/icons/message-square.svg")),
             copy::text("Conversation", "会话", "工作階段"),
-            copy::text("Timeline display", "时间线显示", "時間線顯示"),
             || String::new(),
             navigate(host.page, SettingsPage::Conversation),
         )
@@ -274,7 +253,6 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         index_row(
             icon(include_str!("../../assets/icons/activity.svg")),
             copy::text("Notifications", "通知", "通知"),
-            copy::text("Alerts", "提醒", "提醒"),
             move || {
                 if notifications.get() {
                     copy::text("On", "开", "開").to_owned()
@@ -289,18 +267,12 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
     let device_row = index_row(
         icon(include_str!("../../assets/icons/settings.svg")),
         copy::text("This device", "本机", "本機"),
-        copy::text("Haptics and screen", "触感与屏幕", "觸感與螢幕"),
         || String::new(),
         navigate(host.page, SettingsPage::Device),
     );
     let about_row = index_row(
         icon(include_str!("../../assets/icons/vibex-mark.svg")),
         copy::text("About Vibex", "关于 Vibex", "關於 Vibex"),
-        copy::text(
-            "Version, licence and updates",
-            "版本、许可与更新",
-            "版本、授權與更新",
-        ),
         || format!("v{}", env!("CARGO_PKG_VERSION")),
         navigate(host.page, SettingsPage::About),
     );
@@ -344,7 +316,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
     button()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .bg(theme::background_card)
+        .bg(theme::block_surface)
         .px(px(theme::SPACING_LG))
         .py(px(14.0))
         .flex_row()
@@ -361,7 +333,7 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
                     if connected() {
                         theme::color_token("chart-1").opacity(0.16)
                     } else {
-                        theme::background_dim()
+                        theme::block_inset()
                     }
                 })
                 .items_center()
@@ -597,7 +569,7 @@ fn appearance_page(host: SettingsHost) -> impl IntoElement {
                     view()
                         .w_full()
                         .rounded(px(10.0))
-                        .bg(theme::background_dim)
+                        .bg(theme::block_inset)
                         .p(px(12.0))
                         .child(
                             text(move || format!("Aa  {}", font_scale_label(font_scale.get())))
@@ -903,7 +875,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             view()
                 .w_full()
                 .rounded(px(CARD_RADIUS))
-                .bg(theme::background_card)
+                .bg(theme::block_surface)
                 .px(px(16.0))
                 .py(px(14.0))
                 .flex_row()
@@ -914,7 +886,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                         .size(px(36.0))
                         .flex_shrink_0()
                         .rounded(px(18.0))
-                        .bg(theme::background_dim)
+                        .bg(theme::block_inset)
                         .items_center()
                         .justify_center()
                         .child(
@@ -1035,7 +1007,7 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .bg(theme::background_card)
+        .bg(theme::block_surface)
         .overflow_hidden()
         .child(
             button()
@@ -1101,7 +1073,7 @@ fn clear_dialog(host: SettingsHost, open: Signal<bool>) -> impl IntoElement {
                         .w_full()
                         .max_w(px(360.0))
                         .rounded(px(24.0))
-                        .bg(theme::background_card)
+                        .bg(theme::block_surface)
                         .p(px(23.0))
                         .flex_col()
                         .gap(px(12.0))
@@ -1135,7 +1107,7 @@ fn clear_dialog(host: SettingsHost, open: Signal<bool>) -> impl IntoElement {
                                         .flex_1()
                                         .h(px(44.0))
                                         .rounded(px(14.0))
-                                        .bg(theme::background_dim)
+                                        .bg(theme::block_inset)
                                         .items_center()
                                         .justify_center()
                                         .active(|style| style.opacity(0.75))
@@ -1180,7 +1152,7 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .bg(theme::background_card)
+        .bg(theme::block_surface)
         .overflow_hidden()
         .child(view().w_full().flex_col().children(rows))
 }
@@ -1188,7 +1160,6 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
 fn index_row(
     leading: ImageSrc,
     title: &'static str,
-    detail: &'static str,
     value: impl Fn() -> String + 'static,
     on_press: impl Fn() + 'static,
 ) -> impl IntoElement {
@@ -1205,21 +1176,12 @@ fn index_row(
         .on_press(on_press)
         .child(icon_tile(leading, false))
         .child(
-            view()
-                .flex_1()
-                .min_w(px(0.0))
-                .flex_col()
-                .child(
-                    text(title)
-                        .text_size(px(theme::font_detail()))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::foreground),
-                )
-                .child(
-                    text(detail)
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                ),
+            view().flex_1().min_w(px(0.0)).child(
+                text(title)
+                    .text_size(px(theme::font_detail()))
+                    .font_weight(FontWeight::MEDIUM)
+                    .text_color(theme::foreground),
+            ),
         )
         .child(
             text(value)
@@ -1348,7 +1310,7 @@ fn radio_mark<T: Copy + PartialEq + 'static>(selected: Signal<T>, choice: T) -> 
             if selected.with(|current| *current == choice) {
                 theme::foreground()
             } else {
-                theme::background_card().opacity(0.0)
+                theme::block_surface().opacity(0.0)
             }
         })
         .items_center()
@@ -1406,7 +1368,7 @@ fn step_button(
         .rounded(px(8.0))
         .border_1()
         .border_color(theme::border_default)
-        .bg(theme::background_dim)
+        .bg(theme::block_inset)
         .items_center()
         .justify_center()
         .active(|style| style.opacity(0.7))
@@ -1466,7 +1428,7 @@ fn toggle_track(enabled: Signal<bool>) -> impl IntoElement {
             if enabled.get() {
                 theme::foreground()
             } else {
-                theme::background_dim()
+                theme::block_inset()
             }
         })
         .child(
@@ -1572,7 +1534,7 @@ fn icon_tile(image: ImageSrc, danger: bool) -> impl IntoElement {
         .h(px(TILE))
         .flex_shrink_0()
         .rounded(px(TILE_RADIUS))
-        .bg(theme::background_dim)
+        .bg(theme::block_inset)
         .items_center()
         .justify_center()
         .child(

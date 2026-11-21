@@ -210,6 +210,25 @@ pub fn background_card() -> Hsla {
     color(theme().card)
 }
 
+/// The filled block a settings group rests on.
+///
+/// The light palette's card and page are both white, so a borderless card
+/// would vanish there; that palette borrows the secondary tone as its block
+/// colour. The dark palette's card already sits a step above the page.
+pub fn block_surface() -> Hsla {
+    let card = background_card();
+    if card == background() {
+        color_token("secondary")
+    } else {
+        card
+    }
+}
+
+/// A well inside a block: a value preview, an icon tile, a switch track.
+pub fn block_inset() -> Hsla {
+    color_token("muted")
+}
+
 /// The dimmed fill dense rows sit on.
 pub fn background_dim() -> Hsla {
     color_token("secondary")

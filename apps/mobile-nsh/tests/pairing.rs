@@ -92,7 +92,7 @@ fn settings_changes_the_language_and_survives_the_sheet() {
     app.press("role:button[返回]").unwrap();
     app.wait_for("设置").unwrap();
     assert!(app.screen().shows("外观"));
-    app.press("关闭").unwrap();
+    app.press("role:button[返回]").unwrap();
     app.wait_for_gone("外观", std::time::Duration::from_secs(5))
         .unwrap();
 }
