@@ -1345,10 +1345,14 @@ impl SessionService {
             if let Ok(Err(error)) = &connected {
                 log::warn!("session connect failed: {} ({})", error.code, error.message);
             }
-            if let Ok(Ok(info)) = &connected
-                && info.server_kind != RemoteServerKind::Unknown
-            {
-                (self.on_server_kind)(info.server_kind);
+            if let Ok(Ok(info)) = &connected {
+                if info.server_kind != RemoteServerKind::Unknown {
+                    (self.on_server_kind)(info.server_kind);
+                }
+                let name = info.server_display_name.trim();
+                if !name.is_empty() {
+                    self.runtime.set(Some(name.to_owned().into()));
+                }
             }
             let failed = match &connected {
                 Ok(Ok(_)) => false,

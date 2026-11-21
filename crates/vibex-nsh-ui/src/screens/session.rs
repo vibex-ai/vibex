@@ -26,7 +26,7 @@ use crate::{
     copy,
     screens::connecting::{self as connecting_screen, ConnectionState},
     theme,
-    ui::{action, brand, field},
+    ui::{action, field},
 };
 
 /// The height of the top bar, above the safe area.
@@ -924,6 +924,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
     let drawer_open = signal(false);
     DRAWER_OPEN.with(|cell| cell.set(Some(drawer_open)));
     let edge_drag = nsh_core::element::animated_value(0.0);
+    let open_drag = nsh_core::element::animated_value(0.0);
     let connection = host.connection;
     let connection_error = host.connection_error;
     let on_retry = host.on_retry.clone();
@@ -932,6 +933,14 @@ fn shell(host: SessionHost) -> impl IntoElement {
         .flex_1()
         .relative()
         .bg(theme::block_page)
+        .pan_values(Some(&open_drag), None)
+        .pan_enabled(move || !drawer_open.get())
+        .on_pan_start(|_: &PanEvent| {})
+        .on_pan_end(move |event: &PanEvent| {
+            if !event.cancelled && event.translation.x.0 > 50.0 {
+                drawer_open.set(true);
+            }
+        })
         .flex_col()
         .child(header(host.clone(), drawer_open))
         .child(when(
@@ -1035,6 +1044,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             host.on_toggle_pin.clone(),
             host.on_archive_session.clone(),
             host.on_delete_session.clone(),
+            host.on_open_team.clone(),
         ))
         .child(attachment_preview_sheet(
             host.attachment_preview,
@@ -4005,6 +4015,7 @@ fn session_actions_sheet(
     on_toggle_pin: Rc<dyn Fn(&str)>,
     on_archive: Rc<dyn Fn()>,
     on_delete: Rc<dyn Fn()>,
+    on_open_team: Action,
 ) -> impl IntoElement {
     let open = computed(move || actions.get().is_some());
     sheet()
@@ -4071,6 +4082,16 @@ fn session_actions_sheet(
                                 false,
                                 None,
                                 move || on_move(),
+                            )
+                        })
+                        .child({
+                            let on_open_team = on_open_team.clone();
+                            sheet_action(
+                                copy::text("Team", "团队", "團隊"),
+                                icon(include_str!("../../assets/icons/bot.svg")),
+                                false,
+                                None,
+                                move || on_open_team(),
                             )
                         })
                         .child({
@@ -4371,15 +4392,15 @@ fn drawer_header_button(
     button()
         .accessibility_label(label)
         .on_press(on_press)
-        .size(px(40.0))
-        .rounded(px(20.0))
+        .size(px(36.0))
+        .rounded(px(theme::RADIUS_CONTROL))
         .items_center()
         .justify_center()
         .active(|style| style.opacity(0.6))
         .child(
             svg(icon)
-                .w(px(20.0))
-                .h(px(20.0))
+                .w(px(18.0))
+                .h(px(18.0))
                 .text_color(theme::foreground),
         )
 }
@@ -4393,7 +4414,7 @@ fn drawer_tool(
     button()
         .accessibility_label(label)
         .on_press(on_press)
-        .size(px(28.0))
+        .size(px(32.0))
         .rounded(px(theme::RADIUS_CONTROL))
         .items_center()
         .justify_center()
@@ -4405,8 +4426,8 @@ fn drawer_tool(
         .active(|style| style.opacity(0.65))
         .child(
             svg(icon)
-                .w(px(18.0))
-                .h(px(18.0))
+                .w(px(16.0))
+                .h(px(16.0))
                 .text_color(theme::text_secondary),
         )
 }
@@ -4415,6 +4436,17 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let close_drag = nsh_core::element::animated_value(0.0);
     let sessions = host.sessions;
     let active = host.active;
+    let activity_phase = signal(0u32);
+    if !crate::motion::reduce_motion() {
+        spawn(async move {
+            let mut frame = 0;
+            loop {
+                nsh_core::element::timer(std::time::Duration::from_millis(100)).await;
+                frame = (frame + 1) % 8;
+                activity_phase.set(frame);
+            }
+        });
+    }
     let collapsed_projects = host.collapsed_projects;
     let on_set_project_collapsed = host.on_set_project_collapsed.clone();
     let collapsed_workspaces = host.collapsed_workspaces;
@@ -4494,30 +4526,43 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                         open.set(false);
                     }
                 })
-                .pt_safe_area_plus(px(theme::SPACING_LG))
                 .pb_safe_area_plus(px(theme::SPACING_MD))
                 .child(
                     view()
                         .h(px(56.0))
+                        .relative()
                         .px(px(theme::SPACING_LG))
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACING_XS))
+                        .gap(px(theme::SPACING_SM))
                         .child(
                             view()
-                                .flex_1()
-                                .min_w(px(0.0))
+                                .absolute()
+                                .left(px(theme::SPACING_LG))
+                                .top(px(35.0))
+                                .w(px(150.0))
                                 .flex_row()
                                 .items_center()
                                 .gap(px(1.0))
-                                .child(brand::mark(22.0))
+                                .child({
+                                    let mark = theme::wordmark_mark(theme::font_title());
+                                    svg(icon(include_str!("../../assets/icons/vibex-mark.svg")))
+                                        .w(px(mark.width))
+                                        .h(px(mark.height))
+                                        .mt(px(mark.margin_top))
+                                        .relative()
+                                        .top(px(mark.top_offset))
+                                        .flex_shrink_0()
+                                        .text_color(theme::foreground)
+                                })
                                 .child(
                                     text("ibex")
-                                        .text_size(px(20.0))
+                                        .text_size(px(theme::font_title()))
                                         .font_weight(FontWeight::SEMIBOLD)
                                         .text_color(theme::foreground),
                                 ),
                         )
+                        .child(view().flex_1())
                         .child({
                             let on_new_session = on_new_session.clone();
                             drawer_header_button(
@@ -4534,11 +4579,11 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                 )
                 .child(
                     view()
-                        .h(px(44.0))
+                        .h(px(40.0))
                         .flex_shrink_0()
                         .px(px(theme::SPACING_LG))
                         .border_b_1()
-                        .border_b_color(theme::border_subtle)
+                        .border_b_color(theme::border_default())
                         .flex_row()
                         .items_center()
                         .gap(px(2.0))
@@ -4547,7 +4592,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .truncate()
-                                .text_size(px(theme::font_micro()))
+                                .text_size(px(theme::font_caption()))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_muted),
                         )
@@ -4558,15 +4603,6 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             {
                                 let on_open_files = on_open_files.clone();
                                 move || on_open_files()
-                            },
-                        ))
-                        .child(drawer_tool(
-                            icon(include_str!("../../assets/icons/folder-plus.svg")),
-                            copy::text("New folder", "新建文件夹", "新增資料夾"),
-                            false,
-                            {
-                                let on_open_folder = on_open_folder.clone();
-                                move || on_open_folder()
                             },
                         ))
                         .child(drawer_tool(
@@ -4600,12 +4636,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             },
                         ))
                         .child(drawer_tool(
-                            icon(include_str!("../../assets/icons/bot.svg")),
-                            copy::text("Team", "团队", "團隊"),
+                            icon(include_str!("../../assets/icons/plus.svg")),
+                            copy::text("New folder", "新建文件夹", "新增資料夾"),
                             false,
                             {
-                                let on_open_team = host.on_open_team.clone();
-                                move || on_open_team()
+                                let on_open_folder = on_open_folder.clone();
+                                move || on_open_folder()
                             },
                         ))
                         .child(drawer_tool(
@@ -4785,6 +4821,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 section,
                                                 sessions,
                                                 active,
+                                                activity_phase,
                                                 section_select.clone(),
                                                 section_menu.clone(),
                                                 {
@@ -4850,6 +4887,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                             drawer_group(
                                                 group,
                                                 active,
+                                                activity_phase,
                                                 collapsed,
                                                 on_set_project_collapsed.clone(),
                                                 on_new_session.clone(),
@@ -5492,6 +5530,7 @@ fn sidebar_section(
     section: ReadSignal<SidebarSectionView>,
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
+    activity_phase: Signal<u32>,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     on_folder_menu: FolderNameAction,
@@ -5513,6 +5552,8 @@ fn sidebar_section(
                 .collect::<Vec<_>>()
         })
     });
+    let indent =
+        move || 24.0 + section.with(|section| section.depth.saturating_sub(1) as f32) * 18.0;
     view()
         .w_full()
         .flex_col()
@@ -5520,7 +5561,7 @@ fn sidebar_section(
         .child(
             view()
                 .w_full()
-                .h(px(38.0))
+                .h(px(42.0))
                 .pl(px(
                     theme::SPACING_XS + section.with(|section| section.depth as f32) * 10.0
                 ))
@@ -5534,7 +5575,7 @@ fn sidebar_section(
                     button()
                         .flex_1()
                         .min_w(px(0.0))
-                        .h(px(38.0))
+                        .h(px(42.0))
                         .px(px(8.0))
                         .flex_row()
                         .items_center()
@@ -5566,19 +5607,44 @@ fn sidebar_section(
                             },
                         ))
                         .child(
-                            text(move || section.with(|section| section.name.clone()))
-                                .flex_1()
+                            view()
+                                .flex_shrink(1.0)
                                 .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(theme::font_detail()))
-                                .font_weight(FontWeight::MEDIUM)
-                                .text_color(theme::foreground),
-                        )
-                        .child(
-                            text(move || rows.with(|rows| rows.len().to_string()))
-                                .flex_shrink_0()
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
+                                .flex_row()
+                                .items_center()
+                                .gap(px(4.0))
+                                .child(
+                                    text(move || section.with(|section| section.name.clone()))
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(theme::font_body()))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::foreground),
+                                )
+                                .child(when(
+                                    move || section.with(|section| section.collapsed),
+                                    || {
+                                        svg(icon(include_str!(
+                                            "../../assets/icons/chevron-right.svg"
+                                        )))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::text_muted)
+                                    },
+                                ))
+                                .child(when(
+                                    move || !section.with(|section| section.collapsed),
+                                    || {
+                                        svg(icon(include_str!(
+                                            "../../assets/icons/chevron-down.svg"
+                                        )))
+                                        .w(px(12.0))
+                                        .h(px(12.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::text_muted)
+                                    },
+                                )),
                         )
                 })
                 .child({
@@ -5620,26 +5686,46 @@ fn sidebar_section(
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
                 let on_move_relative = on_move_relative.clone();
-                view().w_full().flex_col().gap(px(2.0)).child(each(
-                    move || rows.get(),
-                    |session| session.id.clone(),
-                    move |session, _| {
-                        let session_signal = signal(session.get_untracked());
-                        let on_move_relative = on_move_relative.clone();
-                        session_row(
-                            session_signal,
-                            active,
-                            on_select.clone(),
-                            on_menu.clone(),
-                            open,
-                            select_mode,
-                            selected,
-                            pinned,
-                            unread,
-                            on_move_relative,
-                        )
-                    },
-                ))
+                view()
+                    .w_full()
+                    .relative()
+                    .child(
+                        view()
+                            .absolute()
+                            .left(move || px(indent()))
+                            .top(px(0.0))
+                            .bottom(px(0.0))
+                            .w(px(1.0))
+                            .bg(theme::border_subtle()),
+                    )
+                    .child(
+                        view()
+                            .w_full()
+                            .pl(move || px(indent() + 10.0))
+                            .flex_col()
+                            .gap(px(2.0))
+                            .child(each(
+                                move || rows.get(),
+                                |session| session.id.clone(),
+                                move |session, _| {
+                                    let session_signal = signal(session.get_untracked());
+                                    let on_move_relative = on_move_relative.clone();
+                                    session_row(
+                                        session_signal,
+                                        activity_phase,
+                                        active,
+                                        on_select.clone(),
+                                        on_menu.clone(),
+                                        open,
+                                        select_mode,
+                                        selected,
+                                        pinned,
+                                        unread,
+                                        on_move_relative,
+                                    )
+                                },
+                            )),
+                    )
             },
         ))
 }
@@ -5648,6 +5734,7 @@ fn sidebar_section(
 fn drawer_group(
     group: ReadSignal<DrawerGroup>,
     active: Signal<Option<String>>,
+    activity_phase: Signal<u32>,
     collapsed: Signal<Vec<String>>,
     on_project_collapse: SessionToggle,
     on_new_session: Action,
@@ -5698,22 +5785,29 @@ fn drawer_group(
                                 .w(px(16.0))
                                 .h(px(16.0))
                                 .flex_shrink_0()
-                                .text_color(theme::text_muted),
+                                .text_color(theme::color_token("chart-category-4")),
                         )
                         .child(
                             text(move || group.with(|group| group.name.clone()))
-                                .flex_1()
+                                .flex_shrink(1.0)
                                 .min_w(px(0.0))
                                 .truncate()
-                                .text_size(px(theme::font_detail()))
+                                .text_size(px(theme::font_body()))
                                 .font_weight(FontWeight::MEDIUM)
                                 .text_color(theme::foreground),
                         )
                         .child(
-                            text(move || group.with(|group| group.count.to_string()))
+                            view()
                                 .flex_shrink_0()
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
+                                .rounded(px(9.0))
+                                .bg(theme::background_dim())
+                                .px(px(6.0))
+                                .py(px(1.0))
+                                .child(
+                                    text(move || group.with(|group| group.count.to_string()))
+                                        .text_size(px(theme::font_detail()))
+                                        .text_color(theme::text_muted),
+                                ),
                         )
                 })
                 .child({
@@ -5788,19 +5882,36 @@ fn drawer_group(
                             DrawerRow::Session(session) => {
                                 let session = signal(session);
                                 let on_move_relative = on_move_relative.clone();
-                                session_row(
-                                    session,
-                                    active,
-                                    on_select,
-                                    on_menu,
-                                    open,
-                                    select_mode,
-                                    selected,
-                                    pinned,
-                                    unread,
-                                    on_move_relative,
-                                )
-                                .into_element()
+                                view()
+                                    .w_full()
+                                    .relative()
+                                    .pl(px(34.0))
+                                    .child(
+                                        view()
+                                            .absolute()
+                                            .left(px(24.0))
+                                            .top(px(0.0))
+                                            .bottom(px(0.0))
+                                            .w(px(1.0))
+                                            .bg(theme::border_subtle()),
+                                    )
+                                    .child(
+                                        session_row(
+                                            session,
+                                            activity_phase,
+                                            active,
+                                            on_select,
+                                            on_menu,
+                                            open,
+                                            select_mode,
+                                            selected,
+                                            pinned,
+                                            unread,
+                                            on_move_relative,
+                                        )
+                                        .into_element(),
+                                    )
+                                    .into_element()
                             }
                         }
                     },
@@ -5812,6 +5923,7 @@ fn drawer_group(
 #[allow(clippy::too_many_arguments)]
 fn session_row(
     session: Signal<SessionSummary>,
+    activity_phase: Signal<u32>,
     active: Signal<Option<String>>,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
@@ -5923,7 +6035,12 @@ fn session_row(
                                 .text_color(theme::text_secondary),
                         )
                         .child(when(
-                            move || session.get().state != SessionState::Idle,
+                            move || {
+                                matches!(
+                                    session.get().state,
+                                    SessionState::Waiting | SessionState::Failed
+                                )
+                            },
                             move || {
                                 view()
                                     .absolute()
@@ -5966,7 +6083,7 @@ fn session_row(
                         .flex_1()
                         .min_w(px(0.0))
                         .truncate()
-                        .text_size(px(theme::font_detail()))
+                        .text_size(px(theme::font_body()))
                         .font_weight(if is_active() {
                             FontWeight::SEMIBOLD
                         } else {
@@ -5980,12 +6097,46 @@ fn session_row(
                             }
                         }),
                 )
-                .child(
-                    text(move || session.get().meta.clone())
-                        .flex_shrink_0()
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                ),
+                .child(when(
+                    move || session.get().state == SessionState::Running,
+                    move || {
+                        view()
+                            .w(px(14.0))
+                            .h(px(14.0))
+                            .flex_shrink_0()
+                            .relative()
+                            .children((0..6).map(|index| {
+                                let phase = activity_phase;
+                                let column = (index % 2) as f32;
+                                let row = (index / 2) as f32;
+                                view()
+                                    .absolute()
+                                    .left(px(4.0 + column * 4.0))
+                                    .top(px(2.0 + row * 4.0))
+                                    .w(px(2.0))
+                                    .h(px(2.0))
+                                    .rounded(px(1.0))
+                                    .bg(theme::color_token("chart-2"))
+                                    .opacity(move || {
+                                        let head = phase.get() as f32 / 8.0 * 6.0;
+                                        let offset = (index as f32 - head).rem_euclid(6.0);
+                                        let distance = offset.min(6.0 - offset);
+                                        let intensity = 0.5
+                                            + 0.5 * (distance / 6.0 * std::f32::consts::TAU).cos();
+                                        0.28 + 0.72 * intensity
+                                    })
+                            }))
+                    },
+                ))
+                .child(when(
+                    move || session.get().state != SessionState::Running,
+                    move || {
+                        text(move || session.get().meta.clone())
+                            .flex_shrink_0()
+                            .text_size(px(theme::font_detail()))
+                            .text_color(theme::text_muted)
+                    },
+                )),
         )
         .child(when(move || !select_mode.get(), {
             move || {

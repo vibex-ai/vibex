@@ -380,6 +380,7 @@ fn start_back_poller(
     services: Signal<Option<Rc<SessionService>>>,
 ) {
     spawn(async move {
+        let mut last_back: Option<std::time::Instant> = None;
         loop {
             timer(Duration::from_millis(100)).await;
             let service = services.get_untracked();
@@ -409,6 +410,13 @@ fn start_back_poller(
             if !host::take_back() {
                 continue;
             }
+            let now = std::time::Instant::now();
+            if last_back
+                .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(1200))
+            {
+                continue;
+            }
+            last_back = Some(now);
             if pairing.overlay_open() {
                 pairing.close_overlay();
             } else if settings_open.get_untracked() {
