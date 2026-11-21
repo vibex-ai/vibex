@@ -117,8 +117,8 @@ fn settings_steps_the_text_size() {
     let (mut app, _directory) = start();
     app.press("role:button[Settings]").unwrap();
     app.wait_for("Text size").unwrap();
-    app.press("role:button[Change]").unwrap();
+    app.press("role:button[Increase text size]").unwrap();
     app.wait_for("Large").unwrap();
-    app.press("role:button[Change]").unwrap();
-    app.wait_for("Smallest").unwrap();
+    app.press("role:button[Decrease text size]").unwrap();
+    app.wait_for("Standard").unwrap();
 }

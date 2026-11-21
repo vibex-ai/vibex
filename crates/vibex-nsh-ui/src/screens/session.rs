@@ -4694,7 +4694,13 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 copy::text("Settings", "设置", "設定"),
                                 icon(include_str!("../../assets/icons/settings.svg")),
                                 false,
-                                move || on_open_settings(),
+                                {
+                                    let on_open_settings = on_open_settings.clone();
+                                    move || {
+                                        open.set(false);
+                                        on_open_settings()
+                                    }
+                                },
                             )
                             .w_full(),
                         )
