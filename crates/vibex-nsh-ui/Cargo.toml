@@ -10,3 +10,4 @@ description = "The Native Shell (nsh) UI layer of the Vibex mobile client."
 [dependencies]
 nsh-core.workspace = true
 nsh-base.workspace = true
+vibex-locale = { path = "../vibex-locale" }

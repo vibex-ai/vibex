@@ -503,6 +503,11 @@ fn install_service_effect(
             let pairing = pairing.clone();
             Rc::new(move |name: &str| pairing.rename_device(name))
         };
+        let server_kind: Rc<dyn Fn(vibex_core::RemoteServerKind)> = {
+            let pairing = pairing.clone();
+            let host_id = runtime.bundle.host_id().to_owned();
+            Rc::new(move |kind| pairing.set_host_kind(&host_id, kind))
+        };
         // The shell's state must outlive this effect: the effect runs again
         // whenever the connection, the attempt counter or the lifecycle
         // changes, and a signal owned by the scope that created it would be
@@ -515,6 +520,7 @@ fn install_service_effect(
                 open_settings,
                 runtime_renamed,
                 device_renamed,
+                server_kind,
             )
         });
         match built {

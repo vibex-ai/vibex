@@ -16,8 +16,9 @@
 //!   look of a Vibex button, action row, field or page lives here, once.
 //! - [`screens`]: the pages themselves, composed only from [`ui`] and
 //!   [`theme`].
-//! - [`copy`]: the three languages the phone ships (English, Simplified
-//!   Chinese, Traditional Chinese), resolved from the platform locale.
+//! - [`copy`]: the languages the phone ships, resolved from the platform
+//!   locale. English and the two Chinese variants keep their own strings;
+//!   every other language uses the shared translation table.
 //!
 //! Design rules this layer keeps:
 //!

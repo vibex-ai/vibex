@@ -43,12 +43,13 @@ use vibex_core::{
     GitWorktreeOperationStatus, GitWorktreeRestoreRequest, GoalAction, GoalPhase,
     MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RemoteSidebarItemKind, RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    RemoteServerKind, RemoteSidebarItemKind, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationSnapshot, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
+    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
     TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
     TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
     WorkspaceId, unix_timestamp_ms,
@@ -302,6 +303,8 @@ pub struct SessionService {
     on_open_settings: Rc<dyn Fn()>,
     on_runtime_renamed: Rc<dyn Fn(&str)>,
     on_device_renamed: Rc<dyn Fn(&str)>,
+    /// Tells the pairing store what kind of runtime the peer reported.
+    on_server_kind: Rc<dyn Fn(RemoteServerKind)>,
 }
 
 impl SessionService {
@@ -313,6 +316,7 @@ impl SessionService {
         on_open_settings: Rc<dyn Fn()>,
         on_runtime_renamed: Rc<dyn Fn(&str)>,
         on_device_renamed: Rc<dyn Fn(&str)>,
+        on_server_kind: Rc<dyn Fn(RemoteServerKind)>,
     ) -> BackendResult<Self> {
         let web = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = web.clone();
@@ -490,6 +494,7 @@ impl SessionService {
             on_open_settings,
             on_runtime_renamed,
             on_device_renamed,
+            on_server_kind,
         };
         service.start_connection();
         service.start_draft_saver();
@@ -1339,6 +1344,11 @@ impl SessionService {
                 .await;
             if let Ok(Err(error)) = &connected {
                 log::warn!("session connect failed: {} ({})", error.code, error.message);
+            }
+            if let Ok(Ok(info)) = &connected
+                && info.server_kind != RemoteServerKind::Unknown
+            {
+                (self.on_server_kind)(info.server_kind);
             }
             let failed = match &connected {
                 Ok(Ok(_)) => false,

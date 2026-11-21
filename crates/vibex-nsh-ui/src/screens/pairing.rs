@@ -1537,6 +1537,7 @@ fn remove_dialog(
                                 crate::copy::Language::TraditionalChinese => {
                                     format!("移除「{name}」？")
                                 }
+                                _ => format!("Remove \"{name}\"?"),
                             }
                         })
                         .text_size(px(theme::font_heading()))

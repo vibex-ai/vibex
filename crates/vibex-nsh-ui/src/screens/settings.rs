@@ -615,6 +615,13 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
         (Choice::English, "English", None),
         (Choice::SimplifiedChinese, "简体中文", None),
         (Choice::TraditionalChinese, "繁體中文", None),
+        (Choice::Japanese, "日本語", None),
+        (Choice::Korean, "한국어", None),
+        (Choice::German, "Deutsch", None),
+        (Choice::French, "Français", None),
+        (Choice::Spanish, "Español", None),
+        (Choice::BrazilianPortuguese, "Português (BR)", None),
+        (Choice::Russian, "Русский", None),
     ];
     let mut rows: Vec<AnyElement> = Vec::new();
     for (index, (choice, label, detail)) in choices.into_iter().enumerate() {
@@ -1620,9 +1627,7 @@ fn language_label(language: copy::LanguagePreference) -> &'static str {
     use copy::LanguagePreference as Choice;
     match language {
         Choice::System => copy::text("System", "跟随系统", "跟隨系統"),
-        Choice::English => "English",
-        Choice::SimplifiedChinese => "简体中文",
-        Choice::TraditionalChinese => "繁體中文",
+        other => other.label(),
     }
 }
 

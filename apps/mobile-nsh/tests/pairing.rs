@@ -118,6 +118,18 @@ fn the_chosen_language_survives_a_restart() {
 }
 
 #[test]
+fn settings_offers_every_language_the_clients_ship() {
+    let (mut app, _directory) = start();
+    app.press("role:button[Settings]").unwrap();
+    app.wait_for("Appearance").unwrap();
+    app.press("role:button[Language]").unwrap();
+    app.wait_for("日本語").unwrap();
+    for language in ["한국어", "Deutsch", "Français", "Español", "Português (BR)", "Русский"] {
+        assert!(app.screen().shows(language), "`{language}` is offered");
+    }
+}
+
+#[test]
 fn settings_steps_the_text_size() {
     let (mut app, _directory) = start();
     app.press("role:button[Settings]").unwrap();

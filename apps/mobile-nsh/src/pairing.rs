@@ -659,6 +659,38 @@ impl PairingService {
         self.error.set(None);
     }
 
+    /// Records the kind of runtime a connected peer reported.
+    pub fn set_host_kind(&self, host_id: &str, kind: RemoteServerKind) {
+        if kind == RemoteServerKind::Unknown {
+            return;
+        }
+        let mut changed = false;
+        {
+            let mut meta = self.meta.borrow_mut();
+            let entry = meta.entry(host_id.to_owned()).or_default();
+            if entry.server_kind != kind {
+                entry.server_kind = kind;
+                changed = true;
+            }
+        }
+        if !changed {
+            return;
+        }
+        self.save_meta();
+        let kind = runtime_kind(kind);
+        self.saved.update(|rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == host_id) {
+                row.kind = kind;
+            }
+        });
+        if let Some(mut details) = self.details.get_untracked()
+            && details.id == host_id
+        {
+            details.kind = kind;
+            self.details.set(Some(details));
+        }
+    }
+
     /// Removes every saved credential; the settings page confirms first.
     pub fn clear_runtimes(&self) {
         let ids = self
@@ -1475,6 +1507,12 @@ fn added_label(at_ms: i64) -> String {
             2 => format!("新增時間：{value} 小時前"),
             _ => format!("新增時間：{value} 天前"),
         },
+        _ => match unit {
+            0 => "Added just now".to_owned(),
+            1 => format!("Added {value}m ago"),
+            2 => format!("Added {value}h ago"),
+            _ => format!("Added {value}d ago"),
+        },
     }
 }
 
@@ -1499,6 +1537,12 @@ fn last_connected_label(at_ms: i64) -> String {
             1 => format!("上次連線：{value} 分鐘前"),
             2 => format!("上次連線：{value} 小時前"),
             _ => format!("上次連線：{value} 天前"),
+        },
+        _ => match unit {
+            0 => "Last connected just now".to_owned(),
+            1 => format!("Last connected {value}m ago"),
+            2 => format!("Last connected {value}h ago"),
+            _ => format!("Last connected {value}d ago"),
         },
     }
 }
