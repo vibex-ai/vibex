@@ -217,6 +217,17 @@ pub fn background_card() -> Hsla {
     color(theme().card)
 }
 
+/// The card surface as an adaptive color, for a style prop that follows the
+/// appearance on its own.
+pub fn card_adaptive() -> AdaptiveColor {
+    theme().card
+}
+
+/// The default border as an adaptive color.
+pub fn border_adaptive() -> AdaptiveColor {
+    theme().border
+}
+
 /// The page behind a column of filled blocks.
 ///
 /// The blocks are the lighter surface in both appearances: the card tone in

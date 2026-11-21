@@ -342,11 +342,9 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .child(when(move || saved.with(|saved| !saved.is_empty()), {
             let on_pick = host.on_pick_saved.clone();
             let on_actions = host.on_show_actions.clone();
-            let active = host.active_id;
             move || {
                 saved_runtimes(
                     saved,
-                    active,
                     on_pick.clone(),
                     on_actions.clone(),
                     spinner,
@@ -557,7 +555,6 @@ fn error_message(error: Signal<Option<SharedString>>) -> impl IntoElement {
 /// The runtimes this phone saved, above the entries.
 fn saved_runtimes(
     saved: Signal<Vec<SavedRuntime>>,
-    active: Signal<Option<SharedString>>,
     on_pick: Rc<dyn Fn(&str)>,
     on_actions: Rc<dyn Fn(&str)>,
     spinner: Signal<SharedString>,
@@ -581,13 +578,7 @@ fn saved_runtimes(
                         move || saved.get(),
                         |runtime| runtime.id.clone(),
                         move |runtime, _| {
-                            saved_row(
-                                runtime,
-                                active,
-                                on_pick.clone(),
-                                on_actions.clone(),
-                                spinner,
-                            )
+                            saved_row(runtime, on_pick.clone(), on_actions.clone(), spinner)
                         },
                     )),
             ),
@@ -597,18 +588,10 @@ fn saved_runtimes(
 /// One saved runtime: a status dot, its name, the kind it is, and its actions.
 fn saved_row(
     runtime: ReadSignal<SavedRuntime>,
-    active: Signal<Option<SharedString>>,
     on_pick: Rc<dyn Fn(&str)>,
     on_actions: Rc<dyn Fn(&str)>,
     spinner: Signal<SharedString>,
 ) -> impl IntoElement {
-    let selected = move || {
-        active.with(|active| {
-            active
-                .as_ref()
-                .is_some_and(|id| id.as_str() == runtime.get().id.as_str())
-        })
-    };
     let accessible = format!(
         "{} · {} · {}",
         runtime.get_untracked().name,
@@ -619,14 +602,7 @@ fn saved_row(
         .w_full()
         .min_h(px(RUNTIME_ROW_HEIGHT))
         .rounded(px(theme::RADIUS_CARD))
-        .border_1()
-        .border_color(move || {
-            if selected() {
-                theme::border_default()
-            } else {
-                theme::border_subtle()
-            }
-        })
+        .shadow_xs()
         .bg(theme::block_surface)
         .flex_row()
         .items_center()
@@ -744,8 +720,8 @@ fn manual_sheet(
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(theme::border_default())
-                .bg(theme::background_card())
+                .border_color(|| theme::border_adaptive())
+                .bg(|| theme::card_adaptive())
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
@@ -907,8 +883,8 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>, clock: Signal<i64>) -> im
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(theme::border_default())
-                .bg(theme::background_card())
+                .border_color(|| theme::border_adaptive())
+                .bg(|| theme::card_adaptive())
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
@@ -1265,8 +1241,8 @@ fn actions_sheet(host: PairingHost) -> impl IntoElement {
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(theme::border_default())
-                .bg(theme::background_card())
+                .border_color(|| theme::border_adaptive())
+                .bg(|| theme::card_adaptive())
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event
