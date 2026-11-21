@@ -1014,14 +1014,17 @@ const AGENT_SESSION_VIEW_ALLOCATION_OVERHEAD: usize = 3;
 const AGENT_TIMELINE_TURN_WINDOW: u32 = 8;
 /// Upper bound on the payload cost of one window or history page.
 const AGENT_TIMELINE_WINDOW_BYTES: u32 = 1_048_576;
-/// How many pages a window may read before it starts on a turn boundary.
+/// How many pages a window may read to cover two turns.
 ///
-/// A page is capped by item count, and one running turn can exceed that cap on
-/// its own — a run with hundreds of tool calls is thousands of items. A window
-/// taken from the top then opens in the *middle* of the live turn, and a session
-/// with a long run behind it opens as a single partial turn until history loads
-/// under it. Reaching back to a turn boundary costs at most this many pages.
-const AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 8;
+/// A page is capped by item count *and* by bytes, and one running turn can
+/// exceed both on its own — a run with hundreds of tool calls is thousands of
+/// items, and its tool output makes the byte cap bite long before the item cap.
+/// A window taken from the top then opens in the *middle* of the live turn, or
+/// on its own start, which is one turn of a long conversation either way. The
+/// budget is what keeps that walk from turning into "read the session".
+const AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 64;
+/// How many items the two-turn walk may gather before it settles for what it has.
+const AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS: usize = 20_000;
 /// How much a resumed load may pull before re-opening beats patching.
 ///
 /// Resuming from a view a long background run left far behind would make the
@@ -3363,10 +3366,17 @@ where
     F: FnMut(i64) -> Fut,
     Fut: std::future::Future<Output = vibex_core::VibexResult<vibex_core::TimelinePage>>,
 {
+    // One boundary is not enough. A window that opens on the live turn's own
+    // start holds exactly one turn, and a session with a long run behind it then
+    // opens as that one turn until history loads under it — the same collapse as
+    // a window that opens inside the turn, which is why this walk asks for two
+    // boundaries: the live turn and the turn before it.
+    let mut boundaries = usize::from(page.starts_at_turn_start);
     let mut pages = 0;
-    while !page.starts_at_turn_start
+    while boundaries < 2
         && page.has_older
         && pages < AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES
+        && page.items.len() < AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS
     {
         let Some(start_sequence) = page.start_sequence else {
             break;
@@ -3380,8 +3390,12 @@ where
                 Err(_) => break,
             },
         };
+        let older_starts_at_turn_start = older.starts_at_turn_start;
         if !prepend_older_timeline_page(&mut page, older) {
             break;
+        }
+        if older_starts_at_turn_start {
+            boundaries += 1;
         }
         pages += 1;
     }
@@ -140539,7 +140553,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_window_opens_on_a_turn_boundary() {
+    async fn a_window_covers_the_live_turn_and_the_one_before_it() {
         let session_id = VibexSessionId::parse("session_turn_align").unwrap();
         let page = |start: i64, end: i64, has_older: bool, at_turn_start: bool| TimelinePage {
             session_id: session_id.clone(),
@@ -140555,46 +140569,54 @@ mod tests {
             omitted: None,
         };
 
-        // One running turn is bigger than a page, so the newest page opens in
-        // the middle of it. The walk reaches back to the page that opens the
-        // turn, and the window is a whole number of turns again.
+        // The page taken from the top is the live turn on its own: it already
+        // starts at a turn boundary, so a walk that stopped at the first
+        // boundary would install one turn of a long conversation. The walk
+        // reaches the *second* boundary — the turn before it — and the window is
+        // a transcript again.
         let reads = Rc::new(std::cell::Cell::new(0_usize));
         let counter = reads.clone();
         let window =
-            align_timeline_window_to_turn_start(page(500, 999, true, false), move |before| {
+            align_timeline_window_to_turn_start(page(1000, 1999, true, true), move |before| {
                 let counter = counter.clone();
                 async move {
                     counter.set(counter.get() + 1);
-                    Ok(page(before - 500, before - 1, false, true))
+                    match before {
+                        1000 => Ok(page(500, 999, true, false)),
+                        _ => Ok(page(0, 499, false, true)),
+                    }
                 }
             })
             .await;
-        assert_eq!(reads.get(), 1);
+        assert_eq!(reads.get(), 2);
         assert_eq!(window.start_sequence, Some(0));
         assert!(window.starts_at_turn_start);
-        assert_eq!(window.items.len(), 1000);
+        assert_eq!(window.items.len(), 2000);
 
-        // A walk that never reaches a boundary stops at the page budget instead
-        // of reading the whole session: the window is still usable, it just
-        // opens mid-turn until history is paged in under it.
+        // A walk that never reaches a second boundary stops at the page budget
+        // instead of reading the session: the window is still usable, it just
+        // opens inside the live turn until history is paged in under it.
         let reads = Rc::new(std::cell::Cell::new(0_usize));
         let counter = reads.clone();
-        let window =
-            align_timeline_window_to_turn_start(page(9000, 9999, true, false), move |before| {
+        let window = align_timeline_window_to_turn_start(
+            page(100_000, 100_999, true, true),
+            move |before| {
                 let counter = counter.clone();
                 async move {
                     counter.set(counter.get() + 1);
-                    Ok(page(before - 500, before - 1, true, false))
+                    Ok(page(before - 1000, before - 1, true, false))
                 }
-            })
-            .await;
-        assert_eq!(reads.get(), AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES);
-        assert!(!window.starts_at_turn_start);
+            },
+        )
+        .await;
+        assert!(reads.get() >= 2);
+        assert!(reads.get() <= AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES);
+        assert!(window.items.len() <= AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS + 1000);
 
-        // The oldest page of a session needs no walk at all.
+        // A session with nothing older needs no walk at all.
         let reads = Rc::new(std::cell::Cell::new(0_usize));
         let counter = reads.clone();
-        let window = align_timeline_window_to_turn_start(page(0, 9, false, false), move |before| {
+        let window = align_timeline_window_to_turn_start(page(0, 9, false, true), move |before| {
             let counter = counter.clone();
             async move {
                 counter.set(counter.get() + 1);
