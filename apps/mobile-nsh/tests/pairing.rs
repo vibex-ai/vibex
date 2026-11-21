@@ -84,9 +84,12 @@ fn settings_changes_the_language_and_survives_the_sheet() {
     let (mut app, _directory) = start();
     app.press("role:button[Settings]").unwrap();
     app.wait_for("Appearance").unwrap();
-    assert!(app.screen().shows("Language"));
-    app.press("简体中文").unwrap();
+    app.press("role:button[Language]").unwrap();
+    app.wait_for("简体中文").unwrap();
+    app.press("role:button[简体中文]").unwrap();
     // The whole surface is rebuilt in the chosen language, not just the row.
+    app.wait_for("语言").unwrap();
+    app.press("role:button[返回]").unwrap();
     app.wait_for("设置").unwrap();
     assert!(app.screen().shows("外观"));
     app.press("关闭").unwrap();
@@ -101,8 +104,10 @@ fn the_chosen_language_survives_a_restart() {
         let mut app = start_at(directory.path());
         app.press("role:button[Settings]").unwrap();
         app.wait_for("Appearance").unwrap();
-        app.press("简体中文").unwrap();
-        app.wait_for("设置").unwrap();
+        app.press("role:button[Language]").unwrap();
+        app.wait_for("简体中文").unwrap();
+        app.press("role:button[简体中文]").unwrap();
+        app.wait_for("语言").unwrap();
     }
     // The settings store is written on the engine's own thread; give it the
     // moment the next launch would have spent before it reads the page.
@@ -116,6 +121,8 @@ fn the_chosen_language_survives_a_restart() {
 fn settings_steps_the_text_size() {
     let (mut app, _directory) = start();
     app.press("role:button[Settings]").unwrap();
+    app.wait_for("Appearance").unwrap();
+    app.press("role:button[Appearance]").unwrap();
     app.wait_for("Text size").unwrap();
     app.press("role:button[Increase text size]").unwrap();
     app.wait_for("Large").unwrap();

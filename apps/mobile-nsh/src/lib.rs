@@ -32,6 +32,7 @@ use std::{rc::Rc, time::Duration};
 
 use nsh_core::{platform::Lifecycle, prelude::*};
 use pairing::PairingService;
+use vibex_nsh_ui::screens::settings::SettingsPage;
 use session::SessionService;
 use settings::SettingsState;
 use vibex_nsh_ui::screens::{
@@ -89,6 +90,7 @@ pub fn App() -> impl IntoElement {
     let connected = pairing.connected();
     let switcher = pairing.switcher();
     let settings_open = signal(false);
+    let settings_page = signal(SettingsPage::Root);
     let services = signal_with(None::<Rc<SessionService>>, SignalEquals::Never);
     let service_error = signal(None::<SharedString>);
     let boot_connection = signal(ConnectionState::Connecting);
@@ -97,18 +99,29 @@ pub fn App() -> impl IntoElement {
     install_service_effect(
         pairing.clone(),
         settings_open,
+        settings_page,
         services,
         service_error,
         boot_connection,
         attempt,
     );
-    start_back_poller(pairing.clone(), settings_open, services);
+    start_back_poller(pairing.clone(), settings_open, settings_page, services);
 
     let open_settings: Rc<dyn Fn()> = {
         let open = settings_open;
-        Rc::new(move || open.set(true))
+        let page = settings_page;
+        Rc::new(move || {
+            page.set(SettingsPage::Root);
+            open.set(true);
+        })
     };
-    let settings_host = settings_host(&pairing, &settings, settings_open, services);
+    let settings_host = settings_host(
+        &pairing,
+        &settings,
+        settings_open,
+        settings_page,
+        services,
+    );
 
     view()
         .flex_1()
@@ -222,6 +235,7 @@ fn settings_host(
     pairing: &PairingService,
     settings: &SettingsState,
     open: Signal<bool>,
+    page: Signal<SettingsPage>,
     services: Signal<Option<Rc<SessionService>>>,
 ) -> SettingsHost {
     let appearance = settings.appearance;
@@ -263,6 +277,7 @@ fn settings_host(
     let pairing_for_clear = pairing.clone();
     SettingsHost {
         open,
+        page,
         appearance,
         language,
         haptics,
@@ -367,6 +382,7 @@ fn settings_host(
 fn start_back_poller(
     pairing: PairingService,
     settings_open: Signal<bool>,
+    settings_page: Signal<SettingsPage>,
     services: Signal<Option<Rc<SessionService>>>,
 ) {
     spawn(async move {
@@ -403,7 +419,11 @@ fn start_back_poller(
             if pairing.overlay_open() {
                 pairing.close_overlay();
             } else if settings_open.get_untracked() {
-                settings_open.set(false);
+                if settings_page.get_untracked() == SettingsPage::Root {
+                    settings_open.set(false);
+                } else {
+                    settings_page.set(SettingsPage::Root);
+                }
             } else if switcher {
                 pairing.close_switcher();
             } else if let Some(service) = service {
@@ -419,6 +439,7 @@ fn start_back_poller(
 fn install_service_effect(
     pairing: PairingService,
     settings_open: Signal<bool>,
+    settings_page: Signal<SettingsPage>,
     services: Signal<Option<Rc<SessionService>>>,
     service_error: Signal<Option<SharedString>>,
     boot_connection: Signal<ConnectionState>,
@@ -474,7 +495,12 @@ fn install_service_effect(
             let pairing = pairing.clone();
             Rc::new(move || pairing.open_switcher())
         };
-        let open_settings: Rc<dyn Fn()> = { Rc::new(move || settings_open.set(true)) };
+        let open_settings: Rc<dyn Fn()> = {
+            Rc::new(move || {
+                settings_page.set(SettingsPage::Root);
+                settings_open.set(true);
+            })
+        };
         let runtime_renamed: Rc<dyn Fn(&str)> = {
             let pairing = pairing.clone();
             Rc::new(move |name: &str| pairing.rename_connected(name))
