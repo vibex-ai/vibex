@@ -185,9 +185,9 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeBack(
 ) -> jni::sys::jboolean {
     if crate::host::back_intercept() {
         crate::host::request_back();
-        1
+        true
     } else {
-        0
+        false
     }
 }
 

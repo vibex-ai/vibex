@@ -61,9 +61,9 @@ public final class MainActivity extends Activity {
             }
             int connectionService = NshHost.nativeTakeConnectionService();
             if (connectionService == 1) {
-                ConnectionService.start(this);
+                ConnectionService.start(MainActivity.this);
             } else if (connectionService == 0) {
-                ConnectionService.stop(this);
+                ConnectionService.stop(MainActivity.this);
             }
             int awake = NshHost.nativeTakeKeepScreenOn();
             if (awake == 1) {
@@ -103,7 +103,15 @@ public final class MainActivity extends Activity {
                 }
             }
         };
-        registerReceiver(updateReceiver, new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE));
+        IntentFilter downloads = new IntentFilter(DownloadManager.ACTION_DOWNLOAD_COMPLETE);
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            // Android 13+ requires an explicit export flag at registration time;
+            // the download manager's broadcast is a system broadcast, so the
+            // receiver stays unexported.
+            registerReceiver(updateReceiver, downloads, Context.RECEIVER_NOT_EXPORTED);
+        } else {
+            registerReceiver(updateReceiver, downloads);
+        }
         handler.post(poll);
     }
 
