@@ -48,7 +48,7 @@ const PAGE_GUTTER: f32 = 16.0;
 /// The gap between two cards.
 const CARD_GAP: f32 = 12.0;
 /// The corner radius of a card.
-const CARD_RADIUS: f32 = 16.0;
+const CARD_RADIUS: f32 = 18.0;
 /// The height of the title bar.
 const HEADER_HEIGHT: f32 = 56.0;
 /// The minimum height of a settings row.
@@ -344,8 +344,6 @@ fn runtime_summary(host: SettingsHost) -> impl IntoElement {
     button()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .border_1()
-        .border_color(theme::border_subtle)
         .bg(theme::background_card)
         .px(px(theme::SPACING_LG))
         .py(px(14.0))
@@ -905,8 +903,6 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             view()
                 .w_full()
                 .rounded(px(CARD_RADIUS))
-                .border_1()
-                .border_color(theme::border_subtle)
                 .bg(theme::background_card)
                 .px(px(16.0))
                 .py(px(14.0))
@@ -1039,8 +1035,6 @@ fn danger_card(confirm_clear: Signal<bool>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .border_1()
-        .border_color(theme::border_subtle)
         .bg(theme::background_card)
         .overflow_hidden()
         .child(
@@ -1186,8 +1180,6 @@ fn plain_card(rows: Vec<AnyElement>) -> impl IntoElement {
     view()
         .w_full()
         .rounded(px(CARD_RADIUS))
-        .border_1()
-        .border_color(theme::border_subtle)
         .bg(theme::background_card)
         .overflow_hidden()
         .child(view().w_full().flex_col().children(rows))
@@ -1611,7 +1603,6 @@ fn footer_note(message: &'static str) -> impl IntoElement {
 fn section_label(label: &'static str) -> impl IntoElement {
     text(label)
         .w_full()
-        .px(px(4.0))
         .py(px(8.0))
         .text_size(px(theme::font_micro()))
         .font_weight(FontWeight::MEDIUM)
