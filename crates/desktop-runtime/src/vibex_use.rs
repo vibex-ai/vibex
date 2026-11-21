@@ -3557,6 +3557,18 @@ impl VibexUseService {
                 }
             };
         let execution = self.accepted_execution(&conn, &submission_id)?;
+        // Admission reopened the task for another round. The parent's card is a
+        // separate row, so it has to follow the task back to work instead of
+        // keeping the previous round's finished state until dispatch redraws it.
+        if let Some(task) = task.as_ref()
+            && let Err(error) = self.manager.sync_agent_delegation_card(&task.id)
+        {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "reopened task card update failed"
+            );
+        }
         self.record_operation_resource(
             &conn,
             &operation,
@@ -3873,6 +3885,17 @@ impl VibexUseService {
             accepted,
             summary.as_deref(),
         )?;
+        // Acceptance settles the task in its own transaction. The card the
+        // parent reads is a separate timeline row, so it has to be drawn from
+        // the phase the acceptance just wrote or the badge keeps whatever the
+        // last round left behind.
+        if let Err(error) = self.manager.sync_agent_delegation_card(&finished.id) {
+            tracing::warn!(
+                target: "vibex_desktop",
+                error_code = %error.code,
+                "accepted task card update failed"
+            );
+        }
         self.notify_progress();
         Ok(serde_json::json!({
             "taskRef": VibexUseRef::task(&finished.id).as_uri(),

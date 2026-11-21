@@ -103,6 +103,11 @@ evidence; old taskless causal task identity may remain unknown. Existing tasks r
 - Save fixed result ranges. Late observers cannot finish/replace a newer round. Preserve `completed`, `actions_only`,
   `empty_reply`, `refusal`, `max_tokens`, `auth_required`, `cancelled`, `failed`, and `ambiguous` outcomes
   independently.
+- The parent timeline card is a projection, not the record: the phase lives in `agent_delegations`, while the card is a
+  separate `collaboration` row keyed by `provider_correlation_id = delegation_id`. Draw its status from the phase and
+  rewrite it whenever the phase moves (settlement, acceptance/rejection, cancellation, follow-up admission, restart
+  reconciliation); `awaiting_review` is finished work, not `progress`. A writer that would only repeat the newest card
+  skips the append.
 - Authority assigns `MessageProvenance`; do not infer it from text. Requested and effective runtime summaries differ;
   dispatch records effective binding identity.
 - Fingerprint the complete semantic payload. Same key/payload reuses resources; changed payload conflicts. Checkpoint
@@ -275,10 +280,11 @@ actual stable error/capability.
 | --- | --- |
 | [DB budget/cancellation](../../../crates/db/src/vibex_use/budget_tests.rs) | Cross-connection admission, reservation consumption, deadlines, unknown/overflow usage, saved cross-root origin; cascade true/false captures taskless work correctly, excludes foreign children, fences new work, waits for all rounds, and retains ambiguous cancellation/control. |
 | [DB domain](../../../crates/db/src/vibex_use.rs) | Phase/status, idempotency races, immutable ranges, unique ownership, controller CAS, delivery-before-ACK. |
+| [Timeline store](../../../crates/db/src/lib.rs) | The newest row of one `provider_correlation_id` is the card a writer compares against; an older card never answers "already stated". |
 | [Runtime integration](../../../crates/desktop-runtime/src/vibex_use/integration_tests.rs) | Independent rounds/stale settlement; review release; delivery `Success`/`Reused`; all 61 backlog events survive; nonzero-cursor failures; scope, grouping, manual revision, and recovery. |
 | [Reads](../../../crates/desktop-runtime/src/vibex_use/read.rs) | Frozen snapshots, lossless Unicode, explicit windows exclude neighbors, resources stay source-bound. |
 | [Transport](../../../crates/agent/src/delegation/tests.rs) / [framing](../../../crates/agent/src/delegation/framing.rs) | Credentials/revocation, concurrent waits, cancellation/ID reuse, capacity/partial frames, exact post-flush receipts, ACK responsiveness, fail-closed aliases. |
-| [Manager recovery](../../../crates/agent/src/manager/delegation_recovery_tests.rs) | Saved creation/runtime checkpoints, cancelled spawn, dispatch revisions, expired queued input; stop retries cannot interrupt unrelated work or report interrupt ACK as settlement. |
+| [Manager recovery](../../../crates/agent/src/manager/delegation_recovery_tests.rs) | Saved creation/runtime checkpoints, cancelled spawn, dispatch revisions, expired queued input; stop retries cannot interrupt unrelated work or report interrupt ACK as settlement. A settled round draws its parent card from the phase (`awaiting_review` and later read finished), and a card that already states the phase is not rewritten. |
 | [Human team](../../../crates/desktop-runtime/src/vibex_use/team_tests.rs) | Mention ranges/runtime, revoke-safe retry, taskless human takeover, explicit handback, stale queued-input rejection, old human replay, foreign task-owner guard, navigation pages, atomic independent inbox ACK, manual presentation recovery. |
 | [Remote](../../../crates/remote/src/lib.rs) / [shared UI](../../../crates/vibex-ui/src/team.rs) / [desktop](../../../apps/desktop/src/team_tests.rs) | Device permission/trusted identity; bounded/stale loads, separate cursors, retained members, correct pane runtime/actions, four live conversations. |
 | [Layout](../../../crates/desktop-model/src/session_group.rs) / [policy](../../../crates/core/src/vibex_use/budget.rs) | Width adaptation/selected tab/manual ownership; preset overrides and invalid ranges. |

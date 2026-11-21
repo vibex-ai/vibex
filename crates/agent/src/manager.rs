@@ -2561,6 +2561,18 @@ impl AgentManager {
                     vibex_db::settle_vibex_use_execution(&mut self.open_migrated()?, &execution)?;
                 }
             }
+            // A task that settled just before a crash may have written its row
+            // and its event but never its card, which leaves the parent reading
+            // the last card it holds — the one that said the child was still
+            // working. Repairing it here is what makes a restart enough to
+            // clear that badge, without a second event from the child.
+            if let Err(error) = self.sync_agent_delegation_card(&delegation.id) {
+                tracing::warn!(
+                    target: "vibex_agent",
+                    error_code = %error.code,
+                    "recovered task card update failed"
+                );
+            }
             let kind = match delegation.phase() {
                 DelegationTaskPhase::Completed => DelegationTaskEventKind::TaskFinished,
                 DelegationTaskPhase::Cancelled => DelegationTaskEventKind::TaskCancelled,
@@ -2719,42 +2731,68 @@ impl AgentManager {
         Ok(selection)
     }
 
+    /// Appends the parent-visible card for one task.
+    ///
+    /// The card is drawn from the phase, never from the compatibility `status`
+    /// a caller may have read before a later transition moved the task on.
     fn append_delegation_timeline(
         &self,
         conn: &mut DbConnection,
         delegation: &AgentDelegation,
-        summary: Option<&str>,
     ) -> VibexResult<TimelineItem> {
-        // The phase is the fact; `status` is the compatibility projection a
-        // caller may have read before a later transition moved the task on. A
-        // card is redrawn from whichever snapshot the caller holds, so it has
-        // to be drawn from the one column every transition writes.
-        let phase = delegation.phase();
-        let status_text = summary
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS))
-            .unwrap_or_else(|| delegation_status_summary_for_phase(phase));
         self.append_timeline_item(
             conn,
             &delegation.parent_session_id,
             TimelineSource::System,
-            TimelinePayload::Collaboration(vibex_core::CollaborationPayload {
-                action: "delegate_to_agent".to_string(),
-                status: delegation_tool_status_for_phase(phase),
-                summary: format!("{}: {}", delegation.title, status_text),
-                agent_label: delegation
-                    .effective_agent_id
-                    .as_ref()
-                    .map(ToString::to_string),
-                delegation_id: Some(delegation.id.clone()),
-                child_session_id: delegation.child_session_id.clone(),
-                raw_extension: None,
-            }),
+            TimelinePayload::Collaboration(delegation_collaboration_payload(delegation)),
             None,
             Some(delegation.id.as_str()),
             TimelineRedactionState::None,
         )
+    }
+
+    /// Rewrites the parent-visible card for one task when it no longer states
+    /// the task's phase.
+    ///
+    /// A task and its card are two durable rows, and a phase can move without a
+    /// card writer running: acceptance, cancellation and a recovered terminal
+    /// task all settle the task without touching the parent timeline. The
+    /// reader then keeps the last card it was given — which said the child was
+    /// still working — for a task that already finished. Every writer that
+    /// moves a phase calls this after its commit, and
+    /// [`Self::reconcile_agent_delegations`] calls it so a card that was
+    /// already stale on disk is repaired on the next start.
+    ///
+    /// `Ok(None)` means the timeline already agrees and nothing was written.
+    pub fn sync_agent_delegation_card(
+        &self,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Option<TimelineItem>> {
+        self.sync_agent_delegation_card_on(&mut self.open_migrated()?, delegation_id)
+    }
+
+    fn sync_agent_delegation_card_on(
+        &self,
+        conn: &mut DbConnection,
+        delegation_id: &AgentDelegationId,
+    ) -> VibexResult<Option<TimelineItem>> {
+        let Some(delegation) = AgentDelegationRepository::get(conn, delegation_id)? else {
+            return Ok(None);
+        };
+        let expected = delegation_collaboration_payload(&delegation);
+        let newest = TimelineRepository::latest_by_provider_correlation(
+            conn,
+            &delegation.parent_session_id,
+            delegation.id.as_str(),
+        )?;
+        let stated = newest.as_ref().and_then(|item| match &item.payload {
+            TimelinePayload::Collaboration(current) => Some(current),
+            _ => None,
+        });
+        if stated == Some(&expected) {
+            return Ok(None);
+        }
+        self.append_delegation_timeline(conn, &delegation).map(Some)
     }
 
     fn update_agent_delegation_status(
@@ -2798,24 +2836,8 @@ impl AgentManager {
                 )
             });
         };
-        let _ = self.append_delegation_timeline(
-            &mut conn,
-            &updated,
-            updated
-                .result_summary
-                .as_deref()
-                .or(updated.error_code.as_deref()),
-        )?;
+        let _ = self.sync_agent_delegation_card_on(&mut conn, &updated.id)?;
         Ok(updated)
-    }
-
-    /// Reads one delegation without going through the parent-scoped lookup.
-    fn get_agent_delegation_by_id(
-        &self,
-        delegation_id: &AgentDelegationId,
-    ) -> VibexResult<Option<AgentDelegation>> {
-        let conn = self.open_migrated()?;
-        AgentDelegationRepository::get(&conn, delegation_id)
     }
 
     /// Reads the pending request, if any, that a child session is waiting on.
@@ -2902,6 +2924,25 @@ impl AgentManager {
         }
         let settled = vibex_db::settle_vibex_use_execution(&mut conn, &execution)?;
         self.execution_progress.notify_waiters();
+        // The settlement moved the task's phase in its own transaction; the
+        // parent's card is a second row that nothing else redraws. Every
+        // settlement path — the observer, an interrupt, a recovered round —
+        // comes through here, so this is where the card is brought up to the
+        // phase it now stands on.
+        if let Some(task_id) = settled
+            .as_ref()
+            .and_then(|execution| execution.task_ref.as_ref())
+            .and_then(VibexUseRef::task_id)
+            && let Err(error) = self.sync_agent_delegation_card(&task_id)
+        {
+            // A card is a projection, not the record: a failure to draw it must
+            // not turn a settled round into a failed one.
+            tracing::warn!(
+                target: "vibex_agent",
+                error_code = %error.code,
+                "settled task card update failed"
+            );
+        }
         Ok(settled)
     }
 
@@ -8355,10 +8396,19 @@ fn delegation_tool_status_for_phase(phase: DelegationTaskPhase) -> vibex_core::T
         }
         // A stopping task is still occupied: its execution has not settled, so
         // it is not a failure yet. Only the confirmed stop turns the card.
-        DelegationTaskPhase::Active
-        | DelegationTaskPhase::AwaitingReview
-        | DelegationTaskPhase::Cancelling => vibex_core::ToolCallStatus::Progress,
-        DelegationTaskPhase::Completed => vibex_core::ToolCallStatus::Completed,
+        DelegationTaskPhase::Active | DelegationTaskPhase::Cancelling => {
+            vibex_core::ToolCallStatus::Progress
+        }
+        // A round that ended is finished work even while the owner decides
+        // whether to accept it: the child has stopped, its session is idle, and
+        // the rail already shows it as completed. Reading `awaiting_review` as
+        // still working is what left the card spinning and the composer's
+        // "background work" strip up for a child that was no longer running.
+        // The summary carries the review state ("Task awaiting review"); the
+        // badge only has to say whether work is still arriving.
+        DelegationTaskPhase::AwaitingReview | DelegationTaskPhase::Completed => {
+            vibex_core::ToolCallStatus::Completed
+        }
         DelegationTaskPhase::Failed | DelegationTaskPhase::Cancelled => {
             vibex_core::ToolCallStatus::Failed
         }
@@ -8375,6 +8425,54 @@ fn delegation_status_summary_for_phase(phase: DelegationTaskPhase) -> String {
         DelegationTaskPhase::Completed => "Task completed".to_string(),
         DelegationTaskPhase::Failed => "Task failed".to_string(),
         DelegationTaskPhase::Cancelled => "Task cancelled".to_string(),
+    }
+}
+
+/// The payload of the parent-visible card for one task.
+///
+/// The card states the phase and nothing a reader has to interpret: its status
+/// is what the reader's badge shows, so a task that finished must not be
+/// written as [`vibex_core::ToolCallStatus::Progress`]. Two writers compare
+/// payloads to decide whether a card still needs to be drawn, so this is the
+/// one place the card's shape is built.
+fn delegation_collaboration_payload(
+    delegation: &AgentDelegation,
+) -> vibex_core::CollaborationPayload {
+    let phase = delegation.phase();
+    // A round that ended has a conclusion worth showing; the phase only says
+    // what happened to the round, not what it found. A live round has no
+    // conclusion of its own yet, so it says where it stands — carrying the
+    // previous round's result there would read as work still arriving.
+    let settled = matches!(
+        phase,
+        DelegationTaskPhase::AwaitingReview
+            | DelegationTaskPhase::Completed
+            | DelegationTaskPhase::Failed
+            | DelegationTaskPhase::Cancelled
+    );
+    let status_text = settled
+        .then(|| {
+            delegation
+                .result_summary
+                .as_deref()
+                .or(delegation.error_code.as_deref())
+        })
+        .flatten()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| bounded_text(value, MAX_AGENT_DELEGATION_SUMMARY_CHARS))
+        .unwrap_or_else(|| delegation_status_summary_for_phase(phase));
+    vibex_core::CollaborationPayload {
+        action: "delegate_to_agent".to_string(),
+        status: delegation_tool_status_for_phase(phase),
+        summary: format!("{}: {}", delegation.title, status_text),
+        agent_label: delegation
+            .effective_agent_id
+            .as_ref()
+            .map(ToString::to_string),
+        delegation_id: Some(delegation.id.clone()),
+        child_session_id: delegation.child_session_id.clone(),
+        raw_extension: None,
     }
 }
 
@@ -8652,6 +8750,45 @@ mod tests {
         assert_eq!(
             super::delegation_status_summary_for_phase(DelegationTaskPhase::Cancelled),
             "Task cancelled"
+        );
+    }
+
+    /// A round the child already finished is not work still arriving.
+    ///
+    /// `awaiting_review` is a non-terminal task phase: the compatibility status
+    /// stays `running`, and reading it as live kept the card's "Working" badge
+    /// and the composer's background-work strip up while the child session was
+    /// idle and its rail row already said completed. The badge reports whether
+    /// work is still arriving; whether an owner has yet accepted the round is
+    /// the summary's job and the team's review count.
+    #[test]
+    fn a_round_awaiting_review_is_a_finished_card_not_a_working_one() {
+        assert_eq!(
+            super::delegation_tool_status_for_phase(DelegationTaskPhase::AwaitingReview),
+            vibex_core::ToolCallStatus::Completed
+        );
+        let delegation = AgentDelegation::single_turn_legacy(
+            VibexSessionId::new(),
+            "awaiting-review-card",
+            "Review",
+            "Check the change",
+            Some(AgentId::parse("codex").unwrap()),
+            AgentDelegationStatus::Starting,
+            1,
+        );
+        let mut delegation = delegation;
+        delegation.phase = DelegationTaskPhase::AwaitingReview;
+        delegation.result_summary = Some("Reviewed the change".to_string());
+        let payload = super::delegation_collaboration_payload(&delegation);
+        assert_eq!(payload.status, vibex_core::ToolCallStatus::Completed);
+        assert_eq!(payload.summary, "Review: Reviewed the change");
+
+        // The status is what the reader draws; a payload that says completed is
+        // also what keeps the card from being rewritten on every pass.
+        delegation.phase = DelegationTaskPhase::Completed;
+        assert_eq!(
+            super::delegation_collaboration_payload(&delegation),
+            payload
         );
     }
 

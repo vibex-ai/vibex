@@ -626,6 +626,94 @@ async fn cancellation_during_creation_keeps_the_fence_and_creates_no_child_or_ro
     assert_eq!(SessionRepository::list(&conn, false).unwrap().len(), 1);
 }
 
+/// The card the parent reads follows the task into `awaiting_review`.
+///
+/// A round that ended is settled durable state, but the parent's card is a
+/// second row: without a write here the reader keeps the last card it was
+/// given — `progress` — and its badge says the child is still working while the
+/// child's own session is idle and its rail row says completed. The card has
+/// to move on the settlement itself, before any owner accepts the task.
+#[tokio::test]
+async fn a_settled_round_leaves_its_parent_card_finished_not_working() {
+    let fixture = DelegationFixture::new().await;
+    let manager = fixture.harness.manager();
+    let first = manager
+        .create_task_delegation(fixture.request("settled-card"))
+        .await
+        .unwrap();
+    let task = fixture.wait_for_task(&first.delegation.id).await;
+    assert_eq!(task.phase(), DelegationTaskPhase::AwaitingReview);
+
+    let conn = manager.open_migrated().unwrap();
+    // The phase and the card commit separately — the phase in the settlement's
+    // transaction, the card right after it — so the assertion waits for the
+    // card rather than racing the writer that draws it.
+    let card = wait_for(|| {
+        let card = vibex_db::TimelineRepository::latest_by_provider_correlation(
+            &conn,
+            &fixture.parent.id,
+            task.id.as_str(),
+        )
+        .unwrap()?;
+        let TimelinePayload::Collaboration(collaboration) = &card.payload else {
+            return None;
+        };
+        (collaboration.status == vibex_core::ToolCallStatus::Completed).then_some(card)
+    })
+    .await;
+    let TimelinePayload::Collaboration(collaboration) = &card.payload else {
+        panic!("the parent card must be a collaboration item, got {:?}", card.kind);
+    };
+    assert_eq!(
+        collaboration.status,
+        vibex_core::ToolCallStatus::Completed,
+        "a round awaiting review is finished work, not work still arriving"
+    );
+    assert_eq!(
+        collaboration.delegation_id.as_ref(),
+        Some(&task.id),
+        "the card has to stay addressable as this task's card"
+    );
+
+    // The acceptance that follows settles the task again; it must not put the
+    // card back into a working state, and the finished phase keeps it.
+    let accepted = vibex_db::finish_delegation_task(
+        &mut manager.open_migrated().unwrap(),
+        &task.id,
+        Some(task.revision),
+        true,
+        Some("Accepted after review"),
+    )
+    .unwrap();
+    assert_eq!(accepted.phase(), DelegationTaskPhase::Completed);
+    manager.sync_agent_delegation_card(&task.id).unwrap();
+    let conn = manager.open_migrated().unwrap();
+    let card = vibex_db::TimelineRepository::latest_by_provider_correlation(
+        &conn,
+        &fixture.parent.id,
+        task.id.as_str(),
+    )
+    .unwrap()
+    .unwrap();
+    let TimelinePayload::Collaboration(collaboration) = &card.payload else {
+        panic!("the parent card must be a collaboration item");
+    };
+    assert_eq!(
+        collaboration.status,
+        vibex_core::ToolCallStatus::Completed,
+        "acceptance keeps the card finished"
+    );
+    assert!(
+        collaboration.summary.contains("Accepted after review"),
+        "the acceptance summary is the accepted card's own text: {}",
+        collaboration.summary
+    );
+    assert!(
+        manager.sync_agent_delegation_card(&task.id).unwrap().is_none(),
+        "a card that already states the phase is not rewritten on every pass"
+    );
+}
+
 #[tokio::test]
 async fn dispatch_records_effective_runtime_without_overwriting_the_controller_revision() {
     let fixture = DelegationFixture::new().await;

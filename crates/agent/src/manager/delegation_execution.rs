@@ -76,6 +76,19 @@ impl AgentManager {
             &summary,
             u64::try_from(state.selection_revision).unwrap_or_default(),
         )?;
+        // A follow-up round reopens a task that was awaiting review. The
+        // admission already moved the phase back to `active` in the ledger, so
+        // the parent's card has to say work is running again instead of
+        // holding the previous round's finished state.
+        if let Some(task_id) = execution.task_ref.as_ref().and_then(VibexUseRef::task_id)
+            && let Err(error) = self.sync_agent_delegation_card(&task_id)
+        {
+            tracing::warn!(
+                target: "vibex_agent",
+                error_code = %error.code,
+                "delegation card update at dispatch failed"
+            );
+        }
         self.observability.observe_duration_ms(
             RuntimeMetricName::DelegationQueueWait,
             None,
@@ -185,7 +198,19 @@ impl AgentManager {
                 VibexError::storage("vibex_use_execution_missing", "execution was not found")
             })?;
         if execution.is_settled() {
+            // Replaying a settled round still folds the seeded task phase (the
+            // process may have died between the two commits), so the parent's
+            // card is drawn from it afterwards like any other settlement.
             vibex_db::settle_vibex_use_execution(&mut self.open_migrated()?, &execution)?;
+            if let Some(task_id) = execution.task_ref.as_ref().and_then(VibexUseRef::task_id)
+                && let Err(error) = self.sync_agent_delegation_card(&task_id)
+            {
+                tracing::warn!(
+                    target: "vibex_agent",
+                    error_code = %error.code,
+                    "settled task card update failed"
+                );
+            }
             return Ok(());
         }
         let coordinator = self
@@ -244,13 +269,10 @@ impl AgentManager {
             }
         };
         let (outcome, summary) = classify_execution(items.iter().map(|item| &item.payload));
+        // The settlement draws the parent's card from the phase it writes, so
+        // the round can no longer be read as still running even when nobody
+        // accepts the task afterwards.
         self.settle_execution_by_id(id, outcome, Some("end_turn"), summary.as_deref())?;
-        if let Some(task_id) = execution.task_ref.as_ref().and_then(VibexUseRef::task_id)
-            && let Some(task) = self.get_agent_delegation_by_id(&task_id)?
-        {
-            let mut conn = self.open_migrated()?;
-            self.append_delegation_timeline(&mut conn, &task, task.result_summary.as_deref())?;
-        }
         Ok(())
     }
 }

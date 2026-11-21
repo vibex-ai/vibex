@@ -117,6 +117,17 @@ impl AgentManager {
         tx.commit().map_err(|error| {
             VibexError::storage("agent_delegation_cancel_failed", error.to_string())
         })?;
+        // The stop is confirmed, so the card has to stop saying the child is
+        // still occupied. Without this the reader keeps a spinner for a task
+        // the ledger already calls cancelled. The stop itself is already
+        // committed, so a card that failed to draw is reported, not raised.
+        if let Err(error) = self.sync_agent_delegation_card(&fenced.id) {
+            tracing::warn!(
+                target: "vibex_agent",
+                error_code = %error.code,
+                "cancelled task card update failed"
+            );
+        }
         self.get_agent_delegation(&request.parent_session_id, &fenced.id)
     }
 

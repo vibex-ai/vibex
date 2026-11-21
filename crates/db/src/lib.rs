@@ -9355,6 +9355,38 @@ impl TimelineRepository {
         }
     }
 
+    /// The newest item one provider correlation names in a session.
+    ///
+    /// A managed child Agent keeps one card per parent session and every task
+    /// transition writes a newer one, so "what does the parent already show for
+    /// this task" is the newest row under the task's own correlation id. A
+    /// writer that would only repeat that row can skip the append and leave the
+    /// timeline alone.
+    pub fn latest_by_provider_correlation(
+        conn: &Connection,
+        session_id: &VibexSessionId,
+        provider_correlation_id: &str,
+    ) -> VibexResult<Option<TimelineItem>> {
+        conn.query_row(
+            "
+            SELECT session_id, sequence, timeline_item_id, kind, source, timestamp_ms,
+                correlation_id, provider_correlation_id, payload_json, redaction_state,
+                execution_attribution_json
+            FROM agent_timeline_items
+            WHERE session_id = ?1 AND provider_correlation_id = ?2
+            ORDER BY sequence DESC
+            LIMIT 1
+            ",
+            params![session_id.as_str(), provider_correlation_id],
+            map_timeline_item,
+        )
+        .optional()
+        .map_err(storage_err(
+            "timeline_provider_correlation_read_failed",
+            "failed to read the newest item by provider correlation id",
+        ))
+    }
+
     /// How many user turns a session's timeline is made of.
     ///
     /// One user-message row opens one conversational turn, so the count is the
@@ -24746,6 +24778,83 @@ mod tests {
         };
         assert_eq!(stored.status, vibex_core::ToolCallStatus::Completed);
         assert_eq!(stored.summary, "done");
+
+        cleanup_db(temp);
+    }
+
+    /// Reads back the newest row one provider correlation names.
+    ///
+    /// A managed child Agent keeps one card per parent session and every task
+    /// transition writes a newer one, so a writer that would only repeat the
+    /// newest row needs this read to tell "already stated" from "needs a
+    /// write". The read has to be the newest row, not any row: an older card
+    /// still says the child was working.
+    #[test]
+    fn the_newest_row_of_a_provider_correlation_is_the_one_that_is_read() {
+        let (temp, mut conn, session, first_sequence) =
+            seed_session_for_coalescing("correlation-newest");
+        let card = |status: vibex_core::ToolCallStatus, summary: &str| {
+            TimelinePayload::Collaboration(vibex_core::CollaborationPayload {
+                action: "delegate_to_agent".to_string(),
+                status,
+                summary: summary.to_string(),
+                agent_label: Some("Reviewer".to_string()),
+                delegation_id: Some(
+                    vibex_core::AgentDelegationId::parse("delegation_fixture").unwrap(),
+                ),
+                child_session_id: Some(VibexSessionId::parse("session_child").unwrap()),
+                raw_extension: None,
+            })
+        };
+        assert!(
+            TimelineRepository::latest_by_provider_correlation(
+                &conn,
+                &session.id,
+                "delegation_fixture"
+            )
+            .unwrap()
+            .is_none(),
+            "a correlation the session never wrote has no row"
+        );
+
+        let started = TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::System,
+            card(
+                vibex_core::ToolCallStatus::Started,
+                "Starting child session",
+            ),
+            None,
+            Some("delegation_fixture"),
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let finished = TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::System,
+            card(vibex_core::ToolCallStatus::Completed, "Reviewed the change"),
+            None,
+            Some("delegation_fixture"),
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        assert!(finished.sequence > started.sequence);
+        assert!(finished.sequence > first_sequence);
+
+        let newest = TimelineRepository::latest_by_provider_correlation(
+            &conn,
+            &session.id,
+            "delegation_fixture",
+        )
+        .unwrap()
+        .expect("the correlation was written twice");
+        assert_eq!(newest.sequence, finished.sequence);
+        let TimelinePayload::Collaboration(stored) = newest.payload else {
+            panic!("the row is the card's");
+        };
+        assert_eq!(stored.status, vibex_core::ToolCallStatus::Completed);
 
         cleanup_db(temp);
     }
