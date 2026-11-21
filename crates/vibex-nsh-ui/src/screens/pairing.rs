@@ -23,8 +23,8 @@ use crate::{
     ui::{action, brand, field},
 };
 
-/// The page's top padding above the wordmark, matching the GPUI client.
-const PAGE_TOP_PAD: f32 = 88.0;
+/// The page's top padding above the wordmark.
+const PAGE_TOP_PAD: f32 = 112.0;
 /// The switcher opens over a live connection and carries no wordmark, so its
 /// rows start one step under the back button.
 const SWITCHER_TOP_PAD: f32 = 56.0;
