@@ -33,6 +33,16 @@ Streaming presentation buffers:
   incremental Terminal parser/buffer before any returned frames are applied. Treat
   those frames as the new base and adopt the batch's `next_sequence`; never append
   across a server cursor rewind, an evicted frame gap, or a dropped-frame increase.
+- NSH polls remote terminal subscriptions on the process Tokio runtime, not on
+  the renderer's executor. Deliver batches to the mounted emulator through a
+  bounded channel, cancel the old stream on reattach, and forward the last
+  measured grid size even if layout ran before the remote terminal was ready.
+
+Sidebar revisions are content hashes, not increasing counters. Clients may
+pass a displayed revision as a precondition for relative moves, but must not
+discard a returned snapshot because its hash is numerically smaller. The NSH
+client serializes snapshot reads and mutations and preserves the latest local
+hierarchy choice while its absolute mutation is in flight.
 
 Persisted preferences:
 - Theme, layout sizes, sidebar collapsed state, recent projects, local display

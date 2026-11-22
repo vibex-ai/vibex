@@ -1,4 +1,4 @@
-//! The new-session sheet: pick a workspace and a runtime, then start.
+//! The new-session page: pick a workspace and a runtime, then start.
 //!
 //! The options come from the runtime itself (`list_workspaces` and
 //! `list_runtime_options`): a workspace names the project it belongs to and
@@ -8,7 +8,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::{SheetEvent, button, sheet};
+use nsh_base::{SheetEvent, button, input, sheet};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::screens::session::{AttachmentItem, BrowseDirs};
@@ -21,7 +21,10 @@ pub struct DirectoryEntry {
     pub name: String,
     pub path: String,
 }
-use crate::{copy, theme, ui::action};
+use crate::{
+    copy, theme,
+    ui::{action, brand, field, sheet as chrome},
+};
 
 /// A workspace the new session can live in.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -39,10 +42,9 @@ pub struct RuntimeChoice {
     pub detail: String,
 }
 
-/// What the sheet may do, and the state it shows.
+/// What the page may do, and the state it shows.
 #[derive(Clone)]
 pub struct NewSessionHost {
-    pub open: Signal<bool>,
     pub workspaces: Signal<Vec<WorkspaceChoice>>,
     pub runtimes: Signal<Vec<RuntimeChoice>>,
     /// The chosen workspace's id.
@@ -67,134 +69,364 @@ pub struct NewSessionHost {
     pub on_create_worktree: Rc<dyn Fn()>,
 }
 
-/// The sheet.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+enum Location {
+    #[default]
+    Workspace,
+    Worktree,
+    Temporary,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Picker {
+    Location,
+    Runtime,
+    Attachment,
+}
+
+/// The full-screen first-message composer and its choice sheets.
 pub fn new_session(host: NewSessionHost) -> impl IntoElement {
-    let open = host.open;
+    let picker = signal(None::<Picker>);
+    let location = signal(Location::Workspace);
     let error = host.error;
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = event {
-                open.set(*next);
-            }
+    let busy = host.busy;
+    let workspace = host.workspace;
+    let workspaces = host.workspaces;
+    let runtime = host.runtime;
+    let runtimes = host.runtimes;
+    let workspace_label = move || {
+        if location.get() == Location::Temporary {
+            return copy::text("Temporary session", "临时会话", "暫時工作階段").to_owned();
+        }
+        workspaces.with(|choices| {
+            workspace
+                .with(|selected| {
+                    choices
+                        .iter()
+                        .find(|choice| selected.as_ref() == Some(&choice.id))
+                })
+                .map(|choice| choice.name.clone())
+                .unwrap_or_else(|| copy::text("Choose project", "选择项目", "選擇專案").to_owned())
         })
+    };
+    let runtime_label = move || {
+        runtimes.with(|choices| {
+            runtime
+                .with(|selected| {
+                    choices
+                        .iter()
+                        .find(|choice| selected.as_ref() == Some(&choice.id))
+                })
+                .map(|choice| choice.title.clone())
+                .unwrap_or_else(|| {
+                    copy::text("Agent and model", "Agent 与模型", "Agent 與模型").to_owned()
+                })
+        })
+    };
+    let close = host.on_close.clone();
+    let prompt = host.prompt;
+    let branch = host.worktree_branch;
+    let can_create = move || {
+        !busy.get()
+            && runtime.with(Option::is_some)
+            && match location.get() {
+                Location::Temporary => true,
+                Location::Workspace => workspace.with(Option::is_some),
+                Location::Worktree => {
+                    workspace.with(Option::is_some) && branch.with(|name| !name.trim().is_empty())
+                }
+            }
+    };
+    view()
+        .absolute()
+        .inset(px(0.0))
+        .flex_col()
+        .bg(theme::background)
+        .pt_safe_area()
+        .pb_keyboard()
+        .child(chrome::sheet_header(
+            copy::text("New session", "新建会话", "新增工作階段"),
+            move || {
+                dismiss_keyboard();
+                close();
+            },
+        ))
+        .child(
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .overflow_hidden()
+                .justify_center()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(brand::wordmark())
+                .child(
+                    text(workspace_label)
+                        .w_full()
+                        .text_center()
+                        .px(px(theme::SPACING_LG))
+                        .truncate()
+                        .text_size(px(theme::font_caption()))
+                        .text_color(theme::text_muted),
+                ),
+        )
         .child(
             view()
                 .w_full()
+                .flex_shrink_0()
                 .gap(px(theme::SPACING_SM))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("New session", "新建会话", "新增工作階段"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(crate::ui::field::text_field(
-                    host.title,
-                    copy::text("Title (optional)", "标题（可选）", "標題（選填）"),
-                ))
-                .child(crate::ui::field::text_field(
-                    host.prompt,
-                    copy::text(
-                        "First message (optional)",
-                        "第一条消息（可选）",
-                        "第一則訊息（選填）",
-                    ),
-                ))
-                .child(new_session_attachments(
-                    host.attachments,
-                    host.on_attach_image.clone(),
-                    host.on_attach_file.clone(),
-                    host.on_remove_attachment.clone(),
-                ))
-                .child(section_label(copy::text("Workspace", "工作区", "工作區")))
-                .child(choice_list(
-                    host.workspaces,
-                    host.workspace,
-                    |choice| choice.id.clone(),
-                    |choice| (choice.name.clone(), choice.detail.clone()),
-                ))
-                .child(section_label(copy::text(
-                    "New worktree",
-                    "新建 Worktree",
-                    "新增 Worktree",
-                )))
-                .child(
-                    view()
-                        .w_full()
-                        .flex_row()
-                        .items_end()
-                        .gap(px(theme::SPACING_SM))
-                        .child(crate::ui::field::text_field(
-                            host.worktree_branch,
-                            copy::text("Branch name", "分支名", "分支名稱"),
-                        ))
-                        .child({
-                            let on_create_worktree = host.on_create_worktree.clone();
-                            action::secondary(
-                                copy::text("Create worktree", "创建 Worktree", "建立 Worktree"),
-                                icon(include_str!("../../assets/icons/folder.svg")),
-                                false,
-                                move || on_create_worktree(),
-                            )
-                        }),
-                )
-                .child(crate::ui::field::text_field(
-                    host.base_ref,
-                    copy::text(
-                        "Base ref (optional)",
-                        "基准引用（可选）",
-                        "基準參照（選填）",
-                    ),
-                ))
-                .child(section_label(copy::text(
-                    "Agent and model",
-                    "Agent 与模型",
-                    "Agent 與模型",
-                )))
-                .child(choice_list(
-                    host.runtimes,
-                    host.runtime,
-                    |choice| choice.id.clone(),
-                    |choice| (choice.title.clone(), choice.detail.clone()),
-                ))
+                .px(px(theme::SPACING_LG))
+                .pb(px(theme::SPACING_MD))
                 .child(when(
-                    move || error.get().is_some(),
+                    move || error.with(Option::is_some),
                     move || {
                         text(move || error.get().unwrap_or_default())
                             .text_size(px(theme::font_caption()))
                             .text_color(theme::accent_red)
                     },
                 ))
-                .child({
-                    let on_create = host.on_create.clone();
-                    let busy = host.busy;
-                    let workspace = host.workspace;
-                    let runtime = host.runtime;
-                    action::primary(
-                        copy::text("Create", "创建", "建立"),
-                        icon(include_str!("../../assets/icons/circle-plus.svg")),
-                        move || on_create(),
-                    )
-                    .w_full()
-                    .disabled(move || {
-                        busy.get()
-                            || workspace.with(|workspace| workspace.is_none())
-                            || runtime.with(|runtime| runtime.is_none())
-                    })
-                    .disabled_style(|style| style.opacity(0.4))
-                }),
+                .child(when(
+                    move || location.get() == Location::Worktree,
+                    move || {
+                        view()
+                            .gap(px(theme::SPACING_XS))
+                            .child(field::text_field(
+                                branch,
+                                copy::text("Branch name", "分支名", "分支名稱"),
+                            ))
+                            .child(field::text_field(
+                                host.base_ref,
+                                copy::text(
+                                    "Base ref (optional)",
+                                    "基准引用（可选）",
+                                    "基準參照（選填）",
+                                ),
+                            ))
+                    },
+                ))
+                .child(
+                    view()
+                        .p(px(theme::SPACING_SM))
+                        .gap(px(theme::SPACING_XS))
+                        .rounded(px(theme::RADIUS_COMPOSER))
+                        .border_1()
+                        .border_color(theme::border_default)
+                        .bg(theme::composer_surface)
+                        .child(new_session_attachments(
+                            host.attachments,
+                            host.on_remove_attachment.clone(),
+                        ))
+                        .child(
+                            input()
+                                .value(move || prompt.get())
+                                .on_change(move |value: &str| prompt.set(value.to_owned()))
+                                .multiline(true)
+                                .h(px(70.0))
+                                .w_full()
+                                .p(px(theme::SPACING_XS))
+                                .placeholder(copy::text(
+                                    "First message",
+                                    "第一条消息",
+                                    "第一則訊息",
+                                ))
+                                .placeholder_color(theme::muted_foreground)
+                                .text_color(theme::foreground)
+                                .text_size(px(theme::font_body())),
+                        )
+                        .child(
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .child(action::icon_button(
+                                    icon!("plus"),
+                                    copy::text("Attach a file", "添加附件", "新增附件"),
+                                    move || {
+                                        dismiss_keyboard();
+                                        picker.set(Some(Picker::Attachment));
+                                    },
+                                ))
+                                .child(
+                                    button()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .h(px(theme::TOUCH_TARGET))
+                                        .items_start()
+                                        .justify_center()
+                                        .on_press(move || {
+                                            dismiss_keyboard();
+                                            picker.set(Some(Picker::Runtime));
+                                        })
+                                        .child(
+                                            text(runtime_label)
+                                                .truncate()
+                                                .w_full()
+                                                .text_size(px(theme::font_caption()))
+                                                .text_color(theme::foreground),
+                                        ),
+                                )
+                                .child(
+                                    action::icon_button(
+                                        icon!("send"),
+                                        copy::text("Create", "创建", "建立"),
+                                        move || {
+                                            dismiss_keyboard();
+                                            match location.get_untracked() {
+                                                Location::Workspace => (host.on_create)(),
+                                                Location::Worktree => (host.on_create_worktree)(),
+                                                Location::Temporary => (host.on_create_temporary)(),
+                                            }
+                                        },
+                                    )
+                                    .size(px(theme::COMPOSER_SEND_SIZE))
+                                    .rounded_full()
+                                    .bg(theme::action_primary)
+                                    .disabled(move || !can_create())
+                                    .disabled_style(|style| style.opacity(0.4)),
+                                ),
+                        ),
+                )
+                .child(
+                    button()
+                        .h(px(theme::TOUCH_TARGET))
+                        .w_full()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .accessibility_label(copy::text(
+                            "Choose workspace",
+                            "选择工作区",
+                            "選擇工作區",
+                        ))
+                        .on_press(move || {
+                            dismiss_keyboard();
+                            picker.set(Some(Picker::Location));
+                        })
+                        .child(
+                            svg(icon!("folder"))
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted),
+                        )
+                        .child(
+                            text(workspace_label)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(theme::font_caption()))
+                                .text_color(theme::text_secondary),
+                        )
+                        .child(
+                            svg(icon!("chevron-down"))
+                                .size(px(theme::ICON_SM))
+                                .text_color(theme::text_muted),
+                        ),
+                ),
         )
+        .child(when(
+            move || keyboard_height().0 == 0.0,
+            || view().h(safe_area().bottom),
+        ))
+        .child(choice_sheet(
+            picker,
+            Picker::Location,
+            copy::text("Workspace", "工作区", "工作區"),
+            view()
+                .gap(px(theme::SPACING_XS))
+                .child(choice_list(
+                    workspaces,
+                    workspace,
+                    |choice| choice.id.clone(),
+                    |choice| (choice.name.clone(), choice.detail.clone()),
+                    move || {
+                        location.set(Location::Workspace);
+                        picker.set(None);
+                    },
+                ))
+                .child(chrome::sheet_entry(
+                    icon!("git-branch"),
+                    copy::text("New worktree", "新建 Worktree", "新增 Worktree"),
+                    false,
+                    move || {
+                        location.set(Location::Worktree);
+                        picker.set(None);
+                    },
+                ))
+                .child(chrome::sheet_entry(
+                    icon!("box"),
+                    copy::text("Temporary session", "临时会话", "暫時工作階段"),
+                    false,
+                    move || {
+                        location.set(Location::Temporary);
+                        picker.set(None);
+                    },
+                ))
+                .child(field::text_field(
+                    host.title,
+                    copy::text("Title (optional)", "标题（可选）", "標題（選填）"),
+                )),
+        ))
+        .child(choice_sheet(
+            picker,
+            Picker::Runtime,
+            copy::text("Agent and model", "Agent 与模型", "Agent 與模型"),
+            choice_list(
+                runtimes,
+                runtime,
+                |choice| choice.id.clone(),
+                |choice| (choice.title.clone(), choice.detail.clone()),
+                move || picker.set(None),
+            ),
+        ))
+        .child(choice_sheet(
+            picker,
+            Picker::Attachment,
+            copy::text("Add attachment", "添加附件", "新增附件"),
+            view()
+                .child(chrome::sheet_entry(
+                    icon!("image"),
+                    copy::text("Image", "图片", "圖片"),
+                    false,
+                    move || {
+                        picker.set(None);
+                        (host.on_attach_image)();
+                    },
+                ))
+                .child(chrome::sheet_entry(
+                    icon!("file-plus"),
+                    copy::text("File", "文件", "檔案"),
+                    false,
+                    move || {
+                        picker.set(None);
+                        (host.on_attach_file)();
+                    },
+                )),
+        ))
 }
 
-fn section_label(label: &'static str) -> impl IntoElement {
-    text(label)
-        .text_size(px(theme::font_micro()))
-        .text_color(theme::text_muted)
+fn choice_sheet(
+    picker: Signal<Option<Picker>>,
+    current: Picker,
+    title: &'static str,
+    content: impl IntoElement,
+) -> impl IntoElement {
+    chrome::bottom_sheet(
+        move || picker.get() == Some(current),
+        move || picker.set(None),
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.75))
+            .min_h(px(0.0))
+            .child(chrome::sheet_header(title, move || picker.set(None)))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    view()
+                        .w_full()
+                        .px(px(theme::SPACING_MD))
+                        .pt(px(theme::SPACING_SM))
+                        .pb_safe_area_plus(px(theme::SPACING_LG))
+                        .child(content),
+                ),
+            ),
+    )
 }
 
 /// A vertical list of choices, each a row; the chosen one is marked.
@@ -203,6 +435,7 @@ fn choice_list<T>(
     selected: Signal<Option<String>>,
     id: impl Fn(&T) -> String + Clone + 'static,
     text_of: impl Fn(&T) -> (String, String) + Clone + 'static,
+    on_select: impl Fn() + Copy + 'static,
 ) -> impl IntoElement
 where
     T: Clone + PartialEq + 'static,
@@ -215,7 +448,7 @@ where
         .child(each(
             move || items.get(),
             move |item| key_id(item),
-            move |item, _| choice_row(item, selected, id.clone(), text_of.clone()),
+            move |item, _| choice_row(item, selected, id.clone(), text_of.clone(), on_select),
         ))
 }
 
@@ -224,6 +457,7 @@ fn choice_row<T>(
     selected: Signal<Option<String>>,
     id: impl Fn(&T) -> String + 'static,
     text_of: impl Fn(&T) -> (String, String) + 'static,
+    on_select: impl Fn() + 'static,
 ) -> impl IntoElement
 where
     T: Clone + PartialEq + 'static,
@@ -253,7 +487,10 @@ where
         .py(px(theme::SPACING_XS))
         .flex_col()
         .items_start()
-        .on_press(move || selected.set(Some(key.get_untracked())))
+        .on_press(move || {
+            selected.set(Some(key.get_untracked()));
+            on_select();
+        })
         .child(
             text(move || value.get().0)
                 .truncate()
@@ -270,8 +507,6 @@ where
 
 fn new_session_attachments(
     attachments: Signal<Vec<AttachmentItem>>,
-    on_attach_image: Action,
-    on_attach_file: Action,
     on_remove: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     view()
@@ -319,23 +554,6 @@ fn new_session_attachments(
                     ))
             },
         ))
-        .child(
-            view()
-                .flex_row()
-                .gap(px(theme::SPACING_XS))
-                .child(action::secondary(
-                    copy::text("Image", "图片", "圖片"),
-                    icon(include_str!("../../assets/icons/image.svg")),
-                    false,
-                    move || on_attach_image(),
-                ))
-                .child(action::secondary(
-                    copy::text("File", "文件", "檔案"),
-                    icon(include_str!("../../assets/icons/paperclip.svg")),
-                    false,
-                    move || on_attach_file(),
-                )),
-        )
 }
 
 #[derive(Clone)]

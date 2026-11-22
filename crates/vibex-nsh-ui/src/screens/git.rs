@@ -1,8 +1,4 @@
-//! A read-only Git surface over the workspace.
-//!
-//! The runtime owns the repository; this lists its status (`git_status`) and
-//! shows a file's diff (`git_diff`). Staging, committing and worktrees stay on
-//! the desktop for now.
+//! Changes, commits, and worktree controls for the runtime's repository.
 
 use std::rc::Rc;
 
@@ -17,6 +13,7 @@ use crate::{
 /// Opens a path's diff, staged or not.
 type OpenDiff = Rc<dyn Fn(&str, bool)>;
 pub type ResolveWorktree = Rc<dyn Fn(&str, &str, bool)>;
+type ToggleDirectory = Rc<dyn Fn(&[String])>;
 
 /// One local branch in the branch sheet.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -62,11 +59,26 @@ pub struct WorktreeOperationRow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct GitChangeRow {
     pub path: String,
+    pub name: String,
+    pub directory: bool,
+    pub depth: usize,
+    pub expanded: bool,
+    pub segments: Vec<String>,
+    pub selection: PathSelection,
     /// The one-letter kind ("M", "A", "D", "R", "?").
     pub status: String,
     pub staged: bool,
+    pub unstaged: bool,
     pub additions: u32,
     pub deletions: u32,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum PathSelection {
+    #[default]
+    Unchecked,
+    Partial,
+    Checked,
 }
 
 /// One commit in the history list.
@@ -101,12 +113,17 @@ pub struct CommitDetailPreview {
 /// What the surface may do, and the state it shows.
 #[derive(Clone)]
 pub struct GitHost {
+    pub active_session: Signal<Option<String>>,
     pub branch: Signal<Option<SharedString>>,
+    pub totals: Signal<(u32, u32)>,
     pub changes: Signal<Vec<GitChangeRow>>,
     pub diff: Signal<Option<GitDiffPreview>>,
     pub error: Signal<Option<SharedString>>,
-    /// How many paths are staged (the commit's precondition).
-    pub staged: Signal<u32>,
+    pub selected: Signal<Vec<String>>,
+    pub on_toggle_selection: Rc<dyn Fn(&str)>,
+    pub on_toggle_directory: ToggleDirectory,
+    pub on_toggle_directories: Rc<dyn Fn()>,
+    pub on_revert_selection: ToggleDirectory,
     /// The commit message being written.
     pub message: Signal<String>,
     pub committing: Signal<bool>,
@@ -137,6 +154,7 @@ pub struct GitHost {
     pub on_toggle_push_after: Rc<dyn Fn()>,
     pub on_push: Rc<dyn Fn()>,
     pub on_pull: Rc<dyn Fn()>,
+    pub on_fetch: Rc<dyn Fn()>,
     /// The commit history, on its own view.
     pub history: Signal<Vec<CommitRow>>,
     pub show_history: Signal<bool>,
@@ -160,108 +178,72 @@ pub struct GitHost {
 
 /// The Git surface.
 pub fn git(host: GitHost) -> impl IntoElement {
-    let branch = host.branch;
     let diff = host.diff;
-    let changes = host.changes;
-    let error = host.error;
-    let on_refresh = host.on_refresh.clone();
-    let show_history = host.show_history;
-    let history_query = signal(String::new());
-    let commit_detail = host.commit_detail;
+    let commit = host.commit_detail;
+    let details = move || diff.with(Option::is_some) || commit.with(Option::is_some);
+    let detail_host = host.clone();
+    let overview = git_overview(host.clone());
     view()
         .flex_1()
+        .min_h(px(0.0))
         .bg(theme::sidebar_bg)
-        .flex_col()
         .pb_safe_area()
         .child(
             view()
-                .w_full()
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
+                .flex_1()
+                .min_h(px(0.0))
+                .style_when(details, |style| style.hidden())
+                .child(overview),
+        )
+        .child(when(details, move || {
+            let back = detail_host.on_back.clone();
+            let revert = detail_host.on_revert.clone();
+            view()
+                .flex_1()
+                .min_h(px(0.0))
                 .child(
                     view()
-                        .w_full()
                         .h(px(theme::TOUCH_TARGET))
+                        .flex_shrink_0()
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .px(px(theme::SPACING_SM))
-                        .child(when(
-                            move || commit_detail.with(Option::is_some) || show_history.get(),
-                            {
-                                let on_back = host.on_back.clone();
-                                move || {
-                                    let on_back = on_back.clone();
-                                    action::icon_button(
-                                        icon!("chevron-left"),
-                                        copy::text("Back", "返回", "返回"),
-                                        move || on_back(),
-                                    )
-                                }
-                            },
+                        .border_b_1()
+                        .border_b_color(theme::border_subtle)
+                        .child(git_icon(
+                            icon!("chevron-left"),
+                            copy::text("Back", "返回", "返回"),
+                            move || back(),
                         ))
                         .child(
                             text(move || {
-                                if let Some(detail) = commit_detail.get() {
-                                    return detail.title;
-                                }
-                                if show_history.get() {
-                                    return copy::text("History", "历史", "歷史").to_owned();
-                                }
-                                match branch.get() {
-                                    Some(branch) => branch.to_string(),
-                                    None => copy::text("Changes", "变更", "變更").to_owned(),
-                                }
+                                diff.with(|diff| diff.as_ref().map(|value| value.title.clone()))
+                                    .or_else(|| {
+                                        commit.with(|commit| {
+                                            commit.as_ref().map(|value| value.title.clone())
+                                        })
+                                    })
+                                    .unwrap_or_default()
                             })
                             .flex_1()
+                            .min_w(px(0.0))
                             .truncate()
                             .text_size(px(theme::font_body()))
-                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
-                        )
-                        .child({
-                            let on_refresh = on_refresh.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/refresh.svg")),
-                                copy::text("Refresh", "刷新", "重新整理"),
-                                move || on_refresh(),
-                            )
-                        })
-                        .child({
-                            let on_open_worktrees = host.on_open_worktrees.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/folder.svg")),
-                                copy::text("Worktrees", "Worktree", "Worktree"),
-                                move || on_open_worktrees(),
-                            )
-                        })
-                        .child({
-                            let on_open_branches = host.on_open_branches.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/menu.svg")),
-                                copy::text("Branches", "分支", "分支"),
-                                move || on_open_branches(),
-                            )
-                        })
-                        .child({
-                            let on_toggle_history = host.on_toggle_history.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/history.svg")),
-                                copy::text("History", "历史", "歷史"),
-                                move || on_toggle_history(),
-                            )
-                        }),
-                ),
-        )
-        .child(when(move || commit_detail.get().is_some(), {
-            let detail = commit_detail;
-            move || commit_detail_view(detail)
+                        ),
+                )
+                .child(
+                    when(
+                        move || diff.with(Option::is_some),
+                        move || diff_view(diff, revert.clone()),
+                    )
+                    .otherwise(move || commit_detail_view(commit)),
+                )
         }))
         .child(branch_sheet(
             host.branch_menu,
             host.branches,
-            host.on_close_branches.clone(),
-            host.on_select_branch.clone(),
+            host.on_close_branches,
+            host.on_select_branch,
         ))
         .child(worktree_sheet(
             host.worktree_menu,
@@ -269,395 +251,403 @@ pub fn git(host: GitHost) -> impl IntoElement {
             host.worktree_operations,
             host.worktree_busy,
             host.worktree_error,
-            host.on_close_worktrees.clone(),
-            host.on_archive_worktree.clone(),
-            host.on_merge_worktree.clone(),
-            host.on_discard_worktree.clone(),
-            host.on_continue_worktree.clone(),
-            host.on_abort_worktree.clone(),
-            host.on_resolve_worktree.clone(),
-            host.on_restore_worktree.clone(),
+            host.on_close_worktrees,
+            host.on_archive_worktree,
+            host.on_merge_worktree,
+            host.on_discard_worktree,
+            host.on_continue_worktree,
+            host.on_abort_worktree,
+            host.on_resolve_worktree,
+            host.on_restore_worktree,
         ))
-        .child(when(
-            move || commit_detail.get().is_none() && show_history.get(),
-            {
-                let history = host.history;
-                let on_open_commit = host.on_open_commit.clone();
-                move || history_list(history, history_query, on_open_commit.clone())
-            },
-        ))
-        .child(when(
-            move || commit_detail.get().is_none() && !show_history.get(),
-            {
-                let on_toggle_amend = host.on_toggle_amend.clone();
-                let on_toggle_push_after = host.on_toggle_push_after.clone();
-                let on_push = host.on_push.clone();
-                let on_pull = host.on_pull.clone();
+}
+
+fn git_overview(host: GitHost) -> impl IntoElement {
+    let history = host.show_history;
+    let query = signal(String::new());
+    let branch = host.branch;
+    let totals = host.totals;
+    let busy = host.remote_busy;
+    let selected = host.selected;
+    let active_session = host.active_session;
+    let error = host.error;
+    let history_host = host.clone();
+    let change_host = host.clone();
+    view().flex_1().min_h(px(0.0))
+        .child(view().h(px(theme::TOUCH_TARGET)).flex_shrink_0().flex_row().items_center().px(px(theme::SPACING_SM))
+            .gap(px(theme::SPACING_XS)).border_b_1().border_b_color(theme::border_subtle)
+            .child(view().flex_1().min_w(px(0.0)).child(when(move || history.get(), move || {
+                view().flex_row().items_center()
+                    .child(field::text_field_flat(query, copy::text("Search commits", "搜索提交", "搜尋提交")).flex_1().min_w(px(0.0)))
+                    .child(when(move || !query.with(String::is_empty), move || git_icon(icon!("x"), copy::text("Clear commit search", "清除提交搜索", "清除提交搜尋"), move || query.set(String::new()))))
+            }).otherwise({
+                let branches = host.on_open_branches.clone();
                 move || {
-                    git_tools(
-                        host.amend,
-                        host.push_after,
-                        host.remote_busy,
-                        on_toggle_amend.clone(),
-                        on_toggle_push_after.clone(),
-                        on_push.clone(),
-                        on_pull.clone(),
-                    )
+                    let branches = branches.clone();
+                    button().flex_row().items_center().gap(px(theme::SPACING_XS)).h(px(theme::TOUCH_TARGET)).min_w(px(0.0))
+                        .accessibility_label(copy::text("Branches", "分支", "分支"))
+                        .on_press(move || branches())
+                        .child(svg(icon!("git-branch")).size(px(theme::ICON_SM)).flex_shrink_0().text_color(theme::text_muted))
+                        .child(text(move || branch.get().unwrap_or_else(|| copy::text("No repository", "没有仓库", "沒有儲存庫").into()))
+                            .flex_1().min_w(px(0.0)).truncate().text_size(px(theme::font_detail())).text_color(theme::foreground))
+                        .child(when(move || totals.get().0 > 0, move || text(move || format!("+{}", totals.get().0))
+                            .flex_shrink_0().text_size(px(theme::font_micro())).text_color(theme::accent_success)))
+                        .child(when(move || totals.get().1 > 0, move || text(move || format!("-{}", totals.get().1))
+                            .flex_shrink_0().text_size(px(theme::font_micro())).text_color(theme::accent_red)))
                 }
-            },
-        ))
-        .child(when(
-            move || commit_detail.get().is_none() && error.get().is_some(),
-            move || {
-                text(move || error.get().unwrap_or_default())
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_SM))
-                    .text_size(px(theme::font_caption()))
-                    .text_color(theme::accent_red)
-            },
-        ))
-        .child(diff_sheet(
-            diff,
-            host.on_back.clone(),
-            host.on_revert.clone(),
-        ))
-        .child(when(
-            move || commit_detail.get().is_none() && !show_history.get(),
-            move || {
-                change_list(
-                    changes,
-                    host.on_open_diff.clone(),
-                    host.on_stage.clone(),
-                    host.on_unstage.clone(),
-                )
-            },
-        ))
-        .child(when(
-            move || commit_detail.get().is_none() && !show_history.get(),
-            move || {
-                commit_bar(
-                    host.staged,
-                    host.message,
-                    host.committing,
-                    host.amend,
-                    host.on_commit.clone(),
-                )
-            },
-        ))
+            })))
+            .child(git_icon(icon!("refresh"), copy::text("Fetch", "获取", "擷取"), move || (host.on_fetch)())
+                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4)))
+            .child(git_icon(icon!("download"), copy::text("Pull", "拉取", "拉取"), move || (host.on_pull)())
+                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4)))
+            .child(git_icon(icon!("upload"), copy::text("Push", "推送", "推送"), move || (host.on_push)())
+                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4))))
+        .child(view().h(px(theme::TOUCH_TARGET)).flex_shrink_0().flex_row().items_center().px(px(theme::SPACING_XS))
+            .border_b_1().border_b_color(theme::border_subtle)
+            .child(git_mode_button(copy::text("Changes", "更改", "變更"), history, false, host.on_toggle_history.clone()))
+            .child(git_mode_button(copy::text("Commits", "提交", "提交"), history, true, host.on_toggle_history))
+            .child(view().flex_1().min_w(px(0.0)))
+            .child(when(move || !history.get(), {
+                let select = host.on_toggle_selection.clone();
+                let revert = host.on_revert_selection.clone();
+                let dirs = host.on_toggle_directories.clone();
+                move || {
+                    let select = select.clone();
+                    let revert = revert.clone();
+                    let dirs = dirs.clone();
+                    view().flex_row().items_center()
+                        .child(git_icon(icon!("list-checks"), copy::text("Select all changes", "选择全部变更", "選取全部變更"), move || select("")))
+                        .child(git_icon(icon!("undo"), copy::text("Rollback selected", "回滚所选变更", "復原已選變更"), move || {
+                            let revert = revert.clone();
+                            let paths = selected.get_untracked();
+                            let owner = active_session.get_untracked();
+                            spawn(async move {
+                                let result = nsh_base::alert_dialog()
+                                    .title(copy::text("Rollback selected changes?", "回滚所选变更？", "復原已選變更？"))
+                                    .description(copy::text("Changes to the selected paths will be discarded.", "所选路径的改动将被丢弃。", "已選路徑的變更將被捨棄。"))
+                                    .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                                    .destructive("revert", copy::text("Rollback", "回滚", "復原"))
+                                    .show().await;
+                                if matches!(result, Ok(answer) if answer.action.as_deref() == Some("revert"))
+                                    && active_session.get_untracked() == owner { revert(&paths); }
+                            });
+                        }).disabled(move || selected.with(Vec::is_empty) || busy.get()).disabled_style(|style| style.opacity(0.4)))
+                        .child(git_icon(icon!("chevrons-down-up"), copy::text("Expand or collapse all", "展开或折叠目录", "展開或摺疊資料夾"), move || dirs()))
+                }
+            }))
+            .child(git_icon(icon!("folder"), copy::text("Worktrees", "Worktree", "Worktree"), move || (host.on_open_worktrees)())))
+        .child(when(move || error.with(Option::is_some), move || {
+            view().flex_row().items_center().px(px(theme::SPACING_SM)).gap(px(theme::SPACING_XS))
+                .child(text(move || error.get().unwrap_or_default()).flex_1().min_w(px(0.0)).text_size(px(theme::font_caption())).text_color(theme::accent_red))
+                .child({ let refresh = host.on_refresh.clone(); git_icon(icon!("refresh"), copy::text("Refresh", "刷新", "重新整理"), move || refresh()) })
+        }))
+        .child(when(move || history.get(), move || history_list(history_host.history, query, history_host.on_open_commit.clone()))
+            .otherwise(move || view().flex_1().min_h(px(0.0))
+                .child(change_list(change_host.clone()))
+                .child(commit_bar(change_host.clone()))))
 }
 
-fn diff_sheet(
-    diff: Signal<Option<GitDiffPreview>>,
-    close: Rc<dyn Fn()>,
-    revert: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_header};
-    bottom_sheet(
-        move || diff.with(Option::is_some),
-        {
-            let close = close.clone();
-            move || close()
-        },
-        view()
-            .h(move || px(window().height.0 * 0.68))
-            .pb_safe_area()
-            .child(sheet_header(
-                copy::text("Changes", "变更", "變更"),
-                move || close(),
-            ))
-            .child(diff_view(diff, revert)),
-    )
+fn git_icon(icon: ImageSrc, label: &'static str, action: impl Fn() + 'static) -> ButtonElement {
+    action::icon_button(icon, label, action)
+        .size(px(34.0))
+        .flex_shrink_0()
 }
 
-fn change_list(
-    changes: Signal<Vec<GitChangeRow>>,
-    on_open_diff: OpenDiff,
-    on_stage: Rc<dyn Fn(&str)>,
-    on_unstage: Rc<dyn Fn(&str)>,
+fn git_mode_button(
+    label: &'static str,
+    history: Signal<bool>,
+    selected: bool,
+    toggle: Rc<dyn Fn()>,
 ) -> impl IntoElement {
-    view()
-        .flex_1()
-        .min_h(px(0.0))
-        .child(when(
-            move || changes.with(Vec::is_empty),
-            || {
-                text(copy::text("No changes", "没有变更", "沒有變更"))
-                    .py(px(theme::SPACING_LG))
-                    .text_center()
-                    .text_size(px(theme::font_body()))
-                    .text_color(theme::text_muted)
-            },
-        ))
+    button()
+        .h(px(32.0))
+        .px(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .items_center()
+        .justify_center()
+        .style_when(
+            move || history.get() == selected,
+            |style| style.bg(theme::rail_tab_bg()),
+        )
+        .on_press(move || {
+            if history.get_untracked() != selected {
+                dismiss_keyboard();
+                toggle();
+            }
+        })
         .child(
+            text(label)
+                .text_size(px(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
+}
+
+fn change_list(host: GitHost) -> impl IntoElement {
+    let changes = host.changes;
+    view().flex_1().min_h(px(0.0)).child(
+        when(
+            move || changes.with(Vec::is_empty),
+            || super::session::empty_hint(copy::text("No changes", "没有变更", "沒有變更")),
+        )
+        .otherwise(move || {
+            let host = host.clone();
             virtual_list(
-                move || changes.with(|changes| changes.len()),
+                move || changes.with(Vec::len),
                 move |at: Position| {
-                    change_row(
-                        at,
-                        changes,
-                        on_open_diff.clone(),
-                        on_stage.clone(),
-                        on_unstage.clone(),
-                    )
+                    let change =
+                        computed(move || changes.with(|changes| changes.get(at.index()).cloned()));
+                    let host = host.clone();
+                    dynamic(move || {
+                        change.get().map_or_else(
+                            || view().into_element(),
+                            |row| change_row(row, host.clone()).into_element(),
+                        )
+                    })
                 },
             )
             .keys(move || {
                 changes.with(|changes| {
                     changes
                         .iter()
-                        .map(|change| format!("{}:{}", change.path, change.staged))
+                        .map(|change| change.path.clone())
                         .collect::<Vec<_>>()
                 })
             })
-            .estimated_item_size(px(48.0))
-            .flex_1(),
-        )
+            .estimated_item_size(px(theme::TOUCH_TARGET))
+            .flex_1()
+        }),
+    )
 }
 
-fn change_row(
-    at: Position,
-    changes: Signal<Vec<GitChangeRow>>,
-    on_open_diff: OpenDiff,
-    on_stage: Rc<dyn Fn(&str)>,
-    on_unstage: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    let change = computed(move || changes.with(|changes| changes.get(at.index()).cloned()));
-    let opened = change;
+fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
+    let path = row.path.clone();
+    let color = status_color(&row.status);
+    let action_path = path.clone();
+    let selection_path = path.clone();
+    let selection = row.selection;
+    let stage_path = path.clone();
+    let stage = if row.staged {
+        host.on_unstage
+    } else {
+        host.on_stage
+    };
     view()
-        .w_full()
-        .min_h(px(48.0))
-        .flex_row()
-        .items_center()
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .child(
-            button()
-                .flex_1()
-                .min_h(px(48.0))
-                .flex_row()
-                .items_center()
-                .gap(px(theme::SPACING_SM))
-                .px(px(theme::SPACING_LG))
-                .active(|style| style.opacity(0.8))
-                .on_press(move || {
-                    let Some(change) = opened.get_untracked() else {
-                        return;
-                    };
-                    on_open_diff(&change.path, change.staged);
-                })
-                .child(
-                    text(move || {
-                        change
-                            .with(|change| change.as_ref().map(|change| change.status.clone()))
-                            .unwrap_or_default()
-                    })
-                    .w(px(16.0))
-                    .text_size(px(theme::font_micro()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(move || {
-                        change
-                            .with(|change| {
-                                change.as_ref().map(|change| status_color(&change.status))
-                            })
-                            .unwrap_or_else(theme::text_muted)
-                    }),
-                )
-                .child(
-                    text(move || {
-                        change
-                            .with(|change| change.as_ref().map(|change| change.path.clone()))
-                            .unwrap_or_default()
-                    })
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(theme::font_detail()))
-                    .text_color(theme::foreground),
-                )
-                .child(
-                    text(move || {
-                        change.with(|change| {
-                            change.as_ref().map_or(String::new(), |change| {
-                                format!("+{} −{}", change.additions, change.deletions)
-                            })
-                        })
-                    })
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_muted),
-                )
-                .child(when(
-                    move || {
-                        change.with(|change| change.as_ref().is_some_and(|change| change.staged))
-                    },
-                    || {
-                        text("●")
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::color_token("chart-1"))
-                    },
-                )),
-        )
-        .child({
-            let staged = change;
-            button()
-                .min_h(px(theme::TOUCH_TARGET))
-                .px(px(theme::SPACING_MD))
-                .items_center()
-                .justify_center()
-                .active(|style| style.opacity(0.7))
-                .on_press(move || {
-                    let Some(change) = staged.get_untracked() else {
-                        return;
-                    };
-                    if change.staged {
-                        on_unstage(&change.path);
-                    } else {
-                        on_stage(&change.path);
-                    }
-                })
-                .child(
-                    text(move || {
-                        if staged.with(|change| change.as_ref().is_some_and(|change| change.staged))
-                        {
-                            copy::text("Unstage", "取消暂存", "取消暫存")
-                        } else {
-                            copy::text("Stage", "暂存", "暫存")
-                        }
-                    })
-                    .text_size(px(theme::font_micro()))
-                    .text_color(theme::text_secondary),
-                )
-        })
-}
-
-/// The message field and the Commit action.
-fn git_tools(
-    amend: Signal<bool>,
-    push_after: Signal<bool>,
-    busy: Signal<bool>,
-    on_toggle_amend: Rc<dyn Fn()>,
-    on_toggle_push_after: Rc<dyn Fn()>,
-    on_push: Rc<dyn Fn()>,
-    on_pull: Rc<dyn Fn()>,
-) -> impl IntoElement {
-    view()
-        .w_full()
+        .h(px(theme::TOUCH_TARGET))
+        .mx(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_XS))
         .flex_row()
         .items_center()
         .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_XS))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .child(tool_button(
-            || copy::text("Pull", "拉取", "拉取"),
-            {
-                let on_pull = on_pull.clone();
-                move || on_pull()
-            },
-            move || busy.get(),
-        ))
-        .child(tool_button(
-            || copy::text("Push", "推送", "推送"),
-            {
-                let on_push = on_push.clone();
-                move || on_push()
-            },
-            move || busy.get(),
-        ))
-        .child(tool_button(
-            move || {
-                if amend.get() {
-                    copy::text("Amending", "修补提交", "修補提交")
-                } else {
-                    copy::text("Amend", "修补提交", "修補提交")
-                }
-            },
-            move || on_toggle_amend(),
-            move || busy.get(),
-        ))
-        .child(tool_button(
-            move || {
-                if push_after.get() {
-                    copy::text("Push after ✓", "提交后推送 ✓", "提交後推送 ✓")
-                } else {
-                    copy::text("Push after", "提交后推送", "提交後推送")
-                }
-            },
-            move || on_toggle_push_after(),
-            move || busy.get(),
-        ))
-}
-
-fn tool_button(
-    label: impl Fn() -> &'static str + 'static,
-    on_press: impl Fn() + 'static,
-    busy: impl Fn() -> bool + 'static,
-) -> ButtonElement {
-    button()
-        .on_press(move || {
-            if !busy() {
-                on_press();
-            }
-        })
-        .min_h(px(32.0))
-        .px(px(theme::SPACING_SM))
-        .items_center()
-        .justify_center()
         .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_dim)
-        .active(|style| style.opacity(0.7))
+        .child(view().w(px(row.depth.min(8) as f32 * 16.0)).flex_shrink_0())
         .child(
-            text(label)
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_secondary),
+            button()
+                .w(px(28.0))
+                .h_full()
+                .flex_shrink_0()
+                .items_center()
+                .justify_center()
+                .accessibility_label(format!(
+                    "{} {}",
+                    copy::text("Select", "选择", "選取"),
+                    selection_path
+                ))
+                .on_press(move || (host.on_toggle_selection)(&selection_path))
+                .child(
+                    view()
+                        .size(px(18.0))
+                        .rounded(px(4.0))
+                        .border_1()
+                        .items_center()
+                        .justify_center()
+                        .border_color(if selection == PathSelection::Unchecked {
+                            theme::border_default
+                        } else {
+                            theme::primary
+                        })
+                        .when(selection != PathSelection::Unchecked, |view| {
+                            view.bg(theme::primary).child(
+                                svg(if selection == PathSelection::Checked {
+                                    icon!("check")
+                                } else {
+                                    icon!("minus")
+                                })
+                                .size(px(12.0))
+                                .text_color(theme::primary_foreground),
+                            )
+                        }),
+                ),
         )
+        .child(
+            button()
+                .flex_1()
+                .min_w(px(0.0))
+                .h_full()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .accessibility_label(path)
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_press(move || {
+                    if row.directory {
+                        (host.on_toggle_directory)(&row.segments);
+                    } else {
+                        (host.on_open_diff)(&action_path, !row.unstaged && row.staged);
+                    }
+                })
+                .child(
+                    svg(if row.directory {
+                        if row.expanded {
+                            icon!("chevron-down")
+                        } else {
+                            icon!("chevron-right")
+                        }
+                    } else {
+                        icon!("file-code")
+                    })
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::text_muted),
+                )
+                .child(
+                    text(row.name)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(theme::font_detail()))
+                        .text_color(theme::foreground),
+                )
+                .children((!row.directory).then(|| {
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            text(row.status)
+                                .px(px(theme::SPACING_XS))
+                                .rounded(px(4.0))
+                                .bg(color.opacity(0.18))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(color),
+                        )
+                        .children((row.additions > 0).then(|| {
+                            text(format!("+{}", row.additions))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::accent_success)
+                        }))
+                        .children((row.deletions > 0).then(|| {
+                            text(format!("-{}", row.deletions))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::accent_red)
+                        }))
+                })),
+        )
+        .children((!row.directory).then(|| {
+            git_icon(
+                if row.staged {
+                    icon!("minus")
+                } else {
+                    icon!("plus")
+                },
+                if row.staged {
+                    copy::text("Unstage", "取消暂存", "取消暫存")
+                } else {
+                    copy::text("Stage", "暂存", "暫存")
+                },
+                move || stage(&stage_path),
+            )
+        }))
 }
 
-fn commit_bar(
-    staged: Signal<u32>,
-    message: Signal<String>,
-    committing: Signal<bool>,
-    amend: Signal<bool>,
-    on_commit: Rc<dyn Fn()>,
-) -> impl IntoElement {
+fn commit_bar(host: GitHost) -> impl IntoElement {
+    let selected = host.selected;
+    let message = host.message;
+    let amend = host.amend;
+    let push = host.push_after;
+    let committing = host.committing;
     view()
         .w_full()
-        .flex_row()
-        .items_end()
-        .gap(px(theme::SPACING_SM))
-        .px(px(theme::SPACING_LG))
+        .flex_shrink_0()
+        .pb_keyboard()
+        .gap(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_SM))
         .py(px(theme::SPACING_SM))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
+        .border_t_1()
+        .border_t_color(theme::border_subtle)
         .child(
-            crate::ui::field::text_field(
-                message,
-                copy::text("Commit message", "提交说明", "提交說明"),
-            )
-            .flex_1(),
+            view()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .child(
+                    text(move || {
+                        format!(
+                            "{} {}",
+                            selected.with(Vec::len),
+                            copy::text("selected", "已选择", "已選取")
+                        )
+                    })
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted),
+                )
+                .child(
+                    git_icon(
+                        icon!("rotate-ccw"),
+                        copy::text("Amend", "修补提交", "修補提交"),
+                        move || (host.on_toggle_amend)(),
+                    )
+                    .style_when(move || amend.get(), |style| style.bg(theme::rail_tab_bg())),
+                )
+                .child(
+                    git_icon(
+                        icon!("upload"),
+                        copy::text("Push after", "提交后推送", "提交後推送"),
+                        move || (host.on_toggle_push_after)(),
+                    )
+                    .style_when(move || push.get(), |style| style.bg(theme::rail_tab_bg())),
+                ),
         )
         .child(
-            action::primary(
-                move || {
-                    if amend.get() {
-                        copy::text("Amend", "修补提交", "修補提交")
-                    } else {
-                        copy::text("Commit", "提交", "提交")
-                    }
-                },
-                icon(include_str!("../../assets/icons/check.svg")),
-                {
-                    let on_commit = on_commit.clone();
-                    move || on_commit()
-                },
-            )
-            .disabled(move || {
-                committing.get()
-                    || (staged.with(|staged| *staged == 0) && !amend.get())
-                    || message.with(|message| message.trim().is_empty())
-            })
-            .disabled_style(|style| style.opacity(0.4)),
+            view()
+                .flex_row()
+                .gap(px(theme::SPACING_XS))
+                .items_center()
+                .child(
+                    crate::ui::field::text_field(
+                        message,
+                        copy::text("Commit message", "提交说明", "提交說明"),
+                    )
+                    .flex_1()
+                    .min_w(px(0.0)),
+                )
+                .child(
+                    action::primary(
+                        move || {
+                            if amend.get() {
+                                copy::text("Amend", "修补提交", "修補提交")
+                            } else {
+                                copy::text("Commit", "提交", "提交")
+                            }
+                        },
+                        icon(include_str!("../../assets/icons/check.svg")),
+                        {
+                            move || {
+                                dismiss_keyboard();
+                                (host.on_commit)();
+                            }
+                        },
+                    )
+                    .disabled(move || {
+                        committing.get()
+                            || selected.with(Vec::is_empty)
+                            || message.with(|message| message.trim().is_empty())
+                    })
+                    .disabled_style(|style| style.opacity(0.4)),
+                ),
         )
 }
 
@@ -1086,35 +1076,22 @@ fn history_list(
             })
         })
     });
-    view()
-        .flex_1()
-        .min_h(px(0.0))
-        .flex_col()
-        .child(
-            view()
-                .px(px(theme::SPACING_LG))
-                .py(px(theme::SPACING_SM))
-                .child(field::text_field(
-                    query,
-                    copy::text("Search commits", "搜索提交", "搜尋提交"),
-                )),
+    view().flex_1().min_h(px(0.0)).flex_col().child(
+        virtual_list(
+            move || filtered.with(|filtered| filtered.len()),
+            move |at: Position| history_row(at, filtered, on_open_commit.clone()),
         )
-        .child(
-            virtual_list(
-                move || filtered.with(|filtered| filtered.len()),
-                move |at: Position| history_row(at, filtered, on_open_commit.clone()),
-            )
-            .keys(move || {
-                filtered.with(|filtered| {
-                    filtered
-                        .iter()
-                        .map(|commit| commit.hash.clone())
-                        .collect::<Vec<_>>()
-                })
+        .keys(move || {
+            filtered.with(|filtered| {
+                filtered
+                    .iter()
+                    .map(|commit| commit.hash.clone())
+                    .collect::<Vec<_>>()
             })
-            .estimated_item_size(px(56.0))
-            .flex_1(),
-        )
+        })
+        .estimated_item_size(px(56.0))
+        .flex_1(),
+    )
 }
 
 fn history_row(

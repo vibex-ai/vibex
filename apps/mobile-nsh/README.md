@@ -102,26 +102,24 @@ horizontal drags; returning from a side page leaves the conversation mounted.
   `@…` token in place), attaches photos and files through the platform's own
   picker (`pick_images`, `pick_files`, encoded as the `data:` URLs the runtime
   materializes), shows them as removable chips, and sends them with the text;
-  the drawer starts a new session through a sheet that lists the runtime's
-  workspaces and its ready Agent/model options (`list_workspaces`,
-  `list_runtime_options`), and that sheet also starts a session in a new
-  worktree (`git_worktree_create` from the chosen workspace's branch name);
+  the drawer opens a full-screen new-session composer. Its location and model
+  sheets use `list_workspaces` and `list_runtime_options`; the location sheet
+  also offers a new worktree and a temporary session;
 - a session's "⋯" opens its actions: Rename, Archive, and Delete (after the
   native confirmation); removing the active session opens the next one;
 - the Terminal tab attaches to the runtime's PTY. Terminal-mode Agent
   sessions open their own PTY instead of an ACP composer. The runtime's PTY
-  snapshot fills it, its frame stream keeps it live (a character split across
-  two frames is carried to the next), its size changes are forwarded
-  (`resize_terminal`), and what the person types goes back to the PTY; the
-  header's list shows the workspace's terminals, switches between them, and
-  starts a new one. Closing the surface leaves the terminal running;
-- Files shows a tree that expands directories in place and searches names or
-  content. Its preview uses the native editor and saves text with the revision
-  it was read at;
+  frame stream backfills output and keeps it live. Split UTF-8 is carried
+  across frames; input and size changes are sent in order from a background
+  task. The header shows running terminal tabs. Closing the surface leaves the
+  PTY running; closing a tab asks before stopping it;
+- Files shows an expandable tree and searches names or contents. A content
+  result opens the read-only viewer at its line. Markdown and images have
+  rendered previews, and source files support find and go to line;
 - Changes shows the workspace's Git status: branch, changed paths with
   additions and deletions, and a path's diff from `git_diff`; each row stages
   or unstages its path (`stage`, `unstage`), the status the runtime returns
-  replaces the list, a message field commits what is staged (`commit`), the
+  replaces the list, a message field commits the selected paths (`commit`), the
   History view lists recent commits (`git_history`), a commit opens its message
   and patch (`git_commit_detail`), and an unstaged diff can be discarded with
   a native confirmation (`git_revert`). The branch sheet lists local branches

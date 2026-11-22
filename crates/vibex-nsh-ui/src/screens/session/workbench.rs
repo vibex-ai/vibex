@@ -37,7 +37,7 @@ impl WorkbenchTab {
 
     pub(super) fn back(self, host: &SessionHost) -> bool {
         match self {
-            Self::Files if host.files_preview.with(Option::is_some) => {
+            Self::Files if host.files_path.with(Option::is_some) => {
                 (host.on_files_back)();
                 true
             }

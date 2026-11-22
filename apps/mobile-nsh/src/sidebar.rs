@@ -10,8 +10,9 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use vibex_core::{AgentSession, AgentSessionState, VibexSessionId, WorkspaceMode};
 use vibex_desktop_model::{
-    SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationView,
-    WorktreeLifecycleDisplayState, sidebar_project_items_for_workspace, sidebar_root_items,
+    SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationState,
+    SidebarOrganizationView, WorktreeLifecycleDisplayState, sidebar_project_items_for_workspace,
+    sidebar_root_items,
 };
 
 use vibex_backend::WorkspaceSummary;
@@ -123,6 +124,45 @@ pub struct SidebarRowInput<'a> {
     pub sessions: &'a [AgentSession],
     pub selected_session_id: Option<&'a VibexSessionId>,
     pub query: &'a str,
+}
+
+pub fn folder_batch_ids(
+    organization: &SidebarOrganizationState,
+    sessions: &[AgentSession],
+    folder_id: &str,
+) -> Vec<String> {
+    let mut projects = BTreeSet::new();
+    let mut members = BTreeSet::new();
+    for placement in &organization.placements {
+        if !placement.parent_folder_id.as_deref().is_some_and(|parent| {
+            parent == folder_id || organization.folder_is_descendant_of(parent, folder_id)
+        }) {
+            continue;
+        }
+        match &placement.item {
+            SidebarOrganizationItem::Folder(_) => {}
+            SidebarOrganizationItem::Project(id) => {
+                projects.insert(id.as_str());
+            }
+            SidebarOrganizationItem::Group(id) => {
+                if let Some(group) = organization.groups.get(id) {
+                    members.extend(group.member_session_ids.iter().map(String::as_str));
+                }
+            }
+            SidebarOrganizationItem::Session(id) => {
+                members.insert(id.as_str());
+            }
+        }
+    }
+    sessions
+        .iter()
+        .filter(|session| {
+            session.deleted_at_ms.is_none()
+                && (members.contains(session.id.as_str())
+                    || projects.contains(session.project_id.as_str()))
+        })
+        .map(|session| session.id.as_str().to_owned())
+        .collect()
 }
 
 pub fn projects(workspaces: &[WorkspaceSummary], sessions: &[AgentSession]) -> Vec<SidebarProject> {

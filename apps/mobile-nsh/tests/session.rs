@@ -311,6 +311,7 @@ fn HistoryShell() -> impl IntoElement {
     host.history = signal(vec![ComposerHistoryEntry {
         id: "h1".to_owned(),
         text: "Ship it".to_owned(),
+        sequence: 1,
     }]);
     host.history_open = signal(true);
     session::session(host)
@@ -501,6 +502,14 @@ fn sidebar_fixture(
         on_move_row: Rc::new(|_, _| {}),
         on_new_session: Rc::new(|_| {}),
         on_new_folder: Rc::new(|_| {}),
+        batch_scope: Rc::new(move |row| {
+            if row.kind == SidebarRowKind::Project {
+                sessions
+                    .with(|sessions| sessions.iter().map(|session| session.id.clone()).collect())
+            } else {
+                Vec::new()
+            }
+        }),
     }
 }
 
@@ -626,7 +635,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             status: "running".to_owned(),
         },
     ]);
-    let terminal_menu = signal(false);
+    let terminal_id = signal(Some("t1".to_owned()));
     let on_select_terminal = Rc::new(move |id: &str| {
         if let Some(choice) = terminal_choices.with(|choices| {
             choices
@@ -635,7 +644,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                 .map(|choice| choice.title.clone())
         }) {
             terminal_title.set(Some(choice.into()));
-            terminal_menu.set(false);
+            terminal_id.set(Some(id.to_owned()));
         }
     });
     let files_open = signal(false);
@@ -648,6 +657,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             expanded: false,
             loading: false,
             git: None,
+            icon: Default::default(),
+            ignored: false,
         },
         FileEntry {
             path: "README.md".to_owned(),
@@ -657,9 +668,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             expanded: false,
             loading: false,
             git: None,
+            icon: Default::default(),
+            ignored: false,
         },
     ]);
     let files_preview = signal(None::<FilePreview>);
+    let files_path = signal(None::<String>);
     let files_search = signal(vec![FileSearchRow {
         path: "src/main.rs".to_owned(),
         name: "main.rs".to_owned(),
@@ -667,9 +681,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         snippet: "hello".to_owned(),
     }]);
     let files_error = signal(None::<SharedString>);
-    let files_content = signal(String::new());
-    let files_dirty = signal(false);
-    let files_saving = signal(false);
     let on_open_dir = Rc::new(move |path: &str| {
         files_entries.update(|rows| {
             let Some(index) = rows.iter().position(|row| row.path == path) else {
@@ -687,6 +698,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                         expanded: false,
                         loading: false,
                         git: None,
+                        icon: Default::default(),
+                        ignored: false,
                     },
                 );
             } else {
@@ -694,14 +707,16 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             }
         });
     });
-    let on_open_file = Rc::new(move |path: &str| {
+    let on_open_file = Rc::new(move |path: &str, line| {
         let markdown = path.ends_with(".md");
+        files_path.set(Some(path.to_owned()));
         files_preview.set(Some(FilePreview {
             title: path.rsplit('/').next().unwrap_or(path).to_owned(),
             body: if markdown {
                 "# Hello".to_owned()
             } else {
-                String::new()
+                "fn main() {\n    let greeting = \"hello\";\n    println!(\"{greeting}\");\n}"
+                    .to_owned()
             },
             truncated: false,
             language: if markdown { "markdown" } else { "rust" }.to_owned(),
@@ -711,21 +726,26 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                 FilePreviewKindView::Text
             },
             image_uri: None,
+            line,
         }));
-        files_content.set(if markdown { "# Hello" } else { "edited" }.to_owned());
-        files_dirty.set(!markdown);
     });
-    let on_save_file = Rc::new(move || {
-        files_content.set("saved".to_owned());
-        files_dirty.set(false);
+    let on_files_back = Rc::new(move || {
+        files_preview.set(None);
+        files_path.set(None);
     });
-    let on_files_back = Rc::new(move || files_preview.set(None));
     let git_open = signal(false);
     let git_branch = signal(Some(SharedString::from("main")));
     let git_changes = signal(vec![GitChangeRow {
         path: "src/main.rs".to_owned(),
+        name: "main.rs".to_owned(),
+        directory: false,
+        depth: 0,
+        expanded: false,
+        segments: Vec::new(),
+        selection: Default::default(),
         status: "M".to_owned(),
         staged: false,
+        unstaged: true,
         additions: 3,
         deletions: 1,
     }]);
@@ -741,7 +761,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }));
     });
     let on_git_back = Rc::new(move || git_diff.set(None));
-    let git_staged = signal(1_u32);
+    let git_selected = signal(vec!["src/main.rs".to_owned()]);
     let git_message = signal(String::new());
     let git_committing = signal(false);
     let git_history = signal(vec![CommitRow {
@@ -1088,28 +1108,32 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_interrupt,
         on_switch_runtime: Rc::new(|| {}),
         terminal_choices,
-        terminal_menu,
-        on_terminal_menu: Rc::new(move || terminal_menu.set(true)),
-        on_close_terminal_menu: Rc::new(move || terminal_menu.set(false)),
+        terminal_id,
+        terminal_busy: signal(false),
+        terminal_output_revision: signal(0),
+        on_retry_terminal: Rc::new(|| {}),
+        on_kill_terminal: Rc::new(move |id| {
+            terminal_choices.update(|choices| choices.retain(|choice| choice.id != id));
+        }),
         on_select_terminal,
         on_new_terminal: Rc::new(|| {}),
         files_open,
         files_entries,
         files_search,
+        files_searching: signal(false),
+        files_path,
         on_search_files: Rc::new(|_, _| {}),
         files_preview,
         files_error,
         on_open_files: Rc::new(move || files_open.set(true)),
         on_refresh_files: Rc::new(|| {}),
+        on_collapse_files: Rc::new(|| {}),
         on_open_dir,
         on_open_file,
         on_files_back,
-        files_content,
-        files_dirty,
-        files_saving,
-        on_save_file,
         git_open,
         git_branch,
+        git_totals: signal((3, 1)),
         git_changes,
         git_diff,
         git_error,
@@ -1117,7 +1141,19 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_open_git_diff,
         on_stage_git: on_stage,
         on_unstage_git: on_unstage,
-        git_staged,
+        git_selected,
+        on_toggle_git_selection: Rc::new(move |_| {
+            git_selected.update(|paths| {
+                if paths.is_empty() {
+                    paths.push("src/main.rs".to_owned());
+                } else {
+                    paths.clear();
+                }
+            });
+        }),
+        on_toggle_git_directory: Rc::new(|_| {}),
+        on_toggle_git_directories: Rc::new(|| {}),
+        on_revert_git_selection: Rc::new(|_| {}),
         git_message,
         git_committing,
         git_amend,
@@ -1146,6 +1182,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_toggle_git_push_after: Rc::new(|| {}),
         on_git_push: Rc::new(|| {}),
         on_git_pull: Rc::new(|| {}),
+        on_git_fetch: Rc::new(|| {}),
         git_history,
         git_show_history,
         git_commit_detail,
@@ -1162,6 +1199,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_close_session_actions: Rc::new(|| {}),
         on_rename_session,
         on_archive_session,
+        on_pin_sessions: Rc::new(|_| {}),
+        on_fork_sessions: Rc::new(|_| {}),
         on_archive_sessions: Rc::new(|_| {}),
         on_delete_sessions: Rc::new(|_| {}),
         on_delete_session,
@@ -1260,8 +1299,13 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("↓"));
     app.press("Claude 4").unwrap();
     app.wait_for("Agent and model").unwrap();
-    app.wait_for("Reasoning").unwrap();
     app.wait_for("Codex · GPT-5").unwrap();
+    app.press("role:button[Close]").unwrap();
+    app.wait_for_gone("Codex · GPT-5", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.press("role:button[Reasoning]").unwrap();
+    app.wait_for("Default").unwrap();
+    assert!(!app.screen().shows("Codex · GPT-5"));
 }
 
 #[test]
@@ -1317,12 +1361,15 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     assert!(app.screen().shows("Run cargo test?"));
     assert!(app.screen().shows("Allowed"));
     assert!(app.screen().shows("photo.jpg"));
+    for action in ["Edit", "Copy", "Share", "Fork"] {
+        assert!(
+            app.screen()
+                .matches(&format!("role:button[{action}]"))
+                .unwrap()
+        );
+    }
     app.press("photo.jpg").unwrap();
     app.wait_for("Attachment").unwrap();
-    assert!(app.screen().shows("Edit"));
-    assert!(app.screen().shows("Copy"));
-    assert!(app.screen().shows("Share"));
-    assert!(app.screen().shows("Fork"));
 }
 
 #[test]
@@ -1367,7 +1414,10 @@ fn selected_sessions_can_become_a_group() {
     app.wait_for("Fix the tests").unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("1 selected").unwrap();
-    app.press("Group").unwrap();
+    assert!(!app.screen().enabled("role:button[Group]").unwrap());
+    app.press("role:button[Select: vibex]").unwrap();
+    app.wait_for("2 selected").unwrap();
+    app.press("role:button[Group]").unwrap();
     app.wait_for("Group name").unwrap();
 }
 
@@ -1454,8 +1504,8 @@ fn the_drawer_selects_sessions_for_a_batch() {
     app.wait_for("Archive").unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("1 selected").unwrap();
-    app.press("Done").unwrap();
-    app.wait_for_gone("Archive", std::time::Duration::from_secs(5))
+    app.press("role:button[Select sessions]").unwrap();
+    app.wait_for_gone("role:button[Archive]", std::time::Duration::from_secs(5))
         .unwrap();
 }
 
@@ -1475,7 +1525,7 @@ fn the_conversation_can_be_searched() {
     app.press("role:button[Find in conversation]").unwrap();
     app.type_text("text:Find in conversation", "green").unwrap();
     app.wait_for("1/1").unwrap();
-    app.press("›").unwrap();
+    app.press("role:button[Next match]").unwrap();
     app.press("Close").unwrap();
     app.wait_for_gone("1/1", std::time::Duration::from_secs(5))
         .unwrap();
@@ -1597,8 +1647,7 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("hello from the pty").unwrap();
     assert!(app.screen().shows("Esc"));
-    assert!(app.screen().shows("Ctrl+C"));
-    app.press("role:button[Copy terminal]").unwrap();
+    assert!(app.screen().shows("Ctrl"));
     app.press("role:button[Find in terminal]").unwrap();
     app.type_text("text:Find in terminal", "hello").unwrap();
     app.wait_for("1 matches").unwrap();
@@ -1635,7 +1684,8 @@ fn the_files_surface_lists_a_directory_and_reads_a_file() {
         .unwrap();
     app.press("src").unwrap();
     app.press("main.rs").unwrap();
-    app.wait_for("role:button[Save]").unwrap();
+    app.wait_for("role:button[Go to line]").unwrap();
+    assert!(!app.screen().matches("role:button[Save]").unwrap());
 }
 
 /// The shell with its Git surface open.
@@ -1655,6 +1705,8 @@ fn the_file_browser_searches_content() {
     app.press("Name").unwrap();
     app.type_text("text:Search files", "hello").unwrap();
     app.wait_for("main.rs:3").unwrap();
+    app.press("main.rs:3").unwrap();
+    app.wait_for("role:button[Go to line]").unwrap();
 }
 
 #[test]
@@ -1698,8 +1750,13 @@ fn the_git_surface_lists_changes_and_shows_a_diff() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("src/main.rs").unwrap();
-    for tool in ["Pull", "Push", "Amend", "Push after"] {
-        assert!(app.screen().shows(tool), "the Git tools offer {tool}");
+    for tool in ["Fetch", "Pull", "Push", "Amend", "Push after"] {
+        assert!(
+            app.screen()
+                .matches(&format!("role:button[{tool}]"))
+                .unwrap(),
+            "the Git tools offer {tool}"
+        );
     }
     app.press("src/main.rs").unwrap();
     app.wait_for("diff --git a/src/main.rs b/src/main.rs")
@@ -1712,8 +1769,8 @@ fn a_git_change_can_be_staged_from_the_surface() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("src/main.rs").unwrap();
-    app.press("Stage").unwrap();
-    app.wait_for("Unstage").unwrap();
+    app.press("role:button[Stage]").unwrap();
+    app.wait_for("role:button[Unstage]").unwrap();
 }
 
 #[test]
@@ -1726,7 +1783,7 @@ fn the_git_surface_commits_and_shows_history() {
     app.press("role:button[Commit]").unwrap();
     // The composer clears when the commit is accepted.
     app.wait_for("text:Commit message").unwrap();
-    app.press("role:button[History]").unwrap();
+    app.press("role:button[Commits]").unwrap();
     app.wait_for("Initial commit").unwrap();
     app.type_text("text:Search commits", "zzz").unwrap();
     app.wait_for_gone("Initial commit", std::time::Duration::from_secs(5))
@@ -1734,7 +1791,7 @@ fn the_git_surface_commits_and_shows_history() {
 }
 
 #[test]
-fn a_files_save_follows_the_edited_state() {
+fn the_read_only_file_viewer_can_find_in_source() {
     let mut config = EngineConfig::new(Root::of::<FilesShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
@@ -1742,8 +1799,12 @@ fn a_files_save_follows_the_edited_state() {
     app.press("src").unwrap();
     app.wait_for("main.rs").unwrap();
     app.press("main.rs").unwrap();
-    app.wait_for("role:button[Save]").unwrap();
-    assert!(app.screen().enabled("role:button[Save]").unwrap());
+    app.wait_for("role:button[Find in file]").unwrap();
+    app.press("role:button[Find in file]").unwrap();
+    app.type_text("text:Find in file", "greeting").unwrap();
+    app.wait_for("0/2").unwrap();
+    app.press("role:button[Next match]").unwrap();
+    app.wait_for("1/2").unwrap();
 }
 
 #[test]
@@ -1752,7 +1813,7 @@ fn a_history_row_opens_the_commit_detail() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Commit").unwrap();
-    app.press("role:button[History]").unwrap();
+    app.press("role:button[Commits]").unwrap();
     app.wait_for("Initial commit").unwrap();
     app.press("Initial commit").unwrap();
     app.wait_for("commit detail body").unwrap();
@@ -2003,29 +2064,76 @@ fn workspace_tabs_keep_the_preview_and_the_conversation_draft() {
 }
 
 #[test]
-fn the_terminal_list_switches_between_terminals() {
+fn terminal_tabs_switch_and_can_close_a_terminal() {
     let mut config = EngineConfig::new(Root::of::<TerminalShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("role:button[Terminals]").unwrap();
-    app.press("role:button[Terminals]").unwrap();
-    app.wait_for("Build").unwrap();
+    app.wait_for("role:button[Close terminal: Build]").unwrap();
     app.press("Build").unwrap();
-    app.wait_until(
-        "the title follows",
-        std::time::Duration::from_secs(5),
-        |screen| screen.texts().contains(&"Build"),
+    app.press("role:button[Close terminal: Build]").unwrap();
+    app.wait_for("Close this terminal and stop its running process?")
+        .unwrap();
+    app.press("Cancel").unwrap();
+    app.wait_for("role:button[Close terminal: Build]").unwrap();
+    app.press("role:button[Close terminal: Build]").unwrap();
+    app.press("Close terminal").unwrap();
+    app.wait_for_gone(
+        "role:button[Close terminal: Build]",
+        std::time::Duration::from_secs(3),
     )
     .unwrap();
 }
 
 #[test]
-fn a_new_worktree_session_can_be_started_from_the_sheet() {
+fn a_new_worktree_session_can_be_started_from_the_creation_page() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.press("role:button[New session]").unwrap();
+    app.wait_for("role:button[Choose workspace]").unwrap();
+    app.press("role:button[Choose workspace]").unwrap();
+    app.press("New worktree").unwrap();
     app.wait_for("text:Branch name").unwrap();
     app.type_text("text:Branch name", "feat/mobile").unwrap();
-    app.press("role:button[Create worktree]").unwrap();
+    app.press("role:button[Create]").unwrap();
     app.wait_for("Worktree session").unwrap();
+}
+
+#[test]
+fn backing_out_of_creation_returns_to_the_session_drawer() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New session]").unwrap();
+    app.wait_for("role:button[Choose workspace]").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone(
+        "role:button[Choose workspace]",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    app.wait_for("role:button[Back to session]").unwrap();
+}
+
+#[component]
+fn LongTitleShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.update(|sessions| {
+        sessions[0].title =
+            "A very long session title that must not cover the controls ".repeat(12);
+    });
+    session::session(host)
+}
+
+#[test]
+fn a_long_title_does_not_push_header_controls_out_of_reach() {
+    let mut config = EngineConfig::new(Root::of::<LongTitleShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Sessions]").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Back to session]").unwrap();
+    app.press("role:button[Back to session]").unwrap();
+    app.press("role:button[Find in conversation]").unwrap();
+    app.wait_for("text:Find in conversation").unwrap();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Terminal]").unwrap();
 }

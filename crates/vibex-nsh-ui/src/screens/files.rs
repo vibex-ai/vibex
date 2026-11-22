@@ -1,18 +1,25 @@
-//! The file tree and preview for a remote workspace.
-//!
-//! The host projects the tree and owns its reads and revision-checked writes.
+//! The remote workspace's file tree, search, and read-only viewer.
 
 use std::rc::Rc;
 
 use nsh_base::{
     button, editor,
+    editor::{Editor, EditorApi, EditorCommand, EditorSearch, EditorSearchResult},
     text_view::{MarkdownOptions, text_view},
 };
-use nsh_core::{element::ImageSrc, prelude::*};
+use nsh_core::{
+    element::{ImageSrc, Position},
+    prelude::*,
+};
 
-use crate::{copy, theme, ui::action};
+use crate::{
+    copy, theme,
+    ui::{action, field},
+};
 
-/// One row of the listing.
+const TREE_ROW_HEIGHT: f32 = 38.0;
+const TREE_INDENT: f32 = 20.0;
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
     pub path: String,
@@ -22,9 +29,49 @@ pub struct FileEntry {
     pub expanded: bool,
     pub loading: bool,
     pub git: Option<String>,
+    pub icon: FileGlyph,
+    pub ignored: bool,
 }
 
-/// One file content search result.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum FileGlyph {
+    #[default]
+    Text,
+    Code,
+    Markdown,
+    Script,
+    Database,
+    Style,
+    Image,
+    Data,
+    Archive,
+}
+
+impl FileGlyph {
+    fn icon(self) -> ImageSrc {
+        match self {
+            Self::Text => icon!("file-text"),
+            Self::Code => icon!("file-code"),
+            Self::Markdown => icon!("book-open-text"),
+            Self::Script => icon!("file-terminal"),
+            Self::Database => icon!("database"),
+            Self::Style => icon!("hash"),
+            Self::Image => icon!("image"),
+            Self::Data => icon!("braces"),
+            Self::Archive => icon!("package"),
+        }
+    }
+
+    fn color(self) -> Hsla {
+        match self {
+            Self::Code | Self::Script => theme::accent_blue(),
+            Self::Markdown | Self::Image => theme::accent_purple(),
+            Self::Database | Self::Data => theme::accent_yellow(),
+            _ => theme::text_muted(),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileSearchRow {
     pub path: String,
@@ -33,21 +80,17 @@ pub struct FileSearchRow {
     pub snippet: String,
 }
 
-/// An opened file.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FilePreview {
     pub title: String,
     pub body: String,
     pub truncated: bool,
-    /// The language the runtime reported, for highlighting.
     pub language: String,
-    /// The face the runtime says the file wants.
     pub kind: FilePreviewKindView,
-    /// A `data:` URL for an image, when one was read.
     pub image_uri: Option<String>,
+    pub line: Option<u32>,
 }
 
-/// How a file's preview is drawn.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FilePreviewKindView {
     Text,
@@ -56,264 +99,327 @@ pub enum FilePreviewKindView {
     Binary,
 }
 
-/// What the browser may do, and the state it shows.
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct SearchOptions {
+    pub contents: bool,
+    pub case_sensitive: bool,
+    pub whole_word: bool,
+    pub regex: bool,
+}
+
+pub type FileSearch = Rc<dyn Fn(&str, SearchOptions)>;
+pub type OpenFile = Rc<dyn Fn(&str, Option<u32>)>;
+
 #[derive(Clone)]
 pub struct FilesHost {
     pub entries: Signal<Vec<FileEntry>>,
     pub search: Signal<Vec<FileSearchRow>>,
-    pub on_search: FileSearch,
-    pub on_refresh: Rc<dyn Fn()>,
-    /// The file being read, when one is open.
+    pub searching: Signal<bool>,
+    pub path: Signal<Option<String>>,
     pub file: Signal<Option<FilePreview>>,
     pub error: Signal<Option<SharedString>>,
-    /// The open file's text, as edited.
-    pub content: Signal<String>,
-    /// Whether the text differs from what was read.
-    pub dirty: Signal<bool>,
-    pub saving: Signal<bool>,
-    pub on_save: Rc<dyn Fn()>,
+    pub on_search: FileSearch,
+    pub on_refresh: Rc<dyn Fn()>,
+    pub on_collapse: Rc<dyn Fn()>,
     pub on_open_dir: Rc<dyn Fn(&str)>,
-    pub on_open_file: Rc<dyn Fn(&str)>,
+    pub on_open_file: OpenFile,
     pub on_back: Rc<dyn Fn()>,
 }
 
-pub type FileSearch = Rc<dyn Fn(&str, bool)>;
-
-/// The files surface.
 pub fn files(host: FilesHost) -> impl IntoElement {
-    let on_back = host.on_back.clone();
-    let entries = host.entries;
-    let search = host.search;
-    let search_query = signal(String::new());
-    let search_contents = signal(false);
-    let has_query = move || search_query.with(|query: &String| !query.trim().is_empty());
-    let on_search = host.on_search.clone();
-    let on_open_file = host.on_open_file.clone();
-    let file = host.file;
-    let error = host.error;
-    let dirty = host.dirty;
-    let saving = host.saving;
+    let path = host.path;
+    let preview = host.clone();
     view()
         .flex_1()
+        .min_h(px(0.0))
         .bg(theme::sidebar_bg)
-        .flex_col()
         .pb_safe_area()
+        .child(
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .style_when(move || path.with(Option::is_some), |style| style.hidden())
+                .child(file_browser(host)),
+        )
         .child(when(
-            move || file.with(Option::is_some),
+            move || path.with(Option::is_some),
+            move || file_viewer(preview.clone()),
+        ))
+}
+
+fn file_browser(host: FilesHost) -> impl IntoElement {
+    let query = signal(String::new());
+    let options = signal(SearchOptions::default());
+    let has_query = move || query.with(|query| !query.trim().is_empty());
+    let search = host.on_search;
+    let run_search: Rc<dyn Fn()> = Rc::new({
+        let search = search.clone();
+        move || search(&query.get_untracked(), options.get_untracked())
+    });
+    let error = host.error;
+    let searching = host.searching;
+    let results = host.search;
+    let entries = host.entries;
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(
+            view()
+                .h(px(theme::TOUCH_TARGET))
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .px(px(theme::SPACING_XS))
+                .gap(px(theme::SPACING_XS))
+                .border_b_1()
+                .border_b_color(theme::border_subtle)
+                .child(
+                    field::text_field_flat_with(
+                        query,
+                        copy::text("Search files", "搜索文件", "搜尋檔案"),
+                        {
+                            let search = search.clone();
+                            move |value| search(value, options.get_untracked())
+                        },
+                    )
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .px(px(theme::SPACING_SM)),
+                )
+                .child(when(has_query, {
+                    let run_search = run_search.clone();
+                    move || {
+                        let run_search = run_search.clone();
+                        rail_button(
+                            icon!("x"),
+                            copy::text("Clear search", "清除搜索", "清除搜尋"),
+                            move || {
+                                query.set(String::new());
+                                run_search();
+                            },
+                        )
+                    }
+                }))
+                .child(
+                    button()
+                        .h(px(36.0))
+                        .px(px(theme::SPACING_XS))
+                        .justify_center()
+                        .flex_shrink_0()
+                        .on_press({
+                            let run_search = run_search.clone();
+                            move || {
+                                options.update(|options| options.contents = !options.contents);
+                                run_search();
+                            }
+                        })
+                        .child(
+                            text(move || {
+                                if options.get().contents {
+                                    copy::text("Content", "内容", "內容")
+                                } else {
+                                    copy::text("Name", "名称", "名稱")
+                                }
+                            })
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::text_secondary),
+                        ),
+                )
+                .child(rail_button(
+                    icon!("refresh"),
+                    copy::text("Refresh files", "刷新文件", "重新整理檔案"),
+                    move || (host.on_refresh)(),
+                ))
+                .child(rail_button(
+                    icon!("chevrons-down-up"),
+                    copy::text("Collapse folders", "折叠文件夹", "摺疊資料夾"),
+                    move || (host.on_collapse)(),
+                )),
+        )
+        .child(when(
+            move || options.get().contents,
             move || {
                 view()
-                    .w_full()
-                    .border_b_1()
-                    .border_b_color(theme::border_subtle)
-                    .child(
-                        view()
-                            .w_full()
-                            .h(px(theme::TOUCH_TARGET))
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .px(px(theme::SPACING_SM))
-                            .child({
-                                let on_back = on_back.clone();
-                                action::icon_button(
-                                    icon!("chevron-left"),
-                                    copy::text("Back", "返回", "返回"),
-                                    move || on_back(),
-                                )
-                            })
-                            .child(
-                                text(move || {
-                                    file.with(|file| {
-                                        file.as_ref()
-                                            .map_or_else(String::new, |file| file.title.clone())
-                                    })
-                                })
-                                .flex_1()
-                                .truncate()
-                                .text_size(px(theme::font_body()))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::foreground),
-                            )
-                            .child(when(
-                                move || {
-                                    file.get().is_some_and(|file| {
-                                        matches!(
-                                            file.kind,
-                                            FilePreviewKindView::Text
-                                                | FilePreviewKindView::Markdown
-                                        )
-                                    })
-                                },
-                                {
-                                    let on_save = host.on_save.clone();
-                                    move || {
-                                        let on_save = on_save.clone();
-                                        action::icon_button(
-                                            icon(include_str!("../../assets/icons/check.svg")),
-                                            copy::text("Save", "保存", "儲存"),
-                                            move || on_save(),
-                                        )
-                                        .disabled(move || !dirty.get() || saving.get())
-                                        .disabled_style(|style| style.opacity(0.35))
-                                    }
-                                },
-                            )),
-                    )
+                    .flex_row()
+                    .gap(px(theme::SPACING_XS))
+                    .px(px(theme::SPACING_SM))
+                    .child(search_toggle(
+                        "Aa",
+                        copy::text("Case sensitive", "区分大小写", "區分大小寫"),
+                        options,
+                        |options| &mut options.case_sensitive,
+                        run_search.clone(),
+                    ))
+                    .child(search_toggle(
+                        copy::text("Word", "整词", "整詞"),
+                        copy::text("Whole word", "匹配整词", "符合整詞"),
+                        options,
+                        |options| &mut options.whole_word,
+                        run_search.clone(),
+                    ))
+                    .child(search_toggle(
+                        ".*",
+                        copy::text("Regex", "正则表达式", "規則運算式"),
+                        options,
+                        |options| &mut options.regex,
+                        run_search.clone(),
+                    ))
             },
         ))
         .child(when(
-            move || error.get().is_some(),
+            move || error.with(Option::is_some) && !searching.get(),
             move || {
                 text(move || error.get().unwrap_or_default())
-                    .px(px(theme::SPACING_LG))
+                    .px(px(theme::SPACING_MD))
                     .py(px(theme::SPACING_SM))
-                    .text_size(px(theme::font_caption()))
                     .text_color(theme::accent_red)
+                    .text_size(px(theme::font_caption()))
             },
         ))
-        .child(when(
-            move || file.get().is_some(),
-            move || file_preview(file, host.content, dirty),
-        ))
-        .child(when(move || file.with(Option::is_none), {
-            let on_search = on_search.clone();
-            let on_open_file = on_open_file.clone();
-            let on_open_dir = host.on_open_dir.clone();
-            let on_refresh = host.on_refresh.clone();
-            move || {
-                view()
-                    .flex_1()
-                    .min_h(px(0.0))
-                    .flex_col()
-                    .child(
-                        view()
-                            .h(px(theme::TOUCH_TARGET))
-                            .flex_shrink_0()
-                            .px(px(theme::SPACING_XS))
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .border_b_1()
-                            .border_b_color(theme::border_subtle)
-                            .child(
-                                crate::ui::field::text_field_flat_with(
-                                    search_query,
-                                    copy::text("Search files", "搜索文件", "搜尋檔案"),
-                                    {
-                                        let on_search = on_search.clone();
-                                        move |text| on_search(text, search_contents.get_untracked())
-                                    },
-                                )
-                                .flex_1()
-                                .min_w(px(0.0)),
-                            )
-                            .child(when(has_query, {
-                                let on_search = on_search.clone();
-                                move || {
-                                    let on_search = on_search.clone();
-                                    action::icon_button(
-                                        icon!("x"),
-                                        copy::text("Clear search", "清除搜索", "清除搜尋"),
-                                        move || {
-                                            search_query.set(String::new());
-                                            on_search("", search_contents.get_untracked());
-                                        },
-                                    )
-                                    .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                                    .flex_shrink_0()
+        .child(
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .style_when(has_query, |style| style.hidden())
+                .child({
+                    let open = host.on_open_file.clone();
+                    virtual_list(
+                        move || entries.with(Vec::len),
+                        move |at: Position| {
+                            let entry = computed(move || {
+                                entries.with(|entries| entries.get(at.index()).cloned())
+                            });
+                            let open = open.clone();
+                            let dir = host.on_open_dir.clone();
+                            dynamic(move || match entry.get() {
+                                Some(row) => {
+                                    file_row(row, open.clone(), dir.clone()).into_element()
                                 }
-                            }))
-                            .child(
-                                button()
-                                    .h(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                                    .px(px(theme::SPACING_SM))
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .justify_center()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .on_press({
-                                        let on_search = on_search.clone();
-                                        move || {
-                                            let next = !search_contents.get_untracked();
-                                            search_contents.set(next);
-                                            on_search(&search_query.get_untracked(), next);
-                                        }
-                                    })
-                                    .child(
-                                        text(move || {
-                                            if search_contents.get() {
-                                                copy::text("Content", "内容", "內容")
-                                            } else {
-                                                copy::text("Name", "名称", "名稱")
-                                            }
-                                        })
-                                        .text_size(px(theme::font_caption()))
-                                        .text_color(theme::text_secondary),
-                                    ),
-                            )
-                            .child({
-                                let on_refresh = on_refresh.clone();
-                                action::icon_button(
-                                    icon!("refresh"),
-                                    copy::text("Refresh files", "刷新文件", "重新整理檔案"),
-                                    move || on_refresh(),
-                                )
-                                .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                                .flex_shrink_0()
-                            }),
+                                None => view().into_element(),
+                            })
+                        },
+                    )
+                    .keys(move || {
+                        entries.with(|entries| {
+                            entries
+                                .iter()
+                                .map(|entry| entry.path.clone())
+                                .collect::<Vec<_>>()
+                        })
+                    })
+                    .estimated_item_size(px(TREE_ROW_HEIGHT))
+                    .flex_1()
+                }),
+        )
+        .child(when(has_query, move || {
+            let open = host.on_open_file.clone();
+            when(
+                move || searching.get(),
+                || super::session::empty_hint(copy::text("Searching…", "正在搜索…", "正在搜尋…")),
+            )
+            .otherwise(move || {
+                let open = open.clone();
+                when(
+                    move || error.with(Option::is_none) && results.with(Vec::is_empty),
+                    || {
+                        super::session::empty_hint(copy::text(
+                            "No matching items",
+                            "没有匹配项",
+                            "沒有符合項目",
+                        ))
+                    },
+                )
+                .otherwise(move || file_search_list(results, open.clone()))
+            })
+        }))
+}
+
+fn search_toggle(
+    title: &'static str,
+    label: &'static str,
+    options: Signal<SearchOptions>,
+    field: fn(&mut SearchOptions) -> &mut bool,
+    submit: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    button()
+        .h(px(32.0))
+        .px(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CONTROL))
+        .accessibility_label(label)
+        .style_when(
+            move || *field(&mut options.get()),
+            |style| style.bg(theme::sidebar_selected_bg()),
+        )
+        .on_press(move || {
+            options.update(|options| {
+                let value = field(options);
+                *value = !*value;
+            });
+            submit();
+        })
+        .child(
+            text(title)
+                .text_size(px(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
+}
+
+fn file_search_list(rows: Signal<Vec<FileSearchRow>>, open: OpenFile) -> impl IntoElement {
+    scroll()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(view().w_full().child(each(
+            move || rows.get(),
+            |row| (row.path.clone(), row.line),
+            move |row, _| {
+                let open = open.clone();
+                button()
+                    .h(px(theme::TOUCH_TARGET))
+                    .mx(px(theme::SPACING_XS))
+                    .px(px(theme::SPACING_SM))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CONTROL))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .on_press(move || {
+                        let row = row.get_untracked();
+                        dismiss_keyboard();
+                        open(&row.path, row.line);
+                    })
+                    .child(
+                        svg(icon!("file-text"))
+                            .size(px(theme::ICON_SM))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted),
                     )
                     .child(
                         view()
                             .flex_1()
-                            .min_h(px(0.0))
-                            .style_when(has_query, |style| style.hidden())
-                            .child(file_list(
-                                entries,
-                                on_open_dir.clone(),
-                                on_open_file.clone(),
-                            )),
-                    )
-                    .child(when(has_query, {
-                        let on_open_file = on_open_file.clone();
-                        move || file_search_list(search, on_open_file.clone())
-                    }))
-            }
-        }))
-}
-
-fn file_search_list(
-    rows: Signal<Vec<FileSearchRow>>,
-    on_open_file: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    scroll()
-        .flex_1()
-        .child(view().w_full().flex_col().child(each(
-            move || rows.get(),
-            |row| (row.path.clone(), row.line),
-            move |row, _| {
-                let on_open_file = on_open_file.clone();
-                button()
-                    .on_press(move || on_open_file(&row.get_untracked().path))
-                    .w_full()
-                    .px(px(theme::SPACING_LG))
-                    .py(px(theme::SPACING_XS))
-                    .flex_col()
-                    .items_start()
-                    .border_b_1()
-                    .border_b_color(theme::border_subtle)
-                    .child(
-                        text(move || {
-                            let row = row.get();
-                            match row.line {
-                                Some(line) => format!("{}:{line}", row.name),
-                                None => row.name,
-                            }
-                        })
-                        .text_size(px(theme::font_body()))
-                        .text_color(theme::foreground),
+                            .min_w(px(0.0))
+                            .child(
+                                text(move || {
+                                    row.with(|row| match row.line {
+                                        Some(line) => format!("{}:{line}", row.name),
+                                        None => row.name.clone(),
+                                    })
+                                })
+                                .truncate()
+                                .text_size(px(theme::font_body()))
+                                .text_color(theme::foreground),
+                            )
+                            .child(
+                                text(move || row.with(|row| row.path.clone()))
+                                    .truncate()
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_muted),
+                            ),
                     )
                     .child(
-                        text(move || row.get().snippet)
+                        text(move || row.with(|row| row.snippet.clone()))
+                            .max_w(px(110.0))
                             .truncate()
                             .text_size(px(theme::font_micro()))
                             .text_color(theme::text_muted),
@@ -322,199 +428,408 @@ fn file_search_list(
         )))
 }
 
-fn file_list(
-    entries: Signal<Vec<FileEntry>>,
-    on_open_dir: Rc<dyn Fn(&str)>,
-    on_open_file: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    view().flex_1().min_h(px(0.0)).child(
-        virtual_list(
-            move || entries.with(|entries| entries.len()),
-            move |at: Position| file_row(at, entries, on_open_dir.clone(), on_open_file.clone()),
+fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl IntoElement {
+    let directory = row.directory;
+    let depth = row.depth.min(10);
+    let (icon, color) = if directory {
+        (
+            if row.expanded {
+                icon!("folder-open")
+            } else {
+                icon!("folder")
+            },
+            theme::text_secondary(),
         )
-        .keys(move || {
-            entries.with(|entries| {
-                entries
-                    .iter()
-                    .map(|entry| entry.path.clone())
-                    .collect::<Vec<_>>()
-            })
-        })
-        .estimated_item_size(px(theme::TOUCH_TARGET))
-        .flex_1(),
-    )
-}
-
-fn file_row(
-    at: Position,
-    entries: Signal<Vec<FileEntry>>,
-    on_open_dir: Rc<dyn Fn(&str)>,
-    on_open_file: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
+    } else {
+        (row.icon.icon(), row.icon.color())
+    };
+    let path = row.path;
+    let status = row.git.unwrap_or_default();
+    let status_color = match status.as_str() {
+        "A" | "?" => theme::accent_success(),
+        "D" => theme::accent_red(),
+        "M" | "R" => theme::accent_yellow(),
+        _ => theme::text_muted(),
+    };
     button()
-        .w_full()
-        .min_h(px(theme::TOUCH_TARGET))
+        .min_h(px(TREE_ROW_HEIGHT))
+        .relative()
+        .mx(px(theme::SPACING_XS))
+        .px(px(theme::SPACING_XS))
+        .rounded(px(theme::RADIUS_CONTROL))
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_SM))
-        .px(px(theme::SPACING_SM))
+        .gap(px(theme::SPACING_XS))
         .active(|style| style.bg(theme::row_pressed_bg()))
         .on_press(move || {
-            let Some(entry) = entry.get_untracked() else {
-                return;
-            };
-            if entry.directory {
-                on_open_dir(&entry.path);
+            if directory {
+                toggle(&path);
             } else {
-                on_open_file(&entry.path);
+                open(&path, None);
             }
         })
-        .child(dynamic(move || {
-            let row = entry.get();
-            let indent = row.as_ref().map_or(0, |row| row.depth.min(12)) as f32 * theme::SPACING_SM;
-            let glyph = match row {
-                Some(row) if row.loading => icon!("loader-circle"),
-                Some(row) if row.directory && row.expanded => icon!("folder-open"),
-                Some(row) if row.directory => icon!("folder"),
-                _ => icon!("file-text"),
-            };
-            svg(glyph)
+        .children((0..depth).map(|level| {
+            view()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .left(px(theme::SPACING_MD + level as f32 * TREE_INDENT))
+                .w(px(1.0))
+                .bg(theme::sidebar_tree_guide)
+                .pointer_events(PointerEvents::None)
+        }))
+        .child(view().w(px(depth as f32 * TREE_INDENT)).flex_shrink_0())
+        .child(
+            view()
+                .w(px(16.0))
+                .flex_shrink_0()
+                .items_center()
+                .child(when(
+                    move || directory,
+                    move || {
+                        svg(if row.expanded {
+                            icon!("chevron-down")
+                        } else {
+                            icon!("chevron-right")
+                        })
+                        .size(px(12.0))
+                        .text_color(theme::text_muted)
+                    },
+                )),
+        )
+        .child(
+            svg(icon)
                 .size(px(theme::ICON_SM))
-                .ml(px(indent))
+                .flex_shrink_0()
+                .text_color(color)
+                .opacity(if row.ignored { 0.55 } else { 1.0 }),
+        )
+        .child(
+            text(row.name)
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(theme::font_body()))
+                .text_color(if row.ignored {
+                    theme::text_muted
+                } else {
+                    theme::foreground
+                }),
+        )
+        .children(row.loading.then(|| {
+            svg(icon!("loader-circle"))
+                .size(px(14.0))
                 .flex_shrink_0()
                 .text_color(theme::text_muted)
         }))
         .child(
-            text(move || {
-                entry.with(|entry| {
-                    entry
-                        .as_ref()
-                        .map(|entry| entry.name.clone())
-                        .unwrap_or_default()
-                })
-            })
-            .flex_1()
-            .truncate()
-            .text_size(px(theme::font_body()))
-            .text_color(theme::foreground),
-        )
-        .child(
-            text(move || {
-                entry.with(|row| {
-                    row.as_ref()
-                        .and_then(|row| row.git.clone())
-                        .unwrap_or_default()
-                })
-            })
-            .text_size(px(theme::font_caption()))
-            .text_color(theme::text_muted),
+            text(status)
+                .w(px(16.0))
+                .flex_shrink_0()
+                .text_size(px(theme::font_micro()))
+                .text_color(status_color),
         )
 }
 
-fn file_preview(
-    file: Signal<Option<FilePreview>>,
-    content: Signal<String>,
-    dirty: Signal<bool>,
-) -> impl IntoElement {
-    let truncated =
-        computed(move || file.with(|file| file.as_ref().is_some_and(|file| file.truncated)));
+fn file_viewer(host: FilesHost) -> impl IntoElement {
+    let path = host.path;
+    let file = host.file;
+    let error = host.error;
+    let reader = component_ref::<Editor>();
+    let find = signal(false);
+    let jump = signal(false);
+    let query = signal(String::new());
+    let line = signal(String::new());
+    let matches = signal(EditorSearchResult::default());
+    let initial = stored(None::<(String, u32)>);
+    let can_find = move || {
+        file.with(|file| {
+            file.as_ref().is_some_and(|file| {
+                matches!(
+                    file.kind,
+                    FilePreviewKindView::Text | FilePreviewKindView::Markdown
+                )
+            })
+        })
+    };
+    let on_jump = move || {
+        let Some(api) = reader.api::<EditorApi>() else {
+            return;
+        };
+        if let Ok(line) = line.get_untracked().trim().parse::<u32>() {
+            let last = api.value().lines().count().saturating_sub(1) as u32;
+            api.go_to_line(line.saturating_sub(1).min(last));
+            dismiss_keyboard();
+        }
+    };
     view()
         .flex_1()
         .min_h(px(0.0))
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_SM))
-        .child(when(
-            move || {
-                file.with(|file| {
-                    file.as_ref()
-                        .is_some_and(|file| file.kind == FilePreviewKindView::Markdown)
-                })
-            },
-            move || {
-                scroll().flex_1().child(
-                    view().p(px(theme::SPACING_MD)).child(
-                        text_view()
-                            .markdown(move || Some(content.get().into()))
-                            .options(MarkdownOptions::default)
-                            .selectable(true),
-                    ),
-                )
-            },
-        ))
-        .child(when(
-            move || {
-                file.with(|file| {
-                    file.as_ref()
-                        .is_some_and(|file| file.kind == FilePreviewKindView::Image)
-                })
-            },
-            move || {
-                view().flex_1().items_center().justify_center().child(
-                    image(move || {
-                        ImageSrc::from(file.with(|file| {
-                            file.as_ref()
-                                .and_then(|file| file.image_uri.clone())
-                                .unwrap_or_default()
-                        }))
-                    })
-                    .w_full()
-                    .object_fit(nsh_core::ResizeMode::Contain),
-                )
-            },
-        ))
-        .child(when(
-            move || {
-                file.with(|file| {
-                    file.as_ref().is_some_and(|file| {
-                        matches!(
-                            file.kind,
-                            FilePreviewKindView::Text | FilePreviewKindView::Binary
-                        )
-                    })
-                })
-            },
-            move || {
-                editor()
-                    .value(move || Some(content.get().into()))
-                    .language(move || {
-                        file.with(|file| {
-                            file.as_ref()
-                                .map(|file| SharedString::from(file.language.clone()))
-                                .filter(|language| !language.is_empty())
-                        })
-                    })
-                    .test_id("file-content")
-                    .read_only(move || {
-                        file.with(|file| {
-                            file.as_ref()
-                                .is_some_and(|file| file.kind == FilePreviewKindView::Binary)
-                        })
-                    })
-                    .on_change(move |value: &SharedString| {
-                        content.set(value.to_string());
-                        dirty.set(true);
-                    })
-                    .flex_1()
-                    .min_h(px(240.0))
-            },
-        ))
-        .child(when(
-            move || truncated.get(),
-            || {
-                text(copy::text(
-                    "The file is larger than the preview limit.",
-                    "文件超过预览上限。",
-                    "檔案超過預覽上限。",
+        .pb_keyboard()
+        .child(
+            view()
+                .h(px(theme::TOUCH_TARGET))
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .border_b_1()
+                .border_b_color(theme::border_subtle)
+                .child(rail_button(
+                    icon!("chevron-left"),
+                    copy::text("Back", "返回", "返回"),
+                    move || {
+                        dismiss_keyboard();
+                        (host.on_back)();
+                    },
                 ))
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted)
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .child(
+                            text(move || {
+                                path.with(|path| {
+                                    path.as_deref()
+                                        .unwrap_or_default()
+                                        .rsplit('/')
+                                        .next()
+                                        .unwrap_or_default()
+                                        .to_owned()
+                                })
+                            })
+                            .truncate()
+                            .text_size(px(theme::font_body()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                        )
+                        .child(
+                            text(move || {
+                                path.with(|path| {
+                                    path.as_deref()
+                                        .and_then(|path| {
+                                            path.rsplit_once('/')
+                                                .map(|(parent, _)| parent.to_owned())
+                                        })
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .truncate()
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted),
+                        ),
+                )
+                .child(when(can_find, move || {
+                    view()
+                        .flex_row()
+                        .flex_shrink_0()
+                        .child(rail_button(
+                            icon!("search"),
+                            copy::text("Find in file", "在文件中查找", "在檔案中尋找"),
+                            move || {
+                                jump.set(false);
+                                find.update(|value| *value = !*value);
+                            },
+                        ))
+                        .child(rail_button(
+                            icon!("hash"),
+                            copy::text("Go to line", "转到行", "前往行"),
+                            move || {
+                                find.set(false);
+                                jump.update(|value| *value = !*value);
+                            },
+                        ))
+                })),
+        )
+        .child(when(
+            move || find.get(),
+            move || {
+                view()
+                    .h(px(theme::TOUCH_TARGET))
+                    .flex_row()
+                    .items_center()
+                    .px(px(theme::SPACING_XS))
+                    .child(
+                        field::text_field_flat(
+                            query,
+                            copy::text("Find in file", "在文件中查找", "在檔案中尋找"),
+                        )
+                        .flex_1()
+                        .min_w(px(0.0)),
+                    )
+                    .child(
+                        text(move || {
+                            matches.with(|result| {
+                                format!("{}/{}", result.current.map_or(0, |i| i + 1), result.count)
+                            })
+                        })
+                        .flex_shrink_0()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                    )
+                    .child(find_button(
+                        reader,
+                        EditorCommand::FindPrevious,
+                        icon!("chevron-up"),
+                        copy::text("Previous match", "上一个匹配", "上一個符合"),
+                    ))
+                    .child(find_button(
+                        reader,
+                        EditorCommand::FindNext,
+                        icon!("chevron-down"),
+                        copy::text("Next match", "下一个匹配", "下一個符合"),
+                    ))
+                    .child(rail_button(
+                        icon!("x"),
+                        copy::text("Close search", "关闭搜索", "關閉搜尋"),
+                        move || {
+                            find.set(false);
+                            query.set(String::new());
+                            dismiss_keyboard();
+                        },
+                    ))
             },
         ))
+        .child(when(
+            move || jump.get(),
+            move || {
+                view()
+                    .h(px(theme::TOUCH_TARGET))
+                    .flex_row()
+                    .items_center()
+                    .px(px(theme::SPACING_XS))
+                    .child(
+                        field::text_field_flat(line, copy::text("Line number", "行号", "行號"))
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .on_submit(move |_: &str| on_jump()),
+                    )
+                    .child(rail_button(
+                        icon!("arrow-to-top"),
+                        copy::text("Go", "跳转", "前往"),
+                        on_jump,
+                    ))
+                    .child(rail_button(
+                        icon!("x"),
+                        copy::text("Close go to line", "关闭行定位", "關閉行定位"),
+                        move || {
+                            jump.set(false);
+                            dismiss_keyboard();
+                        },
+                    ))
+            },
+        ))
+        .child(dynamic(move || {
+            let Some(preview) = file.get() else {
+                return view()
+                    .flex_1()
+                    .items_center()
+                    .justify_center()
+                    .px(px(theme::SPACING_MD))
+                    .child(
+                        text(move || {
+                            error.get().unwrap_or_else(|| {
+                                copy::text("Loading file…", "正在加载文件…", "正在載入檔案…").into()
+                            })
+                        })
+                        .text_size(px(theme::font_body()))
+                        .text_color(theme::text_muted),
+                    )
+                    .into_element();
+            };
+            let force_source = find.get() || jump.get() || preview.line.is_some();
+            let body = match preview.kind {
+                FilePreviewKindView::Markdown if !force_source => scroll()
+                    .flex_1()
+                    .child(
+                        view().p(px(theme::SPACING_MD)).child(
+                            text_view()
+                                .markdown(Some(SharedString::from(preview.body)))
+                                .options(MarkdownOptions::default)
+                                .selectable(true),
+                        ),
+                    )
+                    .into_element(),
+                FilePreviewKindView::Image => view()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .justify_center()
+                    .items_center()
+                    .child(
+                        image(ImageSrc::from(preview.image_uri.unwrap_or_default()))
+                            .w_full()
+                            .h_full()
+                            .object_fit(nsh_core::ResizeMode::Contain),
+                    )
+                    .into_element(),
+                FilePreviewKindView::Binary => super::session::empty_hint(copy::text(
+                    "No preview for this file",
+                    "无法预览此文件",
+                    "無法預覽此檔案",
+                ))
+                .into_element(),
+                _ => {
+                    let location = path.get_untracked().zip(preview.line);
+                    editor()
+                        .component_ref(&reader)
+                        .value(Some(SharedString::from(preview.body)))
+                        .language(Some(SharedString::from(preview.language)))
+                        .read_only(true)
+                        .search(move || find.get().then(|| EditorSearch::new(query.get())))
+                        .on_search_change(move |result: &EditorSearchResult| {
+                            matches.set(result.clone())
+                        })
+                        .on_layout(move |_: &Bounds<Points>| {
+                            if initial.get() != location
+                                && let Some((_, line)) = location.as_ref()
+                                && let Some(api) = reader.api::<EditorApi>()
+                            {
+                                initial.replace(location.clone());
+                                api.go_to_line(line.saturating_sub(1));
+                            }
+                        })
+                        .test_id("file-content")
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .into_element()
+                }
+            };
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .child(body)
+                .children(preview.truncated.then(|| {
+                    text(copy::text(
+                        "The file is larger than the preview limit.",
+                        "文件超过预览上限。",
+                        "檔案超過預覽上限。",
+                    ))
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+                }))
+                .into_element()
+        }))
 }
 
-/// An SVG from this crate's assets, drawn inline.
-fn icon(markup: &'static str) -> ImageSrc {
-    ImageSrc::svg_markup(markup)
+fn find_button(
+    reader: ComponentRef<Editor>,
+    command: EditorCommand,
+    icon: ImageSrc,
+    label: &'static str,
+) -> impl IntoElement {
+    rail_button(icon, label, move || {
+        if let Some(api) = reader.api::<EditorApi>() {
+            api.run(command);
+        }
+    })
+}
+
+fn rail_button(
+    icon: ImageSrc,
+    label: &'static str,
+    action: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    action::icon_button(icon, label, action)
+        .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+        .flex_shrink_0()
 }

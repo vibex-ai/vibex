@@ -64,6 +64,7 @@ pub struct Pager {
     /// Counts settles, so a finished animation only tidies up after itself.
     run: Stored<u64>,
     drag_page: Stored<Option<ShellPage>>,
+    on_pre_back: Stored<Option<Rc<dyn Fn() -> bool>>>,
     on_back: Stored<Option<Rc<dyn Fn() -> bool>>>,
     on_sessions_back: Stored<Option<Rc<dyn Fn() -> bool>>>,
 }
@@ -94,6 +95,7 @@ impl Pager {
             workbench_made: signal(false),
             run: stored(0),
             drag_page: stored(None),
+            on_pre_back: stored(None),
             on_back: stored(None),
             on_sessions_back: stored(None),
         };
@@ -142,11 +144,18 @@ impl Pager {
         self.on_back.replace(Some(Rc::new(on_back)));
     }
 
+    pub(super) fn on_pre_back(self, on_back: impl Fn() -> bool + 'static) {
+        self.on_pre_back.replace(Some(Rc::new(on_back)));
+    }
+
     pub(super) fn on_sessions_back(self, on_back: impl Fn() -> bool + 'static) {
         self.on_sessions_back.replace(Some(Rc::new(on_back)));
     }
 
     pub(super) fn back(self) -> bool {
+        if self.on_pre_back.get().is_some_and(|on_back| on_back()) {
+            return true;
+        }
         let handler = if self.page_untracked() == ShellPage::Sessions {
             self.on_sessions_back
         } else {

@@ -16,14 +16,16 @@ use std::{
 
 use base64::Engine as _;
 use nsh_base::{Terminal, TerminalApi};
+use nsh_core::element::ImageSrc;
 use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::platform::Lifecycle;
 use nsh_core::prelude::*;
 use nsh_core::storage::Storage;
+use tokio::{sync::mpsc, task::AbortHandle};
 use vibex_backend::{
     AgentBackend, BackendError, BackendErrorKind, BackendEvent, BackendProjection, BackendResult,
-    FileBackend, GitBackend, MutationRequest, SidebarBackend, TerminalBackend, WorkspaceBackend,
-    WorkspaceSummary,
+    FileBackend, GitBackend, MutationRequest, SidebarBackend, TerminalBackend, TerminalFrameBatch,
+    TerminalFrameSubscription, WorkspaceBackend, WorkspaceSummary,
 };
 use vibex_core::{
     AgentCommandDiscoverRequest, AgentCommandEntry, AgentCommandExecuteRequest,
@@ -55,14 +57,18 @@ use vibex_core::{
     WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
-    FileTreeLoadState, FileTreeProjection, SidebarHierarchyMode, SidebarOrganizationView,
+    FileIconKind, FileTreeLoadState, FileTreeProjection, GitPathSelectionState, GitQueryKind,
+    GitTreeRowKind, GitWorkbenchState, SidebarHierarchyMode, SidebarOrganizationView,
+    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
     TimelineConversationTurn, TimelineModel, TimelineRow,
 };
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
-    screens::files::{FileEntry, FilePreview, FilePreviewKindView, FileSearchRow},
+    screens::files::{
+        FileEntry, FileGlyph, FilePreview, FilePreviewKindView, FileSearchRow, SearchOptions,
+    },
     screens::git::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
         WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
@@ -129,9 +135,12 @@ pub struct SessionService {
     git_backend: Arc<dyn GitBackend>,
     workspace_backend: Arc<dyn WorkspaceBackend>,
     sidebar_backend: Arc<dyn SidebarBackend>,
+    sidebar_sync: Rc<futures_util::lock::Mutex<()>>,
     sidebar_snapshot: Rc<RefCell<RemoteSidebarOrganizationSnapshot>>,
     sidebar_view: Signal<SidebarOrganizationView>,
     sidebar_detailed: Signal<bool>,
+    sidebar_mode_pending: Rc<Cell<Option<bool>>>,
+    sidebar_mode_request: Rc<Cell<u64>>,
     sidebar_sections: Signal<Vec<SidebarSectionView>>,
     folder_open: Signal<bool>,
     folder_name: Signal<String>,
@@ -169,11 +178,16 @@ pub struct SessionService {
     terminal_title: Signal<Option<SharedString>>,
     terminal_error: Signal<Option<SharedString>>,
     terminal_ref: ComponentRef<Terminal>,
-    terminal_id: Rc<RefCell<Option<TerminalId>>>,
+    terminal_id: Signal<Option<String>>,
+    terminal_busy: Signal<bool>,
+    terminal_output_revision: Signal<u64>,
+    terminal_size: Rc<Cell<(u16, u16)>>,
+    terminal_tx: Rc<RefCell<Option<mpsc::Sender<TerminalCommand>>>>,
+    terminal_stream: Rc<RefCell<Option<AbortHandle>>>,
+    terminal_writer: Rc<RefCell<Option<AbortHandle>>>,
     /// Bytes of a UTF-8 character split across two frames.
     terminal_pending: Rc<RefCell<Vec<u8>>>,
     terminal_choices: Signal<Vec<TerminalChoice>>,
-    terminal_menu: Signal<bool>,
     /// Bumped when the terminal closes, so its stream stops writing.
     terminal_generation: Rc<Cell<u64>>,
     files_open: Signal<bool>,
@@ -183,20 +197,19 @@ pub struct SessionService {
     workbench_generation: Rc<Cell<u64>>,
     files_entries: Signal<Vec<FileEntry>>,
     files_search: Signal<Vec<FileSearchRow>>,
+    files_searching: Signal<bool>,
+    files_path: Signal<Option<String>>,
     files_preview: Signal<Option<FilePreview>>,
     files_error: Signal<Option<SharedString>>,
     files_workspace: Rc<RefCell<Option<WorkspaceId>>>,
-    files_content: Signal<String>,
-    files_dirty: Signal<bool>,
-    files_saving: Signal<bool>,
-    files_revision: Rc<RefCell<Option<String>>>,
-    files_current: Rc<RefCell<Option<String>>>,
     git_open: Signal<bool>,
+    git_model: Rc<RefCell<GitWorkbenchState>>,
     git_branch: Signal<Option<SharedString>>,
+    git_totals: Signal<(u32, u32)>,
     git_changes: Signal<Vec<GitChangeRow>>,
     git_diff: Signal<Option<GitDiffPreview>>,
     git_error: Signal<Option<SharedString>>,
-    git_staged: Signal<u32>,
+    git_selected: Signal<Vec<String>>,
     git_message: Signal<String>,
     git_committing: Signal<bool>,
     git_amend: Signal<bool>,
@@ -223,6 +236,7 @@ pub struct SessionService {
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
+    new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     new_workspace: Signal<Option<String>>,
     new_runtime: Signal<Option<String>>,
     new_worktree_branch: Signal<String>,
@@ -239,7 +253,6 @@ pub struct SessionService {
     new_busy: Signal<bool>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Signal<Vec<WorkspaceSummary>>,
-    runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     resolving: Signal<bool>,
     /// The session's projection, kept for the live stream to append to.
     model: Rc<RefCell<TimelineModel>>,
@@ -262,7 +275,7 @@ pub struct SessionService {
     /// The state the runtime last reported for each session, for turn folds.
     session_states: Rc<RefCell<BTreeMap<String, AgentSessionState>>>,
     /// The turns whose working rows the reader opened.
-    expanded_turns: Rc<RefCell<std::collections::BTreeSet<String>>>,
+    turn_disclosures: Rc<RefCell<BTreeMap<String, bool>>>,
     /// The rows whose full detail the reader opened, and the detail itself.
     expanded_rows: Rc<RefCell<std::collections::BTreeSet<String>>>,
     row_details: Rc<RefCell<BTreeMap<String, String>>>,
@@ -345,9 +358,12 @@ impl SessionService {
             git_backend,
             workspace_backend,
             sidebar_backend,
+            sidebar_sync: Rc::new(futures_util::lock::Mutex::new(())),
             sidebar_snapshot: Rc::new(RefCell::new(Default::default())),
             sidebar_view: signal(SidebarOrganizationView::default()),
             sidebar_detailed: signal(false),
+            sidebar_mode_pending: Rc::new(Cell::new(None)),
+            sidebar_mode_request: Rc::new(Cell::new(0)),
             sidebar_sections: signal(Vec::new()),
             folder_open: signal(false),
             folder_name: signal(String::new()),
@@ -383,10 +399,15 @@ impl SessionService {
             terminal_title: signal(None),
             terminal_error: signal(None),
             terminal_ref: component_ref::<Terminal>(),
-            terminal_id: Rc::new(RefCell::new(None)),
+            terminal_id: signal(None),
+            terminal_busy: signal(false),
+            terminal_output_revision: signal(0),
+            terminal_size: Rc::new(Cell::new((80, 24))),
+            terminal_tx: Rc::new(RefCell::new(None)),
+            terminal_stream: Rc::new(RefCell::new(None)),
+            terminal_writer: Rc::new(RefCell::new(None)),
             terminal_pending: Rc::new(RefCell::new(Vec::new())),
             terminal_choices: signal(Vec::new()),
-            terminal_menu: signal(false),
             terminal_generation: Rc::new(Cell::new(0)),
             files_open: signal(false),
             file_tree: Rc::new(RefCell::new(FileTreeProjection::default())),
@@ -395,20 +416,19 @@ impl SessionService {
             workbench_generation: Rc::new(Cell::new(0)),
             files_entries: signal(Vec::new()),
             files_search: signal(Vec::new()),
+            files_searching: signal(false),
+            files_path: signal(None),
             files_preview: signal(None),
             files_error: signal(None),
             files_workspace: Rc::new(RefCell::new(None)),
-            files_content: signal(String::new()),
-            files_dirty: signal(false),
-            files_saving: signal(false),
-            files_revision: Rc::new(RefCell::new(None)),
-            files_current: Rc::new(RefCell::new(None)),
             git_open: signal(false),
+            git_model: Rc::new(RefCell::new(GitWorkbenchState::default())),
             git_branch: signal(None),
+            git_totals: signal((0, 0)),
             git_changes: signal(Vec::new()),
             git_diff: signal(None),
             git_error: signal(None),
-            git_staged: signal(0),
+            git_selected: signal(Vec::new()),
             git_message: signal(String::new()),
             git_committing: signal(false),
             git_amend: signal(false),
@@ -434,6 +454,7 @@ impl SessionService {
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
+            new_runtime_options: Rc::new(RefCell::new(Vec::new())),
             new_workspace: signal(None),
             new_runtime: signal(None),
             new_worktree_branch: signal(String::new()),
@@ -450,7 +471,6 @@ impl SessionService {
             new_busy: signal(false),
             new_error: signal(None),
             workspace_records: signal(Vec::new()),
-            runtime_options: Rc::new(RefCell::new(Vec::new())),
             resolving: signal(false),
             model: Rc::new(RefCell::new(TimelineModel::default())),
             connection: signal(ConnectionState::Connecting),
@@ -463,7 +483,7 @@ impl SessionService {
             attachment_drafts: Rc::new(RefCell::new(BTreeMap::new())),
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
             session_states: Rc::new(RefCell::new(BTreeMap::new())),
-            expanded_turns: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
+            turn_disclosures: Rc::new(RefCell::new(BTreeMap::new())),
             expanded_rows: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
             row_details: Rc::new(RefCell::new(BTreeMap::new())),
             runtime_state: Rc::new(RefCell::new(None)),
@@ -525,8 +545,7 @@ impl SessionService {
         self.notification_generation
             .set(self.notification_generation.get().wrapping_add(1));
         crate::host::set_keep_screen_on(false);
-        self.terminal_generation
-            .set(self.terminal_generation.get().wrapping_add(1));
+        self.stop_terminal_tasks();
         self.stash_draft();
         self.persist_drafts();
     }
@@ -683,29 +702,62 @@ impl SessionService {
             terminal_error: self.terminal_error,
             terminal_ref: self.terminal_ref,
             terminal_choices: self.terminal_choices,
-            terminal_menu: self.terminal_menu,
+            terminal_id: self.terminal_id,
+            terminal_busy: self.terminal_busy,
+            terminal_output_revision: self.terminal_output_revision,
             files_open: self.files_open,
             files_entries: self.files_entries,
             files_search: self.files_search,
+            files_searching: self.files_searching,
+            files_path: self.files_path,
             on_search_files: {
                 let service = self.clone();
-                Rc::new(move |query: &str, contents: bool| service.search_files(query, contents))
+                Rc::new(move |query: &str, options| service.search_files(query, options))
             },
             files_preview: self.files_preview,
             files_error: self.files_error,
-            files_content: self.files_content,
-            files_dirty: self.files_dirty,
-            files_saving: self.files_saving,
-            on_save_file: {
-                let service = self.clone();
-                Rc::new(move || service.save_file())
-            },
             git_open: self.git_open,
             git_branch: self.git_branch,
+            git_totals: self.git_totals,
             git_changes: self.git_changes,
             git_diff: self.git_diff,
             git_error: self.git_error,
-            git_staged: self.git_staged,
+            git_selected: self.git_selected,
+            on_toggle_git_selection: {
+                let service = self.clone();
+                Rc::new(move |path| {
+                    let mut model = service.git_model.borrow_mut();
+                    let selected =
+                        model.path_selection_state(path) != GitPathSelectionState::Checked;
+                    model.select_path_prefix(path, selected);
+                    drop(model);
+                    service.publish_git_changes();
+                })
+            },
+            on_toggle_git_directory: {
+                let service = self.clone();
+                Rc::new(move |paths| {
+                    service
+                        .git_model
+                        .borrow_mut()
+                        .toggle_change_directories(paths);
+                    service.publish_git_changes();
+                })
+            },
+            on_toggle_git_directories: {
+                let service = self.clone();
+                Rc::new(move || {
+                    service
+                        .git_model
+                        .borrow_mut()
+                        .toggle_all_change_directories();
+                    service.publish_git_changes();
+                })
+            },
+            on_revert_git_selection: {
+                let service = self.clone();
+                Rc::new(move |paths| service.revert_paths(paths.to_vec()))
+            },
             git_message: self.git_message,
             git_committing: self.git_committing,
             git_amend: self.git_amend,
@@ -783,6 +835,10 @@ impl SessionService {
             on_git_pull: {
                 let service = self.clone();
                 Rc::new(move || service.git_remote(GitRemoteActionKind::Pull))
+            },
+            on_git_fetch: {
+                let service = self.clone();
+                Rc::new(move || service.git_remote(GitRemoteActionKind::Fetch))
             },
             git_history: self.git_history,
             git_show_history: self.git_show_history,
@@ -987,7 +1043,12 @@ impl SessionService {
             on_recall_history: {
                 let service = self.clone();
                 Rc::new(move |text: &str| {
-                    service.draft.set(text.to_owned());
+                    service.draft.update(|draft| {
+                        if draft.trim().is_empty() {
+                            draft.clear();
+                        }
+                        draft.push_str(text);
+                    });
                     service.history_open.set(false);
                 })
             },
@@ -1119,6 +1180,20 @@ impl SessionService {
                     service.session_actions.set(Some(id.to_owned()));
                 })
             },
+            on_pin_sessions: {
+                let service = self.clone();
+                Rc::new(move |ids| {
+                    let pinned = service.pinned.get_untracked();
+                    let target = !ids.iter().all(|id| pinned.contains(id));
+                    for id in ids.iter().filter(|id| pinned.contains(id) != target) {
+                        service.toggle_pin(id);
+                    }
+                })
+            },
+            on_fork_sessions: {
+                let service = self.clone();
+                Rc::new(move |ids| service.fork_sessions(ids))
+            },
             on_archive_sessions: {
                 let service = self.clone();
                 Rc::new(move |ids: &[String]| service.archive_sessions(ids))
@@ -1168,13 +1243,13 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.interrupt_active())
             },
-            on_terminal_menu: {
+            on_retry_terminal: {
                 let service = self.clone();
-                Rc::new(move || service.terminal_menu.set(true))
+                Rc::new(move || service.retry_terminal())
             },
-            on_close_terminal_menu: {
+            on_kill_terminal: {
                 let service = self.clone();
-                Rc::new(move || service.terminal_menu.set(false))
+                Rc::new(move |id| service.kill_terminal(id))
             },
             on_select_terminal: {
                 let service = self.clone();
@@ -1200,13 +1275,23 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move || service.load_tree(String::new()))
             },
+            on_collapse_files: {
+                let service = self.clone();
+                Rc::new(move || {
+                    service
+                        .file_tree
+                        .borrow_mut()
+                        .restore_navigation_state([], None);
+                    service.publish_file_tree();
+                })
+            },
             on_open_dir: {
                 let service = self.clone();
                 Rc::new(move |path: &str| service.toggle_directory(path))
             },
             on_open_file: {
                 let service = self.clone();
-                Rc::new(move |path: &str| service.open_file(path.to_owned()))
+                Rc::new(move |path: &str, line| service.open_file(path.to_owned(), line))
             },
             on_files_back: {
                 let service = self.clone();
@@ -1242,7 +1327,7 @@ impl SessionService {
             },
             on_revert_git: {
                 let service = self.clone();
-                Rc::new(move |path: &str| service.revert_path(path))
+                Rc::new(move |path: &str| service.revert_paths(vec![path.to_owned()]))
             },
             on_git_back: {
                 let service = self.clone();
@@ -1396,13 +1481,7 @@ impl SessionService {
                     .and_then(Result::ok)
                     .unwrap_or_default();
                 self.workspace_records.set(spaces.clone());
-                let sidebar = self.sidebar_backend.clone();
-                if let Ok(Ok(snapshot)) = crate::runtime::handle()
-                    .spawn(async move { sidebar.sidebar_organization().await })
-                    .await
-                {
-                    self.apply_sidebar(snapshot);
-                }
+                let _ = self.reload_sidebar().await;
                 let rows = sessions
                     .iter()
                     .map(|session| summary(session, &spaces))
@@ -1629,7 +1708,7 @@ impl SessionService {
                             .terminal
                             .as_ref()
                             .and_then(|facts| facts.terminal_id.clone())
-                        && self.terminal_id.borrow().as_ref() != Some(&id)
+                        && self.terminal_id.get_untracked().as_deref() != Some(id.as_str())
                     {
                         self.attach_terminal(id, session.title.clone());
                     }
@@ -1685,12 +1764,7 @@ impl SessionService {
             BackendEvent::ProjectionInvalidated(projection) => match projection {
                 BackendProjection::Files => {
                     if self.files_open.get_untracked() {
-                        let open_file = self.files_current.borrow().clone();
-                        match open_file {
-                            Some(path) if !self.files_dirty.get_untracked() => self.open_file(path),
-                            None => self.load_tree(String::new()),
-                            _ => {}
-                        }
+                        self.load_tree(String::new());
                     }
                 }
                 BackendProjection::Git => {
@@ -1768,15 +1842,19 @@ impl SessionService {
         self.file_search_run
             .set(self.file_search_run.get().wrapping_add(1));
         self.files_search.set(Vec::new());
+        self.files_searching.set(false);
         self.files_entries.set(Vec::new());
         self.files_back();
         self.git_open.set(false);
+        self.git_model.replace(GitWorkbenchState::default());
         self.git_changes.set(Vec::new());
         self.git_branch.set(None);
         self.git_branches.set(Vec::new());
         self.git_diff.set(None);
         self.git_error.set(None);
-        self.git_staged.set(0);
+        self.git_selected.set(Vec::new());
+        self.git_remote_busy.set(false);
+        self.git_totals.set((0, 0));
         self.git_branch_menu.set(false);
         self.git_history.set(Vec::new());
         self.git_message.set(String::new());
@@ -1942,6 +2020,7 @@ impl SessionService {
             history.push(ComposerHistoryEntry {
                 id: item.id.as_str().to_owned(),
                 text: message.text.clone(),
+                sequence: item.sequence,
             });
             if history.len() >= 50 {
                 break;
@@ -2614,10 +2693,8 @@ impl SessionService {
         }
         let mentions = self.armed_mentions_for(&text);
         let due = unix_timestamp_ms() + (seconds as i64) * 1000;
-        let revision = self.sidebar_snapshot.borrow().revision;
         self.schedule_open.set(false);
         let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
         let session_id = active.clone();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
@@ -2635,27 +2712,18 @@ impl SessionService {
                 mentions,
                 scheduled_at_ms: due,
             };
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    sidebar
-                        .mutate_sidebar_organization(mutation, Some(revision))
-                        .await
-                })
-                .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.apply_sidebar(snapshot);
-                    if service.draft.get_untracked() == text {
+            match service.submit_sidebar(mutation, None).await {
+                Ok(()) => {
+                    if service.active.get_untracked().as_deref() == Some(active.as_str())
+                        && service.draft.get_untracked().trim() == text
+                        && service.attachments.get_untracked() == attachments
+                    {
                         service.draft.set(String::new());
                         service.attachments.set(Vec::new());
+                        service.armed_mentions.borrow_mut().clear();
                     }
-                    service.armed_mentions.borrow_mut().clear();
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_schedule_task_failed",
-                    format!("scheduling the message did not finish: {error}"),
-                )),
+                Err(error) => service.fail(&error),
             }
         });
     }
@@ -2667,33 +2735,15 @@ impl SessionService {
         let Some(message_id) = *self.scheduled_message_id.borrow() else {
             return;
         };
-        let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::SetScheduledSend {
-                session_id: active,
+                session_id: active.clone(),
                 message_id,
                 scheduled_at_ms: None,
             };
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    sidebar
-                        .mutate_sidebar_organization(mutation, Some(revision))
-                        .await
-                })
-                .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.scheduled.set(false);
-                    service.scheduled_message_id.borrow_mut().take();
-                    service.apply_sidebar(snapshot);
-                }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_schedule_task_failed",
-                    format!("cancelling the schedule did not finish: {error}"),
-                )),
+            if let Err(error) = service.submit_sidebar(mutation, None).await {
+                service.fail(&error);
             }
         });
     }
@@ -2705,13 +2755,11 @@ impl SessionService {
         attachments: Vec<AttachmentItem>,
         mentions: Vec<VibexUseMention>,
     ) {
-        let revision = self.sidebar_snapshot.borrow().revision;
         let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
         let sent_text = text.clone();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
-                session_id: session,
+                session_id: session.clone(),
                 text,
                 attachments: attachments
                     .iter()
@@ -2724,27 +2772,18 @@ impl SessionService {
                     .collect(),
                 mentions,
             };
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    sidebar
-                        .mutate_sidebar_organization(mutation, Some(revision))
-                        .await
-                })
-                .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.apply_sidebar(snapshot);
-                    if service.draft.get_untracked() == sent_text {
+            match service.submit_sidebar(mutation, None).await {
+                Ok(()) => {
+                    if service.active.get_untracked().as_deref() == Some(session.as_str())
+                        && service.draft.get_untracked().trim() == sent_text
+                        && service.attachments.get_untracked() == attachments
+                    {
                         service.draft.set(String::new());
                         service.attachments.set(Vec::new());
+                        service.armed_mentions.borrow_mut().clear();
                     }
-                    service.armed_mentions.borrow_mut().clear();
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_queue_task_failed",
-                    format!("queueing the message did not finish: {error}"),
-                )),
+                Err(error) => service.fail(&error),
             }
         });
     }
@@ -3059,8 +3098,14 @@ impl SessionService {
                 entries.push(self.entry_from_row(row, turn, &model.items));
             }
             if !turn.process_rows.is_empty() {
-                let expanded = self.expanded_turns.borrow().contains(&turn.id)
-                    || (turn.conclusion_row.is_none() && (!turn.complete || turn.superseded));
+                let expanded = self
+                    .turn_disclosures
+                    .borrow()
+                    .get(&turn.id)
+                    .copied()
+                    .unwrap_or_else(|| {
+                        turn.conclusion_row.is_none() && (!turn.complete || turn.superseded)
+                    });
                 entries.push(process_header(turn, expanded));
                 if expanded {
                     for row in &turn.process_rows {
@@ -3168,11 +3213,17 @@ impl SessionService {
     }
 
     fn toggle_turn(&self, turn_id: &str) {
-        let mut expanded = self.expanded_turns.borrow_mut();
-        if !expanded.remove(turn_id) {
-            expanded.insert(turn_id.to_owned());
-        }
-        drop(expanded);
+        let Some(expanded) = self.timeline.with(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.kind == EntryKind::ProcessHeader && entry.turn_id == turn_id)
+                .map(|entry| entry.expanded)
+        }) else {
+            return;
+        };
+        self.turn_disclosures
+            .borrow_mut()
+            .insert(turn_id.to_owned(), !expanded);
         self.publish();
     }
 
@@ -3850,16 +3901,11 @@ impl SessionService {
         }) else {
             return;
         };
-        let Some(option) = self
-            .runtime_options
-            .borrow()
-            .iter()
-            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
-            .nth(index)
-            .cloned()
-        else {
+        let Some(option) = self.new_runtime_options.borrow().get(index).cloned() else {
             return;
         };
+        let draft = self.new_session_draft();
+        let base_ref = self.new_base_ref.get_untracked().trim().to_owned();
         self.new_busy.set(true);
         self.new_error.set(None);
         let service = self.clone();
@@ -3871,10 +3917,7 @@ impl SessionService {
                     git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
                         workspace_id: base,
                         branch_name: branch,
-                        base_ref: {
-                            let base = service.new_base_ref.get_untracked().trim().to_owned();
-                            (!base.is_empty()).then_some(base)
-                        },
+                        base_ref: (!base_ref.is_empty()).then_some(base_ref),
                         name: None,
                         worktree_path: None,
                         target_workspace_id: None,
@@ -3902,10 +3945,7 @@ impl SessionService {
                 runtime: option.selection,
                 workspace_root: worktree.workspace.root_path,
                 workspace_mode: worktree.workspace.mode,
-                title: {
-                    let title = service.new_title.get_untracked().trim().to_owned();
-                    (!title.is_empty()).then_some(title)
-                },
+                title: draft.title.clone(),
                 safety: None,
                 session_id: Some(VibexSessionId::new()),
                 defer_runtime_materialization: false,
@@ -3917,16 +3957,7 @@ impl SessionService {
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
-                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
-                    service.new_session_open.set(false);
-                    service.new_worktree_branch.set(String::new());
-                    service.new_base_ref.set(String::new());
-                    service.refresh();
-                    service.open(session.id.as_str());
-                    if !prompt.is_empty() {
-                        let attachments = service.new_attachments.get_untracked();
-                        service.deliver(prompt, attachments, Vec::new(), false);
-                    }
+                    service.finish_new_session(session, draft);
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -4012,6 +4043,40 @@ impl SessionService {
                     )),
                 }
             }
+        });
+    }
+
+    fn fork_sessions(&self, ids: &[String]) {
+        let ids = ids
+            .iter()
+            .filter_map(|id| VibexSessionId::parse(id.as_str()).ok())
+            .collect::<Vec<_>>();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        spawn(async move {
+            for source_session_id in ids {
+                let backend = backend.clone();
+                match crate::runtime::handle()
+                    .spawn(async move {
+                        backend
+                            .fork_session(MutationRequest::new(ForkAgentSessionRequest {
+                                source_session_id,
+                                through_sequence: ForkAgentSessionRequest::AT_TIP,
+                                expected_source_end_sequence: None,
+                            }))
+                            .await
+                    })
+                    .await
+                {
+                    Ok(Ok(session)) => service.record_sidebar_session(&session),
+                    Ok(Err(error)) => service.fail(&error),
+                    Err(error) => service.fail(&BackendError::failed(
+                        "session_fork_task_failed",
+                        error.to_string(),
+                    )),
+                }
+            }
+            service.refresh();
         });
     }
 
@@ -4130,13 +4195,55 @@ impl SessionService {
         self.folder_open.set(true);
     }
 
+    async fn reload_sidebar(&self) -> Result<(), BackendError> {
+        let _sync = self.sidebar_sync.lock().await;
+        let backend = self.sidebar_backend.clone();
+        let snapshot = crate::runtime::handle()
+            .spawn(async move { backend.sidebar_organization().await })
+            .await
+            .map_err(|error| {
+                BackendError::failed("session_sidebar_read_failed", error.to_string())
+            })??;
+        self.apply_sidebar(snapshot);
+        Ok(())
+    }
+
+    async fn submit_sidebar(
+        &self,
+        mutation: RemoteSidebarOrganizationMutation,
+        revision: Option<u64>,
+    ) -> Result<(), BackendError> {
+        let _sync = self.sidebar_sync.lock().await;
+        let backend = self.sidebar_backend.clone();
+        let snapshot = crate::runtime::handle()
+            .spawn(async move {
+                backend
+                    .mutate_sidebar_organization(mutation, revision)
+                    .await
+            })
+            .await
+            .map_err(|error| {
+                BackendError::failed("session_sidebar_task_failed", error.to_string())
+            })??;
+        self.apply_sidebar(snapshot);
+        Ok(())
+    }
+
     fn apply_sidebar(&self, snapshot: RemoteSidebarOrganizationSnapshot) {
-        if snapshot.revision < self.sidebar_snapshot.borrow().revision {
+        if !self.alive.get() {
             return;
         }
-        let view = SidebarOrganizationView::from_remote(&snapshot);
-        self.sidebar_detailed
-            .set(view.hierarchy_mode == SidebarHierarchyMode::Detailed);
+        let mut view = SidebarOrganizationView::from_remote(&snapshot);
+        let detailed = self
+            .sidebar_mode_pending
+            .get()
+            .unwrap_or(view.hierarchy_mode == SidebarHierarchyMode::Detailed);
+        view.hierarchy_mode = if detailed {
+            SidebarHierarchyMode::Detailed
+        } else {
+            SidebarHierarchyMode::Compact
+        };
+        self.sidebar_detailed.set(detailed);
         self.sidebar_view.set(view);
         self.pinned.set(snapshot.pinned_session_ids.clone());
         self.unread.set(snapshot.unread_session_ids.clone());
@@ -4239,16 +4346,7 @@ impl SessionService {
             detailed: self.sidebar_detailed,
             on_toggle_hierarchy: {
                 let service = self.clone();
-                Rc::new(move || {
-                    let mode = if service.sidebar_detailed.get_untracked() {
-                        RemoteSidebarHierarchyMode::Compact
-                    } else {
-                        RemoteSidebarHierarchyMode::Detailed
-                    };
-                    service.sidebar_mutation(RemoteSidebarOrganizationMutation::SetHierarchyMode {
-                        mode,
-                    });
-                })
+                Rc::new(move || service.toggle_sidebar_hierarchy())
             },
             on_toggle_row: {
                 let service = self.clone();
@@ -4287,6 +4385,25 @@ impl SessionService {
                     )
                 })
             },
+            batch_scope: {
+                let service = self.clone();
+                Rc::new(move |row| {
+                    service.session_records.with(|sessions| match row.kind {
+                        SidebarRowKind::Project => sessions
+                            .iter()
+                            .filter(|session| {
+                                session.deleted_at_ms.is_none()
+                                    && session.project_id.as_str() == row.id
+                            })
+                            .map(|session| session.id.as_str().to_owned())
+                            .collect(),
+                        SidebarRowKind::Folder => service.sidebar_view.with(|view| {
+                            sidebar::folder_batch_ids(&view.organization, sessions, &row.id)
+                        }),
+                        _ => Vec::new(),
+                    })
+                })
+            },
         }
     }
 
@@ -4306,11 +4423,69 @@ impl SessionService {
         })
     }
 
+    fn toggle_sidebar_hierarchy(&self) {
+        let detailed = !self.sidebar_detailed.get_untracked();
+        self.sidebar_mode_pending.set(Some(detailed));
+        self.display_sidebar_hierarchy(detailed);
+        let request = self.sidebar_mode_request.get().wrapping_add(1);
+        self.sidebar_mode_request.set(request);
+        let service = self.clone();
+        spawn(async move {
+            let mode = if detailed {
+                RemoteSidebarHierarchyMode::Detailed
+            } else {
+                RemoteSidebarHierarchyMode::Compact
+            };
+            let result = service
+                .submit_sidebar(
+                    RemoteSidebarOrganizationMutation::SetHierarchyMode { mode },
+                    None,
+                )
+                .await;
+            if !service.alive.get() || service.sidebar_mode_request.get() != request {
+                return;
+            }
+            service.sidebar_mode_pending.set(None);
+            let mode = service.sidebar_snapshot.borrow().hierarchy_mode;
+            service.display_sidebar_hierarchy(mode == RemoteSidebarHierarchyMode::Detailed);
+            if let Err(error) = result {
+                service.fail(&error);
+            }
+        });
+    }
+
+    fn display_sidebar_hierarchy(&self, detailed: bool) {
+        self.sidebar_detailed.set(detailed);
+        self.sidebar_view.update(|view| {
+            view.hierarchy_mode = if detailed {
+                SidebarHierarchyMode::Detailed
+            } else {
+                SidebarHierarchyMode::Compact
+            };
+        });
+    }
+
     fn sidebar_rows(&self, query: &str) -> Vec<SidebarRowView> {
         self.sidebar_view.with(|view| {
             let rows = self.projected_sidebar(view, query);
             let cards = sidebar::workspace_cards(&rows);
             let pinned = self.pinned.get();
+            let project_appearances = self.workspace_records.with(|workspaces| {
+                workspaces
+                    .iter()
+                    .map(|space| {
+                        (
+                            space.project.id.as_str().to_owned(),
+                            view.project_appearances
+                                .get(space.project.id.as_str())
+                                .cloned()
+                                .unwrap_or_else(|| {
+                                    SidebarProjectAppearance::default_for(&space.project)
+                                }),
+                        )
+                    })
+                    .collect::<BTreeMap<_, _>>()
+            });
             self.session_records.with(|sessions| {
                 let by_id = sessions
                     .iter()
@@ -4360,6 +4535,13 @@ impl SessionService {
                                 }
                             }),
                             count: row.child_count,
+                            project_mark: (kind == SidebarRowKind::Project).then(|| {
+                                project_mark(
+                                    project_appearances
+                                        .get(id)
+                                        .or_else(|| view.project_appearances.get(id)),
+                                )
+                            }),
                             collapsed: row.collapsed,
                             active: row.selected,
                             pinned: row.pinned
@@ -4597,47 +4779,31 @@ impl SessionService {
         retries: u8,
         done: Option<Rc<dyn Fn()>>,
     ) {
-        let revision = self.sidebar_snapshot.borrow().revision;
+        let revision = matches!(
+            mutation,
+            RemoteSidebarOrganizationMutation::MoveItems { .. }
+        )
+        .then(|| self.sidebar_snapshot.borrow().revision);
         let service = self.clone();
-        let sidebar = self.sidebar_backend.clone();
         spawn(async move {
-            let for_request = sidebar.clone();
-            let request = mutation.clone();
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    for_request
-                        .mutate_sidebar_organization(request, Some(revision))
-                        .await
-                })
-                .await;
-            match result {
-                Ok(Ok(snapshot)) => {
-                    service.apply_sidebar(snapshot);
+            match service.submit_sidebar(mutation.clone(), revision).await {
+                Ok(()) => {
                     if let Some(done) = done.as_ref() {
                         done();
                     }
                 }
-                Ok(Err(error))
+                Err(error)
                     if retries > 0
                         && (error.kind == BackendErrorKind::Conflict
                             || error.code.contains("stale_revision")) =>
                 {
-                    let refresh = crate::runtime::handle()
-                        .spawn(async move { sidebar.sidebar_organization().await })
-                        .await;
-                    match refresh {
-                        Ok(Ok(snapshot)) => {
-                            service.apply_sidebar(snapshot);
-                            service.sidebar_mutation_attempt(mutation, retries - 1, done.clone());
-                        }
-                        _ => service.fail(&error),
+                    if service.reload_sidebar().await.is_ok() {
+                        service.sidebar_mutation_attempt(mutation, retries - 1, done);
+                    } else {
+                        service.fail(&error);
                     }
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_sidebar_task_failed",
-                    format!("changing the sidebar did not finish: {error}"),
-                )),
+                Err(error) => service.fail(&error),
             }
         });
     }
@@ -4772,11 +4938,21 @@ impl SessionService {
     }
 
     fn open_new_session_in(&self, workspace: Option<String>, project: Option<String>) {
+        if self.new_busy.get_untracked() || self.new_session_open.get_untracked() {
+            return;
+        }
         self.new_session_open.set(true);
         self.new_error.set(None);
         self.new_title.set(String::new());
         self.new_prompt.set(String::new());
         self.new_attachments.set(Vec::new());
+        self.new_worktree_branch.set(String::new());
+        self.new_base_ref.set(String::new());
+        self.new_workspaces.set(Vec::new());
+        self.new_runtimes.set(Vec::new());
+        self.new_workspace.set(None);
+        self.new_runtime.set(None);
+        self.new_runtime_options.borrow_mut().clear();
         self.new_busy.set(true);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
@@ -4800,12 +4976,15 @@ impl SessionService {
                             detail: space.workspace.root_path.clone(),
                         })
                         .collect::<Vec<_>>();
-                    let runtime_choices = catalog
+                    let available = catalog
                         .options
-                        .iter()
+                        .into_iter()
                         .filter(|option| {
                             option.availability == RuntimeOptionAvailability::Available
                         })
+                        .collect::<Vec<_>>();
+                    let runtime_choices = available
+                        .iter()
                         .enumerate()
                         .map(|(index, option)| RuntimeChoice {
                             id: index.to_string(),
@@ -4813,12 +4992,12 @@ impl SessionService {
                             detail: option.auth_source_label.clone(),
                         })
                         .collect::<Vec<_>>();
-                    if workspace_choices.is_empty() || runtime_choices.is_empty() {
+                    if runtime_choices.is_empty() {
                         service.new_error.set(Some(
                             copy::text(
-                                "No workspace or ready Agent is available on this runtime.",
-                                "该运行时没有可用的工作区或就绪的 Agent。",
-                                "該執行環境沒有可用的工作區或就緒的 Agent。",
+                                "No ready Agent is available on this runtime.",
+                                "该运行时没有就绪的 Agent。",
+                                "該執行環境沒有就緒的 Agent。",
                             )
                             .into(),
                         ));
@@ -4838,13 +5017,20 @@ impl SessionService {
                             .filter(|id| workspace_choices.iter().any(|choice| &choice.id == id))
                             .or_else(|| workspace_choices.first().map(|choice| choice.id.clone())),
                     );
-                    service
-                        .new_runtime
-                        .set(runtime_choices.first().map(|choice| choice.id.clone()));
+                    let preferred = service.runtime_state.borrow().as_ref().and_then(|state| {
+                        available
+                            .iter()
+                            .position(|option| option.selection == state.desired)
+                            .map(|index| index.to_string())
+                    });
+                    service.new_runtime.set(
+                        preferred
+                            .or_else(|| runtime_choices.first().map(|choice| choice.id.clone())),
+                    );
                     service.new_workspaces.set(workspace_choices);
                     service.new_runtimes.set(runtime_choices);
                     service.workspace_records.set(spaces);
-                    *service.runtime_options.borrow_mut() = catalog.options;
+                    *service.new_runtime_options.borrow_mut() = available;
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -4874,18 +5060,13 @@ impl SessionService {
                 .find(|space| space.workspace.id.as_str() == workspace_id)
                 .cloned()
         });
-        let option = self
-            .runtime_options
-            .borrow()
-            .iter()
-            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
-            .nth(index)
-            .cloned();
+        let option = self.new_runtime_options.borrow().get(index).cloned();
         let (Some(workspace), Some(option)) = (workspace, option) else {
             return;
         };
         self.new_busy.set(true);
         self.new_error.set(None);
+        let draft = self.new_session_draft();
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -4893,10 +5074,7 @@ impl SessionService {
                 runtime: option.selection,
                 workspace_root: workspace.workspace.root_path.clone(),
                 workspace_mode: workspace.workspace.mode,
-                title: {
-                    let title = service.new_title.get_untracked().trim().to_owned();
-                    (!title.is_empty()).then_some(title)
-                },
+                title: draft.title.clone(),
                 safety: None,
                 session_id: Some(VibexSessionId::new()),
                 defer_runtime_materialization: false,
@@ -4908,14 +5086,7 @@ impl SessionService {
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
-                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
-                    service.new_session_open.set(false);
-                    service.refresh();
-                    service.open(session.id.as_str());
-                    if !prompt.is_empty() {
-                        let attachments = service.new_attachments.get_untracked();
-                        service.deliver(prompt, attachments, Vec::new(), false);
-                    }
+                    service.finish_new_session(session, draft);
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -4923,6 +5094,28 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    fn new_session_draft(&self) -> NewSessionDraft {
+        let title = self.new_title.get_untracked().trim().to_owned();
+        NewSessionDraft {
+            title: (!title.is_empty()).then_some(title),
+            text: self.new_prompt.get_untracked().trim().to_owned(),
+            attachments: self.new_attachments.get_untracked(),
+        }
+    }
+
+    fn finish_new_session(&self, session: AgentSession, draft: NewSessionDraft) {
+        if !self.alive.get() {
+            return;
+        }
+        self.new_session_open.set(false);
+        self.record_sidebar_session(&session);
+        self.refresh();
+        self.open(session.id.as_str());
+        if !draft.text.is_empty() || !draft.attachments.is_empty() {
+            self.deliver(draft.text, draft.attachments, Vec::new(), false);
+        }
     }
 
     fn browse_project_dirs(&self, path: Option<String>) {
@@ -5024,18 +5217,13 @@ impl SessionService {
         let Ok(index) = runtime_id.parse::<usize>() else {
             return;
         };
-        let option = self
-            .runtime_options
-            .borrow()
-            .iter()
-            .filter(|option| option.availability == RuntimeOptionAvailability::Available)
-            .nth(index)
-            .cloned();
+        let option = self.new_runtime_options.borrow().get(index).cloned();
         let Some(option) = option else {
             return;
         };
         self.new_busy.set(true);
         self.new_error.set(None);
+        let draft = self.new_session_draft();
         let service = self.clone();
         let backend = self.backend.clone();
         let workspaces = self.workspace_backend.clone();
@@ -5062,10 +5250,7 @@ impl SessionService {
                 runtime: option.selection,
                 workspace_root: root,
                 workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
-                title: {
-                    let title = service.new_title.get_untracked().trim().to_owned();
-                    (!title.is_empty()).then_some(title)
-                },
+                title: draft.title.clone(),
                 safety: None,
                 session_id: Some(VibexSessionId::new()),
                 defer_runtime_materialization: false,
@@ -5077,14 +5262,7 @@ impl SessionService {
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
-                    let prompt = service.new_prompt.get_untracked().trim().to_owned();
-                    service.new_session_open.set(false);
-                    service.refresh();
-                    service.open(session.id.as_str());
-                    if !prompt.is_empty() {
-                        let attachments = service.new_attachments.get_untracked();
-                        service.deliver(prompt, attachments, Vec::new(), false);
-                    }
+                    service.finish_new_session(session, draft);
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -5111,8 +5289,8 @@ impl SessionService {
             return;
         };
         self.terminal_open.set(true);
+        self.terminal_busy.set(true);
         self.terminal_error.set(None);
-        self.terminal_menu.set(false);
         self.terminal_title
             .set(Some(copy::text("Terminal", "终端", "終端").into()));
         let service = self.clone();
@@ -5135,6 +5313,7 @@ impl SessionService {
             if !service.alive.get() || service.terminal_generation.get() != generation {
                 return;
             }
+            service.terminal_busy.set(false);
             let (session, terminals) = match result {
                 Ok(Ok(opened)) => opened,
                 Ok(Err(error)) => {
@@ -5167,12 +5346,13 @@ impl SessionService {
             if let Some(terminal) = terminals
                 .iter()
                 .find(|terminal| terminal.status == TerminalStatus::Running)
-                .or_else(|| terminals.first())
             {
                 service.attach_terminal(terminal.id.clone(), terminal.title.clone());
                 return;
             }
             let workspace = session.workspace_id;
+            let (cols, rows) = service.terminal_size.get();
+            service.terminal_busy.set(true);
             let created = crate::runtime::handle()
                 .spawn(async move {
                     terminal_backend
@@ -5181,8 +5361,8 @@ impl SessionService {
                             title: None,
                             shell: None,
                             cwd: None,
-                            rows: 24,
-                            cols: 80,
+                            rows,
+                            cols,
                         }))
                         .await
                 })
@@ -5190,6 +5370,7 @@ impl SessionService {
             if !service.alive.get() || service.terminal_generation.get() != generation {
                 return;
             }
+            service.terminal_busy.set(false);
             match created {
                 Ok(Ok(terminal)) => {
                     service
@@ -5207,79 +5388,119 @@ impl SessionService {
 
     /// Shows a terminal's current screen and follows it.
     fn attach_terminal(&self, id: TerminalId, title: String) {
-        let generation = self.terminal_generation.get().wrapping_add(1);
-        self.terminal_generation.set(generation);
-        self.terminal_pending.borrow_mut().clear();
+        self.stop_terminal_tasks();
+        let generation = self.terminal_generation.get();
         self.reset_terminal_output();
-        *self.terminal_id.borrow_mut() = Some(id.clone());
+        self.terminal_id.set(Some(id.as_str().to_owned()));
         self.terminal_title.set(Some(title.into()));
         self.terminal_error.set(None);
+        self.terminal_busy.set(false);
         let service = self.clone();
-        let terminal_backend = self.terminal_backend.clone();
-        spawn(async move {
-            let snapshot = crate::runtime::handle()
-                .spawn({
-                    let backend = terminal_backend.clone();
-                    let id = id.clone();
-                    async move { backend.terminal_snapshot(id).await }
-                })
-                .await;
-            if service.terminal_generation.get() != generation {
-                return;
-            }
-            let snapshot = match snapshot {
-                Ok(Ok(snapshot)) => snapshot,
-                Ok(Err(error)) => {
-                    service.terminal_error.set(Some(error_text(&error)));
-                    return;
-                }
-                Err(error) => {
-                    service.terminal_error.set(Some(
-                        format!("reading the terminal did not finish: {error}").into(),
-                    ));
-                    return;
-                }
-            };
-            for chunk in snapshot.chunks {
-                service.write_terminal_output(chunk.data);
-            }
-            let subscription = match terminal_backend.subscribe_terminal(id, snapshot.next_sequence)
-            {
-                Ok(subscription) => subscription,
-                Err(error) => {
-                    service.terminal_error.set(Some(error_text(&error)));
-                    return;
-                }
-            };
-            let mut subscription = subscription;
-            while service.terminal_generation.get() == generation {
-                let next = subscription.next().await;
-                if service.terminal_generation.get() != generation {
+        let backend = self.terminal_backend.clone();
+        let stream_id = id.clone();
+        let (output, mut receive) = mpsc::channel(32);
+        let stream =
+            spawn_terminal_stream(move || backend.subscribe_terminal(stream_id, 1), output);
+        self.terminal_stream.replace(Some(stream.abort_handle()));
+        let (sender, mut commands) = mpsc::channel(128);
+        let backend = self.terminal_backend.clone();
+        let (errors, mut command_errors) = mpsc::channel(8);
+        let writer = crate::runtime::handle().spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command {
+                    TerminalCommand::Input(data) => {
+                        backend
+                            .write_terminal(MutationRequest::new(TerminalWriteRequest {
+                                terminal_id: id.clone(),
+                                data,
+                            }))
+                            .await
+                    }
+                    TerminalCommand::Resize(cols, rows) => backend
+                        .resize_terminal(MutationRequest::new(TerminalResizeRequest {
+                            terminal_id: id.clone(),
+                            cols,
+                            rows,
+                        }))
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(error) = result
+                    && errors.send(error).await.is_err()
+                {
                     break;
                 }
-                match next {
-                    Ok(Some(batch)) => {
-                        if batch.reset_required {
-                            service.reset_terminal_output();
-                        }
-                        for frame in batch.frames {
-                            let text = service.decode_terminal_frame(&frame.bytes);
-                            service.write_terminal_output(text);
-                        }
+            }
+        });
+        self.terminal_writer.replace(Some(writer.abort_handle()));
+        self.terminal_tx.replace(Some(sender));
+        let (cols, rows) = self.terminal_size.get();
+        self.queue_terminal_command(TerminalCommand::Resize(cols, rows));
+        spawn({
+            let service = self.clone();
+            async move {
+                while let Some(error) = command_errors.recv().await {
+                    if service.terminal_generation.get() != generation {
+                        break;
                     }
-                    Ok(None) | Err(_) => break,
+                    service.terminal_error.set(Some(error_text(&error)));
                 }
+            }
+        });
+        spawn(async move {
+            while let Some(batch) = receive.recv().await {
+                if service.terminal_generation.get() != generation {
+                    return;
+                }
+                while service.terminal_ref.api::<TerminalApi>().is_none() {
+                    timer(Duration::from_millis(16)).await;
+                    if service.terminal_generation.get() != generation {
+                        return;
+                    }
+                }
+                if batch.reset_required {
+                    service.reset_terminal_output();
+                }
+                for frame in batch.frames {
+                    let text = service.decode_terminal_frame(&frame.bytes);
+                    service.write_terminal_output(text);
+                }
+                service
+                    .terminal_output_revision
+                    .update(|revision| *revision = revision.wrapping_add(1));
+            }
+            let result = stream.await;
+            if service.terminal_generation.get() == generation {
+                service.terminal_error.set(Some(match result {
+                    Ok(Err(error)) => error_text(&error),
+                    Err(error) => format!("reading the terminal did not finish: {error}").into(),
+                    Ok(Ok(())) => copy::text(
+                        "Terminal disconnected",
+                        "终端连接已断开",
+                        "終端機已中斷連線",
+                    )
+                    .into(),
+                }));
             }
         });
     }
 
     /// Starts another terminal in the workspace and shows it.
     fn new_terminal(&self) {
+        if self.terminal_busy.get_untracked() {
+            return;
+        }
+        self.terminal_busy.set(true);
+        let generation = self.terminal_generation.get();
+        let (cols, rows) = self.terminal_size.get();
         let service = self.clone();
         let terminal_backend = self.terminal_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
+                if service.terminal_generation.get() == generation {
+                    service.terminal_busy.set(false);
+                }
                 return;
             };
             let created = crate::runtime::handle()
@@ -5290,19 +5511,22 @@ impl SessionService {
                             title: None,
                             shell: None,
                             cwd: None,
-                            rows: 24,
-                            cols: 80,
+                            rows,
+                            cols,
                         }))
                         .await
                 })
                 .await;
+            if service.terminal_generation.get() != generation {
+                return;
+            }
+            service.terminal_busy.set(false);
             match created {
                 Ok(Ok(terminal)) => {
                     service
                         .terminal_choices
                         .update(|choices| push_terminal_choice(choices, &terminal));
                     service.attach_terminal(terminal.id, terminal.title);
-                    service.terminal_menu.set(false);
                 }
                 Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
                 Err(error) => service.terminal_error.set(Some(
@@ -5314,6 +5538,12 @@ impl SessionService {
 
     /// Shows another of the workspace's terminals.
     fn select_terminal(&self, id: &str) {
+        if self.terminal_busy.get_untracked()
+            || self.terminal_id.get_untracked().as_deref() == Some(id)
+                && self.terminal_error.with(Option::is_none)
+        {
+            return;
+        }
         let Ok(id) = TerminalId::parse(id) else {
             return;
         };
@@ -5326,8 +5556,67 @@ impl SessionService {
                     .map(|choice| choice.title.clone())
             })
             .unwrap_or_else(|| copy::text("Terminal", "终端", "終端").to_owned());
-        self.terminal_menu.set(false);
         self.attach_terminal(id, title);
+    }
+
+    fn retry_terminal(&self) {
+        if let Some(id) = self.terminal_id.get_untracked() {
+            if let Ok(id) = TerminalId::parse(id) {
+                let title = self.terminal_title.get_untracked().unwrap_or_default();
+                self.attach_terminal(id, title.to_string());
+            }
+        } else {
+            self.close_terminal();
+            self.open_terminal();
+        }
+    }
+
+    fn kill_terminal(&self, id: &str) {
+        if self.terminal_busy.get_untracked() {
+            return;
+        }
+        let Ok(id) = TerminalId::parse(id) else {
+            return;
+        };
+        self.terminal_busy.set(true);
+        let generation = self.terminal_generation.get();
+        let service = self.clone();
+        let backend = self.terminal_backend.clone();
+        spawn(async move {
+            let target = id.clone();
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.close_terminal(MutationRequest::new(target)).await })
+                .await;
+            if service.terminal_generation.get() != generation {
+                return;
+            }
+            service.terminal_busy.set(false);
+            match result {
+                Ok(Ok(_)) => {
+                    service
+                        .terminal_choices
+                        .update(|choices| choices.retain(|choice| choice.id != id.as_str()));
+                    if service.terminal_id.get_untracked().as_deref() == Some(id.as_str()) {
+                        service.stop_terminal_tasks();
+                        service.terminal_id.set(None);
+                        service.terminal_error.set(None);
+                        service.reset_terminal_output();
+                        if let Some(next) = service.terminal_choices.with(|choices| {
+                            choices
+                                .iter()
+                                .find(|choice| choice.status == "running")
+                                .map(|choice| choice.id.clone())
+                        }) {
+                            service.select_terminal(&next);
+                        }
+                    }
+                }
+                Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
+                Err(error) => service.terminal_error.set(Some(
+                    format!("closing the terminal did not finish: {error}").into(),
+                )),
+            }
+        });
     }
 
     /// Replaces the terminal list from a backend listing.
@@ -5338,40 +5627,38 @@ impl SessionService {
 
     /// Closes the terminal surface; the PTY keeps running on the runtime.
     fn close_terminal(&self) {
+        self.stop_terminal_tasks();
+        self.terminal_open.set(false);
+        self.terminal_busy.set(false);
+        self.terminal_id.set(None);
+    }
+
+    fn stop_terminal_tasks(&self) {
         self.terminal_generation
             .set(self.terminal_generation.get().wrapping_add(1));
-        self.terminal_open.set(false);
-        self.terminal_menu.set(false);
-        *self.terminal_id.borrow_mut() = None;
+        self.terminal_tx.take();
+        for task in [&self.terminal_stream, &self.terminal_writer] {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
     }
 
     /// Sends what the person typed to the PTY.
     fn terminal_input(&self, data: &str) {
-        let Some(terminal_id) = self.terminal_id.borrow().clone() else {
-            return;
-        };
-        let data = data.to_owned();
-        let service = self.clone();
-        let backend = self.terminal_backend.clone();
-        spawn(async move {
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    backend
-                        .write_terminal(MutationRequest::new(TerminalWriteRequest {
-                            terminal_id,
-                            data,
-                        }))
-                        .await
-                })
-                .await;
-            match result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
-                Err(error) => service.terminal_error.set(Some(
-                    format!("writing to the terminal did not finish: {error}").into(),
-                )),
-            }
-        });
+        if !data.is_empty() {
+            self.queue_terminal_command(TerminalCommand::Input(data.to_owned()));
+        }
+    }
+
+    fn queue_terminal_command(&self, command: TerminalCommand) {
+        if let Some(sender) = self.terminal_tx.borrow().as_ref()
+            && sender.try_send(command).is_err()
+        {
+            self.terminal_error.set(Some(
+                copy::text("Terminal input is busy", "终端输入繁忙", "終端機輸入忙碌").into(),
+            ));
+        }
     }
 
     fn write_terminal_output(&self, text: String) {
@@ -5385,6 +5672,8 @@ impl SessionService {
         if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
             api.reset();
         }
+        self.terminal_output_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
     }
 
     /// Decodes a frame, keeping a character split across frames for the next
@@ -5395,23 +5684,16 @@ impl SessionService {
 
     /// Tells the runtime the grid's new size.
     fn terminal_resize(&self, cols: u32, rows: u32) {
-        let Some(terminal_id) = self.terminal_id.borrow().clone() else {
+        if !self.terminal_visible.get_untracked() || cols <= 1 || rows <= 1 {
             return;
-        };
-        let backend = self.terminal_backend.clone();
-        spawn(async move {
-            let _ = crate::runtime::handle()
-                .spawn(async move {
-                    backend
-                        .resize_terminal(MutationRequest::new(TerminalResizeRequest {
-                            terminal_id,
-                            rows: rows.min(u32::from(u16::MAX)) as u16,
-                            cols: cols.min(u32::from(u16::MAX)) as u16,
-                        }))
-                        .await
-                })
-                .await;
-        });
+        }
+        let size = (
+            cols.min(u32::from(u16::MAX)) as u16,
+            rows.min(u32::from(u16::MAX)) as u16,
+        );
+        if self.terminal_size.replace(size) != size {
+            self.queue_terminal_command(TerminalCommand::Resize(size.0, size.1));
+        }
     }
 
     fn open_files(&self) {
@@ -5424,24 +5706,28 @@ impl SessionService {
         self.load_tree(String::new());
     }
 
-    fn search_files(&self, query: &str, contents: bool) {
+    fn search_files(&self, query: &str, options: SearchOptions) {
         let run = self.file_search_run.get().wrapping_add(1);
         self.file_search_run.set(run);
         let query = query.trim().to_owned();
+        self.files_error.set(None);
+        self.files_searching.set(!query.is_empty());
+        self.files_search.set(Vec::new());
         if query.is_empty() {
-            self.files_search.set(Vec::new());
             return;
         }
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
-        self.files_error.set(None);
         spawn(async move {
             timer(Duration::from_millis(180)).await;
             if service.file_search_run.get() != run {
                 return;
             }
             let Some(workspace) = service.workspace(&agent).await else {
+                if service.file_search_run.get() == run {
+                    service.files_searching.set(false);
+                }
                 return;
             };
             let result = crate::runtime::handle()
@@ -5450,10 +5736,10 @@ impl SessionService {
                         .search_files(FileSearchRequest {
                             workspace_id: workspace,
                             query,
-                            include_content: contents,
-                            case_sensitive: false,
-                            whole_word: false,
-                            regex: false,
+                            include_content: options.contents,
+                            case_sensitive: options.case_sensitive,
+                            whole_word: options.whole_word,
+                            regex: options.regex,
                             limit: Some(50),
                         })
                         .await
@@ -5462,6 +5748,7 @@ impl SessionService {
             if !service.alive.get() || service.file_search_run.get() != run {
                 return;
             }
+            service.files_searching.set(false);
             match result {
                 Ok(Ok(results)) => service.files_search.set(
                     results
@@ -5506,14 +5793,32 @@ impl SessionService {
                 .borrow()
                 .all_visible_rows()
                 .iter()
+                .filter(|row| !row.path.is_empty())
                 .map(|row| FileEntry {
                     path: row.path.clone(),
                     name: row.name.clone(),
                     directory: row.kind == vibex_core::FileEntryKind::Directory,
-                    depth: row.depth,
+                    depth: row.depth.saturating_sub(1),
                     expanded: row.expanded,
                     loading: row.load_state == FileTreeLoadState::Loading,
                     git: row.git.map(|git| git.signal.short_label().to_owned()),
+                    ignored: row.ignored,
+                    icon: match row.icon.kind {
+                        FileIconKind::Code
+                        | FileIconKind::Rust
+                        | FileIconKind::Java
+                        | FileIconKind::TypeScript
+                        | FileIconKind::JavaScript
+                        | FileIconKind::Markup => FileGlyph::Code,
+                        FileIconKind::Markdown => FileGlyph::Markdown,
+                        FileIconKind::Script => FileGlyph::Script,
+                        FileIconKind::Database => FileGlyph::Database,
+                        FileIconKind::Style => FileGlyph::Style,
+                        FileIconKind::Image | FileIconKind::Svg => FileGlyph::Image,
+                        FileIconKind::Json | FileIconKind::Spreadsheet => FileGlyph::Data,
+                        FileIconKind::Archive => FileGlyph::Archive,
+                        _ => FileGlyph::Text,
+                    },
                 })
                 .collect(),
         );
@@ -5619,15 +5924,27 @@ impl SessionService {
     }
 
     /// Reads a file into the preview.
-    fn open_file(&self, path: String) {
+    fn open_file(&self, path: String, line: Option<u32>) {
         let run = self.file_read_run.get().wrapping_add(1);
         self.file_read_run.set(run);
         self.files_error.set(None);
+        self.files_preview.set(None);
+        self.files_path.set(Some(path.clone()));
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
+                if service.file_read_run.get() == run {
+                    service.files_error.set(Some(
+                        copy::text(
+                            "The workspace is unavailable",
+                            "工作区不可用",
+                            "工作區無法使用",
+                        )
+                        .into(),
+                    ));
+                }
                 return;
             };
             let read_workspace = workspace.clone();
@@ -5679,12 +5996,17 @@ impl SessionService {
                     if !service.alive.get() || service.file_read_run.get() != run {
                         return;
                     }
-                    *service.files_current.borrow_mut() = Some(file.path);
-                    *service.files_revision.borrow_mut() = Some(file.content_revision);
-                    service
-                        .files_content
-                        .set(file.content.clone().unwrap_or_default());
-                    service.files_dirty.set(false);
+                    if kind == FilePreviewKindView::Image && image_uri.is_none() {
+                        service.files_error.set(Some(
+                            copy::text(
+                                "The image could not be loaded",
+                                "无法加载图片",
+                                "無法載入圖片",
+                            )
+                            .into(),
+                        ));
+                        return;
+                    }
                     service.files_preview.set(Some(FilePreview {
                         title: file.name,
                         body: file.content.unwrap_or_default(),
@@ -5692,6 +6014,7 @@ impl SessionService {
                         language: file.language.unwrap_or_default(),
                         kind,
                         image_uri,
+                        line,
                     }));
                 }
                 Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
@@ -5702,84 +6025,12 @@ impl SessionService {
         });
     }
 
-    /// Writes the edited text back, guarded by the revision it was read at.
-    fn save_file(&self) {
-        if self.files_saving.get_untracked() {
-            return;
-        }
-        if self.files_preview.get_untracked().is_some_and(|file| {
-            !matches!(
-                file.kind,
-                FilePreviewKindView::Text | FilePreviewKindView::Markdown
-            )
-        }) {
-            return;
-        }
-        let Some(path) = self.files_current.borrow().clone() else {
-            return;
-        };
-        let revision = self.files_revision.borrow().clone();
-        let content = self.files_content.get_untracked();
-        let run = self.file_read_run.get();
-        self.files_saving.set(true);
-        self.files_error.set(None);
-        let service = self.clone();
-        let file_backend = self.file_backend.clone();
-        let agent = self.backend.clone();
-        spawn(async move {
-            if service.file_read_run.get() != run || !service.alive.get() {
-                return;
-            }
-            let Some(workspace) = service.workspace(&agent).await else {
-                if service.file_read_run.get() == run {
-                    service.files_saving.set(false);
-                }
-                return;
-            };
-            if service.file_read_run.get() != run || !service.alive.get() {
-                return;
-            }
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    file_backend
-                        .write_file(MutationRequest::new(vibex_core::FileWriteRequest {
-                            workspace_id: workspace,
-                            path,
-                            content,
-                            create_if_missing: false,
-                            expected_revision: revision,
-                            encoding: None,
-                            line_ending: None,
-                        }))
-                        .await
-                })
-                .await;
-            if service.file_read_run.get() != run || !service.alive.get() {
-                return;
-            }
-            service.files_saving.set(false);
-            match result {
-                Ok(Ok(file)) => {
-                    *service.files_revision.borrow_mut() = Some(file.content_revision);
-                    service.files_content.set(file.content.unwrap_or_default());
-                    service.files_dirty.set(false);
-                }
-                Ok(Err(error)) => service.files_error.set(Some(error_text(&error))),
-                Err(error) => service.files_error.set(Some(
-                    format!("saving the file did not finish: {error}").into(),
-                )),
-            }
-        });
-    }
-
     fn files_back(&self) {
         self.file_read_run
             .set(self.file_read_run.get().wrapping_add(1));
         self.files_preview.set(None);
-        self.files_dirty.set(false);
-        self.files_saving.set(false);
+        self.files_path.set(None);
         self.files_error.set(None);
-        *self.files_current.borrow_mut() = None;
     }
 
     fn workbench_is_current(&self, generation: u64) -> bool {
@@ -5804,7 +6055,12 @@ impl SessionService {
             *self.files_workspace.borrow_mut() = Some(workspace.clone());
             return Some(workspace);
         }
-        let session = agent.open_session(session_id).await.ok()?;
+        let agent = agent.clone();
+        let session = crate::runtime::handle()
+            .spawn(async move { agent.open_session(session_id).await })
+            .await
+            .ok()?
+            .ok()?;
         if self.active.get_untracked().as_deref() != Some(active.as_str()) {
             return None;
         }
@@ -5865,9 +6121,24 @@ impl SessionService {
     }
 
     fn apply_git_status(&self, status: GitStatusSummary) {
+        let mut model = self.git_model.borrow_mut();
+        if model.workspace_id() != Some(&status.workspace_id) {
+            model.reset_workspace(status.workspace_id.clone());
+        }
+        let Some(ticket) = model.begin_query(GitQueryKind::Status, "status") else {
+            return;
+        };
         self.file_tree.borrow_mut().set_git_changes(&status.changes);
         self.publish_file_tree();
-        self.git_staged.set(status.staged_count);
+        self.git_totals.set(status.changes.iter().fold(
+            (0_u32, 0_u32),
+            |(added, removed), change| {
+                (
+                    added.saturating_add(change.additions),
+                    removed.saturating_add(change.deletions),
+                )
+            },
+        ));
         self.git_branch.set(
             status
                 .branch
@@ -5876,19 +6147,70 @@ impl SessionService {
                 .map(Some)
                 .unwrap_or(None),
         );
+        model.apply_status(&ticket, status);
+        drop(model);
+        self.publish_git_changes();
+    }
+
+    fn publish_git_changes(&self) {
+        use vibex_nsh_ui::screens::git::PathSelection;
+        let model = self.git_model.borrow();
+        let selected = model.selected_change_paths();
+        let selected_paths = selected
+            .iter()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        let mut prefix_counts = BTreeMap::<&str, (usize, usize)>::new();
+        for change in model.status.iter().flat_map(|status| &status.changes) {
+            let checked = usize::from(selected_paths.contains(change.path.as_str()));
+            for prefix in std::iter::once(change.path.as_str()).chain(
+                change
+                    .path
+                    .match_indices('/')
+                    .map(|(slash, _)| &change.path[..slash]),
+            ) {
+                let (total, selected) = prefix_counts.entry(prefix).or_default();
+                *total += 1;
+                *selected += checked;
+            }
+        }
         self.git_changes.set(
-            status
-                .changes
-                .into_iter()
-                .map(|change| GitChangeRow {
-                    status: change_letter(change.kind).to_owned(),
-                    path: change.path,
-                    staged: change.staged,
-                    additions: change.additions,
-                    deletions: change.deletions,
+            (0..model.change_tree_row_count())
+                .filter_map(|index| model.change_tree_row(index))
+                .map(|(row, change)| GitChangeRow {
+                    path: row.path.clone(),
+                    name: if row.kind == GitTreeRowKind::Directory {
+                        row.segments
+                            .iter()
+                            .map(|segment| segment.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    } else {
+                        row.path.rsplit('/').next().unwrap_or(&row.path).to_owned()
+                    },
+                    directory: row.kind == GitTreeRowKind::Directory,
+                    depth: row.depth,
+                    expanded: row.expanded,
+                    segments: row
+                        .segments
+                        .iter()
+                        .map(|segment| segment.path.clone())
+                        .collect(),
+                    selection: match prefix_counts.get(row.path.as_str()).copied() {
+                        Some((_, 0)) | None => PathSelection::Unchecked,
+                        Some((total, selected)) if total == selected => PathSelection::Checked,
+                        Some(_) => PathSelection::Partial,
+                    },
+                    status: change
+                        .map_or_else(String::new, |change| change_letter(change.kind).to_owned()),
+                    staged: change.is_some_and(|change| change.staged),
+                    unstaged: change.is_some_and(|change| change.unstaged || !change.staged),
+                    additions: change.map_or(0, |change| change.additions),
+                    deletions: change.map_or(0, |change| change.deletions),
                 })
                 .collect(),
         );
+        self.git_selected.set(selected);
     }
 
     /// Reads a path's diff into the preview.
@@ -5935,6 +6257,7 @@ impl SessionService {
 
     /// Stages or unstages one path and applies the status that comes back.
     fn stage_path(&self, path: &str, stage: bool) {
+        let generation = self.workbench_generation.get();
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
@@ -5943,6 +6266,9 @@ impl SessionService {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             let result = crate::runtime::handle()
                 .spawn(async move {
                     let request = MutationRequest::new(GitStageRequest {
@@ -5956,6 +6282,9 @@ impl SessionService {
                     }
                 })
                 .await;
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             match result {
                 Ok(Ok(status)) => service.apply_git_status(status),
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
@@ -6575,14 +6904,20 @@ impl SessionService {
         }
         self.git_remote_busy.set(true);
         self.git_error.set(None);
+        let generation = self.workbench_generation.get();
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
-                service.git_remote_busy.set(false);
+                if service.workbench_is_current(generation) {
+                    service.git_remote_busy.set(false);
+                }
                 return;
             };
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             let result = crate::runtime::handle()
                 .spawn(async move {
                     git.git_remote_action(MutationRequest::new(GitRemoteActionRequest {
@@ -6594,6 +6929,9 @@ impl SessionService {
                     .await
                 })
                 .await;
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             service.git_remote_busy.set(false);
             match result {
                 Ok(Ok(result)) => {
@@ -6615,33 +6953,43 @@ impl SessionService {
             return;
         }
         let message = self.git_message.get_untracked().trim().to_owned();
-        if message.is_empty() {
+        let paths = self.git_model.borrow().selected_change_paths();
+        if message.is_empty() || paths.is_empty() {
             return;
         }
         self.git_committing.set(true);
         self.git_error.set(None);
         let amend = self.git_amend.get_untracked();
         let push_after = self.git_push_after.get_untracked();
+        let generation = self.workbench_generation.get();
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
-                service.git_committing.set(false);
+                if service.workbench_is_current(generation) {
+                    service.git_committing.set(false);
+                }
                 return;
             };
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             let result = crate::runtime::handle()
                 .spawn(async move {
                     git.commit(MutationRequest::new(GitCommitRequest {
                         workspace_id: workspace,
                         message,
-                        paths: Vec::new(),
+                        paths,
                         amend,
                         push_after,
                     }))
                     .await
                 })
                 .await;
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             service.git_committing.set(false);
             match result {
                 Ok(Ok(_)) => {
@@ -6769,25 +7117,38 @@ impl SessionService {
         });
     }
 
-    /// Reverts one path's working-tree changes.
-    fn revert_path(&self, path: &str) {
-        let path = path.to_owned();
+    fn revert_paths(&self, paths: Vec<String>) {
+        if paths.is_empty() || self.git_remote_busy.get_untracked() {
+            return;
+        }
+        let generation = self.workbench_generation.get();
+        self.git_remote_busy.set(true);
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
+                if service.workbench_is_current(generation) {
+                    service.git_remote_busy.set(false);
+                }
                 return;
             };
+            if !service.workbench_is_current(generation) {
+                return;
+            }
             let result = crate::runtime::handle()
                 .spawn(async move {
                     git.git_revert(MutationRequest::new(GitStageRequest {
                         workspace_id: workspace,
-                        paths: vec![path],
+                        paths,
                     }))
                     .await
                 })
                 .await;
+            if !service.workbench_is_current(generation) {
+                return;
+            }
+            service.git_remote_busy.set(false);
             match result {
                 Ok(Ok(status)) => {
                     service.git_diff.set(None);
@@ -7019,6 +7380,62 @@ fn collapse_sidebar_row(
     })
 }
 
+fn project_mark(appearance: Option<&SidebarProjectAppearance>) -> (ImageSrc, Hsla) {
+    use vibex_nsh_ui::theme;
+    let default = SidebarProjectAppearance::default();
+    let appearance = appearance.unwrap_or(&default);
+    macro_rules! svg {
+        ($stem:literal) => {
+            ImageSrc::svg_markup(include_str!(concat!(
+                "../../../crates/vibex-nsh-ui/assets/icons/",
+                $stem,
+                ".svg"
+            )))
+        };
+    }
+    let image = if appearance.custom_logo_file.is_some() {
+        svg!("image")
+    } else {
+        match appearance.logo {
+            SidebarProjectLogo::Boxes => svg!("boxes"),
+            SidebarProjectLogo::Code => svg!("code-xml"),
+            SidebarProjectLogo::Terminal => svg!("file-terminal"),
+            SidebarProjectLogo::Database => svg!("database"),
+            SidebarProjectLogo::GitBranch => svg!("git-branch"),
+            SidebarProjectLogo::Hash => svg!("hash"),
+            SidebarProjectLogo::Book => svg!("book-open-text"),
+            SidebarProjectLogo::Sparkles => svg!("sparkles"),
+            SidebarProjectLogo::Folder => svg!("folder"),
+            SidebarProjectLogo::Briefcase => svg!("briefcase"),
+            SidebarProjectLogo::Box => svg!("box"),
+            SidebarProjectLogo::Globe => svg!("globe"),
+            SidebarProjectLogo::Server => svg!("server"),
+            SidebarProjectLogo::Cpu => svg!("cpu"),
+            SidebarProjectLogo::Layers => svg!("layers"),
+            SidebarProjectLogo::Braces => svg!("braces"),
+            SidebarProjectLogo::Rocket => svg!("rocket"),
+            SidebarProjectLogo::Wrench => svg!("wrench"),
+            SidebarProjectLogo::Gift => svg!("gift"),
+            SidebarProjectLogo::Chart => svg!("chart-column"),
+            SidebarProjectLogo::Palette => svg!("palette"),
+            SidebarProjectLogo::Gauge => svg!("gauge"),
+            SidebarProjectLogo::Workflow => svg!("workflow"),
+            SidebarProjectLogo::Package => svg!("package"),
+        }
+    };
+    let color = match appearance.color {
+        SidebarProjectLogoColor::Neutral => theme::sidebar_text_muted(),
+        SidebarProjectLogoColor::Blue => theme::accent_blue(),
+        SidebarProjectLogoColor::Cyan => nsh_core::color::hsla(187.0 / 360.0, 0.86, 0.54, 1.0),
+        SidebarProjectLogoColor::Green => theme::accent_green(),
+        SidebarProjectLogoColor::Yellow => theme::accent_yellow(),
+        SidebarProjectLogoColor::Orange => nsh_core::color::hsla(24.0 / 360.0, 0.95, 0.53, 1.0),
+        SidebarProjectLogoColor::Red => theme::accent_red(),
+        SidebarProjectLogoColor::Magenta => nsh_core::color::hsla(292.0 / 360.0, 0.84, 0.76, 1.0),
+    };
+    (image, color)
+}
+
 fn display_state(state: AgentSessionState) -> SessionState {
     match state {
         AgentSessionState::Running | AgentSessionState::Initializing => SessionState::Running,
@@ -7066,23 +7483,60 @@ fn summary(session: &AgentSession, spaces: &[WorkspaceSummary]) -> SessionSummar
     }
 }
 
+struct NewSessionDraft {
+    title: Option<String>,
+    text: String,
+    attachments: Vec<AttachmentItem>,
+}
+
+enum TerminalCommand {
+    Input(String),
+    Resize(u16, u16),
+}
+
+fn spawn_terminal_stream(
+    subscribe: impl FnOnce() -> BackendResult<Box<dyn TerminalFrameSubscription>> + Send + 'static,
+    output: mpsc::Sender<TerminalFrameBatch>,
+) -> tokio::task::JoinHandle<BackendResult<()>> {
+    crate::runtime::handle().spawn(async move {
+        let mut subscription = subscribe()?;
+        while let Some(batch) = subscription.next().await? {
+            if output.send(batch).await.is_err() {
+                break;
+            }
+        }
+        Ok(())
+    })
+}
+
 /// Decodes a terminal frame, keeping an incomplete UTF-8 tail for the next
 /// frame instead of showing a replacement mark for it.
 fn decode_terminal_bytes(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
     pending.extend_from_slice(bytes);
-    match std::str::from_utf8(pending) {
-        Ok(text) => {
-            let text = text.to_owned();
-            pending.clear();
-            text
-        }
-        Err(error) => {
-            let valid = error.valid_up_to();
-            let text = String::from_utf8_lossy(&pending[..valid]).into_owned();
-            pending.drain(..valid);
-            text
+    let mut decoded = String::new();
+    let mut consumed = 0;
+    while consumed < pending.len() {
+        match std::str::from_utf8(&pending[consumed..]) {
+            Ok(text) => {
+                decoded.push_str(text);
+                consumed = pending.len();
+            }
+            Err(error) => {
+                let valid_end = consumed + error.valid_up_to();
+                decoded.push_str(
+                    std::str::from_utf8(&pending[consumed..valid_end]).unwrap_or_default(),
+                );
+                consumed = valid_end;
+                let Some(invalid_len) = error.error_len() else {
+                    break;
+                };
+                decoded.push(char::REPLACEMENT_CHARACTER);
+                consumed += invalid_len;
+            }
         }
     }
+    pending.drain(..consumed);
+    decoded
 }
 
 /// The sheet's row for one terminal.
@@ -7738,7 +8192,51 @@ fn age(timestamp_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{AttachmentItem, BTreeMap, decode_terminal_bytes, swap_attachment_draft};
+    use super::{
+        AttachmentItem, BTreeMap, Duration, TerminalFrameBatch, TerminalFrameSubscription,
+        TerminalId, decode_terminal_bytes, mpsc, spawn_terminal_stream, swap_attachment_draft,
+    };
+
+    struct TimedTerminalFrames(std::vec::IntoIter<TerminalFrameBatch>);
+
+    impl TerminalFrameSubscription for TimedTerminalFrames {
+        fn next(&mut self) -> vibex_backend::BackendFuture<'_, Option<TerminalFrameBatch>> {
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                Ok(self.0.next())
+            })
+        }
+    }
+
+    #[test]
+    fn terminal_subscription_has_a_reactor_and_forwards_frames_in_order() {
+        assert!(tokio::runtime::Handle::try_current().is_err());
+        let terminal_id = TerminalId::new();
+        let batch = |sequence, reset_required| TerminalFrameBatch {
+            terminal_id: terminal_id.clone(),
+            frames: vec![vibex_backend::TerminalFrame {
+                sequence,
+                bytes: b"prompt".to_vec(),
+            }],
+            next_sequence: sequence + 1,
+            dropped_frames: 0,
+            reset_required,
+        };
+        let expected = vec![batch(1, false), batch(4, true)];
+        let source = expected.clone();
+        let (output, mut frames) = mpsc::channel(1);
+        let task = spawn_terminal_stream(
+            move || Ok(Box::new(TimedTerminalFrames(source.into_iter()))),
+            output,
+        );
+        crate::runtime::block_on(async move {
+            for batch in expected {
+                assert_eq!(frames.recv().await, Some(batch));
+            }
+            assert_eq!(frames.recv().await, None);
+            task.await.unwrap().unwrap();
+        });
+    }
 
     #[test]
     fn attachment_drafts_stay_with_the_session_they_were_added_to() {
@@ -7775,6 +8273,13 @@ mod tests {
         let split = bytes.len() - 2;
         assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..split]), "a");
         assert_eq!(decode_terminal_bytes(&mut pending, &bytes[split..]), "😀");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn an_invalid_terminal_byte_does_not_hide_following_output() {
+        let mut pending = Vec::new();
+        assert_eq!(decode_terminal_bytes(&mut pending, b"\xffready"), "�ready");
         assert!(pending.is_empty());
     }
 }
