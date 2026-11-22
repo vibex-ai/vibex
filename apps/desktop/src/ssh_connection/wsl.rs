@@ -1,9 +1,10 @@
 //! Windows Subsystem for Linux transport primitives.
 //!
 //! WSL2 is a local Linux environment, not a remote Windows host: there is no
-//! sshd or SSH auth. The desktop invokes `wsl.exe -d <distro> --exec /bin/sh
-//! -s`, sends fixed scripts on stdin, and reaches the runtime through WSL2
-//! localhost forwarding.
+//! sshd or SSH auth. The desktop invokes `wsl.exe -d <distro> --cd ~ --exec
+//! /bin/sh -s`, sends fixed scripts on stdin, and reaches the runtime through
+//! WSL2 localhost forwarding. `--cd ~` keeps the guest out of the caller's
+//! Windows working directory, which WSL cannot always translate.
 //!
 //! This module is deliberately transport-only. The SSH installer/launcher
 //! scripts are reused by the provisioning layer once a Windows test host is
@@ -27,10 +28,10 @@ const DEFAULT_TIMEOUT: Duration = Duration::from_secs(30);
 const LIST_TIMEOUT: Duration = Duration::from_secs(15);
 const UPLOAD_SCRIPT: &str = r#"set -eu; umask 077; mkdir -p "$(dirname "$1")"; cat > "$1""#;
 const MAX_SCRIPT_BYTES: usize = 64 * 1024;
-/// How much of a child's stderr travels with an error. `wsl.exe` prints one
+/// How much of a child's output travels with an error. `wsl.exe` prints one
 /// actionable sentence, and the point of keeping it is that the reader can
 /// read it.
-const MAX_STDERR_CHARS: usize = 2048;
+const MAX_DETAIL_CHARS: usize = 2048;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WslError {
@@ -94,14 +95,30 @@ impl WslCommand {
                 "the WSL script is invalid or too large",
             ));
         }
-        self.args.clear();
-        self.args.push("-d".into());
-        self.args.push(self.distro.clone().into());
+        self.args = self.enter_distro_args();
         self.args.push("--exec".into());
         self.args.push("/bin/sh".into());
         self.args.push("-s".into());
         self.stdin = Some(script.as_bytes().to_vec());
         Ok(self)
+    }
+
+    /// `-d <distro> --cd ~`: enter the distro in its own home directory.
+    ///
+    /// WSL translates the *Windows* working directory into the distro before
+    /// it runs anything, and a directory it cannot map — a network drive, a
+    /// UNC path, a drive excluded from automount — makes `wsl.exe` exit before
+    /// the guest starts. `wsl -l -q` needs no translation, so the distro list
+    /// keeps working while every `-d <distro> --exec` call fails, which reads
+    /// as "the distro is broken" when only the caller's cwd is. `--cd ~`
+    /// removes the dependency: the guest always starts in its own home.
+    fn enter_distro_args(&self) -> Vec<std::ffi::OsString> {
+        vec![
+            "-d".into(),
+            self.distro.clone().into(),
+            "--cd".into(),
+            "~".into(),
+        ]
     }
 
     pub fn arg(&mut self, value: impl Into<std::ffi::OsString>) -> &mut Self {
@@ -121,10 +138,8 @@ impl WslCommand {
     /// Uploads bytes to a destination inside the distro without a shell
     /// reparse of the path.
     pub fn upload(&mut self, destination: &str, contents: &[u8]) -> Result<WslOutput, WslError> {
-        self.args.clear();
+        self.args = self.enter_distro_args();
         self.args.extend([
-            "-d".into(),
-            self.distro.clone().into(),
             "--exec".into(),
             "/bin/sh".into(),
             "-c".into(),
@@ -141,6 +156,12 @@ impl WslCommand {
     }
 
     pub fn run_with_timeout(&self, timeout: Duration) -> Result<WslOutput, WslError> {
+        self.run_inner(timeout, true)
+    }
+
+    /// One `wsl.exe` call. `explain` is false for the transport's own health
+    /// check, whose failure must not start another health check.
+    fn run_inner(&self, timeout: Duration, explain: bool) -> Result<WslOutput, WslError> {
         let mut command = hidden_command(&self.program);
         command.args(&self.args);
         command.env("WSL_UTF8", "1");
@@ -210,14 +231,12 @@ impl WslCommand {
             ));
         };
         if !status.success() {
-            return Err(WslError::new(
-                "wsl_command_failed",
-                format!(
-                    "wsl.exe exited with {}: {}",
-                    status.code().unwrap_or(-1),
-                    String::from_utf8_lossy(&stderr).trim()
-                ),
-            ));
+            let exit = status.code().unwrap_or(-1);
+            return Err(if explain {
+                self.explain_failure(exit, &stdout, &stderr)
+            } else {
+                WslError::new("wsl_command_failed", format!("wsl.exe exited with {exit}"))
+            });
         }
         Ok(WslOutput {
             status,
@@ -225,6 +244,62 @@ impl WslCommand {
             stderr,
             timed_out,
         })
+    }
+
+    /// Names the cause of a non-zero `wsl.exe` exit.
+    ///
+    /// The child's own words are reported first: `wsl.exe` writes its usage and
+    /// distribution errors to **stdout** (UTF-16LE on builds that ignore
+    /// `WSL_UTF8`), so reporting stderr alone produced "wsl.exe exited with 2:"
+    /// with an empty tail — the reader got a status and no cause.
+    ///
+    /// A silent exit needs one more step, because its two causes want opposite
+    /// next moves: the distro refuses to run anything (WSL's own registration
+    /// or version problem) or the guest command failed without a word. One
+    /// trivial command separates them; it never runs for a failure that already
+    /// said something.
+    fn explain_failure(&self, exit: i32, stdout: &[u8], stderr: &[u8]) -> WslError {
+        let detail = child_detail(stdout, stderr);
+        if !detail.is_empty() {
+            return WslError::new(
+                "wsl_command_failed",
+                format!("wsl.exe exited with {exit}: {detail}"),
+            );
+        }
+        let distro = &self.distro;
+        match trivial_command_runs(&self.program, distro) {
+            Some(true) => WslError::new(
+                "wsl_command_failed",
+                format!(
+                    "wsl.exe exited with {exit} and the command printed nothing, while `/bin/true` ran in {distro}: the command itself failed inside the distro"
+                ),
+            ),
+            Some(false) => WslError::new(
+                "wsl_exec_refused",
+                format!(
+                    "WSL refused to run commands in {distro} (wsl.exe exited with {exit} and printed nothing, and `/bin/true` fails the same way); run `wsl --update` and `wsl -l -v`, then `wsl.exe -d {distro} -- true` in a terminal"
+                ),
+            ),
+            None => WslError::new(
+                "wsl_command_failed",
+                format!("wsl.exe exited with {exit} and printed nothing on stdout or stderr"),
+            ),
+        }
+    }
+}
+
+/// Whether `wsl.exe` can run a command in the distro at all.
+///
+/// `None` means the check itself could not answer (it failed to start or timed
+/// out), which is not evidence either way.
+fn trivial_command_runs(program: &Path, distro: &str) -> Option<bool> {
+    let mut command = WslCommand::new(program, distro);
+    command.args = command.enter_distro_args();
+    command.args.extend(["--exec".into(), "/bin/true".into()]);
+    match command.run_inner(DEFAULT_TIMEOUT, false) {
+        Ok(_) => Some(true),
+        Err(error) if error.code == "wsl_command_failed" => Some(false),
+        Err(_) => None,
     }
 }
 
@@ -250,6 +325,8 @@ impl WslKeepalive {
             .args([
                 "-d",
                 distro,
+                "--cd",
+                "~",
                 "--exec",
                 "/bin/sh",
                 "-c",
@@ -281,7 +358,7 @@ impl WslKeepalive {
 
     pub fn spawn(program: &Path, distro: &str) -> Result<Self, WslError> {
         let child = hidden_command(program)
-            .args(["-d", distro, "--exec", "sleep", "infinity"])
+            .args(["-d", distro, "--cd", "~", "--exec", "sleep", "infinity"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
             .stderr(Stdio::null())
@@ -316,8 +393,11 @@ pub struct WslOutput {
 }
 
 impl WslOutput {
+    /// The guest's output. `wsl.exe` may hand back UTF-16LE when it ignores
+    /// `WSL_UTF8`, and the probe and the status/pairing JSON go through the
+    /// same decoder as the distro list so one build cannot break one reader.
     pub fn stdout_lossy(&self) -> String {
-        String::from_utf8_lossy(&self.stdout).into_owned()
+        decode_wsl_text(&self.stdout)
     }
 }
 
@@ -423,22 +503,36 @@ fn list_distros_with_timeout(program: &Path, timeout: Duration) -> Result<Vec<St
     Ok(parse_distro_output(&stdout))
 }
 
-/// The child's own words, on one line, bounded the way `SshFailure` bounds its
-/// stderr tail. WSL writes UTF-16LE for older builds, so a NUL-bearing stream
-/// goes through the same decoder the distro list uses.
-fn stderr_detail(stderr: &[u8]) -> String {
-    let text = decode_wsl_text(stderr);
+/// The child's own words from both streams, on one line, bounded the way
+/// `SshFailure` bounds its stderr tail.
+///
+/// stdout comes first because that is where `wsl.exe` prints its own messages
+/// and where every guest command in this module writes its result. WSL writes
+/// UTF-16LE on older builds, so a NUL-bearing stream goes through the same
+/// decoder the distro list uses.
+fn child_detail(stdout: &[u8], stderr: &[u8]) -> String {
     let mut joined = String::new();
-    for line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
-        if !joined.is_empty() {
-            joined.push_str("; ");
+    for bytes in [stdout, stderr] {
+        for line in decode_wsl_text(bytes)
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.is_empty())
+        {
+            if !joined.is_empty() {
+                joined.push_str("; ");
+            }
+            joined.push_str(line);
         }
-        joined.push_str(line);
     }
-    if joined.chars().count() <= MAX_STDERR_CHARS {
+    if joined.chars().count() <= MAX_DETAIL_CHARS {
         return joined;
     }
-    joined.chars().take(MAX_STDERR_CHARS).collect()
+    joined.chars().take(MAX_DETAIL_CHARS).collect()
+}
+
+/// [`child_detail`] for a caller that only captures stderr.
+fn stderr_detail(stderr: &[u8]) -> String {
+    child_detail(&[], stderr)
 }
 
 pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
@@ -623,6 +717,9 @@ mod tests {
             [
                 "-d",
                 "Ubuntu-24.04",
+                // The guest never starts in the caller's Windows directory.
+                "--cd",
+                "~",
                 "--exec",
                 "/bin/sh",
                 "-s",
@@ -630,6 +727,154 @@ mod tests {
                 "three"
             ]
         );
+    }
+
+    /// The upload path and the runtime holder enter the distro the same way.
+    #[cfg(unix)]
+    #[test]
+    fn upload_and_keepalive_enter_the_distro_home() {
+        let dir = tempfile::tempdir().unwrap();
+        let capture = dir.path().join("args");
+        let wsl = fake_wsl(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\ncat >/dev/null\n",
+                capture.display()
+            ),
+        );
+        let _guard = test_support::process_guard();
+        let mut command = WslCommand::new(&wsl, "Ubuntu");
+        command
+            .upload("/home/dev/.incoming.tar.gz", b"bytes")
+            .unwrap();
+        let args = std::fs::read_to_string(&capture).unwrap();
+        assert_eq!(
+            args.lines().take(4).collect::<Vec<_>>(),
+            ["-d", "Ubuntu", "--cd", "~"]
+        );
+        assert!(
+            args.contains("-c"),
+            "the upload still runs the fixed stdin script: {args}"
+        );
+
+        // The holder is the process that keeps the runtime alive, so it must
+        // start in the same directory or the whole deployment fails where the
+        // upload succeeded.
+        let keepalive_capture = dir.path().join("keepalive-args");
+        let keepalive = fake_wsl(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\nprintf '%s\\n' \"$@\" > \"{}\"\nexec sleep 30\n",
+                keepalive_capture.display()
+            ),
+        );
+        let _held = WslKeepalive::spawn(&keepalive, "Ubuntu").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut keepalive_args = String::new();
+        while Instant::now() < deadline {
+            if let Ok(read) = std::fs::read_to_string(&keepalive_capture) {
+                keepalive_args = read;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            keepalive_args.lines().take(4).collect::<Vec<_>>(),
+            ["-d", "Ubuntu", "--cd", "~"]
+        );
+    }
+
+    /// A failing command has to carry what it said.
+    ///
+    /// `wsl.exe` prints its usage and distribution errors on **stdout**, so a
+    /// failure that reported only stderr reached the dialog as "wsl.exe exited
+    /// with 2:" with an empty tail — the reported shape of the WSL issue.
+    #[cfg(unix)]
+    #[test]
+    fn a_failed_command_keeps_the_childs_stdout() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = fake_wsl(
+            dir.path(),
+            "#!/bin/sh\ncat >/dev/null\nprintf 'Invalid command line option: --exec\\n'\nexit 2\n",
+        );
+        let _guard = test_support::process_guard();
+        let mut command = WslCommand::new(&wsl, "Ubuntu");
+        command.remote_script("echo ok\n").unwrap();
+        let error = command.run().unwrap_err();
+        assert_eq!(error.code, "wsl_command_failed");
+        assert!(
+            error.message.contains("Invalid command line option"),
+            "the child's stdout must survive: {}",
+            error.message
+        );
+        assert!(
+            error.message.contains("exited with 2"),
+            "the exit status belongs in the message: {}",
+            error.message
+        );
+    }
+
+    /// The same failure written the way older WSL builds write it.
+    #[cfg(unix)]
+    #[test]
+    fn a_utf16_failure_message_is_decoded() {
+        let dir = tempfile::tempdir().unwrap();
+        let bytes: Vec<u8> = "There is no distribution with the supplied name.\r\n"
+            .encode_utf16()
+            .flat_map(u16::to_le_bytes)
+            .collect();
+        std::fs::write(dir.path().join("out.bin"), bytes).unwrap();
+        let wsl = fake_wsl(
+            dir.path(),
+            &format!(
+                "#!/bin/sh\ncat >/dev/null\ncat '{}'\nexit 1\n",
+                dir.path().join("out.bin").display()
+            ),
+        );
+        let _guard = test_support::process_guard();
+        let mut command = WslCommand::new(&wsl, "Ubuntu");
+        command.remote_script("echo ok\n").unwrap();
+        let error = command.run().unwrap_err();
+        assert!(
+            error
+                .message
+                .contains("no distribution with the supplied name"),
+            "a UTF-16LE message must decode: {}",
+            error.message
+        );
+    }
+
+    /// A silent exit has two causes and they want opposite next moves, so one
+    /// trivial command settles it instead of one sentence for both.
+    #[cfg(unix)]
+    #[test]
+    fn a_silent_failure_separates_the_command_from_the_distro() {
+        let dir = tempfile::tempdir().unwrap();
+        let wsl = fake_wsl(
+            dir.path(),
+            "#!/bin/sh\ncase \"$*\" in\n  *\"/bin/true\"*) exit 0 ;;\nesac\ncat >/dev/null\nexit 2\n",
+        );
+        let _guard = test_support::process_guard();
+        let mut command = WslCommand::new(&wsl, "Ubuntu");
+        command.remote_script("echo ok\n").unwrap();
+        let error = command.run().unwrap_err();
+        assert_eq!(error.code, "wsl_command_failed");
+        assert!(
+            error.message.contains("/bin/true") && error.message.contains("Ubuntu"),
+            "the message says what still worked and where: {}",
+            error.message
+        );
+
+        // A distro that refuses everything is its own failure: `wsl --update`
+        // and `wsl -l -v` are the next steps, not "the script is broken".
+        let refused = fake_wsl(dir.path(), "#!/bin/sh\ncat >/dev/null\nexit 2\n");
+        let mut command = WslCommand::new(&refused, "Ubuntu");
+        command.remote_script("echo ok\n").unwrap();
+        let error = command.run().unwrap_err();
+        assert_eq!(error.code, "wsl_exec_refused");
+        assert!(error.message.contains("wsl --update"), "{}", error.message);
+        assert!(error.message.contains("wsl -l -v"), "{}", error.message);
+        assert!(!error.retryable, "a refusing distro is not a flake");
     }
 
     #[cfg(unix)]

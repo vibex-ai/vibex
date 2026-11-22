@@ -509,6 +509,7 @@ New key fingerprint is SHA256:newNewNewNewNew.\n";
             "wsl_list_spawn_failed",
             "wsl_exec_failed",
             "wsl_list_timeout",
+            "wsl_exec_refused",
             "wsl_probe_invalid",
         ] {
             let card = diagnose(code, "wsl.exe could not list distros", "", None, None);

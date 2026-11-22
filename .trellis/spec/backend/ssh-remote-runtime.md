@@ -263,10 +263,27 @@ FoundationSettings::load_wsl_distros(&mut self, cx: &mut Context<Self>)
 ### 3. Contracts
 
 - Saying "SSH into WSL" is a category error: the WSL transport is `wsl.exe -d
-  <distro> --exec /bin/sh`, so no sshd, key, or agent takes part. A reader who
-  reports an SSH failure and a WSL failure at once has hit two unrelated paths.
+  <distro> --cd ~ --exec /bin/sh`, so no sshd, key, or agent takes part. A
+  reader who reports an SSH failure and a WSL failure at once has hit two
+  unrelated paths.
+- Every `-d <distro>` invocation passes `--cd ~`. WSL translates the caller's
+  *Windows* working directory into the distro before it runs anything, and a
+  directory it cannot map — a network drive, a UNC path, a drive excluded from
+  automount — makes `wsl.exe` exit before the guest starts. `wsl -l -q` needs no
+  translation, so the symptom is "the distro list works, every command in the
+  distro fails", and it only reproduces from the app, never from a terminal
+  whose cwd is the home directory.
 - A failed `wsl -l -q` must carry `wsl.exe`'s own stderr and exit status. The
   class code names the failure; only the child's sentence names the cause.
+- A failed `WslCommand` carries **both** streams, decoded through the same
+  UTF-16LE-or-UTF-8 decoder the distro list uses. `wsl.exe` prints its usage and
+  distribution errors on **stdout**, so a failure that reported stderr alone
+  reached the reader as `wsl.exe exited with 2:` with an empty tail.
+- A silent non-zero exit is split by one trivial `--exec /bin/true` check: if
+  the trivial command runs, the guest command failed (`wsl_command_failed`, the
+  message says so); if it fails the same way, the distro refuses to run anything
+  (`wsl_exec_refused`, next steps `wsl --update` / `wsl -l -v`). Neither is
+  retryable: both name a state the reader has to change.
 - The distro read never runs on the UI thread. `wsl.exe` is a process call with
   no bound of its own, and a half-installed WSL used to freeze the settings
   window before the dialog could paint. It runs through
@@ -292,20 +309,36 @@ FoundationSettings::load_wsl_distros(&mut self, cx: &mut Context<Self>)
 | dialog opened, read still running | "Reading WSL distros…", Connect disabled |
 | read failed | the child's message stays in the dialog, plus a Retry button |
 | read succeeded with no distros | "Install WSL2 and at least one distro first." |
+| in-distro command exits non-zero with output | `wsl_command_failed`, message carries stdout + stderr + exit code |
+| in-distro command exits silently, `/bin/true` runs | `wsl_command_failed`, message says the command itself failed |
+| in-distro command exits silently, `/bin/true` fails too | `wsl_exec_refused`, message names `wsl --update` / `wsl -l -v` |
+| guest output is UTF-16LE | decoded before parsing, never reported as malformed |
 
 ### 5. Good / Base / Bad
 
 - Good: `list_distros` drains both pipes on reader threads and polls
   `try_wait` against a deadline, then reports `stderr_detail(&stderr)`.
 - Base: `parse_distro_output` decoding UTF-16LE only when the stream carries a
-  NUL byte.
+  NUL byte; `WslOutput::stdout_lossy` uses the same decoder.
 - Bad: `Command::output()` from a dialog opener — no deadline, no stderr, and
   the UI thread blocks on it.
+- Bad: reporting only `stderr` for a failed `wsl.exe` — WSL's own messages are
+  on stdout, so the reader gets a status and an empty cause.
 
 ### 6. Tests Required
 
 - `ssh_connection::wsl::tests::a_failed_list_keeps_the_childs_own_words` — the
   stderr and exit status survive; the error is not marked retryable.
+- `ssh_connection::wsl::tests::a_failed_command_keeps_the_childs_stdout` — a
+  failed in-distro command carries its stdout, not an empty tail.
+- `ssh_connection::wsl::tests::a_utf16_failure_message_is_decoded` — a UTF-16LE
+  message is decoded instead of dropped.
+- `ssh_connection::wsl::tests::a_silent_failure_separates_the_command_from_the_distro`
+  — the trivial-command check splits `wsl_command_failed` from `wsl_exec_refused`.
+- `ssh_connection::wsl::tests::builds_exec_shell_arguments_and_sends_the_script_on_stdin`
+  — `--cd ~` precedes `--exec`.
+- `ssh_connection::wsl::tests::upload_and_keepalive_enter_the_distro_home` — the
+  upload path enters the same working directory.
 - `ssh_connection::wsl::tests::a_hung_wsl_is_cut_off_at_the_deadline` — a child
   that never returns is killed and reported as `wsl_list_timeout`.
 - `ssh_connection::wsl::tests::a_missing_wsl_exe_stays_a_installation_problem`
