@@ -4579,6 +4579,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                         .h(px(40.0))
                         .flex_shrink_0()
                         .px(px(theme::SPACING_LG))
+                        .border_t_1()
+                        .border_t_color(theme::border_default())
                         .border_b_1()
                         .border_b_color(theme::border_default())
                         .flex_row()
