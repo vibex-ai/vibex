@@ -248,6 +248,7 @@ impl SettingsState {
         nsh_core::element::set_color_scheme(self.appearance.get_untracked());
         copy::set_preference(self.language.get_untracked());
         HAPTICS_ENABLED.store(self.haptics.get_untracked(), Ordering::Relaxed);
+        vibex_nsh_ui::motion::set_haptics(self.haptics.get_untracked());
         KEEP_SCREEN_ON.store(self.keep_screen_on.get_untracked(), Ordering::Relaxed);
         SHOW_TOKEN_USAGE.store(self.show_token_usage.get_untracked(), Ordering::Relaxed);
         SHOW_PLAN_GOAL.store(self.show_plan_goal.get_untracked(), Ordering::Relaxed);
@@ -299,6 +300,7 @@ impl SettingsState {
         }
         self.haptics.set(enabled);
         HAPTICS_ENABLED.store(enabled, Ordering::Relaxed);
+        vibex_nsh_ui::motion::set_haptics(enabled);
         self.persist();
     }
 

@@ -29,6 +29,7 @@ pub struct TerminalChoice {
 /// How the terminal screen reaches the session.
 #[derive(Clone)]
 pub struct TerminalHost {
+    pub session_terminal: Memo<Option<crate::screens::session::SessionSummary>>,
     pub title: Signal<Option<SharedString>>,
     pub error: Signal<Option<SharedString>>,
     /// The reference the service writes the program's output through.
@@ -46,7 +47,6 @@ pub struct TerminalHost {
     pub on_close_menu: Rc<dyn Fn()>,
     pub on_select_terminal: Rc<dyn Fn(&str)>,
     pub on_new_terminal: Rc<dyn Fn()>,
-    pub on_close: Rc<dyn Fn()>,
 }
 
 /// The terminal screen.
@@ -59,6 +59,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let title = host.title;
     let error = host.error;
     let term_ref = host.term_ref;
+    let session_terminal = host.session_terminal;
     let find_open = signal(false);
     let find_query = signal(String::new());
     let find_count = computed(move || {
@@ -79,25 +80,16 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         .child(
             view()
                 .w_full()
-                .pt_safe_area()
                 .border_b_1()
                 .border_b_color(theme::border_subtle)
                 .child(
                     view()
                         .w_full()
-                        .h(px(48.0))
+                        .h(px(theme::TOUCH_TARGET))
                         .flex_row()
                         .items_center()
                         .gap(px(theme::SPACING_XS))
                         .px(px(theme::SPACING_SM))
-                        .child(action::icon_button(
-                            icon(include_str!("../../assets/icons/chevron-left.svg")),
-                            copy::text("Back", "返回", "返回"),
-                            {
-                                let on_close = host.on_close.clone();
-                                move || on_close()
-                            },
-                        ))
                         .child(
                             text(move || {
                                 title.get().unwrap_or_else(|| {
@@ -106,7 +98,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             })
                             .flex_1()
                             .truncate()
-                            .text_size(px(theme::font_heading()))
+                            .text_size(px(theme::font_body()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         )
@@ -129,14 +121,24 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                                 move || find_open.update(|open| *open = !*open),
                             )
                         })
-                        .child({
-                            let on_open_menu = host.on_open_menu.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/menu.svg")),
-                                copy::text("Terminals", "终端列表", "終端清單"),
-                                move || on_open_menu(),
-                            )
-                        }),
+                        .child(when(
+                            move || {
+                                !session_terminal.with(|session| {
+                                    session.as_ref().is_some_and(|session| session.terminal)
+                                })
+                            },
+                            {
+                                let on_open_menu = host.on_open_menu.clone();
+                                move || {
+                                    let on_open_menu = on_open_menu.clone();
+                                    action::icon_button(
+                                        icon(include_str!("../../assets/icons/menu.svg")),
+                                        copy::text("Terminals", "终端列表", "終端清單"),
+                                        move || on_open_menu(),
+                                    )
+                                }
+                            },
+                        )),
                 ),
         )
         .child(when(move || find_open.get(), {

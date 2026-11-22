@@ -34,9 +34,6 @@ public final class NshHost {
     /** One local-network discovery event, as the JSON contract describes. */
     public static native void nativeDiscoveryEvent(String value);
 
-    /** Whether the app has a surface the back key should close (true: consumed). */
-    public static native boolean nativeBack();
-
     /** The pending connection-service change: -1 none, 0 stop, 1 start. */
     public static native int nativeTakeConnectionService();
 

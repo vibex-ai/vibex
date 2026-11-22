@@ -17,16 +17,21 @@ use vibex_nsh_ui::screens::git::{
     BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeConflictRow,
     WorktreeOperationRow, WorktreeRow,
 };
-use vibex_nsh_ui::screens::new_session::{RuntimeChoice, WorkspaceChoice};
+use vibex_nsh_ui::screens::new_session::{
+    DirectoryEntry, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice,
+};
 use vibex_nsh_ui::screens::session::{
-    self, AttachmentItem, CommandEntry, ComposerHistoryEntry, EntryKind, GoalPhaseView, GoalView,
-    PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
-    PlanStepView, PlanView, QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView,
-    RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    SidebarSectionKind, SidebarSectionView, TimelineEntry, TokenUsageView,
+    self, AttachmentItem, CommandEntry, ComposerHistoryEntry, ConversationState, EntryKind,
+    GoalPhaseView, GoalView, PendingPermission, PendingQuestion, PermissionChoice,
+    PermissionOption, PlanStepState, PlanStepView, PlanView, QuestionField, QuestionFieldKind,
+    QueuedMessageView, RuntimeChoiceView, RuntimeOptionView, RuntimeSummaryView, SessionHost,
+    SessionState, SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind,
+    SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
+
+const COMPOSER: &str = "text:/ commands @files $skills";
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
     TimelineEntry {
@@ -56,6 +61,7 @@ fn sessions() -> Vec<SessionSummary> {
             agent: "Claude".to_owned(),
             meta: "2m".to_owned(),
             state: SessionState::Idle,
+            terminal: false,
             project_id: "p1".to_owned(),
             project_name: "vibex".to_owned(),
             workspace_id: "w1".to_owned(),
@@ -67,6 +73,7 @@ fn sessions() -> Vec<SessionSummary> {
             agent: "Codex".to_owned(),
             meta: "1h".to_owned(),
             state: SessionState::Idle,
+            terminal: false,
             project_id: "p1".to_owned(),
             project_name: "vibex".to_owned(),
             workspace_id: "w1".to_owned(),
@@ -95,6 +102,7 @@ fn transcript(session: &str) -> Vec<TimelineEntry> {
 /// these tests cover.
 #[component]
 fn Shell() -> impl IntoElement {
+    on_back_press(session::handle_back);
     session::session(host_with(None, None))
 }
 
@@ -411,18 +419,97 @@ fn OfflineShell() -> impl IntoElement {
     session::session(host)
 }
 
+fn sidebar_fixture(
+    sessions: Signal<Vec<SessionSummary>>,
+    active: Signal<Option<String>>,
+    pinned: Signal<Vec<String>>,
+    sections: Signal<Vec<SidebarSectionView>>,
+) -> SidebarTree {
+    SidebarTree {
+        rows: Rc::new(move |query| {
+            let sessions = sessions.get();
+            let sections = sections.get();
+            let active = active.get();
+            let pinned = pinned.get();
+            let make_row = |session: &SessionSummary| SidebarRowView {
+                id: session.id.clone(),
+                title: session.title.clone(),
+                detail: session.agent.clone(),
+                metadata: session.meta.clone(),
+                active: active.as_deref() == Some(&session.id),
+                pinned: pinned.contains(&session.id),
+                state: Some(session.state),
+                indent: 12.0,
+                ..Default::default()
+            };
+            let query = query.to_lowercase();
+            let matches = |session: &&SessionSummary| session.title.to_lowercase().contains(&query);
+            let mut rows = vec![SidebarRowView {
+                id: "p1".to_owned(),
+                kind: SidebarRowKind::Project,
+                title: "vibex".to_owned(),
+                count: sessions.len(),
+                ..Default::default()
+            }];
+            rows.extend(
+                sessions
+                    .iter()
+                    .filter(matches)
+                    .filter(|session| {
+                        !sections
+                            .iter()
+                            .any(|section| section.session_ids.contains(&session.id))
+                    })
+                    .map(make_row),
+            );
+            for section in sections {
+                rows.push(SidebarRowView {
+                    id: section.id.clone(),
+                    kind: if section.kind == SidebarSectionKind::Group {
+                        SidebarRowKind::Group
+                    } else {
+                        SidebarRowKind::Folder
+                    },
+                    title: section.name,
+                    collapsed: section.collapsed,
+                    indent: 12.0,
+                    ..Default::default()
+                });
+                if !section.collapsed {
+                    rows.extend(
+                        sessions
+                            .iter()
+                            .filter(matches)
+                            .filter(|session| section.session_ids.contains(&session.id))
+                            .map(make_row),
+                    );
+                }
+            }
+            rows
+        }),
+        detailed: signal(false),
+        on_toggle_hierarchy: Rc::new(|| {}),
+        on_toggle_row: Rc::new(move |row| {
+            sections.update(|sections| {
+                if let Some(section) = sections.iter_mut().find(|section| section.id == row.id) {
+                    section.collapsed = !section.collapsed;
+                }
+            })
+        }),
+        on_collapse_all: Rc::new(|| {}),
+        on_reveal_active: Rc::new(|| {}),
+        on_move_row: Rc::new(|_, _| {}),
+        on_new_session: Rc::new(|_| {}),
+        on_new_folder: Rc::new(|_| {}),
+    }
+}
+
 fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
     let pinned = signal(Vec::new());
-    let unread = signal(Vec::new());
     let auto_continue_sessions = signal(Vec::new());
-    let sidebar_project_order = signal(Vec::new());
-    let sidebar_workspace_order = signal(Vec::new());
-    let sidebar_session_order = signal(Vec::new());
-    let collapsed_projects = signal(Vec::new());
-    let collapsed_workspaces = signal(Vec::new());
-    let sidebar_sections = signal(Vec::new());
+    let sidebar_sections = signal(Vec::<SidebarSectionView>::new());
     let folder_open = signal(false);
     let folder_name = signal(String::new());
     let move_open = signal(None::<String>);
@@ -446,6 +533,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         name: "main".to_owned(),
         current: true,
         detail: "origin/main".to_owned(),
+        ahead: 2,
+        behind: 1,
     }]);
     let git_branch_menu = signal(false);
     let worktrees = signal(vec![WorktreeRow {
@@ -550,17 +639,24 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }
     });
     let files_open = signal(false);
-    let files_path = signal(String::new());
     let files_entries = signal(vec![
         FileEntry {
             path: "src".to_owned(),
             name: "src".to_owned(),
             directory: true,
+            depth: 1,
+            expanded: false,
+            loading: false,
+            git: None,
         },
         FileEntry {
             path: "README.md".to_owned(),
             name: "README.md".to_owned(),
             directory: false,
+            depth: 1,
+            expanded: false,
+            loading: false,
+            git: None,
         },
     ]);
     let files_preview = signal(None::<FilePreview>);
@@ -575,12 +671,28 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let files_dirty = signal(false);
     let files_saving = signal(false);
     let on_open_dir = Rc::new(move |path: &str| {
-        files_path.set(path.to_owned());
-        files_entries.set(vec![FileEntry {
-            path: "src/main.rs".to_owned(),
-            name: "main.rs".to_owned(),
-            directory: false,
-        }]);
+        files_entries.update(|rows| {
+            let Some(index) = rows.iter().position(|row| row.path == path) else {
+                return;
+            };
+            rows[index].expanded = !rows[index].expanded;
+            if rows[index].expanded {
+                rows.insert(
+                    index + 1,
+                    FileEntry {
+                        path: "src/main.rs".to_owned(),
+                        name: "main.rs".to_owned(),
+                        directory: false,
+                        depth: 2,
+                        expanded: false,
+                        loading: false,
+                        git: None,
+                    },
+                );
+            } else {
+                rows.remove(index + 1);
+            }
+        });
     });
     let on_open_file = Rc::new(move |path: &str| {
         let markdown = path.ends_with(".md");
@@ -720,10 +832,12 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let new_error = signal(None::<SharedString>);
     let new_worktree_branch = signal(String::new());
     let new_base_ref = signal(String::new());
-    let new_project_path = signal(String::new());
-    let project_dirs = signal(Vec::new());
+    let project_dirs = signal(vec![DirectoryEntry {
+        name: "demo".to_owned(),
+        path: "/workspace/demo".to_owned(),
+    }]);
     let project_browser_open = signal(false);
-    let project_dir_path = signal(None);
+    let project_dir_path = signal(Some("/workspace".to_owned()));
     let project_dir_parent = signal(None);
     let on_create_worktree_session = Rc::new(move || {
         if new_worktree_branch.get_untracked().trim().is_empty() {
@@ -738,6 +852,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                     agent: "Claude".to_owned(),
                     meta: "now".to_owned(),
                     state: SessionState::Idle,
+                    terminal: false,
                     project_id: "p1".to_owned(),
                     project_name: "vibex".to_owned(),
                     workspace_id: "w1".to_owned(),
@@ -759,6 +874,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
                     agent: "Claude".to_owned(),
                     meta: "now".to_owned(),
                     state: SessionState::Idle,
+                    terminal: false,
                     project_id: "p1".to_owned(),
                     project_name: "vibex".to_owned(),
                     workspace_id: "w1".to_owned(),
@@ -815,7 +931,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }]);
     });
     let on_open_terminal = Rc::new(move || terminal_open.set(true));
-    let on_close_terminal = Rc::new(move || terminal_open.set(false));
     let on_new_session = Rc::new(move || new_session_open.set(true));
     let on_interrupt = Rc::new(move || {
         sessions.update(|sessions| {
@@ -828,15 +943,8 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         sessions,
         active,
         pinned,
-        unread,
         auto_continue_sessions,
-        sidebar_project_order,
-        sidebar_workspace_order,
-        sidebar_session_order,
-        collapsed_projects,
-        collapsed_workspaces,
-        on_set_project_collapsed: Rc::new(|_, _| {}),
-        on_set_workspace_collapsed: Rc::new(|_, _| {}),
+        sidebar: sidebar_fixture(sessions, active, pinned, sidebar_sections),
         on_set_session_auto_continue: Rc::new(|_, _| {}),
         sidebar_sections,
         folder_open,
@@ -851,8 +959,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_delete_group: Rc::new(|_| {}),
         on_set_group_members: Rc::new(|_, _| {}),
         on_set_group_pinned: Rc::new(|_, _| {}),
-        on_toggle_folder_collapsed: Rc::new(|_, _| {}),
-        on_toggle_group_collapsed: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
         move_open,
         on_open_move: Rc::new(move || {
@@ -862,9 +968,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }),
         on_close_move: Rc::new(move || move_open.set(None)),
         on_move_session: Rc::new(|_, _| {}),
-        on_move_session_relative: Rc::new(|_, _| {}),
         on_toggle_pin: Rc::new(|_| {}),
         timeline,
+        conversation: signal(ConversationState::Ready),
         draft,
         sending,
         error,
@@ -964,17 +1070,18 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_command_query,
         on_mention_query,
         on_new_session,
+        on_new_project: Rc::new(move || project_browser_open.set(true)),
         on_open_settings: Rc::new(|| {}),
         on_toggle_turn: Rc::new(|_| {}),
         on_toggle_detail: Rc::new(|_, _| {}),
         on_fork: Rc::new(|_| {}),
         on_load_older: Rc::new(|| {}),
         terminal_open,
+        terminal_visible: signal(false),
         terminal_title,
         terminal_error,
         terminal_ref,
         on_open_terminal,
-        on_close_terminal,
         on_terminal_data: Rc::new(|_| {}),
         on_terminal_resize: Rc::new(|_, _| {}),
         on_terminal_title: Rc::new(|_| {}),
@@ -987,14 +1094,13 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_select_terminal,
         on_new_terminal: Rc::new(|| {}),
         files_open,
-        files_path,
         files_entries,
         files_search,
-        on_search_files: Rc::new(|_| {}),
+        on_search_files: Rc::new(|_, _| {}),
         files_preview,
         files_error,
         on_open_files: Rc::new(move || files_open.set(true)),
-        on_close_files: Rc::new(move || files_open.set(false)),
+        on_refresh_files: Rc::new(|| {}),
         on_open_dir,
         on_open_file,
         on_files_back,
@@ -1008,7 +1114,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         git_diff,
         git_error,
         on_open_git: Rc::new(move || git_open.set(true)),
-        on_close_git: Rc::new(move || git_open.set(false)),
         on_open_git_diff,
         on_stage_git: on_stage,
         on_unstage_git: on_unstage,
@@ -1069,13 +1174,19 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         new_error,
         on_create_session,
         on_create_temporary_session: Rc::new(|| {}),
-        new_project_path,
-        on_open_project: Rc::new(|| {}),
-        project_dirs,
-        project_browser_open,
-        project_dir_path,
-        project_dir_parent,
-        on_browse_project_dirs: Rc::new(|_| {}),
+        project_browser: ProjectBrowserHost {
+            open: project_browser_open,
+            dirs: project_dirs,
+            current: project_dir_path,
+            parent: project_dir_parent,
+            busy: signal(false),
+            error: signal(None),
+            on_browse: Rc::new(move |path| project_dir_path.set(path.map(str::to_owned))),
+            on_open: Rc::new(move |path| {
+                assert_eq!(path, "/workspace/demo");
+                project_browser_open.set(false);
+            }),
+        },
         new_worktree_branch,
         new_base_ref,
         new_title,
@@ -1171,7 +1282,7 @@ fn the_dollar_palette_inserts_a_skill() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Good morning").unwrap();
-    app.type_text("text:Message the Agent…", "$").unwrap();
+    app.type_text(COMPOSER, "$").unwrap();
     app.wait_for("My skill").unwrap();
     app.press("My skill").unwrap();
     app.wait_for("$my-skill").unwrap();
@@ -1217,6 +1328,7 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
 #[test]
 fn a_photo_alone_can_be_sent() {
     let mut app = start();
+    app.press("role:button[Attach a file]").unwrap();
     app.press("role:button[Attach a photo]").unwrap();
     app.press("role:button[Send]").unwrap();
     app.wait_for("sent an attachment").unwrap();
@@ -1289,12 +1401,25 @@ fn a_group_opens_its_actions() {
 fn a_folder_can_be_named_from_the_drawer() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[New project]").unwrap();
+    app.long_press("Projects").unwrap();
     app.wait_for("New folder").unwrap();
     app.press("New folder").unwrap();
     app.wait_for("Folder name").unwrap();
     app.type_text("text:Folder name", "Work").unwrap();
     assert!(app.screen().shows("Create"));
+}
+
+#[test]
+fn add_project_opens_the_chosen_runtime_directory() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New project]").unwrap();
+    app.press("demo").unwrap();
+    app.wait_for("/workspace/demo").unwrap();
+    app.press("role:button[Open project]").unwrap();
+    app.wait_for_gone("/workspace/demo", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.wait_for("role:button[Back to session]").unwrap();
 }
 
 #[test]
@@ -1317,7 +1442,7 @@ fn a_pinned_session_keeps_its_marker() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Good morning").unwrap();
     app.press("role:button[Sessions]").unwrap();
-    app.wait_for("★").unwrap();
+    app.wait_for("label:Pinned").unwrap();
 }
 
 #[test]
@@ -1337,7 +1462,7 @@ fn the_drawer_selects_sessions_for_a_batch() {
 #[test]
 fn a_message_can_be_scheduled() {
     let mut app = start();
-    app.type_text("text:Message the Agent…", "Later").unwrap();
+    app.type_text(COMPOSER, "Later").unwrap();
     app.press("role:button[Schedule message]").unwrap();
     app.wait_for("In 5 minutes").unwrap();
     app.press("In 5 minutes").unwrap();
@@ -1359,13 +1484,10 @@ fn the_conversation_can_be_searched() {
 #[test]
 fn the_composer_appends_what_was_sent() {
     let mut app = start();
-    app.type_text("text:Message the Agent…", "Ship it").unwrap();
+    app.type_text(COMPOSER, "Ship it").unwrap();
     app.press("role:button[Send]").unwrap();
     app.wait_for("Ship it").unwrap();
-    assert_eq!(
-        app.screen().input_text("text:Message the Agent…").unwrap(),
-        Some("")
-    );
+    assert_eq!(app.screen().input_text(COMPOSER).unwrap(), Some(""));
 }
 
 /// The app switches to the shell inside a `when` region; that branch creates
@@ -1427,7 +1549,7 @@ fn a_question_collects_an_answer_and_leaves() {
 #[test]
 fn the_slash_palette_inserts_a_command() {
     let mut app = start();
-    app.type_text("text:Message the Agent…", "/").unwrap();
+    app.type_text(COMPOSER, "/").unwrap();
     app.wait_for("Review changes").unwrap();
     app.press("Review changes").unwrap();
     app.wait_for("text:/review ").unwrap();
@@ -1485,7 +1607,7 @@ fn the_terminal_opens_and_shows_the_programs_output() {
 #[test]
 fn the_at_palette_inserts_a_workspace_reference() {
     let mut app = start();
-    app.type_text("text:Message the Agent…", "@src").unwrap();
+    app.type_text(COMPOSER, "@src").unwrap();
     app.wait_for("src/main.rs").unwrap();
     app.press("src/main.rs").unwrap();
     app.wait_for("text:@src/main.rs ").unwrap();
@@ -1507,6 +1629,11 @@ fn the_files_surface_lists_a_directory_and_reads_a_file() {
     app.wait_for("README.md").unwrap();
     app.press("src").unwrap();
     app.wait_for("main.rs").unwrap();
+    assert!(app.screen().shows("README.md"));
+    app.press("src").unwrap();
+    app.wait_for_gone("main.rs", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.press("src").unwrap();
     app.press("main.rs").unwrap();
     app.wait_for("role:button[Save]").unwrap();
 }
@@ -1525,7 +1652,8 @@ fn the_file_browser_searches_content() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("README.md").unwrap();
-    app.press("role:button[Search files]").unwrap();
+    app.press("Name").unwrap();
+    app.type_text("text:Search files", "hello").unwrap();
     app.wait_for("main.rs:3").unwrap();
 }
 
@@ -1633,6 +1761,7 @@ fn a_history_row_opens_the_commit_detail() {
 #[test]
 fn a_photo_can_be_attached_and_removed() {
     let mut app = start();
+    app.press("role:button[Attach a file]").unwrap();
     app.press("role:button[Attach a photo]").unwrap();
     app.wait_for("photo.jpg").unwrap();
     app.press("photo.jpg").unwrap();
@@ -1654,11 +1783,31 @@ fn OneSessionShell() -> impl IntoElement {
         agent: "Claude".to_owned(),
         meta: "2m".to_owned(),
         state: SessionState::Running,
+        terminal: false,
         project_id: "p1".to_owned(),
         project_name: "vibex".to_owned(),
         workspace_id: "w1".to_owned(),
         workspace_label: "main".to_owned(),
     }]);
+    session::session(host)
+}
+
+#[component]
+fn AgentTerminalShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.update(|sessions| sessions[0].terminal = true);
+    host.timeline.set(Vec::new());
+    session::session(host)
+}
+
+#[component]
+fn FailedConversationShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.timeline.set(Vec::new());
+    host.conversation
+        .set(ConversationState::Failed("Conversation read failed".into()));
+    let status = host.conversation;
+    host.on_refresh = Rc::new(move || status.set(ConversationState::Ready));
     session::session(host)
 }
 
@@ -1718,6 +1867,139 @@ fn a_running_turn_can_be_stopped_from_the_composer() {
     app.wait_for("role:button[Stop]").unwrap();
     app.press("role:button[Stop]").unwrap();
     app.wait_for("role:button[Send]").unwrap();
+}
+
+#[test]
+fn a_draft_can_be_submitted_while_a_turn_is_running() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<OneSessionShell>())).unwrap();
+    app.wait_for("role:button[Stop]").unwrap();
+    app.type_text(COMPOSER, "Run the next check").unwrap();
+    app.press("role:button[Queue for the turn]").unwrap();
+    app.wait_for("Run the next check").unwrap();
+    app.wait_for("role:button[Stop]").unwrap();
+}
+
+#[test]
+fn both_side_pages_open_and_close_with_horizontal_drags() {
+    let mut app = start();
+    let travel = |distance| nsh_core::geometry::Point::new(px(distance), px(0.0));
+    app.drag("role:button[Sessions]", travel(130.0)).unwrap();
+    app.wait_for("role:button[Back to session]").unwrap();
+    app.drag("role:button[Back to session]", travel(-130.0))
+        .unwrap();
+    app.wait_for_gone(
+        "role:button[Back to session]",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    app.drag("role:button[Files, Git, and terminal]", travel(-130.0))
+        .unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.drag("role:button[Changes]", travel(130.0)).unwrap();
+    app.wait_for_gone("role:button[Changes]", std::time::Duration::from_secs(3))
+        .unwrap();
+}
+
+#[test]
+fn vertical_drag_keeps_the_conversation_open() {
+    let mut app = start();
+    app.drag(
+        "role:button[Sessions]",
+        nsh_core::geometry::Point::new(px(20.0), px(130.0)),
+    )
+    .unwrap();
+    assert!(
+        app.screen()
+            .matches("role:button[Files, Git, and terminal]")
+            .unwrap()
+    );
+    assert!(
+        !app.screen()
+            .matches("role:button[Back to session]")
+            .unwrap()
+    );
+    assert!(!app.screen().matches("role:button[Changes]").unwrap());
+}
+
+#[test]
+fn back_closes_the_drawer_sheet_before_the_drawer() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.long_press("Projects").unwrap();
+    app.wait_for("Sidebar").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone("Sidebar", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.wait_for("role:button[Back to session]").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone(
+        "role:button[Back to session]",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+}
+
+#[test]
+fn a_terminal_session_opens_the_rail_without_an_acp_composer() {
+    let mut app = Headless::start(EngineConfig::new(Root::of::<AgentTerminalShell>())).unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.wait_for("role:button[Find in terminal]").unwrap();
+    assert!(!app.screen().matches("role:button[Terminals]").unwrap());
+    app.press("role:button[Close]").unwrap();
+    app.wait_for("role:button[Open terminal]").unwrap();
+    assert!(!app.screen().matches(COMPOSER).unwrap());
+}
+
+#[test]
+fn a_failed_conversation_is_not_presented_as_empty() {
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<FailedConversationShell>())).unwrap();
+    app.wait_for("Conversation read failed").unwrap();
+    assert!(!app.screen().shows("No messages yet"));
+    app.press("role:button[Retry]").unwrap();
+    app.wait_for("No messages yet").unwrap();
+}
+
+#[test]
+fn the_rail_tabs_are_reachable_on_a_narrow_phone() {
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Files, Git, and terminal]")
+        .unwrap();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Terminal]").unwrap();
+    app.press("role:button[Terminal]").unwrap();
+    app.wait_for("role:button[Find in terminal]").unwrap();
+    app.press("role:button[Close]").unwrap();
+    app.wait_for("role:button[Send]").unwrap();
+}
+
+#[test]
+fn workspace_tabs_keep_the_preview_and_the_conversation_draft() {
+    let mut app = start();
+    app.type_text(COMPOSER, "Keep this draft").unwrap();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("README.md").unwrap();
+    app.wait_for("Hello").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.wait_for("↓1").unwrap();
+    app.wait_for("↑2").unwrap();
+    app.press("role:button[Files]").unwrap();
+    app.wait_for("Hello").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone("Hello", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone("role:button[Changes]", std::time::Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(
+        app.screen().input_text("text:Keep this draft").unwrap(),
+        Some("Keep this draft")
+    );
 }
 
 #[test]

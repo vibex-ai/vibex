@@ -107,11 +107,19 @@ theme generation.
   exception that proves it: `nsh`'s own picker (`pick_images`, `pick_files`)
   hands the app bytes, which travel to the authoritative runtime as `data:`
   URLs rather than being read from a phone path.
+- The paired workspace keeps the conversation mounted between full-width
+  Sessions and Workbench pages. Page and tab selection are local presentation
+  state. Disclosing a page does not replace the active session or its draft.
+  Native modals get back before the enclosing page; vertical scroll remains
+  independent of horizontal page drags.
+- `SidebarOrganizationView` and `FileTreeProjection` drive the sidebar and file
+  tree. The UI receives display rows and sends intent; sidebar mutations use
+  the holder's revision, and directory reads are scoped to the current
+  workspace and load generation.
 - Files are edited with `nsh`'s `Editor` (highlighting in the language the
   runtime reports) and written with a revision guard; Git status, staging,
-  commit, revert and commit detail call the same backend contracts the desktop
-  workbench uses. Branch switching is absent because the backend exposes no
-  checkout call.
+  commit, revert, commit detail and branch checkout call the same backend
+  contracts the desktop workbench uses.
 - The platform names the phone for pairing (`nativeSetDeviceName` /
   `vibex_mobile_nsh_set_device_name`), and packaging is `nsh package` behind
   `apps/mobile-nsh/scripts/build-{android,ios}.sh`.

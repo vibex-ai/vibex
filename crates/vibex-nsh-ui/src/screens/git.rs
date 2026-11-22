@@ -24,6 +24,8 @@ pub struct BranchRow {
     pub name: String,
     pub current: bool,
     pub detail: String,
+    pub ahead: u32,
+    pub behind: u32,
 }
 
 /// One managed worktree.
@@ -99,7 +101,6 @@ pub struct CommitDetailPreview {
 /// What the surface may do, and the state it shows.
 #[derive(Clone)]
 pub struct GitHost {
-    pub open: Signal<bool>,
     pub branch: Signal<Option<SharedString>>,
     pub changes: Signal<Vec<GitChangeRow>>,
     pub diff: Signal<Option<GitDiffPreview>>,
@@ -155,7 +156,6 @@ pub struct GitHost {
     pub on_unstage: Rc<dyn Fn(&str)>,
     pub on_back: Rc<dyn Fn()>,
     pub on_refresh: Rc<dyn Fn()>,
-    pub on_close: Rc<dyn Fn()>,
 }
 
 /// The Git surface.
@@ -170,31 +170,36 @@ pub fn git(host: GitHost) -> impl IntoElement {
     let commit_detail = host.commit_detail;
     view()
         .flex_1()
-        .bg(theme::block_page)
+        .bg(theme::sidebar_bg)
         .flex_col()
         .pb_safe_area()
         .child(
             view()
                 .w_full()
-                .pt_safe_area()
                 .border_b_1()
                 .border_b_color(theme::border_subtle)
                 .child(
                     view()
                         .w_full()
-                        .h(px(48.0))
+                        .h(px(theme::TOUCH_TARGET))
                         .flex_row()
                         .items_center()
                         .gap(px(theme::SPACING_XS))
                         .px(px(theme::SPACING_SM))
-                        .child({
-                            let on_back = host.on_back.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/chevron-left.svg")),
-                                copy::text("Back", "返回", "返回"),
-                                move || on_back(),
-                            )
-                        })
+                        .child(when(
+                            move || commit_detail.with(Option::is_some) || show_history.get(),
+                            {
+                                let on_back = host.on_back.clone();
+                                move || {
+                                    let on_back = on_back.clone();
+                                    action::icon_button(
+                                        icon!("chevron-left"),
+                                        copy::text("Back", "返回", "返回"),
+                                        move || on_back(),
+                                    )
+                                }
+                            },
+                        ))
                         .child(
                             text(move || {
                                 if let Some(detail) = commit_detail.get() {
@@ -210,7 +215,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             })
                             .flex_1()
                             .truncate()
-                            .text_size(px(theme::font_heading()))
+                            .text_size(px(theme::font_body()))
                             .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         )
@@ -244,14 +249,6 @@ pub fn git(host: GitHost) -> impl IntoElement {
                                 icon(include_str!("../../assets/icons/history.svg")),
                                 copy::text("History", "历史", "歷史"),
                                 move || on_toggle_history(),
-                            )
-                        })
-                        .child({
-                            let on_close = host.on_close.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/x.svg")),
-                                copy::text("Close", "关闭", "關閉"),
-                                move || on_close(),
                             )
                         }),
                 ),
@@ -290,7 +287,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
+            move || commit_detail.get().is_none() && !show_history.get(),
             {
                 let on_toggle_amend = host.on_toggle_amend.clone();
                 let on_toggle_push_after = host.on_toggle_push_after.clone();
@@ -310,7 +307,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
             },
         ))
         .child(when(
-            move || commit_detail.get().is_none() && !show_history.get() && error.get().is_some(),
+            move || commit_detail.get().is_none() && error.get().is_some(),
             move || {
                 text(move || error.get().unwrap_or_default())
                     .px(px(theme::SPACING_LG))
@@ -319,25 +316,13 @@ pub fn git(host: GitHost) -> impl IntoElement {
                     .text_color(theme::accent_red)
             },
         ))
-        .child(when(
-            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
-            {
-                let staged = host.staged;
-                let message = host.message;
-                let committing = host.committing;
-                let on_commit = host.on_commit.clone();
-                move || commit_bar(staged, message, committing, host.amend, on_commit.clone())
-            },
+        .child(diff_sheet(
+            diff,
+            host.on_back.clone(),
+            host.on_revert.clone(),
         ))
         .child(when(
-            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_some(),
-            {
-                let on_revert = host.on_revert.clone();
-                move || diff_view(diff, on_revert.clone())
-            },
-        ))
-        .child(when(
-            move || commit_detail.get().is_none() && !show_history.get() && diff.get().is_none(),
+            move || commit_detail.get().is_none() && !show_history.get(),
             move || {
                 change_list(
                     changes,
@@ -347,6 +332,41 @@ pub fn git(host: GitHost) -> impl IntoElement {
                 )
             },
         ))
+        .child(when(
+            move || commit_detail.get().is_none() && !show_history.get(),
+            move || {
+                commit_bar(
+                    host.staged,
+                    host.message,
+                    host.committing,
+                    host.amend,
+                    host.on_commit.clone(),
+                )
+            },
+        ))
+}
+
+fn diff_sheet(
+    diff: Signal<Option<GitDiffPreview>>,
+    close: Rc<dyn Fn()>,
+    revert: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_header};
+    bottom_sheet(
+        move || diff.with(Option::is_some),
+        {
+            let close = close.clone();
+            move || close()
+        },
+        view()
+            .h(move || px(window().height.0 * 0.68))
+            .pb_safe_area()
+            .child(sheet_header(
+                copy::text("Changes", "变更", "變更"),
+                move || close(),
+            ))
+            .child(diff_view(diff, revert)),
+    )
 }
 
 fn change_list(
@@ -355,30 +375,43 @@ fn change_list(
     on_stage: Rc<dyn Fn(&str)>,
     on_unstage: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    view().flex_1().min_h(px(0.0)).child(
-        virtual_list(
-            move || changes.with(|changes| changes.len()),
-            move |at: Position| {
-                change_row(
-                    at,
-                    changes,
-                    on_open_diff.clone(),
-                    on_stage.clone(),
-                    on_unstage.clone(),
-                )
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .child(when(
+            move || changes.with(Vec::is_empty),
+            || {
+                text(copy::text("No changes", "没有变更", "沒有變更"))
+                    .py(px(theme::SPACING_LG))
+                    .text_center()
+                    .text_size(px(theme::font_body()))
+                    .text_color(theme::text_muted)
             },
-        )
-        .keys(move || {
-            changes.with(|changes| {
-                changes
-                    .iter()
-                    .map(|change| format!("{}:{}", change.path, change.staged))
-                    .collect::<Vec<_>>()
+        ))
+        .child(
+            virtual_list(
+                move || changes.with(|changes| changes.len()),
+                move |at: Position| {
+                    change_row(
+                        at,
+                        changes,
+                        on_open_diff.clone(),
+                        on_stage.clone(),
+                        on_unstage.clone(),
+                    )
+                },
+            )
+            .keys(move || {
+                changes.with(|changes| {
+                    changes
+                        .iter()
+                        .map(|change| format!("{}:{}", change.path, change.staged))
+                        .collect::<Vec<_>>()
+                })
             })
-        })
-        .estimated_item_size(px(48.0))
-        .flex_1(),
-    )
+            .estimated_item_size(px(48.0))
+            .flex_1(),
+        )
 }
 
 fn change_row(
@@ -1145,7 +1178,19 @@ fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
                     text(move || line.get())
                         .text_size(px(theme::font_micro()))
                         .line_height(theme::line_height_for(theme::font_micro()))
-                        .text_color(theme::foreground),
+                        .text_color(move || {
+                            line.with(|line| {
+                                if line.starts_with('+') && !line.starts_with("+++") {
+                                    theme::accent_success()
+                                } else if line.starts_with('-') && !line.starts_with("---") {
+                                    theme::accent_red()
+                                } else if line.starts_with("@@") {
+                                    theme::accent_blue()
+                                } else {
+                                    theme::foreground()
+                                }
+                            })
+                        }),
                 )
             },
         )

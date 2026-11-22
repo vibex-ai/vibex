@@ -26,6 +26,7 @@ mod platform;
 mod runtime;
 mod session;
 mod settings;
+mod sidebar;
 pub mod theme_gen;
 
 use std::{rc::Rc, time::Duration};
@@ -105,7 +106,26 @@ pub fn App() -> impl IntoElement {
         boot_connection,
         attempt,
     );
-    start_back_poller(pairing.clone(), settings_open, settings_page, services);
+    start_host_poller(services);
+    on_back_press({
+        let pairing = pairing.clone();
+        move || {
+            if settings_open.get_untracked() {
+                if settings_page.get_untracked() == SettingsPage::Root {
+                    settings_open.set(false);
+                } else {
+                    settings_page.set(SettingsPage::Root);
+                }
+            } else if pairing.overlay_open() {
+                pairing.close_overlay();
+            } else if pairing.switcher().get_untracked() {
+                pairing.close_switcher();
+            } else {
+                return session_screen::handle_back();
+            }
+            true
+        }
+    });
 
     let open_settings: Rc<dyn Fn()> = {
         let open = settings_open;
@@ -369,29 +389,10 @@ fn settings_host(
     }
 }
 
-/// Watches the system back key and routes it to the surface the reader is on.
-///
-/// The Android host asks `host::nativeBack` synchronously; the engine thread
-/// consumes the press here, where the app's state lives.
-fn start_back_poller(
-    pairing: PairingService,
-    settings_open: Signal<bool>,
-    settings_page: Signal<SettingsPage>,
-    services: Signal<Option<Rc<SessionService>>>,
-) {
+fn start_host_poller(services: Signal<Option<Rc<SessionService>>>) {
     spawn(async move {
-        let mut last_back: Option<std::time::Instant> = None;
         loop {
             timer(Duration::from_millis(100)).await;
-            let service = services.get_untracked();
-            let switcher = pairing.switcher().get_untracked();
-            let overlay = pairing.overlay_open();
-            let intercept = settings_open.get_untracked()
-                || overlay
-                || switcher
-                || service.is_some()
-                || session_screen::drawer_is_open();
-            host::set_back_intercept(intercept);
             if let Some(text) = host::take_shared_text()
                 && let Some(service) = services.get_untracked()
             {
@@ -406,35 +407,6 @@ fn start_back_poller(
                 && let Some(service) = services.get_untracked()
             {
                 service.open_new_session();
-            }
-            if !host::take_back() {
-                continue;
-            }
-            let now = std::time::Instant::now();
-            if last_back
-                .is_some_and(|previous| now.duration_since(previous) < Duration::from_millis(1200))
-            {
-                continue;
-            }
-            last_back = Some(now);
-            if pairing.overlay_open() {
-                pairing.close_overlay();
-            } else if settings_open.get_untracked() {
-                if settings_page.get_untracked() == SettingsPage::Root {
-                    settings_open.set(false);
-                } else {
-                    settings_page.set(SettingsPage::Root);
-                }
-            } else if switcher {
-                pairing.close_switcher();
-            } else if session_screen::drawer_is_open() {
-                session_screen::close_drawer();
-            } else if let Some(service) = service {
-                if service.back_intercept() {
-                    service.handle_back();
-                } else {
-                    session_screen::open_drawer();
-                }
             }
         }
     });

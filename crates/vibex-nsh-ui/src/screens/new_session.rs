@@ -54,14 +54,6 @@ pub struct NewSessionHost {
     pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
     pub on_create_temporary: Rc<dyn Fn()>,
-    /// A path to open as a project before choosing it.
-    pub project_path: Signal<String>,
-    pub on_open_project: Rc<dyn Fn()>,
-    pub project_dirs: Signal<Vec<DirectoryEntry>>,
-    pub browser_open: Signal<bool>,
-    pub project_dir_path: Signal<Option<String>>,
-    pub project_dir_parent: Signal<Option<String>>,
-    pub on_browse_project_dirs: BrowseDirs,
     /// The session's optional title, first message and its attachments.
     pub title: Signal<String>,
     pub prompt: Signal<String>,
@@ -346,14 +338,31 @@ fn new_session_attachments(
         )
 }
 
-pub fn project_browser_sheet(
-    open: Signal<bool>,
-    dirs: Signal<Vec<DirectoryEntry>>,
-    current: Signal<Option<String>>,
-    parent: Signal<Option<String>>,
-    on_browse: BrowseDirs,
-    project_path: Signal<String>,
-) -> impl IntoElement {
+#[derive(Clone)]
+pub struct ProjectBrowserHost {
+    pub open: Signal<bool>,
+    pub dirs: Signal<Vec<DirectoryEntry>>,
+    pub current: Signal<Option<String>>,
+    pub parent: Signal<Option<String>>,
+    pub busy: Signal<bool>,
+    pub error: Signal<Option<SharedString>>,
+    pub on_browse: BrowseDirs,
+    pub on_open: ProjectOpen,
+}
+
+type ProjectOpen = Rc<dyn Fn(&str)>;
+
+pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
+    let ProjectBrowserHost {
+        open,
+        dirs,
+        current,
+        parent,
+        busy,
+        error,
+        on_browse,
+        on_open,
+    } = host;
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -373,9 +382,9 @@ pub fn project_browser_sheet(
                 .rounded_t(px(16.0))
                 .child(
                     text(move || {
-                        current
-                            .get()
-                            .unwrap_or_else(|| copy::text("Folders", "文件夹", "資料夾").to_owned())
+                        current.get().unwrap_or_else(|| {
+                            copy::text("New project", "新建项目", "新增專案").to_owned()
+                        })
                     })
                     .truncate()
                     .text_size(px(theme::font_heading()))
@@ -399,56 +408,77 @@ pub fn project_browser_sheet(
                                 },
                             )
                             .w_full()
+                            .disabled(move || busy.get())
                         },
                     )
                 })
                 .child({
                     let browse_rows = on_browse.clone();
-                    each(
-                        move || dirs.get(),
-                        |directory| directory.path.clone(),
-                        move |directory, _| {
-                            let on_browse = browse_rows.clone();
-                            button()
-                                .on_press(move || on_browse(Some(&directory.get_untracked().path)))
-                                .w_full()
-                                .min_h(px(40.0))
-                                .px(px(theme::SPACING_SM))
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::SPACING_XS))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::background_dim)
-                                .child(
-                                    svg(icon(include_str!("../../assets/icons/folder.svg")))
-                                        .w(px(theme::ICON_SM))
-                                        .h(px(theme::ICON_SM))
-                                        .text_color(theme::text_muted),
-                                )
-                                .child(
-                                    text(move || directory.get().name)
-                                        .flex_1()
-                                        .truncate()
-                                        .text_size(px(theme::font_body()))
-                                        .text_color(theme::foreground),
-                                )
-                        },
-                    )
+                    scroll()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(view().w_full().child(each(
+                            move || dirs.get(),
+                            |directory| directory.path.clone(),
+                            move |directory, _| {
+                                let on_browse = browse_rows.clone();
+                                button()
+                                    .on_press(move || {
+                                        on_browse(Some(&directory.get_untracked().path))
+                                    })
+                                    .disabled(move || busy.get())
+                                    .w_full()
+                                    .min_h(px(40.0))
+                                    .px(px(theme::SPACING_SM))
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_XS))
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::background_dim)
+                                    .child(
+                                        svg(icon(include_str!("../../assets/icons/folder.svg")))
+                                            .w(px(theme::ICON_SM))
+                                            .h(px(theme::ICON_SM))
+                                            .text_color(theme::text_muted),
+                                    )
+                                    .child(
+                                        text(move || directory.get().name)
+                                            .flex_1()
+                                            .truncate()
+                                            .text_size(px(theme::font_body()))
+                                            .text_color(theme::foreground),
+                                    )
+                            },
+                        )))
                 })
+                .child(when(
+                    move || busy.get(),
+                    || {
+                        text(copy::text("Loading…", "正在加载…", "正在載入…"))
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::text_muted)
+                    },
+                ))
+                .child(when(
+                    move || error.with(Option::is_some),
+                    move || {
+                        text(move || error.get().unwrap_or_default())
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::accent_red)
+                    },
+                ))
                 .child({
-                    let on_browse = on_browse.clone();
                     action::primary(
-                        copy::text("Use this folder", "使用此文件夹", "使用此資料夾"),
-                        icon(include_str!("../../assets/icons/check.svg")),
+                        copy::text("Open project", "打开项目", "開啟專案"),
+                        icon!("folder-open"),
                         move || {
                             if let Some(path) = current.get_untracked() {
-                                project_path.set(path);
-                                open.set(false);
-                                let _ = &on_browse;
+                                on_open(&path);
                             }
                         },
                     )
                     .w_full()
+                    .disabled(move || busy.get() || current.with(Option::is_none))
                 }),
         )
 }

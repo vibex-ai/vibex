@@ -1,9 +1,6 @@
-//! A read-only file browser over the workspace.
+//! The file tree and preview for a remote workspace.
 //!
-//! The runtime owns the files; this surface lists one directory at a time
-//! (`FileBackend::file_tree`) and shows a file's text (`read_file`) when one is
-//! opened. Editing, diffing and Git live elsewhere; this is the phone's first
-//! look at the workspace.
+//! The host projects the tree and owns its reads and revision-checked writes.
 
 use std::rc::Rc;
 
@@ -21,6 +18,10 @@ pub struct FileEntry {
     pub path: String,
     pub name: String,
     pub directory: bool,
+    pub depth: usize,
+    pub expanded: bool,
+    pub loading: bool,
+    pub git: Option<String>,
 }
 
 /// One file content search result.
@@ -58,12 +59,10 @@ pub enum FilePreviewKindView {
 /// What the browser may do, and the state it shows.
 #[derive(Clone)]
 pub struct FilesHost {
-    pub open: Signal<bool>,
-    /// The directory being listed ("" is the workspace root).
-    pub path: Signal<String>,
     pub entries: Signal<Vec<FileEntry>>,
     pub search: Signal<Vec<FileSearchRow>>,
-    pub on_search: Rc<dyn Fn(&str)>,
+    pub on_search: FileSearch,
+    pub on_refresh: Rc<dyn Fn()>,
     /// The file being read, when one is open.
     pub file: Signal<Option<FilePreview>>,
     pub error: Signal<Option<SharedString>>,
@@ -76,32 +75,18 @@ pub struct FilesHost {
     pub on_open_dir: Rc<dyn Fn(&str)>,
     pub on_open_file: Rc<dyn Fn(&str)>,
     pub on_back: Rc<dyn Fn()>,
-    pub on_close: Rc<dyn Fn()>,
 }
+
+pub type FileSearch = Rc<dyn Fn(&str, bool)>;
 
 /// The files surface.
 pub fn files(host: FilesHost) -> impl IntoElement {
-    let title = {
-        let path = host.path;
-        let file = host.file;
-        move || {
-            if let Some(file) = file.get() {
-                return file.title;
-            }
-            let path = path.get();
-            if path.is_empty() {
-                copy::text("Files", "文件", "檔案").to_owned()
-            } else {
-                path
-            }
-        }
-    };
     let on_back = host.on_back.clone();
-    let on_close = host.on_close.clone();
     let entries = host.entries;
     let search = host.search;
-    let search_open = signal(false);
     let search_query = signal(String::new());
+    let search_contents = signal(false);
+    let has_query = move || search_query.with(|query: &String| !query.trim().is_empty());
     let on_search = host.on_search.clone();
     let on_open_file = host.on_open_file.clone();
     let file = host.file;
@@ -110,79 +95,72 @@ pub fn files(host: FilesHost) -> impl IntoElement {
     let saving = host.saving;
     view()
         .flex_1()
-        .bg(theme::block_page)
+        .bg(theme::sidebar_bg)
         .flex_col()
         .pb_safe_area()
-        .child(
-            view()
-                .w_full()
-                .pt_safe_area()
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
-                .child(
-                    view()
-                        .w_full()
-                        .h(px(48.0))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .px(px(theme::SPACING_SM))
-                        .child({
-                            let on_back = on_back.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/chevron-left.svg")),
-                                copy::text("Back", "返回", "返回"),
-                                move || on_back(),
-                            )
-                        })
-                        .child(
-                            text(title)
+        .child(when(
+            move || file.with(Option::is_some),
+            move || {
+                view()
+                    .w_full()
+                    .border_b_1()
+                    .border_b_color(theme::border_subtle)
+                    .child(
+                        view()
+                            .w_full()
+                            .h(px(theme::TOUCH_TARGET))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .px(px(theme::SPACING_SM))
+                            .child({
+                                let on_back = on_back.clone();
+                                action::icon_button(
+                                    icon!("chevron-left"),
+                                    copy::text("Back", "返回", "返回"),
+                                    move || on_back(),
+                                )
+                            })
+                            .child(
+                                text(move || {
+                                    file.with(|file| {
+                                        file.as_ref()
+                                            .map_or_else(String::new, |file| file.title.clone())
+                                    })
+                                })
                                 .flex_1()
                                 .truncate()
-                                .text_size(px(theme::font_heading()))
+                                .text_size(px(theme::font_body()))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
-                        )
-                        .child(when(
-                            move || {
-                                file.get().is_some_and(|file| {
-                                    matches!(
-                                        file.kind,
-                                        FilePreviewKindView::Text | FilePreviewKindView::Markdown
-                                    )
-                                })
-                            },
-                            {
-                                let on_save = host.on_save.clone();
+                            )
+                            .child(when(
                                 move || {
-                                    let on_save = on_save.clone();
-                                    action::icon_button(
-                                        icon(include_str!("../../assets/icons/check.svg")),
-                                        copy::text("Save", "保存", "儲存"),
-                                        move || on_save(),
-                                    )
-                                    .disabled(move || !dirty.get() || saving.get())
-                                    .disabled_style(|style| style.opacity(0.35))
-                                }
-                            },
-                        ))
-                        .child({
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/search.svg")),
-                                copy::text("Search files", "搜索文件", "搜尋檔案"),
-                                move || search_open.update(|open| *open = !*open),
-                            )
-                        })
-                        .child({
-                            let on_close = on_close.clone();
-                            action::icon_button(
-                                icon(include_str!("../../assets/icons/x.svg")),
-                                copy::text("Close", "关闭", "關閉"),
-                                move || on_close(),
-                            )
-                        }),
-                ),
-        )
+                                    file.get().is_some_and(|file| {
+                                        matches!(
+                                            file.kind,
+                                            FilePreviewKindView::Text
+                                                | FilePreviewKindView::Markdown
+                                        )
+                                    })
+                                },
+                                {
+                                    let on_save = host.on_save.clone();
+                                    move || {
+                                        let on_save = on_save.clone();
+                                        action::icon_button(
+                                            icon(include_str!("../../assets/icons/check.svg")),
+                                            copy::text("Save", "保存", "儲存"),
+                                            move || on_save(),
+                                        )
+                                        .disabled(move || !dirty.get() || saving.get())
+                                        .disabled_style(|style| style.opacity(0.35))
+                                    }
+                                },
+                            )),
+                    )
+            },
+        ))
         .child(when(
             move || error.get().is_some(),
             move || {
@@ -197,9 +175,11 @@ pub fn files(host: FilesHost) -> impl IntoElement {
             move || file.get().is_some(),
             move || file_preview(file, host.content, dirty),
         ))
-        .child(when(move || search_open.get(), {
+        .child(when(move || file.with(Option::is_none), {
             let on_search = on_search.clone();
             let on_open_file = on_open_file.clone();
+            let on_open_dir = host.on_open_dir.clone();
+            let on_refresh = host.on_refresh.clone();
             move || {
                 view()
                     .flex_1()
@@ -207,29 +187,98 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                     .flex_col()
                     .child(
                         view()
-                            .px(px(theme::SPACING_LG))
-                            .py(px(theme::SPACING_XS))
+                            .h(px(theme::TOUCH_TARGET))
+                            .flex_shrink_0()
+                            .px(px(theme::SPACING_XS))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_XS))
+                            .border_b_1()
+                            .border_b_color(theme::border_subtle)
                             .child(
-                                nsh_base::input()
-                                    .value(move || search_query.get())
-                                    .on_change({
+                                crate::ui::field::text_field_flat_with(
+                                    search_query,
+                                    copy::text("Search files", "搜索文件", "搜尋檔案"),
+                                    {
                                         let on_search = on_search.clone();
-                                        move |text: &str| {
-                                            search_query.set(text.to_owned());
-                                            on_search(text);
+                                        move |text| on_search(text, search_contents.get_untracked())
+                                    },
+                                )
+                                .flex_1()
+                                .min_w(px(0.0)),
+                            )
+                            .child(when(has_query, {
+                                let on_search = on_search.clone();
+                                move || {
+                                    let on_search = on_search.clone();
+                                    action::icon_button(
+                                        icon!("x"),
+                                        copy::text("Clear search", "清除搜索", "清除搜尋"),
+                                        move || {
+                                            search_query.set(String::new());
+                                            on_search("", search_contents.get_untracked());
+                                        },
+                                    )
+                                    .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+                                    .flex_shrink_0()
+                                }
+                            }))
+                            .child(
+                                button()
+                                    .h(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+                                    .px(px(theme::SPACING_SM))
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .justify_center()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .on_press({
+                                        let on_search = on_search.clone();
+                                        move || {
+                                            let next = !search_contents.get_untracked();
+                                            search_contents.set(next);
+                                            on_search(&search_query.get_untracked(), next);
                                         }
                                     })
-                                    .placeholder(copy::text("Search files", "搜索文件", "搜尋檔案"))
-                                    .h(px(theme::TOUCH_TARGET)),
-                            ),
+                                    .child(
+                                        text(move || {
+                                            if search_contents.get() {
+                                                copy::text("Content", "内容", "內容")
+                                            } else {
+                                                copy::text("Name", "名称", "名稱")
+                                            }
+                                        })
+                                        .text_size(px(theme::font_caption()))
+                                        .text_color(theme::text_secondary),
+                                    ),
+                            )
+                            .child({
+                                let on_refresh = on_refresh.clone();
+                                action::icon_button(
+                                    icon!("refresh"),
+                                    copy::text("Refresh files", "刷新文件", "重新整理檔案"),
+                                    move || on_refresh(),
+                                )
+                                .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
+                                .flex_shrink_0()
+                            }),
                     )
-                    .child(file_search_list(search, on_open_file.clone()))
+                    .child(
+                        view()
+                            .flex_1()
+                            .min_h(px(0.0))
+                            .style_when(has_query, |style| style.hidden())
+                            .child(file_list(
+                                entries,
+                                on_open_dir.clone(),
+                                on_open_file.clone(),
+                            )),
+                    )
+                    .child(when(has_query, {
+                        let on_open_file = on_open_file.clone();
+                        move || file_search_list(search, on_open_file.clone())
+                    }))
             }
         }))
-        .child(when(
-            move || !search_open.get() && file.get().is_none(),
-            move || file_list(entries, host.on_open_dir.clone(), on_open_file.clone()),
-        ))
 }
 
 fn file_search_list(
@@ -240,7 +289,7 @@ fn file_search_list(
         .flex_1()
         .child(view().w_full().flex_col().child(each(
             move || rows.get(),
-            |row| row.path.clone(),
+            |row| (row.path.clone(), row.line),
             move |row, _| {
                 let on_open_file = on_open_file.clone();
                 button()
@@ -291,7 +340,7 @@ fn file_list(
                     .collect::<Vec<_>>()
             })
         })
-        .estimated_item_size(px(44.0))
+        .estimated_item_size(px(theme::TOUCH_TARGET))
         .flex_1(),
     )
 }
@@ -305,14 +354,12 @@ fn file_row(
     let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
     button()
         .w_full()
-        .min_h(px(44.0))
+        .min_h(px(theme::TOUCH_TARGET))
         .flex_row()
         .items_center()
         .gap(px(theme::SPACING_SM))
-        .px(px(theme::SPACING_LG))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .active(|style| style.opacity(0.8))
+        .px(px(theme::SPACING_SM))
+        .active(|style| style.bg(theme::row_pressed_bg()))
         .on_press(move || {
             let Some(entry) = entry.get_untracked() else {
                 return;
@@ -323,19 +370,21 @@ fn file_row(
                 on_open_file(&entry.path);
             }
         })
-        .child(
-            svg(icon(
-                if entry.with(|entry| entry.as_ref().is_some_and(|entry| entry.directory)) {
-                    include_str!("../../assets/icons/folder.svg")
-                } else {
-                    include_str!("../../assets/icons/file-text.svg")
-                },
-            ))
-            .w(px(theme::ICON_SM))
-            .h(px(theme::ICON_SM))
-            .flex_shrink_0()
-            .text_color(theme::text_muted),
-        )
+        .child(dynamic(move || {
+            let row = entry.get();
+            let indent = row.as_ref().map_or(0, |row| row.depth.min(12)) as f32 * theme::SPACING_SM;
+            let glyph = match row {
+                Some(row) if row.loading => icon!("loader-circle"),
+                Some(row) if row.directory && row.expanded => icon!("folder-open"),
+                Some(row) if row.directory => icon!("folder"),
+                _ => icon!("file-text"),
+            };
+            svg(glyph)
+                .size(px(theme::ICON_SM))
+                .ml(px(indent))
+                .flex_shrink_0()
+                .text_color(theme::text_muted)
+        }))
         .child(
             text(move || {
                 entry.with(|entry| {
@@ -349,6 +398,17 @@ fn file_row(
             .truncate()
             .text_size(px(theme::font_body()))
             .text_color(theme::foreground),
+        )
+        .child(
+            text(move || {
+                entry.with(|row| {
+                    row.as_ref()
+                        .and_then(|row| row.git.clone())
+                        .unwrap_or_default()
+                })
+            })
+            .text_size(px(theme::font_caption()))
+            .text_color(theme::text_muted),
         )
 }
 

@@ -113,13 +113,6 @@ static SHARED_TEXT: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 /// The name the platform reports for this phone, once the host sets it.
 static DEVICE_NAME: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
-/// Whether the app has a surface the system back key should close before it
-/// leaves the app. The Android host reads it synchronously from its UI thread.
-static BACK_INTERCEPT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// A back press the host consumed and the engine has not handled yet.
-static BACK_REQUESTED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
 /// The screen-awake state the app wants, and the change the host has not
 /// taken yet: -1 none, 0 off, 1 on.
 static KEEP_SCREEN_ON: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
@@ -129,34 +122,6 @@ static KEEP_SCREEN_ON_REQUEST: std::sync::atomic::AtomicI32 = std::sync::atomic:
 /// 1 start. The service keeps the process runnable while the app is away.
 static CONNECTION_SERVICE_REQUEST: std::sync::atomic::AtomicI32 =
     std::sync::atomic::AtomicI32::new(-1);
-
-/// Records whether the app has a sub-surface open.
-pub fn set_back_intercept(intercept: bool) {
-    BACK_INTERCEPT.store(intercept, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether the host should consume the next back press.
-#[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host is the one with a back key")
-)]
-pub fn back_intercept() -> bool {
-    BACK_INTERCEPT.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-/// Records a consumed back press for the engine to handle.
-#[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host is the one with a back key")
-)]
-pub fn request_back() {
-    BACK_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Takes the pending back press, if there is one.
-pub fn take_back() -> bool {
-    BACK_REQUESTED.swap(false, std::sync::atomic::Ordering::Relaxed)
-}
 
 /// Asks the host to hold the display awake (a running turn, an open terminal).
 pub fn set_keep_screen_on(on: bool) {

@@ -243,12 +243,6 @@ public final class MainActivity extends Activity {
     @Override
     @SuppressWarnings("deprecation")
     public void onBackPressed() {
-        // A closeable surface of the Rust app owns the press first: the
-        // drawer, a file preview, the terminal, a sheet. Only when none is
-        // open does NshView get it, and the system last.
-        if (NshHost.nativeBack()) {
-            return;
-        }
         if (view == null || !view.handleBack()) {
             super.onBackPressed();
         }

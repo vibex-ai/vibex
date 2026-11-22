@@ -29,6 +29,19 @@
 //!   palette and copy match the GPUI client, while text metrics, scrolling,
 //!   keyboards and selection are the platform's.
 
+/// An icon from this crate's `assets/icons/`, inlined so it draws in the first
+/// frame without asset registration: `icon!("menu")`.
+macro_rules! icon {
+    ($name:literal) => {
+        ::nsh_core::element::ImageSrc::svg_markup(include_str!(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/assets/icons/",
+            $name,
+            ".svg"
+        )))
+    };
+}
+
 pub mod copy;
 pub mod motion;
 pub mod screens;

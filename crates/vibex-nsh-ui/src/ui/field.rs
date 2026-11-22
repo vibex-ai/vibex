@@ -30,7 +30,7 @@ pub fn text_field_flat(value: Signal<String>, placeholder: impl IntoReactive<Str
     text_field_flat_with(value, placeholder, |_text: &str| {})
 }
 
-fn text_field_flat_with(
+pub fn text_field_flat_with(
     value: Signal<String>,
     placeholder: impl IntoReactive<String>,
     on_change: impl Fn(&str) + 'static,

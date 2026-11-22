@@ -25,7 +25,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Scan a QR code | `android/ScannerActivity.java`, `screens/pairing.rs`, `scan_photo` | emulator: portrait scanner with viewfinder/close/hint, camera permission, gallery decode (a picked QR was decoded; a non-Vibex code was rejected in place), host→app JNI result exercised | emulator | scan a real desktop QR on a phone |
 | Find runtimes on the LAN | `android/LanDiscovery.java`, `src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules; emulator: host NSD permission, Searching, empty state with Try Again, verification code and countdown | emulator: permission + browsing start + empty state | discovery and approval against a desktop on the same LAN |
 | Runtime actions, rename, details, remove | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs` | none headless (the sheet needs a saved credential) | emulator: actions sheet, rename dialog, details page, remove confirmation, back closes the top surface | rename and remove a real runtime, check the details against the desktop |
-| Session shell and switching | `screens/session.rs`, `apps/mobile-nsh/src/session.rs` | `the_shell_opens_on_the_first_session`, `the_drawer_lists_sessions_and_switching_one_swaps_the_transcript` | headless | long lists, scroll, safe areas |
+| Three-page session shell | `screens/session/pager.rs`, `screens/session/workbench.rs` | horizontal and vertical gestures, modal-first back, retained draft/preview, terminal-mode routing, 320-point viewport | headless | real touch arbitration, system-edge behavior, safe areas, IME |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
 | Composer send | `screens/session.rs` | `the_composer_appends_what_was_sent` | headless | IME composition, multiline, paste |
 | `/` commands | `screens/session.rs`, `query_commands` | `the_slash_palette_inserts_a_command` | headless | discovery against a real runtime |
@@ -81,8 +81,8 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Runtime picker, token use, plan/goal, queue, history, continue | `screens/session.rs`, `session.rs` | headless chips, bars, queue, history, continue; queue projection unit test | live runtime selection, queue and scheduled authority |
 | Composer triggers and structured mentions | `/`, `@`, `$` palettes | slash/at/dollar headless tests | live command execution and mentions |
 | Scheduled send, camera, attachments | `session.rs`, Android host | compile/headless UI only; schedule now uses the Sidebar mutation | real runtime timer, camera, plugin install |
-| Sidebar folders/groups/pin/unread/order/collapse | `session.rs`, `screens/session.rs` | folder/group actions and collapse headless tests | SidebarBackend mutations on a live desktop |
-| Files content search, Markdown/image preview | `screens/files.rs`, `session.rs` | file search and Markdown headless tests | large trees, binary assets |
+| Sidebar hierarchy and operations | `sidebar.rs`, `screens/session/tree.rs` | shared ordering and drop-scope unit tests; folder/group, search, project picker and batch selection headless tests | SidebarBackend mutations on a live runtime |
+| Files tree, search and previews | `screens/files.rs`, `session.rs` | in-place expansion/collapse, content search, Markdown, editor save and preview retained across tabs | large trees, binary assets and live file revisions |
 | Git branch checkout, Worktree lifecycle | `screens/git.rs`, shared backend | compile + list tests | checkout, merge/discard/conflict on a real repo |
 | Team, share-in, shortcuts, APK update | `screens/team.rs`, Android host | team sheet headless; host code compile | real device/network/installer |
 | Settings pages | `screens/settings.rs` | compile only | device toggles and notification permission |

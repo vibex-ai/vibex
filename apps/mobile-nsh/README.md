@@ -69,10 +69,14 @@ Scan and Find work in the app itself, without a Kotlin or Swift host:
 
 ### The session shell
 
-A successful claim or a tapped saved runtime opens the session shell:
+A successful claim or a tapped saved runtime opens the three-page workspace.
+The center is the conversation, Sessions is to its left, and Files, Changes
+and Terminal share the workbench to its right. Use the header controls or
+horizontal drags; returning from a side page leaves the conversation mounted.
 
-- the drawer lists the runtime's sessions (`list_sessions`) with their Agent,
-  age and state, and opening one reads its timeline;
+- Sessions renders the runtime's sidebar organization, including compact and
+  workspace hierarchies, nested folders and groups, search, batch selection,
+  and locating the open session. The runtime owns collapse, pin and order;
 - the transcript is `vibex-desktop-model`'s projection over the fetched page,
   so a row means the same thing it means on the desktop: user bubbles, Agent
   prose, reasoning, tool cards, notices and errors;
@@ -91,8 +95,8 @@ A successful claim or a tapped saved runtime opens the session shell:
 - a pending question is a typed form: one field per kind (text, a number, a
   choice, yes/no, multi-select), required fields checked before submitting,
   and the answers converted back to the runtime's typed values;
-- while the open session is running, the composer's send action becomes Stop
-  (`interrupt`); otherwise it sends, so a turn can be stopped from the phone;
+- during a running turn, the primary action stops the turn when the draft is
+  empty and queues the message when the draft has content or an attachment;
 - the composer offers the session's `/` commands and `@` references (one
   discovery per session each, filtered locally; a reference replaces the
   `@…` token in place), attaches photos and files through the platform's own
@@ -104,18 +108,17 @@ A successful claim or a tapped saved runtime opens the session shell:
   worktree (`git_worktree_create` from the chosen workspace's branch name);
 - a session's "⋯" opens its actions: Rename, Archive, and Delete (after the
   native confirmation); removing the active session opens the next one;
-- the drawer opens the workspace's terminal full-screen: the runtime's PTY
+- the Terminal tab attaches to the runtime's PTY. Terminal-mode Agent
+  sessions open their own PTY instead of an ACP composer. The runtime's PTY
   snapshot fills it, its frame stream keeps it live (a character split across
   two frames is carried to the next), its size changes are forwarded
   (`resize_terminal`), and what the person types goes back to the PTY; the
   header's list shows the workspace's terminals, switches between them, and
   starts a new one. Closing the surface leaves the terminal running;
-- the drawer opens a file browser: one directory at a time from `file_tree`,
-  a file's text from `read_file` edited in `nsh`'s `Editor` (line numbers,
-  folding, syntax highlighting in the language the runtime reports) and
-  written back with `write_file` (guarded by the revision it was read at),
-  with back through the directories and the preview;
-- the drawer opens the workspace's Git status: branch, changed paths with
+- Files shows a tree that expands directories in place and searches names or
+  content. Its preview uses the native editor and saves text with the revision
+  it was read at;
+- Changes shows the workspace's Git status: branch, changed paths with
   additions and deletions, and a path's diff from `git_diff`; each row stages
   or unstages its path (`stage`, `unstage`), the status the runtime returns
   replaces the list, a message field commits what is staged (`commit`), the
@@ -316,11 +319,6 @@ the shipping GPUI client, taken before the screen moves.
 
 ## Next
 
-The code-side migration is complete; what remains needs a host or a device:
-
-1. The Kotlin/Swift shells' camera and discovery implementations against the
-   request queue and event contract above, and the store signing/upload steps
-   that belong to the generated projects or release CI.
-2. Optional parity work: switching a session's model/reasoning in place
-   (`set_desired_runtime`, which needs the selection's revisions), a session
-   search in the drawer, and richer file creation/deletion.
+The [verification checklist](VERIFICATION.md) separates tested interactions
+from device and live-runtime checks. The old GPUI client remains the visual
+reference for the remaining screen-level differences.

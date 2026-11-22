@@ -7,5 +7,7 @@
 //! change here and nowhere else.
 
 pub mod action;
+pub mod activity;
 pub mod brand;
 pub mod field;
+pub mod sheet;
