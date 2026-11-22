@@ -196,6 +196,9 @@ pub struct SidebarSectionView {
     pub kind: SidebarSectionKind,
     pub pinned: bool,
     pub id: String,
+    /// The project a folder or group belongs to; `None` only for a legacy
+    /// runtime-wide section.
+    pub project_id: Option<String>,
     pub parent_id: Option<String>,
     pub depth: usize,
     pub collapsed: bool,
@@ -4764,6 +4767,85 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_switch_runtime = host.on_switch_runtime.clone();
     let on_session_menu = host.on_session_menu.clone();
     let on_open_settings = host.on_open_settings.clone();
+    let section_rows = {
+        let sections = sidebar_sections;
+        let sessions = sessions;
+        let active = active;
+        let activity_phase = activity_phase;
+        let project_view = project_view;
+        let on_select = on_select.clone();
+        let on_session_menu = on_session_menu.clone();
+        let on_move_session_relative = on_move_session_relative.clone();
+        let on_toggle_folder_collapsed = on_toggle_folder_collapsed.clone();
+        let on_toggle_group_collapsed = on_toggle_group_collapsed.clone();
+        let folder_actions = folder_actions;
+        let folder_rename = folder_rename;
+        let group_actions = group_actions;
+        let group_rename = group_rename;
+        Rc::new(move |project_id: &str| -> AnyElement {
+            let on_select = on_select.clone();
+            let on_session_menu = on_session_menu.clone();
+            let on_move_session_relative = on_move_session_relative.clone();
+            let on_toggle_folder_collapsed = on_toggle_folder_collapsed.clone();
+            let on_toggle_group_collapsed = on_toggle_group_collapsed.clone();
+            let project_id = project_id.to_owned();
+            each(
+                move || {
+                    sections.with(|sections| {
+                        sections
+                            .iter()
+                            .filter(|section| {
+                                section.project_id.as_deref() == Some(project_id.as_str())
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                },
+                |section| section.id.clone(),
+                move |section, _| {
+                    sidebar_section(
+                        section,
+                        sessions,
+                        active,
+                        activity_phase,
+                        project_view,
+                        on_select.clone(),
+                        on_session_menu.clone(),
+                        {
+                            let folder_actions = folder_actions;
+                            let folder_rename = folder_rename;
+                            Rc::new(move |id: &str, name: &str| {
+                                folder_rename.set(name.to_owned());
+                                folder_actions.set(Some(id.to_owned()));
+                            })
+                        },
+                        {
+                            let callback = on_toggle_folder_collapsed.clone();
+                            Rc::new(move |id: &str, collapsed: bool| callback(id, collapsed))
+                        },
+                        {
+                            let callback = on_toggle_group_collapsed.clone();
+                            Rc::new(move |id: &str, collapsed: bool| callback(id, collapsed))
+                        },
+                        {
+                            let group_actions = group_actions;
+                            let group_rename = group_rename;
+                            Rc::new(move |id: &str, name: &str| {
+                                group_rename.set(name.to_owned());
+                                group_actions.set(Some(id.to_owned()));
+                            })
+                        },
+                        open,
+                        select_mode,
+                        selected,
+                        pinned,
+                        unread,
+                        on_move_session_relative.clone(),
+                    )
+                },
+            )
+        })
+    };
     sheet()
         .side(Placement::Left)
         .open(move || Some(open.get()))
@@ -5064,67 +5146,12 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                     }
                                 }))
                                 .child({
-                                    let section_select = on_select.clone();
-                                    let section_menu = on_session_menu.clone();
-                                    let section_move = on_move_session_relative.clone();
-                                    each(
-                                        move || sidebar_sections.get(),
-                                        |section| section.id.clone(),
-                                        move |section, _| {
-                                            sidebar_section(
-                                                section,
-                                                sessions,
-                                                active,
-                                                activity_phase,
-                                                project_view,
-                                                section_select.clone(),
-                                                section_menu.clone(),
-                                                {
-                                                    let folder_actions = folder_actions;
-                                                    let folder_rename = folder_rename;
-                                                    Rc::new(move |id: &str, name: &str| {
-                                                        folder_rename.set(name.to_owned());
-                                                        folder_actions.set(Some(id.to_owned()));
-                                                    })
-                                                },
-                                                {
-                                                    let callback =
-                                                        on_toggle_folder_collapsed.clone();
-                                                    Rc::new(move |id: &str, collapsed: bool| {
-                                                        callback(id, collapsed)
-                                                    })
-                                                },
-                                                {
-                                                    let callback =
-                                                        on_toggle_group_collapsed.clone();
-                                                    Rc::new(move |id: &str, collapsed: bool| {
-                                                        callback(id, collapsed)
-                                                    })
-                                                },
-                                                {
-                                                    let group_actions = group_actions;
-                                                    let group_rename = group_rename;
-                                                    Rc::new(move |id: &str, name: &str| {
-                                                        group_rename.set(name.to_owned());
-                                                        group_actions.set(Some(id.to_owned()));
-                                                    })
-                                                },
-                                                open,
-                                                select_mode,
-                                                selected,
-                                                pinned,
-                                                unread,
-                                                section_move.clone(),
-                                            )
-                                        },
-                                    )
-                                })
-                                .child({
                                     let group_move = on_move_session_relative.clone();
                                     each(
                                         move || {
                                             drawer_groups(
                                                 sessions,
+                                                sidebar_sections,
                                                 query,
                                                 host.pinned,
                                                 hidden_sessions,
@@ -5144,6 +5171,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 active,
                                                 activity_phase,
                                                 project_view,
+                                                section_rows.clone(),
                                                 collapsed,
                                                 on_set_project_collapsed.clone(),
                                                 on_new_session.clone(),
@@ -5301,6 +5329,7 @@ impl DrawerRow {
 #[allow(clippy::too_many_arguments)]
 fn drawer_groups(
     sessions: Signal<Vec<SessionSummary>>,
+    sections: Signal<Vec<SidebarSectionView>>,
     query: Signal<String>,
     pinned: Signal<Vec<String>>,
     hidden: Memo<Vec<String>>,
@@ -5318,6 +5347,13 @@ fn drawer_groups(
         let collapsed_workspaces = collapsed_workspaces.get_untracked();
         let query = query.with(|query| query.trim().to_lowercase());
         let _ = &query;
+        let project_totals = sessions.iter().fold(
+            std::collections::BTreeMap::<String, usize>::new(),
+            |mut totals, session| {
+                *totals.entry(session.project_id.clone()).or_default() += 1;
+                totals
+            },
+        );
         let mut groups: Vec<DrawerGroup> = Vec::new();
         for session in sessions {
             if hidden_ids.iter().any(|id| id == &session.id) {
@@ -5348,6 +5384,27 @@ fn drawer_groups(
                 }),
             }
         }
+        let project_names = sessions
+            .iter()
+            .map(|session| (session.project_id.clone(), session.project_name.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for section in sections.get_untracked() {
+            let Some(project_id) = section.project_id else {
+                continue;
+            };
+            if groups.iter().any(|group| group.id == project_id) {
+                continue;
+            }
+            groups.push(DrawerGroup {
+                id: project_id.clone(),
+                name: project_names
+                    .get(&project_id)
+                    .cloned()
+                    .unwrap_or(project_id),
+                count: 0,
+                rows: Vec::new(),
+            });
+        }
         for group in &mut groups {
             let workspace_ranks = workspace_rank
                 .iter()
@@ -5374,7 +5431,10 @@ fn drawer_groups(
                     .unwrap_or(usize::MAX);
                 (pinned, workspace_rank, rank)
             });
-            group.count = sessions.len();
+            group.count = project_totals
+                .get(&group.id)
+                .copied()
+                .unwrap_or(sessions.len());
             let mut rows = Vec::new();
             let mut current: Option<String> = None;
             for session in sessions {
@@ -5998,6 +6058,7 @@ fn drawer_group(
     active: Signal<Option<String>>,
     activity_phase: Signal<u32>,
     project_only: Signal<bool>,
+    section_rows: Rc<dyn Fn(&str) -> AnyElement>,
     collapsed: Signal<Vec<String>>,
     on_project_collapse: SessionToggle,
     on_new_session: Action,
@@ -6096,6 +6157,7 @@ fn drawer_group(
                         )
                 }),
         )
+        .child((section_rows)(&group.get_untracked().id))
         .child(when(move || !closed.get() && !project_only.get(), {
             move || {
                 let on_select = on_select.clone();

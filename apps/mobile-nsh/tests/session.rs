@@ -200,6 +200,7 @@ fn FolderShell() -> impl IntoElement {
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
         pinned: false,
+        project_id: Some("p1".to_owned()),
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -217,6 +218,7 @@ fn GroupShell() -> impl IntoElement {
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Group,
         pinned: false,
+        project_id: Some("p1".to_owned()),
         parent_id: None,
         depth: 0,
         collapsed: false,
@@ -234,6 +236,7 @@ fn CollapsedFolderShell() -> impl IntoElement {
     host.sidebar_sections.set(vec![SidebarSectionView {
         kind: SidebarSectionKind::Folder,
         pinned: false,
+        project_id: Some("p1".to_owned()),
         parent_id: None,
         depth: 0,
         collapsed: true,
