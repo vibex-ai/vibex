@@ -922,6 +922,7 @@ pub fn close_drawer() {
 /// The shell proper: header, transcript, cards, composer and drawer.
 fn shell(host: SessionHost) -> impl IntoElement {
     let drawer_open = signal(false);
+    let tools_open = signal(false);
     DRAWER_OPEN.with(|cell| cell.set(Some(drawer_open)));
     let edge_drag = nsh_core::element::animated_value(0.0);
     let open_drag = nsh_core::element::animated_value(0.0);
@@ -942,7 +943,7 @@ fn shell(host: SessionHost) -> impl IntoElement {
             }
         })
         .flex_col()
-        .child(header(host.clone(), drawer_open))
+        .child(header(host.clone(), drawer_open, tools_open))
         .child(when(
             move || connection.get() != ConnectionState::Online,
             move || connection_banner(connection, connection_error, on_retry.clone()),
@@ -1014,6 +1015,13 @@ fn shell(host: SessionHost) -> impl IntoElement {
         .child(composer(host.clone()))
         .child(runtime_sheet(host.clone()))
         .child(history_sheet(host.clone()))
+        .child(tools_sheet(
+            tools_open,
+            host.on_open_files.clone(),
+            host.on_open_git.clone(),
+            host.on_open_terminal.clone(),
+            host.on_open_team.clone(),
+        ))
         .child(drawer(host.clone(), drawer_open))
         .child(
             view()
@@ -1106,7 +1114,11 @@ fn shell(host: SessionHost) -> impl IntoElement {
 }
 
 /// The top bar: the drawer, the title, a refresh.
-fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
+fn header(
+    host: SessionHost,
+    drawer_open: Signal<bool>,
+    tools_open: Signal<bool>,
+) -> impl IntoElement {
     let sessions = host.sessions;
     let active = host.active;
     let refresh = host.on_refresh.clone();
@@ -1155,6 +1167,11 @@ fn header(host: SessionHost, drawer_open: Signal<bool>) -> impl IntoElement {
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::foreground),
                 )
+                .child(action::icon_button(
+                    icon(include_str!("../../assets/icons/wrench.svg")),
+                    copy::text("Tools", "工具", "工具"),
+                    move || tools_open.set(true),
+                ))
                 .child({
                     let on_toggle_find = on_toggle_find.clone();
                     action::icon_button(
@@ -3953,6 +3970,166 @@ fn attachment_chip(
 
 /// Rename, archive or delete one session.
 #[allow(clippy::too_many_arguments)]
+fn tools_sheet(
+    open: Signal<bool>,
+    on_files: Action,
+    on_changes: Action,
+    on_terminal: Action,
+    on_team: Action,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                open.set(false);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
+                .child(
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Tools", "工具", "工具"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .child({
+                            let action = on_files.clone();
+                            sheet_action(
+                                copy::text("Files", "文件", "檔案"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    action();
+                                },
+                            )
+                        })
+                        .child({
+                            let action = on_changes.clone();
+                            sheet_action(
+                                copy::text("Changes", "变更", "變更"),
+                                icon(include_str!("../../assets/icons/code-xml.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    action();
+                                },
+                            )
+                        })
+                        .child({
+                            let action = on_terminal.clone();
+                            sheet_action(
+                                copy::text("Terminal", "终端", "終端"),
+                                icon(include_str!("../../assets/icons/terminal.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    action();
+                                },
+                            )
+                        })
+                        .child({
+                            let action = on_team.clone();
+                            sheet_action(
+                                copy::text("Team", "团队", "團隊"),
+                                icon(include_str!("../../assets/icons/bot.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    action();
+                                },
+                            )
+                        }),
+                ),
+        )
+}
+
+fn drawer_root_menu(
+    open: Signal<bool>,
+    on_new_session: Action,
+    on_new_folder: Action,
+) -> impl IntoElement {
+    sheet()
+        .open(move || Some(open.get()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                open.set(false);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
+                .child(
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Projects", "项目", "專案"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .child({
+                            let on_new_session = on_new_session.clone();
+                            sheet_action(
+                                copy::text("New project", "新建项目", "新增專案"),
+                                icon(include_str!("../../assets/icons/plus.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    on_new_session();
+                                },
+                            )
+                        })
+                        .child({
+                            let on_new_folder = on_new_folder.clone();
+                            sheet_action(
+                                copy::text("New folder", "新建文件夹", "新增資料夾"),
+                                icon(include_str!("../../assets/icons/folder.svg")),
+                                false,
+                                None,
+                                move || {
+                                    open.set(false);
+                                    on_new_folder();
+                                },
+                            )
+                        }),
+                ),
+        )
+}
+
 fn sheet_grabber() -> impl IntoElement {
     view()
         .w(px(36.0))
@@ -4384,6 +4561,42 @@ fn agent_icon(agent: &str) -> &'static str {
     }
 }
 
+fn drawer_view_tool(project_view: Signal<bool>, on_press: impl Fn() + 'static) -> ButtonElement {
+    button()
+        .accessibility_label(copy::text("Switch view", "切换视图", "切換檢視"))
+        .on_press(on_press)
+        .size(px(32.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .items_center()
+        .justify_center()
+        .bg(move || {
+            if project_view.get() {
+                theme::background_dim()
+            } else {
+                theme::background_card().opacity(0.0)
+            }
+        })
+        .active(|style| style.opacity(0.65))
+        .child(when(
+            move || project_view.get(),
+            || {
+                svg(icon(include_str!("../../assets/icons/message-square.svg")))
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .text_color(theme::text_secondary)
+            },
+        ))
+        .child(when(
+            move || !project_view.get(),
+            || {
+                svg(icon(include_str!("../../assets/icons/folder.svg")))
+                    .w(px(16.0))
+                    .h(px(16.0))
+                    .text_color(theme::text_secondary)
+            },
+        ))
+}
+
 fn drawer_header_button(
     icon: ImageSrc,
     label: &'static str,
@@ -4453,6 +4666,8 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_set_workspace_collapsed = host.on_set_workspace_collapsed.clone();
     let search_open = signal(false);
     let query = signal(String::new());
+    let project_view = signal(false);
+    let root_menu = signal(false);
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
     let pinned = host.pinned;
@@ -4463,7 +4678,6 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let session_order = host.sidebar_session_order;
     let folder_open = host.folder_open;
     let folder_name = host.folder_name;
-    let on_open_folder = host.on_open_folder.clone();
     let on_open_subfolder = host.on_open_subfolder.clone();
     let on_close_folder = host.on_close_folder.clone();
     let on_create_folder = host.on_create_folder.clone();
@@ -4482,6 +4696,57 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_delete_group = host.on_delete_group.clone();
     let on_toggle_folder_collapsed = host.on_toggle_folder_collapsed.clone();
     let on_toggle_group_collapsed = host.on_toggle_group_collapsed.clone();
+
+    let on_collapse_all = {
+        let sessions = sessions;
+        let sections = sidebar_sections;
+        let collapsed = collapsed_projects;
+        let on_project = on_set_project_collapsed.clone();
+        let on_folder = on_toggle_folder_collapsed.clone();
+        let on_group = on_toggle_group_collapsed.clone();
+        move || {
+            let project_ids = sessions.with(|sessions| {
+                sessions
+                    .iter()
+                    .map(|session| session.project_id.clone())
+                    .collect::<std::collections::BTreeSet<_>>()
+            });
+            let rows = sections.get_untracked();
+            let any_open = project_ids
+                .iter()
+                .any(|id| !collapsed.with(|collapsed| collapsed.contains(id)))
+                || rows.iter().any(|section| !section.collapsed);
+            for id in project_ids {
+                on_project(&id, any_open);
+            }
+            for section in rows {
+                if section.kind == SidebarSectionKind::Folder {
+                    on_folder(&section.id, any_open);
+                } else {
+                    on_group(&section.id, any_open);
+                }
+            }
+        }
+    };
+    let on_locate = {
+        let sessions = sessions;
+        let active = active;
+        let on_project = on_set_project_collapsed.clone();
+        move || {
+            let Some(active) = active.get_untracked() else {
+                return;
+            };
+            let project = sessions.with(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.id == active)
+                    .map(|session| session.project_id.clone())
+            });
+            if let Some(project) = project {
+                on_project(&project, false);
+            }
+        }
+    };
     let group_open = signal(false);
     let group_name = signal(String::new());
     let on_create_group = host.on_create_group.clone();
@@ -4497,9 +4762,6 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
     let on_select = host.on_select.clone();
     let on_new_session = host.on_new_session.clone();
     let on_switch_runtime = host.on_switch_runtime.clone();
-    let on_open_terminal = host.on_open_terminal.clone();
-    let on_open_files = host.on_open_files.clone();
-    let on_open_git = host.on_open_git.clone();
     let on_session_menu = host.on_session_menu.clone();
     let on_open_settings = host.on_open_settings.clone();
     sheet()
@@ -4595,15 +4857,9 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::text_muted),
                         )
-                        .child(drawer_tool(
-                            icon(include_str!("../../assets/icons/folder.svg")),
-                            copy::text("Files", "文件", "檔案"),
-                            false,
-                            {
-                                let on_open_files = on_open_files.clone();
-                                move || on_open_files()
-                            },
-                        ))
+                        .child(drawer_view_tool(project_view, move || {
+                            project_view.update(|view| *view = !*view);
+                        }))
                         .child(drawer_tool(
                             icon(include_str!("../../assets/icons/list-checks.svg")),
                             copy::text("Select sessions", "选择会话", "選取工作階段"),
@@ -4617,31 +4873,30 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                             },
                         ))
                         .child(drawer_tool(
-                            icon(include_str!("../../assets/icons/code-xml.svg")),
-                            copy::text("Changes", "变更", "變更"),
+                            icon(include_str!("../../assets/icons/chevrons-right-left.svg")),
+                            copy::text(
+                                "Collapse or expand projects",
+                                "折叠或展开项目",
+                                "摺疊或展開專案",
+                            ),
                             false,
-                            {
-                                let on_open_git = on_open_git.clone();
-                                move || on_open_git()
-                            },
+                            on_collapse_all,
                         ))
                         .child(drawer_tool(
-                            icon(include_str!("../../assets/icons/terminal.svg")),
-                            copy::text("Terminal", "终端", "終端"),
+                            icon(include_str!("../../assets/icons/crosshair.svg")),
+                            copy::text(
+                                "Locate current session",
+                                "定位当前会话",
+                                "定位目前工作階段",
+                            ),
                             false,
-                            {
-                                let on_open_terminal = on_open_terminal.clone();
-                                move || on_open_terminal()
-                            },
+                            on_locate,
                         ))
                         .child(drawer_tool(
                             icon(include_str!("../../assets/icons/plus.svg")),
-                            copy::text("New folder", "新建文件夹", "新增資料夾"),
+                            copy::text("New project", "新建项目", "新增專案"),
                             false,
-                            {
-                                let on_open_folder = on_open_folder.clone();
-                                move || on_open_folder()
-                            },
+                            move || root_menu.set(true),
                         ))
                         .child(drawer_tool(
                             icon(include_str!("../../assets/icons/search.svg")),
@@ -4821,6 +5076,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 sessions,
                                                 active,
                                                 activity_phase,
+                                                project_view,
                                                 section_select.clone(),
                                                 section_menu.clone(),
                                                 {
@@ -4887,6 +5143,7 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                                 group,
                                                 active,
                                                 activity_phase,
+                                                project_view,
                                                 collapsed,
                                                 on_set_project_collapsed.clone(),
                                                 on_new_session.clone(),
@@ -4990,6 +5247,11 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                 )
                         }),
                 )
+                .child(drawer_root_menu(
+                    root_menu,
+                    host.on_new_session.clone(),
+                    host.on_open_folder.clone(),
+                ))
                 .child(
                     view()
                         .absolute()
@@ -5530,6 +5792,7 @@ fn sidebar_section(
     sessions: Signal<Vec<SessionSummary>>,
     active: Signal<Option<String>>,
     activity_phase: Signal<u32>,
+    project_only: Signal<bool>,
     on_select: Rc<dyn Fn(&str)>,
     on_menu: SessionMenu,
     on_folder_menu: FolderNameAction,
@@ -5680,7 +5943,7 @@ fn sidebar_section(
                 }),
         )
         .child(when(
-            move || !section.with(|section| section.collapsed),
+            move || !section.with(|section| section.collapsed) && !project_only.get(),
             move || {
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();
@@ -5734,6 +5997,7 @@ fn drawer_group(
     group: ReadSignal<DrawerGroup>,
     active: Signal<Option<String>>,
     activity_phase: Signal<u32>,
+    project_only: Signal<bool>,
     collapsed: Signal<Vec<String>>,
     on_project_collapse: SessionToggle,
     on_new_session: Action,
@@ -5832,7 +6096,7 @@ fn drawer_group(
                         )
                 }),
         )
-        .child(when(move || !closed.get(), {
+        .child(when(move || !closed.get() && !project_only.get(), {
             move || {
                 let on_select = on_select.clone();
                 let on_menu = on_menu.clone();

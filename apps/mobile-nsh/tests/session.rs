@@ -1287,7 +1287,9 @@ fn a_group_opens_its_actions() {
 fn a_folder_can_be_named_from_the_drawer() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[New folder]").unwrap();
+    app.press("role:button[New project]").unwrap();
+    app.wait_for("New folder").unwrap();
+    app.press("New folder").unwrap();
     app.wait_for("Folder name").unwrap();
     app.type_text("text:Folder name", "Work").unwrap();
     assert!(app.screen().shows("Create"));
