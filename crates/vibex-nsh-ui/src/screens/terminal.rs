@@ -1,9 +1,10 @@
 //! Workspace terminal tabs and the native terminal emulator. The authority owns the PTYs.
 
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
-use nsh_base::{Terminal, TerminalApi, TerminalEvent, button, terminal as terminal_view};
+use nsh_base::{Terminal, TerminalApi, TerminalEvent, button, input, terminal as terminal_view};
 use nsh_core::prelude::*;
+use nsh_core::{AutoCapitalize, AutoFill, SubmitBehavior, element::Composition};
 
 use crate::{
     copy, theme,
@@ -32,6 +33,7 @@ pub struct TerminalHost {
     pub active: Signal<Option<String>>,
     pub busy: Signal<bool>,
     pub output_revision: Signal<u64>,
+    pub find_open: Signal<bool>,
     pub on_retry: Rc<dyn Fn()>,
     pub on_kill: TerminalAction,
     pub on_select_terminal: TerminalAction,
@@ -42,10 +44,11 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let active = host.active;
     let busy = host.busy;
     let term_ref = host.term_ref;
-    let find_open = signal(false);
+    let find_open = host.find_open;
     let find_query = signal(String::new());
     let control = signal(false);
     let alt = signal(false);
+    let keyboard = element_ref();
     let confirm = signal(None::<String>);
     let error = host.error;
     let output = host.output_revision;
@@ -62,11 +65,30 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             }
         }
     });
+    let on_text: TerminalAction = Rc::new({
+        let on_data = on_data.clone();
+        move |text: &str| {
+            if text.starts_with(|character: char| !character.is_control()) {
+                let text = modified_input(text, control.get_untracked(), alt.get_untracked());
+                control.set(false);
+                alt.set(false);
+                on_data(&text);
+            } else {
+                on_data(text);
+            }
+        }
+    });
     effect(move || {
         active.get();
         control.set(false);
         alt.set(false);
         confirm.set(None);
+        find_open.set(false);
+    });
+    effect(move || {
+        if !find_open.get() {
+            find_query.set(String::new());
+        }
     });
     let find_count = computed(move || {
         output.get();
@@ -100,6 +122,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             find_query,
                             copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
                         )
+                        .auto_focus(true)
                         .flex_1()
                         .min_w(px(0.0)),
                     )
@@ -121,7 +144,6 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             copy::text("Close search", "关闭搜索", "關閉搜尋"),
                             move || {
                                 find_open.set(false);
-                                find_query.set(String::new());
                                 dismiss_keyboard();
                             },
                         )
@@ -153,6 +175,24 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         let terminals = host.terminals;
                         move || terminal_tabs(terminals, active, busy, confirm, select.clone())
                     }),
+                )
+                .child(
+                    button()
+                        .h(px(theme::TOUCH_TARGET))
+                        .px(px(theme::SPACING_SM))
+                        .flex_shrink_0()
+                        .items_center()
+                        .justify_center()
+                        .accessibility_label(copy::text("Keyboard", "键盘", "鍵盤"))
+                        .on_press(move || keyboard.focus())
+                        .active(|style| style.bg(theme::row_pressed_bg()))
+                        .disabled(move || !selected() || busy.get())
+                        .disabled_style(|style| style.opacity(0.4))
+                        .child(
+                            svg(icon!("keyboard"))
+                                .size(px(theme::ICON_MD))
+                                .text_color(theme::text_secondary),
+                        ),
                 )
                 .child(
                     action::icon_button(
@@ -262,28 +302,11 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .w_full()
                 .relative()
                 .child({
-                    let data = on_data.clone();
+                    let data = on_text.clone();
                     terminal_view()
                         .component_ref(&term_ref)
-                        .accessibility_label(copy::text("Terminal input", "终端输入", "終端機輸入"))
-                        .on_data(move |text: &SharedString| {
-                            if text
-                                .chars()
-                                .next()
-                                .is_some_and(|character| !character.is_control())
-                            {
-                                let text = modified_input(
-                                    text,
-                                    control.get_untracked(),
-                                    alt.get_untracked(),
-                                );
-                                control.set(false);
-                                alt.set(false);
-                                data(&text);
-                            } else {
-                                data(text);
-                            }
-                        })
+                        .accessibility_label(copy::text("Terminal grid", "终端网格", "終端機網格"))
+                        .on_data(move |text: &SharedString| data(text))
                         .on_resize(move |event: &TerminalEvent| {
                             if let TerminalEvent::Resize(cols, rows) = event {
                                 (host.on_resize)(*cols, *rows);
@@ -294,6 +317,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         .flex_1()
                         .min_h(px(0.0))
                 })
+                .child(terminal_keyboard(keyboard, active, on_text))
                 .child(when(
                     move || !selected(),
                     move || {
@@ -326,7 +350,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 )),
         )
         .child(when(selected, move || {
-            terminal_keys(term_ref, control, alt, on_data.clone())
+            terminal_keys(control, alt, on_data.clone())
         }))
         .child(when(
             move || keyboard_height().0 == 0.0,
@@ -431,7 +455,6 @@ fn terminal_tabs(
 }
 
 fn terminal_keys(
-    term_ref: ComponentRef<Terminal>,
     control: Signal<bool>,
     alt: Signal<bool>,
     data: TerminalAction,
@@ -482,20 +505,116 @@ fn terminal_keys(
                     move || {
                         let paste = paste.clone();
                         spawn(async move {
-                            paste(&clipboard_string().await.replace('\n', "\r"));
+                            paste(&terminal_newlines(&clipboard_string().await));
                         });
-                    },
-                ))
-                .child(key_chip(
-                    copy::text("Keyboard", "键盘", "鍵盤"),
-                    || false,
-                    move || {
-                        if let Some(api) = term_ref.api::<TerminalApi>() {
-                            api.focus();
-                        }
                     },
                 )),
         )
+}
+
+const INPUT_SEED: &str = " ";
+
+fn terminal_keyboard(
+    keyboard: ElementRef,
+    active: Signal<Option<String>>,
+    send: TerminalAction,
+) -> impl IntoElement {
+    let value = signal(INPUT_SEED.to_owned());
+    let pending = Rc::new(RefCell::new(None::<String>));
+    let composing = signal(false);
+    let reset = {
+        let pending = pending.clone();
+        move || {
+            composing.set(false);
+            pending.borrow_mut().take();
+            value.set(INPUT_SEED.to_owned());
+        }
+    };
+    effect({
+        let reset = reset.clone();
+        move || {
+            active.get();
+            keyboard.blur();
+            reset();
+        }
+    });
+    let commit = {
+        let send = send.clone();
+        move |next: &str| {
+            let data = value.with_untracked(|previous| terminal_edit(previous, next));
+            value.set(if next.is_empty() {
+                INPUT_SEED.to_owned()
+            } else {
+                next.to_owned()
+            });
+            if !data.is_empty() {
+                send(&data);
+            }
+        }
+    };
+    input()
+        .element_ref(&keyboard)
+        .absolute()
+        .top_0()
+        .left_0()
+        .size(px(theme::TOUCH_TARGET))
+        .opacity(0.02)
+        .text_color(theme::foreground().opacity(0.0))
+        .caret(false)
+        .pointer_events(PointerEvents::None)
+        .label(copy::text("Terminal input", "终端输入", "終端機輸入"))
+        .auto_correct(false)
+        .auto_capitalize(AutoCapitalize::None)
+        .auto_fill(AutoFill::Off)
+        .submit_behavior(SubmitBehavior::Submit)
+        .value(move || value.get())
+        .selected_range(move || {
+            let end = value.with(|value| value.encode_utf16().count() as u32);
+            (end, end)
+        })
+        .on_change({
+            let pending = pending.clone();
+            let commit = commit.clone();
+            move |next: &str| {
+                if composing.get_untracked() {
+                    pending.replace(Some(next.to_owned()));
+                } else {
+                    commit(next);
+                }
+            }
+        })
+        .on_composition_change(move |composition: &Composition| {
+            composing.set(composition.composing);
+            if !composition.composing
+                && let Some(next) = pending.take()
+            {
+                commit(&next);
+            }
+        })
+        .on_submit({
+            let reset = reset.clone();
+            move |_: &str| {
+                send("\r");
+                reset();
+            }
+        })
+        .on_blur(reset)
+}
+
+fn terminal_edit(previous: &str, next: &str) -> String {
+    let common = previous
+        .chars()
+        .zip(next.chars())
+        .take_while(|(before, after)| before == after)
+        .map(|(character, _)| character.len_utf8())
+        .sum::<usize>();
+    let mut bytes = "\u{7f}".repeat(previous[common..].chars().count());
+    bytes.push_str(&terminal_newlines(&next[common..]));
+    bytes
+}
+
+fn terminal_newlines(text: &str) -> String {
+    text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
 fn key_chip(
@@ -541,7 +660,16 @@ fn modified_input(text: &str, control: bool, alt: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::modified_input;
+    use super::{modified_input, terminal_edit};
+
+    #[test]
+    fn native_input_edits_produce_pty_bytes() {
+        assert_eq!(terminal_edit(" ", " 你好"), "你好");
+        assert_eq!(terminal_edit(" 你好", " 你"), "\u{7f}");
+        assert_eq!(terminal_edit(" ", ""), "\u{7f}");
+        assert_eq!(terminal_edit(" 你", " 您"), "\u{7f}您");
+        assert_eq!(terminal_edit(" ", " ls\r\npwd\n"), "ls\rpwd\r");
+    }
 
     #[test]
     fn latched_keys_apply_to_the_next_committed_character() {

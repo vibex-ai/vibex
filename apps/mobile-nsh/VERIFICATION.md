@@ -38,6 +38,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | New worktree session | `screens/new_session.rs`, `create_worktree_session` | `a_new_worktree_session_can_be_started_from_the_creation_page` | headless | `git_worktree_create` on a real repo, branch conflicts |
 | Session rename/archive/delete | drawer actions sheet | `a_session_can_be_renamed_from_the_drawer`, `a_session_can_be_archived_from_the_drawer`, `a_session_can_be_deleted_from_the_drawer` | headless | native delete confirmation, deleting the last session |
 | Terminal output and UTF-8 | `screens/terminal.rs`, `attach_terminal` | headless output, UTF-8 carry, and ordered frames from a Tokio-backed subscription | headless + unit | latency, platform keyboard, rotation, live PTY/TUI |
+| Terminal keyboard input | `screens/terminal.rs` | `the_terminal_keyboard_sends_native_edits_and_return`, `native_input_edits_produce_pty_bytes` | headless + unit: narrow-screen focus, outbound text, DEL, CR, Unicode edits | phone IME composition and a command round-trip against a paired PTY |
 | Terminal tabs/switch/close | terminal header | `terminal_tabs_switch_and_can_close_a_terminal` | headless | many terminals, exited/stale states |
 | Files list/read | `screens/files.rs` | `the_files_surface_lists_a_directory_and_reads_a_file` | headless | large directories, binary files |
 | File search and read-only viewer | `screens/files.rs` | `the_file_browser_searches_content`, `the_read_only_file_viewer_can_find_in_source` | headless | live search, search-result positioning, large files |

@@ -18,7 +18,7 @@ use nsh_base::{
     text_view::{MarkdownOptions, text_view},
 };
 use nsh_core::{
-    element::{ImageSrc, Position},
+    element::{ImageSrc, Painter, Position, canvas},
     prelude::*,
 };
 
@@ -143,6 +143,8 @@ pub struct RuntimeSummaryView {
     pub mode: String,
     /// Whether the session has been moved off the Agent's own defaults.
     pub options_set: bool,
+    pub reasoning_set: bool,
+    pub mode_set: bool,
     pub available: bool,
 }
 
@@ -150,6 +152,7 @@ pub struct RuntimeSummaryView {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeOptionView {
     pub id: String,
+    pub agent_id: String,
     pub agent: String,
     pub model: String,
     pub detail: String,
@@ -172,7 +175,7 @@ pub struct RuntimeFeatureView {
     pub label: String,
     pub detail: String,
     pub toggle: bool,
-    pub selected: bool,
+    pub explicit_value: Option<String>,
     pub values: Vec<RuntimeChoiceView>,
 }
 
@@ -411,7 +414,7 @@ use crate::screens::new_session::{
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 /// Chooses a value for one of the Agent's session options.
-type ChooseFeature = FolderNameAction;
+type ChooseFeature = Rc<dyn Fn(&str, Option<&str>)>;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
 type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
@@ -796,6 +799,7 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         None
     };
     let tab = signal(initial_tab.unwrap_or_default());
+    let terminal_find = signal(false);
     if initial_tab.is_some() {
         pager.show_initial(ShellPage::Workbench);
     }
@@ -803,6 +807,14 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
     pager.on_back({
         let host = host.clone();
         move || match pager.page_untracked() {
+            ShellPage::Workbench
+                if tab.get_untracked() == WorkbenchTab::Terminal
+                    && terminal_find.get_untracked() =>
+            {
+                terminal_find.set(false);
+                dismiss_keyboard();
+                true
+            }
             ShellPage::Workbench => tab.get_untracked().back(&host),
             ShellPage::Home if host.find_open.get_untracked() => {
                 (host.on_toggle_find)();
@@ -877,7 +889,10 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
                     pager,
                     shell(host, pager, tab),
                     drawer(drawer_host, pager),
-                    move || workbench::workbench(pager, tab, rail_host.clone()).into_element(),
+                    move || {
+                        workbench::workbench(pager, tab, terminal_find, rail_host.clone())
+                            .into_element()
+                    },
                 )),
         )
         .child(when(
@@ -886,7 +901,11 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         ))
 }
 
-fn workbench_surfaces(host: SessionHost, tab: Signal<WorkbenchTab>) -> impl IntoElement {
+fn workbench_surfaces(
+    host: SessionHost,
+    tab: Signal<WorkbenchTab>,
+    terminal_find: Signal<bool>,
+) -> impl IntoElement {
     let terminal = crate::screens::terminal::TerminalHost {
         session_terminal: active_session(&host),
         title: host.terminal_title,
@@ -899,6 +918,7 @@ fn workbench_surfaces(host: SessionHost, tab: Signal<WorkbenchTab>) -> impl Into
         active: host.terminal_id,
         busy: host.terminal_busy,
         output_revision: host.terminal_output_revision,
+        find_open: terminal_find,
         on_retry: host.on_retry_terminal.clone(),
         on_kill: host.on_kill_terminal.clone(),
         on_select_terminal: host.on_select_terminal.clone(),
@@ -3026,6 +3046,7 @@ fn composer(
     let runtime_reasoning = host.runtime_reasoning;
     let runtime_modes = host.runtime_modes;
     let runtime_features = host.runtime_features;
+    let runtime_busy = host.runtime_busy;
     let token_usage = host.token_usage;
     let show_token_usage = host.show_token_usage;
     let show_plan_goal = host.show_plan_goal;
@@ -3269,7 +3290,13 @@ fn composer(
                     .min_h(px(theme::TOUCH_TARGET))
                     .max_h(px(120.0))
                     .pl(px(0.0))
-                    .pr(px(theme::TOUCH_TARGET))
+                    .pr(move || {
+                        px(if active.with(Option::is_some) && !editing.get() {
+                            theme::TOUCH_TARGET
+                        } else {
+                            0.0
+                        })
+                    })
                     .text_size(px(theme::font_composer())),
                 )
                 .child(when(
@@ -3280,7 +3307,10 @@ fn composer(
                             action::icon_button(
                                 icon!("clock"),
                                 copy::text("Schedule message", "定时发送", "定時傳送"),
-                                move || open(),
+                                move || {
+                                    dismiss_keyboard();
+                                    open();
+                                },
                             )
                             .absolute()
                             .top(px(theme::SPACING_XS))
@@ -3292,9 +3322,9 @@ fn composer(
                 ))
                 .child(
                     view()
+                        .h(px(theme::TOUCH_TARGET))
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACING_XS))
                         .child(
                             action::icon_button(
                                 icon!("plus"),
@@ -3304,7 +3334,8 @@ fn composer(
                                     attach_open.set(true);
                                 },
                             )
-                            .size(px(theme::COMPOSER_OPTION_SIZE))
+                            .size(px(theme::TOUCH_TARGET))
+                            .ml(px(-theme::SPACING_MD))
                             .flex_shrink_0()
                             .disabled(move || sending.get() || active.with(Option::is_none))
                             .disabled_style(|style| style.opacity(0.38)),
@@ -3314,9 +3345,12 @@ fn composer(
                             runtime_reasoning,
                             runtime_modes,
                             runtime_features,
-                            token_usage,
-                            show_token_usage,
+                            move || sending.get() || runtime_busy.get(),
                             on_open_runtime,
+                        ))
+                        .child(when(
+                            move || show_token_usage.get(),
+                            move || token_chip(token_usage),
                         ))
                         .child(dynamic(move || {
                             let stop = running.get() && !has_content.get();
@@ -3370,6 +3404,7 @@ fn composer(
                                         .size(px(theme::ICON_MD))
                                         .text_color(theme::action_primary_label),
                                 )
+                                .ml(px(theme::SPACING_XS))
                         })),
                 ),
         )
@@ -3393,38 +3428,86 @@ fn composer_attachments_sheet(
     camera: Action,
     file: Action,
 ) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_entry, sheet_header};
-    let title = copy::text("Attachments", "附件", "附件");
+    use crate::ui::sheet::{bottom_sheet, sheet_header};
+    let title = copy::text("Attach", "添加附件", "新增附件");
     bottom_sheet(
         move || open.get(),
         move || open.set(false),
         view()
             .child(sheet_header(title, move || open.set(false)))
             .child(
-                sheet_body().children(
+                view().pb_safe_area_plus(px(theme::SPACING_SM)).children(
                     [
                         (
                             icon!("image"),
-                            copy::text("Attach a photo", "附加照片", "附加照片"),
+                            copy::text("Photo", "图片", "圖片"),
+                            copy::text(
+                                "Scaled down before it is sent",
+                                "发送前会先缩放",
+                                "傳送前會先縮放",
+                            ),
                             photo,
                         ),
                         (
-                            icon!("circle-plus"),
-                            copy::text("Take a photo", "拍照", "拍照"),
+                            icon!("file-video-camera"),
+                            copy::text("Camera", "拍照", "拍照"),
+                            copy::text("Take a photograph now", "现在拍一张照片", "現在拍一張照片"),
                             camera,
                         ),
                         (
-                            icon!("paperclip"),
-                            copy::text("Choose a file", "选择文件", "選擇檔案"),
+                            icon!("file-plus"),
+                            copy::text("File", "文件", "檔案"),
+                            copy::text(
+                                "Sent as it is, up to 8 MB",
+                                "原样发送，最大 8 MB",
+                                "原樣傳送，最大 8 MB",
+                            ),
                             file,
                         ),
                     ]
-                    .map(|(glyph, label, action)| {
-                        sheet_entry(glyph, label, false, move || {
-                            open.set(false);
-                            action();
-                        })
-                        .accessibility_label(label)
+                    .map(|(glyph, label, detail, action)| {
+                        button()
+                            .w_full()
+                            .px(px(theme::SPACING_LG))
+                            .py(px(theme::SPACING_SM))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_MD))
+                            .accessibility_label(label)
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .on_press(move || {
+                                open.set(false);
+                                action();
+                            })
+                            .child(
+                                view()
+                                    .size(px(theme::TOUCH_TARGET))
+                                    .flex_shrink_0()
+                                    .rounded_full()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(theme::background_dim)
+                                    .child(
+                                        svg(glyph)
+                                            .size(px(theme::ICON_SM))
+                                            .text_color(theme::text_secondary),
+                                    ),
+                            )
+                            .child(
+                                view()
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .child(
+                                        text(label)
+                                            .text_size(px(theme::font_body()))
+                                            .text_color(theme::foreground),
+                                    )
+                                    .child(
+                                        text(detail)
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_muted),
+                                    ),
+                            )
                     }),
                 ),
             ),
@@ -3844,7 +3927,7 @@ enum RuntimePanel {
 impl RuntimePanel {
     fn title(self) -> &'static str {
         match self {
-            Self::Model => copy::text("Agent and model", "Agent 与模型", "Agent 與模型"),
+            Self::Model => copy::text("Agent settings", "Agent 设置", "Agent 設定"),
             Self::Reasoning => copy::text("Reasoning", "推理", "推理"),
             Self::Mode => copy::text("Mode", "模式", "模式"),
             Self::Options => copy::text("Session options", "会话选项", "工作階段選項"),
@@ -3857,8 +3940,7 @@ fn runtime_chip_row(
     reasoning: Signal<Vec<RuntimeChoiceView>>,
     modes: Signal<Vec<RuntimeChoiceView>>,
     features: Signal<Vec<RuntimeFeatureView>>,
-    token_usage: Signal<Option<TokenUsageView>>,
-    show_token: Signal<bool>,
+    busy: impl Fn() -> bool + Copy + 'static,
     on_open: Rc<dyn Fn(RuntimePanel)>,
 ) -> impl IntoElement {
     view()
@@ -3873,16 +3955,18 @@ fn runtime_chip_row(
                 .on_press(move || on_open(RuntimePanel::Model))
                 .flex_1()
                 .min_w(px(0.0))
-                .min_h(px(28.0))
+                .h(px(theme::TOUCH_TARGET))
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_XS))
                 .rounded(px(theme::RADIUS_CONTROL))
-                .px(px(theme::SPACING_SM))
+                .px(px(theme::SPACING_XS))
                 .active(|style| style.opacity(0.8))
+                .disabled(busy)
+                .disabled_style(|style| style.opacity(0.42))
                 .child(
                     svg(icon!("sparkles"))
-                        .size(px(theme::ICON_SM))
+                        .size(px(theme::ICON_MD))
                         .flex_shrink_0()
                         .text_color(theme::text_muted),
                 )
@@ -3895,17 +3979,18 @@ fn runtime_chip_row(
                                 .unwrap_or_else(|| copy::text("Model", "模型", "模型").to_owned())
                         })
                     })
-                    .flex_1()
                     .min_w(px(0.0))
                     .truncate()
                     .text_size(px(theme::font_caption()))
-                    .text_color(theme::text_secondary),
-                )
-                .child(
-                    svg(icon!("chevron-down"))
-                        .size(px(12.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted),
+                    .text_color(move || {
+                        if summary.with(|summary| {
+                            summary.as_ref().is_some_and(|summary| !summary.available)
+                        }) {
+                            theme::color_token("warning")
+                        } else {
+                            theme::text_secondary()
+                        }
+                    }),
                 )
         })
         .child(when(
@@ -3917,6 +4002,14 @@ fn runtime_chip_row(
                     composer_option(
                         icon!("brain"),
                         copy::text("Reasoning", "推理", "推理"),
+                        move || {
+                            summary.with(|summary| {
+                                summary
+                                    .as_ref()
+                                    .is_some_and(|summary| summary.reasoning_set)
+                            })
+                        },
+                        busy,
                         Rc::new(move || on_open(RuntimePanel::Reasoning)),
                     )
                 }
@@ -3929,6 +4022,12 @@ fn runtime_chip_row(
                 composer_option(
                     icon!("shield-alert"),
                     copy::text("Mode", "模式", "模式"),
+                    move || {
+                        summary.with(|summary| {
+                            summary.as_ref().is_some_and(|summary| summary.mode_set)
+                        })
+                    },
+                    busy,
                     Rc::new(move || on_open(RuntimePanel::Mode)),
                 )
             }
@@ -3942,60 +4041,74 @@ fn runtime_chip_row(
                     composer_option(
                         icon!("sliders-horizontal"),
                         copy::text("Session options", "会话选项", "工作階段選項"),
+                        move || {
+                            summary.with(|summary| {
+                                summary.as_ref().is_some_and(|summary| summary.options_set)
+                            })
+                        },
+                        busy,
                         Rc::new(move || on_open(RuntimePanel::Options)),
                     )
                 }
             },
         ))
-        .child(when(
-            move || show_token.get() && token_usage.get().is_some(),
-            move || token_chip(token_usage),
-        ))
 }
 
 fn token_chip(usage: Signal<Option<TokenUsageView>>) -> impl IntoElement {
+    let label = copy::text("Token usage", "Token 使用情况", "Token 使用情況");
     button()
+        .accessibility_label(label)
         .on_press(move || {
             let usage = usage.get_untracked();
+            dismiss_keyboard();
             spawn(async move {
                 let body = token_usage_detail(usage.as_ref());
                 let _ = nsh_base::alert_dialog()
-                    .title(copy::text(
-                        "Token usage",
-                        "Token 使用情况",
-                        "Token 使用情況",
-                    ))
+                    .title(label)
                     .description(body)
                     .show()
                     .await;
             });
         })
-        .min_h(px(28.0))
-        .px(px(theme::SPACING_SM))
+        .size(px(theme::COMPOSER_OPTION_SIZE))
+        .flex_shrink_0()
         .items_center()
         .justify_center()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_dim)
-        .active(|style| style.opacity(0.8))
+        .rounded_full()
+        .active(|style| style.bg(theme::row_pressed_bg()))
         .child(
-            text(move || match usage.get() {
-                Some(usage) => usage
-                    .percent
-                    .map(|percent| format!("{percent}%"))
-                    .unwrap_or_else(|| compact_tokens(usage.input + usage.output)),
-                None => "–".to_owned(),
-            })
-            .text_size(px(theme::font_micro()))
-            .text_color(move || match usage.get() {
-                Some(usage) => match usage.percent {
-                    Some(percent) if percent > 90 => theme::accent_red(),
-                    Some(percent) if percent >= 70 => theme::color_token("warning"),
+            canvas(move || {
+                use std::f32::consts::{FRAC_PI_2, TAU};
+                let percent = usage
+                    .with(|usage| usage.as_ref().and_then(|usage| usage.percent))
+                    .unwrap_or(0)
+                    .min(100);
+                let color = match percent {
+                    91.. => theme::accent_red(),
+                    70..=90 => theme::color_token("warning"),
                     _ => theme::text_muted(),
-                },
-                None => theme::text_muted(),
-            }),
+                };
+                let ring = Painter::new()
+                    .line_width(2.0)
+                    .stroke_color(theme::text_muted().opacity(0.3))
+                    .arc(10.0, 10.0, 8.0, 0.0, TAU)
+                    .stroke();
+                if percent == 0 {
+                    ring
+                } else {
+                    ring.begin_path()
+                        .stroke_color(color)
+                        .arc(
+                            10.0,
+                            10.0,
+                            8.0,
+                            -FRAC_PI_2,
+                            TAU * f32::from(percent) / 100.0 - FRAC_PI_2,
+                        )
+                        .stroke()
+                }
+            })
+            .size(px(20.0)),
         )
 }
 
@@ -4036,10 +4149,31 @@ fn compact_tokens(tokens: u64) -> String {
     }
 }
 
-fn composer_option(icon: ImageSrc, label: &'static str, on_press: Action) -> ButtonElement {
-    action::icon_button(icon, label, move || on_press())
+fn composer_option(
+    icon: ImageSrc,
+    label: &'static str,
+    selected: impl Fn() -> bool + 'static,
+    busy: impl Fn() -> bool + 'static,
+    on_press: Action,
+) -> ButtonElement {
+    button()
         .size(px(theme::COMPOSER_OPTION_SIZE))
         .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .accessibility_label(label)
+        .on_press(move || on_press())
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled(busy)
+        .disabled_style(|style| style.opacity(0.42))
+        .child(svg(icon).size(px(theme::ICON_MD)).text_color(move || {
+            if selected() {
+                theme::foreground()
+            } else {
+                theme::text_secondary()
+            }
+        }))
 }
 
 /// The prompts already sent, one tap from the composer.
@@ -4168,28 +4302,57 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
     let open = host.runtime_open;
     let close = host.on_close_runtime;
     let query = signal(String::new());
+    let agent = signal(None::<String>);
     let options = host.runtime_options;
     let busy = host.runtime_busy;
     effect(move || {
         if !open.get() {
             query.set(String::new());
+            agent.set(None);
         }
     });
+    let agents = computed(move || {
+        options.with(|options| {
+            let mut seen = std::collections::HashSet::new();
+            options
+                .iter()
+                .filter(|option| seen.insert(&option.agent_id))
+                .map(|option| (option.agent_id.clone(), option.agent.clone()))
+                .collect::<Vec<_>>()
+        })
+    });
+    let active_agent = computed(move || {
+        agent.get().or_else(|| {
+            options.with(|options| {
+                options
+                    .iter()
+                    .find(|option| option.selected)
+                    .or_else(|| options.iter().find(|option| option.available))
+                    .or_else(|| options.first())
+                    .map(|option| option.agent_id.clone())
+            })
+        })
+    });
     let filtered = computed(move || {
-        let query = query.get().trim().to_lowercase();
+        let search = query.get().trim().to_lowercase();
+        let agent = active_agent.get();
         options.with(|options| {
             options
                 .iter()
                 .filter(|option| {
-                    query.is_empty()
-                        || [&option.agent, &option.model, &option.detail]
-                            .iter()
-                            .any(|text| text.to_lowercase().contains(&query))
+                    agent.as_ref() == Some(&option.agent_id)
+                        && (search.is_empty()
+                            || [&option.model, &option.detail]
+                                .iter()
+                                .any(|text| text.to_lowercase().contains(&search)))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
         })
     });
+    let finish_reasoning = close.clone();
+    let finish_mode = close.clone();
+    let finish_options = close.clone();
     bottom_sheet(
         move || open.get(),
         {
@@ -4211,16 +4374,71 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 move || panel.get() == RuntimePanel::Model,
                 move || {
                     view()
-                        .px(px(theme::SPACING_MD))
-                        .pt(px(theme::SPACING_SM))
-                        .child(field::text_field(
-                            query,
-                            copy::text(
-                                "Search agents and models",
-                                "搜索 Agent 和模型",
-                                "搜尋 Agent 和模型",
+                        .child(
+                            scroll().horizontal().scrollbar(false).w_full().child(
+                                view()
+                                    .flex_row()
+                                    .px(px(theme::SPACING_SM))
+                                    .gap(px(theme::SPACING_XS))
+                                    .border_b_1()
+                                    .border_color(theme::border_subtle)
+                                    .child(each(
+                                        move || agents.get(),
+                                        |row| row.0.clone(),
+                                        move |row, _| {
+                                            button()
+                                                .size(px(theme::TOUCH_TARGET))
+                                                .flex_shrink_0()
+                                                .items_center()
+                                                .justify_center()
+                                                .accessibility_label(move || {
+                                                    row.with(|row| {
+                                                        SharedString::from(row.1.clone())
+                                                    })
+                                                })
+                                                .style_when(
+                                                    move || {
+                                                        active_agent.with(|id| {
+                                                            row.with(|row| {
+                                                                id.as_ref() == Some(&row.0)
+                                                            })
+                                                        })
+                                                    },
+                                                    |style| {
+                                                        style
+                                                            .border_b_1()
+                                                            .border_color(theme::accent_blue)
+                                                    },
+                                                )
+                                                .on_press(move || {
+                                                    agent.set(Some(
+                                                        row.with_untracked(|row| row.0.clone()),
+                                                    ))
+                                                })
+                                                .child(dynamic(move || {
+                                                    svg(icon(agent_icon(
+                                                        &row.with(|row| row.0.clone()),
+                                                    )))
+                                                    .size(px(theme::ICON_MD))
+                                                    .text_color(theme::text_secondary)
+                                                }))
+                                        },
+                                    )),
                             ),
-                        ))
+                        )
+                        .child(
+                            view()
+                                .px(px(theme::SPACING_MD))
+                                .pt(px(theme::SPACING_SM))
+                                .child(
+                                    field::text_field_flat(
+                                        query,
+                                        copy::text("Search models", "搜索模型", "搜尋模型"),
+                                    )
+                                    .rounded(px(theme::RADIUS_CONTROL))
+                                    .bg(theme::background_dim),
+                                ),
+                        )
                 },
             ))
             .child(
@@ -4262,12 +4480,7 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                 .disabled_style(|style| style.opacity(0.45))
                                                 .child(
                                                     text(move || {
-                                                        option.with(|option| {
-                                                            format!(
-                                                                "{} · {}",
-                                                                option.agent, option.model
-                                                            )
-                                                        })
+                                                        option.with(|option| option.model.clone())
                                                     })
                                                     .w_full()
                                                     .truncate()
@@ -4309,9 +4522,10 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || panel.get() == RuntimePanel::Reasoning,
                             move || {
                                 choice_section(
-                                    RuntimePanel::Reasoning.title(),
                                     host.runtime_reasoning,
+                                    busy,
                                     host.on_choose_reasoning.clone(),
+                                    finish_reasoning.clone(),
                                 )
                             },
                         ))
@@ -4319,9 +4533,10 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || panel.get() == RuntimePanel::Mode,
                             move || {
                                 choice_section(
-                                    RuntimePanel::Mode.title(),
                                     host.runtime_modes,
+                                    busy,
                                     host.on_choose_mode.clone(),
+                                    finish_mode.clone(),
                                 )
                             },
                         ))
@@ -4330,7 +4545,9 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || {
                                 feature_section(
                                     host.runtime_features,
+                                    busy,
                                     host.on_choose_feature.clone(),
+                                    finish_options.clone(),
                                 )
                             },
                         )),
@@ -4347,56 +4564,41 @@ fn section_label(label: &'static str) -> impl IntoElement {
 }
 
 fn choice_section(
-    label: &'static str,
     choices: Signal<Vec<RuntimeChoiceView>>,
+    busy: Signal<bool>,
     on_choose: Rc<dyn Fn(&str)>,
+    close: Action,
 ) -> impl IntoElement {
     view()
         .w_full()
-        .flex_col()
-        .gap(px(theme::SPACING_XS))
-        .child(when(move || !choices.with(|choices| choices.is_empty()), {
-            move || {
-                view()
-                    .w_full()
-                    .flex_col()
-                    .gap(px(theme::SPACING_XS))
-                    .child(section_label(label))
-            }
-        }))
+        .flex_row()
+        .flex_wrap()
+        .gap(px(theme::SPACING_SM))
         .child(each(
             move || choices.get(),
             |choice| choice.value.clone(),
             move |choice, _| {
                 let value = choice.with(|choice| choice.value.clone());
                 let on_choose = on_choose.clone();
-                button()
-                    .on_press(move || on_choose(&value))
-                    .w_full()
-                    .min_h(px(40.0))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(move || {
-                        if choice.with(|choice| choice.selected) {
-                            theme::foreground()
-                        } else {
-                            theme::border_subtle()
-                        }
-                    })
-                    .px(px(theme::SPACING_MD))
-                    .items_center()
-                    .child(
-                        text(move || choice.with(|choice| choice.label.clone()))
-                            .text_size(px(theme::font_detail()))
-                            .text_color(theme::foreground),
-                    )
+                let close = close.clone();
+                runtime_choice_chip(
+                    move || choice.with(|choice| choice.label.clone()),
+                    move || choice.with(|choice| choice.selected),
+                    busy,
+                    move || {
+                        on_choose(&value);
+                        close();
+                    },
+                )
             },
         ))
 }
 
 fn feature_section(
     features: Signal<Vec<RuntimeFeatureView>>,
+    busy: Signal<bool>,
     on_choose: ChooseFeature,
+    close: Action,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -4410,81 +4612,110 @@ fn feature_section(
             move || features.get(),
             |feature| feature.id.clone(),
             move |feature, _| {
-                let id = feature.with(|feature| feature.id.clone());
-                let toggle = feature.with(|feature| feature.toggle);
                 let on_choose = on_choose.clone();
-                if toggle {
-                    let next = if feature.with(|feature| feature.selected) {
-                        "false"
-                    } else {
-                        "true"
-                    };
-                    button()
-                        .on_press(move || on_choose(&id, next))
-                        .w_full()
-                        .min_h(px(40.0))
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .border_1()
-                        .border_color(theme::border_subtle)
-                        .px(px(theme::SPACING_MD))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .child(
-                            text(move || feature.with(|feature| feature.label.clone()))
-                                .flex_1()
-                                .truncate()
-                                .text_size(px(theme::font_detail()))
-                                .text_color(theme::foreground),
-                        )
-                        .child(
-                            text(move || {
-                                if feature.with(|feature| feature.selected) {
-                                    copy::text("On", "开", "開")
-                                } else {
-                                    copy::text("Off", "关", "關")
-                                }
-                            })
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted),
-                        )
-                        .into_element()
-                } else {
-                    let values = feature.with(|feature| feature.values.clone());
-                    view()
-                        .w_full()
-                        .flex_col()
-                        .gap(px(theme::SPACING_XS))
-                        .child(
-                            text(move || feature.with(|feature| feature.label.clone()))
+                let close = close.clone();
+                view()
+                    .w_full()
+                    .gap(px(theme::SPACING_XS))
+                    .pb(px(theme::SPACING_SM))
+                    .child(
+                        text(move || feature.with(|feature| feature.label.clone()))
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::text_secondary),
+                    )
+                    .child(when(
+                        move || feature.with(|feature| !feature.detail.is_empty()),
+                        move || {
+                            text(move || feature.with(|feature| feature.detail.clone()))
                                 .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
-                        )
-                        .children(values.into_iter().map({
-                            let on_choose = on_choose.clone();
-                            move |value| {
-                                let id = id.clone();
-                                let choice = value.value.clone();
+                                .text_color(theme::text_muted)
+                        },
+                    ))
+                    .child(dynamic(move || {
+                        let snapshot = feature.get();
+                        let mut choices =
+                            vec![(None, copy::text("Default", "默认", "預設").to_owned())];
+                        if snapshot.toggle {
+                            choices.extend([
+                                (
+                                    Some("true".to_owned()),
+                                    copy::text("On", "开", "開").to_owned(),
+                                ),
+                                (
+                                    Some("false".to_owned()),
+                                    copy::text("Off", "关", "關").to_owned(),
+                                ),
+                            ]);
+                        } else {
+                            choices.extend(
+                                snapshot
+                                    .values
+                                    .into_iter()
+                                    .map(|value| (Some(value.value), value.label)),
+                            );
+                        }
+                        view()
+                            .flex_row()
+                            .flex_wrap()
+                            .gap(px(theme::SPACING_SM))
+                            .children(choices.into_iter().map(|(value, label)| {
+                                let selected = value == snapshot.explicit_value;
+                                let id = snapshot.id.clone();
                                 let on_choose = on_choose.clone();
-                                button()
-                                    .on_press(move || on_choose(&id, &choice))
-                                    .w_full()
-                                    .min_h(px(36.0))
-                                    .px(px(theme::SPACING_MD))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::background_dim)
-                                    .items_center()
-                                    .child(
-                                        text(value.label)
-                                            .text_size(px(theme::font_detail()))
-                                            .text_color(theme::text_secondary),
-                                    )
-                            }
-                        }))
-                        .into_element()
-                }
+                                let close = close.clone();
+                                runtime_choice_chip(
+                                    move || label.clone(),
+                                    move || selected,
+                                    busy,
+                                    move || {
+                                        on_choose(&id, value.as_deref());
+                                        close();
+                                    },
+                                )
+                            }))
+                    }))
             },
         ))
+}
+
+fn runtime_choice_chip(
+    label: impl Fn() -> String + 'static,
+    selected: impl Fn() -> bool + Copy + 'static,
+    busy: Signal<bool>,
+    on_choose: impl Fn() + 'static,
+) -> ButtonElement {
+    button()
+        .h(px(theme::TOUCH_TARGET))
+        .min_w(px(0.0))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .border_1()
+        .border_color(move || {
+            if selected() {
+                theme::accent_blue()
+            } else {
+                theme::border_default()
+            }
+        })
+        .bg(move || {
+            if selected() {
+                theme::background_card()
+            } else {
+                theme::background_dim()
+            }
+        })
+        .px(px(theme::SPACING_MD))
+        .items_center()
+        .justify_center()
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled(move || busy.get())
+        .disabled_style(|style| style.opacity(0.42))
+        .on_press(on_choose)
+        .child(
+            text(label)
+                .truncate()
+                .text_size(px(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
 }
 
 /// The pending attachments, each removable.

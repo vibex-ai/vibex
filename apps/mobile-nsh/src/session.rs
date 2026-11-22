@@ -1078,7 +1078,7 @@ impl SessionService {
             },
             on_choose_feature: {
                 let service = self.clone();
-                Rc::new(move |id: &str, value: &str| service.choose_feature(id, value))
+                Rc::new(move |id: &str, value: Option<&str>| service.choose_feature(id, value))
             },
             on_toggle_turn: {
                 let service = self.clone();
@@ -2087,10 +2087,13 @@ impl SessionService {
         selection: &SessionRuntimeSelection,
         catalog: &SessionRuntimeOptionCatalog,
     ) {
-        let option = catalog
-            .options
-            .iter()
-            .find(|option| &option.selection == selection);
+        let matches_model = |option: &SessionRuntimeOption| {
+            let candidate = &option.selection;
+            candidate.agent_id == selection.agent_id
+                && candidate.auth_source == selection.auth_source
+                && candidate.model == selection.model
+        };
+        let option = catalog.options.iter().find(|option| matches_model(option));
         let model = match &selection.model {
             RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
             _ => copy::text("Default", "默认", "預設").to_owned(),
@@ -2137,6 +2140,8 @@ impl SessionService {
             reasoning: reasoning_label,
             mode: mode_label,
             options_set: !selection.config_values.is_empty(),
+            reasoning_set: selection.reasoning_effort.is_some(),
+            mode_set: selection.mode_id.is_some(),
             available: option
                 .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available),
         }));
@@ -2147,10 +2152,11 @@ impl SessionService {
                 .enumerate()
                 .map(|(index, option)| RuntimeOptionView {
                     id: index.to_string(),
+                    agent_id: option.selection.agent_id.as_str().to_owned(),
                     agent: option.agent_label.clone(),
                     model: option.model_label.clone(),
                     detail: option.auth_source_label.clone(),
-                    selected: &option.selection == selection,
+                    selected: matches_model(option),
                     available: option.availability == RuntimeOptionAvailability::Available,
                 })
                 .collect(),
@@ -2205,6 +2211,7 @@ impl SessionService {
                 option
                     .features
                     .iter()
+                    .filter(|feature| feature.kind != SessionRuntimeFeatureKind::String)
                     .map(|feature| {
                         let current = selection
                             .config_values
@@ -2227,8 +2234,7 @@ impl SessionService {
                             label: feature.label.clone(),
                             detail: feature.description.clone().unwrap_or_default(),
                             toggle: feature.kind == SessionRuntimeFeatureKind::Toggle,
-                            selected: feature.kind == SessionRuntimeFeatureKind::Toggle
-                                && current.as_deref() == Some("true"),
+                            explicit_value: selection.config_values.get(&feature.id).cloned(),
                             values: feature
                                 .values
                                 .iter()
@@ -2257,6 +2263,13 @@ impl SessionService {
         let Some(option) = catalog.and_then(|catalog| catalog.options.get(index).cloned()) else {
             return;
         };
+        if let Some(current) = self.current_selection()
+            && current.agent_id == option.selection.agent_id
+            && current.auth_source == option.selection.auth_source
+            && current.model == option.selection.model
+        {
+            return;
+        }
         self.apply_selection(option.selection);
     }
 
@@ -2276,13 +2289,17 @@ impl SessionService {
         self.apply_selection(selection);
     }
 
-    fn choose_feature(&self, id: &str, value: &str) {
+    fn choose_feature(&self, id: &str, value: Option<&str>) {
         let Some(mut selection) = self.current_selection() else {
             return;
         };
-        selection
-            .config_values
-            .insert(id.to_owned(), value.to_owned());
+        if let Some(value) = value {
+            selection
+                .config_values
+                .insert(id.to_owned(), value.to_owned());
+        } else {
+            selection.config_values.remove(id);
+        }
         self.apply_selection(selection);
     }
 
@@ -2534,12 +2551,13 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
+            let requested = session_id.clone();
             let result = crate::runtime::handle()
                 .spawn(async move {
                     backend
                         .set_desired_runtime(MutationRequest::new(
                             SetDesiredAgentSessionRuntimeRequest {
-                                session_id: session_id.clone(),
+                                session_id: requested,
                                 idempotency_key: RequestId::new().into_string(),
                                 expected_revision: state.session_revision,
                                 expected_selection_revision: state.selection_revision,
@@ -2550,6 +2568,11 @@ impl SessionService {
                         .await
                 })
                 .await;
+            if !service.alive.get()
+                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            {
+                return;
+            }
             service.runtime_busy.set(false);
             match result {
                 Ok(Ok(state)) => {

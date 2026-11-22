@@ -327,11 +327,14 @@ fn RuntimeShell() -> impl IntoElement {
         reasoning: "High".to_owned(),
         mode: "Default".to_owned(),
         options_set: false,
+        reasoning_set: true,
+        mode_set: false,
         available: true,
     }));
     host.runtime_options = signal(vec![
         RuntimeOptionView {
             id: "0".to_owned(),
+            agent_id: "claude".to_owned(),
             agent: "Claude".to_owned(),
             model: "Claude 4".to_owned(),
             detail: "Pro".to_owned(),
@@ -340,6 +343,7 @@ fn RuntimeShell() -> impl IntoElement {
         },
         RuntimeOptionView {
             id: "1".to_owned(),
+            agent_id: "codex".to_owned(),
             agent: "Codex".to_owned(),
             model: "GPT-5".to_owned(),
             detail: "Team".to_owned(),
@@ -1287,7 +1291,7 @@ fn the_composer_opens_the_runtime_choices() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Claude 4").unwrap();
-    app.wait_for("42%").unwrap();
+    app.wait_for("role:button[Token usage]").unwrap();
     assert!(app.screen().shows("Ship P1"));
     assert!(app.screen().shows("Continue"));
     assert!(app.screen().shows("Current plan"));
@@ -1298,14 +1302,34 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("↑"));
     assert!(app.screen().shows("↓"));
     app.press("Claude 4").unwrap();
-    app.wait_for("Agent and model").unwrap();
-    app.wait_for("Codex · GPT-5").unwrap();
+    app.wait_for("Agent settings").unwrap();
+    assert!(!app.screen().shows("GPT-5"));
+    app.press("role:button[Codex]").unwrap();
+    app.wait_for("GPT-5").unwrap();
     app.press("role:button[Close]").unwrap();
-    app.wait_for_gone("Codex · GPT-5", std::time::Duration::from_secs(3))
+    app.wait_for_gone("GPT-5", std::time::Duration::from_secs(3))
         .unwrap();
     app.press("role:button[Reasoning]").unwrap();
     app.wait_for("Default").unwrap();
-    assert!(!app.screen().shows("Codex · GPT-5"));
+    app.press("Default").unwrap();
+    app.wait_for_gone("Default", std::time::Duration::from_secs(3))
+        .unwrap();
+}
+
+#[test]
+fn the_attachment_sheet_explains_the_three_sources_and_keeps_the_draft() {
+    let mut app = start();
+    app.type_text(COMPOSER, "Keep this draft").unwrap();
+    app.press("role:button[Attach a file]").unwrap();
+    app.wait_for("role:button[Photo]").unwrap();
+    assert!(app.screen().shows("Scaled down before it is sent"));
+    app.wait_for("role:button[Camera]").unwrap();
+    assert!(app.screen().shows("Sent as it is, up to 8 MB"));
+    app.press("role:button[Close]").unwrap();
+    assert_eq!(
+        app.screen().input_text("text:Keep this draft").unwrap(),
+        Some("Keep this draft")
+    );
 }
 
 #[test]
@@ -1376,7 +1400,7 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
 fn a_photo_alone_can_be_sent() {
     let mut app = start();
     app.press("role:button[Attach a file]").unwrap();
-    app.press("role:button[Attach a photo]").unwrap();
+    app.press("role:button[Photo]").unwrap();
     app.press("role:button[Send]").unwrap();
     app.wait_for("sent an attachment").unwrap();
 }
@@ -1440,7 +1464,7 @@ fn a_group_opens_its_actions() {
     app.wait_for("Good morning").unwrap();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Pair").unwrap();
-    app.press("role:button[Folder actions]").unwrap();
+    app.press("role:button[Group actions]").unwrap();
     app.wait_for("Session group").unwrap();
     assert!(app.screen().shows("Pin group"));
     app.press("Members").unwrap();
@@ -1500,8 +1524,14 @@ fn the_drawer_selects_sessions_for_a_batch() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
+    app.wait_for("role:button[New session here]").unwrap();
     app.press("role:button[Select sessions]").unwrap();
     app.wait_for("Archive").unwrap();
+    app.wait_for_gone(
+        "role:button[New session here]",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("1 selected").unwrap();
     app.press("role:button[Select sessions]").unwrap();
@@ -1629,9 +1659,19 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
 /// the first frame, as the runtime's snapshot would.
 #[component]
 fn TerminalShell() -> impl IntoElement {
-    let host = host_with(None, None);
+    let mut host = host_with(None, None);
+    on_back_press(session::handle_back);
     host.terminal_open.set(true);
     let terminal_ref = host.terminal_ref;
+    host.on_terminal_data = Rc::new(move |data| {
+        if let Some(api) = terminal_ref.api::<TerminalApi>() {
+            let display = data
+                .replace('\r', "[return]")
+                .replace('\u{7f}', "[delete]")
+                .replace('\u{3}', "[ctrl-c]");
+            api.write(format!("\r\ninput: {display}"));
+        }
+    });
     set_timeout(std::time::Duration::from_millis(50), move || {
         if let Some(api) = terminal_ref.api::<TerminalApi>() {
             api.write("hello from the pty\n".to_owned());
@@ -1651,6 +1691,25 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     app.press("role:button[Find in terminal]").unwrap();
     app.type_text("text:Find in terminal", "hello").unwrap();
     app.wait_for("1 matches").unwrap();
+    app.back().unwrap();
+    app.wait_for_gone("1 matches", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.wait_for("role:button[Keyboard]").unwrap();
+}
+
+#[test]
+fn the_terminal_keyboard_sends_native_edits_and_return() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Keyboard]").unwrap();
+    app.press("role:button[Keyboard]").unwrap();
+    app.press_key("x").unwrap();
+    app.wait_for("text:input: x").unwrap();
+    app.press_key("backspace").unwrap();
+    app.wait_for("text:input: [delete]").unwrap();
+    app.press_key("enter").unwrap();
+    app.wait_for("text:input: [return]").unwrap();
 }
 
 #[test]
@@ -1823,7 +1882,7 @@ fn a_history_row_opens_the_commit_detail() {
 fn a_photo_can_be_attached_and_removed() {
     let mut app = start();
     app.press("role:button[Attach a file]").unwrap();
-    app.press("role:button[Attach a photo]").unwrap();
+    app.press("role:button[Photo]").unwrap();
     app.wait_for("photo.jpg").unwrap();
     app.press("photo.jpg").unwrap();
     app.wait_until(
@@ -2046,8 +2105,8 @@ fn workspace_tabs_keep_the_preview_and_the_conversation_draft() {
     app.wait_for("Hello").unwrap();
     app.press("role:button[Changes]").unwrap();
     app.wait_for("src/main.rs").unwrap();
-    app.wait_for("↓1").unwrap();
-    app.wait_for("↑2").unwrap();
+    app.wait_for("↓ 1").unwrap();
+    app.wait_for("↑ 2").unwrap();
     app.press("role:button[Files]").unwrap();
     app.wait_for("Hello").unwrap();
     app.back().unwrap();

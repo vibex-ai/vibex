@@ -227,6 +227,7 @@ fn row_item(
         SidebarRowKind::Project => copy::text("Project actions", "项目操作", "專案操作"),
         SidebarRowKind::Workspace => copy::text("Workspace actions", "工作区操作", "工作區操作"),
         SidebarRowKind::Session => copy::text("Session actions", "会话操作", "工作階段操作"),
+        SidebarRowKind::Group => copy::text("Group actions", "会话组操作", "工作階段群組操作"),
         _ => copy::text("Folder actions", "文件夹操作", "資料夾操作"),
     };
     let active = is_session && row.active;
@@ -416,23 +417,30 @@ fn row_item(
                         )
                         .child(row_metadata(&row, clock)),
                 )
-                .children(
-                    matches!(
-                        row.kind,
-                        SidebarRowKind::Project | SidebarRowKind::Workspace
-                    )
-                    .then(|| {
+                .child(when(
+                    move || {
+                        !state.select_mode.get()
+                            && matches!(
+                                row.kind,
+                                SidebarRowKind::Project | SidebarRowKind::Workspace
+                            )
+                    },
+                    {
                         let row = row.clone();
                         let create = actions.new_session.clone();
-                        crate::ui::action::icon_button(
-                            icon!("plus"),
-                            copy::text("New session here", "在此新建会话", "在此新增工作階段"),
-                            move || create(&row),
-                        )
-                        .size(px(theme::SIDEBAR_ACTION_WIDTH))
-                        .flex_shrink_0()
-                    }),
-                )
+                        move || {
+                            let row = row.clone();
+                            let create = create.clone();
+                            crate::ui::action::icon_button(
+                                icon!("plus"),
+                                copy::text("New session here", "在此新建会话", "在此新增工作階段"),
+                                move || create(&row),
+                            )
+                            .size(px(theme::SIDEBAR_ACTION_WIDTH))
+                            .flex_shrink_0()
+                        }
+                    },
+                ))
                 .child(when(
                     move || !is_empty && !state.select_mode.get(),
                     move || {
@@ -459,7 +467,7 @@ fn row_item(
                                 }
                             })
                             .child(
-                                svg(icon!("ellipsis"))
+                                svg(icon!("ellipsis-vertical"))
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::sidebar_text_muted),
                             )

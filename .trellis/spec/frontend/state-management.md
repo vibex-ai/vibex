@@ -37,6 +37,12 @@ Streaming presentation buffers:
   the renderer's executor. Deliver batches to the mounted emulator through a
   bounded channel, cancel the old stream on reattach, and forward the last
   measured grid size even if layout ran before the remote terminal was ready.
+- For NSH mobile terminal input, the fixed keyboard button focuses a native
+  input independent of the emulator grid. Convert committed edits to PTY bytes
+  (`DEL` for deletion and `CR` for Return); keep a one-character seed so
+  Backspace is observable even before any text is typed. Never forward the
+  seed or intermediate IME composition. In regression tests, press the
+  keyboard button and assert outgoing bytes, not just visible emulator output.
 
 Sidebar revisions are content hashes, not increasing counters. Clients may
 pass a displayed revision as a precondition for relative moves, but must not

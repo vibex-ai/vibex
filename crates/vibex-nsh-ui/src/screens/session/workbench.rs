@@ -57,6 +57,7 @@ impl WorkbenchTab {
 pub(super) fn workbench(
     pager: Pager,
     tab: Signal<WorkbenchTab>,
+    terminal_find: Signal<bool>,
     host: SessionHost,
 ) -> impl IntoElement {
     let branches = host.git_branches;
@@ -106,6 +107,7 @@ pub(super) fn workbench(
                         .min_w(px(0.0))
                         .flex_row()
                         .items_center()
+                        .overflow_hidden()
                         .gap(px(TAB_GAP))
                         .children(
                             [
@@ -151,7 +153,7 @@ pub(super) fn workbench(
                                         },
                                         move || {
                                             sync_badge(
-                                                format!("↓{}", counts.get().0),
+                                                format!("↓ {}", counts.get().0),
                                                 theme::accent_blue,
                                             )
                                         },
@@ -162,7 +164,7 @@ pub(super) fn workbench(
                                         },
                                         move || {
                                             sync_badge(
-                                                format!("↑{}", counts.get().1),
+                                                format!("↑ {}", counts.get().1),
                                                 theme::accent_success,
                                             )
                                         },
@@ -190,17 +192,24 @@ pub(super) fn workbench(
                 ))
             },
         ))
-        .child(workbench_surfaces(host, tab))
+        .child(workbench_surfaces(host, tab, terminal_find))
 }
 
 fn sync_badge(label: String, color: fn() -> Hsla) -> impl IntoElement {
-    text(label)
+    view()
+        .h(px(18.0))
+        .min_w(px(24.0))
         .flex_shrink_0()
-        .px(px(theme::SPACING_XS))
-        .rounded(px(4.0))
-        .bg(move || color().opacity(0.10))
-        .text_size(px(theme::font_hint()))
-        .text_color(color)
+        .items_center()
+        .justify_center()
+        .rounded(px(3.0))
+        .bg(move || color().opacity(0.12))
+        .child(
+            text(label)
+                .font_family("monospace")
+                .text_size(px(theme::font_micro()))
+                .text_color(color),
+        )
 }
 
 pub(super) fn tab_panel(
