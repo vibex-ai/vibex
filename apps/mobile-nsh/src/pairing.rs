@@ -1036,15 +1036,11 @@ impl PairingService {
 
     /// Probes every saved runtime once, at startup.
     fn probe_saved(&self) {
-        let active = self
-            .connected
-            .get_untracked()
-            .map(|connected| connected.bundle.host_id().to_owned());
+        // Probe every saved runtime, including the one this phone is on. The
+        // connected row used to be skipped, so stopping its desktop left the
+        // row green until the phone forgot the runtime.
         let bundles = self.bundles.borrow().clone();
         for bundle in bundles {
-            if active.as_deref() == Some(bundle.host_id()) {
-                continue;
-            }
             self.spawn_probe(bundle, false);
         }
     }
