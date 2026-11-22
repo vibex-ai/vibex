@@ -5436,26 +5436,12 @@ fn drawer_groups(
                 .copied()
                 .unwrap_or(sessions.len());
             let mut rows = Vec::new();
-            let mut current: Option<String> = None;
             for session in sessions {
                 let key = if session.workspace_id.trim().is_empty() {
                     session.workspace_label.clone()
                 } else {
                     session.workspace_id.clone()
                 };
-                let label = if session.workspace_label.trim().is_empty() {
-                    copy::text("Workspace", "工作区", "工作區").to_owned()
-                } else {
-                    session.workspace_label.clone()
-                };
-                if current.as_ref() != Some(&key) {
-                    rows.push(DrawerRow::Header {
-                        id: format!("{}:{key}", group.id),
-                        name: label,
-                        workspace: Some(key.clone()),
-                    });
-                    current = Some(key.clone());
-                }
                 if !collapsed_workspaces.iter().any(|id| id == &key) {
                     rows.push(DrawerRow::Session(session));
                 }
@@ -6157,7 +6143,6 @@ fn drawer_group(
                         )
                 }),
         )
-        .child((section_rows)(&group.get_untracked().id))
         .child(when(move || !closed.get() && !project_only.get(), {
             move || {
                 let on_select = on_select.clone();
@@ -6243,6 +6228,7 @@ fn drawer_group(
                 ))
             }
         }))
+        .child((section_rows)(&group.get_untracked().id))
 }
 
 #[allow(clippy::too_many_arguments)]
