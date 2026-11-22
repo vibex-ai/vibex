@@ -58,9 +58,9 @@ use vibex_core::{
 };
 use vibex_desktop_model::{
     FileIconKind, FileTreeLoadState, FileTreeProjection, GitPathSelectionState, GitQueryKind,
-    GitTreeRowKind, GitWorkbenchState, SidebarHierarchyMode, SidebarOrganizationView,
-    SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    TimelineConversationTurn, TimelineModel, TimelineRow,
+    GitTreeRowKind, GitWorkbenchState, ReasoningDisplayMode, SidebarHierarchyMode,
+    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
+    TimelineConversationTurn, TimelineModel, TimelineRow, TimelineRowKind,
 };
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
@@ -75,16 +75,21 @@ use vibex_nsh_ui::{
     },
     screens::new_session::{DirectoryEntry, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice},
     screens::session::{
-        AttachmentItem, CommandEntry, ComposerHistoryEntry, ConversationState, EntryKind,
-        GoalControl, GoalPhaseView, GoalView, PendingPermission, PendingQuestion, PermissionChoice,
-        PermissionOption, PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField,
-        QuestionFieldKind, QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView,
-        RuntimeFeatureView, RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState,
-        SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView,
-        SidebarTree, TimelineEntry, TokenUsageView,
+        ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
+        ComposerHistoryEntry, ConversationState, EntryKind, GoalControl, GoalPhaseView, GoalView,
+        PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
+        PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
+        QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
+        RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
+        SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView, SidebarTree,
+        TimelineEntry, TokenUsageView, TurnFileChange,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
+};
+use vibex_ui::{
+    timeline::{self as activity, Activity, ActivityKind, ActivitySummary},
+    tool_detail,
 };
 
 use crate::{pairing::error_text, sidebar};
@@ -278,7 +283,8 @@ pub struct SessionService {
     turn_disclosures: Rc<RefCell<BTreeMap<String, bool>>>,
     /// The rows whose full detail the reader opened, and the detail itself.
     expanded_rows: Rc<RefCell<std::collections::BTreeSet<String>>>,
-    row_details: Rc<RefCell<BTreeMap<String, String>>>,
+    row_details: Rc<RefCell<ActivityDetailsCache>>,
+    loading_row_details: Rc<RefCell<std::collections::BTreeSet<(String, i64)>>>,
     /// The open session's runtime selection and the runtime's catalogue.
     runtime_state: Rc<RefCell<Option<AgentSessionRuntimeSelectionState>>>,
     runtime_catalog: Signal<Option<SessionRuntimeOptionCatalog>>,
@@ -329,6 +335,8 @@ pub struct SessionService {
     /// Tells the pairing store what kind of runtime the peer reported.
     on_server_kind: Rc<dyn Fn(RemoteServerKind)>,
 }
+
+type ActivityDetailsCache = BTreeMap<String, (i64, Vec<ActivityDetail>)>;
 
 impl SessionService {
     /// Builds the service for a connected runtime and loads its sessions.
@@ -486,6 +494,7 @@ impl SessionService {
             turn_disclosures: Rc::new(RefCell::new(BTreeMap::new())),
             expanded_rows: Rc::new(RefCell::new(std::collections::BTreeSet::new())),
             row_details: Rc::new(RefCell::new(BTreeMap::new())),
+            loading_row_details: Rc::new(RefCell::new(Default::default())),
             runtime_state: Rc::new(RefCell::new(None)),
             runtime_catalog: signal(None),
             runtime_summary: signal(None),
@@ -1083,6 +1092,10 @@ impl SessionService {
             on_toggle_turn: {
                 let service = self.clone();
                 Rc::new(move |turn_id: &str| service.toggle_turn(turn_id))
+            },
+            on_reveal_row: {
+                let service = self.clone();
+                Rc::new(move |row_id: &str, detail| service.reveal_row(row_id, detail))
             },
             on_toggle_detail: {
                 let service = self.clone();
@@ -1865,6 +1878,10 @@ impl SessionService {
         self.terminal_choices.set(Vec::new());
         self.active.set(Some(session_id.as_str().to_owned()));
         *self.model.borrow_mut() = TimelineModel::default();
+        self.turn_disclosures.borrow_mut().clear();
+        self.expanded_rows.borrow_mut().clear();
+        self.row_details.borrow_mut().clear();
+        self.loading_row_details.borrow_mut().clear();
         self.conversation.set(ConversationState::Loading);
         self.timeline.set(Vec::new());
         self.has_older.set(false);
@@ -3114,45 +3131,123 @@ impl SessionService {
             .as_ref()
             .and_then(|active| self.session_states.borrow().get(active).copied());
         let model = self.model.borrow();
-        let turns = model.conversation_turns(state, state == Some(AgentSessionState::Running));
+        let turns = model.conversation_turns_with_reasoning_mode(
+            state,
+            state == Some(AgentSessionState::Running),
+            ReasoningDisplayMode::LatestAtBottom,
+        );
         let mut entries = Vec::new();
+        let show_reasoning = self.show_reasoning.get_untracked();
+        let locale = copy::language().locale();
+        let disclosures = self.turn_disclosures.borrow();
         for turn in &turns {
+            let finished = activity::turn_finished(turn);
+            let answered = turn
+                .conclusion_row
+                .as_ref()
+                .is_some_and(|row| !row.body.trim().is_empty());
             if let Some(row) = turn.user_row.as_ref() {
                 entries.push(self.entry_from_row(row, turn, &model.items));
             }
-            if !turn.process_rows.is_empty() {
-                let expanded = self
-                    .turn_disclosures
-                    .borrow()
-                    .get(&turn.id)
-                    .copied()
-                    .unwrap_or_else(|| {
-                        turn.conclusion_row.is_none() && (!turn.complete || turn.superseded)
-                    });
-                entries.push(process_header(turn, expanded));
-                if expanded {
-                    for row in &turn.process_rows {
-                        entries.push(self.entry_from_row(row, turn, &model.items));
-                    }
+            let mut parent = None;
+            if turn
+                .process_rows
+                .iter()
+                .any(|row| show_reasoning || row.kind != TimelineRowKind::Reasoning)
+            {
+                let mut header = process_header(turn);
+                header.expandable = answered && !turn.pending_permission;
+                header.expanded =
+                    !header.expandable || disclosures.get(&header.id).copied().unwrap_or(!finished);
+                parent = Some(header.id.clone());
+                entries.push(header);
+            }
+            let mut groups = turn
+                .process_activity_groups_with_commands_and_file_operations
+                .iter()
+                .peekable();
+            let mut group_parent = None::<(&str, usize)>;
+            let mut files = Vec::new();
+            for (index, row) in turn.process_rows.iter().enumerate() {
+                if group_parent.is_some_and(|(_, end)| index >= end) {
+                    group_parent = None;
                 }
+                if let Some(group) = groups.next_if(|group| group.start_row == index) {
+                    let rows = &turn.process_rows[group.start_row..group.end_row];
+                    let mut summary = ActivitySummary::default();
+                    for row in rows {
+                        summary.record(
+                            &Activity::project(row, row_payload(row, &model.items), locale),
+                            &row.id,
+                        );
+                    }
+                    let approval = rows.iter().any(|row| row.pending_permission);
+                    entries.push(TimelineEntry {
+                        id: group.id.clone(),
+                        kind: EntryKind::ActivityGroup,
+                        title: summary.label(locale),
+                        turn_id: turn.id.clone(),
+                        parent_id: parent.clone(),
+                        expandable: !approval,
+                        expanded: approval
+                            || activity::group_open(
+                                turn,
+                                group,
+                                disclosures.get(&group.id).copied(),
+                                false,
+                            ),
+                        streaming: rows.iter().any(|row| activity::is_running(row, !finished)),
+                        ..TimelineEntry::default()
+                    });
+                    group_parent = Some((&group.id, group.end_row));
+                }
+                if row.kind == TimelineRowKind::Reasoning && !show_reasoning {
+                    continue;
+                }
+                let mut entry = self.entry_from_row(row, turn, &model.items);
+                entry.parent_id = group_parent
+                    .map(|(id, _)| id.to_owned())
+                    .or_else(|| parent.clone());
+                if finished
+                    && let Some(change) = turn_file_change(row, row_payload(row, &model.items))
+                {
+                    files.push(change);
+                }
+                entries.push(entry);
             }
             if let Some(row) = turn.conclusion_row.as_ref() {
                 entries.push(self.entry_from_row(row, turn, &model.items));
-            } else if (!turn.complete || turn.superseded)
-                && self.show_generation_status.get_untracked()
-            {
-                entries.push(live_turn_entry(turn));
+            } else if !finished && !turn.pending_permission {
+                if let Some(thought) = turn
+                    .live_status
+                    .as_deref()
+                    .filter(|thought| !thought.trim().is_empty())
+                    && show_reasoning
+                {
+                    let id = format!("reasoning-live:{}", turn.id);
+                    entries.push(TimelineEntry {
+                        expanded: self.expanded_rows.borrow().contains(&id),
+                        id,
+                        kind: EntryKind::Reasoning,
+                        body: activity::reasoning_window_tail(thought).to_owned(),
+                        streaming: true,
+                        expandable: true,
+                        turn_id: turn.id.clone(),
+                        ..TimelineEntry::default()
+                    });
+                } else if self.show_generation_status.get_untracked() {
+                    entries.push(live_turn_entry(turn));
+                }
             }
-            let files = turn
-                .process_rows
-                .iter()
-                .filter(|row| row.kind == vibex_desktop_model::TimelineRowKind::FileOperation)
-                .map(|row| row.title.clone())
-                .collect::<Vec<_>>();
             if !files.is_empty() {
-                entries.push(changes_entry(turn, &files));
+                let mut seen = std::collections::BTreeSet::new();
+                files.reverse();
+                files.retain(|change| seen.insert(change.path.clone()));
+                files.reverse();
+                entries.push(changes_entry(turn, files));
             }
         }
+        drop(disclosures);
         let latest_ended_normally = turns
             .last()
             .is_some_and(|turn| turn.complete && !turn.failed && !turn.pending_permission);
@@ -3161,9 +3256,6 @@ impl SessionService {
         });
         let plan = plan_view(&model.items);
         let goal = goal_view(&model.items);
-        entries.retain(|entry| {
-            entry.kind != EntryKind::Reasoning || self.show_reasoning.get_untracked()
-        });
         let editable = turns
             .iter()
             .rev()
@@ -3198,56 +3290,121 @@ impl SessionService {
         turn: &TimelineConversationTurn,
         items: &[vibex_core::TimelineItem],
     ) -> TimelineEntry {
-        let expandable = matches!(
-            row.kind,
-            vibex_desktop_model::TimelineRowKind::ToolCall
-                | vibex_desktop_model::TimelineRowKind::Command
-                | vibex_desktop_model::TimelineRowKind::FileOperation
-                | vibex_desktop_model::TimelineRowKind::WebSearch
-                | vibex_desktop_model::TimelineRowKind::TodoUpdate
-        );
         let expanded = self.expanded_rows.borrow().contains(&row.id);
-        let body = if expanded {
-            self.row_details
-                .borrow()
-                .get(&row.id)
-                .cloned()
-                .unwrap_or_else(|| row.body.clone())
-        } else {
-            row.body.clone()
-        };
+        let kind = entry_kind(row.kind);
+        let item = row_item(row, items);
+        let payload = item.map(|item| &item.payload);
+        let shared = (kind == EntryKind::Tool)
+            .then(|| Activity::project(row, payload, copy::language().locale()));
+        let finished = activity::turn_finished(turn);
+        let detail_cached = self.row_details.borrow();
+        let details = detail_cached
+            .get(&row.id)
+            .filter(|(sequence, _)| *sequence == row.last_sequence);
+        let details_pending = details.is_none()
+            && item.is_some_and(|item| {
+                item.payload_depth == vibex_core::TimelinePayloadDepth::Summary
+            });
         TimelineEntry {
             id: row.id.clone(),
-            kind: entry_kind(row.kind),
-            title: row.title.clone(),
-            body,
-            meta: row_meta(row, items),
-            streaming: row.streaming,
+            kind,
+            title: shared.as_ref().map_or_else(
+                || row.title.clone(),
+                |activity| activity.action().to_owned(),
+            ),
+            body: row.body.clone(),
+            meta: row_meta(payload),
+            streaming: if shared.is_some() {
+                activity::is_running(row, !finished)
+            } else {
+                row.streaming && !finished
+            },
             turn_id: turn.id.clone(),
-            process_count: turn.process_rows.len(),
             expanded,
-            expandable,
-            attachments: row_attachments(row, items),
+            expandable: shared.is_some() || kind == EntryKind::Reasoning,
+            attachments: row_attachments(row, payload),
             last_sequence: row.last_sequence,
             started_at_ms: turn.started_at_ms,
             ended_at_ms: turn.ended_at_ms.unwrap_or(0),
-            complete: turn.complete,
+            complete: finished,
+            parent_id: None,
+            changed_files: Vec::new(),
+            activity: shared.map(|shared| ActivityView {
+                glyph: activity_glyph(shared.icon()),
+                target: shared.target().to_owned(),
+                path: shared.path().map(str::to_owned),
+                failed: shared.is_failed(),
+                error: shared.error_line().map(str::to_owned),
+                duration: activity::row_duration_ms(row, &shared, items)
+                    .map(activity::format_duration),
+                details_pending,
+                details_loading: self
+                    .loading_row_details
+                    .borrow()
+                    .contains(&(row.id.clone(), row.last_sequence)),
+                details: details
+                    .map(|(_, details)| details.clone())
+                    .unwrap_or_else(|| {
+                        if expanded {
+                            activity_details(row, payload)
+                        } else {
+                            Vec::new()
+                        }
+                    }),
+            }),
         }
     }
 
-    fn toggle_turn(&self, turn_id: &str) {
+    fn toggle_turn(&self, row_id: &str) {
         let Some(expanded) = self.timeline.with(|entries| {
             entries
                 .iter()
-                .find(|entry| entry.kind == EntryKind::ProcessHeader && entry.turn_id == turn_id)
+                .find(|entry| {
+                    entry.id == row_id
+                        && entry.expandable
+                        && matches!(
+                            entry.kind,
+                            EntryKind::ProcessHeader | EntryKind::ActivityGroup
+                        )
+                })
                 .map(|entry| entry.expanded)
         }) else {
             return;
         };
         self.turn_disclosures
             .borrow_mut()
-            .insert(turn_id.to_owned(), !expanded);
+            .insert(row_id.to_owned(), !expanded);
         self.publish();
+    }
+
+    fn reveal_row(&self, row_id: &str, detail: bool) {
+        let Some((parents, open_detail)) = self.timeline.with_untracked(|entries| {
+            let entry = entries.iter().find(|entry| entry.id == row_id)?;
+            let open_detail =
+                (detail && entry.expandable && !entry.expanded).then_some(entry.last_sequence);
+            let mut id = entry.parent_id.as_deref();
+            let mut parents = Vec::new();
+            while let Some(parent) = id.and_then(|id| entries.iter().find(|entry| entry.id == id)) {
+                if !parent.expanded {
+                    parents.push(parent.id.clone());
+                }
+                id = parent.parent_id.as_deref();
+            }
+            Some((parents, open_detail))
+        }) else {
+            return;
+        };
+        let open_parents = !parents.is_empty();
+        if open_parents {
+            self.turn_disclosures
+                .borrow_mut()
+                .extend(parents.into_iter().map(|id| (id, true)));
+        }
+        if let Some(sequence) = open_detail {
+            self.toggle_row_detail(row_id, sequence);
+        } else if open_parents {
+            self.publish();
+        }
     }
 
     /// Opens or closes one row's full detail, reading it on first open.
@@ -3260,7 +3417,16 @@ impl SessionService {
         }
         expanded.insert(row_id.to_owned());
         drop(expanded);
-        if self.row_details.borrow().contains_key(row_id) || sequence <= 0 {
+        let needs_read = self.timeline.with_untracked(|entries| {
+            entries.iter().any(|entry| {
+                entry.id == row_id
+                    && entry
+                        .activity
+                        .as_ref()
+                        .is_some_and(|activity| activity.details_pending)
+            })
+        });
+        if !needs_read || sequence <= 0 {
             self.publish();
             return;
         }
@@ -3273,6 +3439,16 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         let row_id = row_id.to_owned();
+        let generation = self.workbench_generation.get();
+        let request_key = (row_id.clone(), sequence);
+        let started = self
+            .loading_row_details
+            .borrow_mut()
+            .insert(request_key.clone());
+        self.publish();
+        if !started {
+            return;
+        }
         spawn(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
@@ -3284,15 +3460,31 @@ impl SessionService {
                         .await
                 })
                 .await;
+            if !service.workbench_is_current(generation) {
+                return;
+            }
+            service
+                .loading_row_details
+                .borrow_mut()
+                .remove(&request_key);
+            if !service.timeline.with_untracked(|entries| {
+                entries
+                    .iter()
+                    .any(|entry| entry.id == row_id && entry.last_sequence == sequence)
+            }) {
+                return;
+            }
             match result {
                 Ok(Ok(item)) => {
-                    let body = vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
+                    let details = vibex_desktop_model::timeline_rows(std::slice::from_ref(&item))
                         .into_iter()
                         .next()
-                        .map(|row| row.body)
+                        .map(|row| activity_details(&row, Some(&item.payload)))
                         .unwrap_or_default();
-                    service.row_details.borrow_mut().insert(row_id, body);
-                    service.publish();
+                    service
+                        .row_details
+                        .borrow_mut()
+                        .insert(row_id, (sequence, details));
                 }
                 Ok(Err(error)) => service.fail(&error),
                 Err(error) => service.fail(&BackendError::failed(
@@ -3300,6 +3492,7 @@ impl SessionService {
                     format!("reading the activity did not finish: {error}"),
                 )),
             }
+            service.publish();
         });
     }
 
@@ -5971,6 +6164,13 @@ impl SessionService {
                 return;
             };
             let read_workspace = workspace.clone();
+            let root = service.workspace_records.with_untracked(|spaces| {
+                spaces
+                    .iter()
+                    .find(|space| space.workspace.id == workspace)
+                    .map(|space| space.workspace.root_path.clone())
+            });
+            let path = workspace_file_path(&path, root.as_deref());
             let result = crate::runtime::handle()
                 .spawn(async move {
                     file_backend
@@ -8010,154 +8210,155 @@ fn token_usage_view(usage: AgentTokenUsage) -> TokenUsageView {
 }
 
 /// The one-line status a permission or question row carries.
-fn row_meta(row: &TimelineRow, items: &[vibex_core::TimelineItem]) -> String {
-    for id in row.item_ids.iter().rev() {
-        let Some(item) = items.iter().find(|item| item.id.as_str() == id) else {
-            continue;
-        };
-        return match &item.payload {
-            TimelinePayload::PermissionRequest(request) => match request.status {
-                PermissionRequestStatus::Pending => {
-                    copy::text("Pending", "待确认", "待確認").to_owned()
-                }
-                PermissionRequestStatus::Approved => {
-                    copy::text("Allowed", "已允许", "已允許").to_owned()
-                }
-                PermissionRequestStatus::Denied => {
-                    copy::text("Denied", "已拒绝", "已拒絕").to_owned()
-                }
-                PermissionRequestStatus::Expired => {
-                    copy::text("Expired", "已过期", "已過期").to_owned()
-                }
-            },
-            TimelinePayload::PermissionResolution(resolution) => match resolution.response {
-                PermissionResponseKind::Approve => {
-                    copy::text("Allowed", "已允许", "已允許").to_owned()
-                }
-                PermissionResponseKind::AlwaysAllowForSession => {
-                    copy::text("Allowed for session", "本会话允许", "本工作階段允許").to_owned()
-                }
-                PermissionResponseKind::Deny => copy::text("Denied", "已拒绝", "已拒絕").to_owned(),
-            },
-            TimelinePayload::ElicitationRequest(request) => match request.status {
-                ElicitationRequestStatus::Pending => {
-                    copy::text("Pending", "待回答", "待回答").to_owned()
-                }
-                ElicitationRequestStatus::Accepted => {
-                    copy::text("Answered", "已回答", "已回答").to_owned()
-                }
-                ElicitationRequestStatus::Declined => {
-                    copy::text("Declined", "已拒绝", "已拒絕").to_owned()
-                }
-                ElicitationRequestStatus::Cancelled => {
-                    copy::text("Cancelled", "已取消", "已取消").to_owned()
-                }
-            },
-            TimelinePayload::ElicitationResolution(resolution) => match resolution.action {
-                ElicitationResolutionAction::Accept => {
-                    copy::text("Answered", "已回答", "已回答").to_owned()
-                }
-                ElicitationResolutionAction::Decline => {
-                    copy::text("Declined", "已拒绝", "已拒絕").to_owned()
-                }
-                _ => String::new(),
-            },
+fn row_meta(payload: Option<&TimelinePayload>) -> String {
+    let Some(payload) = payload else {
+        return String::new();
+    };
+    match payload {
+        TimelinePayload::UserMessage(message) => match message.delivery {
+            UserMessageDelivery::Prompt => String::new(),
+            UserMessageDelivery::Steer => copy::text(
+                "Steered into the running turn",
+                "已插入正在运行的回合",
+                "已插入正在執行的回合",
+            )
+            .to_owned(),
+            UserMessageDelivery::Resend => copy::text(
+                "Interrupted and resent",
+                "已中断并重新发送",
+                "已中斷並重新傳送",
+            )
+            .to_owned(),
+        },
+        TimelinePayload::PermissionRequest(request) => match request.status {
+            PermissionRequestStatus::Pending => {
+                copy::text("Pending", "待确认", "待確認").to_owned()
+            }
+            PermissionRequestStatus::Approved => {
+                copy::text("Allowed", "已允许", "已允許").to_owned()
+            }
+            PermissionRequestStatus::Denied => copy::text("Denied", "已拒绝", "已拒絕").to_owned(),
+            PermissionRequestStatus::Expired => {
+                copy::text("Expired", "已过期", "已過期").to_owned()
+            }
+        },
+        TimelinePayload::PermissionResolution(resolution) => match resolution.response {
+            PermissionResponseKind::Approve => copy::text("Allowed", "已允许", "已允許").to_owned(),
+            PermissionResponseKind::AlwaysAllowForSession => {
+                copy::text("Allowed for session", "本会话允许", "本工作階段允許").to_owned()
+            }
+            PermissionResponseKind::Deny => copy::text("Denied", "已拒绝", "已拒絕").to_owned(),
+        },
+        TimelinePayload::ElicitationRequest(request) => match request.status {
+            ElicitationRequestStatus::Pending => {
+                copy::text("Pending", "待回答", "待回答").to_owned()
+            }
+            ElicitationRequestStatus::Accepted => {
+                copy::text("Answered", "已回答", "已回答").to_owned()
+            }
+            ElicitationRequestStatus::Declined => {
+                copy::text("Declined", "已拒绝", "已拒絕").to_owned()
+            }
+            ElicitationRequestStatus::Cancelled => {
+                copy::text("Cancelled", "已取消", "已取消").to_owned()
+            }
+        },
+        TimelinePayload::ElicitationResolution(resolution) => match resolution.action {
+            ElicitationResolutionAction::Accept => {
+                copy::text("Answered", "已回答", "已回答").to_owned()
+            }
+            ElicitationResolutionAction::Decline => {
+                copy::text("Declined", "已拒绝", "已拒絕").to_owned()
+            }
             _ => String::new(),
-        };
+        },
+        _ => String::new(),
     }
-    String::new()
 }
 
 /// The attachments a user row carried, from the items behind it.
-fn row_attachments(row: &TimelineRow, items: &[vibex_core::TimelineItem]) -> Vec<AttachmentItem> {
-    for id in &row.item_ids {
-        let Some(item) = items.iter().find(|item| item.id.as_str() == id) else {
-            continue;
-        };
-        let TimelinePayload::UserMessage(message) = &item.payload else {
-            continue;
-        };
-        return message
-            .attachments
-            .iter()
-            .enumerate()
-            .map(|(index, attachment)| AttachmentItem {
-                id: format!("{}:{index}", row.id),
-                label: attachment.display_label().to_owned(),
-                mime_type: attachment.mime_type.clone().unwrap_or_default(),
-                uri: attachment.uri.clone().unwrap_or_default(),
-            })
-            .collect();
-    }
-    Vec::new()
+fn row_attachments(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Vec<AttachmentItem> {
+    let Some(TimelinePayload::UserMessage(message)) = payload else {
+        return Vec::new();
+    };
+    message
+        .attachments
+        .iter()
+        .enumerate()
+        .map(|(index, attachment)| AttachmentItem {
+            id: format!("{}:{index}", row.id),
+            label: attachment.display_label().to_owned(),
+            mime_type: attachment.mime_type.clone().unwrap_or_default(),
+            uri: attachment.uri.clone().unwrap_or_default(),
+        })
+        .collect()
 }
 
-fn process_header(turn: &TimelineConversationTurn, expanded: bool) -> TimelineEntry {
-    let label = if turn.complete {
-        copy::text("Worked for", "工作了", "工作了")
-    } else {
-        copy::text("Working for", "工作了", "工作了")
-    };
+fn process_header(turn: &TimelineConversationTurn) -> TimelineEntry {
+    let finished = activity::turn_finished(turn);
     TimelineEntry {
         id: format!("turn-header:{}", turn.id),
         kind: EntryKind::ProcessHeader,
-        title: format!(
-            "{label} {}",
-            compact_duration(turn.started_at_ms, turn.ended_at_ms)
-        ),
-        body: String::new(),
-        meta: String::new(),
-        streaming: !turn.complete,
+        streaming: !finished,
         turn_id: turn.id.clone(),
-        process_count: turn.process_rows.len(),
-        expanded,
-        expandable: false,
-        attachments: Vec::new(),
-        last_sequence: 0,
         started_at_ms: turn.started_at_ms,
         ended_at_ms: turn.ended_at_ms.unwrap_or(0),
-        complete: turn.complete,
+        complete: finished,
+        ..TimelineEntry::default()
     }
 }
 
-fn changes_entry(turn: &TimelineConversationTurn, files: &[String]) -> TimelineEntry {
+fn changes_entry(turn: &TimelineConversationTurn, files: Vec<TurnFileChange>) -> TimelineEntry {
     TimelineEntry {
         id: format!("turn-changes:{}", turn.id),
         kind: EntryKind::Changes,
         title: format!(
             "{} {}",
             files.len(),
-            copy::text("files changed", "个文件已更改", "個檔案已變更")
+            if files.len() == 1 {
+                copy::text("file changed", "个文件已更改", "個檔案已變更")
+            } else {
+                copy::text("files changed", "个文件已更改", "個檔案已變更")
+            }
         ),
-        body: files.join("\n"),
-        meta: String::new(),
-        streaming: false,
+        changed_files: files,
         turn_id: turn.id.clone(),
-        process_count: 0,
-        expanded: false,
-        expandable: false,
-        attachments: Vec::new(),
-        last_sequence: 0,
-        started_at_ms: turn.started_at_ms,
-        ended_at_ms: turn.ended_at_ms.unwrap_or(0),
-        complete: turn.complete,
+        ..TimelineEntry::default()
     }
+}
+
+fn turn_file_change(
+    row: &TimelineRow,
+    payload: Option<&TimelinePayload>,
+) -> Option<TurnFileChange> {
+    use vibex_core::FileOperationKind;
+    let derived;
+    let operation = match payload? {
+        TimelinePayload::FileOperation(operation) => operation,
+        TimelinePayload::ToolCall(tool) => {
+            derived = tool_detail::file_operation(tool)?;
+            &derived
+        }
+        _ => return None,
+    };
+    (operation.operation != FileOperationKind::Read && !operation.path.trim().is_empty()).then(
+        || TurnFileChange {
+            path: operation.path.clone(),
+            row_id: row.id.clone(),
+            deleted: operation.operation == FileOperationKind::Delete,
+        },
+    )
 }
 
 fn live_turn_entry(turn: &TimelineConversationTurn) -> TimelineEntry {
     TimelineEntry {
         id: format!("turn-live:{}", turn.id),
-        kind: EntryKind::Agent,
+        kind: EntryKind::Generating,
         title: copy::text("Agent", "Agent", "Agent").to_owned(),
-        body: turn
-            .live_status
-            .clone()
-            .filter(|status| !status.trim().is_empty())
-            .unwrap_or_else(|| copy::text("Thinking...", "思考中…", "思考中…").to_owned()),
+        body: copy::text("Working…", "工作中…", "工作中…").to_owned(),
         meta: String::new(),
         streaming: true,
         turn_id: turn.id.clone(),
-        process_count: turn.process_rows.len(),
         expanded: false,
         expandable: false,
         attachments: Vec::new(),
@@ -8165,16 +8366,71 @@ fn live_turn_entry(turn: &TimelineConversationTurn) -> TimelineEntry {
         started_at_ms: turn.started_at_ms,
         ended_at_ms: turn.ended_at_ms.unwrap_or(0),
         complete: false,
+        ..TimelineEntry::default()
     }
 }
 
-fn compact_duration(started_at_ms: i64, ended_at_ms: Option<i64>) -> String {
-    let end = ended_at_ms.unwrap_or_else(unix_timestamp_ms);
-    let seconds = ((end - started_at_ms).max(0) / 1_000) as u64;
-    match seconds {
-        0..=59 => format!("{seconds}s"),
-        60..=3_599 => format!("{}m {}s", seconds / 60, seconds % 60),
-        _ => format!("{}h {}m", seconds / 3_600, (seconds % 3_600) / 60),
+fn row_payload<'a>(
+    row: &TimelineRow,
+    items: &'a [vibex_core::TimelineItem],
+) -> Option<&'a TimelinePayload> {
+    row_item(row, items).map(|item| &item.payload)
+}
+
+fn row_item<'a>(
+    row: &TimelineRow,
+    items: &'a [vibex_core::TimelineItem],
+) -> Option<&'a vibex_core::TimelineItem> {
+    let end = items.partition_point(|item| item.sequence <= row.last_sequence);
+    items[..end]
+        .iter()
+        .rev()
+        .take_while(|item| item.sequence >= row.first_sequence)
+        .find(|item| row.item_ids.iter().any(|id| id == item.id.as_str()))
+}
+
+fn workspace_file_path(path: &str, root: Option<&str>) -> String {
+    let normalized = path.replace('\\', "/");
+    let root = root.map(|root| root.replace('\\', "/"));
+    root.as_deref()
+        .and_then(|root| std::path::Path::new(&normalized).strip_prefix(root).ok())
+        .filter(|path| !path.as_os_str().is_empty())
+        .map_or_else(
+            || path.to_owned(),
+            |relative| relative.to_string_lossy().into_owned(),
+        )
+}
+
+fn activity_details(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Vec<ActivityDetail> {
+    tool_detail::project(row, payload, None, copy::language().locale())
+        .iter()
+        .filter_map(|detail| {
+            let text = detail.text();
+            (!text.trim().is_empty()).then(|| ActivityDetail {
+                label: detail.label().to_owned(),
+                text,
+                copy: detail.copy_text(),
+            })
+        })
+        .collect()
+}
+
+fn activity_glyph(kind: ActivityKind) -> ActivityGlyph {
+    match kind {
+        ActivityKind::Command => ActivityGlyph::Command,
+        ActivityKind::Search => ActivityGlyph::Search,
+        ActivityKind::Directory => ActivityGlyph::Directory,
+        ActivityKind::FileRead => ActivityGlyph::Read,
+        ActivityKind::FileEdit => ActivityGlyph::Edit,
+        ActivityKind::FileCreate => ActivityGlyph::Create,
+        ActivityKind::FileDelete => ActivityGlyph::Delete,
+        ActivityKind::Todo => ActivityGlyph::Plan,
+        ActivityKind::Collaboration => ActivityGlyph::Agent,
+        ActivityKind::Image => ActivityGlyph::Image,
+        ActivityKind::Integration => ActivityGlyph::Integration,
+        ActivityKind::Web => ActivityGlyph::Web,
+        ActivityKind::Retry => ActivityGlyph::Retry,
+        ActivityKind::Generic => ActivityGlyph::Tool,
     }
 }
 
@@ -8184,7 +8440,7 @@ fn entry_kind(kind: vibex_desktop_model::TimelineRowKind) -> EntryKind {
         Row::UserMessage => EntryKind::User,
         Row::AgentMessage => EntryKind::Agent,
         Row::Reasoning => EntryKind::Reasoning,
-        Row::Error | Row::Retry => EntryKind::Error,
+        Row::Error => EntryKind::Error,
         Row::ToolCall
         | Row::Command
         | Row::FileOperation
@@ -8192,6 +8448,7 @@ fn entry_kind(kind: vibex_desktop_model::TimelineRowKind) -> EntryKind {
         | Row::TodoUpdate
         | Row::Plan
         | Row::Collaboration
+        | Row::Retry
         | Row::ImageGeneration => EntryKind::Tool,
         Row::PermissionRequest | Row::PermissionResolution => EntryKind::Permission,
         Row::ElicitationRequest | Row::ElicitationResolution => EntryKind::Question,
@@ -8218,7 +8475,28 @@ mod tests {
     use super::{
         AttachmentItem, BTreeMap, Duration, TerminalFrameBatch, TerminalFrameSubscription,
         TerminalId, decode_terminal_bytes, mpsc, spawn_terminal_stream, swap_attachment_draft,
+        workspace_file_path,
     };
+
+    #[test]
+    fn timeline_paths_are_relativized_only_against_their_workspace() {
+        assert_eq!(
+            workspace_file_path("/work/project/src/main.rs", Some("/work/project/")),
+            "src/main.rs"
+        );
+        assert_eq!(
+            workspace_file_path("C:\\work\\project\\src\\main.rs", Some("C:\\work\\project")),
+            "src/main.rs"
+        );
+        assert_eq!(
+            workspace_file_path("/work/project-other/main.rs", Some("/work/project")),
+            "/work/project-other/main.rs"
+        );
+        assert_eq!(
+            workspace_file_path("src/main.rs", Some("/work/project")),
+            "src/main.rs"
+        );
+    }
 
     struct TimedTerminalFrames(std::vec::IntoIter<TerminalFrameBatch>);
 

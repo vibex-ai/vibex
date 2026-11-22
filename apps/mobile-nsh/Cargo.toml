@@ -31,6 +31,7 @@ futures-util.workspace = true
 # One pairing address attempt is bounded; `background` work is a Tokio task.
 tokio = { workspace = true, features = ["time"] }
 vibex-nsh-ui = { path = "../../crates/vibex-nsh-ui" }
+vibex-ui = { path = "../../crates/vibex-ui", default-features = false }
 
 [target.'cfg(target_os = "ios")'.dependencies]
 nsh-platform-ios = { version = "=0.6.1", default-features = false }

@@ -21,12 +21,13 @@ use vibex_nsh_ui::screens::new_session::{
     DirectoryEntry, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice,
 };
 use vibex_nsh_ui::screens::session::{
-    self, AttachmentItem, CommandEntry, ComposerHistoryEntry, ConversationState, EntryKind,
-    GoalPhaseView, GoalView, PendingPermission, PendingQuestion, PermissionChoice,
-    PermissionOption, PlanStepState, PlanStepView, PlanView, QuestionField, QuestionFieldKind,
-    QueuedMessageView, RuntimeChoiceView, RuntimeOptionView, RuntimeSummaryView, SessionHost,
-    SessionState, SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind,
-    SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
+    self, ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
+    ComposerHistoryEntry, ConversationState, EntryKind, GoalPhaseView, GoalView, PendingPermission,
+    PendingQuestion, PermissionChoice, PermissionOption, PlanStepState, PlanStepView, PlanView,
+    QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView, RuntimeOptionView,
+    RuntimeSummaryView, SessionHost, SessionState, SessionSummary, SidebarRowKind, SidebarRowView,
+    SidebarSectionKind, SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
+    TurnFileChange,
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
@@ -42,7 +43,6 @@ fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
         meta: String::new(),
         streaming: false,
         turn_id: id.to_owned(),
-        process_count: 0,
         expanded: false,
         expandable: false,
         attachments: Vec::new(),
@@ -50,6 +50,7 @@ fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
         started_at_ms: 0,
         ended_at_ms: 0,
         complete: true,
+        ..TimelineEntry::default()
     }
 }
 
@@ -157,8 +158,8 @@ fn TurnShell() -> impl IntoElement {
     let mut host = host_with(None, None);
     let mut header = entry("h1", EntryKind::ProcessHeader, "Worked for 2s", "");
     let now = nsh_core::time::unix_ms() as i64;
-    header.process_count = 2;
     header.expanded = true;
+    header.expandable = true;
     header.turn_id = "t1".to_owned();
     header.started_at_ms = now - 2_000;
     header.ended_at_ms = now;
@@ -185,12 +186,18 @@ fn TurnShell() -> impl IntoElement {
         "Command: cargo test",
     );
     permission.meta = "Allowed".to_owned();
+    let mut changes = entry("c1", EntryKind::Changes, "1 file changed", "");
+    changes.changed_files.push(TurnFileChange {
+        path: "src/main.rs".to_owned(),
+        row_id: tool.id.clone(),
+        deleted: false,
+    });
     host.timeline = signal(vec![
         user,
         header,
         tool,
         permission,
-        entry("c1", EntryKind::Changes, "1 files changed", "src/main.rs"),
+        changes,
         entry(
             "a1",
             EntryKind::Agent,
@@ -1097,6 +1104,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_new_project: Rc::new(move || project_browser_open.set(true)),
         on_open_settings: Rc::new(|| {}),
         on_toggle_turn: Rc::new(|_| {}),
+        on_reveal_row: Rc::new(|_, _| {}),
         on_toggle_detail: Rc::new(|_, _| {}),
         on_fork: Rc::new(|_| {}),
         on_load_older: Rc::new(|| {}),
@@ -1380,8 +1388,8 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Worked for 2s").unwrap();
     assert!(app.screen().shows("cargo test"));
-    assert!(app.screen().shows("Detail"));
-    assert!(app.screen().shows("1 files changed"));
+    app.wait_for("role:button[cargo test]").unwrap();
+    assert!(app.screen().shows("1 file changed"));
     assert!(app.screen().shows("Run cargo test?"));
     assert!(app.screen().shows("Allowed"));
     assert!(app.screen().shows("photo.jpg"));
@@ -1394,6 +1402,152 @@ fn a_turn_shows_its_fold_and_the_attachments_it_carried() {
     }
     app.press("photo.jpg").unwrap();
     app.wait_for("Attachment").unwrap();
+}
+
+#[test]
+fn a_changed_file_in_the_timeline_opens_the_workbench_reader() {
+    let mut config = EngineConfig::new(Root::of::<TurnShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(900.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[src/main.rs]").unwrap();
+    app.press("role:button[src/main.rs]").unwrap();
+    app.wait_for("role:button[Files]").unwrap();
+    app.wait_for("role:button[Find in file]").unwrap();
+    app.wait_for("main.rs").unwrap();
+}
+
+#[component]
+fn ActivityTimelineShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let mut fold = entry(
+        "turn-header:example",
+        EntryKind::ProcessHeader,
+        "Worked for 2s",
+        "",
+    );
+    fold.expandable = true;
+    fold.started_at_ms = 1_000;
+    fold.ended_at_ms = 3_000;
+    let mut group = entry(
+        "activity-group:one",
+        EntryKind::ActivityGroup,
+        "Read 2 files",
+        "",
+    );
+    group.expandable = true;
+    group.parent_id = Some(fold.id.clone());
+    let reads = ["src/model.rs", "src/sidebar.rs"]
+        .into_iter()
+        .map(|path| {
+            let mut row = entry(path, EntryKind::Tool, "Read", "");
+            row.parent_id = Some(group.id.clone());
+            row.expandable = true;
+            row.activity = Some(ActivityView {
+                glyph: ActivityGlyph::Read,
+                target: path.split('/').next_back().unwrap().to_owned(),
+                path: Some(path.to_owned()),
+                failed: false,
+                error: None,
+                duration: None,
+                details_pending: false,
+                details_loading: false,
+                details: vec![ActivityDetail {
+                    label: "Output".to_owned(),
+                    text: format!("Contents of {path}\nFetched from the worktree"),
+                    copy: format!("Contents of {path}\nFetched from the worktree"),
+                }],
+            });
+            row
+        })
+        .collect::<Vec<_>>();
+    let timeline = signal(vec![
+        fold,
+        group,
+        reads[0].clone(),
+        reads[1].clone(),
+        entry("answer", EntryKind::Agent, "Claude", "Here is the answer."),
+    ]);
+    host.timeline = timeline;
+    host.on_reveal_row = Rc::new(move |id, detail| {
+        if id.starts_with("src/") {
+            timeline.update(|rows| {
+                rows[0].expanded = true;
+                rows[1].expanded = true;
+                if detail && let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                    row.expanded = true;
+                }
+            });
+        }
+    });
+    let toggle = move |id: &str| {
+        timeline.update(|rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == id) {
+                row.expanded = !row.expanded;
+            }
+        });
+    };
+    host.on_toggle_turn = Rc::new(toggle);
+    host.on_toggle_detail = Rc::new(move |id, _| toggle(id));
+    session::session(host)
+}
+
+#[test]
+fn searching_reveals_a_collapsed_activity_without_expanding_its_siblings() {
+    let mut config = EngineConfig::new(Root::of::<ActivityTimelineShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(860.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Here is the answer.").unwrap();
+    assert!(!app.screen().shows("Read 2 files"));
+    app.press("role:button[Find in conversation]").unwrap();
+    app.type_text("text:Find in conversation", "src/model.rs")
+        .unwrap();
+    app.wait_for("1/1").unwrap();
+    app.wait_for("Read 2 files").unwrap();
+    app.wait_for("role:button[Read src/model.rs]").unwrap();
+    app.press("role:button[Read src/model.rs]").unwrap();
+    app.wait_for("text:Contents of src/model.rs\nFetched from the worktree")
+        .unwrap();
+    app.press("role:button[Copy Output]").unwrap();
+    assert_eq!(
+        app.screen().clipboard(),
+        Some("Contents of src/model.rs\nFetched from the worktree")
+    );
+    assert!(
+        app.screen()
+            .shows("Contents of src/model.rs\nFetched from the worktree")
+    );
+    assert!(
+        !app.screen()
+            .shows("Contents of src/sidebar.rs\nFetched from the worktree")
+    );
+    app.press("role:button[Read 2 files]").unwrap();
+    app.wait_for_gone(
+        "text:Contents of src/model.rs\nFetched from the worktree",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    assert!(app.screen().shows("Read 2 files"));
+}
+
+#[test]
+fn a_match_in_tool_output_opens_only_the_matching_detail() {
+    let mut config = EngineConfig::new(Root::of::<ActivityTimelineShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(860.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Here is the answer.").unwrap();
+    app.press("role:button[Find in conversation]").unwrap();
+    app.type_text("text:Find in conversation", "Fetched from the worktree")
+        .unwrap();
+    app.wait_for("1/2").unwrap();
+    app.wait_for("role:button[Copy Output]").unwrap();
+    assert!(
+        !app.screen()
+            .shows("Contents of src/sidebar.rs\nFetched from the worktree")
+    );
+    app.press("role:button[Next match]").unwrap();
+    app.wait_for("2/2").unwrap();
+    app.wait_for("text:Contents of src/sidebar.rs\nFetched from the worktree")
+        .unwrap();
 }
 
 #[test]

@@ -4,7 +4,7 @@
 
 Read this when changing timeline activity identity, details, grouping,
 reasoning preferences, or disclosure motion in `apps/desktop`, `apps/mobile`,
-or `crates/vibex-tui`.
+`apps/mobile-nsh`, or `crates/vibex-tui`.
 Desktop remains the visual and semantic baseline. Mobile adapts it to touch;
 TUI retains character-grid navigation and incremental Markdown rendering.
 The desktop runtime remains the sole owner of session state.
@@ -60,6 +60,15 @@ Transcript::advance_disclosures(&mut self, Instant) -> bool
   targets, semantic icons, and muted text. Explicit copy controls sit beside
   bounded detail scroll regions. File detail preferences change content inside
   the activity group.
+- NSH projects through `vibex-ui` with default features disabled. The service
+  keeps stable parent IDs for the turn and activity disclosures, and the
+  virtual list mounts only visible rows. Find indexes loaded source rows,
+  including collapsed rows and already-fetched details. Select a hit by row
+  ID, open only its ancestors and any matched detail, then resolve a visible
+  scroll index. Synthetic headers and file summaries are not duplicate hits.
+  A detail read may only update the originating session generation and row
+  sequence. The changed-file summary uses typed file operations, deduplicates
+  by full path, and links to the reader and the original timeline activity.
 - Explicit expansion/collapse wins over live defaults and survives refresh.
   Mobile opens active groups by the shared desktop rule and reads the same
   **Auto-collapse tool calls** preference from the synced display settings.

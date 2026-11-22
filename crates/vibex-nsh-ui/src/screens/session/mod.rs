@@ -6,10 +6,8 @@
 //! owns the data and the actions; this module binds them and decides how a row
 //! looks.
 //!
-//! One row per timeline projection (`vibex-desktop-model`'s `TimelineRow`):
-//! user messages as bubbles, Agent messages as prose, tools and notices as
-//! cards, errors in the destructive tone. Markdown is still plain text here;
-//! the `TextView` renderer replaces it once the row shapes settle.
+//! The timeline renders desktop-projected turns and activity groups as
+//! a virtual list with touch disclosures and native Markdown views.
 
 use std::rc::Rc;
 
@@ -78,7 +76,7 @@ pub enum ConversationState {
 }
 
 /// What kind of timeline row this is.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum EntryKind {
     /// What the person wrote.
     User,
@@ -89,6 +87,7 @@ pub enum EntryKind {
     /// A tool call or command.
     Tool,
     /// A system or Git notice.
+    #[default]
     Notice,
     /// A failure.
     Error,
@@ -100,10 +99,57 @@ pub enum EntryKind {
     Question,
     /// The fold above one turn's working rows.
     ProcessHeader,
+    ActivityGroup,
+    Generating,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActivityGlyph {
+    Command,
+    Search,
+    Directory,
+    Read,
+    Edit,
+    Create,
+    Delete,
+    Plan,
+    Agent,
+    Image,
+    Integration,
+    Web,
+    Retry,
+    Tool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityDetail {
+    pub label: String,
+    pub text: String,
+    pub copy: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ActivityView {
+    pub glyph: ActivityGlyph,
+    pub target: String,
+    pub path: Option<String>,
+    pub failed: bool,
+    pub error: Option<String>,
+    pub duration: Option<String>,
+    pub details_pending: bool,
+    pub details_loading: bool,
+    pub details: Vec<ActivityDetail>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TurnFileChange {
+    pub path: String,
+    pub row_id: String,
+    pub deleted: bool,
 }
 
 /// One row of the transcript.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub id: String,
     pub kind: EntryKind,
@@ -116,8 +162,6 @@ pub struct TimelineEntry {
     pub streaming: bool,
     /// The turn this row belongs to; empty when the row stands alone.
     pub turn_id: String,
-    /// The fold's row count, on a process header.
-    pub process_count: usize,
     /// Whether the fold or the row's detail is open.
     pub expanded: bool,
     /// Whether a row has more detail to read.
@@ -132,6 +176,9 @@ pub struct TimelineEntry {
     pub ended_at_ms: i64,
     /// Whether the turn is finished.
     pub complete: bool,
+    pub parent_id: Option<String>,
+    pub activity: Option<ActivityView>,
+    pub changed_files: Vec<TurnFileChange>,
 }
 
 /// What the open session is running on, for the composer's chips.
@@ -427,6 +474,7 @@ type MoveSessionAction = Rc<dyn Fn(&str, Option<&str>)>;
 pub type BrowseDirs = Rc<dyn Fn(Option<&str>)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
+type RevealRow = Rc<dyn Fn(&str, bool)>;
 
 /// One entry of the composer's `/` palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -585,6 +633,7 @@ pub struct SessionHost {
     pub on_choose_feature: ChooseFeature,
     /// Opens or closes one turn's working rows.
     pub on_toggle_turn: Rc<dyn Fn(&str)>,
+    pub on_reveal_row: RevealRow,
     /// Opens a row's full detail, by row id and sequence.
     pub on_toggle_detail: ToggleDetail,
     /// Whether the conversation find bar is open.
@@ -1048,10 +1097,7 @@ fn shell(host: SessionHost, pager: Pager, tab: Signal<WorkbenchTab>) -> impl Int
             view()
                 .flex_1()
                 .min_h(px(0.0))
-                .child(timeline_view(host.clone(), jump_to_message, move || {
-                    tab.set(WorkbenchTab::Terminal);
-                    pager.open(ShellPage::Workbench);
-                }))
+                .child(timeline_view(host.clone(), jump_to_message, pager, tab))
                 .child(when(move || host.error.get().is_some(), {
                     let error = host.error;
                     move || {
@@ -1466,9 +1512,32 @@ fn connection_banner(
 fn timeline_view(
     host: SessionHost,
     jump_to_message: Signal<Option<i64>>,
-    on_terminal: impl Fn() + 'static,
+    pager: Pager,
+    tab: Signal<WorkbenchTab>,
 ) -> impl IntoElement {
-    let timeline = host.timeline;
+    let on_terminal = move || {
+        tab.set(WorkbenchTab::Terminal);
+        pager.open(ShellPage::Workbench);
+    };
+    let source = host.timeline;
+    let visible = computed(move || source.with(|entries| visible_timeline(entries)));
+    let position_for = move |predicate: &dyn Fn(&TimelineEntry) -> bool| {
+        visible.with(|indices| {
+            source.with(|entries| {
+                indices
+                    .iter()
+                    .position(|&index| entries.get(index).is_some_and(predicate))
+            })
+        })
+    };
+    let reveal = signal(None::<String>);
+    let reveal_row: RevealRow = Rc::new({
+        let on_reveal_row = host.on_reveal_row.clone();
+        move |id, detail| {
+            on_reveal_row(id, detail);
+            reveal.set(Some(id.to_owned()));
+        }
+    });
     let active = host.active;
     let status = host.conversation;
     let on_refresh = host.on_refresh.clone();
@@ -1482,18 +1551,42 @@ fn timeline_view(
         edit: host.on_edit_message.clone(),
         attachment: host.on_open_attachment.clone(),
         jump: jump_to_message,
-        entries: timeline,
+        entries: source,
+        visible,
+        reveal: reveal_row.clone(),
+        open_file: {
+            let open_files = host.on_open_files.clone();
+            let open_file = host.on_open_file.clone();
+            Rc::new(move |path| {
+                open_files();
+                open_file(path, None);
+                tab.set(WorkbenchTab::Files);
+                pager.open(ShellPage::Workbench);
+            })
+        },
     };
     let find_open = host.find_open;
     let find_query = signal(String::new());
     let find_cursor = signal(0usize);
     let list_ref = element_ref();
     effect(move || {
+        if let Some(id) = reveal.get()
+            && position_for(&|entry| entry.id == id).is_some()
+        {
+            set_timeout(std::time::Duration::from_millis(16), move || {
+                if reveal.get_untracked().as_ref() == Some(&id)
+                    && let Some(index) = position_for(&|entry| entry.id == id)
+                {
+                    reveal.set(None);
+                    list_ref.scroll_to_index(index as u32, Percentage(0.5), px(0.0), false);
+                }
+            });
+        }
+    });
+    effect(move || {
         if let Some(sequence) = jump_to_message.get() {
-            if let Some(index) = timeline.with(|entries| {
-                entries.iter().position(|entry| {
-                    entry.kind == EntryKind::User && entry.last_sequence == sequence
-                })
+            if let Some(index) = position_for(&|entry| {
+                entry.kind == EntryKind::User && entry.last_sequence == sequence
             }) {
                 list_ref.scroll_to_index(
                     index as u32,
@@ -1511,23 +1604,43 @@ fn timeline_view(
             find_cursor.set(0);
         }
     });
+    effect(move || {
+        active.get();
+        find_query.set(String::new());
+        find_cursor.set(0);
+        reveal.set(None);
+    });
     let away_from_end = signal(false);
     let find_matches = computed(move || {
         let query = find_query.with(|query| query.trim().to_lowercase());
         if query.is_empty() {
             return Vec::new();
         }
-        timeline.with(|entries| {
+        source.with(|entries| {
             entries
                 .iter()
-                .enumerate()
-                .filter(|(_, entry)| {
-                    entry.title.to_lowercase().contains(&query)
-                        || entry.body.to_lowercase().contains(&query)
-                })
-                .map(|(index, _)| index)
+                .filter(|entry| searchable_match(entry, &query))
+                .map(|entry| entry.id.clone())
                 .collect::<Vec<_>>()
         })
+    });
+    let find_reveal: Rc<dyn Fn(&str)> = Rc::new(move |id| {
+        let query = find_query.with_untracked(|query| query.trim().to_lowercase());
+        let open_detail = source.with_untracked(|entries| {
+            entries
+                .iter()
+                .find(|entry| entry.id == id)
+                .is_some_and(|entry| {
+                    let matches = |value: &str| value.to_lowercase().contains(&query);
+                    entry.kind == EntryKind::Reasoning && matches(&entry.body)
+                        || entry.activity.as_ref().is_some_and(|activity| {
+                            !matches(&entry.title)
+                                && !matches(&activity.target)
+                                && !activity.path.as_deref().is_some_and(matches)
+                        })
+                })
+        });
+        reveal_row(id, open_detail);
     });
     let has_older = host.has_older;
     let loading_older = host.loading_older;
@@ -1562,7 +1675,7 @@ fn timeline_view(
             },
         ))
         .child(when(
-            move || active.get().is_some() && timeline.with(|entries| entries.is_empty()),
+            move || active.get().is_some() && visible.with(Vec::is_empty),
             {
                 let on_terminal = Rc::new(on_terminal);
                 move || {
@@ -1627,7 +1740,7 @@ fn timeline_view(
             },
         ))
         .child(when(
-            move || timeline.with(|entries| !entries.is_empty()),
+            move || !visible.with(Vec::is_empty),
             move || {
                 view()
                     .flex_1()
@@ -1670,7 +1783,16 @@ fn timeline_view(
                     }))
                     .child(when(move || find_open.get(), {
                         let close = find_open;
-                        move || find_bar(find_query, find_matches, find_cursor, list_ref, close)
+                        let find_reveal = find_reveal.clone();
+                        move || {
+                            find_bar(
+                                find_query,
+                                find_matches,
+                                find_cursor,
+                                find_reveal.clone(),
+                                close,
+                            )
+                        }
                     }))
                     .child({
                         let actions = row_actions.clone();
@@ -1680,17 +1802,21 @@ fn timeline_view(
                             .min_h(px(0.0))
                             .child(
                                 virtual_list(
-                                    move || timeline.with(Vec::len),
+                                    move || visible.with(Vec::len),
                                     move |at: Position| {
                                         entry_row(at, actions.clone(), find_matches, find_cursor)
                                     },
                                 )
                                 .keys(move || {
-                                    timeline.with(|entries| {
-                                        entries
-                                            .iter()
-                                            .map(|entry| entry.id.clone())
-                                            .collect::<Vec<_>>()
+                                    visible.with(|indices| {
+                                        source.with(|entries| {
+                                            indices
+                                                .iter()
+                                                .filter_map(|&index| {
+                                                    entries.get(index).map(|entry| entry.id.clone())
+                                                })
+                                                .collect::<Vec<_>>()
+                                        })
                                     })
                                 })
                                 .estimated_item_size(px(72.0))
@@ -1735,11 +1861,49 @@ fn timeline_view(
         ))
 }
 
+fn visible_timeline(entries: &[TimelineEntry]) -> Vec<usize> {
+    let mut headers = std::collections::HashMap::new();
+    let mut visible = Vec::new();
+    for (index, entry) in entries.iter().enumerate() {
+        let shown = entry
+            .parent_id
+            .as_deref()
+            .is_none_or(|id| headers.get(id).copied().unwrap_or(false));
+        if matches!(
+            entry.kind,
+            EntryKind::ProcessHeader | EntryKind::ActivityGroup
+        ) {
+            headers.insert(entry.id.as_str(), shown && entry.expanded);
+        }
+        if shown {
+            visible.push(index);
+        }
+    }
+    visible
+}
+
+fn searchable_match(entry: &TimelineEntry, query: &str) -> bool {
+    let matches = |value: &str| value.to_lowercase().contains(query);
+    !matches!(
+        entry.kind,
+        EntryKind::ProcessHeader
+            | EntryKind::ActivityGroup
+            | EntryKind::Generating
+            | EntryKind::Changes
+    ) && (matches(&entry.title)
+        || matches(&entry.body)
+        || entry.activity.as_ref().is_some_and(|activity| {
+            matches(&activity.target)
+                || activity.path.as_deref().is_some_and(matches)
+                || activity.details.iter().any(|detail| matches(&detail.text))
+        }))
+}
+
 fn find_bar(
     query: Signal<String>,
-    matches: Memo<Vec<usize>>,
+    matches: Memo<Vec<String>>,
     cursor: Signal<usize>,
-    list: ElementRef,
+    reveal: Rc<dyn Fn(&str)>,
     close: Signal<bool>,
 ) -> impl IntoElement {
     let count = computed(move || {
@@ -1768,13 +1932,17 @@ fn find_bar(
             field::text_field_with(
                 query,
                 copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
-                move |_| {
-                    cursor.set(0);
-                    if let Some(index) = matches.with(|matches| matches.first().copied()) {
-                        list.scroll_to_index(index as u32, Percentage(0.5), px(0.0), false);
+                {
+                    let reveal = reveal.clone();
+                    move |_| {
+                        cursor.set(0);
+                        if let Some(id) = matches.with(|matches| matches.first().cloned()) {
+                            reveal(&id);
+                        }
                     }
                 },
             )
+            .min_w(px(0.0))
             .flex_1(),
         )
         .child(
@@ -1782,8 +1950,8 @@ fn find_bar(
                 .text_size(px(theme::font_micro()))
                 .text_color(theme::text_muted),
         )
-        .child(find_step(true, matches, cursor, list))
-        .child(find_step(false, matches, cursor, list))
+        .child(find_step(true, matches, cursor, reveal.clone()))
+        .child(find_step(false, matches, cursor, reveal))
         .child(small_action(
             copy::text("Close", "关闭", "關閉"),
             move || {
@@ -1795,9 +1963,9 @@ fn find_bar(
 
 fn find_step(
     previous: bool,
-    matches: Memo<Vec<usize>>,
+    matches: Memo<Vec<String>>,
     cursor: Signal<usize>,
-    list: ElementRef,
+    reveal: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     action::icon_button(
         if previous {
@@ -1821,12 +1989,9 @@ fn find_step(
                 (cursor.get_untracked() + 1) % total
             };
             cursor.set(next);
-            list.scroll_to_index(
-                matches.with(|matches| matches[next]) as u32,
-                Percentage(0.5),
-                px(0.0),
-                false,
-            );
+            if let Some(id) = matches.with(|matches| matches.get(next).cloned()) {
+                reveal(&id);
+            }
         },
     )
     .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
@@ -1853,22 +2018,41 @@ struct TranscriptActions {
     attachment: OpenAttachment,
     jump: Signal<Option<i64>>,
     entries: Signal<Vec<TimelineEntry>>,
+    visible: Memo<Vec<usize>>,
+    reveal: RevealRow,
+    open_file: Rc<dyn Fn(&str)>,
 }
 
 fn entry_row(
     at: Position,
     actions: TranscriptActions,
-    matches: Memo<Vec<usize>>,
+    matches: Memo<Vec<String>>,
     cursor: Signal<usize>,
 ) -> impl IntoElement {
     let entries = actions.entries;
-    let entry = computed(move || entries.with(|entries| entries.get(at.index()).cloned()));
+    let visible = actions.visible;
+    let entry = computed(move || {
+        visible.with(|indices| {
+            indices
+                .get(at.index())
+                .and_then(|&index| entries.with(|entries| entries.get(index).cloned()))
+        })
+    });
     view()
         .w_full()
         .px(px(theme::SPACING_LG))
         .py(px(theme::SPACING_SM))
         .style_when(
-            move || matches.with(|matches| matches.get(cursor.get()) == Some(&at.index())),
+            move || {
+                entry.with(|entry| {
+                    entry.as_ref().is_some_and(|entry| {
+                        matches.with(|matches| {
+                            matches.get(cursor.get().min(matches.len().saturating_sub(1)))
+                                == Some(&entry.id)
+                        })
+                    })
+                })
+            },
             |style| style.bg(theme::sidebar_selected_bg()),
         )
         .child(entry_element(entry, actions))
@@ -1887,6 +2071,9 @@ fn entry_element(
         attachment: on_open_attachment,
         jump,
         entries,
+        reveal,
+        open_file,
+        ..
     } = actions;
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
     let body =
@@ -1905,7 +2092,6 @@ fn entry_element(
     });
     let turn_id =
         computed(move || entry.with(|e| e.as_ref().map(|e| e.turn_id.clone()).unwrap_or_default()));
-    let process_count = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.process_count)));
     let expanded = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expanded)));
     let sequence = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.last_sequence)));
     let prompt = computed(move || {
@@ -1921,8 +2107,16 @@ fn entry_element(
     let ended_at_ms = computed(move || entry.with(|e| e.as_ref().map_or(0, |e| e.ended_at_ms)));
     let complete = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.complete)));
     let expandable = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expandable)));
-    let row_expanded = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.expanded)));
-
+    let row_id = computed(move || {
+        entry.with(|entry| {
+            entry
+                .as_ref()
+                .map(|entry| entry.id.clone())
+                .unwrap_or_default()
+        })
+    });
+    let toggle_detail: Rc<dyn Fn()> =
+        Rc::new(move || on_toggle_detail(&row_id.get_untracked(), sequence.get_untracked()));
     view()
         .w_full()
         .flex_col()
@@ -1932,6 +2126,7 @@ fn entry_element(
             move || {
                 user_bubble(
                     body,
+                    meta,
                     attachments,
                     sequence,
                     editable_sequence,
@@ -1949,10 +2144,27 @@ fn entry_element(
                         started_at_ms,
                         ended_at_ms,
                         complete,
-                        process_count,
                         expanded,
-                        turn_id,
+                        expandable,
+                        row_id,
                         on_toggle_turn.clone(),
+                    )
+                }
+            },
+        ))
+        .child(when(
+            move || kind.get() == Some(EntryKind::ActivityGroup),
+            {
+                let on_toggle_turn = on_toggle_turn.clone();
+                move || {
+                    let toggle = on_toggle_turn.clone();
+                    disclosure_header(
+                        icon!("layers"),
+                        title,
+                        streaming,
+                        expanded,
+                        expandable,
+                        move || toggle(&row_id.get_untracked()),
                     )
                 }
             },
@@ -1976,22 +2188,28 @@ fn entry_element(
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Reasoning)),
-            move || muted_prose(copy::text("Thought", "思考", "思考"), body),
+            {
+                let toggle = toggle_detail.clone();
+                move || reasoning_row(body, streaming, expanded, expandable, toggle.clone())
+            },
         ))
         .child(when(
-            move || kind.with(|kind| matches!(kind, Some(EntryKind::Tool | EntryKind::Notice))),
-            {
-                let on_toggle_detail = on_toggle_detail.clone();
-                move || {
-                    let on_toggle_detail = on_toggle_detail.clone();
-                    let toggle = Rc::new(move || {
-                        if let Some(entry) = entry.get_untracked() {
-                            on_toggle_detail(&entry.id, entry.last_sequence);
-                        }
-                    });
-                    tool_card(title, body, meta, expandable, row_expanded, toggle)
-                }
+            move || kind.get() == Some(EntryKind::Tool),
+            move || {
+                activity_row(
+                    title,
+                    body,
+                    entry,
+                    streaming,
+                    expanded,
+                    expandable,
+                    toggle_detail.clone(),
+                )
             },
+        ))
+        .child(when(
+            move || matches!(kind.get(), Some(EntryKind::Notice | EntryKind::Generating)),
+            move || muted_prose(copy::text("Activity", "活动", "活動"), body),
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Error)),
@@ -1999,7 +2217,7 @@ fn entry_element(
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Changes)),
-            move || changes_card(title, body),
+            move || changes_card(title, entry, reveal.clone(), open_file.clone()),
         ))
         .child(when(
             move || {
@@ -2011,6 +2229,7 @@ fn entry_element(
 
 fn user_bubble(
     body: Memo<String>,
+    meta: Memo<String>,
     attachments: Memo<Vec<AttachmentItem>>,
     sequence: Memo<i64>,
     editable_sequence: Signal<i64>,
@@ -2022,6 +2241,14 @@ fn user_bubble(
         .flex_col()
         .items_end()
         .gap(px(theme::SPACING_XS))
+        .child(when(
+            move || !meta.with(String::is_empty),
+            move || {
+                text(move || meta.get())
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+            },
+        ))
         .child(
             view()
                 .max_w(px(320.0))
@@ -2031,6 +2258,7 @@ fn user_bubble(
                 .py(px(theme::SPACING_SM))
                 .child(
                     text(move || body.get())
+                        .selectable(true)
                         .text_size(px(theme::font_body()))
                         .line_height(theme::line_height_for(theme::font_body()))
                         .text_color(theme::foreground),
@@ -2104,46 +2332,109 @@ fn process_header_row(
     started_at_ms: Memo<i64>,
     ended_at_ms: Memo<i64>,
     complete: Memo<bool>,
-    process_count: Memo<usize>,
     expanded: Memo<bool>,
-    turn_id: Memo<String>,
+    expandable: Memo<bool>,
+    row_id: Memo<String>,
     on_toggle: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    button()
-        .w_full()
-        .min_h(px(36.0))
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SPACING_XS))
-        .active(|style| style.opacity(0.8))
-        .on_press(move || on_toggle(&turn_id.get_untracked()))
-        .child(
-            text(move || {
-                let label = if complete.get() {
-                    copy::text("Worked for", "工作了", "工作了")
-                } else {
-                    copy::text("Working for", "工作了", "工作了")
-                };
-                format!(
-                    "{label} {}",
-                    work_duration(started_at_ms.get(), ended_at_ms.get(), complete.get())
-                )
-            })
-            .flex_1()
-            .truncate()
-            .text_size(px(theme::font_detail()))
-            .text_color(theme::text_secondary),
+    let title = computed(move || {
+        let label = if complete.get() {
+            copy::text("Worked for", "工作了", "工作了")
+        } else {
+            copy::text("Working for", "工作了", "工作了")
+        };
+        format!(
+            "{label} {}",
+            work_duration(started_at_ms.get(), ended_at_ms.get(), complete.get())
         )
-        .child(
-            text(move || process_count.get().to_string())
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-        .child(
-            text(move || if expanded.get() { "▾" } else { "▸" })
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
+    });
+    let running = computed(move || !complete.get());
+    disclosure_header(
+        icon!("activity"),
+        title,
+        running,
+        expanded,
+        expandable,
+        move || on_toggle(&row_id.get_untracked()),
+    )
+}
+
+fn disclosure_header(
+    glyph: ImageSrc,
+    title: Memo<String>,
+    running: Memo<bool>,
+    expanded: Memo<bool>,
+    expandable: Memo<bool>,
+    on_toggle: impl Fn() + 'static,
+) -> impl IntoElement {
+    let label = move || SharedString::from(title.get());
+    let content = move || {
+        view()
+            .w_full()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .child(
+                svg(glyph.clone())
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(theme::text_muted),
+            )
+            .child(
+                text(move || title.get())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(theme::font_detail()))
+                    .text_color(theme::text_secondary),
+            )
+            .child(when(
+                move || running.get(),
+                || {
+                    text(copy::text("Running", "运行中", "執行中"))
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted)
+                },
+            ))
+            .child(when(
+                move || expandable.get(),
+                move || disclosure_chevron(expanded),
+            ))
+    };
+    let action = Rc::new(on_toggle);
+    when(move || expandable.get(), {
+        let content = content.clone();
+        move || {
+            let action = action.clone();
+            button()
+                .w_full()
+                .min_h(px(theme::TOUCH_TARGET))
+                .justify_center()
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .accessibility_label(label)
+                .on_press(move || action())
+                .child(content())
+        }
+    })
+    .otherwise(move || {
+        view()
+            .w_full()
+            .min_h(px(theme::TOUCH_TARGET))
+            .justify_center()
+            .child(content())
+    })
+}
+
+fn disclosure_chevron(expanded: Memo<bool>) -> impl IntoElement {
+    dynamic(move || {
+        svg(if expanded.get() {
+            icon!("chevron-down")
+        } else {
+            icon!("chevron-right")
+        })
+        .size(px(theme::ICON_SM))
+        .flex_shrink_0()
+        .text_color(theme::text_muted)
+    })
 }
 
 fn work_duration(started_at_ms: i64, ended_at_ms: i64, complete: bool) -> String {
@@ -2283,7 +2574,7 @@ fn markdown_images(text: &str) -> Vec<String> {
 
 fn row_action(icon: ImageSrc, label: &'static str, action: impl Fn() + 'static) -> ButtonElement {
     action::icon_button(icon, label, action)
-        .size(px(32.0))
+        .size(px(theme::TOUCH_TARGET))
         .flex_shrink_0()
 }
 
@@ -2365,105 +2656,412 @@ fn muted_prose(label: &'static str, body: Memo<String>) -> impl IntoElement {
         )
 }
 
-fn tool_card(
-    title: Memo<String>,
+fn reasoning_row(
     body: Memo<String>,
-    meta: Memo<String>,
-    expandable: Memo<bool>,
+    streaming: Memo<bool>,
     expanded: Memo<bool>,
-    on_toggle: Rc<dyn Fn()>,
+    expandable: Memo<bool>,
+    toggle: Rc<dyn Fn()>,
 ) -> impl IntoElement {
+    let title = computed(move || copy::text("Thought", "思考", "思考").to_owned());
     view()
         .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_card)
-        .p(px(theme::SPACING_MD))
-        .gap(px(theme::SPACING_XS))
+        .min_w(px(0.0))
+        .child(disclosure_header(
+            icon!("brain"),
+            title,
+            streaming,
+            expanded,
+            expandable,
+            move || toggle(),
+        ))
+        .child(when(
+            move || expanded.get(),
+            move || {
+                view()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .pl(px(theme::SPACING_MD))
+                    .border_l_1()
+                    .border_color(theme::border_subtle)
+                    .style_when(
+                        move || streaming.get(),
+                        |style| {
+                            style
+                                .max_h(theme::line_height_for(theme::font_detail()) * 6.0)
+                                .overflow_hidden()
+                                .justify_end()
+                        },
+                    )
+                    .child(
+                        text_view()
+                            .markdown(move || Some(body.get().into()))
+                            .options(move || MarkdownOptions {
+                                streaming: streaming.get(),
+                                ..MarkdownOptions::default()
+                            })
+                            .flex_shrink_0()
+                            .selectable(true)
+                            .text_size(px(theme::font_detail()))
+                            .text_color(theme::text_muted),
+                    )
+            },
+        ))
+}
+
+fn activity_row(
+    title: Memo<String>,
+    body: Memo<String>,
+    entry: Memo<Option<TimelineEntry>>,
+    running: Memo<bool>,
+    expanded: Memo<bool>,
+    expandable: Memo<bool>,
+    on_toggle: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    let grouped = computed(move || {
+        entry.with(|entry| {
+            entry
+                .as_ref()
+                .and_then(|entry| entry.parent_id.as_deref())
+                .is_some_and(|id| id.starts_with("activity-group:"))
+        })
+    });
+    let activity = computed(move || {
+        entry.with(|entry| entry.as_ref().and_then(|entry| entry.activity.clone()))
+    });
+    let failed = computed(move || {
+        activity.with(|value| value.as_ref().is_some_and(|activity| activity.failed))
+    });
+    let target = computed(move || {
+        activity.with(|value| {
+            value
+                .as_ref()
+                .map(|activity| activity.target.clone())
+                .unwrap_or_default()
+        })
+    });
+    let label = move || {
+        let mut label = title.get();
+        activity.with(|value| {
+            if let Some(activity) = value.as_ref() {
+                let target = activity.path.as_deref().unwrap_or(&activity.target);
+                if !target.is_empty() {
+                    label.push(' ');
+                    label.push_str(target);
+                }
+            }
+        });
+        SharedString::from(label)
+    };
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .style_when(
+            move || grouped.get(),
+            |style| {
+                style
+                    .pl(px(theme::SPACING_SM))
+                    .border_l_1()
+                    .border_color(theme::border_subtle)
+            },
+        )
         .child(
-            view()
+            button()
+                .w_full()
+                .min_h(px(theme::TOUCH_TARGET))
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_SM))
+                .accessibility_label(label)
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .disabled(move || !expandable.get())
+                .on_press(move || on_toggle())
+                .child(dynamic(move || {
+                    svg(activity_glyph_icon(activity.with(|value| {
+                        value
+                            .as_ref()
+                            .map(|activity| activity.glyph)
+                            .unwrap_or(ActivityGlyph::Tool)
+                    })))
+                    .size(px(theme::ICON_SM))
+                    .flex_shrink_0()
+                    .text_color(move || {
+                        if failed.get() {
+                            theme::accent_red()
+                        } else {
+                            theme::text_muted()
+                        }
+                    })
+                }))
                 .child(
-                    text(move || title.get())
+                    view()
                         .flex_1()
-                        .truncate()
-                        .text_size(px(theme::font_detail()))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::foreground),
+                        .min_w(px(0.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            text(move || title.get())
+                                .min_w(px(0.0))
+                                .truncate()
+                                .text_size(px(theme::font_detail()))
+                                .text_color(theme::text_secondary),
+                        )
+                        .child(when(
+                            move || !target.with(String::is_empty),
+                            move || {
+                                text(move || target.get())
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_detail()))
+                                    .text_color(theme::text_muted)
+                            },
+                        )),
                 )
                 .child(
-                    text(move || meta.get())
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
+                    text(move || {
+                        if failed.get() {
+                            copy::text("Failed", "失败", "失敗").to_owned()
+                        } else if running.get() {
+                            copy::text("Running", "运行中", "執行中").to_owned()
+                        } else {
+                            activity.with(|value| {
+                                value
+                                    .as_ref()
+                                    .and_then(|activity| activity.duration.clone())
+                                    .unwrap_or_default()
+                            })
+                        }
+                    })
+                    .flex_shrink_0()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(move || {
+                        if failed.get() {
+                            theme::accent_red()
+                        } else {
+                            theme::text_muted()
+                        }
+                    }),
                 )
                 .child(when(
                     move || expandable.get(),
-                    move || {
-                        let on_toggle = on_toggle.clone();
-                        button()
-                            .on_press(move || on_toggle())
-                            .min_h(px(24.0))
-                            .px(px(theme::SPACING_XS))
-                            .items_center()
-                            .child(
-                                text(move || {
-                                    if expanded.get() {
-                                        copy::text("Hide", "收起", "收起")
-                                    } else {
-                                        copy::text("Detail", "详情", "詳情")
-                                    }
-                                })
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
-                            )
-                    },
+                    move || disclosure_chevron(expanded),
                 )),
         )
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::font_caption()))
-                .line_height(theme::line_height_for(theme::font_caption()))
-                .text_color(theme::text_secondary),
-        )
+        .child(when(
+            move || failed.get() && !expanded.get(),
+            move || {
+                text(move || {
+                    activity.with(|value| {
+                        value
+                            .as_ref()
+                            .and_then(|activity| activity.error.clone())
+                            .unwrap_or_default()
+                    })
+                })
+                .truncate()
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::accent_red)
+            },
+        ))
+        .child(when(
+            move || expanded.get(),
+            move || activity_details_view(activity, body),
+        ))
 }
 
-fn changes_card(title: Memo<String>, body: Memo<String>) -> impl IntoElement {
+fn activity_glyph_icon(glyph: ActivityGlyph) -> ImageSrc {
+    match glyph {
+        ActivityGlyph::Command => icon!("terminal"),
+        ActivityGlyph::Search => icon!("search"),
+        ActivityGlyph::Directory => icon!("folder-open"),
+        ActivityGlyph::Read => icon!("file-text"),
+        ActivityGlyph::Edit => icon!("file-code"),
+        ActivityGlyph::Create => icon!("file-plus"),
+        ActivityGlyph::Delete => icon!("trash-2"),
+        ActivityGlyph::Plan => icon!("list-checks"),
+        ActivityGlyph::Agent => icon!("bot"),
+        ActivityGlyph::Image => icon!("image"),
+        ActivityGlyph::Integration => icon!("plug-zap"),
+        ActivityGlyph::Web => icon!("globe"),
+        ActivityGlyph::Retry => icon!("refresh"),
+        ActivityGlyph::Tool => icon!("wrench"),
+    }
+}
+
+fn activity_details_view(
+    activity: Memo<Option<ActivityView>>,
+    body: Memo<String>,
+) -> impl IntoElement {
+    dynamic(move || {
+        let (details_loading, details_pending) = activity.with(|activity| {
+            activity.as_ref().map_or((false, false), |activity| {
+                (activity.details_loading, activity.details_pending)
+            })
+        });
+        let details = activity
+            .with(|activity| activity.as_ref().map(|activity| activity.details.clone()))
+            .unwrap_or_else(|| {
+                let body = body.get();
+                vec![ActivityDetail {
+                    label: copy::text("Details", "详情", "詳細資料").to_owned(),
+                    text: body.clone(),
+                    copy: body,
+                }]
+            });
+        view()
+            .w_full()
+            .min_w(px(0.0))
+            .gap(px(theme::SPACING_XS))
+            .pl(px(theme::SPACING_MD))
+            .border_l_1()
+            .border_color(theme::border_subtle)
+            .when(details.is_empty(), |body| {
+                body.child(
+                    text(if details_loading {
+                        copy::text("Loading details…", "正在加载详情…", "正在載入詳細資料…")
+                    } else if details_pending {
+                        copy::text("Details unavailable", "详情不可用", "詳細資料無法使用")
+                    } else {
+                        copy::text("No details", "没有详情", "沒有詳細資料")
+                    })
+                    .text_size(px(theme::font_caption()))
+                    .text_color(theme::text_muted),
+                )
+            })
+            .children(details.into_iter().map(|detail| {
+                let label = copy::text("Copy {label}", "复制{label}", "複製{label}")
+                    .replace("{label}", &detail.label);
+                view()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .child(
+                        view()
+                            .w_full()
+                            .flex_row()
+                            .items_center()
+                            .child(
+                                text(detail.label)
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .text_size(px(theme::font_micro()))
+                                    .text_color(theme::text_muted),
+                            )
+                            .child(
+                                row_action(
+                                    icon!("copy"),
+                                    copy::text("Copy detail", "复制详情", "複製詳細資料"),
+                                    move || set_clipboard(detail.copy.clone()),
+                                )
+                                .accessibility_label(label),
+                            ),
+                    )
+                    .child(
+                        scroll().max_h(px(192.0)).w_full().child(
+                            text(detail.text)
+                                .w_full()
+                                .font_family("monospace")
+                                .selectable(true)
+                                .text_size(px(theme::font_caption()))
+                                .text_color(theme::text_secondary),
+                        ),
+                    )
+            }))
+    })
+}
+
+fn changes_card(
+    title: Memo<String>,
+    entry: Memo<Option<TimelineEntry>>,
+    reveal: RevealRow,
+    open_file: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    const PREVIEW_FILES: usize = 3;
+    let files = computed(move || {
+        entry.with(|entry| {
+            entry
+                .as_ref()
+                .map(|entry| entry.changed_files.clone())
+                .unwrap_or_default()
+        })
+    });
+    let expanded = signal(false);
+    let expandable = computed(move || files.with(|files| files.len() > PREVIEW_FILES));
     view()
         .w_full()
         .rounded(px(theme::RADIUS_CONTROL))
         .border_1()
         .border_color(theme::border_subtle)
         .bg(theme::background_card)
-        .p(px(theme::SPACING_MD))
+        .px(px(theme::SPACING_MD))
         .gap(px(theme::SPACING_XS))
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(theme::SPACING_XS))
-                .child(
-                    svg(icon(include_str!("../../../assets/icons/file-text.svg")))
-                        .w(px(theme::ICON_SM))
-                        .h(px(theme::ICON_SM))
-                        .text_color(theme::text_muted),
-                )
-                .child(
-                    text(move || title.get())
-                        .flex_1()
-                        .text_size(px(theme::font_detail()))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::foreground),
-                ),
-        )
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::font_micro()))
-                .line_height(theme::line_height_for(theme::font_micro()))
-                .text_color(theme::text_secondary),
-        )
+        .child(disclosure_header(
+            icon!("file-code"),
+            title,
+            computed(|| false),
+            computed(move || expanded.get()),
+            expandable,
+            move || expanded.update(|expanded| *expanded = !*expanded),
+        ))
+        .child(each(
+            move || {
+                files.with(|files| {
+                    files
+                        .iter()
+                        .take(if expanded.get() {
+                            files.len()
+                        } else {
+                            PREVIEW_FILES
+                        })
+                        .cloned()
+                        .collect::<Vec<_>>()
+                })
+            },
+            |file| file.path.clone(),
+            move |file, _| {
+                let open_file = open_file.clone();
+                let reveal = reveal.clone();
+                view()
+                    .w_full()
+                    .min_w(px(0.0))
+                    .flex_row()
+                    .items_center()
+                    .border_t_1()
+                    .border_color(theme::border_subtle)
+                    .child(
+                        button()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .min_h(px(theme::TOUCH_TARGET))
+                            .justify_center()
+                            .items_start()
+                            .accessibility_label(move || {
+                                file.with(|file| SharedString::from(file.path.clone()))
+                            })
+                            .disabled(move || file.with(|file| file.deleted))
+                            .active(|style| style.bg(theme::row_pressed_bg()))
+                            .child(
+                                text(move || file.with(|file| file.path.clone()))
+                                    .w_full()
+                                    .truncate()
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::text_secondary),
+                            )
+                            .on_press(move || {
+                                open_file(&file.with_untracked(|file| file.path.clone()))
+                            }),
+                    )
+                    .child(
+                        action::icon_button(
+                            icon!("chevrons-right-left"),
+                            copy::text("View changes", "查看变更", "檢視變更"),
+                            move || reveal(&file.with_untracked(|file| file.row_id.clone()), true),
+                        )
+                        .flex_shrink_0(),
+                    )
+            },
+        ))
 }
 
 fn decision_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> impl IntoElement {

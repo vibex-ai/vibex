@@ -11244,6 +11244,7 @@ dependencies = [
  "vibex-mobile-pairing",
  "vibex-nsh-ui",
  "vibex-remote-client",
+ "vibex-ui",
 ]
 
 [[package]]
