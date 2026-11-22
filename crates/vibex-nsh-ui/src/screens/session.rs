@@ -4526,21 +4526,19 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                         open.set(false);
                     }
                 })
+                .pt_safe_area()
                 .pb_safe_area_plus(px(theme::SPACING_MD))
                 .child(
                     view()
                         .h(px(56.0))
-                        .relative()
                         .px(px(theme::SPACING_LG))
                         .flex_row()
                         .items_center()
                         .gap(px(theme::SPACING_SM))
                         .child(
                             view()
-                                .absolute()
-                                .left(px(theme::SPACING_LG))
-                                .top(px(35.0))
-                                .w(px(150.0))
+                                .flex_1()
+                                .min_w(px(0.0))
                                 .flex_row()
                                 .items_center()
                                 .gap(px(1.0))
@@ -4562,7 +4560,6 @@ fn drawer(host: SessionHost, open: Signal<bool>) -> impl IntoElement {
                                         .text_color(theme::foreground),
                                 ),
                         )
-                        .child(view().flex_1())
                         .child({
                             let on_new_session = on_new_session.clone();
                             drawer_header_button(
