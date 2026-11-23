@@ -45,22 +45,23 @@ use vibex_core::{
     GitWorktreeOperationStatus, GitWorktreeRestoreRequest, GoalAction, GoalPhase,
     MessageAttachment, MessageProvenance, OpenWorkspaceRequest, PermissionRequest,
     PermissionRequestStatus, PermissionResolution, PermissionResponseKind, PlanStepStatus,
-    RemoteServerKind, RemoteSidebarHierarchyMode, RemoteSidebarItemKind,
-    RemoteSidebarOrganizationMutation, RemoteSidebarOrganizationSnapshot,
-    RenameAgentSessionRequest, RequestId, ResolveElicitationRequest, ResolvePermissionRequest,
-    RuntimeModelSelection, RuntimeOptionAvailability, RuntimeSelectionInteraction,
-    SendAgentMessageRequest, SessionRuntimeFeatureKind, SessionRuntimeOption,
-    SessionRuntimeOptionCatalog, SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest,
-    TeamSnapshotRequest, TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
+    ProjectId, RemoteServerKind, RemoteSidebarHierarchyMode, RemoteSidebarItemKind,
+    RemoteSidebarNewSessionLocation, RemoteSidebarOrganizationMutation,
+    RemoteSidebarOrganizationSnapshot, RenameAgentSessionRequest, RequestId,
+    ResolveElicitationRequest, ResolvePermissionRequest, RuntimeModelSelection,
+    RuntimeOptionAvailability, RuntimeSelectionInteraction, SendAgentMessageRequest,
+    SessionRuntimeFeatureKind, SessionRuntimeOption, SessionRuntimeOptionCatalog,
+    SessionRuntimeSelection, SetDesiredAgentSessionRuntimeRequest, TeamSnapshotRequest,
+    TeamTaskAction, TeamTaskControlRequest, TerminalCreateRequest, TerminalId,
     TerminalResizeRequest, TerminalSession, TerminalStatus, TerminalWriteRequest, TimelinePage,
     TimelinePayload, UserMessageDelivery, VibexSessionId, VibexUseMention, VibexUseRef,
     WorkspaceId, unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     FileIconKind, FileTreeLoadState, FileTreeProjection, GitPathSelectionState, GitQueryKind,
-    GitTreeRowKind, GitWorkbenchState, ReasoningDisplayMode, SidebarHierarchyMode,
-    SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo, SidebarProjectLogoColor,
-    TimelineConversationTurn, TimelineModel, TimelineRow, TimelineRowKind,
+    GitTreeRowKind, GitWorkbenchState, NewSessionLocation, ReasoningDisplayMode,
+    SidebarHierarchyMode, SidebarOrganizationView, SidebarProjectAppearance, SidebarProjectLogo,
+    SidebarProjectLogoColor, TimelineConversationTurn, TimelineModel, TimelineRow, TimelineRowKind,
 };
 use vibex_mobile_pairing::MobileCredentialBundle;
 use vibex_nsh_ui::{
@@ -80,9 +81,9 @@ use vibex_nsh_ui::{
         PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
         PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
         QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
-        RuntimeOptionView, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-        SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView, SidebarTree,
-        TimelineEntry, TokenUsageView, TurnFileChange,
+        RuntimeOptionView, RuntimeSummaryView, ScheduledSendView, SessionHost, SessionState,
+        SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView,
+        SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -238,6 +239,8 @@ pub struct SessionService {
     session_actions: Signal<Option<String>>,
     session_rename: Signal<String>,
     session_busy: Signal<bool>,
+    auto_continue_paused: Signal<Vec<String>>,
+    scheduled_sends: Signal<Vec<ScheduledSendView>>,
     new_session_open: Signal<bool>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -255,6 +258,9 @@ pub struct SessionService {
     new_title: Signal<String>,
     new_prompt: Signal<String>,
     new_attachments: Signal<Vec<AttachmentItem>>,
+    /// The folder a session created from its row menu is filed into once the
+    /// runtime answers. The folder row's menu promises that destination.
+    new_session_folder: Signal<Option<String>>,
     new_busy: Signal<bool>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Signal<Vec<WorkspaceSummary>>,
@@ -459,6 +465,8 @@ impl SessionService {
             session_actions: signal(None),
             session_rename: signal(String::new()),
             session_busy: signal(false),
+            auto_continue_paused: signal(Vec::new()),
+            scheduled_sends: signal(Vec::new()),
             new_session_open: signal(false),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
@@ -476,6 +484,7 @@ impl SessionService {
             new_title: signal(String::new()),
             new_prompt: signal(String::new()),
             new_attachments: signal(Vec::new()),
+            new_session_folder: signal(None),
             new_busy: signal(false),
             new_error: signal(None),
             workspace_records: signal(Vec::new()),
@@ -644,6 +653,10 @@ impl SessionService {
             on_set_group_pinned: {
                 let service = self.clone();
                 Rc::new(move |id: &str, pinned: bool| service.set_group_pinned(id, pinned))
+            },
+            on_set_group_auto_continue: {
+                let service = self.clone();
+                Rc::new(move |id: &str, enabled: bool| service.set_group_auto_continue(id, enabled))
             },
             on_set_session_auto_continue: {
                 let service = self.clone();
@@ -856,6 +869,34 @@ impl SessionService {
             session_actions: self.session_actions,
             session_rename: self.session_rename,
             session_busy: self.session_busy,
+            auto_continue_paused: self.auto_continue_paused,
+            scheduled_sends: self.scheduled_sends,
+            on_resume_auto_continue: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.resume_auto_continue(id))
+            },
+            on_cancel_scheduled_send: {
+                let service = self.clone();
+                Rc::new(move |id: &str, message: u64| service.cancel_scheduled_send(id, message))
+            },
+            on_reschedule_scheduled_send: {
+                let service = self.clone();
+                Rc::new(move |id: &str, message: u64, seconds: u64| {
+                    service.reschedule_scheduled_send(id, message, seconds)
+                })
+            },
+            on_set_folder_auto_archive: {
+                let service = self.clone();
+                Rc::new(move |id: &str, days: Option<u8>| service.set_folder_auto_archive(id, days))
+            },
+            on_toggle_project_new_session_location: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.toggle_project_new_session_location(id))
+            },
+            on_remove_project: {
+                let service = self.clone();
+                Rc::new(move |id: &str| service.remove_project(id))
+            },
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
             new_runtimes: self.new_runtimes,
@@ -2775,15 +2816,99 @@ impl SessionService {
         let Some(message_id) = *self.scheduled_message_id.borrow() else {
             return;
         };
+        self.cancel_scheduled_send(&active, message_id);
+    }
+
+    /// Takes the deadline off one queued message, leaving it queued.
+    fn cancel_scheduled_send(&self, session_id: &str, message_id: u64) {
         let service = self.clone();
+        let session_id = session_id.to_owned();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::SetScheduledSend {
-                session_id: active.clone(),
+                session_id,
                 message_id,
                 scheduled_at_ms: None,
             };
             if let Err(error) = service.submit_sidebar(mutation, None).await {
                 service.fail(&error);
+            }
+        });
+    }
+
+    /// Moves one queued message's deadline to `seconds` from now.
+    fn reschedule_scheduled_send(&self, session_id: &str, message_id: u64, seconds: u64) {
+        let service = self.clone();
+        let session_id = session_id.to_owned();
+        let due = unix_timestamp_ms() + (seconds as i64) * 1000;
+        spawn(async move {
+            let mutation = RemoteSidebarOrganizationMutation::SetScheduledSend {
+                session_id,
+                message_id,
+                scheduled_at_ms: Some(due),
+            };
+            if let Err(error) = service.submit_sidebar(mutation, None).await {
+                service.fail(&error);
+            }
+        });
+    }
+
+    fn set_folder_auto_archive(&self, folder_id: &str, days: Option<u8>) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+            folder_id: folder_id.to_owned(),
+            days,
+        });
+    }
+
+    fn toggle_project_new_session_location(&self, project_id: &str) {
+        let next = match self
+            .sidebar_view
+            .with(|view| view.project_location_preferences.get(project_id).copied())
+        {
+            Some(NewSessionLocation::NewWorktree) => {
+                RemoteSidebarNewSessionLocation::CurrentCheckout
+            }
+            _ => RemoteSidebarNewSessionLocation::NewWorktree,
+        };
+        self.sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetProjectNewSessionLocation {
+                project_id: project_id.to_owned(),
+                location: next,
+            },
+        );
+    }
+
+    fn resume_auto_continue(&self, id: &str) {
+        self.sidebar_mutation(
+            RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
+                session_ids: vec![id.to_owned()],
+                paused: false,
+            },
+        );
+    }
+
+    fn remove_project(&self, id: &str) {
+        let Ok(project_id) = ProjectId::parse(id) else {
+            return;
+        };
+        let service = self.clone();
+        let backend = self.workspace_backend.clone();
+        spawn(async move {
+            let result = crate::runtime::handle()
+                .spawn(async move {
+                    backend
+                        .delete_project(MutationRequest::new(project_id))
+                        .await
+                })
+                .await;
+            match result {
+                Ok(Ok(())) => {
+                    service.reload_sessions().await;
+                }
+                Ok(Err(error)) => service.fail(&error),
+                Err(error) => service.fail(&BackendError::failed(
+                    "project_remove_task_failed",
+                    format!("removing the project did not finish: {error}"),
+                )),
             }
         });
     }
@@ -2832,6 +2957,8 @@ impl SessionService {
         let Some(active) = self.active.get_untracked() else {
             self.queued.set(Vec::new());
             self.queue_paused.set(false);
+            self.scheduled.set(false);
+            *self.scheduled_message_id.borrow_mut() = None;
             return;
         };
         let snapshot = self.sidebar_snapshot.borrow();
@@ -2840,6 +2967,12 @@ impl SessionService {
             .set(snapshot.paused_queue_session_ids.contains(&active));
         self.queue_manual
             .set(snapshot.manual_queue_session_ids.contains(&active));
+        let schedule = snapshot
+            .scheduled_sends
+            .iter()
+            .find(|send| send.session_id == active);
+        self.scheduled.set(schedule.is_some());
+        *self.scheduled_message_id.borrow_mut() = schedule.map(|send| send.message_id);
     }
 
     fn send_queued(&self, id: u64) {
@@ -4460,6 +4593,29 @@ impl SessionService {
             SidebarHierarchyMode::Compact
         };
         self.sidebar_detailed.set(detailed);
+        self.auto_continue_paused
+            .set(snapshot.auto_continue_paused_session_ids.clone());
+        self.scheduled_sends.set(
+            snapshot
+                .scheduled_sends
+                .iter()
+                .map(|send| ScheduledSendView {
+                    session_id: send.session_id.clone(),
+                    message_id: send.message_id,
+                    scheduled_at_ms: send.scheduled_at_ms,
+                })
+                .collect(),
+        );
+        let group_auto_continue = snapshot
+            .groups
+            .iter()
+            .map(|group| {
+                (
+                    group.id.clone(),
+                    view.auto_continue_group_enabled(group.auto_continue, &group.project_id),
+                )
+            })
+            .collect::<BTreeMap<_, _>>();
         self.sidebar_view.set(view);
         self.pinned.set(snapshot.pinned_session_ids.clone());
         self.unread.set(snapshot.unread_session_ids.clone());
@@ -4514,11 +4670,14 @@ impl SessionService {
                 pinned: false,
                 id: folder.id.clone(),
                 project_id: folder.project_id.clone(),
+                workspace_id: folder.workspace_id.clone(),
                 parent_id: folder_parents.get(&folder.id).cloned(),
                 depth: folder_depth(&folder.id),
                 collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
                 name: folder.name.clone(),
                 session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
+                auto_archive_after_days: folder.auto_archive_after_days,
+                auto_continue: false,
             });
         }
         for group in &snapshot.groups {
@@ -4527,11 +4686,14 @@ impl SessionService {
                 pinned: group.pinned,
                 id: group.id.clone(),
                 project_id: Some(group.project_id.clone()),
+                workspace_id: Some(group.workspace_id.clone()),
                 parent_id: folder_parents.get(&group.id).cloned(),
                 depth: 0,
                 collapsed: snapshot.collapsed_group_ids.contains(&group.id),
                 name: group.name.clone(),
                 session_ids: group.member_session_ids.clone(),
+                auto_archive_after_days: None,
+                auto_continue: group_auto_continue.get(&group.id).copied().unwrap_or(false),
             });
         }
         self.sidebar_sections.set(sections);
@@ -4585,10 +4747,23 @@ impl SessionService {
                 let service = self.clone();
                 Rc::new(move |row, delta| service.move_sidebar_row(row, delta))
             },
+            on_move_row_step: {
+                let service = self.clone();
+                Rc::new(move |row, upwards| service.move_sidebar_row_step(row, upwards))
+            },
+            row_move_targets: {
+                let service = self.clone();
+                Rc::new(move |row| service.sidebar_move_targets(row))
+            },
             on_new_session: {
                 let service = self.clone();
                 Rc::new(move |row| {
-                    service.open_new_session_in(row.workspace_id.clone(), row.project_id.clone())
+                    let folder = (row.kind == SidebarRowKind::Folder).then(|| row.id.clone());
+                    service.open_new_session_in(
+                        row.workspace_id.clone(),
+                        row.project_id.clone(),
+                        folder,
+                    )
                 })
             },
             on_new_folder: {
@@ -4772,6 +4947,10 @@ impl SessionService {
                                 .iter()
                                 .any(|send| send.session_id == id),
                             state: row.state.map(display_state),
+                            project_starts_in_worktree: kind == SidebarRowKind::Project
+                                && view.project_location_preferences.get(id).is_some_and(
+                                    |location| *location == NewSessionLocation::NewWorktree,
+                                ),
                         }
                     })
                     .collect()
@@ -4863,6 +5042,115 @@ impl SessionService {
         }
     }
 
+    /// Whether one row has a sibling above and below it in its own scope.
+    fn sidebar_move_targets(&self, row: &SidebarRowView) -> (bool, bool) {
+        let rows = untracked(|| {
+            self.sidebar_view
+                .with(|view| self.projected_sidebar(view, ""))
+        });
+        let same_scope = |candidate: &&sidebar::SidebarRow| {
+            if row.kind == SidebarRowKind::Workspace {
+                candidate.kind == sidebar::SidebarRowKind::Workspace
+                    && candidate.project_id == row.project_id
+            } else {
+                matches!(
+                    candidate.kind,
+                    sidebar::SidebarRowKind::Session
+                        | sidebar::SidebarRowKind::Folder
+                        | sidebar::SidebarRowKind::Group
+                ) && candidate.project_id == row.project_id
+                    && candidate.workspace_id == row.workspace_id
+                    && (candidate.indent - row.indent).abs() < f32::EPSILON
+            }
+        };
+        let siblings = rows.iter().filter(same_scope).collect::<Vec<_>>();
+        let Some(index) = siblings.iter().position(|candidate| {
+            sidebar_kind(candidate.kind) == row.kind && candidate.id() == row.id
+        }) else {
+            return (false, false);
+        };
+        (index > 0, index + 1 < siblings.len())
+    }
+
+    /// Moves one row one step against the sibling beside it. A phone cannot
+    /// drop a row it picked up on every platform, so the sheet carries the
+    /// same move the drag performs.
+    fn move_sidebar_row_step(&self, row: &SidebarRowView, upwards: bool) {
+        let rows = untracked(|| {
+            self.sidebar_view
+                .with(|view| self.projected_sidebar(view, ""))
+        });
+        let same_scope = |candidate: &&sidebar::SidebarRow| {
+            if row.kind == SidebarRowKind::Workspace {
+                candidate.kind == sidebar::SidebarRowKind::Workspace
+                    && candidate.project_id == row.project_id
+            } else {
+                matches!(
+                    candidate.kind,
+                    sidebar::SidebarRowKind::Session
+                        | sidebar::SidebarRowKind::Folder
+                        | sidebar::SidebarRowKind::Group
+                ) && candidate.project_id == row.project_id
+                    && candidate.workspace_id == row.workspace_id
+                    && (candidate.indent - row.indent).abs() < f32::EPSILON
+            }
+        };
+        let siblings = rows.iter().filter(same_scope).collect::<Vec<_>>();
+        let Some(index) = siblings.iter().position(|candidate| {
+            sidebar_kind(candidate.kind) == row.kind && candidate.id() == row.id
+        }) else {
+            return;
+        };
+        let target = if upwards {
+            index.checked_sub(1)
+        } else {
+            (index + 1 < siblings.len()).then_some(index + 1)
+        };
+        let Some(anchor) = target.and_then(|target| siblings.get(target)) else {
+            return;
+        };
+        let position = if upwards {
+            vibex_core::RemoteSidebarDropPosition::Before
+        } else {
+            vibex_core::RemoteSidebarDropPosition::After
+        };
+        if row.kind == SidebarRowKind::Workspace {
+            self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveWorkspaces {
+                project_id: row.project_id.clone().unwrap_or_default(),
+                workspace_ids: vec![row.workspace_id.clone().unwrap_or_default()],
+                anchor_workspace_id: Some(anchor.id().to_owned()),
+                position,
+            });
+            return;
+        }
+        let item_ref = |candidate: &sidebar::SidebarRow| {
+            let kind = match candidate.kind {
+                sidebar::SidebarRowKind::Folder => RemoteSidebarItemKind::Folder,
+                sidebar::SidebarRowKind::Group => RemoteSidebarItemKind::Group,
+                sidebar::SidebarRowKind::Project => RemoteSidebarItemKind::Project,
+                _ => RemoteSidebarItemKind::Session,
+            };
+            vibex_core::RemoteSidebarItemRef {
+                kind,
+                id: candidate.id().to_owned(),
+            }
+        };
+        let moved_kind = match row.kind {
+            SidebarRowKind::Folder => RemoteSidebarItemKind::Folder,
+            SidebarRowKind::Group => RemoteSidebarItemKind::Group,
+            _ => RemoteSidebarItemKind::Session,
+        };
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveItems {
+            items: vec![vibex_core::RemoteSidebarItemRef {
+                kind: moved_kind,
+                id: row.id.clone(),
+            }],
+            anchor: Some(item_ref(anchor)),
+            position,
+            project_id: row.project_id.clone(),
+        });
+    }
+
     fn sidebar_mutations(&self, mut operations: Vec<RemoteSidebarOrganizationMutation>) {
         operations.reverse();
         self.next_sidebar_mutation(Rc::new(RefCell::new(operations)));
@@ -4944,6 +5232,13 @@ impl SessionService {
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupPinned {
             group_id: id.to_owned(),
             pinned,
+        });
+    }
+
+    fn set_group_auto_continue(&self, id: &str, enabled: bool) {
+        self.sidebar_mutation(RemoteSidebarOrganizationMutation::SetGroupAutoContinue {
+            group_id: id.to_owned(),
+            enabled,
         });
     }
 
@@ -5150,14 +5445,20 @@ impl SessionService {
                 .find(|session| session.id.as_str() == active)
                 .map(|session| session.workspace_id.as_str().to_owned())
         });
-        self.open_new_session_in(workspace, None);
+        self.open_new_session_in(workspace, None, None);
     }
 
-    fn open_new_session_in(&self, workspace: Option<String>, project: Option<String>) {
+    fn open_new_session_in(
+        &self,
+        workspace: Option<String>,
+        project: Option<String>,
+        folder: Option<String>,
+    ) {
         if self.new_busy.get_untracked() || self.new_session_open.get_untracked() {
             return;
         }
         self.new_session_open.set(true);
+        self.new_session_folder.set(folder);
         self.new_error.set(None);
         self.new_title.set(String::new());
         self.new_prompt.set(String::new());
@@ -5327,6 +5628,36 @@ impl SessionService {
         }
         self.new_session_open.set(false);
         self.record_sidebar_session(&session);
+        if let Some(folder) = self.new_session_folder.get_untracked()
+            && self.sidebar_sections.with(|sections| {
+                sections.iter().any(|section| {
+                    section.kind == SidebarSectionKind::Folder
+                        && section.id == folder
+                        && section
+                            .project_id
+                            .as_deref()
+                            .is_none_or(|project| project == session.project_id.as_str())
+                        && section
+                            .workspace_id
+                            .as_deref()
+                            .is_none_or(|workspace| workspace == session.workspace_id.as_str())
+                })
+            })
+        {
+            self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveItems {
+                items: vec![vibex_core::RemoteSidebarItemRef {
+                    kind: RemoteSidebarItemKind::Session,
+                    id: session.id.as_str().to_owned(),
+                }],
+                anchor: Some(vibex_core::RemoteSidebarItemRef {
+                    kind: RemoteSidebarItemKind::Folder,
+                    id: folder,
+                }),
+                position: vibex_core::RemoteSidebarDropPosition::Into,
+                project_id: Some(session.project_id.as_str().to_owned()),
+            });
+        }
+        self.new_session_folder.set(None);
         self.refresh();
         self.open(session.id.as_str());
         if !draft.text.is_empty() || !draft.attachments.is_empty() {

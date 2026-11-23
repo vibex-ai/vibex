@@ -53,6 +53,9 @@ pub struct SidebarRowView {
     pub auto_continue_paused: bool,
     pub scheduled: bool,
     pub state: Option<SessionState>,
+    /// Whether a project's new sessions start in a fresh worktree. The row
+    /// menu flips the same preference the desktop keeps per project.
+    pub project_starts_in_worktree: bool,
 }
 
 impl SidebarRowView {
@@ -65,6 +68,8 @@ type Rows = Rc<dyn Fn(&str) -> Vec<SidebarRowView>>;
 type RowAction = Rc<dyn Fn(&SidebarRowView)>;
 type BatchScope = Rc<dyn Fn(&SidebarRowView) -> Vec<String>>;
 type MoveRow = Rc<dyn Fn(&SidebarRowView, f32)>;
+type MoveRowStep = Rc<dyn Fn(&SidebarRowView, bool)>;
+type MoveTargets = Rc<dyn Fn(&SidebarRowView) -> (bool, bool)>;
 
 #[derive(Clone)]
 pub struct SidebarTree {
@@ -78,6 +83,24 @@ pub struct SidebarTree {
     pub on_new_session: RowAction,
     pub on_new_folder: RowAction,
     pub batch_scope: BatchScope,
+    /// Moves one row one step up or down, for the menu entry a finger cannot
+    /// reach by dragging in a sheet.
+    pub on_move_row_step: MoveRowStep,
+    /// Whether a row has a neighbour above and below it, so the menu only
+    /// offers a move that can happen.
+    pub row_move_targets: MoveTargets,
+}
+
+impl SidebarTree {
+    /// One row as the list currently projects it.
+    ///
+    /// The actions sheet is not inside the list, so it asks for the row it was
+    /// opened on rather than carrying a second copy of the tree.
+    pub fn row(&self, kind: SidebarRowKind, id: &str) -> Option<SidebarRowView> {
+        (self.rows)("")
+            .into_iter()
+            .find(|row| row.kind == kind && row.id == id)
+    }
 }
 
 #[derive(Clone)]
@@ -362,15 +385,22 @@ fn row_item(
                             view()
                                 .flex_1()
                                 .min_w(px(0.0))
+                                .overflow_hidden()
                                 .flex_col()
                                 .child(
                                     view()
+                                        .w_full()
+                                        .min_w(px(0.0))
+                                        .overflow_hidden()
                                         .flex_row()
                                         .items_center()
                                         .gap(px(theme::SPACING_XS))
                                         .child(
                                             text(row.title.clone())
+                                                .flex_shrink(1.0)
                                                 .min_w(px(0.0))
+                                                .max_w(relative(1.0))
+                                                .overflow_hidden()
                                                 .truncate()
                                                 .text_size(px(theme::font_sidebar_row()))
                                                 .font_weight(
@@ -410,6 +440,9 @@ fn row_item(
                                 )
                                 .children(detail.into_iter().map(|detail| {
                                     text(detail)
+                                        .min_w(px(0.0))
+                                        .max_w(relative(1.0))
+                                        .overflow_hidden()
                                         .truncate()
                                         .text_size(px(theme::font_hint()))
                                         .text_color(theme::sidebar_text_muted)

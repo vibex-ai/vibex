@@ -216,13 +216,32 @@ fn FolderShell() -> impl IntoElement {
         kind: SidebarSectionKind::Folder,
         pinned: false,
         project_id: Some("p1".to_owned()),
+        workspace_id: None,
         parent_id: None,
         depth: 0,
         collapsed: false,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
         session_ids: vec!["s2".to_owned()],
+        auto_archive_after_days: None,
+        auto_continue: false,
     }]);
+    session::session(host)
+}
+
+/// A title far wider than the drawer, for the ellipsis check.
+const DRAWER_LONG_TITLE: &str =
+    "A session title long enough that the drawer has to cut it with an ellipsis";
+
+/// A shell whose first session has a title wider than the drawer.
+#[component]
+fn DrawerLongTitleShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.update(|sessions| {
+        if let Some(session) = sessions.first_mut() {
+            session.title = DRAWER_LONG_TITLE.to_owned();
+        }
+    });
     session::session(host)
 }
 
@@ -234,12 +253,15 @@ fn GroupShell() -> impl IntoElement {
         kind: SidebarSectionKind::Group,
         pinned: false,
         project_id: Some("p1".to_owned()),
+        workspace_id: None,
         parent_id: None,
         depth: 0,
         collapsed: false,
         id: "group-1".to_owned(),
         name: "Pair".to_owned(),
         session_ids: vec!["s1".to_owned(), "s2".to_owned()],
+        auto_archive_after_days: None,
+        auto_continue: false,
     }]);
     session::session(host)
 }
@@ -252,12 +274,15 @@ fn CollapsedFolderShell() -> impl IntoElement {
         kind: SidebarSectionKind::Folder,
         pinned: false,
         project_id: Some("p1".to_owned()),
+        workspace_id: None,
         parent_id: None,
         depth: 0,
         collapsed: true,
         id: "folder-1".to_owned(),
         name: "Work".to_owned(),
         session_ids: vec!["s2".to_owned()],
+        auto_archive_after_days: None,
+        auto_continue: false,
     }]);
     session::session(host)
 }
@@ -511,6 +536,8 @@ fn sidebar_fixture(
         on_collapse_all: Rc::new(|| {}),
         on_reveal_active: Rc::new(|| {}),
         on_move_row: Rc::new(|_, _| {}),
+        on_move_row_step: Rc::new(|_, _| {}),
+        row_move_targets: Rc::new(|_| (false, false)),
         on_new_session: Rc::new(|_| {}),
         on_new_folder: Rc::new(|_| {}),
         batch_scope: Rc::new(move |row| {
@@ -990,6 +1017,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_delete_group: Rc::new(|_| {}),
         on_set_group_members: Rc::new(|_, _| {}),
         on_set_group_pinned: Rc::new(|_, _| {}),
+        on_set_group_auto_continue: Rc::new(|_, _| {}),
         on_create_group: Rc::new(|_, _| {}),
         move_open,
         on_open_move: Rc::new(move || {
@@ -1207,6 +1235,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         session_actions,
         session_rename,
         session_busy,
+        auto_continue_paused: signal(Vec::new()),
+        scheduled_sends: signal(Vec::new()),
+        on_resume_auto_continue: Rc::new(|_| {}),
+        on_cancel_scheduled_send: Rc::new(|_, _| {}),
+        on_reschedule_scheduled_send: Rc::new(|_, _, _| {}),
+        on_set_folder_auto_archive: Rc::new(|_, _| {}),
+        on_toggle_project_new_session_location: Rc::new(|_| {}),
+        on_remove_project: Rc::new(|_| {}),
         on_session_menu,
         on_close_session_actions: Rc::new(|| {}),
         on_rename_session,
@@ -1611,6 +1647,34 @@ fn a_collapsed_folder_hides_its_sessions() {
 }
 
 #[test]
+fn a_long_row_title_is_ellipsized_instead_of_widening_the_drawer() {
+    let mut config = EngineConfig::new(Root::of::<DrawerLongTitleShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for(DRAWER_LONG_TITLE).unwrap();
+    let node = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == DRAWER_LONG_TITLE)
+        })
+        .expect("the long title is on screen");
+    let text = node.text.expect("the node carries its text");
+    assert_eq!(text.text.max_lines, 1, "the title is one line");
+    assert_eq!(text.text.ellipsize, nsh_core::EllipsizeMode::Tail);
+    assert!(
+        text.content.size.width.0 < 340.0,
+        "the title is cut to the row, not laid out at {}pt wide",
+        text.content.size.width.0
+    );
+}
+
+#[test]
 fn a_group_opens_its_actions() {
     let mut config = EngineConfig::new(Root::of::<GroupShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
@@ -1620,8 +1684,10 @@ fn a_group_opens_its_actions() {
     app.wait_for("Pair").unwrap();
     app.press("role:button[Group actions]").unwrap();
     app.wait_for("Session group").unwrap();
-    assert!(app.screen().shows("Pin group"));
-    app.press("Members").unwrap();
+    assert!(app.screen().shows("Pin"));
+    assert!(app.screen().shows("Auto continue"));
+    assert!(app.screen().shows("Dissolve group"));
+    app.press("Edit members").unwrap();
     app.wait_for("Group members").unwrap();
 }
 
@@ -1661,6 +1727,45 @@ fn a_sidebar_folder_groups_its_sessions() {
     assert!(app.screen().shows("Fix the tests"));
     app.press("role:button[Folder actions]").unwrap();
     app.wait_for("Rename").unwrap();
+}
+
+#[test]
+fn the_project_row_menu_carries_the_desktop_actions() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Project actions]").unwrap();
+    app.press("role:button[Project actions]").unwrap();
+    app.wait_for("New session").unwrap();
+    assert!(app.screen().shows("New folder"));
+    assert!(app.screen().shows("Start sessions in a new worktree"));
+    assert!(app.screen().shows("Remove project"));
+}
+
+#[test]
+fn the_folder_row_menu_carries_the_desktop_actions() {
+    let mut config = EngineConfig::new(Root::of::<FolderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Work").unwrap();
+    app.press("role:button[Folder actions]").unwrap();
+    app.wait_for("New chat in folder Work").unwrap();
+    assert!(app.screen().shows("Scheduled archive · Off"));
+    assert!(app.screen().shows("Delete"));
+}
+
+#[test]
+fn the_session_row_menu_carries_the_desktop_actions() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[Session actions]").unwrap();
+    app.wait_for("Fork session").unwrap();
+    assert!(app.screen().shows("Auto continue"));
+    assert!(app.screen().shows("Pin"));
 }
 
 #[test]

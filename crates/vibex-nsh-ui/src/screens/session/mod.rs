@@ -252,11 +252,30 @@ pub struct SidebarSectionView {
     /// The project a folder or group belongs to; `None` only for a legacy
     /// runtime-wide section.
     pub project_id: Option<String>,
+    /// The worktree a group is anchored to, for the session-row menus that
+    /// offer to join a group in the same scope.
+    pub workspace_id: Option<String>,
     pub parent_id: Option<String>,
     pub depth: usize,
     pub collapsed: bool,
     pub name: String,
     pub session_ids: Vec<String>,
+    /// The idle days after which a folder archives its own sessions.
+    pub auto_archive_after_days: Option<u8>,
+    /// Whether automatic continuation is on for every member of a group.
+    pub auto_continue: bool,
+}
+
+/// One message a session is holding for a later hour.
+///
+/// The row menu addresses the holder's queue entry, so the id travels with
+/// the session it belongs to; a sheet that only knew the session could not
+/// cancel or move the deadline.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ScheduledSendView {
+    pub session_id: String,
+    pub message_id: u64,
+    pub scheduled_at_ms: i64,
 }
 
 /// A prompt waiting for the running turn to settle.
@@ -467,6 +486,9 @@ type EditMessage = Rc<dyn Fn(i64, &str)>;
 type OpenAttachment = Rc<dyn Fn(&AttachmentItem)>;
 type BatchAction = Rc<dyn Fn(&[String])>;
 type FolderNameAction = Rc<dyn Fn(&str, &str)>;
+type CancelScheduledAction = Rc<dyn Fn(&str, u64)>;
+type RescheduleScheduledAction = Rc<dyn Fn(&str, u64, u64)>;
+type FolderArchiveAction = Rc<dyn Fn(&str, Option<u8>)>;
 type CreateGroupAction = Rc<dyn Fn(&str, &[String])>;
 type CollapseAction = SessionToggle;
 type SessionToggle = Rc<dyn Fn(&str, bool)>;
@@ -522,6 +544,7 @@ pub struct SessionHost {
     pub on_delete_group: Rc<dyn Fn(&str)>,
     pub on_set_group_members: CreateGroupAction,
     pub on_set_group_pinned: SessionToggle,
+    pub on_set_group_auto_continue: SessionToggle,
     pub on_create_group: CreateGroupAction,
     pub move_open: Signal<Option<String>>,
     pub on_open_move: Action,
@@ -731,6 +754,19 @@ pub struct SessionHost {
     /// The title being edited in that sheet.
     pub session_rename: Signal<String>,
     pub session_busy: Signal<bool>,
+    /// Sessions whose automatic continuation the reader suspended. The row
+    /// menu lifts a suspension; only the badge used to read it.
+    pub auto_continue_paused: Signal<Vec<String>>,
+    /// The messages the holder is waiting to send later, by session.
+    pub scheduled_sends: Signal<Vec<ScheduledSendView>>,
+    pub on_resume_auto_continue: Rc<dyn Fn(&str)>,
+    pub on_cancel_scheduled_send: CancelScheduledAction,
+    /// Moves a held send to `seconds` from now, the other half of the same
+    /// deadline the schedule menu asks about.
+    pub on_reschedule_scheduled_send: RescheduleScheduledAction,
+    pub on_set_folder_auto_archive: FolderArchiveAction,
+    pub on_toggle_project_new_session_location: Rc<dyn Fn(&str)>,
+    pub on_remove_project: Rc<dyn Fn(&str)>,
     pub on_session_menu: SessionMenu,
     pub on_pin_sessions: BatchAction,
     pub on_fork_sessions: BatchAction,
@@ -1081,6 +1117,7 @@ fn shell(host: SessionHost, pager: Pager, tab: Signal<WorkbenchTab>) -> impl Int
     let composer_input = element_ref();
     let jump_to_message = signal(None::<i64>);
     let runtime_panel = signal(RuntimePanel::Model);
+    let reschedule_send = signal(None::<(String, u64)>);
 
     view()
         .flex_1()
@@ -1165,7 +1202,11 @@ fn shell(host: SessionHost, pager: Pager, tab: Signal<WorkbenchTab>) -> impl Int
         ))
         .child(runtime_sheet(host.clone(), runtime_panel))
         .child(history_sheet(host.clone(), jump_to_message, composer_input))
-        .child(session_actions_sheet(&host))
+        .child(session_actions_sheet(&host, reschedule_send))
+        .child(scheduled_send_sheet(
+            reschedule_send,
+            host.on_reschedule_scheduled_send.clone(),
+        ))
         .child(attachment_preview_sheet(
             host.attachment_preview,
             host.on_close_attachment.clone(),
@@ -5434,7 +5475,10 @@ fn sheet_action(
         )
 }
 
-fn session_actions_sheet(host: &SessionHost) -> impl IntoElement + use<> {
+fn session_actions_sheet(
+    host: &SessionHost,
+    reschedule: Signal<Option<(String, u64)>>,
+) -> impl IntoElement + use<> {
     let actions = host.session_actions;
     let rename = host.session_rename;
     let busy = host.session_busy;
@@ -5443,20 +5487,102 @@ fn session_actions_sheet(host: &SessionHost) -> impl IntoElement + use<> {
     let on_move = host.on_open_move.clone();
     let auto_continue = host.auto_continue_sessions;
     let on_toggle_auto_continue = host.on_set_session_auto_continue.clone();
+    let paused = host.auto_continue_paused;
+    let on_resume_auto_continue = host.on_resume_auto_continue.clone();
+    let scheduled_sends = host.scheduled_sends;
+    let on_cancel_scheduled = host.on_cancel_scheduled_send.clone();
     let pinned = host.pinned;
     let on_toggle_pin = host.on_toggle_pin.clone();
+    let on_fork = host.on_fork_sessions.clone();
+    let sections = host.sidebar_sections;
+    let sessions = host.sessions;
+    let on_set_group_members = host.on_set_group_members.clone();
+    let tree = host.sidebar.clone();
+    let on_move_row_step = host.sidebar.on_move_row_step.clone();
+    let row_move_targets = host.sidebar.row_move_targets.clone();
     let on_archive = host.on_archive_session.clone();
     let on_delete = host.on_delete_session.clone();
     let on_open_team = host.on_open_team.clone();
     let open = computed(move || actions.get().is_some());
+    // The group the session already belongs to. A session belongs to at most
+    // one, so leaving it and joining one are the two halves of one question.
+    let group = computed(move || {
+        let id = actions.get()?;
+        sections.with(|sections| {
+            sections
+                .iter()
+                .find(|section| {
+                    section.kind == SidebarSectionKind::Group
+                        && section.session_ids.iter().any(|member| member == &id)
+                })
+                .cloned()
+        })
+    });
+    // Groups the session could join: the same project and worktree, since a
+    // group is a pane layout over one checkout.
+    let join_groups = computed(move || {
+        let id = actions.get()?;
+        let (project_id, workspace_id) = sessions.with(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.id == id)
+                .map(|session| (session.project_id.clone(), session.workspace_id.clone()))
+        })?;
+        Some(sections.with(|sections| {
+            sections
+                .iter()
+                .filter(|section| {
+                    section.kind == SidebarSectionKind::Group
+                        && section.project_id.as_deref() == Some(project_id.as_str())
+                        && section.workspace_id.as_deref() == Some(workspace_id.as_str())
+                        && !section.session_ids.iter().any(|member| member == &id)
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        }))
+    });
+    let send = computed(move || {
+        let id = actions.get()?;
+        scheduled_sends.with(|sends| sends.iter().find(|send| send.session_id == id).cloned())
+    });
+    let auto_continue_on = computed(move || {
+        actions.with(|id| {
+            id.as_ref().is_some_and(|id| {
+                auto_continue.with(|sessions| sessions.iter().any(|candidate| candidate == id))
+            })
+        })
+    });
+    let pinned_now = computed(move || {
+        actions.with(|id| {
+            id.as_ref().is_some_and(|id| {
+                pinned.with(|pinned| pinned.iter().any(|candidate| candidate == id))
+            })
+        })
+    });
+    let paused_now = computed(move || {
+        actions.with(|id| {
+            id.as_ref().is_some_and(|id| {
+                paused.with(|paused| paused.iter().any(|candidate| candidate == id))
+            })
+        })
+    });
+    let move_row = computed(move || {
+        let id = actions.get()?;
+        let row = tree.row(SidebarRowKind::Session, &id)?;
+        let targets = row_move_targets(&row);
+        Some((row, targets))
+    });
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = event
-                && !next
-            {
-                on_close();
+        .on_open_change({
+            let on_close = on_close.clone();
+            move |event: &SheetEvent| {
+                if let SheetEvent::OpenChange(next, _) = event
+                    && !next
+                {
+                    on_close();
+                }
             }
         })
         .child(
@@ -5502,119 +5628,368 @@ fn session_actions_sheet(host: &SessionHost) -> impl IntoElement + use<> {
                         }),
                 )
                 .child(
-                    view()
-                        .w_full()
-                        .pt(px(4.0))
-                        .child({
-                            let on_move = on_move.clone();
-                            sheet_action(
-                                copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
-                                icon(include_str!("../../../assets/icons/folder.svg")),
-                                false,
-                                None,
-                                move || on_move(),
-                            )
-                        })
-                        .child({
-                            let on_open_team = on_open_team.clone();
-                            sheet_action(
-                                copy::text("Team", "团队", "團隊"),
-                                icon(include_str!("../../../assets/icons/bot.svg")),
-                                false,
-                                None,
-                                move || on_open_team(),
-                            )
-                        })
-                        .child({
-                            let on_toggle_auto_continue = on_toggle_auto_continue.clone();
-                            sheet_action(
+                    scroll().max_h(px(480.0)).child(
+                        view()
+                            .w_full()
+                            .pt(px(4.0))
+                            .child({
+                                let on_archive = on_archive.clone();
+                                sheet_action(
+                                    copy::text("Archive", "归档", "封存"),
+                                    icon(include_str!("../../../assets/icons/package.svg")),
+                                    false,
+                                    Some(busy),
+                                    move || on_archive(),
+                                )
+                            })
+                            .child({
+                                let on_delete = on_delete.clone();
+                                sheet_action(
+                                    copy::text("Delete", "删除", "刪除"),
+                                    icon(include_str!("../../../assets/icons/trash-2.svg")),
+                                    true,
+                                    Some(busy),
+                                    move || on_delete(),
+                                )
+                            })
+                            .child(when(move || group.with(Option::is_some), {
+                                let on_set_group_members = on_set_group_members.clone();
                                 move || {
-                                    let enabled = actions.with(|id| {
-                                        id.as_ref().is_some_and(|id| {
-                                            auto_continue.with(|sessions| {
-                                                sessions.iter().any(|candidate| candidate == id)
-                                            })
-                                        })
-                                    });
-                                    if enabled {
+                                    let on_set_group_members = on_set_group_members.clone();
+                                    sheet_action(
                                         copy::text(
-                                            "Auto-continue on",
-                                            "自动继续已开",
-                                            "自動繼續已開",
+                                            "Remove from session group",
+                                            "移出会话组",
+                                            "移出會話組",
+                                        ),
+                                        icon(include_str!("../../../assets/icons/layers.svg")),
+                                        false,
+                                        None,
+                                        move || {
+                                            let Some(group) = group.get_untracked() else {
+                                                return;
+                                            };
+                                            let Some(id) = actions.get_untracked() else {
+                                                return;
+                                            };
+                                            let members = group
+                                                .session_ids
+                                                .iter()
+                                                .filter(|member| **member != id)
+                                                .cloned()
+                                                .collect::<Vec<_>>();
+                                            on_set_group_members(&group.id, &members);
+                                        },
+                                    )
+                                }
+                            }))
+                            .child(each(
+                                move || join_groups.get().unwrap_or_default(),
+                                |group| group.id.clone(),
+                                {
+                                    let on_set_group_members = on_set_group_members.clone();
+                                    move |group, _| {
+                                        let on_set_group_members = on_set_group_members.clone();
+                                        let target: SidebarSectionView = group.get_untracked();
+                                        let name = target.name.clone();
+                                        let label = add_to_group_label(&name);
+                                        sheet_action(
+                                            label,
+                                            icon(include_str!("../../../assets/icons/layers.svg")),
+                                            false,
+                                            None,
+                                            move || {
+                                                let Some(id) = actions.get_untracked() else {
+                                                    return;
+                                                };
+                                                let mut members = group.get_untracked().session_ids;
+                                                members.push(id);
+                                                on_set_group_members(&target.id, &members);
+                                            },
                                         )
-                                    } else {
+                                    }
+                                },
+                            ))
+                            .child(when(move || send.with(Option::is_some), {
+                                let on_cancel_scheduled = on_cancel_scheduled.clone();
+                                move || {
+                                    let on_cancel_scheduled = on_cancel_scheduled.clone();
+                                    sheet_action(
                                         copy::text(
-                                            "Auto-continue off",
-                                            "自动继续已关",
-                                            "自動繼續已關",
+                                            "Cancel scheduled send",
+                                            "取消定时发送",
+                                            "取消定時傳送",
+                                        ),
+                                        icon(include_str!("../../../assets/icons/x.svg")),
+                                        true,
+                                        None,
+                                        move || {
+                                            let Some(send) = send.get_untracked() else {
+                                                return;
+                                            };
+                                            on_cancel_scheduled(&send.session_id, send.message_id);
+                                        },
+                                    )
+                                }
+                            }))
+                            .child(when(move || send.with(Option::is_some), {
+                                let on_close = on_close.clone();
+                                move || {
+                                    let on_close = on_close.clone();
+                                    sheet_action(
+                                        copy::text("Send later instead", "改期发送", "改期傳送"),
+                                        icon(include_str!("../../../assets/icons/clock.svg")),
+                                        false,
+                                        None,
+                                        move || {
+                                            let Some(send) = send.get_untracked() else {
+                                                return;
+                                            };
+                                            on_close();
+                                            reschedule
+                                                .set(Some((send.session_id, send.message_id)));
+                                        },
+                                    )
+                                }
+                            }))
+                            .child(when(move || paused_now.get(), {
+                                let on_resume_auto_continue = on_resume_auto_continue.clone();
+                                move || {
+                                    let on_resume_auto_continue = on_resume_auto_continue.clone();
+                                    sheet_action(
+                                        copy::text(
+                                            "Resume auto continue",
+                                            "恢复自动继续",
+                                            "恢復自動繼續",
+                                        ),
+                                        icon(include_str!("../../../assets/icons/rotate-ccw.svg")),
+                                        false,
+                                        None,
+                                        move || {
+                                            if let Some(id) = actions.get_untracked() {
+                                                on_resume_auto_continue(&id);
+                                            }
+                                        },
+                                    )
+                                }
+                            }))
+                            .child({
+                                let on_fork = on_fork.clone();
+                                sheet_action(
+                                    copy::text("Fork session", "分叉会话", "分支會話"),
+                                    icon(include_str!("../../../assets/icons/git-branch.svg")),
+                                    false,
+                                    None,
+                                    move || {
+                                        if let Some(id) = actions.get_untracked() {
+                                            on_fork(std::slice::from_ref(&id));
+                                        }
+                                    },
+                                )
+                            })
+                            .child({
+                                let on_toggle_auto_continue = on_toggle_auto_continue.clone();
+                                sheet_action(
+                                    move || {
+                                        if auto_continue_on.get() {
+                                            copy::text(
+                                                "Disable auto continue",
+                                                "关闭自动继续",
+                                                "關閉自動繼續",
+                                            )
+                                        } else {
+                                            copy::text("Auto continue", "自动继续", "自動繼續")
+                                        }
+                                    },
+                                    icon(include_str!("../../../assets/icons/send.svg")),
+                                    false,
+                                    None,
+                                    move || {
+                                        if let Some(id) = actions.get_untracked() {
+                                            on_toggle_auto_continue(
+                                                &id,
+                                                !auto_continue_on.get_untracked(),
+                                            );
+                                        }
+                                    },
+                                )
+                            })
+                            .child({
+                                let on_toggle_pin = on_toggle_pin.clone();
+                                sheet_action(
+                                    move || {
+                                        if pinned_now.get() {
+                                            copy::text("Unpin", "取消置顶", "取消置頂")
+                                        } else {
+                                            copy::text("Pin", "置顶", "置頂")
+                                        }
+                                    },
+                                    icon(include_str!("../../../assets/icons/pin.svg")),
+                                    false,
+                                    None,
+                                    move || {
+                                        if let Some(id) = actions.get_untracked() {
+                                            on_toggle_pin(&id);
+                                        }
+                                    },
+                                )
+                            })
+                            .child(when(
+                                move || {
+                                    move_row.with(|state| {
+                                        state.as_ref().is_some_and(|(_, (up, _))| *up)
+                                    })
+                                },
+                                {
+                                    let on_move_row_step = on_move_row_step.clone();
+                                    move || {
+                                        let on_move_row_step = on_move_row_step.clone();
+                                        sheet_action(
+                                            copy::text("Move up", "上移", "上移"),
+                                            icon(include_str!(
+                                                "../../../assets/icons/chevron-up.svg"
+                                            )),
+                                            false,
+                                            None,
+                                            move || {
+                                                if let Some((row, _)) = move_row.get_untracked() {
+                                                    on_move_row_step(&row, true);
+                                                }
+                                            },
                                         )
                                     }
                                 },
-                                icon(include_str!("../../../assets/icons/send.svg")),
-                                false,
-                                None,
+                            ))
+                            .child(when(
                                 move || {
-                                    if let Some(id) = actions.get_untracked() {
-                                        let enabled = auto_continue.with(|sessions| {
-                                            sessions.iter().any(|candidate| candidate == &id)
-                                        });
-                                        on_toggle_auto_continue(&id, !enabled);
+                                    move_row.with(|state| {
+                                        state.as_ref().is_some_and(|(_, (_, down))| *down)
+                                    })
+                                },
+                                {
+                                    let on_move_row_step = on_move_row_step.clone();
+                                    move || {
+                                        let on_move_row_step = on_move_row_step.clone();
+                                        sheet_action(
+                                            copy::text("Move down", "下移", "下移"),
+                                            icon(include_str!(
+                                                "../../../assets/icons/chevron-down.svg"
+                                            )),
+                                            false,
+                                            None,
+                                            move || {
+                                                if let Some((row, _)) = move_row.get_untracked() {
+                                                    on_move_row_step(&row, false);
+                                                }
+                                            },
+                                        )
                                     }
                                 },
-                            )
-                        })
-                        .child({
-                            let on_toggle_pin = on_toggle_pin.clone();
-                            sheet_action(
-                                move || {
-                                    let pinned = actions.with(|id| {
-                                        id.as_ref().is_some_and(|id| {
-                                            pinned.with(|pinned| {
-                                                pinned.iter().any(|candidate| candidate == id)
-                                            })
-                                        })
-                                    });
-                                    if pinned {
-                                        copy::text("Unpin", "取消置顶", "取消置頂")
-                                    } else {
-                                        copy::text("Pin", "置顶", "置頂")
-                                    }
-                                },
-                                icon(include_str!("../../../assets/icons/check.svg")),
-                                false,
-                                None,
-                                move || {
-                                    if let Some(id) = actions.get_untracked() {
-                                        on_toggle_pin(&id);
-                                    }
-                                },
-                            )
-                        })
-                        .child({
-                            let on_archive = on_archive.clone();
-                            sheet_action(
-                                copy::text("Archive", "归档", "封存"),
-                                icon(include_str!("../../../assets/icons/folder.svg")),
-                                false,
-                                Some(busy),
-                                move || on_archive(),
-                            )
-                        })
-                        .child({
-                            let on_delete = on_delete.clone();
-                            sheet_action(
-                                copy::text("Delete", "删除", "刪除"),
-                                icon(include_str!("../../../assets/icons/x.svg")),
-                                true,
-                                Some(busy),
-                                move || on_delete(),
-                            )
-                        }),
+                            ))
+                            .child({
+                                let on_move = on_move.clone();
+                                sheet_action(
+                                    copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
+                                    icon(include_str!("../../../assets/icons/folder.svg")),
+                                    false,
+                                    None,
+                                    move || on_move(),
+                                )
+                            })
+                            .child({
+                                let on_open_team = on_open_team.clone();
+                                sheet_action(
+                                    copy::text("Team", "团队", "團隊"),
+                                    icon(include_str!("../../../assets/icons/bot.svg")),
+                                    false,
+                                    None,
+                                    move || on_open_team(),
+                                )
+                            }),
+                    ),
                 ),
         )
 }
 
-/// The session drawer, from the left edge.
+/// Moves one held send to a new hour. The same three answers the composer's
+/// schedule menu offers, because a deadline is a deadline whichever side of
+/// the conversation set it.
+fn scheduled_send_sheet(
+    open: Signal<Option<(String, u64)>>,
+    on_reschedule: RescheduleScheduledAction,
+) -> impl IntoElement {
+    let choices = [
+        (
+            copy::text("In 5 minutes", "5 分钟后", "5 分鐘後"),
+            5 * 60u64,
+        ),
+        (
+            copy::text("In 30 minutes", "30 分钟后", "30 分鐘後"),
+            30 * 60u64,
+        ),
+        (copy::text("In 1 hour", "1 小时后", "1 小時後"), 60 * 60u64),
+    ];
+    sheet()
+        .open(move || Some(open.get().is_some()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                open.set(None);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
+                .child(
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Send later", "稍后发送", "稍後傳送"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .pt(px(4.0))
+                        .children(choices.iter().map(|(label, seconds)| {
+                            let label = *label;
+                            let seconds = *seconds;
+                            let on_reschedule = on_reschedule.clone();
+                            sheet_action(
+                                label,
+                                icon(include_str!("../../../assets/icons/clock.svg")),
+                                false,
+                                None,
+                                move || {
+                                    let Some((session_id, message_id)) = open.get_untracked()
+                                    else {
+                                        return;
+                                    };
+                                    open.set(None);
+                                    on_reschedule(&session_id, message_id, seconds);
+                                },
+                            )
+                        }))
+                        .child(sheet_action(
+                            copy::text("Cancel", "取消", "取消"),
+                            icon(include_str!("../../../assets/icons/x.svg")),
+                            false,
+                            None,
+                            move || open.set(None),
+                        )),
+                ),
+        )
+}
+
 fn move_session_sheet(
     open: Signal<Option<String>>,
     sections: Signal<Vec<SidebarSectionView>>,
@@ -5908,6 +6283,7 @@ fn drawer_tool(
 }
 
 fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
+    let menu_host = host.clone();
     let sessions = host.sessions;
     let active = host.active;
     let search_open = signal(false);
@@ -5940,6 +6316,7 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
     let on_rename_folder = host.on_rename_folder.clone();
     let on_delete_folder = host.on_delete_folder.clone();
     let folder_actions = signal(None::<String>);
+    let folder_archive = signal(None::<String>);
     let folder_rename = signal(String::new());
     let group_actions = signal(None::<String>);
     let group_rename = signal(String::new());
@@ -5947,6 +6324,7 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
     let members_selected = signal(Vec::<String>::new());
     let on_set_group_members = host.on_set_group_members.clone();
     let on_set_group_pinned = host.on_set_group_pinned.clone();
+    let on_set_group_auto_continue = host.on_set_group_auto_continue.clone();
     let on_rename_group = host.on_rename_group.clone();
     let on_delete_group = host.on_delete_group.clone();
 
@@ -6260,22 +6638,9 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                     group_rename,
                     on_rename_group.clone(),
                     on_delete_group.clone(),
-                    {
-                        let on_set_group_pinned = on_set_group_pinned.clone();
-                        let sections = sidebar_sections;
-                        Rc::new(move || {
-                            if let Some(id) = group_actions.get_untracked() {
-                                let pinned = sections.with(|sections| {
-                                    sections
-                                        .iter()
-                                        .find(|section| section.id == id)
-                                        .is_some_and(|section| section.pinned)
-                                });
-                                on_set_group_pinned(&id, !pinned);
-                                group_actions.set(None);
-                            }
-                        })
-                    },
+                    sidebar_sections,
+                    on_set_group_pinned.clone(),
+                    on_set_group_auto_continue.clone(),
                     {
                         let sections = sidebar_sections;
                         Rc::new(move || {
@@ -6307,6 +6672,7 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                     selected,
                 ))
                 .child(folder_actions_sheet(
+                    &menu_host,
                     folder_actions,
                     folder_rename,
                     on_rename_folder.clone(),
@@ -6320,6 +6686,12 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                             }
                         })
                     },
+                    Rc::new(move |id: &str| folder_archive.set(Some(id.to_owned()))),
+                ))
+                .child(folder_archive_sheet(
+                    folder_archive,
+                    menu_host.sidebar_sections,
+                    menu_host.on_set_folder_auto_archive.clone(),
                 ))
                 .child(folder_sheet(
                     folder_open,
@@ -6420,11 +6792,19 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                     root_menu,
                     host.on_open_folder.clone(),
                 ))
-                .child(drawer_scope_menu(scope_menu, host.sidebar))
+                .child(drawer_scope_menu(scope_menu, &menu_host))
 }
 
-fn drawer_scope_menu(scope: Signal<Option<SidebarRowView>>, host: SidebarTree) -> impl IntoElement {
+fn drawer_scope_menu(
+    scope: Signal<Option<SidebarRowView>>,
+    host: &SessionHost,
+) -> impl IntoElement {
     use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_entry, sheet_header};
+    let tree = host.sidebar.clone();
+    let on_toggle_location = host.on_toggle_project_new_session_location.clone();
+    let on_remove = host.on_remove_project.clone();
+    let sessions = host.sessions;
+    let row = computed(move || scope.get());
     bottom_sheet(
         move || scope.with(Option::is_some),
         move || scope.set(None),
@@ -6445,10 +6825,13 @@ fn drawer_scope_menu(scope: Signal<Option<SidebarRowView>>, host: SidebarTree) -
                         icon!("plus"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         false,
-                        move || {
-                            if let Some(row) = scope.get_untracked() {
-                                scope.set(None);
-                                (host.on_new_session)(&row);
+                        {
+                            let tree = tree.clone();
+                            move || {
+                                if let Some(row) = scope.get_untracked() {
+                                    scope.set(None);
+                                    (tree.on_new_session)(&row);
+                                }
                             }
                         },
                     ))
@@ -6456,26 +6839,145 @@ fn drawer_scope_menu(scope: Signal<Option<SidebarRowView>>, host: SidebarTree) -
                         icon!("folder-open"),
                         copy::text("New folder", "新建文件夹", "新增資料夾"),
                         false,
-                        move || {
-                            if let Some(row) = scope.get_untracked() {
-                                scope.set(None);
-                                (host.on_new_folder)(&row);
+                        {
+                            let tree = tree.clone();
+                            move || {
+                                if let Some(row) = scope.get_untracked() {
+                                    scope.set(None);
+                                    (tree.on_new_folder)(&row);
+                                }
                             }
+                        },
+                    ))
+                    .child(when(
+                        move || row.with(|row| row.as_ref().is_some_and(|row| row.kind == SidebarRowKind::Project)),
+                        {
+                            let on_toggle_location = on_toggle_location.clone();
+                            move || {
+                                let on_toggle_location = on_toggle_location.clone();
+                                sheet_entry(
+                                    icon!("git-branch"),
+                                    move || {
+                                        let starts_in_worktree = row.with(|row| {
+                                            row.as_ref()
+                                                .is_some_and(|row| row.project_starts_in_worktree)
+                                        });
+                                        if starts_in_worktree {
+                                            copy::text(
+                                                "Start sessions in the checkout",
+                                                "默认在当前检出中开始",
+                                                "預設在目前檢出中開始",
+                                            )
+                                        } else {
+                                            copy::text(
+                                                "Start sessions in a new worktree",
+                                                "默认在新建 Worktree 中开始",
+                                                "預設在新建 Worktree 中開始",
+                                            )
+                                        }
+                                    },
+                                    false,
+                                    move || {
+                                        if let Some(row) = scope.get_untracked() {
+                                            scope.set(None);
+                                            on_toggle_location(&row.id);
+                                        }
+                                    },
+                                )
+                            }
+                        },
+                    ))
+                    .child(when(
+                        move || row.with(|row| row.as_ref().is_some_and(|row| row.kind == SidebarRowKind::Project)),
+                        move || {
+                            let on_remove = on_remove.clone();
+                            sheet_entry(
+                                icon!("trash-2"),
+                                copy::text("Remove project", "移除项目", "移除專案"),
+                                true,
+                                move || {
+                                    let Some(row) = scope.get_untracked() else {
+                                        return;
+                                    };
+                                    scope.set(None);
+                                    let project_id = row.id;
+                                    let count = sessions.with(|sessions| {
+                                        sessions
+                                            .iter()
+                                            .filter(|session| session.project_id == project_id)
+                                            .count()
+                                    });
+                                    let on_remove = on_remove.clone();
+                                    spawn(async move {
+                                        let answer = nsh_base::alert_dialog()
+                                            .title(copy::text(
+                                                "Remove this project?",
+                                                "移除该项目？",
+                                                "移除該專案？",
+                                            ))
+                                            .description(format!(
+                                                "{} {}",
+                                                count,
+                                                copy::text(
+                                                    "sessions leave the workbench with it. Nothing on disk is deleted.",
+                                                    "个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                                                    "個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                                                )
+                                            ))
+                                            .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                                            .destructive(
+                                                "remove",
+                                                copy::text("Remove", "移除", "移除"),
+                                            )
+                                            .show()
+                                            .await;
+                                        if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("remove"))
+                                        {
+                                            on_remove(&project_id);
+                                        }
+                                    });
+                                },
+                            )
                         },
                     )),
             ),
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn group_actions_sheet(
     action: Signal<Option<String>>,
     name: Signal<String>,
     on_rename: FolderNameAction,
     on_delete: Rc<dyn Fn(&str)>,
-    on_pin: Action,
+    sections: Signal<Vec<SidebarSectionView>>,
+    on_pin: SessionToggle,
+    on_auto_continue: SessionToggle,
     on_members: Action,
 ) -> impl IntoElement {
     let open = computed(move || action.get().is_some());
+    let pinned = computed(move || {
+        let Some(id) = action.get() else {
+            return false;
+        };
+        sections.with(|sections| {
+            sections
+                .iter()
+                .find(|section| section.id == id)
+                .is_some_and(|section| section.pinned)
+        })
+    });
+    let auto_continue = computed(move || {
+        let Some(id) = action.get() else {
+            return false;
+        };
+        sections.with(|sections| {
+            sections
+                .iter()
+                .find(|section| section.id == id)
+                .is_some_and(|section| section.auto_continue)
+        })
+    });
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -6530,18 +7032,53 @@ fn group_actions_sheet(
                         .child({
                             let on_pin = on_pin.clone();
                             sheet_action(
-                                copy::text("Pin group", "置顶分组", "置頂分組"),
-                                icon(include_str!("../../../assets/icons/check.svg")),
+                                move || {
+                                    if pinned.get() {
+                                        copy::text("Unpin", "取消置顶", "取消置頂")
+                                    } else {
+                                        copy::text("Pin", "置顶", "置頂")
+                                    }
+                                },
+                                icon(include_str!("../../../assets/icons/pin.svg")),
                                 false,
                                 None,
-                                move || on_pin(),
+                                move || {
+                                    if let Some(id) = action.get_untracked() {
+                                        on_pin(&id, !pinned.get_untracked());
+                                        action.set(None);
+                                    }
+                                },
+                            )
+                        })
+                        .child({
+                            let on_auto_continue = on_auto_continue.clone();
+                            sheet_action(
+                                move || {
+                                    if auto_continue.get() {
+                                        copy::text(
+                                            "Disable auto continue",
+                                            "关闭自动继续",
+                                            "關閉自動繼續",
+                                        )
+                                    } else {
+                                        copy::text("Auto continue", "自动继续", "自動繼續")
+                                    }
+                                },
+                                icon(include_str!("../../../assets/icons/rotate-ccw.svg")),
+                                false,
+                                None,
+                                move || {
+                                    if let Some(id) = action.get_untracked() {
+                                        on_auto_continue(&id, !auto_continue.get_untracked());
+                                    }
+                                },
                             )
                         })
                         .child({
                             let on_members = on_members.clone();
                             sheet_action(
-                                copy::text("Members", "成员", "成員"),
-                                icon(include_str!("../../../assets/icons/bot.svg")),
+                                copy::text("Edit members", "编辑成员", "編輯成員"),
+                                icon(include_str!("../../../assets/icons/user.svg")),
                                 false,
                                 None,
                                 move || on_members(),
@@ -6550,8 +7087,8 @@ fn group_actions_sheet(
                         .child({
                             let on_delete = on_delete.clone();
                             sheet_action(
-                                copy::text("Delete", "删除", "刪除"),
-                                icon(include_str!("../../../assets/icons/x.svg")),
+                                copy::text("Dissolve group", "解散分组", "解散群組"),
+                                icon(include_str!("../../../assets/icons/layers.svg")),
                                 true,
                                 None,
                                 move || {
@@ -6708,13 +7245,47 @@ fn group_sheet(
 }
 
 fn folder_actions_sheet(
+    host: &SessionHost,
     action: Signal<Option<String>>,
     name: Signal<String>,
     on_rename: FolderNameAction,
     on_delete: Rc<dyn Fn(&str)>,
     on_new_subfolder: Action,
+    on_archive: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     let open = computed(move || action.get().is_some());
+    let tree = host.sidebar.clone();
+    let sections = host.sidebar_sections;
+    let on_new_session = host.sidebar.on_new_session.clone();
+    let on_move_row_step = host.sidebar.on_move_row_step.clone();
+    let row_move_targets = host.sidebar.row_move_targets.clone();
+    let label_tree = tree.clone();
+    let new_session_label = computed(move || {
+        let id = action.get()?;
+        let row = label_tree.row(SidebarRowKind::Folder, &id)?;
+        Some(new_chat_in_folder_label(&row.title))
+    });
+    let archive_label = computed(move || {
+        let id = action.get()?;
+        let days = sections.with(|sections| {
+            sections
+                .iter()
+                .find(|section| section.kind == SidebarSectionKind::Folder && section.id == id)
+                .and_then(|section| section.auto_archive_after_days)
+        });
+        Some(format!(
+            "{} · {}",
+            copy::text("Scheduled archive", "定时归档", "定時封存"),
+            folder_archive_label(days)
+        ))
+    });
+    let move_tree = tree.clone();
+    let move_row = computed(move || {
+        let id = action.get()?;
+        let row = move_tree.row(SidebarRowKind::Folder, &id)?;
+        let targets = row_move_targets(&row);
+        Some((row, targets))
+    });
     sheet()
         .open(move || Some(open.get()))
         .close_on_swipe(true)
@@ -6767,20 +7338,61 @@ fn folder_actions_sheet(
                         .w_full()
                         .pt(px(4.0))
                         .child({
+                            let on_new_session = on_new_session.clone();
+                            sheet_action(
+                                move || {
+                                    new_session_label
+                                        .get()
+                                        .unwrap_or_else(|| "New session".to_owned())
+                                },
+                                icon(include_str!("../../../assets/icons/message-square.svg")),
+                                false,
+                                None,
+                                move || {
+                                    let Some(id) = action.get_untracked() else {
+                                        return;
+                                    };
+                                    action.set(None);
+                                    if let Some(row) = tree.row(SidebarRowKind::Folder, &id) {
+                                        on_new_session(&row);
+                                    }
+                                },
+                            )
+                        })
+                        .child({
                             let on_new_subfolder = on_new_subfolder.clone();
                             sheet_action(
-                                copy::text("New subfolder", "新建子文件夹", "新增子資料夾"),
-                                icon(include_str!("../../../assets/icons/folder.svg")),
+                                copy::text("New folder", "新建文件夹", "新增資料夾"),
+                                icon(include_str!("../../../assets/icons/folder-plus.svg")),
                                 false,
                                 None,
                                 move || on_new_subfolder(),
                             )
                         })
                         .child({
+                            let on_archive = on_archive.clone();
+                            sheet_action(
+                                move || {
+                                    archive_label
+                                        .get()
+                                        .unwrap_or_else(|| "Scheduled archive".to_owned())
+                                },
+                                icon(include_str!("../../../assets/icons/package.svg")),
+                                false,
+                                None,
+                                move || {
+                                    if let Some(id) = action.get_untracked() {
+                                        action.set(None);
+                                        on_archive(&id);
+                                    }
+                                },
+                            )
+                        })
+                        .child({
                             let on_delete = on_delete.clone();
                             sheet_action(
                                 copy::text("Delete", "删除", "刪除"),
-                                icon(include_str!("../../../assets/icons/x.svg")),
+                                icon(include_str!("../../../assets/icons/trash-2.svg")),
                                 true,
                                 None,
                                 move || {
@@ -6790,9 +7402,180 @@ fn folder_actions_sheet(
                                     }
                                 },
                             )
-                        }),
+                        })
+                        .child(when(
+                            move || {
+                                move_row
+                                    .with(|state| state.as_ref().is_some_and(|(_, (up, _))| *up))
+                            },
+                            {
+                                let on_move_row_step = on_move_row_step.clone();
+                                move || {
+                                    let on_move_row_step = on_move_row_step.clone();
+                                    sheet_action(
+                                        copy::text("Move up", "上移", "上移"),
+                                        icon(include_str!("../../../assets/icons/chevron-up.svg")),
+                                        false,
+                                        None,
+                                        move || {
+                                            if let Some((row, _)) = move_row.get_untracked() {
+                                                on_move_row_step(&row, true);
+                                            }
+                                        },
+                                    )
+                                }
+                            },
+                        ))
+                        .child(when(
+                            move || {
+                                move_row.with(|state| {
+                                    state.as_ref().is_some_and(|(_, (_, down))| *down)
+                                })
+                            },
+                            {
+                                let on_move_row_step = on_move_row_step.clone();
+                                move || {
+                                    let on_move_row_step = on_move_row_step.clone();
+                                    sheet_action(
+                                        copy::text("Move down", "下移", "下移"),
+                                        icon(include_str!(
+                                            "../../../assets/icons/chevron-down.svg"
+                                        )),
+                                        false,
+                                        None,
+                                        move || {
+                                            if let Some((row, _)) = move_row.get_untracked() {
+                                                on_move_row_step(&row, false);
+                                            }
+                                        },
+                                    )
+                                }
+                            },
+                        )),
                 ),
         )
+}
+
+/// The schedules a folder can archive on. `None` turns the window off; every
+/// day the desktop accepts is offered, because a phone sheet can list them and
+/// a value it cannot set would make the row's current window unchangeable.
+fn folder_archive_sheet(
+    open: Signal<Option<String>>,
+    sections: Signal<Vec<SidebarSectionView>>,
+    on_set: FolderArchiveAction,
+) -> impl IntoElement {
+    // The desktop's `SIDEBAR_AUTO_ARCHIVE_MAX_DAYS`; a value it accepts has to
+    // be settable here, or the sheet would show a window the row cannot use.
+    const MAX_DAYS: u8 = 14;
+    let choices = (0..=MAX_DAYS)
+        .map(|days| (days > 0).then_some(days))
+        .collect::<Vec<_>>();
+    sheet()
+        .open(move || Some(open.get().is_some()))
+        .close_on_swipe(true)
+        .on_open_change(move |event: &SheetEvent| {
+            if let SheetEvent::OpenChange(false, _) = event {
+                open.set(None);
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .flex_col()
+                .items_center()
+                .gap(px(8.0))
+                .p(px(theme::SPACING_MD))
+                .pb_safe_area_plus(px(theme::SPACING_LG))
+                .bg(theme::background_card)
+                .rounded_t(px(theme::RADIUS_SHEET))
+                .child(sheet_grabber())
+                .child(
+                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
+                        text(copy::text("Scheduled archive", "定时归档", "定時封存"))
+                            .text_size(px(theme::font_title()))
+                            .font_weight(FontWeight::SEMIBOLD)
+                            .text_color(theme::foreground),
+                    ),
+                )
+                .child(scroll().max_h(px(420.0)).child(
+                    view().w_full().flex_col().gap(px(2.0)).child(each(
+                        move || choices.clone(),
+                        |days| days.map_or_else(|| "off".to_owned(), |days| days.to_string()),
+                        {
+                            let on_set = on_set.clone();
+                            move |days, _| {
+                                let on_set = on_set.clone();
+                                let days = days.get_untracked();
+                                let current = open.with(|id| {
+                                    id.as_ref().is_some_and(|id| {
+                                        sections.with(|sections| {
+                                            sections.iter().any(|section| {
+                                                section.kind == SidebarSectionKind::Folder
+                                                    && &section.id == id
+                                                    && section.auto_archive_after_days == days
+                                            })
+                                        })
+                                    })
+                                });
+                                let label = if current {
+                                    format!("✓ {}", folder_archive_label(days))
+                                } else {
+                                    folder_archive_label(days)
+                                };
+                                sheet_action(
+                                    label,
+                                    icon(include_str!("../../../assets/icons/package.svg")),
+                                    false,
+                                    None,
+                                    move || {
+                                        let Some(id) = open.get_untracked() else {
+                                            return;
+                                        };
+                                        open.set(None);
+                                        on_set(&id, days);
+                                    },
+                                )
+                            }
+                        },
+                    )),
+                )),
+        )
+}
+
+/// The entry that adds a session to one group, named after the group the way
+/// the desktop names it.
+fn add_to_group_label(name: &str) -> String {
+    match copy::language() {
+        copy::Language::SimplifiedChinese => format!("加入「{name}」"),
+        copy::Language::TraditionalChinese => format!("加入「{name}」"),
+        _ => format!("Add to {name}"),
+    }
+}
+
+/// The entry that starts a session inside one folder, in the desktop's words.
+fn new_chat_in_folder_label(name: &str) -> String {
+    match copy::language() {
+        copy::Language::SimplifiedChinese => {
+            format!("在「{name}」文件夹中新建会话")
+        }
+        copy::Language::TraditionalChinese => {
+            format!("在「{name}」資料夾中建立會話")
+        }
+        _ => format!("New chat in folder {name}"),
+    }
+}
+
+/// The window a folder archives on, said the way the desktop says it.
+fn folder_archive_label(days: Option<u8>) -> String {
+    let Some(days) = days else {
+        return copy::text("Off", "关闭", "關閉").to_owned();
+    };
+    match copy::language() {
+        copy::Language::SimplifiedChinese => format!("{days}天后"),
+        copy::Language::TraditionalChinese => format!("{days}天後"),
+        _ if days == 1 => "After 1 day".to_owned(),
+        _ => format!("After {days} days"),
+    }
 }
 
 fn folder_sheet(
