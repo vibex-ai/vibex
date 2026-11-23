@@ -50,6 +50,19 @@ pub fn text_field_flat_with(
         .text_color(theme::foreground)
 }
 
+/// A field with neither frame nor padding, for a pill that draws both around
+/// the field and the glyphs beside it.
+pub fn text_field_bare(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
+    input()
+        .value(move || value.get())
+        .on_change(move |text: &str| value.set(text.to_owned()))
+        .placeholder(placeholder)
+        .placeholder_color(theme::muted_foreground)
+        .caret_color(theme::primary)
+        .text_size(px(theme::font_detail()))
+        .text_color(theme::foreground)
+}
+
 fn framed(field: Input) -> Input {
     field
         .rounded(px(theme::RADIUS_CONTROL))

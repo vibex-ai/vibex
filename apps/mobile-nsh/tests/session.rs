@@ -1605,11 +1605,10 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
-    app.press("role:button[Search sessions]").unwrap();
     app.type_text("text:Search sessions", "zzz").unwrap();
     app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
         .unwrap();
-    app.press("role:button[Search sessions]").unwrap();
+    app.press("role:button[Clear search]").unwrap();
     app.wait_for("Fix the tests").unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("Please fix the tests").unwrap();
@@ -1624,7 +1623,8 @@ fn the_drawer_lists_sessions_and_switching_one_swaps_the_transcript() {
 fn selected_sessions_can_become_a_group() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[Select sessions]").unwrap();
+    app.press("role:button[Sidebar options]").unwrap();
+    app.press("Select or reorder").unwrap();
     app.wait_for("Fix the tests").unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("1 selected").unwrap();
@@ -1682,7 +1682,7 @@ fn a_group_opens_its_actions() {
     app.wait_for("Good morning").unwrap();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Pair").unwrap();
-    app.press("role:button[Group actions]").unwrap();
+    app.long_press("role:button[Pair]").unwrap();
     app.wait_for("Session group").unwrap();
     assert!(app.screen().shows("Pin"));
     assert!(app.screen().shows("Auto continue"));
@@ -1725,7 +1725,7 @@ fn a_sidebar_folder_groups_its_sessions() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Work").unwrap();
     assert!(app.screen().shows("Fix the tests"));
-    app.press("role:button[Folder actions]").unwrap();
+    app.long_press("role:button[Work]").unwrap();
     app.wait_for("Rename").unwrap();
 }
 
@@ -1733,8 +1733,8 @@ fn a_sidebar_folder_groups_its_sessions() {
 fn the_project_row_menu_carries_the_desktop_actions() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.wait_for("role:button[Project actions]").unwrap();
-    app.press("role:button[Project actions]").unwrap();
+    app.wait_for("role:button[vibex]").unwrap();
+    app.long_press("role:button[vibex]").unwrap();
     app.wait_for("New session").unwrap();
     assert!(app.screen().shows("New folder"));
     assert!(app.screen().shows("Start sessions in a new worktree"));
@@ -1749,7 +1749,7 @@ fn the_folder_row_menu_carries_the_desktop_actions() {
     app.wait_for("Good morning").unwrap();
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Work").unwrap();
-    app.press("role:button[Folder actions]").unwrap();
+    app.long_press("role:button[Work]").unwrap();
     app.wait_for("New chat in folder Work").unwrap();
     assert!(app.screen().shows("Scheduled archive · Off"));
     assert!(app.screen().shows("Delete"));
@@ -1762,7 +1762,7 @@ fn the_session_row_menu_carries_the_desktop_actions() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[Session actions]").unwrap();
+    app.long_press("role:button[Fix the tests]").unwrap();
     app.wait_for("Fork session").unwrap();
     assert!(app.screen().shows("Auto continue"));
     assert!(app.screen().shows("Pin"));
@@ -1784,7 +1784,8 @@ fn the_drawer_selects_sessions_for_a_batch() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Fix the tests").unwrap();
     app.wait_for("role:button[New session here]").unwrap();
-    app.press("role:button[Select sessions]").unwrap();
+    app.press("role:button[Sidebar options]").unwrap();
+    app.press("Select or reorder").unwrap();
     app.wait_for("Archive").unwrap();
     app.wait_for_gone(
         "role:button[New session here]",
@@ -1793,9 +1794,10 @@ fn the_drawer_selects_sessions_for_a_batch() {
     .unwrap();
     app.press("Fix the tests").unwrap();
     app.wait_for("1 selected").unwrap();
-    app.press("role:button[Select sessions]").unwrap();
+    app.press("role:button[Done]").unwrap();
     app.wait_for_gone("role:button[Archive]", std::time::Duration::from_secs(5))
         .unwrap();
+    app.wait_for("role:button[New session here]").unwrap();
 }
 
 #[test]
@@ -1904,7 +1906,6 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
         "the drawer carries the way into settings"
     );
     assert!(app.screen().shows("vibex"), "the project groups the rows");
-    app.press("role:button[Search sessions]").unwrap();
     app.type_text("text:Search sessions", "zzz").unwrap();
     app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
         .unwrap();
@@ -2197,7 +2198,7 @@ fn a_session_can_be_renamed_from_the_drawer() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[Session actions]").unwrap();
+    app.long_press("role:button[Fix the tests]").unwrap();
     app.wait_for("role:button[Rename]").unwrap();
     app.type_text("text:Fix the tests", " v2").unwrap();
     app.press("role:button[Rename]").unwrap();
@@ -2211,7 +2212,7 @@ fn a_session_can_be_archived_from_the_drawer() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[Session actions]").unwrap();
+    app.long_press("role:button[Fix the tests]").unwrap();
     app.press("role:button[Archive]").unwrap();
     app.wait_until(
         "the row leaves",
@@ -2228,7 +2229,7 @@ fn a_session_can_be_deleted_from_the_drawer() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[Session actions]").unwrap();
+    app.long_press("role:button[Fix the tests]").unwrap();
     app.press("role:button[Delete]").unwrap();
     app.wait_until(
         "the row leaves",

@@ -328,8 +328,6 @@ pub const HEADER_TRAILING_BUTTON_SIZE: f32 = 36.0;
 pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
 /// The strip that names the tree and carries its tools.
 pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
-/// A footer action on a side page.
-pub const DRAWER_ACTION_HEIGHT: f32 = 40.0;
 /// How far a side page dims the conversation behind it when fully open.
 pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
 /// How long a side page takes to open, and to close.
@@ -342,6 +340,35 @@ pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.15;
 pub const DRAWER_SWIPE_VELOCITY: f32 = 600.0;
 /// How much faster across than along a release must be to count as one.
 pub const DRAWER_SWIPE_STRAIGHTNESS: f32 = 1.5;
+
+// The sessions page is a drawer beside the conversation rather than a page
+// over it: the conversation is pushed aside as a card and a strip of it stays
+// in reach, so the way back is always under the thumb.
+
+/// The widest the sessions drawer grows.
+pub const SESSIONS_DRAWER_MAX_WIDTH: f32 = 360.0;
+/// The share of the screen it takes on a phone.
+pub const SESSIONS_DRAWER_WIDTH_RATIO: f32 = 0.86;
+/// The strip of the conversation that always stays beside it.
+pub const SESSIONS_DRAWER_PEEK: f32 = 52.0;
+/// The corner the conversation takes while it is a card beside the drawer.
+pub const SESSIONS_CARD_RADIUS: f32 = 28.0;
+/// How much shorter the card stands with the drawer fully open.
+pub const SESSIONS_CARD_SHRINK: f32 = 0.05;
+/// How far the card fades into the page behind it.
+pub const SESSIONS_CARD_FADE: f32 = 0.5;
+/// The card travels with the drawer, so it takes longer than a page that
+/// slides over a still one.
+pub const SESSIONS_OPEN_ANIMATION_MS: f32 = 260.0;
+pub const SESSIONS_CLOSE_ANIMATION_MS: f32 = 200.0;
+
+/// The width of the sessions drawer on a screen `screen` points wide.
+pub fn sessions_drawer_width(screen: f32) -> f32 {
+    SESSIONS_DRAWER_MAX_WIDTH
+        .min(screen * SESSIONS_DRAWER_WIDTH_RATIO)
+        .min(screen - SESSIONS_DRAWER_PEEK)
+        .max(1.0)
+}
 
 /// A status dot beside a runtime's name.
 pub const ICON_STATUS: f32 = 6.0;
@@ -363,61 +390,62 @@ pub fn font_composer() -> f32 {
     scaled_font(FONT_COMPOSER)
 }
 
-// The tree's geometry. Rows are a touch target tall; the columns are the ones
-// the desktop tree uses, so the two read as one tree.
+// The tree's geometry. Every row is the same height and has the same columns:
+// a disclosure slot, a mark slot, the title, and what trails it. A level of
+// nesting moves a row one disclosure slot to the right, so a child's
+// disclosure sits under its parent's mark.
 
 /// Horizontal padding of the row list.
-pub const SIDEBAR_LIST_PADDING: f32 = 16.0;
-/// The leading slot of a project, folder or worktree row.
-pub const SIDEBAR_ICON_SLOT: f32 = 30.0;
-/// How far that slot hangs left of the list padding.
-pub const SIDEBAR_ICON_SLOT_OVERHANG: f32 = 8.0;
-/// The gap between the leading slot and the title.
-pub const SIDEBAR_ICON_TITLE_GAP: f32 = 4.0;
+pub const SIDEBAR_LIST_PADDING: f32 = 12.0;
+/// The padding inside a row's plate, on both sides.
+pub const SIDEBAR_ROW_INSET: f32 = 8.0;
+/// The gap a row keeps above and below its plate.
+pub const SIDEBAR_ROW_GAP: f32 = 2.0;
+/// The disclosure slot at the start of a row.
+pub const SIDEBAR_CHEVRON_SLOT: f32 = 16.0;
+/// The disclosure glyph.
+pub const SIDEBAR_CHEVRON_SIZE: f32 = 12.0;
+/// The mark slot: an Agent, a project, a folder, or the selection mark.
+pub const SIDEBAR_ICON_SLOT: f32 = 24.0;
+/// The gap between the mark slot and the title.
+pub const SIDEBAR_ICON_TITLE_GAP: f32 = 6.0;
 /// Indent of a project's own sessions.
-pub const SIDEBAR_PROJECT_SESSION_INDENT: f32 = 12.0;
+pub const SIDEBAR_PROJECT_SESSION_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 /// Indent of the sessions inside a worktree card.
-pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = 20.0;
+pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 /// Indent of the rows filed inside a folder.
-pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = 18.0;
-/// Where a folder draws the guide down its child column.
-pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = 7.0;
-/// A session row's content starts past the card overhang.
-pub const SIDEBAR_SESSION_CONTENT_INSET: f32 = 8.0;
-/// The floor of a session row's trailing column.
-pub const SIDEBAR_SESSION_META_WIDTH: f32 = 48.0;
-/// The radius of a row's fill.
-pub const SIDEBAR_ROW_RADIUS: f32 = 8.0;
+pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
+/// Where a folder draws the guide down its child column: under the middle of
+/// its own disclosure.
+pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = SIDEBAR_ROW_INSET + SIDEBAR_CHEVRON_SLOT / 2.0;
+/// The radius of a row's plate.
+pub const SIDEBAR_ROW_RADIUS: f32 = 12.0;
 /// The radius of the card around a worktree and its sessions.
-pub const SIDEBAR_CARD_RADIUS: f32 = 10.0;
-/// The card's right inset.
+pub const SIDEBAR_CARD_RADIUS: f32 = 14.0;
+/// How far a row's plate stands in from the edges of the card around it.
 pub const SIDEBAR_CARD_INSET: f32 = 4.0;
 /// The Agent mark on a session row.
-pub const SIDEBAR_AGENT_LOGO_SIZE: f32 = 14.0;
+pub const SIDEBAR_AGENT_LOGO_SIZE: f32 = 16.0;
 /// Project and folder marks.
 pub const SIDEBAR_PROJECT_LOGO_SIZE: f32 = 16.0;
 /// A worktree or session status dot.
 pub const SIDEBAR_STATUS_DOT: f32 = 8.0;
 /// The unread dot, deliberately smaller than a status dot.
 pub const SIDEBAR_UNREAD_DOT: f32 = 7.0;
-/// The trailing menu column of a row.
-pub const SIDEBAR_ACTION_WIDTH: f32 = 34.0;
-/// The inset a row keeps before the menu glyph.
-pub const SIDEBAR_ACTION_CONTENT_INSET: f32 = 8.0;
+/// The glyphs trailing a row: a pin, a pause, a schedule.
+pub const SIDEBAR_META_ICON: f32 = 13.0;
+/// The round control at the end of a project or worktree row.
+pub const SIDEBAR_ROW_ACTION: f32 = 28.0;
+/// The mark a row wears while sessions are being selected.
+pub const SIDEBAR_SELECTION_MARK: f32 = 20.0;
 /// The floor of a tree row's height.
 pub const SIDEBAR_ROW_HEIGHT: f32 = 48.0;
 
-/// The tree's own type steps, one rung above the same role on a content page.
-pub const FONT_SIDEBAR_TITLE: f32 = 20.0;
+/// The tree's own type steps.
 pub const FONT_SIDEBAR_ROW: f32 = FONT_BODY;
-pub const FONT_SIDEBAR_META: f32 = FONT_DETAIL;
+pub const FONT_SIDEBAR_META: f32 = FONT_MICRO;
 
-/// A project or worktree name at the current text-size step.
-pub fn font_sidebar_title() -> f32 {
-    scaled_font(FONT_SIDEBAR_TITLE)
-}
-
-/// A session row's title at the current text-size step.
+/// A row's title at the current text-size step.
 pub fn font_sidebar_row() -> f32 {
     scaled_font(FONT_SIDEBAR_ROW)
 }
@@ -427,11 +455,12 @@ pub fn font_sidebar_meta() -> f32 {
     scaled_font(FONT_SIDEBAR_META)
 }
 
-/// The height of a tree row: the two lines a worktree row stacks, never below
-/// the touch-target floor, so a larger text step does not clip the second.
+/// The height of a tree row: the two lines a worktree row stacks inside its
+/// plate, never below the touch-target floor, so a larger text step does not
+/// clip the second.
 pub fn sidebar_row_height() -> f32 {
-    let lines = (font_sidebar_title() + font_sidebar_meta()) * LINE_HEIGHT_RATIO;
-    lines.max(SIDEBAR_ROW_HEIGHT)
+    let lines = (font_sidebar_row() + font_hint()) * LINE_HEIGHT_RATIO;
+    (lines + SIDEBAR_ROW_GAP * 2.0).max(SIDEBAR_ROW_HEIGHT)
 }
 
 /// The surface of the two side pages.
@@ -439,20 +468,9 @@ pub fn sidebar_bg() -> Hsla {
     color_token("sidebar")
 }
 
-/// The plate of the open session's row.
+/// The plate of the selected row on a side page.
 pub fn sidebar_selected_bg() -> Hsla {
     color_token("sidebar-accent")
-}
-
-/// The tree's foreground at `alpha`. The tree builds its contrast ladder by
-/// fading one color, so the two appearances land on matching shades.
-pub fn sidebar_foreground(alpha: f32) -> Hsla {
-    color_token("sidebar-foreground").alpha(alpha)
-}
-
-/// The side page's own headings.
-pub fn sidebar_text_primary() -> Hsla {
-    color_token("sidebar-foreground")
 }
 
 /// Tool glyphs and the footer's label.
@@ -465,29 +483,21 @@ pub fn sidebar_text_muted() -> Hsla {
     blend(muted_foreground(), color_token("sidebar-foreground"), 0.12)
 }
 
-/// A session row's title.
-pub fn sidebar_session_title() -> Hsla {
-    sidebar_foreground(if dark() { 0.82 } else { 0.90 })
-}
-
-/// The hour, path or count trailing a row.
-pub fn sidebar_session_meta() -> Hsla {
-    sidebar_foreground(if dark() { 0.72 } else { 0.78 })
-}
-
-/// A placeholder written where content will be.
-pub fn sidebar_placeholder() -> Hsla {
-    sidebar_foreground(if dark() { 0.64 } else { 0.70 })
-}
-
-/// The border of the worktree card the reader is on.
-pub fn sidebar_card_focus_border() -> Hsla {
-    color_token("sidebar-ring").alpha(if dark() { 0.42 } else { 0.45 })
-}
-
 /// The guide down a folder's child column.
 pub fn sidebar_tree_guide() -> Hsla {
     color_token("sidebar-border").opacity(0.70)
+}
+
+/// A well on the sessions page: the search field, a round control. A wash of
+/// the ink rather than a token of its own, so it reads on the page and on a
+/// card alike.
+pub fn sidebar_well() -> Hsla {
+    foreground().alpha(if dark() { 0.09 } else { 0.055 })
+}
+
+/// A hairline on the sessions page.
+pub fn sidebar_hairline() -> Hsla {
+    border_subtle().opacity(0.6)
 }
 
 /// The wash a pressed row or control takes.

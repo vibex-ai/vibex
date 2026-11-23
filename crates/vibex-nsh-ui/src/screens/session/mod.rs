@@ -5404,8 +5404,26 @@ fn attachment_chip(
         )
 }
 
-fn drawer_root_menu(open: Signal<bool>, on_new_folder: Action) -> impl IntoElement {
+/// What the sessions page keeps behind its header's menu: the commands that
+/// act on the whole tree rather than on a row.
+struct DrawerMenu {
+    select: Action,
+    detailed: Signal<bool>,
+    toggle_hierarchy: Action,
+    collapse_all: Action,
+    locate: Action,
+    new_folder: Action,
+}
+
+fn drawer_root_menu(open: Signal<bool>, menu: DrawerMenu) -> impl IntoElement {
     use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_entry, sheet_header};
+    let detailed = menu.detailed;
+    let entry = move |icon: ImageSrc, label: &'static str, action: Action| {
+        sheet_entry(icon, label, false, move || {
+            open.set(false);
+            action();
+        })
+    };
     bottom_sheet(
         move || open.get(),
         move || open.set(false),
@@ -5414,15 +5432,59 @@ fn drawer_root_menu(open: Signal<bool>, on_new_folder: Action) -> impl IntoEleme
                 copy::text("Sidebar", "侧栏", "側欄"),
                 move || open.set(false),
             ))
-            .child(sheet_body().child(sheet_entry(
-                icon!("folder-open"),
-                copy::text("New folder", "新建文件夹", "新增資料夾"),
-                false,
-                move || {
-                    open.set(false);
-                    on_new_folder();
-                },
-            ))),
+            .child(
+                sheet_body()
+                    .child(entry(
+                        icon!("list-checks"),
+                        copy::text("Select or reorder", "选择或排序", "選取或排序"),
+                        menu.select,
+                    ))
+                    .child(sheet_entry(
+                        icon!("git-branch"),
+                        move || {
+                            if detailed.get() {
+                                copy::text(
+                                    "Hide worktrees",
+                                    "隐藏 Worktree 层级",
+                                    "隱藏 Worktree 層級",
+                                )
+                            } else {
+                                copy::text(
+                                    "Show worktrees",
+                                    "显示 Worktree 层级",
+                                    "顯示 Worktree 層級",
+                                )
+                            }
+                        },
+                        false,
+                        {
+                            let toggle = menu.toggle_hierarchy;
+                            move || {
+                                open.set(false);
+                                toggle();
+                            }
+                        },
+                    ))
+                    .child(entry(
+                        icon!("chevrons-down-up"),
+                        copy::text(
+                            "Collapse or expand projects",
+                            "折叠或展开项目",
+                            "摺疊或展開專案",
+                        ),
+                        menu.collapse_all,
+                    ))
+                    .child(entry(
+                        icon!("crosshair"),
+                        copy::text("Locate current session", "定位当前会话", "定位目前工作階段"),
+                        menu.locate,
+                    ))
+                    .child(entry(
+                        icon!("folder-plus"),
+                        copy::text("New folder", "新建文件夹", "新增資料夾"),
+                        menu.new_folder,
+                    )),
+            ),
     )
 }
 
@@ -6196,45 +6258,8 @@ fn agent_icon(agent: &str) -> &'static str {
     }
 }
 
-fn drawer_view_tool(project_view: Signal<bool>, on_press: impl Fn() + 'static) -> ButtonElement {
-    button()
-        .accessibility_label(copy::text("Switch view", "切换视图", "切換檢視"))
-        .on_press(on_press)
-        .size(px(32.0))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .items_center()
-        .justify_center()
-        .bg(move || {
-            if project_view.get() {
-                theme::background_dim()
-            } else {
-                theme::background_card().opacity(0.0)
-            }
-        })
-        .active(|style| style.opacity(0.65))
-        .child(when(
-            move || project_view.get(),
-            || {
-                svg(icon(include_str!(
-                    "../../../assets/icons/message-square.svg"
-                )))
-                .w(px(16.0))
-                .h(px(16.0))
-                .text_color(theme::text_secondary)
-            },
-        ))
-        .child(when(
-            move || !project_view.get(),
-            || {
-                svg(icon(include_str!("../../../assets/icons/folder.svg")))
-                    .w(px(16.0))
-                    .h(px(16.0))
-                    .text_color(theme::text_secondary)
-            },
-        ))
-}
-
-fn drawer_header_button(
+/// A round control on the sessions page: a glyph in a well.
+fn drawer_round_button(
     icon: ImageSrc,
     label: &'static str,
     on_press: impl Fn() + 'static,
@@ -6242,60 +6267,104 @@ fn drawer_header_button(
     button()
         .accessibility_label(label)
         .on_press(on_press)
-        .size(px(36.0))
-        .rounded(px(theme::RADIUS_CONTROL))
+        .size(px(DRAWER_CONTROL_HEIGHT))
+        .flex_shrink_0()
+        .rounded_full()
+        .bg(theme::sidebar_well)
         .items_center()
         .justify_center()
         .active(|style| style.opacity(0.6))
         .child(
             svg(icon)
-                .w(px(18.0))
-                .h(px(18.0))
+                .w(px(theme::ICON_MD))
+                .h(px(theme::ICON_MD))
                 .text_color(theme::foreground),
         )
 }
 
-fn drawer_tool(
-    icon: ImageSrc,
-    label: &'static str,
-    active: bool,
+/// A quiet action written out in words, with an optional glyph before them.
+fn drawer_text_action(
+    icon: Option<ImageSrc>,
+    label: impl IntoReactive<SharedString>,
     on_press: impl Fn() + 'static,
 ) -> ButtonElement {
     button()
-        .accessibility_label(label)
         .on_press(on_press)
-        .size(px(32.0))
-        .rounded(px(theme::RADIUS_CONTROL))
+        .h(px(32.0))
+        .px(px(theme::SPACING_SM))
+        .flex_shrink_0()
+        .flex_row()
         .items_center()
-        .justify_center()
-        .bg(if active {
-            theme::background_dim()
-        } else {
-            theme::background_card().opacity(0.0)
-        })
-        .active(|style| style.opacity(0.65))
-        .child(
+        .gap(px(theme::SPACING_XS))
+        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled_style(|style| style.opacity(0.4))
+        .children(icon.into_iter().map(|icon| {
             svg(icon)
-                .w(px(16.0))
-                .h(px(16.0))
+                .w(px(14.0))
+                .h(px(14.0))
+                .text_color(theme::text_secondary)
+        }))
+        .child(
+            text(label)
+                .text_size(px(theme::font_caption()))
+                .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::text_secondary),
         )
 }
+
+/// One command of the selection bar: a glyph over the word for it.
+fn drawer_batch_action(
+    icon: ImageSrc,
+    caption: &'static str,
+    label: &'static str,
+    danger: bool,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let ink: fn() -> Hsla = if danger {
+        theme::accent_red
+    } else {
+        theme::text_secondary
+    };
+    button()
+        .accessibility_label(label)
+        .on_press(on_press)
+        .flex_1()
+        .min_w(px(0.0))
+        .h(px(52.0))
+        .flex_col()
+        .items_center()
+        .justify_center()
+        .gap(px(2.0))
+        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled_style(|style| style.opacity(0.4))
+        .child(svg(icon).w(px(20.0)).h(px(20.0)).text_color(ink))
+        .child(
+            text(caption)
+                .max_w(relative(1.0))
+                .truncate()
+                .text_size(px(theme::font_hint()))
+                .text_color(ink),
+        )
+}
+
+/// The search field and the round controls beside it.
+const DRAWER_CONTROL_HEIGHT: f32 = 40.0;
+/// The brand tile at the head of the sessions page.
+const DRAWER_BRAND_TILE: f32 = 38.0;
 
 fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
     let menu_host = host.clone();
     let sessions = host.sessions;
     let active = host.active;
-    let search_open = signal(false);
     let query = signal(String::new());
-    let project_view = host.sidebar.detailed;
     let root_menu = signal(false);
     let scope_menu = signal(None::<SidebarRowView>);
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
     pager.on_sessions_back(move || {
-        if search_open.get_untracked() {
-            search_open.set(false);
+        if !query.with_untracked(String::is_empty) {
             query.set(String::new());
             dismiss_keyboard();
         } else if select_mode.get_untracked() {
@@ -6383,12 +6452,30 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
     let on_locate = {
         let reveal = host.sidebar.on_reveal_active.clone();
         move || {
-            search_open.set(false);
             query.set(String::new());
             dismiss_keyboard();
             locate.set(active.get_untracked());
             reveal();
         }
+    };
+    let all_selected = computed(move || {
+        matching.with(|matching| {
+            !matching.is_empty()
+                && selected.with(|selected| matching.iter().all(|id| selected.contains(id)))
+        })
+    });
+    let none_selected = move || selected.with(Vec::is_empty);
+    let leave_selection = move || {
+        select_mode.set(false);
+        selected.set(Vec::new());
+    };
+    let menu = DrawerMenu {
+        select: Rc::new(move || select_mode.set(true)),
+        detailed: host.sidebar.detailed,
+        toggle_hierarchy: host.sidebar.on_toggle_hierarchy.clone(),
+        collapse_all: host.sidebar.on_collapse_all.clone(),
+        locate: Rc::new(on_locate),
+        new_folder: host.on_open_folder.clone(),
     };
     let tree_actions = tree::TreeActions {
         toggle: host.sidebar.on_toggle_row.clone(),
@@ -6419,380 +6506,532 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
         batch_scope: host.sidebar.batch_scope.clone(),
     };
     view()
-                .w_full()
-                .h_full()
-                .relative()
-                .flex_col()
-                .bg(theme::sidebar_bg)
-                .pt_safe_area()
-                .pb_safe_area_plus(px(theme::SPACING_MD))
+        .w_full()
+        .h_full()
+        .relative()
+        .flex_col()
+        .bg(theme::block_page)
+        .pt_safe_area()
+        .pb_safe_area_plus(px(theme::SPACING_SM))
+        // The head: what this is and where it runs, and the tree's own menu.
+        .child(
+            view()
+                .flex_shrink_0()
+                .pl(px(theme::SPACING_LG))
+                .pr(px(theme::SPACING_SM))
+                .pt(px(theme::SPACING_MD))
+                .pb(px(theme::SPACING_SM))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child({
+                    let on_switch = on_switch_runtime.clone();
+                    button()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_MD))
+                        .active(|style| style.opacity(0.7))
+                        .accessibility_label(copy::text(
+                            "Switch runtime",
+                            "切换运行时",
+                            "切換執行環境",
+                        ))
+                        .on_press(move || {
+                            pager.close();
+                            on_switch()
+                        })
+                        .child(
+                            view()
+                                .size(px(DRAWER_BRAND_TILE))
+                                .flex_shrink_0()
+                                .rounded(px(11.0))
+                                .bg(theme::block_surface)
+                                .shadow_xs()
+                                .items_center()
+                                .justify_center()
+                                .child(crate::ui::brand::mark(20.0)),
+                        )
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_col()
+                                .child(
+                                    text("Vibex")
+                                        .text_size(px(theme::font_heading()))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(theme::foreground),
+                                )
+                                .child(
+                                    view()
+                                        .w_full()
+                                        .min_w(px(0.0))
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(6.0))
+                                        .child(
+                                            view()
+                                                .size(px(theme::ICON_STATUS))
+                                                .flex_shrink_0()
+                                                .rounded_full()
+                                                .bg(move || match connection.get() {
+                                                    ConnectionState::Online => {
+                                                        theme::accent_success()
+                                                    }
+                                                    ConnectionState::Connecting => {
+                                                        theme::accent_yellow()
+                                                    }
+                                                    ConnectionState::Offline => {
+                                                        theme::text_muted()
+                                                    }
+                                                }),
+                                        )
+                                        .child(
+                                            text(move || {
+                                                runtime.get().unwrap_or_else(|| {
+                                                    copy::text(
+                                                        "No runtime",
+                                                        "未连接运行时",
+                                                        "未連線執行環境",
+                                                    )
+                                                    .into()
+                                                })
+                                            })
+                                            .flex_shrink(1.0)
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .text_size(px(theme::font_hint()))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(theme::sidebar_text_muted),
+                                        )
+                                        .child(
+                                            svg(icon!("chevron-down"))
+                                                .size(px(10.0))
+                                                .flex_shrink_0()
+                                                .text_color(theme::sidebar_text_muted),
+                                        ),
+                                ),
+                        )
+                })
+                .child(
+                    when(
+                        move || select_mode.get(),
+                        move || {
+                            drawer_text_action(
+                                None,
+                                copy::text("Done", "完成", "完成"),
+                                leave_selection,
+                            )
+                        },
+                    )
+                    .otherwise(move || {
+                        action::icon_button(
+                            icon!("ellipsis"),
+                            copy::text("Sidebar options", "侧栏选项", "側欄選項"),
+                            move || root_menu.set(true),
+                        )
+                        .rounded_full()
+                    }),
+                ),
+        )
+        // Search, always at hand, and the one thing the page is for beside it.
+        .child(
+            view()
+                .flex_shrink_0()
+                .px(px(theme::SIDEBAR_LIST_PADDING))
+                .py(px(6.0))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
                 .child(
                     view()
-                        .h(px(theme::DRAWER_HEADER_HEIGHT))
-                        .px(px(theme::SPACING_MD))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h(px(DRAWER_CONTROL_HEIGHT))
+                        .pl(px(theme::SPACING_MD))
+                        .pr(px(theme::SPACING_XS))
                         .flex_row()
                         .items_center()
                         .gap(px(theme::SPACING_SM))
+                        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                        .bg(theme::sidebar_well)
                         .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex_row()
-                                .items_center()
-                                .gap(px(1.0))
-                                .child({
-                                    let mark = theme::wordmark_mark(theme::font_title());
-                                    svg(icon!("vibex-mark"))
-                                        .w(px(mark.width))
-                                        .h(px(mark.height))
-                                        .mt(px(mark.margin_top))
-                                        .relative()
-                                        .top(px(mark.top_offset))
-                                        .flex_shrink_0()
-                                        .text_color(theme::sidebar_text_primary)
-                                })
-                                .child(
-                                    text("ibex")
-                                        .text_size(px(theme::font_title()))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::sidebar_text_primary),
-                                ),
+                            svg(icon!("search"))
+                                .size(px(theme::ICON_SM))
+                                .flex_shrink_0()
+                                .text_color(theme::sidebar_text_muted),
                         )
-                        .child({
-                            let on_new_session = on_new_session.clone();
-                            drawer_header_button(
-                                icon(include_str!("../../../assets/icons/plus.svg")),
-                                copy::text("New session", "新建会话", "新增工作階段"),
-                                move || on_new_session(),
+                        .child(
+                            field::text_field_bare(
+                                query,
+                                copy::text("Search sessions", "搜索会话", "搜尋工作階段"),
                             )
-                        })
-                        .child(drawer_header_button(
-                            icon(include_str!("../../../assets/icons/chevron-right.svg")),
-                            copy::text("Back to session", "返回会话", "返回工作階段"),
-                            move || pager.close(),
-                        )),
-                )
-                .child(
-                    view()
-                        .h(px(theme::DRAWER_SECTION_HEIGHT))
-                        .flex_shrink_0()
-                        .px(px(theme::SPACING_MD))
-                        .border_t_1()
-                        .border_t_color(theme::border_default())
-                        .border_b_1()
-                        .border_b_color(theme::border_default())
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .items_start().justify_center()
-                                .h_full()
-                                .on_long_press(move || root_menu.set(true))
-                                .child(text(copy::text("Projects", "项目", "專案"))
-                                    .truncate()
-                                    .text_size(px(theme::font_caption()))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::sidebar_text_muted)),
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .h_full(),
                         )
-                        .child({
-                            let toggle = host.sidebar.on_toggle_hierarchy.clone();
-                            drawer_view_tool(project_view, move || toggle())
-                        })
-                        .child(drawer_tool(
-                            icon(include_str!("../../../assets/icons/list-checks.svg")),
-                            copy::text("Select sessions", "选择会话", "選取工作階段"),
-                            false,
+                        .child(when(
+                            move || !query.with(String::is_empty),
                             move || {
-                                let next = !select_mode.get_untracked();
-                                select_mode.set(next);
-                                if !next {
-                                    selected.set(Vec::new());
-                                }
-                            },
-                        ))
-                        .child(drawer_tool(
-                            icon!("chevrons-down-up"),
-                            copy::text(
-                                "Collapse or expand projects",
-                                "折叠或展开项目",
-                                "摺疊或展開專案",
-                            ),
-                            false,
-                            { let collapse = host.sidebar.on_collapse_all.clone(); move || collapse() },
-                        ))
-                        .child(drawer_tool(
-                            icon(include_str!("../../../assets/icons/crosshair.svg")),
-                            copy::text(
-                                "Locate current session",
-                                "定位当前会话",
-                                "定位目前工作階段",
-                            ),
-                            false,
-                            on_locate,
-                        ))
-                        .child(drawer_tool(
-                            icon(include_str!("../../../assets/icons/plus.svg")),
-                            copy::text("New project", "新建项目", "新增專案"),
-                            false,
-                            { let new_project = host.on_new_project.clone(); move || new_project() },
-                        ))
-                        .child(drawer_tool(
-                            icon(include_str!("../../../assets/icons/search.svg")),
-                            copy::text("Search sessions", "搜索会话", "搜尋工作階段"),
-                            false,
-                            move || {
-                                search_open.update(|open| *open = !*open);
-                                if !search_open.get_untracked() {
-                                    query.set(String::new());
-                                    dismiss_keyboard();
-                                }
-                            },
-                        )),
-                )
-                .child(when(move || select_mode.get(), {
-                    let on_pin_sessions = host.on_pin_sessions.clone();
-                    let on_fork_sessions = host.on_fork_sessions.clone();
-                    let on_archive_sessions = host.on_archive_sessions.clone();
-                    let on_delete_sessions = host.on_delete_sessions.clone();
-                    move || {
-                        let on_pin_sessions = on_pin_sessions.clone();
-                        let on_fork_sessions = on_fork_sessions.clone();
-                        let on_archive_sessions = on_archive_sessions.clone();
-                        let on_delete_sessions = on_delete_sessions.clone();
-                        view()
-                            .w_full()
-                            .h(px(theme::DRAWER_SECTION_HEIGHT))
-                            .flex_shrink_0()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(2.0))
-                            .px(px(theme::SPACING_MD))
-                            .border_b_1()
-                            .border_b_color(theme::border_default)
-                            .child(
-                                text(move || {
-                                    format!(
-                                        "{} {}",
-                                        selected.with(|selected| selected.len()),
-                                        copy::text("selected", "已选择", "已選取")
+                                button()
+                                    .size(px(32.0))
+                                    .flex_shrink_0()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .active(|style| style.opacity(0.6))
+                                    .accessibility_label(copy::text(
+                                        "Clear search",
+                                        "清除搜索",
+                                        "清除搜尋",
+                                    ))
+                                    .on_press(move || {
+                                        query.set(String::new());
+                                        dismiss_keyboard();
+                                    })
+                                    .child(
+                                        svg(icon!("x"))
+                                            .size(px(14.0))
+                                            .text_color(theme::sidebar_text_muted),
                                     )
-                                })
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted),
-                            )
-                            .child(drawer_tool(icon!("list-checks"), copy::text("Select all sessions", "选择全部会话", "選取全部工作階段"), false,
-                                move || tree::toggle_batch(selected, &matching.get_untracked()))
-                                .disabled(move || matching.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("x"), copy::text("Clear selection", "清除选择", "清除選取"), false, move || selected.set(Vec::new()))
-                                .disabled(move || selected.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("pin"), copy::text("Pin selected sessions", "置顶选中会话", "釘選已選工作階段"), false,
-                                move || on_pin_sessions(&selected.get_untracked()))
-                                .disabled(move || selected.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("git-branch"), copy::text("Fork selected sessions", "分叉选中会话", "分叉已選工作階段"), false,
-                                move || on_fork_sessions(&selected.get_untracked()))
-                                .disabled(move || selected.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("layers"), copy::text("Group", "分组", "分組"), false, move || group_open.set(true))
-                                .disabled(move || !can_group.get()).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("package"), copy::text("Archive", "归档", "封存"), false, {
-                                let on_archive_sessions = on_archive_sessions.clone();
-                                move || {
-                                    let ids = selected.get_untracked();
-                                    if !ids.is_empty() {
-                                        on_archive_sessions(&ids);
-                                    }
-                                    selected.set(Vec::new());
-                                }
-                            }).disabled(move || selected.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                            .child(drawer_tool(icon!("trash-2"), copy::text("Delete", "删除", "刪除"), false, {
-                                let on_delete_sessions = on_delete_sessions.clone();
-                                move || {
-                                    let ids = selected.get_untracked();
-                                    if ids.is_empty() {
-                                        return;
-                                    }
-                                    let on_delete_sessions = on_delete_sessions.clone();
-                                    spawn(async move {
-                                        let answer = nsh_base::alert_dialog()
-                                            .title(copy::text("Delete selected sessions?", "删除所选会话？", "刪除所選工作階段？"))
-                                            .description(copy::text("Their conversation history will be permanently deleted.", "对话记录将被永久删除。", "對話記錄將永久刪除。"))
-                                            .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                                            .destructive("delete", copy::text("Delete", "删除", "刪除"))
-                                            .show().await;
-                                        if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("delete")) {
-                                            on_delete_sessions(&ids);
-                                            selected.update(|selected| selected.retain(|id| !ids.contains(id)));
-                                        }
-                                    });
-                                }
-                            }).disabled(move || selected.with(Vec::is_empty)).disabled_style(|style| style.opacity(0.4)))
-                    }
-                }))
-                .child(group_actions_sheet(
-                    group_actions,
-                    group_rename,
-                    on_rename_group.clone(),
-                    on_delete_group.clone(),
-                    sidebar_sections,
-                    on_set_group_pinned.clone(),
-                    on_set_group_auto_continue.clone(),
-                    {
-                        let sections = sidebar_sections;
-                        Rc::new(move || {
-                            if let Some(id) = group_actions.get_untracked() {
-                                let members = sections.with(|sections| {
-                                    sections
-                                        .iter()
-                                        .find(|section| section.id == id)
-                                        .map(|section| section.session_ids.clone())
-                                        .unwrap_or_default()
-                                });
-                                members_selected.set(members);
-                                members_group.set(Some(id));
-                                group_actions.set(None);
-                            }
-                        })
-                    },
-                ))
-                .child(group_members_sheet(
-                    members_group,
-                    members_selected,
-                    sessions,
-                    on_set_group_members.clone(),
-                ))
-                .child(group_sheet(
-                    group_open,
-                    group_name,
-                    on_create_group.clone(),
-                    selected,
-                ))
-                .child(folder_actions_sheet(
-                    &menu_host,
-                    folder_actions,
-                    folder_rename,
-                    on_rename_folder.clone(),
-                    on_delete_folder.clone(),
-                    {
-                        let on_open_subfolder = on_open_subfolder.clone();
-                        Rc::new(move || {
-                            if let Some(id) = folder_actions.get_untracked() {
-                                folder_actions.set(None);
-                                on_open_subfolder(&id);
-                            }
-                        })
-                    },
-                    Rc::new(move |id: &str| folder_archive.set(Some(id.to_owned()))),
-                ))
-                .child(folder_archive_sheet(
-                    folder_archive,
-                    menu_host.sidebar_sections,
-                    menu_host.on_set_folder_auto_archive.clone(),
-                ))
-                .child(folder_sheet(
-                    folder_open,
-                    folder_name,
-                    on_close_folder.clone(),
-                    on_create_folder.clone(),
-                ))
-                .child(when(move || search_open.get(), move || {
-                    view().px(px(theme::SPACING_MD)).py(px(theme::SPACING_XS)).child(
-                        field::text_field(query, copy::text("Search sessions", "搜索会话", "搜尋工作階段"))
+                            },
+                        )),
+                )
+                .child({
+                    let on_new_session = on_new_session.clone();
+                    drawer_round_button(
+                        icon!("plus"),
+                        copy::text("New session", "新建会话", "新增工作階段"),
+                        move || on_new_session(),
                     )
-                }))
-                .child(tree::list(tree::TreeState { pager, rows, query, select_mode, selected, locate }, tree_actions))
+                }),
+        )
+        // The tree's name, and the way to add to its top level.
+        .child(
+            view()
+                .flex_shrink_0()
+                .pl(px(theme::SPACING_XL + theme::SPACING_XS))
+                .pr(px(theme::SIDEBAR_LIST_PADDING))
+                .pt(px(theme::SPACING_SM))
+                .pb(px(2.0))
+                .flex_row()
+                .items_center()
                 .child(
                     view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .h(px(32.0))
+                        .justify_center()
+                        .on_long_press(move || {
+                            crate::motion::tick();
+                            root_menu.set(true)
+                        })
+                        .child(
+                            text(copy::text("Projects", "项目", "專案"))
+                                .truncate()
+                                .text_size(px(theme::font_caption()))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::sidebar_text_muted),
+                        ),
+                )
+                .child({
+                    let new_project = host.on_new_project.clone();
+                    drawer_text_action(
+                        Some(icon!("plus")),
+                        copy::text("New project", "新建项目", "新增專案"),
+                        move || new_project(),
+                    )
+                    .accessibility_label(copy::text("New project", "新建项目", "新增專案"))
+                }),
+        )
+        .child(tree::list(
+            tree::TreeState {
+                pager,
+                rows,
+                query,
+                select_mode,
+                selected,
+                locate,
+            },
+            tree_actions,
+        ))
+        // The foot: settings, or what to do with the sessions being selected.
+        .child(
+            when(move || select_mode.get(), {
+                let on_pin_sessions = host.on_pin_sessions.clone();
+                let on_fork_sessions = host.on_fork_sessions.clone();
+                let on_archive_sessions = host.on_archive_sessions.clone();
+                let on_delete_sessions = host.on_delete_sessions.clone();
+                move || {
+                    let on_pin_sessions = on_pin_sessions.clone();
+                    let on_fork_sessions = on_fork_sessions.clone();
+                    let on_archive_sessions = on_archive_sessions.clone();
+                    let on_delete_sessions = on_delete_sessions.clone();
+                    view()
+                        .w_full()
+                        .flex_shrink_0()
+                        .flex_col()
                         .border_t_1()
-                        .border_t_color(theme::border_subtle)
-                        .px(px(theme::SPACING_LG))
-                        .py(px(10.0))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .child({
-                            let on_switch = on_switch_runtime.clone();
-                            button()
-                                .flex_1()
-                                .min_h(px(40.0))
-                                .min_w(px(0.0))
+                        .border_t_color(theme::sidebar_hairline)
+                        .px(px(theme::SIDEBAR_LIST_PADDING))
+                        .pt(px(theme::SPACING_XS))
+                        .child(
+                            view()
+                                .w_full()
+                                .pl(px(theme::SPACING_SM))
                                 .flex_row()
                                 .items_center()
-                                .gap(px(theme::SPACING_SM))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .active(|style| style.opacity(0.7))
-                                .accessibility_label(copy::text(
-                                    "Switch runtime",
-                                    "切换运行时",
-                                    "切換執行環境",
-                                ))
-                                .on_press(move || {
-                                    pager.close();
-                                    on_switch()
-                                })
-                                .child(
-                                    view()
-                                        .w(px(8.0))
-                                        .h(px(8.0))
-                                        .flex_shrink_0()
-                                        .rounded(px(4.0))
-                                        .bg(move || {
-                                            match connection.get() {
-                                                ConnectionState::Online => theme::accent_success(),
-                                                ConnectionState::Connecting => theme::accent_yellow(),
-                                                ConnectionState::Offline => theme::text_muted(),
-                                            }
-                                        }),
-                                )
                                 .child(
                                     text(move || {
-                                        runtime.get().unwrap_or_else(|| {
-                                            copy::text(
-                                                "No runtime",
-                                                "未连接运行时",
-                                                "未連線執行環境",
-                                            )
-                                            .into()
-                                        })
+                                        format!(
+                                            "{} {}",
+                                            selected.with(|selected| selected.len()),
+                                            copy::text("selected", "已选择", "已選取")
+                                        )
                                     })
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .truncate()
                                     .text_size(px(theme::font_detail()))
-                                    .text_color(theme::text_secondary),
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::foreground),
                                 )
-                        })
-                        .child({
-                            let on_open_settings = on_open_settings.clone();
-                            button()
-                                .size(px(40.0))
-                                .flex_shrink_0()
+                                .child(
+                                    drawer_text_action(
+                                        None,
+                                        move || {
+                                            if all_selected.get() {
+                                                copy::text("Deselect all", "取消全选", "取消全選")
+                                            } else {
+                                                copy::text("Select all", "全选", "全選")
+                                            }
+                                        },
+                                        move || {
+                                            tree::toggle_batch(selected, &matching.get_untracked())
+                                        },
+                                    )
+                                    .disabled(move || matching.with(Vec::is_empty)),
+                                ),
+                        )
+                        .child(
+                            view()
+                                .w_full()
+                                .flex_row()
                                 .items_center()
-                                .justify_center()
-                                .rounded(px(20.0))
-                                .active(|style| style.opacity(0.6))
+                                .child(
+                                    drawer_batch_action(
+                                        icon!("pin"),
+                                        copy::text("Pin", "置顶", "釘選"),
+                                        copy::text(
+                                            "Pin selected sessions",
+                                            "置顶选中会话",
+                                            "釘選已選工作階段",
+                                        ),
+                                        false,
+                                        move || on_pin_sessions(&selected.get_untracked()),
+                                    )
+                                    .disabled(none_selected),
+                                )
+                                .child(
+                                    drawer_batch_action(
+                                        icon!("git-branch"),
+                                        copy::text("Fork", "分叉", "分叉"),
+                                        copy::text(
+                                            "Fork selected sessions",
+                                            "分叉选中会话",
+                                            "分叉已選工作階段",
+                                        ),
+                                        false,
+                                        move || on_fork_sessions(&selected.get_untracked()),
+                                    )
+                                    .disabled(none_selected),
+                                )
+                                .child(
+                                    drawer_batch_action(
+                                        icon!("layers"),
+                                        copy::text("Group", "分组", "分組"),
+                                        copy::text("Group", "分组", "分組"),
+                                        false,
+                                        move || group_open.set(true),
+                                    )
+                                    .disabled(move || !can_group.get()),
+                                )
+                                .child(
+                                    drawer_batch_action(
+                                        icon!("package"),
+                                        copy::text("Archive", "归档", "封存"),
+                                        copy::text("Archive", "归档", "封存"),
+                                        false,
+                                        move || {
+                                            let ids = selected.get_untracked();
+                                            if !ids.is_empty() {
+                                                on_archive_sessions(&ids);
+                                            }
+                                            selected.set(Vec::new());
+                                        },
+                                    )
+                                    .disabled(none_selected),
+                                )
+                                .child(
+                                    drawer_batch_action(
+                                        icon!("trash-2"),
+                                        copy::text("Delete", "删除", "刪除"),
+                                        copy::text("Delete", "删除", "刪除"),
+                                        true,
+                                        move || {
+                                            let ids = selected.get_untracked();
+                                            if ids.is_empty() {
+                                                return;
+                                            }
+                                            let on_delete_sessions = on_delete_sessions.clone();
+                                            spawn(async move {
+                                                let answer = nsh_base::alert_dialog()
+                                                    .title(copy::text(
+                                                        "Delete selected sessions?",
+                                                        "删除所选会话？",
+                                                        "刪除所選工作階段？",
+                                                    ))
+                                                    .description(copy::text(
+                                                        "Their conversation history will be permanently deleted.",
+                                                        "对话记录将被永久删除。",
+                                                        "對話記錄將永久刪除。",
+                                                    ))
+                                                    .cancel(
+                                                        "cancel",
+                                                        copy::text("Cancel", "取消", "取消"),
+                                                    )
+                                                    .destructive(
+                                                        "delete",
+                                                        copy::text("Delete", "删除", "刪除"),
+                                                    )
+                                                    .show()
+                                                    .await;
+                                                if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("delete"))
+                                                {
+                                                    on_delete_sessions(&ids);
+                                                    selected.update(|selected| {
+                                                        selected.retain(|id| !ids.contains(id))
+                                                    });
+                                                }
+                                            });
+                                        },
+                                    )
+                                    .disabled(none_selected),
+                                ),
+                        )
+                }
+            })
+            .otherwise({
+                let on_open_settings = on_open_settings.clone();
+                move || {
+                    let on_open_settings = on_open_settings.clone();
+                    view()
+                        .w_full()
+                        .flex_shrink_0()
+                        .flex_row()
+                        .border_t_1()
+                        .border_t_color(theme::sidebar_hairline)
+                        .px(px(theme::SIDEBAR_LIST_PADDING))
+                        .pt(px(6.0))
+                        .child(
+                            button()
+                                .h(px(46.0))
+                                .px(px(theme::SPACING_MD))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_MD))
+                                .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                                .active(|style| style.bg(theme::row_pressed_bg()))
                                 .accessibility_label(copy::text("Settings", "设置", "設定"))
                                 .on_press(move || {
                                     pager.close();
                                     on_open_settings()
                                 })
                                 .child(
-                                    svg(icon(include_str!("../../../assets/icons/settings.svg")))
+                                    svg(icon!("settings"))
                                         .w(px(20.0))
                                         .h(px(20.0))
                                         .text_color(theme::text_secondary),
                                 )
-                        }),
-                )
-                .child(drawer_root_menu(
-                    root_menu,
-                    host.on_open_folder.clone(),
-                ))
-                .child(drawer_scope_menu(scope_menu, &menu_host))
+                                .child(
+                                    text(copy::text("Settings", "设置", "設定"))
+                                        .text_size(px(theme::font_body()))
+                                        .text_color(theme::foreground),
+                                ),
+                        )
+                }
+            }),
+        )
+        .child(group_actions_sheet(
+            group_actions,
+            group_rename,
+            on_rename_group.clone(),
+            on_delete_group.clone(),
+            sidebar_sections,
+            on_set_group_pinned.clone(),
+            on_set_group_auto_continue.clone(),
+            {
+                let sections = sidebar_sections;
+                Rc::new(move || {
+                    if let Some(id) = group_actions.get_untracked() {
+                        let members = sections.with(|sections| {
+                            sections
+                                .iter()
+                                .find(|section| section.id == id)
+                                .map(|section| section.session_ids.clone())
+                                .unwrap_or_default()
+                        });
+                        members_selected.set(members);
+                        members_group.set(Some(id));
+                        group_actions.set(None);
+                    }
+                })
+            },
+        ))
+        .child(group_members_sheet(
+            members_group,
+            members_selected,
+            sessions,
+            on_set_group_members.clone(),
+        ))
+        .child(group_sheet(
+            group_open,
+            group_name,
+            on_create_group.clone(),
+            selected,
+        ))
+        .child(folder_actions_sheet(
+            &menu_host,
+            folder_actions,
+            folder_rename,
+            on_rename_folder.clone(),
+            on_delete_folder.clone(),
+            {
+                let on_open_subfolder = on_open_subfolder.clone();
+                Rc::new(move || {
+                    if let Some(id) = folder_actions.get_untracked() {
+                        folder_actions.set(None);
+                        on_open_subfolder(&id);
+                    }
+                })
+            },
+            Rc::new(move |id: &str| folder_archive.set(Some(id.to_owned()))),
+        ))
+        .child(folder_archive_sheet(
+            folder_archive,
+            menu_host.sidebar_sections,
+            menu_host.on_set_folder_auto_archive.clone(),
+        ))
+        .child(folder_sheet(
+            folder_open,
+            folder_name,
+            on_close_folder.clone(),
+            on_create_folder.clone(),
+        ))
+        .child(drawer_root_menu(root_menu, menu))
+        .child(drawer_scope_menu(scope_menu, &menu_host))
 }
 
 fn drawer_scope_menu(

@@ -61,8 +61,11 @@ anything that needs a runtime or a phone are listed at the bottom.
    Stop mid-turn.
 3. **Attach** a photo and a file, remove one chip, send with and without text.
 4. Let the Agent ask for a **permission** and a **question**; answer each kind.
-5. **Left drawer**: switch regular/worktree views, select a project with
-   collapsed children, and start a new session, including a new worktree.
+5. **Left drawer**: drag it open and shut and watch the conversation move
+   aside as a card; tap the strip of the card to return. Search, long-press a
+   row of each kind for its menu, switch regular/worktree views from the
+   header menu, select a project with collapsed children, reorder a row by its
+   grip while selecting, and start a new session, including a new worktree.
 6. **Terminal**: type in a shell, run a TUI, rotate the phone, and create,
    switch, and close terminal tabs.
 7. **Files**: expand and collapse directories, search contents, open a result

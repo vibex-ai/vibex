@@ -197,17 +197,30 @@ fn row_item(
     let is_session = row.kind == SidebarRowKind::Session;
     let is_empty = row.kind == SidebarRowKind::EmptyWorkspace;
     let is_scope = matches!(row.kind, SidebarRowKind::Project | SidebarRowKind::Folder);
+    let is_container = matches!(
+        row.kind,
+        SidebarRowKind::Project
+            | SidebarRowKind::Workspace
+            | SidebarRowKind::Folder
+            | SidebarRowKind::Group
+    );
+    let adds_sessions = matches!(
+        row.kind,
+        SidebarRowKind::Project | SidebarRowKind::Workspace
+    );
     let card = row.card.clone();
+    let in_card = card.is_some();
+    let card_indent = card.as_ref().map(|card| card.indent);
+    let card_inset = if in_card {
+        theme::SIDEBAR_CARD_INSET
+    } else {
+        0.0
+    };
     let inset = theme::SIDEBAR_LIST_PADDING;
-    let indent = row.indent
-        + if card.is_some() {
-            theme::SIDEBAR_CARD_INSET
-        } else {
-            0.0
-        };
-    let height = theme::sidebar_row_height();
     let selection = move || state.select_mode.get() && is_session;
+    let scope_selection = move || state.select_mode.get() && is_scope;
     let checked = computed(move || state.selected.with(|selected| selected.contains(&id)));
+    let dragging = signal(false);
     let main_action = {
         let row = row.clone();
         let toggle = actions.toggle;
@@ -223,11 +236,14 @@ fn row_item(
             }
         }
     };
+    // A row's commands are behind a long press: the row itself stays a title
+    // and what trails it.
     let on_menu = {
         let menu = actions.menu.clone();
         let row = row.clone();
         move || {
             if !state.select_mode.get_untracked() {
+                crate::motion::tick();
                 menu(&row);
             }
         }
@@ -240,70 +256,85 @@ fn row_item(
                 SidebarRowKind::Folder if row.collapsed => icon!("folder"),
                 SidebarRowKind::Folder => icon!("folder-open"),
                 SidebarRowKind::Group => icon!("layers"),
-                SidebarRowKind::Session => icon(agent_icon(&row.detail)),
-                SidebarRowKind::EmptyWorkspace => icon!("message-square"),
+                SidebarRowKind::Session | SidebarRowKind::EmptyWorkspace => {
+                    icon(agent_icon(&row.detail))
+                }
             },
             theme::sidebar_text_secondary(),
         )
     });
-    let menu_label = match row.kind {
-        SidebarRowKind::Project => copy::text("Project actions", "项目操作", "專案操作"),
-        SidebarRowKind::Workspace => copy::text("Workspace actions", "工作区操作", "工作區操作"),
-        SidebarRowKind::Session => copy::text("Session actions", "会话操作", "工作階段操作"),
-        SidebarRowKind::Group => copy::text("Group actions", "会话组操作", "工作階段群組操作"),
-        _ => copy::text("Folder actions", "文件夹操作", "資料夾操作"),
-    };
     let active = is_session && row.active;
     let detail = (row.kind == SidebarRowKind::Workspace
         && row.detail != row.title
         && !row.detail.is_empty())
     .then(|| row.detail.clone());
     view()
-        .h(px(height))
+        .h(px(theme::sidebar_row_height()))
         .w_full()
         .px(px(inset))
+        .py(px(theme::SIDEBAR_ROW_GAP))
         .relative()
         .children(card.into_iter().map(|card| {
+            // One row's slice of the card a worktree shares with its sessions.
             view()
                 .absolute()
-                .top_0()
-                .bottom_0()
+                .top(px(if card.top {
+                    theme::SIDEBAR_ROW_GAP
+                } else {
+                    0.0
+                }))
+                .bottom(px(if card.bottom {
+                    theme::SIDEBAR_ROW_GAP
+                } else {
+                    0.0
+                }))
                 .left(px(inset + card.indent))
                 .right(px(inset))
-                .bg(theme::block_inset)
-                .border_l_1()
-                .border_r_1()
-                .border_color(theme::border_subtle)
+                .bg(theme::block_surface)
                 .when(card.top, |frame| {
-                    frame.border_t_1().rounded_t(px(theme::SIDEBAR_CARD_RADIUS))
+                    frame.rounded_t(px(theme::SIDEBAR_CARD_RADIUS))
                 })
                 .when(card.bottom, |frame| {
-                    frame.border_b_1().rounded_b(px(theme::SIDEBAR_CARD_RADIUS))
+                    frame.rounded_b(px(theme::SIDEBAR_CARD_RADIUS))
                 })
                 .pointer_events(PointerEvents::None)
         }))
         .children(row.guides.iter().map(|guide| {
+            // A guide that starts inside the card moves in with its rows.
+            let shift = if card_indent.is_some_and(|indent| *guide >= indent) {
+                theme::SIDEBAR_CARD_INSET
+            } else {
+                0.0
+            };
             view()
                 .absolute()
                 .top_0()
                 .bottom_0()
-                .left(px(inset + guide))
+                .left(px(inset + guide + shift))
                 .w(px(1.0))
                 .bg(theme::sidebar_tree_guide)
                 .pointer_events(PointerEvents::None)
         }))
         .child(
+            // The plate: the open session's is raised off the page, or sunk
+            // into the card it is already on.
             view()
-                .ml(px(indent))
-                .h_full()
+                .ml(px(row.indent + card_inset))
+                .mr(px(card_inset))
+                .flex_1()
+                .min_h(px(0.0))
                 .flex_row()
                 .items_center()
                 .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                .when(active && !in_card, |plate| {
+                    plate.bg(theme::block_surface).shadow_xs()
+                })
+                .when(active && in_card, |plate| plate.bg(theme::sidebar_well))
                 .style_when(
-                    move || active || (selection() && checked.get()),
-                    |style| style.bg(theme::sidebar_selected_bg()),
+                    move || dragging.get(),
+                    |style| style.bg(theme::sidebar_well()),
                 )
-                .child(when(move || is_scope && state.select_mode.get(), {
+                .child(when(scope_selection, {
                     let row = row.clone();
                     let scope = actions.batch_scope.clone();
                     move || {
@@ -319,12 +350,19 @@ fn row_item(
                                 })
                             })
                         };
+                        // The mark takes the disclosure's place as well: what
+                        // it selects is everything the row holds.
                         button()
-                            .w(px(theme::SIDEBAR_ICON_SLOT))
+                            .w(px(theme::SIDEBAR_ROW_INSET
+                                + theme::SIDEBAR_CHEVRON_SLOT
+                                + theme::SIDEBAR_ICON_SLOT))
                             .h_full()
                             .flex_shrink_0()
-                            .items_center()
+                            .items_end()
                             .justify_center()
+                            .pr(px((theme::SIDEBAR_ICON_SLOT
+                                - theme::SIDEBAR_SELECTION_MARK)
+                                / 2.0))
                             .accessibility_label(format!(
                                 "{}: {}",
                                 copy::text("Select", "选择", "選取"),
@@ -346,38 +384,66 @@ fn row_item(
                         .flex_1()
                         .flex_row()
                         .items_center()
+                        .pr(px(theme::SIDEBAR_ROW_INSET))
+                        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
                         .when(!is_empty, |view| {
                             view.role(AccessibilityRole::Button)
                                 .label(row.title.clone())
                                 .focusable(true)
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_press(main_action)
-                                .on_long_press(on_menu.clone())
+                                .on_long_press(on_menu)
                         })
                         .child(when(
-                            move || !is_scope || !state.select_mode.get(),
+                            move || !scope_selection(),
                             move || {
                                 let logo = logo.clone();
                                 view()
-                                    .w(px(theme::SIDEBAR_ICON_SLOT))
+                                    .ml(px(theme::SIDEBAR_ROW_INSET))
                                     .flex_shrink_0()
+                                    .flex_row()
                                     .items_center()
-                                    .justify_center()
                                     .child(
-                                        when(selection, move || {
-                                            selection_mark(move || checked.get().then_some(true))
-                                        })
-                                        .otherwise(
-                                            move || {
-                                                svg(logo.clone())
-                                                    .size(px(if is_session {
-                                                        theme::SIDEBAR_AGENT_LOGO_SIZE
+                                        view()
+                                            .w(px(theme::SIDEBAR_CHEVRON_SLOT))
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .justify_center()
+                                            .when(is_container, |slot| {
+                                                slot.child(
+                                                    svg(if row.collapsed {
+                                                        icon!("chevron-right")
                                                     } else {
-                                                        theme::SIDEBAR_PROJECT_LOGO_SIZE
-                                                    }))
-                                                    .text_color(logo_color)
-                                            },
-                                        ),
+                                                        icon!("chevron-down")
+                                                    })
+                                                    .size(px(theme::SIDEBAR_CHEVRON_SIZE))
+                                                    .text_color(theme::sidebar_text_muted),
+                                                )
+                                            }),
+                                    )
+                                    .child(
+                                        view()
+                                            .w(px(theme::SIDEBAR_ICON_SLOT))
+                                            .flex_shrink_0()
+                                            .items_center()
+                                            .justify_center()
+                                            .child(
+                                                when(selection, move || {
+                                                    selection_mark(move || {
+                                                        checked.get().then_some(true)
+                                                    })
+                                                })
+                                                .otherwise(move || {
+                                                    svg(logo.clone())
+                                                        .size(px(if is_session {
+                                                            theme::SIDEBAR_AGENT_LOGO_SIZE
+                                                        } else {
+                                                            theme::SIDEBAR_PROJECT_LOGO_SIZE
+                                                        }))
+                                                        .text_color(logo_color)
+                                                        .when(is_empty, |mark| mark.opacity(0.0))
+                                                }),
+                                            ),
                                     )
                             },
                         ))
@@ -385,6 +451,7 @@ fn row_item(
                             view()
                                 .flex_1()
                                 .min_w(px(0.0))
+                                .ml(px(theme::SIDEBAR_ICON_TITLE_GAP))
                                 .overflow_hidden()
                                 .flex_col()
                                 .child(
@@ -394,7 +461,7 @@ fn row_item(
                                         .overflow_hidden()
                                         .flex_row()
                                         .items_center()
-                                        .gap(px(theme::SPACING_XS))
+                                        .gap(px(theme::SPACING_SM))
                                         .child(
                                             text(row.title.clone())
                                                 .flex_shrink(1.0)
@@ -402,20 +469,22 @@ fn row_item(
                                                 .max_w(relative(1.0))
                                                 .overflow_hidden()
                                                 .truncate()
-                                                .text_size(px(theme::font_sidebar_row()))
-                                                .font_weight(
-                                                    if active || !is_session && !is_empty {
-                                                        FontWeight::SEMIBOLD
-                                                    } else {
-                                                        FontWeight::NORMAL
-                                                    },
-                                                )
-                                                .text_color(if is_empty {
-                                                    theme::sidebar_placeholder
-                                                } else if is_session {
-                                                    theme::sidebar_session_title
+                                                .text_size(px(if is_empty {
+                                                    theme::font_detail()
                                                 } else {
-                                                    theme::sidebar_text_primary
+                                                    theme::font_sidebar_row()
+                                                }))
+                                                .font_weight(if is_empty {
+                                                    FontWeight::NORMAL
+                                                } else {
+                                                    FontWeight::MEDIUM
+                                                })
+                                                .text_color(if is_empty {
+                                                    theme::sidebar_text_muted
+                                                } else if is_session {
+                                                    theme::foreground
+                                                } else {
+                                                    theme::text_secondary
                                                 }),
                                         )
                                         .when(
@@ -427,11 +496,6 @@ fn row_item(
                                                 title.child(
                                                     text(row.count.to_string())
                                                         .flex_shrink_0()
-                                                        .min_w(px(20.0))
-                                                        .px(px(theme::SPACING_XS))
-                                                        .rounded_full()
-                                                        .bg(theme::background_dim)
-                                                        .text_center()
                                                         .text_size(px(theme::font_sidebar_meta()))
                                                         .text_color(theme::sidebar_text_muted),
                                                 )
@@ -450,57 +514,70 @@ fn row_item(
                         )
                         .child(row_metadata(&row, clock)),
                 )
-                .child(when(
+                .child(when(move || adds_sessions && !state.select_mode.get(), {
+                    let row = row.clone();
+                    let create = actions.new_session.clone();
                     move || {
-                        !state.select_mode.get()
-                            && matches!(
-                                row.kind,
-                                SidebarRowKind::Project | SidebarRowKind::Workspace
-                            )
-                    },
-                    {
                         let row = row.clone();
-                        let create = actions.new_session.clone();
-                        move || {
-                            let row = row.clone();
-                            let create = create.clone();
-                            crate::ui::action::icon_button(
-                                icon!("plus"),
-                                copy::text("New session here", "在此新建会话", "在此新增工作階段"),
-                                move || create(&row),
-                            )
-                            .size(px(theme::SIDEBAR_ACTION_WIDTH))
+                        let create = create.clone();
+                        button()
+                            .size(px(theme::SIDEBAR_ROW_ACTION))
+                            .mr(px(theme::SIDEBAR_ROW_INSET))
                             .flex_shrink_0()
-                        }
-                    },
-                ))
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(theme::sidebar_well)
+                            .hit_slop(px(theme::SPACING_SM))
+                            .active(|style| style.opacity(0.6))
+                            .accessibility_label(copy::text(
+                                "New session here",
+                                "在此新建会话",
+                                "在此新增工作階段",
+                            ))
+                            .on_press(move || create(&row))
+                            .child(
+                                svg(icon!("plus"))
+                                    .size(px(14.0))
+                                    .text_color(theme::text_secondary),
+                            )
+                    }
+                }))
                 .child(when(
-                    move || !is_empty && !state.select_mode.get(),
+                    // Rows are put in order while they are being selected:
+                    // the grip is the one place a drag does not scroll.
                     move || {
-                        let on_menu = on_menu.clone();
+                        !is_empty
+                            && state.select_mode.get()
+                            && state.query.with(|query| query.trim().is_empty())
+                    },
+                    move || {
                         let move_row = actions.move_row.clone();
                         let row = row.clone();
                         let travel = animated_value(0.0);
                         view()
-                            .size(px(theme::SIDEBAR_ACTION_WIDTH))
+                            .w(px(theme::SIDEBAR_ROW_ACTION))
+                            .h_full()
+                            .mr(px(theme::SPACING_XS))
                             .flex_shrink_0()
                             .items_center()
                             .justify_center()
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .role(AccessibilityRole::Button)
-                            .label(menu_label)
-                            .focusable(true)
-                            .on_press(on_menu)
+                            .label(copy::text("Drag to reorder", "拖动排序", "拖曳排序"))
                             .pan_values(None, Some(&travel))
-                            .pan_enabled(move || state.query.with(|query| query.trim().is_empty()))
+                            .pan_enabled(true)
+                            .on_pan_start(move |_: &PanEvent| {
+                                crate::motion::tick();
+                                dragging.set(true);
+                            })
                             .on_pan_end(move |event: &PanEvent| {
                                 travel.set(0.0);
+                                dragging.set(false);
                                 if !event.cancelled {
                                     move_row(&row, event.translation.y.0);
                                 }
                             })
                             .child(
-                                svg(icon!("ellipsis-vertical"))
+                                svg(icon!("grip-vertical"))
                                     .size(px(theme::ICON_SM))
                                     .text_color(theme::sidebar_text_muted),
                             )
@@ -526,23 +603,25 @@ pub(super) fn toggle_batch(selection: Signal<Vec<String>>, ids: &[String]) {
     });
 }
 
+/// The mark a row wears while sessions are being selected: an empty ring, a
+/// filled one with a check, or with a dash for a scope only partly selected.
 fn selection_mark(mark: impl Fn() -> Option<bool> + Copy + 'static) -> impl IntoElement {
     view()
-        .size(px(20.0))
-        .rounded(px(4.0))
-        .border_1()
+        .size(px(theme::SIDEBAR_SELECTION_MARK))
+        .rounded_full()
+        .border(px(1.5))
         .border_color(move || {
             if mark().is_some() {
                 theme::primary()
             } else {
-                theme::border_default()
+                theme::sidebar_text_muted()
             }
         })
         .bg(move || {
             if mark().is_some() {
                 theme::primary()
             } else {
-                theme::background()
+                theme::primary().opacity(0.0)
             }
         })
         .items_center()
@@ -551,7 +630,7 @@ fn selection_mark(mark: impl Fn() -> Option<bool> + Copy + 'static) -> impl Into
             move || mark() == Some(true),
             || {
                 svg(icon!("check"))
-                    .size(px(14.0))
+                    .size(px(13.0))
                     .text_color(theme::primary_foreground)
             },
         ))
@@ -559,7 +638,7 @@ fn selection_mark(mark: impl Fn() -> Option<bool> + Copy + 'static) -> impl Into
             move || mark() == Some(false),
             || {
                 view()
-                    .w(px(10.0))
+                    .w(px(9.0))
                     .h(px(2.0))
                     .rounded_full()
                     .bg(theme::primary_foreground)
@@ -567,25 +646,36 @@ fn selection_mark(mark: impl Fn() -> Option<bool> + Copy + 'static) -> impl Into
         ))
 }
 
+/// What trails a row's title: how the session stands, when it was last
+/// touched, and the marks it carries.
 fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement {
-    let muted = theme::sidebar_session_meta;
+    let muted = theme::sidebar_text_muted;
     let mut row_view = view()
         .flex_row()
         .items_center()
         .justify_end()
         .gap(px(theme::SPACING_XS))
+        .ml(px(theme::SPACING_SM))
         .flex_shrink_0();
+    if row.pinned {
+        row_view = row_view.child(
+            svg(icon!("pin"))
+                .size(px(theme::SIDEBAR_META_ICON))
+                .text_color(muted)
+                .label(copy::text("Pinned", "已置顶", "已釘選")),
+        );
+    }
     if row.auto_continue_paused {
         row_view = row_view.child(
             svg(icon!("pause"))
-                .size(px(theme::ICON_SM))
+                .size(px(theme::SIDEBAR_META_ICON))
                 .text_color(muted),
         );
     }
     if row.scheduled {
         row_view = row_view.child(
             svg(icon!("clock"))
-                .size(px(theme::ICON_SM))
+                .size(px(theme::SIDEBAR_META_ICON))
                 .text_color(muted),
         );
     }
@@ -605,6 +695,7 @@ fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement 
         )),
         Some(SessionState::Waiting) => row_view.child(
             text("?")
+                .text_size(px(theme::font_sidebar_meta()))
                 .font_weight(FontWeight::BOLD)
                 .text_color(theme::accent_yellow),
         ),
@@ -627,25 +718,6 @@ fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement 
                 .size(px(theme::SIDEBAR_UNREAD_DOT))
                 .rounded_full()
                 .bg(theme::accent_blue),
-        );
-    }
-    if row.pinned {
-        row_view = row_view.child(
-            svg(icon!("pin"))
-                .size(px(theme::ICON_SM))
-                .text_color(muted)
-                .label(copy::text("Pinned", "已置顶", "已釘選")),
-        );
-    }
-    if matches!(row.kind, SidebarRowKind::Folder | SidebarRowKind::Group) {
-        row_view = row_view.child(
-            svg(if row.collapsed {
-                icon!("chevron-right")
-            } else {
-                icon!("chevron-down")
-            })
-            .size(px(12.0))
-            .text_color(muted),
         );
     }
     row_view
