@@ -3927,6 +3927,15 @@ retryable main stream error -> provider/opencode_model_api_retrying
 - Response, send failure, timeout, shutdown, process exit, and pooled-session
   removal must clear prompt correlation state. No lock may be held while
   sending `session/cancel` or completing a pending sender.
+- A conversation turn has no wall-clock deadline. `session/prompt` waits until
+  the Agent answers, the process exits, or the turn is cancelled: a long model
+  call, a long build and a long tool run are ordinary work, and ending the turn
+  at a fixed hour threw away the answer the reader was waiting for. Silence is
+  reported to the reader instead — the desktop composer shows a stall notice
+  after ten quiet minutes and offers stop-and-continue — and only an explicit
+  stop ends the wait. Deadline-bound requests keep their own waits: handshake,
+  session load, authentication, probes, steering and channel control are still
+  fault detectors with a deadline.
 - OpenCode writes model failures to stderr independently from the stdout
   JSON-RPC response. A terminal prompt RPC error keeps its prompt correlation
   for a bounded 250 ms stderr-drain window before classifying the response; a
@@ -3964,8 +3973,10 @@ retryable main stream error -> provider/opencode_model_api_retrying
 - OpenCode `end_turn` with no model-stream progress and no pending host input ->
   `provider/opencode_model_api_error`; no empty final Agent message.
 - Stream error for an unknown/inactive session -> diagnostic tail only.
-- Prompt timeout wins before stderr failure -> `process/acp_request_timeout`; a
-  late stderr line must not cancel a newer or already completed request.
+- A deadline-bound request that expires before a stderr failure ->
+  `process/acp_request_timeout`; a late stderr line must not cancel a newer or
+  already completed request. A prompt has no such deadline, so this code never
+  ends a turn.
 
 ### 5. Good/Base/Bad Cases
 
@@ -3985,8 +3996,8 @@ retryable main stream error -> provider/opencode_model_api_retrying
   diagnostics because the profile is not OpenCode.
 - Bad: every stderr error fails the first active turn without matching
   `session.id` to its pending prompt.
-- Bad: Vibex waits for the two-hour prompt timeout after OpenCode has already
-  logged repeated unrecoverable API failures.
+- Bad: Vibex keeps the turn open after OpenCode has already logged repeated
+  unrecoverable API failures; there is no prompt deadline left to end it.
 
 ### 6. Tests Required
 
@@ -4028,7 +4039,7 @@ retryable main stream error -> provider/opencode_model_api_retrying
 ```text
 session/prompt -> OpenCode retries model API forever
                -> ACP stdout stays silent
-               -> Vibex remains running until the global prompt timeout
+               -> Vibex keeps the turn running until the reader stops it
 ```
 
 #### Correct

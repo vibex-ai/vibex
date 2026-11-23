@@ -1246,6 +1246,16 @@ const USER_MESSAGE_ATTACHMENT_BUBBLE_GAP_PX: f32 = USER_MESSAGE_ATTACHMENT_GAP_P
 /// How many decoded `data:` pictures a message strip keeps on hand.
 const USER_MESSAGE_THUMBNAIL_CACHE_LIMIT: usize = 32;
 const AGENT_TURN_DURATION_TICK_INTERVAL: Duration = Duration::from_secs(1);
+/// How long a live turn may produce nothing at all before the composer asks
+/// the reader what to do.
+///
+/// Vibex does not end a turn for taking a long time: a long model call, build
+/// or tool run is ordinary work, and a turn has no deadline of its own (see
+/// `RequestWait::UntilStopped` in the ACP runtime). Silence is the only thing
+/// worth reporting, and ten minutes is long past what a healthy model or tool
+/// stays quiet for — while still short enough that a reader watching a dead
+/// turn does not sit in front of it for an hour.
+const AGENT_TURN_STALL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const AGENT_TIMELINE_LAYOUT_WIDTH_EPSILON_PX: f32 = 1.0;
 /// Advance width the timeline's body text averages. The first-layout estimator
 /// counts characters instead of shaping the paragraph, so this is the ratio
@@ -1719,6 +1729,20 @@ struct AutoContinueCountdown {
     session_id: VibexSessionId,
     session_updated_at_ms: i64,
     remaining_seconds: u8,
+}
+
+/// How long one session's live turn has been silent.
+///
+/// See [`App::turn_stall_watches`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct TurnStallWatch {
+    /// When the turn last produced anything, in epoch milliseconds.
+    last_activity_ms: i64,
+    /// Whether the reader closed the notice for the current silence.
+    ///
+    /// Activity clears it: a dismissal speaks about one silent stretch, not
+    /// about the session, so the next stretch still asks.
+    dismissed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -12808,6 +12832,15 @@ pub struct VibexWorkbench {
     /// is what the revision records. Without it a snapshot read before the
     /// dispatch could be mistaken for the dispatch's own settle.
     pending_agent_turn_revisions: BTreeMap<String, i64>,
+    /// When each session's live turn last produced anything at all.
+    ///
+    /// A turn is never cut for taking long, so the only thing left to watch is
+    /// silence: a model or tool that has produced nothing for
+    /// [`AGENT_TURN_STALL_TIMEOUT`] gets a notice above the composer that offers
+    /// to stop the turn and continue it. Every live event for a session moves
+    /// this clock; a turn that starts moves it too, and a turn that ends drops
+    /// the entry.
+    turn_stall_watches: BTreeMap<String, TurnStallWatch>,
     unread_agent_completion_session_ids: BTreeSet<String>,
     /// The highest final-answer sequence already accounted for per session.
     ///
@@ -14505,6 +14538,7 @@ impl VibexWorkbench {
             fork_session_pending: false,
             pending_agent_turn_session_ids: BTreeSet::new(),
             pending_agent_turn_revisions: BTreeMap::new(),
+            turn_stall_watches: BTreeMap::new(),
             unread_agent_completion_session_ids: BTreeSet::new(),
             unread_completion_watermarks: BTreeMap::new(),
             pending_user_request_ids: BTreeMap::new(),
@@ -23452,6 +23486,10 @@ impl VibexWorkbench {
         // The snapshot is the authority's own account of the turn a local
         // dispatch asked for, so it is what answers the optimistic flag.
         self.reconcile_pending_agent_turn(&session);
+        // The stall clock follows the turn rather than the client that started
+        // it: another client's running session is watched from the snapshot
+        // that admits it, and a turn that has ended stops being watched.
+        self.reconcile_turn_stall_watch(&session);
         let delegated = (self.delegated_sessions.contains_key(session.id.as_str())
             && !self.sessions.iter().any(|root| root.id == session.id))
             || self
@@ -23541,11 +23579,18 @@ impl VibexWorkbench {
             self.auto_continue_turn_statuses.remove(session_id.as_str());
             self.auto_continue_probe_tasks.remove(session_id.as_str());
             self.cancel_auto_continue_countdown(session_id);
+            // A dispatch is the turn's first output as far as silence goes: the
+            // clock has to start at the send, not at whatever the previous turn
+            // last produced.
+            if !was_pending {
+                self.start_turn_stall_watch(session_id.as_str());
+            }
         } else {
             self.pending_agent_turn_session_ids
                 .remove(session_id.as_str());
             self.pending_agent_turn_revisions
                 .remove(session_id.as_str());
+            self.clear_turn_stall_watch(session_id.as_str());
         }
         if self.selected_session_id.as_ref() == Some(session_id) {
             self.agent_turn_pending = pending;
@@ -30401,6 +30446,301 @@ impl VibexWorkbench {
         }
     }
 
+    /// The session whose composer is being rendered.
+    ///
+    /// A split renders one composer per pane, and each pane follows its own
+    /// borrowed view: the sidebar selection names the focused pane, not the one
+    /// being drawn. The live timeline's session is the fallback for the frames
+    /// before a view is borrowed.
+    fn composer_notice_session_id(&self) -> Option<VibexSessionId> {
+        self.view_session_id
+            .clone()
+            .or_else(|| self.timeline.session_id.clone())
+    }
+
+    /// Whether a session has a turn in flight right now.
+    ///
+    /// The optimistic flag covers the gap between a dispatch and the snapshot
+    /// that admits it; the snapshot covers a turn another client started.
+    fn session_has_live_turn(&self, session_key: &str) -> bool {
+        self.pending_agent_turn_session_ids.contains(session_key)
+            || self
+                .registered_session(session_key)
+                .is_some_and(|session| matches!(session.state, AgentSessionState::Running))
+    }
+
+    /// Moves a session's stall clock forward.
+    ///
+    /// Every live event is output of some kind — a token, a tool call, a
+    /// terminal line — so this is exactly the "the turn is still doing
+    /// something" signal the notice reads. A session with no turn in flight is
+    /// not watched at all: there is no silence to report for a turn that ended.
+    fn note_turn_activity(&mut self, session_key: &str) {
+        if !self.session_has_live_turn(session_key) {
+            self.turn_stall_watches.remove(session_key);
+            return;
+        }
+        let now_ms = unix_timestamp_ms();
+        let watch = self
+            .turn_stall_watches
+            .entry(session_key.to_string())
+            .or_insert(TurnStallWatch {
+                last_activity_ms: now_ms,
+                dismissed: false,
+            });
+        if now_ms > watch.last_activity_ms {
+            watch.last_activity_ms = now_ms;
+        }
+        // Activity answers a closed notice: the reader dismissed one silent
+        // stretch, and the turn producing something again is news even if it
+        // goes quiet once more later.
+        watch.dismissed = false;
+    }
+
+    /// Keeps a session's stall clock in step with an authoritative snapshot.
+    ///
+    /// A snapshot can be the first account of a turn this client did not start,
+    /// so a running session with no clock gets one. A session that is not
+    /// running any more — or is waiting on the reader, which is silence with a
+    /// reason — stops being watched.
+    fn reconcile_turn_stall_watch(&mut self, session: &AgentSession) {
+        let running = matches!(session.state, AgentSessionState::Running)
+            || self.session_turn_pending(&session.id);
+        if !running {
+            self.clear_turn_stall_watch(session.id.as_str());
+            return;
+        }
+        if !self.turn_stall_watches.contains_key(session.id.as_str()) {
+            self.start_turn_stall_watch(session.id.as_str());
+        }
+    }
+
+    /// Arms the stall clock for a turn that is starting.
+    fn start_turn_stall_watch(&mut self, session_key: &str) {
+        self.turn_stall_watches.insert(
+            session_key.to_string(),
+            TurnStallWatch {
+                last_activity_ms: unix_timestamp_ms(),
+                dismissed: false,
+            },
+        );
+    }
+
+    /// Drops the stall clock for a turn that is over.
+    fn clear_turn_stall_watch(&mut self, session_key: &str) {
+        self.turn_stall_watches.remove(session_key);
+    }
+
+    /// Closes the notice for the silence it is reporting.
+    ///
+    /// The dismissal lasts until the turn produces something or ends, so a
+    /// reader who decides to keep waiting is not asked again about the same
+    /// stretch of silence.
+    fn dismiss_turn_stall_watch(&mut self, session_key: &str) {
+        if let Some(watch) = self.turn_stall_watches.get_mut(session_key) {
+            watch.dismissed = true;
+        }
+    }
+
+    /// Draws the notice above the composer while a live turn is silent.
+    ///
+    /// A turn is never cut for taking a long time, so the reader needs a way to
+    /// judge one that has stopped producing anything: the notice names the
+    /// silence and offers the two answers there are — stop the turn and carry on
+    /// with a fresh one, or say that waiting is fine.
+    fn render_turn_stall_notice(&mut self, cx: &mut Context<Self>) -> Option<AnyElement> {
+        let session_id = self.composer_notice_session_id()?;
+        // Waiting on the reader is silence with a reason: the request card, not
+        // this notice, is what a turn parked on a permission or an input needs.
+        if self
+            .registered_session(session_id.as_str())
+            .is_some_and(|session| matches!(session.state, AgentSessionState::NeedsInput))
+        {
+            return None;
+        }
+        if !self.session_has_live_turn(session_id.as_str()) {
+            return None;
+        }
+        let watch = *self.turn_stall_watches.get(session_id.as_str())?;
+        let now_ms = unix_timestamp_ms();
+        if !turn_stall_notice_is_due(true, watch.last_activity_ms, watch.dismissed, now_ms) {
+            return None;
+        }
+        let silence = format_compact_duration(watch.last_activity_ms, Some(now_ms));
+        let label = turn_stall_notice_label(self.resolved_locale(), &silence);
+        Some(
+            h_flex()
+                .id("turn-stall-notice")
+                .w_full()
+                .min_w_0()
+                .flex_wrap()
+                .flex_none()
+                .items_center()
+                .gap_2()
+                .rounded_md()
+                .border_1()
+                .border_color(cx.theme().warning.opacity(0.45))
+                .bg(cx.theme().warning.opacity(0.08))
+                .px_3()
+                .py_2()
+                .child(
+                    Icon::new(IconName::TriangleAlert)
+                        .small()
+                        .text_color(cx.theme().warning),
+                )
+                .child(
+                    div()
+                        .min_w(px(180.0))
+                        .flex_1()
+                        .text_xs()
+                        .text_color(cx.theme().foreground)
+                        .child(label),
+                )
+                .child(
+                    Button::new("turn-stall-terminate")
+                        .xsmall()
+                        .primary()
+                        .label(locale::text(
+                            "Stop and continue",
+                            "终止后继续任务",
+                            "終止後繼續任務",
+                        ))
+                        .tooltip(locale::text(
+                            "Stop this turn and continue the session from where it stopped",
+                            "中断当前回合，并从这个位置继续任务",
+                            "中斷目前回合，並從這個位置繼續任務",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.terminate_stalled_turn_and_continue(cx)
+                        })),
+                )
+                .child(
+                    Button::new("turn-stall-dismiss")
+                        .xsmall()
+                        .ghost()
+                        .compact()
+                        .size(px(28.0))
+                        .icon(IconName::Close)
+                        .tooltip(locale::text(
+                            "Dismiss this notice",
+                            "关闭提示",
+                            "關閉提示",
+                        ))
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            if let Some(session_id) = this.composer_notice_session_id() {
+                                this.dismiss_turn_stall_watch(session_id.as_str());
+                            }
+                            cx.notify();
+                        })),
+                )
+                .into_any_element(),
+        )
+    }
+
+    /// Stops a silent turn and starts a continuation in its place.
+    ///
+    /// The two halves are sequential on purpose: the runtime releases the old
+    /// turn's lease only once it has unwound, and a continuation that raced it
+    /// would be rejected as a turn already in flight. Interrupting first also
+    /// keeps the reader's context — the continuation prompt is the same hidden
+    /// one the Continue button sends, so the transcript gets the new turn
+    /// without a fake user message.
+    fn terminate_stalled_turn_and_continue(&mut self, cx: &mut Context<Self>) {
+        let Some(session_id) = self.composer_notice_session_id() else {
+            return;
+        };
+        let Some(backend) = self.backend.clone() else {
+            return;
+        };
+        // The click is the notice's answer: it must not outlive it while the
+        // interruption is in flight.
+        self.dismiss_turn_stall_watch(session_id.as_str());
+        if self.view_session_id.as_ref() == Some(&session_id) {
+            self.agent_error = None;
+        }
+        self.set_session_turn_pending(&session_id, true);
+        cx.notify();
+        let continued_session_id = session_id.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let outcome: Result<(), vibex_backend::BackendError> = async {
+                backend
+                    .agent()
+                    .interrupt(MutationRequest::new(session_id.clone()))
+                    .await?;
+                // The interrupted turn settles asynchronously. Ten seconds is
+                // far more than a cancellation needs; if it somehow takes
+                // longer the continuation is attempted anyway and the runtime's
+                // own conflict is what the reader sees.
+                for _ in 0..40 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    match backend.agent().open_session(session_id.clone()).await {
+                        Ok(session) if session.state != AgentSessionState::Running => break,
+                        Ok(_) => continue,
+                        Err(_) => break,
+                    }
+                }
+                backend
+                    .agent()
+                    .continue_turn(MutationRequest::new(ContinueAgentTurnRequest {
+                        session_id: session_id.clone(),
+                        correlation_id: None,
+                    }))
+                    .await
+                    .map(|_| ())?;
+                Ok(())
+            }
+            .await;
+            let session = backend.agent().open_session(session_id.clone()).await.ok();
+            (outcome, session)
+        });
+        cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let joined = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    let (outcome, session) = match joined {
+                        Ok(pair) => pair,
+                        Err(error) => {
+                            this.set_session_turn_pending(&continued_session_id, false);
+                            let hint = locale::text(
+                                "Stopping and continuing the turn failed",
+                                "终止并继续任务失败",
+                                "終止並繼續任務失敗",
+                            );
+                            this.agent_error = Some(format!("{hint}: {error}"));
+                            cx.notify();
+                            return;
+                        }
+                    };
+                    if let Some(session) = session {
+                        this.upsert_session_snapshot(session);
+                        this.reconcile_sidebar_state();
+                        this.publish_sidebar_invalidation();
+                    }
+                    this.set_session_turn_pending(&continued_session_id, false);
+                    this.sync_auto_continue_for_session(&continued_session_id, cx);
+                    match outcome {
+                        Ok(()) => {
+                            if this.view_session_id.as_ref() == Some(&continued_session_id) {
+                                this.refresh_selected_agent_timeline(cx);
+                            }
+                        }
+                        Err(error) => {
+                            let hint = locale::text(
+                                "Stopping and continuing the turn failed",
+                                "终止并继续任务失败",
+                                "終止並繼續任務失敗",
+                            );
+                            this.agent_error =
+                                Some(format!("{hint}: {}", backend_error_to_vibex(error)));
+                        }
+                    }
+                    cx.notify();
+                });
+            },
+        )
+        .detach();
+    }
+
     /// Draws the failover prompt above the composer.
     ///
     /// It sits with the generation status because it describes the same turn:
@@ -32789,6 +33129,22 @@ impl VibexWorkbench {
         }
         if sidebar_changed {
             self.invalidate_sidebar_projection_cache();
+        }
+        // Every live event is output of some kind — a token, a tool call, a
+        // terminal line — so this is the clock the composer's stall notice
+        // reads. It runs before the "surface is hidden" return below on purpose:
+        // a session that is not on screen is still watched, and its notice is
+        // right when the reader comes back to it.
+        {
+            // One batch streams many chunks of the same session; the clock only
+            // needs one visit per session, and `registered_session` is a scan.
+            let mut touched = BTreeSet::new();
+            for event in &events {
+                touched.insert(event.session_id.as_str());
+            }
+            for session_key in touched {
+                self.note_turn_activity(session_key);
+            }
         }
         let unread_changed = update_unread_agent_completions(
             &mut self.unread_agent_completion_session_ids,
@@ -80624,6 +80980,9 @@ impl VibexWorkbench {
         let generation_status = self.render_agent_generation_status(session_running, cx);
         let failover_prompt = self.render_failover_prompt(cx);
         let failover_notices = self.render_failover_notices(cx);
+        // The turn has no deadline, so the reader needs to hear about silence
+        // instead: this is the only surface that can ask what to do about it.
+        let turn_stall_notice = self.render_turn_stall_notice(cx);
         // The cascade edits one selection, so pointing it at the chip the caret
         // is on turns the same controls into that collaborator's parameter
         // panel. No mode, no second widget: move the caret off the chip and the
@@ -80715,7 +81074,8 @@ impl VibexWorkbench {
         // row it replaces used to read from the composer's own box.
         let companion_inset = content_insets.horizontal;
         let composer_is_expanded = self.composer_expanded;
-        let composer_extension_visible = composer_queue.is_some() || composer_goal.is_some();
+        let composer_extension_visible =
+            composer_queue.is_some() || composer_goal.is_some() || turn_stall_notice.is_some();
         // Which of the two densities this frame draws.
         //
         // It is a property of the content, not of the window or the split, so it
@@ -81229,6 +81589,16 @@ impl VibexWorkbench {
                                 .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
                                 .pb_2()
                                 .child(prompt),
+                        )
+                    })
+                    .when_some(turn_stall_notice, |this, notice| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(notice),
                         )
                     })
                     .when_some(composer_collaboration, |this, collaboration| {
@@ -84422,6 +84792,39 @@ fn format_timeline_hover_time(timestamp_ms: i64, locale: locale::ResolvedLocale)
             timestamp.format("%Y/%m/%d %H:%M:%S").to_string()
         }
         _ => timestamp.format("%m/%d/%Y, %H:%M:%S").to_string(),
+    }
+}
+
+/// Whether a silent turn should ask the reader what to do.
+///
+/// Only a running turn can be silent, and only one the reader has not already
+/// dismissed. The comparison is against the turn's own last output rather than
+/// against when it started: a turn that has been working for an hour and then
+/// stops is exactly the case the notice exists for.
+fn turn_stall_notice_is_due(
+    turn_running: bool,
+    last_activity_ms: i64,
+    dismissed: bool,
+    now_ms: i64,
+) -> bool {
+    turn_running
+        && !dismissed
+        && now_ms.saturating_sub(last_activity_ms) >= AGENT_TURN_STALL_TIMEOUT.as_millis() as i64
+}
+
+/// The notice's one sentence, in the reader's language.
+///
+/// `silence` is the formatted stretch of silence, so the sentence says how long
+/// the turn has been quiet instead of only that it has been.
+fn turn_stall_notice_label(locale: locale::ResolvedLocale, silence: &str) -> String {
+    match locale {
+        locale::ResolvedLocale::ZhCn => {
+            format!("任务已 {silence} 没有任何输出，是否终止后继续任务？")
+        }
+        locale::ResolvedLocale::ZhTw => {
+            format!("任務已 {silence} 沒有輸出，是否終止後繼續任務？")
+        }
+        _ => format!("No output for {silence}. Stop the turn and continue?"),
     }
 }
 
@@ -124093,6 +124496,114 @@ mod tests {
                     .contains_key(request.id.as_str())
             );
         });
+    }
+
+    #[test]
+    fn turn_stall_notice_waits_for_ten_silent_minutes() {
+        let now_ms = 1_700_000_000_000_i64;
+        let timeout_ms = AGENT_TURN_STALL_TIMEOUT.as_millis() as i64;
+        assert_eq!(AGENT_TURN_STALL_TIMEOUT, Duration::from_secs(10 * 60));
+
+        // Output a minute ago is a turn that is working, whatever its age.
+        assert!(!turn_stall_notice_is_due(true, now_ms - 60_000, false, now_ms));
+        assert!(!turn_stall_notice_is_due(
+            true,
+            now_ms - (timeout_ms - 1_000),
+            false,
+            now_ms
+        ));
+        // The threshold itself is the first frame that asks.
+        assert!(turn_stall_notice_is_due(true, now_ms - timeout_ms, false, now_ms));
+        // A turn that ended, or that the reader already answered, is quiet.
+        assert!(!turn_stall_notice_is_due(
+            false,
+            now_ms - timeout_ms,
+            false,
+            now_ms
+        ));
+        assert!(!turn_stall_notice_is_due(
+            true,
+            now_ms - timeout_ms,
+            true,
+            now_ms
+        ));
+        // A clock that ran ahead of the wall clock is not a stall.
+        assert!(!turn_stall_notice_is_due(true, now_ms + 5_000, false, now_ms));
+    }
+
+    #[test]
+    fn turn_stall_notice_names_the_silence_in_the_reader_language() {
+        assert_eq!(
+            turn_stall_notice_label(locale::ResolvedLocale::ZhCn, "12m 3s"),
+            "任务已 12m 3s 没有任何输出，是否终止后继续任务？"
+        );
+        assert_eq!(
+            turn_stall_notice_label(locale::ResolvedLocale::ZhTw, "12m 3s"),
+            "任務已 12m 3s 沒有輸出，是否終止後繼續任務？"
+        );
+        assert_eq!(
+            turn_stall_notice_label(locale::ResolvedLocale::En, "12m 3s"),
+            "No output for 12m 3s. Stop the turn and continue?"
+        );
+    }
+
+    #[test]
+    fn the_stall_notice_rides_above_the_composer_input() {
+        let source = include_str!("app.rs");
+        let composer = source
+            .split_once("    fn render_composer(")
+            .and_then(|(_, tail)| tail.split_once("\n    fn render_runtime_failure("))
+            .map(|(body, _)| body)
+            .expect("composer renderer should remain inspectable");
+
+        let notice_position = composer
+            .find(".when_some(turn_stall_notice")
+            .expect("the composer should render the turn stall notice");
+        let input_position = composer
+            .find(".h(px(composer_surface_height_now))")
+            .expect("the composer surface should remain the input box");
+        assert!(
+            notice_position < input_position,
+            "the notice belongs above the input box, not inside it"
+        );
+        assert!(
+            composer.contains("|| turn_stall_notice.is_some()"),
+            "a notice row asks for the full composer box"
+        );
+        // The two answers the notice offers are the whole interaction.
+        let notice = source
+            .split_once("    fn render_turn_stall_notice(")
+            .and_then(|(_, tail)| {
+                tail.split_once("\n    fn terminate_stalled_turn_and_continue(")
+            })
+            .map(|(body, _)| body)
+            .expect("stall notice renderer should remain inspectable");
+        assert!(notice.contains("Button::new(\"turn-stall-terminate\")"));
+        assert!(notice.contains("Button::new(\"turn-stall-dismiss\")"));
+        assert!(notice.contains("turn_stall_notice_label("));
+        assert!(notice.contains("dismiss_turn_stall_watch("));
+    }
+
+    #[test]
+    fn stopping_a_stalled_turn_interrupts_before_continuing() {
+        let source = include_str!("app.rs");
+        let action = source
+            .split_once("    fn terminate_stalled_turn_and_continue(")
+            .and_then(|(_, tail)| tail.split_once("\n    /// Draws the failover prompt"))
+            .map(|(body, _)| body)
+            .expect("the stall action should remain inspectable");
+
+        // The two halves are ordered: a continuation that raced the old turn
+        // would be rejected as a turn already in flight.
+        let interrupt = action
+            .find(".interrupt(MutationRequest::new(session_id.clone()))")
+            .expect("the stalled turn has to be interrupted");
+        let continue_turn = action
+            .find(".continue_turn(")
+            .expect("the interrupted turn has to be continued");
+        assert!(interrupt < continue_turn);
+        assert!(action.contains("AgentSessionState::Running => break"));
+        assert!(action.contains("ContinueAgentTurnRequest"));
     }
 
     #[test]

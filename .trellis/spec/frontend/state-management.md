@@ -1021,6 +1021,29 @@ Regression coverage must assert that an unchanged turn reuses the same `Rc`
 across frames, that a new process row rebuilds it, and that the table never
 holds a turn the current projection dropped.
 
+### Convention: Turn stall notice
+
+A conversation turn has no deadline (see the backend protocol spec), so a turn
+that stops producing anything is reported, not killed. The desktop keeps one
+stall clock per session: every live timeline event moves it forward, a dispatch
+starts it, and a turn that ends (or parks on the reader) drops it. When the
+clock passes ten silent minutes the composer draws a notice above the input box
+that names the silence and offers exactly two answers — stop the turn and
+continue it, or close the notice.
+
+Keep the clock in the workbench, keyed by session id, and keep it off the
+render path: the notice is a projection of that clock plus the session's own
+running state. Do not measure silence from turn start, and do not fold this
+into the ACP runtime as a timeout — a turn that is slow is not a turn that is
+broken.
+
+Dismissal speaks about one silent stretch. Any activity clears it, and the
+notice may ask again after the next stretch; a turn boundary drops the clock
+entirely. The stop-and-continue action interrupts first and only then requests
+the continuation, in the same task, because a continuation that races the old
+turn is rejected as a turn already in flight; the reader must not see the
+notice again while that interruption is in flight.
+
 ### Convention: Existing-session composer drafts
 
 Unsent Composer state is local presentation state scoped by `VibexSessionId`.

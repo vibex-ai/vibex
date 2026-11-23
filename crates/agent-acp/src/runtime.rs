@@ -182,7 +182,15 @@ const ACP_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
 // handshake deadline used for initialize/session requests.
 const ACP_AUTHENTICATION_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 const ACP_SESSION_LOAD_TIMEOUT: Duration = Duration::from_secs(120);
-const ACP_PROMPT_TIMEOUT: Duration = Duration::from_secs(2 * 60 * 60);
+/// How long a control request may wait for its answer.
+///
+/// Steering and channel commands are answered at once by every adapter: they
+/// acknowledge a message, they do not produce the turn's answer. The wait is
+/// therefore a fault detector, not a work budget, and ten minutes is already
+/// far past the point where the Agent has stopped answering.
+///
+/// A conversation turn has no such budget — see [`RequestWait::UntilStopped`].
+const ACP_CONTROL_REQUEST_TIMEOUT: Duration = Duration::from_secs(10 * 60);
 pub(crate) const ACP_PROBE_TIMEOUT: Duration = Duration::from_secs(20);
 const ACP_PROBE_CONFIG_UPDATE_TIMEOUT: Duration = Duration::from_millis(500);
 #[cfg(not(test))]
@@ -2664,6 +2672,37 @@ struct StartedAcpRequest {
     stderr_sequence: u64,
     response: oneshot::Receiver<Result<Value, AcpRpcFailure>>,
     registration_release: Option<oneshot::Sender<()>>,
+}
+
+/// How long one outgoing request waits for the Agent's answer.
+#[derive(Debug, Clone, Copy)]
+enum RequestWait {
+    /// Give up after this long.
+    ///
+    /// Every request outside a conversation turn is a fault when it goes
+    /// silent — a handshake, a session load, an authentication poll, a probe,
+    /// a control command — so a deadline is the honest answer there.
+    Deadline(Duration),
+    /// Wait for as long as the turn runs.
+    ///
+    /// A turn is not a budget. A long model call, a long build or a long tool
+    /// run is ordinary work, and the old fixed wall-clock cap ended the turn at
+    /// the hour mark whatever it was doing: every Agent that ran long enough
+    /// died with "the Agent did not answer the JSON-RPC request in time", with
+    /// the work it had already finished thrown away. Silence is reported to the
+    /// reader instead (the desktop composer's turn-stall notice), and only an
+    /// explicit stop ends the wait. The request still fails when the Agent
+    /// process exits, because that drops the response channel.
+    UntilStopped,
+}
+
+/// The two endings of a request wait.
+///
+/// Only [`RequestWait::Deadline`] can produce `TimedOut`; a turn that waits for
+/// the Agent to finish has no ending of its own, which is the point.
+enum RequestOutcome<T> {
+    Answered(T),
+    TimedOut,
 }
 
 #[derive(Debug, Default)]
@@ -6134,7 +6173,7 @@ impl AcpProcess {
         params: Value,
         wait: Duration,
     ) -> VibexResult<Value> {
-        self.request_internal(method, params, wait, false)
+        self.request_internal(method, params, RequestWait::Deadline(wait), false)
             .await
             .map(|(result, _)| result)
     }
@@ -6145,7 +6184,9 @@ impl AcpProcess {
         params: Value,
         wait: Duration,
     ) -> VibexResult<(Value, AcpRegistrationBarrier)> {
-        let (result, barrier) = self.request_internal(method, params, wait, true).await?;
+        let (result, barrier) = self
+            .request_internal(method, params, RequestWait::Deadline(wait), true)
+            .await?;
         let barrier = barrier.ok_or_else(|| {
             VibexError::process(
                 "acp_registration_barrier_missing",
@@ -6243,17 +6284,44 @@ impl AcpProcess {
         &self,
         method: &str,
         params: Value,
-        wait: Duration,
+        wait: RequestWait,
         registration_barrier: bool,
     ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
         let request = self.start_request(method, params, registration_barrier)?;
-        self.finish_started_request(method, wait, request).await
+        self.finish_started_request_with_wait(method, wait, request)
+            .await
     }
 
+    /// The deadline form of [`Self::finish_started_request_with_wait`], kept for
+    /// the failure-classification tests that answer a request out of band.
+    #[cfg(test)]
     async fn finish_started_request(
         &self,
         method: &str,
         wait: Duration,
+        request: StartedAcpRequest,
+    ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
+        self.finish_started_request_with_wait(method, RequestWait::Deadline(wait), request)
+            .await
+    }
+
+    /// Waits for a turn's answer without a deadline.
+    ///
+    /// The answer arrives when the Agent decides the turn is over, which is what
+    /// the reader is waiting for; it is not bounded by how long that takes.
+    async fn finish_started_request_until_stopped(
+        &self,
+        method: &str,
+        request: StartedAcpRequest,
+    ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
+        self.finish_started_request_with_wait(method, RequestWait::UntilStopped, request)
+            .await
+    }
+
+    async fn finish_started_request_with_wait(
+        &self,
+        method: &str,
+        wait: RequestWait,
         request: StartedAcpRequest,
     ) -> VibexResult<(Value, Option<AcpRegistrationBarrier>)> {
         let StartedAcpRequest {
@@ -6263,27 +6331,35 @@ impl AcpProcess {
             response,
             registration_release,
         } = request;
-        let outcome = timeout(wait, response).await;
-        if outcome.is_err()
+        let outcome = match wait {
+            RequestWait::Deadline(wait) => match timeout(wait, response).await {
+                Ok(outcome) => RequestOutcome::Answered(outcome),
+                Err(_) => RequestOutcome::TimedOut,
+            },
+            RequestWait::UntilStopped => RequestOutcome::Answered(response.await),
+        };
+        if matches!(outcome, RequestOutcome::TimedOut)
             && let Ok(mut pending) = self.pending_requests.lock()
         {
             pending.remove(&id);
         }
         let drained_opencode_stream_error = match (&outcome, prompt_session_id.as_deref()) {
-            (Ok(Ok(Err(_))), Some(native_session_id)) if self.opencode_error_bridge_enabled => {
+            (RequestOutcome::Answered(Ok(Err(_))), Some(native_session_id))
+                if self.opencode_error_bridge_enabled =>
+            {
                 self.wait_for_opencode_stream_error(native_session_id).await
             }
             _ => None,
         };
         self.clear_pending_prompt_request(prompt_session_id.as_deref(), id);
         match outcome {
-            Ok(Ok(Ok(result))) => Ok((
+            RequestOutcome::Answered(Ok(Ok(result))) => Ok((
                 result,
                 registration_release.map(|release| AcpRegistrationBarrier {
                     release: Some(release),
                 }),
             )),
-            Ok(Ok(Err(failure))) => {
+            RequestOutcome::Answered(Ok(Err(failure))) => {
                 let failure_requires_authentication =
                     acp_authentication_required_text(&failure.message);
                 let latest_stream_error = drained_opencode_stream_error.or_else(|| {
@@ -6425,7 +6501,7 @@ impl AcpProcess {
                     .with_diagnostic("stderrSummary", stderr_summary))
                 }
             }
-            Ok(Err(_)) => {
+            RequestOutcome::Answered(Err(_)) => {
                 let stderr_summary = self.wait_for_stderr_summary().await.unwrap_or_default();
                 if credential_shape_failure(&stderr_summary) {
                     Err(provider_credential_shape_error(method, ""))
@@ -6445,12 +6521,22 @@ impl AcpProcess {
                     .with_diagnostic("stderrSummary", stderr_summary))
                 }
             }
-            Err(_) => Err(VibexError::process(
+            RequestOutcome::TimedOut => Err(VibexError::process(
                 "acp_request_timeout",
                 "ACP agent did not answer the JSON-RPC request in time",
             )
             .with_diagnostic("method", method)
-            .with_diagnostic("timeoutMs", wait.as_millis().to_string())
+            .with_diagnostic(
+                "timeoutMs",
+                match wait {
+                    RequestWait::Deadline(wait) => wait.as_millis(),
+                    // A deadline is the only wait that can time out; this arm
+                    // is reached only for one, but the match keeps the
+                    // diagnostic total.
+                    RequestWait::UntilStopped => 0,
+                }
+                .to_string(),
+            )
             .with_diagnostic("stderrSummary", self.stderr_summary().unwrap_or_default())),
         }
     }
@@ -7951,7 +8037,6 @@ pub struct AcpRuntimeClient {
     test_multi_session_identities: Mutex<HashMap<String, String>>,
     handshake_timeout: Duration,
     restore_timeout: Duration,
-    prompt_timeout: Duration,
     terminal_host: Option<Arc<dyn AcpTerminalHost>>,
 }
 
@@ -11107,7 +11192,6 @@ impl std::fmt::Debug for AcpRuntimeClient {
             .debug_struct("AcpRuntimeClient")
             .field("handshake_timeout", &self.handshake_timeout)
             .field("restore_timeout", &self.restore_timeout)
-            .field("prompt_timeout", &self.prompt_timeout)
             .finish_non_exhaustive()
     }
 }
@@ -11227,7 +11311,6 @@ impl AcpRuntimeClient {
             test_multi_session_identities: Mutex::new(HashMap::new()),
             handshake_timeout: ACP_HANDSHAKE_TIMEOUT,
             restore_timeout: ACP_SESSION_LOAD_TIMEOUT,
-            prompt_timeout: ACP_PROMPT_TIMEOUT,
             terminal_host: None,
         }
     }
@@ -11270,7 +11353,6 @@ impl AcpRuntimeClient {
             test_multi_session_identities: Mutex::new(HashMap::new()),
             handshake_timeout: ACP_HANDSHAKE_TIMEOUT,
             restore_timeout: ACP_SESSION_LOAD_TIMEOUT,
-            prompt_timeout: ACP_PROMPT_TIMEOUT,
             terminal_host: Some(terminal_host),
         }
     }
@@ -19715,11 +19797,7 @@ impl AcpClient for AcpRuntimeClient {
         );
         let prompt_started = Instant::now();
         let result = process
-            .finish_started_request(
-                AcpOperation::SessionPrompt.method(),
-                self.prompt_timeout,
-                started,
-            )
+            .finish_started_request_until_stopped(AcpOperation::SessionPrompt.method(), started)
             .await
             .map(|(response, _)| response);
         let prompt_result = if result.is_ok() {
@@ -20026,7 +20104,7 @@ impl AcpClient for AcpRuntimeClient {
                 .request(
                     AcpOperation::SessionSteering.method(),
                     params,
-                    self.prompt_timeout,
+                    ACP_CONTROL_REQUEST_TIMEOUT,
                 )
                 .await?;
             return match response.get("outcome").and_then(Value::as_str) {
@@ -20062,7 +20140,7 @@ impl AcpClient for AcpRuntimeClient {
         // answers `-32601`, which maps back to the same unsupported outcome.
         let params = protocol::build_session_steer_params(&native_session_id, prompt);
         let response = match process
-            .request(STANDARD_STEER_METHOD, params, self.prompt_timeout)
+            .request(STANDARD_STEER_METHOD, params, ACP_CONTROL_REQUEST_TIMEOUT)
             .await
         {
             Ok(response) => response,
@@ -20143,7 +20221,7 @@ impl AcpClient for AcpRuntimeClient {
             objective,
         );
         process
-            .request(&channel.control_method, params, self.prompt_timeout)
+            .request(&channel.control_method, params, ACP_CONTROL_REQUEST_TIMEOUT)
             .await?;
         Ok(process.current_goal())
     }
@@ -24113,6 +24191,58 @@ mod tests {
         assert_eq!(error.code, "provider_authentication_required");
         assert_eq!(error.message, "Agent authentication is required");
         assert!(error.recovery_hint.is_some());
+    }
+
+    /// A turn's answer has no deadline of its own.
+    ///
+    /// The old prompt path failed a request that had not answered within a
+    /// fixed wall-clock hour, which ended long turns that were working fine.
+    /// This pins the replacement: the wait stays open while the Agent is still
+    /// working, and the Agent's own answer is what ends it.
+    #[tokio::test]
+    async fn a_turn_request_waits_until_the_agent_answers() {
+        let process = test_process(
+            AcpProcessInstanceId::new(),
+            None,
+            None,
+            None,
+            Arc::new(DisabledAcpTerminalHost),
+            false,
+            false,
+        );
+        let (response, receiver) = oneshot::channel();
+        let waiter = process.finish_started_request_until_stopped(
+            AcpOperation::SessionPrompt.method(),
+            StartedAcpRequest {
+                id: 7,
+                prompt_session_id: None,
+                stderr_sequence: 0,
+                response: receiver,
+                registration_release: None,
+            },
+        );
+        tokio::pin!(waiter);
+
+        // Silence is not an answer: well past the deadline the deadline-bound
+        // requests use, the turn is still waiting.
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), &mut waiter)
+                .await
+                .is_err(),
+            "a prompt must not be cut off for taking long"
+        );
+
+        response
+            .send(Ok(json!({ "stopReason": "end_turn" })))
+            .unwrap();
+        let (result, _) = tokio::time::timeout(Duration::from_secs(5), waiter)
+            .await
+            .expect("the answered prompt should resolve at once")
+            .expect("the answered prompt should succeed");
+        assert_eq!(
+            result.get("stopReason").and_then(Value::as_str),
+            Some("end_turn")
+        );
     }
 
     /// A credential the Agent refuses on shape is not a sign-in problem.
