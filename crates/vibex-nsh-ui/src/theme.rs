@@ -74,6 +74,8 @@ pub const FONT_HINT: f32 = 12.0;
 pub const FONT_DISPLAY: f32 = 30.0;
 /// The product wordmark.
 pub const FONT_WORDMARK: f32 = 36.0;
+/// The line a blank page greets with.
+pub const FONT_GREETING: f32 = 26.0;
 
 /// The text-size steps the Settings page offers, as percentages of the ladder.
 pub const FONT_SCALE_STEPS: [u32; 4] = [80, 90, 100, 115];
@@ -142,6 +144,11 @@ pub fn font_display() -> f32 {
 /// The wordmark at the current text-size step.
 pub fn font_wordmark() -> f32 {
     scaled_font(FONT_WORDMARK)
+}
+
+/// A blank page's greeting at the current text-size step.
+pub fn font_greeting() -> f32 {
+    scaled_font(FONT_GREETING)
 }
 
 /// The step after `current`, wrapping at the top; an off-ladder value snaps to
@@ -226,6 +233,41 @@ pub fn card_adaptive() -> AdaptiveColor {
 /// The default border as an adaptive color.
 pub fn border_adaptive() -> AdaptiveColor {
     theme().border
+}
+
+/// The page background as an adaptive color, for a gradient that fades into
+/// it.
+pub fn background_adaptive() -> AdaptiveColor {
+    theme().background
+}
+
+/// The same color with no opacity: where such a gradient ends, so it fades
+/// without passing through another hue.
+pub fn background_clear_adaptive() -> AdaptiveColor {
+    let page = theme().background;
+    AdaptiveColor {
+        light: page.light.alpha(0.0),
+        dark: page.dark.alpha(0.0),
+    }
+}
+
+/// [`block_page`] as an adaptive color, for the lip of a sheet.
+pub fn page_adaptive() -> AdaptiveColor {
+    let card = theme().card;
+    let page = theme().background;
+    let grey = adaptive_token("secondary");
+    AdaptiveColor {
+        light: if card.light == page.light {
+            grey.light
+        } else {
+            page.light
+        },
+        dark: if card.dark == page.dark {
+            grey.dark
+        } else {
+            page.dark
+        },
+    }
 }
 
 /// The page behind a column of filled blocks.
@@ -317,22 +359,16 @@ pub fn wordmark_mark(font: f32) -> WordmarkMark {
 // ---------------------------------------------------------------------------
 
 /// The conversation page's top bar, below the status bar.
-pub const HEADER_HEIGHT: f32 = 48.0;
-/// A leading header control: a full touch target.
-pub const HEADER_BUTTON_SIZE: f32 = 44.0;
-/// The search and rail controls at the header's trailing edge. They read as a
-/// pair, so each is narrower than the leading menu while keeping the header's
-/// whole height for the thumb.
-pub const HEADER_TRAILING_BUTTON_SIZE: f32 = 36.0;
-/// The header of a side page and of a sheet.
-pub const DRAWER_HEADER_HEIGHT: f32 = 56.0;
-/// The strip that names the tree and carries its tools.
-pub const DRAWER_SECTION_HEIGHT: f32 = 40.0;
+pub const HEADER_HEIGHT: f32 = 52.0;
 /// How far a side page dims the conversation behind it when fully open.
 pub const DRAWER_BACKDROP_OPACITY: f32 = 0.4;
-/// How long a side page takes to open, and to close.
-pub const DRAWER_OPEN_ANIMATION_MS: f32 = 160.0;
-pub const DRAWER_CLOSE_ANIMATION_MS: f32 = 100.0;
+/// How long a side page takes to open, and to close. A page crosses the whole
+/// screen, so it is given the time to be followed by the eye.
+pub const DRAWER_OPEN_ANIMATION_MS: f32 = 240.0;
+pub const DRAWER_CLOSE_ANIMATION_MS: f32 = 180.0;
+/// How far the conversation travels with a side page, as a share of the page's
+/// own travel: the two move as one strip at two depths.
+pub const PAGE_PARALLAX: f32 = 0.24;
 /// The share of the page a drag must reveal before a slow release settles on
 /// the next page.
 pub const DRAWER_SNAP_TRAVEL_RATIO: f32 = 0.15;
@@ -341,49 +377,95 @@ pub const DRAWER_SWIPE_VELOCITY: f32 = 600.0;
 /// How much faster across than along a release must be to count as one.
 pub const DRAWER_SWIPE_STRAIGHTNESS: f32 = 1.5;
 
-// The sessions page is a drawer beside the conversation rather than a page
-// over it: the conversation is pushed aside as a card and a strip of it stays
-// in reach, so the way back is always under the thumb.
-
-/// The widest the sessions drawer grows.
-pub const SESSIONS_DRAWER_MAX_WIDTH: f32 = 360.0;
-/// The share of the screen it takes on a phone.
-pub const SESSIONS_DRAWER_WIDTH_RATIO: f32 = 0.86;
-/// The strip of the conversation that always stays beside it.
-pub const SESSIONS_DRAWER_PEEK: f32 = 52.0;
-/// The corner the conversation takes while it is a card beside the drawer.
-pub const SESSIONS_CARD_RADIUS: f32 = 28.0;
-/// How much shorter the card stands with the drawer fully open.
-pub const SESSIONS_CARD_SHRINK: f32 = 0.05;
-/// How far the card fades into the page behind it.
-pub const SESSIONS_CARD_FADE: f32 = 0.5;
-/// The card travels with the drawer, so it takes longer than a page that
-/// slides over a still one.
-pub const SESSIONS_OPEN_ANIMATION_MS: f32 = 260.0;
-pub const SESSIONS_CLOSE_ANIMATION_MS: f32 = 200.0;
-
-/// The width of the sessions drawer on a screen `screen` points wide.
-pub fn sessions_drawer_width(screen: f32) -> f32 {
-    SESSIONS_DRAWER_MAX_WIDTH
-        .min(screen * SESSIONS_DRAWER_WIDTH_RATIO)
-        .min(screen - SESSIONS_DRAWER_PEEK)
-        .max(1.0)
-}
-
 /// A status dot beside a runtime's name.
 pub const ICON_STATUS: f32 = 6.0;
 
 /// The prompt card's radius: rounder than a list card, because it is the one
 /// surface the reader writes in.
-pub const RADIUS_COMPOSER: f32 = 14.0;
+pub const RADIUS_COMPOSER: f32 = 24.0;
 /// A pill inside a control row.
 pub const CHIP_HEIGHT: f32 = 32.0;
 /// The composer's primary control.
 pub const COMPOSER_SEND_SIZE: f32 = 36.0;
 /// One icon control on the composer's row.
 pub const COMPOSER_OPTION_SIZE: f32 = 36.0;
-/// The composer's own text step, a rung above body copy.
-pub const FONT_COMPOSER: f32 = 19.0;
+/// The composer's own text step.
+pub const FONT_COMPOSER: f32 = FONT_BODY;
+
+// The phone's surfaces. A page is a column of a few kinds of object: a round
+// control, a pill, an icon tile at the head of a row, a card of rows, and a
+// message bubble. Each kind has one size and one corner wherever it appears.
+
+/// The corner of an icon tile.
+pub const RADIUS_TILE: f32 = 9.0;
+/// The corner of a chip, a key and a segmented track.
+pub const RADIUS_CHIP: f32 = 12.0;
+/// The corner of a card of rows, and of a floating menu.
+pub const RADIUS_GROUP: f32 = 16.0;
+/// The corner of a message bubble, and of the one corner that points at the
+/// side its author sits on.
+pub const RADIUS_BUBBLE: f32 = 20.0;
+pub const RADIUS_BUBBLE_TAIL: f32 = 6.0;
+/// The corner of a labelled action.
+pub const RADIUS_BUTTON: f32 = 14.0;
+/// An icon tile at the head of a row.
+pub const TILE_SIZE: f32 = 32.0;
+/// The glyph inside a tile.
+pub const TILE_ICON: f32 = 17.0;
+/// A row of a card: a tile, a title and what trails it.
+pub const ROW_HEIGHT: f32 = 52.0;
+/// A round control floating on a page.
+pub const ROUND_CONTROL: f32 = 40.0;
+/// A control inside a pill or a toolbar.
+pub const COMPACT_CONTROL: f32 = 34.0;
+/// A segmented control's track.
+pub const SEGMENT_HEIGHT: f32 = 36.0;
+/// A row of a floating menu.
+pub const MENU_ROW_HEIGHT: f32 = 46.0;
+/// A floating menu's width.
+pub const MENU_WIDTH: f32 = 252.0;
+
+/// A wash of the ink: the fill of a well, a pill, an icon tile. A wash rather
+/// than a token of its own, so it reads on a page and on a card alike.
+pub fn fill() -> Hsla {
+    foreground().alpha(if dark() { 0.09 } else { 0.055 })
+}
+
+/// The same wash one step stronger, for the chosen one of several fills.
+pub fn fill_strong() -> Hsla {
+    foreground().alpha(if dark() { 0.16 } else { 0.10 })
+}
+
+/// The plate of a message the reader sent.
+pub fn bubble() -> Hsla {
+    foreground().alpha(if dark() { 0.13 } else { 0.075 })
+}
+
+/// A hairline inside a card, between its rows.
+pub fn hairline() -> Hsla {
+    border_subtle().opacity(0.6)
+}
+
+/// The chosen segment of a track, raised off it: the card surface in the
+/// light appearance, a stronger wash in the dark one, where a card would sink
+/// into the track instead.
+pub fn raised() -> Hsla {
+    if dark() {
+        foreground().alpha(0.14)
+    } else {
+        background_card()
+    }
+}
+
+/// The scrim under a floating menu.
+pub fn menu_scrim() -> Hsla {
+    backdrop(if dark() { 0.5 } else { 0.28 })
+}
+
+/// A tint of `color` behind a mark or a line that carries its meaning.
+pub fn tint(color: Hsla) -> Hsla {
+    color.opacity(if dark() { 0.2 } else { 0.12 })
+}
 
 /// The composer field at the current text-size step.
 pub fn font_composer() -> f32 {
@@ -439,7 +521,7 @@ pub const SIDEBAR_ROW_ACTION: f32 = 28.0;
 /// The mark a row wears while sessions are being selected.
 pub const SIDEBAR_SELECTION_MARK: f32 = 20.0;
 /// The floor of a tree row's height.
-pub const SIDEBAR_ROW_HEIGHT: f32 = 48.0;
+pub const SIDEBAR_ROW_HEIGHT: f32 = 46.0;
 
 /// The tree's own type steps.
 pub const FONT_SIDEBAR_ROW: f32 = FONT_BODY;
@@ -488,32 +570,20 @@ pub fn sidebar_tree_guide() -> Hsla {
     color_token("sidebar-border").opacity(0.70)
 }
 
-/// A well on the sessions page: the search field, a round control. A wash of
-/// the ink rather than a token of its own, so it reads on the page and on a
-/// card alike.
+/// A well on the sessions page: the search field, a round control.
 pub fn sidebar_well() -> Hsla {
-    foreground().alpha(if dark() { 0.09 } else { 0.055 })
+    fill()
 }
 
 /// A hairline on the sessions page.
 pub fn sidebar_hairline() -> Hsla {
-    border_subtle().opacity(0.6)
+    hairline()
 }
 
 /// The wash a pressed row or control takes.
 pub fn row_pressed_bg() -> Hsla {
     let luminance = if dark() { 0.92 } else { 0.10 };
     hsla(0.0, 0.0, luminance, 0.11)
-}
-
-/// The plate the selected surface tab lights up with: dimmer than a pressed
-/// row, because a tab is chrome over the surface.
-pub fn rail_tab_bg() -> Hsla {
-    if dark() {
-        hsla(0.0, 0.0, 0.92, 0.09)
-    } else {
-        hsla(0.0, 0.0, 0.10, 0.07)
-    }
 }
 
 /// The surface the reader writes on, and a sent message's plate.

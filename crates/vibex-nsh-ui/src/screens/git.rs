@@ -2,12 +2,12 @@
 
 use std::rc::Rc;
 
-use nsh_base::{ButtonElement, SheetEvent, button, sheet};
-use nsh_core::{element::ImageSrc, prelude::*};
+use nsh_base::{ButtonElement, button};
+use nsh_core::prelude::*;
 
 use crate::{
     copy, theme,
-    ui::{action, field},
+    ui::{action, field, surface},
 };
 
 /// Opens a path's diff, staged or not.
@@ -186,7 +186,6 @@ pub fn git(host: GitHost) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .bg(theme::sidebar_bg)
         .pb_safe_area()
         .child(
             view()
@@ -203,13 +202,14 @@ pub fn git(host: GitHost) -> impl IntoElement {
                 .min_h(px(0.0))
                 .child(
                     view()
-                        .h(px(theme::TOUCH_TARGET))
+                        .min_h(px(theme::TOUCH_TARGET))
                         .flex_shrink_0()
                         .flex_row()
                         .items_center()
-                        .border_b_1()
-                        .border_b_color(theme::border_subtle)
-                        .child(git_icon(
+                        .gap(px(theme::SPACING_SM))
+                        .px(px(theme::SPACING_MD))
+                        .pb(px(theme::SPACING_SM))
+                        .child(surface::round_button(
                             icon!("chevron-left"),
                             copy::text("Back", "返回", "返回"),
                             move || back(),
@@ -227,7 +227,8 @@ pub fn git(host: GitHost) -> impl IntoElement {
                             .flex_1()
                             .min_w(px(0.0))
                             .truncate()
-                            .text_size(px(theme::font_body()))
+                            .text_size(px(theme::font_detail()))
+                            .font_weight(FontWeight::SEMIBOLD)
                             .text_color(theme::foreground),
                         ),
                 )
@@ -273,113 +274,349 @@ fn git_overview(host: GitHost) -> impl IntoElement {
     let error = host.error;
     let history_host = host.clone();
     let change_host = host.clone();
-    view().flex_1().min_h(px(0.0))
-        .child(view().h(px(theme::TOUCH_TARGET)).flex_shrink_0().flex_row().items_center().px(px(theme::SPACING_SM))
-            .gap(px(theme::SPACING_XS)).border_b_1().border_b_color(theme::border_subtle)
-            .child(view().flex_1().min_w(px(0.0)).child(when(move || history.get(), move || {
-                view().flex_row().items_center()
-                    .child(field::text_field_flat(query, copy::text("Search commits", "搜索提交", "搜尋提交")).flex_1().min_w(px(0.0)))
-                    .child(when(move || !query.with(String::is_empty), move || git_icon(icon!("x"), copy::text("Clear commit search", "清除提交搜索", "清除提交搜尋"), move || query.set(String::new()))))
-            }).otherwise({
-                let branches = host.on_open_branches.clone();
-                move || {
-                    let branches = branches.clone();
-                    button().flex_row().items_center().gap(px(theme::SPACING_XS)).h(px(theme::TOUCH_TARGET)).min_w(px(0.0))
-                        .accessibility_label(copy::text("Branches", "分支", "分支"))
-                        .on_press(move || branches())
-                        .child(svg(icon!("git-branch")).size(px(theme::ICON_SM)).flex_shrink_0().text_color(theme::text_muted))
-                        .child(text(move || branch.get().unwrap_or_else(|| copy::text("No repository", "没有仓库", "沒有儲存庫").into()))
-                            .flex_1().min_w(px(0.0)).truncate().text_size(px(theme::font_detail())).text_color(theme::foreground))
-                        .child(when(move || totals.get().0 > 0, move || text(move || format!("+{}", totals.get().0))
-                            .flex_shrink_0().text_size(px(theme::font_micro())).text_color(theme::accent_success)))
-                        .child(when(move || totals.get().1 > 0, move || text(move || format!("-{}", totals.get().1))
-                            .flex_shrink_0().text_size(px(theme::font_micro())).text_color(theme::accent_red)))
-                }
-            })))
-            .child(git_icon(icon!("refresh"), copy::text("Fetch", "获取", "擷取"), move || (host.on_fetch)())
-                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4)))
-            .child(git_icon(icon!("download"), copy::text("Pull", "拉取", "拉取"), move || (host.on_pull)())
-                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4)))
-            .child(git_icon(icon!("upload"), copy::text("Push", "推送", "推送"), move || (host.on_push)())
-                .disabled(move || busy.get()).disabled_style(|style| style.opacity(0.4))))
-        .child(view().h(px(theme::TOUCH_TARGET)).flex_shrink_0().flex_row().items_center().px(px(theme::SPACING_XS))
-            .border_b_1().border_b_color(theme::border_subtle)
-            .child(git_mode_button(copy::text("Changes", "更改", "變更"), history, false, host.on_toggle_history.clone()))
-            .child(git_mode_button(copy::text("Commits", "提交", "提交"), history, true, host.on_toggle_history))
-            .child(view().flex_1().min_w(px(0.0)))
-            .child(when(move || !history.get(), {
-                let select = host.on_toggle_selection.clone();
-                let revert = host.on_revert_selection.clone();
-                let dirs = host.on_toggle_directories.clone();
-                move || {
-                    let select = select.clone();
-                    let revert = revert.clone();
-                    let dirs = dirs.clone();
-                    view().flex_row().items_center()
-                        .child(git_icon(icon!("list-checks"), copy::text("Select all changes", "选择全部变更", "選取全部變更"), move || select("")))
-                        .child(git_icon(icon!("undo"), copy::text("Rollback selected", "回滚所选变更", "復原已選變更"), move || {
-                            let revert = revert.clone();
-                            let paths = selected.get_untracked();
-                            let owner = active_session.get_untracked();
-                            spawn(async move {
-                                let result = nsh_base::alert_dialog()
-                                    .title(copy::text("Rollback selected changes?", "回滚所选变更？", "復原已選變更？"))
-                                    .description(copy::text("Changes to the selected paths will be discarded.", "所选路径的改动将被丢弃。", "已選路徑的變更將被捨棄。"))
-                                    .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                                    .destructive("revert", copy::text("Rollback", "回滚", "復原"))
-                                    .show().await;
-                                if matches!(result, Ok(answer) if answer.action.as_deref() == Some("revert"))
-                                    && active_session.get_untracked() == owner { revert(&paths); }
-                            });
-                        }).disabled(move || selected.with(Vec::is_empty) || busy.get()).disabled_style(|style| style.opacity(0.4)))
-                        .child(git_icon(icon!("chevrons-down-up"), copy::text("Expand or collapse all", "展开或折叠目录", "展開或摺疊資料夾"), move || dirs()))
-                }
-            }))
-            .child(git_icon(icon!("folder"), copy::text("Worktrees", "Worktree", "Worktree"), move || (host.on_open_worktrees)())))
-        .child(when(move || error.with(Option::is_some), move || {
-            view().flex_row().items_center().px(px(theme::SPACING_SM)).gap(px(theme::SPACING_XS))
-                .child(text(move || error.get().unwrap_or_default()).flex_1().min_w(px(0.0)).text_size(px(theme::font_caption())).text_color(theme::accent_red))
-                .child({ let refresh = host.on_refresh.clone(); git_icon(icon!("refresh"), copy::text("Refresh", "刷新", "重新整理"), move || refresh()) })
-        }))
-        .child(when(move || history.get(), move || history_list(history_host.history, query, history_host.on_open_commit.clone()))
-            .otherwise(move || view().flex_1().min_h(px(0.0))
-                .child(change_list(change_host.clone()))
-                .child(commit_bar(change_host.clone()))))
-}
-
-fn git_icon(icon: ImageSrc, label: &'static str, action: impl Fn() + 'static) -> ButtonElement {
-    action::icon_button(icon, label, action)
-        .size(px(34.0))
-        .flex_shrink_0()
-}
-
-fn git_mode_button(
-    label: &'static str,
-    history: Signal<bool>,
-    selected: bool,
-    toggle: Rc<dyn Fn()>,
-) -> impl IntoElement {
-    button()
-        .h(px(32.0))
-        .px(px(theme::SPACING_SM))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .items_center()
-        .justify_center()
-        .style_when(
-            move || history.get() == selected,
-            |style| style.bg(theme::rail_tab_bg()),
-        )
-        .on_press(move || {
-            if history.get_untracked() != selected {
+    let mode = |commits: bool, toggle: Rc<dyn Fn()>| {
+        move || {
+            if history.get_untracked() != commits {
                 dismiss_keyboard();
                 toggle();
             }
+        }
+    };
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        // Where the work stands: the branch and what it differs by, or the
+        // search of its commits, and the three ways it meets its remote.
+        .child(
+            view()
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_XS))
+                .pl(px(theme::SPACING_MD))
+                .pr(px(theme::SPACING_SM))
+                .child(
+                    view().flex_1().min_w(px(0.0)).child(
+                        when(
+                            move || history.get(),
+                            move || {
+                                surface::field_pill()
+                                    .w_full()
+                                    .child(surface::field_glyph(icon!("search")))
+                                    .child(
+                                        field::text_field_bare(
+                                            query,
+                                            copy::text("Search commits", "搜索提交", "搜尋提交"),
+                                        )
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .h_full(),
+                                    )
+                                    .child(when(
+                                        move || !query.with(String::is_empty),
+                                        move || {
+                                            surface::field_clear(
+                                                copy::text(
+                                                    "Clear commit search",
+                                                    "清除提交搜索",
+                                                    "清除提交搜尋",
+                                                ),
+                                                move || query.set(String::new()),
+                                            )
+                                        },
+                                    ))
+                            },
+                        )
+                        .otherwise({
+                            let branches = host.on_open_branches.clone();
+                            move || {
+                                let branches = branches.clone();
+                                button()
+                                    .w_full()
+                                    .h(px(theme::ROUND_CONTROL))
+                                    .pl(px(theme::SPACING_MD))
+                                    .pr(px(theme::SPACING_MD))
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_SM))
+                                    .rounded(px(theme::RADIUS_CHIP))
+                                    .bg(theme::fill)
+                                    .active(|style| style.opacity(0.6))
+                                    .accessibility_label(copy::text("Branches", "分支", "分支"))
+                                    .on_press(move || branches())
+                                    .child(surface::field_glyph(icon!("git-branch")))
+                                    .child(
+                                        text(move || {
+                                            branch.get().unwrap_or_else(|| {
+                                                copy::text("No repository", "没有仓库", "沒有儲存庫")
+                                                    .into()
+                                            })
+                                        })
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(theme::font_detail()))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::foreground),
+                                    )
+                                    .child(when(
+                                        move || totals.get().0 > 0,
+                                        move || {
+                                            count(
+                                                move || format!("+{}", totals.get().0),
+                                                theme::accent_success,
+                                            )
+                                        },
+                                    ))
+                                    .child(when(
+                                        move || totals.get().1 > 0,
+                                        move || {
+                                            count(
+                                                move || format!("-{}", totals.get().1),
+                                                theme::accent_red,
+                                            )
+                                        },
+                                    ))
+                                    .child(
+                                        svg(icon!("chevron-down"))
+                                            .size(px(12.0))
+                                            .flex_shrink_0()
+                                            .text_color(theme::text_muted),
+                                    )
+                            }
+                        }),
+                    ),
+                )
+                .child(
+                    surface::ghost_button(
+                        icon!("refresh"),
+                        copy::text("Fetch", "获取", "擷取"),
+                        move || (host.on_fetch)(),
+                    )
+                    .disabled(move || busy.get()),
+                )
+                .child(
+                    surface::ghost_button(
+                        icon!("download"),
+                        copy::text("Pull", "拉取", "拉取"),
+                        move || (host.on_pull)(),
+                    )
+                    .disabled(move || busy.get()),
+                )
+                .child(
+                    surface::ghost_button(
+                        icon!("upload"),
+                        copy::text("Push", "推送", "推送"),
+                        move || (host.on_push)(),
+                    )
+                    .disabled(move || busy.get()),
+                ),
+        )
+        // What is being read, the working tree or its history, and what can
+        // be done to the changes as a whole.
+        .child(
+            view()
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .pl(px(theme::SPACING_MD))
+                .pr(px(theme::SPACING_SM))
+                .py(px(theme::SPACING_SM))
+                .child(
+                    surface::segment_track()
+                        .w(px(176.0))
+                        .flex_shrink_0()
+                        .child(surface::segment(
+                            copy::text("Changes", "更改", "變更"),
+                            move || !history.get(),
+                            mode(false, host.on_toggle_history.clone()),
+                        ))
+                        .child(surface::segment(
+                            copy::text("Commits", "提交", "提交"),
+                            move || history.get(),
+                            mode(true, host.on_toggle_history),
+                        )),
+                )
+                .child(view().flex_1().min_w(px(0.0)))
+                .child(when(move || !history.get(), {
+                    let select = host.on_toggle_selection.clone();
+                    let revert = host.on_revert_selection.clone();
+                    let dirs = host.on_toggle_directories.clone();
+                    move || {
+                        let select = select.clone();
+                        let revert = revert.clone();
+                        let dirs = dirs.clone();
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .child(surface::ghost_button(
+                                icon!("list-checks"),
+                                copy::text("Select all changes", "选择全部变更", "選取全部變更"),
+                                move || select(""),
+                            ))
+                            .child(
+                                surface::ghost_button(
+                                    icon!("undo"),
+                                    copy::text(
+                                        "Rollback selected",
+                                        "回滚所选变更",
+                                        "復原已選變更",
+                                    ),
+                                    move || {
+                                        let revert = revert.clone();
+                                        let paths = selected.get_untracked();
+                                        let owner = active_session.get_untracked();
+                                        spawn(async move {
+                                            let result = nsh_base::alert_dialog()
+                                                .title(copy::text(
+                                                    "Rollback selected changes?",
+                                                    "回滚所选变更？",
+                                                    "復原已選變更？",
+                                                ))
+                                                .description(copy::text(
+                                                    "Changes to the selected paths will be discarded.",
+                                                    "所选路径的改动将被丢弃。",
+                                                    "已選路徑的變更將被捨棄。",
+                                                ))
+                                                .cancel(
+                                                    "cancel",
+                                                    copy::text("Cancel", "取消", "取消"),
+                                                )
+                                                .destructive(
+                                                    "revert",
+                                                    copy::text("Rollback", "回滚", "復原"),
+                                                )
+                                                .show()
+                                                .await;
+                                            if matches!(result, Ok(answer) if answer.action.as_deref() == Some("revert"))
+                                                && active_session.get_untracked() == owner
+                                            {
+                                                revert(&paths);
+                                            }
+                                        });
+                                    },
+                                )
+                                .disabled(move || selected.with(Vec::is_empty) || busy.get()),
+                            )
+                            .child(surface::ghost_button(
+                                icon!("chevrons-down-up"),
+                                copy::text(
+                                    "Expand or collapse all",
+                                    "展开或折叠目录",
+                                    "展開或摺疊資料夾",
+                                ),
+                                move || dirs(),
+                            ))
+                    }
+                }))
+                .child(surface::ghost_button(
+                    icon!("git-branch"),
+                    copy::text("Worktrees", "Worktree", "Worktree"),
+                    move || (host.on_open_worktrees)(),
+                )),
+        )
+        .child(when(
+            move || error.with(Option::is_some),
+            move || {
+                let refresh = host.on_refresh.clone();
+                view()
+                    .flex_shrink_0()
+                    .mx(px(theme::SPACING_MD))
+                    .mb(px(theme::SPACING_SM))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
+                    .min_h(px(theme::ROUND_CONTROL))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CHIP))
+                    .bg(move || theme::tint(theme::accent_red()))
+                    .child(
+                        text(move || error.get().unwrap_or_default())
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .py(px(theme::SPACING_SM))
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::accent_red),
+                    )
+                    .child(surface::ghost_button(
+                        icon!("refresh"),
+                        copy::text("Refresh", "刷新", "重新整理"),
+                        move || refresh(),
+                    ))
+            },
+        ))
+        .child(
+            when(
+                move || history.get(),
+                move || {
+                    history_list(
+                        history_host.history,
+                        query,
+                        history_host.on_open_commit.clone(),
+                    )
+                },
+            )
+            .otherwise(move || {
+                view()
+                    .flex_1()
+                    .min_h(px(0.0))
+                    .child(change_list(change_host.clone()))
+                    .child(commit_bar(change_host.clone()))
+            }),
+        )
+}
+
+/// A count of lines in the color of the side it counts.
+fn count(value: impl Fn() -> String + 'static, color: fn() -> Hsla) -> impl IntoElement {
+    text(value)
+        .flex_shrink_0()
+        .font_family("monospace")
+        .text_size(px(theme::font_micro()))
+        .text_color(color)
+}
+
+/// One command of a worktree or of an operation on one, written out.
+fn worktree_action(
+    label: &'static str,
+    danger: bool,
+    busy: Signal<bool>,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let ink: fn() -> Hsla = if danger {
+        theme::accent_red
+    } else {
+        theme::text_secondary
+    };
+    button()
+        .on_press(move || {
+            if !busy.get_untracked() {
+                on_press();
+            }
         })
+        .h(px(theme::CHIP_HEIGHT))
+        .px(px(theme::SPACING_MD))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded_full()
+        .bg(theme::fill)
+        .active(|style| style.opacity(0.6))
         .child(
             text(label)
-                .text_size(px(theme::font_caption()))
-                .text_color(theme::text_secondary),
+                .text_size(px(theme::font_micro()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink),
         )
+}
+
+/// The note under a patch that was cut to the preview's limit.
+fn preview_limit(message: &'static str) -> impl IntoElement {
+    text(message)
+        .px(px(theme::SPACING_LG))
+        .py(px(theme::SPACING_SM))
+        .text_size(px(theme::font_micro()))
+        .text_color(theme::text_muted)
 }
 
 fn change_list(host: GitHost) -> impl IntoElement {
@@ -387,7 +624,17 @@ fn change_list(host: GitHost) -> impl IntoElement {
     view().flex_1().min_h(px(0.0)).child(
         when(
             move || changes.with(Vec::is_empty),
-            || super::session::empty_hint(copy::text("No changes", "没有变更", "沒有變更")),
+            || {
+                surface::empty_state(
+                    icon!("check"),
+                    copy::text("No changes", "没有变更", "沒有變更"),
+                    copy::text(
+                        "The working tree matches the last commit.",
+                        "工作区与最近一次提交一致。",
+                        "工作區與最近一次提交一致。",
+                    ),
+                )
+            },
         )
         .otherwise(move || {
             let host = host.clone();
@@ -433,16 +680,17 @@ fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
     };
     view()
         .h(px(theme::TOUCH_TARGET))
-        .mx(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_XS))
+        .mx(px(theme::SPACING_SM))
+        .pl(px(theme::SPACING_XS))
+        .pr(px(2.0))
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_XS))
-        .rounded(px(theme::RADIUS_CONTROL))
+        .gap(px(2.0))
+        .rounded(px(theme::RADIUS_CHIP))
         .child(view().w(px(row.depth.min(8) as f32 * 16.0)).flex_shrink_0())
         .child(
             button()
-                .w(px(28.0))
+                .w(px(34.0))
                 .h_full()
                 .flex_shrink_0()
                 .items_center()
@@ -452,40 +700,24 @@ fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
                     copy::text("Select", "选择", "選取"),
                     selection_path
                 ))
+                .active(|style| style.opacity(0.6))
                 .on_press(move || (host.on_toggle_selection)(&selection_path))
-                .child(
-                    view()
-                        .size(px(18.0))
-                        .rounded(px(4.0))
-                        .border_1()
-                        .items_center()
-                        .justify_center()
-                        .border_color(if selection == PathSelection::Unchecked {
-                            theme::border_default
-                        } else {
-                            theme::primary
-                        })
-                        .when(selection != PathSelection::Unchecked, |view| {
-                            view.bg(theme::primary).child(
-                                svg(if selection == PathSelection::Checked {
-                                    icon!("check")
-                                } else {
-                                    icon!("minus")
-                                })
-                                .size(px(12.0))
-                                .text_color(theme::primary_foreground),
-                            )
-                        }),
-                ),
+                .child(surface::check_mark(move || match selection {
+                    PathSelection::Unchecked => None,
+                    PathSelection::Partial => Some(false),
+                    PathSelection::Checked => Some(true),
+                })),
         )
         .child(
             button()
                 .flex_1()
                 .min_w(px(0.0))
                 .h_full()
+                .px(px(theme::SPACING_XS))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(theme::SPACING_SM))
+                .rounded(px(theme::RADIUS_CONTROL))
                 .accessibility_label(path)
                 .active(|style| style.bg(theme::row_pressed_bg()))
                 .on_press(move || {
@@ -498,9 +730,9 @@ fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
                 .child(
                     svg(if row.directory {
                         if row.expanded {
-                            icon!("chevron-down")
+                            icon!("folder-open")
                         } else {
-                            icon!("chevron-right")
+                            icon!("folder")
                         }
                     } else {
                         icon!("file-code")
@@ -515,36 +747,49 @@ fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
                         .min_w(px(0.0))
                         .truncate()
                         .text_size(px(theme::font_detail()))
-                        .text_color(theme::foreground),
+                        .text_color(if row.directory {
+                            theme::text_secondary
+                        } else {
+                            theme::foreground
+                        }),
                 )
                 .children((!row.directory).then(|| {
                     view()
                         .flex_row()
                         .items_center()
                         .flex_shrink_0()
-                        .gap(px(theme::SPACING_XS))
-                        .child(
-                            text(row.status)
-                                .px(px(theme::SPACING_XS))
-                                .rounded(px(4.0))
-                                .bg(color.opacity(0.18))
-                                .text_size(px(theme::font_micro()))
-                                .text_color(color),
-                        )
+                        .gap(px(6.0))
                         .children((row.additions > 0).then(|| {
                             text(format!("+{}", row.additions))
-                                .text_size(px(theme::font_micro()))
+                                .font_family("monospace")
+                                .text_size(px(theme::font_hint()))
                                 .text_color(theme::accent_success)
                         }))
                         .children((row.deletions > 0).then(|| {
                             text(format!("-{}", row.deletions))
-                                .text_size(px(theme::font_micro()))
+                                .font_family("monospace")
+                                .text_size(px(theme::font_hint()))
                                 .text_color(theme::accent_red)
                         }))
+                        .child(
+                            view()
+                                .size(px(20.0))
+                                .rounded(px(6.0))
+                                .bg(theme::tint(color))
+                                .items_center()
+                                .justify_center()
+                                .child(
+                                    text(row.status)
+                                        .font_family("monospace")
+                                        .text_size(px(theme::font_hint()))
+                                        .font_weight(FontWeight::SEMIBOLD)
+                                        .text_color(color),
+                                ),
+                        )
                 })),
         )
         .children((!row.directory).then(|| {
-            git_icon(
+            surface::ghost_button(
                 if row.staged {
                     icon!("minus")
                 } else {
@@ -560,6 +805,8 @@ fn change_row(row: GitChangeRow, host: GitHost) -> impl IntoElement {
         }))
 }
 
+/// What is written about the selected changes, and the action that commits
+/// them. It stands at the foot of the list, over the keyboard.
 fn commit_bar(host: GitHost) -> impl IntoElement {
     let selected = host.selected;
     let message = host.message;
@@ -570,16 +817,17 @@ fn commit_bar(host: GitHost) -> impl IntoElement {
         .w_full()
         .flex_shrink_0()
         .pb_keyboard()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_SM))
-        .py(px(theme::SPACING_SM))
+        .gap(px(theme::SPACING_SM))
+        .px(px(theme::SPACING_MD))
+        .pt(px(theme::SPACING_SM))
+        .pb(px(theme::SPACING_SM))
         .border_t_1()
-        .border_t_color(theme::border_subtle)
+        .border_t_color(theme::hairline)
         .child(
             view()
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(theme::SPACING_SM))
                 .child(
                     text(move || {
                         format!(
@@ -591,62 +839,56 @@ fn commit_bar(host: GitHost) -> impl IntoElement {
                     .flex_1()
                     .min_w(px(0.0))
                     .truncate()
+                    .pl(px(theme::SPACING_XS))
                     .text_size(px(theme::font_micro()))
                     .text_color(theme::text_muted),
                 )
-                .child(
-                    git_icon(
-                        icon!("rotate-ccw"),
-                        copy::text("Amend", "修补提交", "修補提交"),
-                        move || (host.on_toggle_amend)(),
-                    )
-                    .style_when(move || amend.get(), |style| style.bg(theme::rail_tab_bg())),
-                )
-                .child(
-                    git_icon(
-                        icon!("upload"),
-                        copy::text("Push after", "提交后推送", "提交後推送"),
-                        move || (host.on_toggle_push_after)(),
-                    )
-                    .style_when(move || push.get(), |style| style.bg(theme::rail_tab_bg())),
-                ),
+                .child(surface::toggle_pill(
+                    icon!("rotate-ccw"),
+                    copy::text("Amend", "修补提交", "修補提交"),
+                    move || amend.get(),
+                    move || (host.on_toggle_amend)(),
+                ))
+                .child(surface::toggle_pill(
+                    icon!("upload"),
+                    copy::text("Push after", "提交后推送", "提交後推送"),
+                    move || push.get(),
+                    move || (host.on_toggle_push_after)(),
+                )),
         )
         .child(
             view()
                 .flex_row()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(theme::SPACING_SM))
                 .items_center()
                 .child(
-                    crate::ui::field::text_field(
+                    field::text_field_well(
                         message,
                         copy::text("Commit message", "提交说明", "提交說明"),
                     )
+                    .h(px(theme::TOUCH_TARGET))
                     .flex_1()
                     .min_w(px(0.0)),
                 )
                 .child(
-                    action::primary(
+                    action::solid(
                         move || {
-                            if amend.get() {
+                            SharedString::from(if amend.get() {
                                 copy::text("Amend", "修补提交", "修補提交")
                             } else {
                                 copy::text("Commit", "提交", "提交")
-                            }
+                            })
                         },
-                        icon(include_str!("../../assets/icons/check.svg")),
-                        {
-                            move || {
-                                dismiss_keyboard();
-                                (host.on_commit)();
-                            }
+                        move || {
+                            dismiss_keyboard();
+                            (host.on_commit)();
                         },
                     )
                     .disabled(move || {
                         committing.get()
                             || selected.with(Vec::is_empty)
                             || message.with(|message| message.trim().is_empty())
-                    })
-                    .disabled_style(|style| style.opacity(0.4)),
+                    }),
                 ),
         )
 }
@@ -667,319 +909,364 @@ fn worktree_sheet(
     on_resolve: ResolveWorktree,
     on_restore: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                on_close();
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .max_h(px(520.0))
-                .gap(px(theme::SPACING_XS))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Worktrees", "Worktree", "Worktree"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(when(
-                    move || error.get().is_some(),
-                    move || {
-                        text(move || error.get().unwrap_or_default())
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::accent_red)
-                    },
-                ))
-                .child(each(
-                    move || worktrees.get(),
-                    |worktree| worktree.id.clone(),
-                    move |worktree, _| {
-                        let on_archive = on_archive.clone();
-                        let on_restore = on_restore.clone();
-                        view()
-                            .w_full()
-                            .flex_col()
-                            .gap(px(2.0))
-                            .p(px(theme::SPACING_SM))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::background_dim)
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(theme::SPACING_XS))
-                                    .child(
-                                        text(move || {
-                                            let worktree = worktree.get();
-                                            if worktree.branch.trim().is_empty() {
-                                                worktree.path.clone()
-                                            } else {
-                                                worktree.branch.clone()
-                                            }
-                                        })
-                                        .flex_1()
-                                        .truncate()
-                                        .text_size(px(theme::font_detail()))
-                                        .text_color(theme::foreground),
-                                    )
-                                    .child(
-                                        text(move || worktree.get().status)
-                                            .text_size(px(theme::font_micro()))
-                                            .text_color(theme::text_muted),
-                                    ),
-                            )
-                            .child(
-                                text(move || worktree.get().path)
-                                    .truncate()
-                                    .text_size(px(theme::font_micro()))
-                                    .text_color(theme::text_muted),
-                            )
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .gap(px(theme::SPACING_XS))
-                                    .child(when(move || worktree.get().can_merge, {
-                                        let on_merge = on_merge.clone();
-                                        let id = worktree.get_untracked().id;
-                                        move || {
-                                            let on_merge = on_merge.clone();
-                                            let id = id.clone();
-                                            button()
-                                                .on_press(move || {
-                                                    if !busy.get_untracked() {
-                                                        on_merge(&id);
-                                                    }
-                                                })
-                                                .min_h(px(28.0))
-                                                .px(px(theme::SPACING_SM))
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_header};
+    bottom_sheet(
+        move || open.get(),
+        {
+            let on_close = on_close.clone();
+            move || on_close()
+        },
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.8))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Worktrees", "Worktree", "Worktree"),
+                move || on_close(),
+            ))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    sheet_body()
+                        .child(when(
+                            move || error.get().is_some(),
+                            move || {
+                                text(move || error.get().unwrap_or_default())
+                                    .px(px(theme::SPACING_XS))
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::accent_red)
+                            },
+                        ))
+                        .child(each(
+                            move || worktrees.get(),
+                            |worktree| worktree.id.clone(),
+                            move |worktree, _| {
+                                let on_archive = on_archive.clone();
+                                let on_restore = on_restore.clone();
+                                let on_merge = on_merge.clone();
+                                let on_discard = on_discard.clone();
+                                let id = worktree.with_untracked(|worktree| worktree.id.clone());
+                                // One worktree: what it is and how it stands,
+                                // where it lives, and what can be done to it.
+                                view().w_full().pb(px(theme::SPACING_MD)).child(
+                                    surface::card()
+                                        .p(px(surface::ROW_INSET))
+                                        .gap(px(6.0))
+                                        .child(
+                                            view()
+                                                .flex_row()
                                                 .items_center()
-                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .gap(px(theme::SPACING_SM))
                                                 .child(
-                                                    text(copy::text("Merge", "合并", "合併"))
-                                                        .text_size(px(theme::font_micro()))
-                                                        .text_color(theme::text_secondary),
+                                                    text(move || {
+                                                        worktree.with(|worktree| {
+                                                            if worktree.branch.trim().is_empty() {
+                                                                worktree.path.clone()
+                                                            } else {
+                                                                worktree.branch.clone()
+                                                            }
+                                                        })
+                                                    })
+                                                    .flex_1()
+                                                    .min_w(px(0.0))
+                                                    .truncate()
+                                                    .text_size(px(theme::font_detail()))
+                                                    .font_weight(FontWeight::MEDIUM)
+                                                    .text_color(theme::foreground),
                                                 )
-                                        }
-                                    }))
-                                    .child(when(
-                                        move || worktree.get().can_archive,
-                                        move || {
-                                            let on_archive = on_archive.clone();
-                                            let id = worktree.get_untracked().id;
-                                            button()
-                                                .on_press(move || {
-                                                    if !busy.get_untracked() {
-                                                        on_archive(&id);
-                                                    }
-                                                })
-                                                .min_h(px(28.0))
-                                                .px(px(theme::SPACING_SM))
-                                                .items_center()
-                                                .rounded(px(theme::RADIUS_CONTROL))
+                                                .child(surface::badge(
+                                                    move || {
+                                                        SharedString::from(worktree.with(
+                                                            |worktree| worktree.status.clone(),
+                                                        ))
+                                                    },
+                                                    theme::text_secondary,
+                                                )),
+                                        )
+                                        .child(
+                                            text(move || {
+                                                worktree.with(|worktree| worktree.path.clone())
+                                            })
+                                            .truncate()
+                                            .font_family("monospace")
+                                            .text_size(px(theme::font_hint()))
+                                            .text_color(theme::text_muted),
+                                        )
+                                        .child(
+                                            view()
+                                                .flex_row()
+                                                .flex_wrap()
+                                                .gap(px(theme::SPACING_SM))
+                                                .pt(px(theme::SPACING_XS))
+                                                .child(when(
+                                                    move || {
+                                                        worktree.with(|worktree| worktree.can_merge)
+                                                    },
+                                                    {
+                                                        let id = id.clone();
+                                                        move || {
+                                                            let on_merge = on_merge.clone();
+                                                            let id = id.clone();
+                                                            worktree_action(
+                                                                copy::text("Merge", "合并", "合併"),
+                                                                false,
+                                                                busy,
+                                                                move || on_merge(&id),
+                                                            )
+                                                        }
+                                                    },
+                                                ))
+                                                .child(when(
+                                                    move || {
+                                                        worktree
+                                                            .with(|worktree| worktree.can_archive)
+                                                    },
+                                                    {
+                                                        let id = id.clone();
+                                                        move || {
+                                                            let on_archive = on_archive.clone();
+                                                            let id = id.clone();
+                                                            worktree_action(
+                                                                copy::text(
+                                                                    "Archive", "归档", "封存",
+                                                                ),
+                                                                false,
+                                                                busy,
+                                                                move || on_archive(&id),
+                                                            )
+                                                        }
+                                                    },
+                                                ))
+                                                .child(when(
+                                                    move || {
+                                                        worktree
+                                                            .with(|worktree| worktree.can_restore)
+                                                    },
+                                                    {
+                                                        let id = id.clone();
+                                                        move || {
+                                                            let on_restore = on_restore.clone();
+                                                            let id = id.clone();
+                                                            worktree_action(
+                                                                copy::text(
+                                                                    "Restore", "恢复", "還原",
+                                                                ),
+                                                                false,
+                                                                busy,
+                                                                move || on_restore(&id),
+                                                            )
+                                                        }
+                                                    },
+                                                ))
+                                                .child(when(
+                                                    move || {
+                                                        worktree
+                                                            .with(|worktree| worktree.can_discard)
+                                                    },
+                                                    {
+                                                        let id = id.clone();
+                                                        move || {
+                                                            let on_discard = on_discard.clone();
+                                                            let id = id.clone();
+                                                            worktree_action(
+                                                                copy::text(
+                                                                    "Discard", "丢弃", "丟棄",
+                                                                ),
+                                                                true,
+                                                                busy,
+                                                                move || on_discard(&id),
+                                                            )
+                                                        }
+                                                    },
+                                                )),
+                                        ),
+                                )
+                            },
+                        ))
+                        .child(when(
+                            move || !operations.with(|operations| operations.is_empty()),
+                            move || {
+                                let on_continue = on_continue.clone();
+                                let on_abort = on_abort.clone();
+                                let on_resolve = on_resolve.clone();
+                                view()
+                                    .w_full()
+                                    .flex_col()
+                                    .gap(px(theme::SPACING_SM))
+                                    .child(surface::group_label(copy::text(
+                                        "Operations",
+                                        "操作",
+                                        "操作",
+                                    )))
+                                    .child(each(
+                                        move || operations.get(),
+                                        |operation| operation.id.clone(),
+                                        move |operation, _| {
+                                            let on_continue = on_continue.clone();
+                                            let on_abort = on_abort.clone();
+                                            let on_resolve = on_resolve.clone();
+                                            let id = operation
+                                                .with_untracked(|operation| operation.id.clone());
+                                            surface::card()
+                                                .p(px(surface::ROW_INSET))
+                                                .gap(px(theme::SPACING_SM))
                                                 .child(
-                                                    text(copy::text("Archive", "归档", "封存"))
-                                                        .text_size(px(theme::font_micro()))
-                                                        .text_color(theme::text_secondary),
+                                                    view()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(theme::SPACING_SM))
+                                                        .child(
+                                                            text(move || {
+                                                                operation.with(|operation| {
+                                                                    operation.label.clone()
+                                                                })
+                                                            })
+                                                            .flex_1()
+                                                            .min_w(px(0.0))
+                                                            .truncate()
+                                                            .text_size(px(theme::font_detail()))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(theme::foreground),
+                                                        )
+                                                        .child(surface::badge(
+                                                            move || {
+                                                                SharedString::from(operation.with(
+                                                                    |operation| {
+                                                                        operation.status.clone()
+                                                                    },
+                                                                ))
+                                                            },
+                                                            theme::accent_yellow,
+                                                        )),
+                                                )
+                                                .child(each(
+                                                    move || {
+                                                        operation.with(|operation| {
+                                                            operation.conflicts.clone()
+                                                        })
+                                                    },
+                                                    |conflict| conflict.path.clone(),
+                                                    {
+                                                        let id = id.clone();
+                                                        move |conflict: ReadSignal<WorktreeConflictRow>, _| {
+                                                            let on_resolve = on_resolve.clone();
+                                                            let id = id.clone();
+                                                            let path = conflict
+                                                                .with_untracked(|conflict| {
+                                                                    conflict.path.clone()
+                                                                });
+                                                            // A conflicted path, and the two
+                                                            // sides it can be settled for.
+                                                            view()
+                                                                .w_full()
+                                                                .flex_row()
+                                                                .items_center()
+                                                                .gap(px(theme::SPACING_SM))
+                                                                .child(
+                                                                    text(path.clone())
+                                                                        .flex_1()
+                                                                        .min_w(px(0.0))
+                                                                        .truncate()
+                                                                        .font_family("monospace")
+                                                                        .text_size(px(
+                                                                            theme::font_hint(),
+                                                                        ))
+                                                                        .text_color(
+                                                                            theme::text_secondary,
+                                                                        ),
+                                                                )
+                                                                .child(worktree_action(
+                                                                    copy::text(
+                                                                        "Worktree",
+                                                                        "工作树",
+                                                                        "工作樹",
+                                                                    ),
+                                                                    false,
+                                                                    busy,
+                                                                    {
+                                                                        let on_resolve =
+                                                                            on_resolve.clone();
+                                                                        let id = id.clone();
+                                                                        let path = path.clone();
+                                                                        move || {
+                                                                            on_resolve(
+                                                                                &id, &path, true,
+                                                                            )
+                                                                        }
+                                                                    },
+                                                                ))
+                                                                .child(worktree_action(
+                                                                    copy::text(
+                                                                        "Target", "目标", "目標",
+                                                                    ),
+                                                                    false,
+                                                                    busy,
+                                                                    move || {
+                                                                        on_resolve(&id, &path, false)
+                                                                    },
+                                                                ))
+                                                        }
+                                                    },
+                                                ))
+                                                .child(
+                                                    view()
+                                                        .flex_row()
+                                                        .flex_wrap()
+                                                        .gap(px(theme::SPACING_SM))
+                                                        .child(when(
+                                                            move || {
+                                                                operation.with(|operation| {
+                                                                    operation.can_continue
+                                                                })
+                                                            },
+                                                            {
+                                                                let id = id.clone();
+                                                                move || {
+                                                                    let on_continue =
+                                                                        on_continue.clone();
+                                                                    let id = id.clone();
+                                                                    worktree_action(
+                                                                        copy::text(
+                                                                            "Continue",
+                                                                            "继续",
+                                                                            "繼續",
+                                                                        ),
+                                                                        false,
+                                                                        busy,
+                                                                        move || on_continue(&id),
+                                                                    )
+                                                                }
+                                                            },
+                                                        ))
+                                                        .child(when(
+                                                            move || {
+                                                                operation.with(|operation| {
+                                                                    operation.can_abort
+                                                                })
+                                                            },
+                                                            {
+                                                                let id = id.clone();
+                                                                move || {
+                                                                    let on_abort = on_abort.clone();
+                                                                    let id = id.clone();
+                                                                    worktree_action(
+                                                                        copy::text(
+                                                                            "Abort", "中止", "中止",
+                                                                        ),
+                                                                        true,
+                                                                        busy,
+                                                                        move || on_abort(&id),
+                                                                    )
+                                                                }
+                                                            },
+                                                        )),
                                                 )
                                         },
                                     ))
-                                    .child(when(move || worktree.get().can_discard, {
-                                        let on_discard = on_discard.clone();
-                                        let id = worktree.get_untracked().id;
-                                        move || {
-                                            let on_discard = on_discard.clone();
-                                            let id = id.clone();
-                                            button()
-                                                .on_press(move || {
-                                                    if !busy.get_untracked() {
-                                                        on_discard(&id);
-                                                    }
-                                                })
-                                                .min_h(px(28.0))
-                                                .px(px(theme::SPACING_SM))
-                                                .items_center()
-                                                .rounded(px(theme::RADIUS_CONTROL))
-                                                .child(
-                                                    text(copy::text("Discard", "丢弃", "丟棄"))
-                                                        .text_size(px(theme::font_micro()))
-                                                        .text_color(theme::accent_red),
-                                                )
-                                        }
-                                    }))
-                                    .child(when(
-                                        move || worktree.get().can_restore,
-                                        move || {
-                                            let on_restore = on_restore.clone();
-                                            let id = worktree.get_untracked().id;
-                                            button()
-                                                .on_press(move || {
-                                                    if !busy.get_untracked() {
-                                                        on_restore(&id);
-                                                    }
-                                                })
-                                                .min_h(px(28.0))
-                                                .px(px(theme::SPACING_SM))
-                                                .items_center()
-                                                .rounded(px(theme::RADIUS_CONTROL))
-                                                .child(
-                                                    text(copy::text("Restore", "恢复", "還原"))
-                                                        .text_size(px(theme::font_micro()))
-                                                        .text_color(theme::text_secondary),
-                                                )
-                                        },
-                                    )),
-                            )
-                    },
-                ))
-                .child(when(
-                    move || !operations.with(|operations| operations.is_empty()),
-                    move || {
-                        let on_continue = on_continue.clone();
-                        let on_abort = on_abort.clone();
-                        let on_resolve = on_resolve.clone();
-                        view()
-                            .w_full()
-                            .flex_col()
-                            .gap(px(theme::SPACING_XS))
-                            .child(
-                                text(copy::text("Operations", "操作", "操作"))
-                                    .text_size(px(theme::font_micro()))
-                                    .font_weight(FontWeight::SEMIBOLD)
-                                    .text_color(theme::text_muted),
-                            )
-                            .child(each(
-                                move || operations.get(),
-                                |operation| operation.id.clone(),
-                                move |operation, _| {
-                                    let on_continue = on_continue.clone();
-                                    let on_abort = on_abort.clone();
-                                    let on_resolve = on_resolve.clone();
-                                    view()
-                                        .w_full()
-                                        .flex_row()
-                                        .flex_wrap()
-                                        .items_center()
-                                        .gap(px(theme::SPACING_XS))
-                                        .p(px(theme::SPACING_SM))
-                                        .rounded(px(theme::RADIUS_CONTROL))
-                                        .bg(theme::background_dim)
-                                        .child(
-                                            text(move || {
-                                                let operation = operation.get();
-                                                format!(
-                                                    "{} · {}",
-                                                    operation.label, operation.status
-                                                )
-                                            })
-                                            .flex_1()
-                                            .truncate()
-                                            .text_size(px(theme::font_micro()))
-                                            .text_color(theme::text_secondary),
-                                        )
-                                        .child(when(
-                                            move || operation.get().can_continue,
-                                            move || {
-                                                let on_continue = on_continue.clone();
-                                                let id = operation.get_untracked().id;
-                                                button()
-                                                    .on_press(move || {
-                                                        if !busy.get_untracked() {
-                                                            on_continue(&id);
-                                                        }
-                                                    })
-                                                    .min_h(px(28.0))
-                                                    .px(px(theme::SPACING_SM))
-                                                    .items_center()
-                                                    .child(
-                                                        text(copy::text(
-                                                            "Continue", "继续", "繼續",
-                                                        ))
-                                                        .text_size(px(theme::font_micro()))
-                                                        .text_color(theme::text_secondary),
-                                                    )
-                                            },
-                                        ))
-                                        .child(when(
-                                            move || operation.get().can_abort,
-                                            move || {
-                                                let on_abort = on_abort.clone();
-                                                let id = operation.get_untracked().id;
-                                                button()
-                                                    .on_press(move || {
-                                                        if !busy.get_untracked() {
-                                                            on_abort(&id);
-                                                        }
-                                                    })
-                                                    .min_h(px(28.0))
-                                                    .px(px(theme::SPACING_SM))
-                                                    .items_center()
-                                                    .child(
-                                                        text(copy::text("Abort", "中止", "中止"))
-                                                            .text_size(px(theme::font_micro()))
-                                                            .text_color(theme::accent_red),
-                                                    )
-                                            },
-                                        ))
-                                        .child(each(
-                                            move || operation.get().conflicts,
-                                            |conflict| conflict.path.clone(),
-                                            move |conflict, _| {
-                                                let on_resolve = on_resolve.clone();
-                                                let id = operation.get_untracked().id;
-                                                let path = conflict.get_untracked().path;
-                                                view()
-                                                    .w_full()
-                                                    .flex_row()
-                                                    .items_center()
-                                                    .gap(px(theme::SPACING_XS))
-                                                    .child(
-                                                        text(path.clone())
-                                                            .flex_1()
-                                                            .truncate()
-                                                            .text_size(px(theme::font_micro()))
-                                                            .text_color(theme::text_muted),
-                                                    )
-                                                    .child(small_text_button(
-                                                        copy::text("Worktree", "工作树", "工作樹"),
-                                                        {
-                                                            let on_resolve = on_resolve.clone();
-                                                            let id = id.clone();
-                                                            let path = path.clone();
-                                                            move || on_resolve(&id, &path, true)
-                                                        },
-                                                    ))
-                                                    .child(small_text_button(
-                                                        copy::text("Target", "目标", "目標"),
-                                                        move || on_resolve(&id, &path, false),
-                                                    ))
-                                            },
-                                        ))
-                                },
-                            ))
-                    },
-                )),
-        )
-}
-
-fn small_text_button(label: &'static str, on_press: impl Fn() + 'static) -> ButtonElement {
-    button()
-        .on_press(on_press)
-        .min_h(px(24.0))
-        .px(px(theme::SPACING_XS))
-        .items_center()
-        .child(
-            text(label)
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_secondary),
-        )
+                            },
+                        )),
+                ),
+            ),
+    )
 }
 
 fn branch_sheet(
@@ -988,68 +1275,103 @@ fn branch_sheet(
     on_close: Rc<dyn Fn()>,
     on_select: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                on_close();
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .max_h(px(480.0))
-                .gap(px(theme::SPACING_XS))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Branches", "分支", "分支"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(each(
-                    move || branches.get(),
-                    |branch| branch.name.clone(),
-                    move |branch, _| {
-                        let on_select = on_select.clone();
-                        button()
-                            .w_full()
-                            .min_h(px(44.0))
-                            .px(px(theme::SPACING_SM))
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::background_dim)
-                            .active(|style| style.opacity(0.8))
-                            .on_press(move || on_select(&branch.get_untracked().name))
-                            .child(
-                                text(move || {
-                                    let branch = branch.get();
-                                    if branch.current {
-                                        format!("✓ {}", branch.name)
-                                    } else {
-                                        branch.name
-                                    }
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
+    bottom_sheet(
+        move || open.get(),
+        {
+            let on_close = on_close.clone();
+            move || on_close()
+        },
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.75))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Branches", "分支", "分支"),
+                move || on_close(),
+            ))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    sheet_body().child(sheet_card().child(each(
+                        move || branches.get(),
+                        |branch| branch.name.clone(),
+                        move |branch, _| {
+                            let on_select = on_select.clone();
+                            button()
+                                .w_full()
+                                .min_h(px(theme::ROW_HEIGHT))
+                                .px(px(surface::ROW_INSET))
+                                .py(px(theme::SPACING_SM))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_MD))
+                                .border_b_1()
+                                .border_b_color(theme::hairline)
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_press(move || {
+                                    on_select(&branch.with_untracked(|branch| branch.name.clone()))
                                 })
-                                .flex_1()
-                                .truncate()
-                                .text_size(px(theme::font_body()))
-                                .text_color(theme::foreground),
-                            )
-                            .child(
-                                text(move || branch.get().detail)
-                                    .truncate()
-                                    .text_size(px(theme::font_micro()))
-                                    .text_color(theme::text_muted),
-                            )
-                    },
-                )),
-        )
+                                .child(surface::tile(icon!("git-branch")))
+                                .child(
+                                    view()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .flex_col()
+                                        .gap(px(1.0))
+                                        .child(
+                                            text(move || branch.with(|branch| branch.name.clone()))
+                                                .truncate()
+                                                .text_size(px(theme::font_detail()))
+                                                .text_color(theme::foreground),
+                                        )
+                                        .child(when(
+                                            move || branch.with(|branch| !branch.detail.is_empty()),
+                                            move || {
+                                                text(move || {
+                                                    branch.with(|branch| branch.detail.clone())
+                                                })
+                                                .truncate()
+                                                .text_size(px(theme::font_micro()))
+                                                .text_color(theme::text_muted)
+                                            },
+                                        )),
+                                )
+                                .child(when(
+                                    move || branch.with(|branch| branch.behind > 0),
+                                    move || {
+                                        count(
+                                            move || {
+                                                format!("↓{}", branch.with(|branch| branch.behind))
+                                            },
+                                            theme::accent_blue,
+                                        )
+                                    },
+                                ))
+                                .child(when(
+                                    move || branch.with(|branch| branch.ahead > 0),
+                                    move || {
+                                        count(
+                                            move || {
+                                                format!("↑{}", branch.with(|branch| branch.ahead))
+                                            },
+                                            theme::accent_success,
+                                        )
+                                    },
+                                ))
+                                .child(when(
+                                    move || branch.with(|branch| branch.current),
+                                    || {
+                                        svg(icon!("check"))
+                                            .size(px(theme::ICON_MD))
+                                            .flex_shrink_0()
+                                            .text_color(theme::foreground)
+                                    },
+                                ))
+                        },
+                    ))),
+                ),
+            ),
+    )
 }
 
 /// The history list.
@@ -1089,10 +1411,13 @@ fn history_list(
                     .collect::<Vec<_>>()
             })
         })
-        .estimated_item_size(px(56.0))
+        .estimated_item_size(px(HISTORY_ROW_HEIGHT))
         .flex_1(),
     )
 }
+
+/// A commit in the history list.
+const HISTORY_ROW_HEIGHT: f32 = 56.0;
 
 fn history_row(
     at: Position,
@@ -1101,49 +1426,88 @@ fn history_row(
 ) -> impl IntoElement {
     let commit = computed(move || history.with(|history| history.get(at.index()).cloned()));
     button()
-        .w_full()
-        .min_h(px(56.0))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_XS))
-        .flex_col()
-        .items_start()
-        .justify_center()
-        .gap(px(2.0))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .active(|style| style.opacity(0.8))
+        .min_h(px(HISTORY_ROW_HEIGHT))
+        .mx(px(theme::SPACING_SM))
+        .px(px(theme::SPACING_SM))
+        .py(px(6.0))
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_MD))
+        .rounded(px(theme::RADIUS_CHIP))
+        .active(|style| style.bg(theme::row_pressed_bg()))
         .on_press(move || {
             if let Some(commit) = commit.get_untracked() {
                 on_open_commit(&commit.hash);
             }
         })
+        // The mark of a commit on the line of its history.
         .child(
-            text(move || {
-                commit
-                    .with(|commit| commit.as_ref().map(|commit| commit.subject.clone()))
-                    .unwrap_or_default()
-            })
-            .truncate()
-            .text_size(px(theme::font_detail()))
-            .text_color(theme::foreground),
+            view()
+                .w(px(theme::SPACING_LG))
+                .flex_shrink_0()
+                .items_center()
+                .child(
+                    view()
+                        .size(px(9.0))
+                        .rounded_full()
+                        .border(px(2.0))
+                        .border_color(theme::text_muted),
+                ),
         )
         .child(
-            text(move || {
-                commit.with(|commit| {
-                    commit.as_ref().map_or(String::new(), |commit| {
-                        format!("{} · {}", commit.short_hash, commit.detail)
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_col()
+                .gap(px(2.0))
+                .child(
+                    text(move || {
+                        commit
+                            .with(|commit| commit.as_ref().map(|commit| commit.subject.clone()))
+                            .unwrap_or_default()
                     })
-                })
-            })
-            .truncate()
-            .text_size(px(theme::font_micro()))
-            .text_color(theme::text_muted),
+                    .truncate()
+                    .text_size(px(theme::font_detail()))
+                    .text_color(theme::foreground),
+                )
+                .child(
+                    text(move || {
+                        commit.with(|commit| {
+                            commit.as_ref().map_or(String::new(), |commit| {
+                                format!("{} · {}", commit.short_hash, commit.detail)
+                            })
+                        })
+                    })
+                    .truncate()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted),
+                ),
         )
+        .child(surface::chevron())
 }
 
-/// The diff with the action that discards it.
-/// A long text, one virtualized row per line, so it scrolls.
+/// A long text, one virtualized row per line, so it scrolls. A line of a
+/// patch is read by its first character: what was added, what was taken
+/// away, and where the hunk stands.
 fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
+    #[derive(Clone, Copy, PartialEq)]
+    enum Kind {
+        Added,
+        Removed,
+        Hunk,
+        Plain,
+    }
+    fn kind(line: &str) -> Kind {
+        if line.starts_with('+') && !line.starts_with("+++") {
+            Kind::Added
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            Kind::Removed
+        } else if line.starts_with("@@") {
+            Kind::Hunk
+        } else {
+            Kind::Plain
+        }
+    }
     view().flex_1().min_h(px(0.0)).child(
         virtual_list(
             move || lines.with(|lines| lines.len()),
@@ -1151,32 +1515,37 @@ fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
                 let line = computed(move || {
                     lines.with(|lines| lines.get(at.index()).cloned().unwrap_or_default())
                 });
-                view().px(px(theme::SPACING_LG)).child(
-                    text(move || line.get())
-                        .text_size(px(theme::font_micro()))
-                        .line_height(theme::line_height_for(theme::font_micro()))
-                        .text_color(move || {
-                            line.with(|line| {
-                                if line.starts_with('+') && !line.starts_with("+++") {
-                                    theme::accent_success()
-                                } else if line.starts_with('-') && !line.starts_with("---") {
-                                    theme::accent_red()
-                                } else if line.starts_with("@@") {
-                                    theme::accent_blue()
-                                } else {
-                                    theme::foreground()
-                                }
-                            })
-                        }),
-                )
+                let of = move || line.with(|line| kind(line));
+                view()
+                    .w_full()
+                    .px(px(theme::SPACING_LG))
+                    .bg(move || match of() {
+                        Kind::Added => theme::tint(theme::accent_success()),
+                        Kind::Removed => theme::tint(theme::accent_red()),
+                        Kind::Hunk => theme::fill(),
+                        Kind::Plain => theme::background().opacity(0.0),
+                    })
+                    .child(
+                        text(move || line.get())
+                            .font_family("monospace")
+                            .text_size(px(theme::font_hint()))
+                            .line_height(theme::line_height_for(theme::font_hint()))
+                            .text_color(move || match of() {
+                                Kind::Added => theme::accent_success(),
+                                Kind::Removed => theme::accent_red(),
+                                Kind::Hunk => theme::accent_blue(),
+                                Kind::Plain => theme::text_secondary(),
+                            }),
+                    )
             },
         )
         .keys(move || (0..lines.with(|lines| lines.len())).collect::<Vec<_>>())
-        .estimated_item_size(px(16.0))
+        .estimated_item_size(px(18.0))
         .flex_1(),
     )
 }
 
+/// The diff with the action that discards it.
 fn diff_view(
     diff: Signal<Option<GitDiffPreview>>,
     on_revert: Rc<dyn Fn(&str)>,
@@ -1189,13 +1558,6 @@ fn diff_view(
         })
     });
     let lines = computed(move || body.get().lines().map(str::to_owned).collect::<Vec<_>>());
-    let title = computed(move || {
-        diff.with(|diff| {
-            diff.as_ref()
-                .map(|diff| diff.title.clone())
-                .unwrap_or_default()
-        })
-    });
     let truncated =
         computed(move || diff.with(|diff| diff.as_ref().is_some_and(|diff| diff.truncated)));
     let path = computed(move || {
@@ -1209,67 +1571,61 @@ fn diff_view(
     view()
         .flex_1()
         .min_h(px(0.0))
-        .gap(px(theme::SPACING_XS))
-        .py(px(theme::SPACING_SM))
-        .child(
-            text(move || title.get())
-                .px(px(theme::SPACING_LG))
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
+        .border_t_1()
+        .border_color(theme::hairline)
         .child(line_list(lines))
         .child(when(move || truncated.get(), || {
-            text(copy::text(
+            preview_limit(copy::text(
                 "The diff is larger than the preview limit.",
                 "差异超过预览上限。",
                 "差異超過預覽上限。",
             ))
-            .text_size(px(theme::font_micro()))
-            .text_color(theme::text_muted)
         }))
         .child(when(move || !staged.get(), {
             let on_revert = on_revert.clone();
             move || {
                 let path = path.get_untracked();
                 let on_revert = on_revert.clone();
-                button()
+                view()
                     .w_full()
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .justify_center()
-                    .items_center()
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::accent_red)
-                    .active(|style| style.opacity(0.7))
-                    .on_press(move || {
-                        let path = path.clone();
-                        let on_revert = on_revert.clone();
-                        spawn(async move {
-                            let answer = nsh_base::alert_dialog()
-                                .title(copy::text(
-                                    "Revert this file?",
-                                    "还原这个文件？",
-                                    "還原這個檔案？",
-                                ))
-                                .description(copy::text(
-                                    "The working-tree changes to this path are discarded.",
-                                    "该路径在工作区的改动会被丢弃。",
-                                    "該路徑在工作區的改動會被丟棄。",
-                                ))
-                                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                                .destructive("revert", copy::text("Revert", "还原", "還原"))
-                                .show()
-                                .await;
-                            if matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("revert"))
-                            {
-                                on_revert(&path);
-                            }
-                        });
-                    })
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_MD))
+                    .py(px(theme::SPACING_SM))
+                    .border_t_1()
+                    .border_color(theme::hairline)
                     .child(
-                        text(copy::text("Revert changes", "还原改动", "還原改動"))
-                            .text_size(px(theme::font_detail()))
-                            .text_color(theme::accent_red),
+                        action::tonal_danger(
+                            copy::text("Revert changes", "还原改动", "還原改動"),
+                            move || {
+                                let path = path.clone();
+                                let on_revert = on_revert.clone();
+                                spawn(async move {
+                                    let answer = nsh_base::alert_dialog()
+                                        .title(copy::text(
+                                            "Revert this file?",
+                                            "还原这个文件？",
+                                            "還原這個檔案？",
+                                        ))
+                                        .description(copy::text(
+                                            "The working-tree changes to this path are discarded.",
+                                            "该路径在工作区的改动会被丢弃。",
+                                            "該路徑在工作區的改動會被丟棄。",
+                                        ))
+                                        .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                                        .destructive(
+                                            "revert",
+                                            copy::text("Revert", "还原", "還原"),
+                                        )
+                                        .show()
+                                        .await;
+                                    if matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("revert"))
+                                    {
+                                        on_revert(&path);
+                                    }
+                                });
+                            },
+                        )
+                        .w_full(),
                     )
             }
         }))
@@ -1292,32 +1648,26 @@ fn commit_detail_view(detail: Signal<Option<CommitDetailPreview>>) -> impl IntoE
     view()
         .flex_1()
         .min_h(px(0.0))
-        .gap(px(theme::SPACING_XS))
-        .py(px(theme::SPACING_SM))
+        .border_t_1()
+        .border_color(theme::hairline)
         .child(line_list(lines))
         .child(when(
             move || truncated.get(),
             || {
-                text(copy::text(
+                preview_limit(copy::text(
                     "The patch is larger than the preview limit.",
                     "补丁超过预览上限。",
                     "補丁超過預覽上限。",
                 ))
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted)
             },
         ))
 }
 
 fn status_color(status: &str) -> Hsla {
     match status {
-        "A" | "?" => theme::color_token("chart-1"),
+        "A" | "?" => theme::accent_success(),
         "D" => theme::accent_red(),
-        "M" | "R" => theme::color_token("warning"),
+        "M" | "R" => theme::accent_yellow(),
         _ => theme::text_muted(),
     }
-}
-
-fn icon(markup: &'static str) -> ImageSrc {
-    ImageSrc::svg_markup(markup)
 }

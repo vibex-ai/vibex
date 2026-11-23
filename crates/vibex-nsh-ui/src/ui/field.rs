@@ -5,31 +5,18 @@ use nsh_core::prelude::*;
 
 use crate::theme;
 
-/// A single-line field on the phone's control ladder.
+/// A single-line field on the phone's control ladder, without a frame of its
+/// own: the pill, the well or the card around it draws one.
 ///
 /// The field is controlled: the owner keeps the text in `value` and
 /// `on_change` writes it back. The platform draws the caret, selection,
 /// autocorrection and keyboard, so the app does not.
-pub fn text_field(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
-    text_field_with(value, placeholder, |_text: &str| {})
-}
-
-/// A field whose owner also hears every edit (a composer that opens its
-/// command palette on `/`).
-pub fn text_field_with(
-    value: Signal<String>,
-    placeholder: impl IntoReactive<String>,
-    on_change: impl Fn(&str) + 'static,
-) -> Input {
-    framed(text_field_flat_with(value, placeholder, on_change))
-}
-
-/// The same field without its own frame, for a row that draws one border
-/// around the field and the controls beside it.
 pub fn text_field_flat(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
     text_field_flat_with(value, placeholder, |_text: &str| {})
 }
 
+/// The same field, whose owner also hears every edit (a composer that opens
+/// its command palette on `/`).
 pub fn text_field_flat_with(
     value: Signal<String>,
     placeholder: impl IntoReactive<String>,
@@ -53,9 +40,21 @@ pub fn text_field_flat_with(
 /// A field with neither frame nor padding, for a pill that draws both around
 /// the field and the glyphs beside it.
 pub fn text_field_bare(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
+    text_field_bare_with(value, placeholder, |_text: &str| {})
+}
+
+/// A bare field whose owner also hears every edit.
+pub fn text_field_bare_with(
+    value: Signal<String>,
+    placeholder: impl IntoReactive<String>,
+    on_change: impl Fn(&str) + 'static,
+) -> Input {
     input()
         .value(move || value.get())
-        .on_change(move |text: &str| value.set(text.to_owned()))
+        .on_change(move |text: &str| {
+            value.set(text.to_owned());
+            on_change(text);
+        })
         .placeholder(placeholder)
         .placeholder_color(theme::muted_foreground)
         .caret_color(theme::primary)
@@ -63,10 +62,11 @@ pub fn text_field_bare(value: Signal<String>, placeholder: impl IntoReactive<Str
         .text_color(theme::foreground)
 }
 
-fn framed(field: Input) -> Input {
-    field
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_default)
-        .focus(|style| style.border_color(theme::foreground))
+/// A field in a well: the one field a sheet or a card asks for.
+pub fn text_field_well(value: Signal<String>, placeholder: impl IntoReactive<String>) -> Input {
+    text_field_flat(value, placeholder)
+        .h(px(48.0))
+        .px(px(theme::SPACING_LG))
+        .rounded(px(theme::RADIUS_BUTTON))
+        .bg(theme::fill)
 }

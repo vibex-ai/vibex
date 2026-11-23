@@ -90,38 +90,71 @@ pub fn floating_icon(
         )
 }
 
-/// A destructive action: the same shape as [`secondary`], in the error ink.
-pub fn destructive(
+/// The one action a card or a sheet is for: a labelled block in the ink.
+pub fn solid(label: impl IntoReactive<SharedString>, on_press: impl Fn() + 'static) -> ButtonElement {
+    labelled(label, theme::action_primary, theme::action_primary_label, on_press)
+}
+
+/// The alternative beside a [`solid`] action: the same block on a wash.
+pub fn tonal(label: impl IntoReactive<SharedString>, on_press: impl Fn() + 'static) -> ButtonElement {
+    labelled(label, theme::fill, theme::foreground, on_press)
+}
+
+/// A [`tonal`] action that removes or discards.
+pub fn tonal_danger(
     label: impl IntoReactive<SharedString>,
-    icon: ImageSrc,
     on_press: impl Fn() + 'static,
 ) -> ButtonElement {
-    let content: fn() -> Hsla = theme::accent_red;
+    labelled(label, danger_fill, theme::accent_red, on_press)
+}
+
+fn danger_fill() -> Hsla {
+    theme::tint(theme::accent_red())
+}
+
+fn labelled(
+    label: impl IntoReactive<SharedString>,
+    fill: fn() -> Hsla,
+    ink: fn() -> Hsla,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
     button()
         .on_press(on_press)
         .h(px(theme::TOUCH_TARGET))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::accent_red)
-        .bg(theme::background_dim)
-        .flex_row()
+        .px(px(theme::SPACING_LG))
+        .rounded(px(theme::RADIUS_BUTTON))
+        .bg(fill)
         .items_center()
         .justify_center()
-        .gap(px(theme::SPACING_SM))
-        .active(|style| style.opacity(0.85))
+        .active(|style| style.opacity(0.75))
+        .disabled_style(|style| style.opacity(0.4))
         .focus_visible(|style| style.outline(px(2.0)).outline_color(theme::foreground))
         .child(
-            svg(icon)
-                .w(px(theme::ICON_SM))
-                .h(px(theme::ICON_SM))
-                .flex_shrink_0()
-                .text_color(content),
+            text(label)
+                .truncate()
+                .text_size(px(theme::font_detail()))
+                .font_weight(FontWeight::SEMIBOLD)
+                .text_color(ink),
         )
+}
+
+/// A quiet action written out in words.
+pub fn link(label: impl IntoReactive<SharedString>, on_press: impl Fn() + 'static) -> ButtonElement {
+    button()
+        .on_press(on_press)
+        .h(px(theme::CHIP_HEIGHT))
+        .px(px(theme::SPACING_SM))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CHIP))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled_style(|style| style.opacity(0.4))
         .child(
             text(label)
-                .text_size(px(theme::font_detail()))
+                .text_size(px(theme::font_caption()))
                 .font_weight(FontWeight::MEDIUM)
-                .text_color(content),
+                .text_color(theme::text_secondary),
         )
 }
 

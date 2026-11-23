@@ -2367,8 +2367,10 @@ impl SessionService {
         if self.active.get_untracked().is_some() {
             self.draft.set(text);
         } else {
-            self.new_prompt.set(text);
+            // Opening the page clears what a session before it left behind,
+            // so the shared text is written after.
             self.open_new_session();
+            self.new_prompt.set(text);
         }
     }
 
@@ -5436,7 +5438,7 @@ impl SessionService {
         }
     }
 
-    /// Opens the new-session sheet with the runtime's choices.
+    /// Starts writing a new session, with the runtime's choices.
     pub fn open_new_session(&self) {
         let workspace = self.session_records.with(|sessions| {
             let active = self.active.get_untracked()?;
@@ -5454,17 +5456,22 @@ impl SessionService {
         project: Option<String>,
         folder: Option<String>,
     ) {
-        if self.new_busy.get_untracked() || self.new_session_open.get_untracked() {
+        if self.new_busy.get_untracked() {
             return;
         }
+        // A session already being written keeps what was written: asking
+        // again only points it at the place that was asked for.
+        let writing = self.new_session_open.get_untracked();
         self.new_session_open.set(true);
         self.new_session_folder.set(folder);
         self.new_error.set(None);
-        self.new_title.set(String::new());
-        self.new_prompt.set(String::new());
-        self.new_attachments.set(Vec::new());
-        self.new_worktree_branch.set(String::new());
-        self.new_base_ref.set(String::new());
+        if !writing {
+            self.new_title.set(String::new());
+            self.new_prompt.set(String::new());
+            self.new_attachments.set(Vec::new());
+            self.new_worktree_branch.set(String::new());
+            self.new_base_ref.set(String::new());
+        }
         self.new_workspaces.set(Vec::new());
         self.new_runtimes.set(Vec::new());
         self.new_workspace.set(None);

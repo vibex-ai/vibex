@@ -1,14 +1,19 @@
-//! The new-session page: pick a workspace and a runtime, then start.
+//! A session being written: the conversation page before its first message.
+//!
+//! A new session has no page of its own. It takes the transcript's place under
+//! the conversation's header: a greeting and a few ways to begin where the
+//! messages will be, and the prompt card where it always is, with the two
+//! things a first message also has to say on its control row: where the
+//! session runs, and what runs it.
 //!
 //! The options come from the runtime itself (`list_workspaces` and
 //! `list_runtime_options`): a workspace names the project it belongs to and
 //! its root, and a runtime is one Agent/model/auth selection the runtime is
-//! ready to run. The sheet only carries ids; the app's service owns the
+//! ready to run. The page only carries ids; the app's service owns the
 //! records and the create call.
 
 use std::rc::Rc;
 
-use nsh_base::{SheetEvent, button, input, sheet};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::screens::session::{AttachmentItem, BrowseDirs};
@@ -23,7 +28,7 @@ pub struct DirectoryEntry {
 }
 use crate::{
     copy, theme,
-    ui::{action, brand, field, sheet as chrome},
+    ui::{action, brand, compose, field, sheet as chrome, surface},
 };
 
 /// A workspace the new session can live in.
@@ -53,7 +58,6 @@ pub struct NewSessionHost {
     pub runtime: Signal<Option<String>>,
     pub busy: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
-    pub on_close: Rc<dyn Fn()>,
     pub on_create: Rc<dyn Fn()>,
     pub on_create_temporary: Rc<dyn Fn()>,
     /// The session's optional title, first message and its attachments.
@@ -84,20 +88,75 @@ enum Picker {
     Attachment,
 }
 
-/// The full-screen first-message composer and its choice sheets.
+/// One way to begin: what it is for, and the message it starts.
+struct Starter {
+    icon: ImageSrc,
+    title: &'static str,
+    caption: &'static str,
+    prompt: &'static str,
+}
+
+fn starters() -> [Starter; 3] {
+    [
+        Starter {
+            icon: icon!("book-open-text"),
+            title: copy::text("Tour this project", "了解这个项目", "了解這個專案"),
+            caption: copy::text(
+                "How it is laid out and how to run it",
+                "梳理代码结构与运行方式",
+                "梳理程式碼結構與執行方式",
+            ),
+            prompt: copy::text(
+                "Give me a tour of this project: what it does, how the code is laid out, and how to build, run and test it.",
+                "带我了解这个项目：它是做什么的、代码如何组织，以及如何构建、运行和测试。",
+                "帶我了解這個專案：它是做什麼的、程式碼如何組織，以及如何建置、執行和測試。",
+            ),
+        },
+        Starter {
+            icon: icon!("list-checks"),
+            title: copy::text("Review my changes", "审查当前改动", "審查目前變更"),
+            caption: copy::text(
+                "Find problems in the working tree",
+                "检查工作区里尚未提交的修改",
+                "檢查工作區裡尚未提交的修改",
+            ),
+            prompt: copy::text(
+                "Review the uncommitted changes in the working tree. Point out bugs, risky edits and anything that needs a test.",
+                "审查工作区中尚未提交的改动，指出其中的缺陷、有风险的修改，以及需要补充测试的地方。",
+                "審查工作區中尚未提交的變更，指出其中的缺陷、有風險的修改，以及需要補充測試的地方。",
+            ),
+        },
+        Starter {
+            icon: icon!("wrench"),
+            title: copy::text("Fix a problem", "修复一个问题", "修復一個問題"),
+            caption: copy::text(
+                "Say what goes wrong and trace the cause",
+                "描述现象，定位原因并修复",
+                "描述現象，定位原因並修復",
+            ),
+            prompt: copy::text(
+                "Something is not working as expected. Here is what happens: ",
+                "有个地方的行为不符合预期，现象是：",
+                "有個地方的行為不符合預期，現象是：",
+            ),
+        },
+    ]
+}
+
+/// The page under the conversation's header while a session is being
+/// written: the blank canvas, the prompt card, and the sheets its choices
+/// open.
 pub fn new_session(host: NewSessionHost) -> impl IntoElement {
     let picker = signal(None::<Picker>);
     let location = signal(Location::Workspace);
+    let input = element_ref();
     let error = host.error;
     let busy = host.busy;
     let workspace = host.workspace;
     let workspaces = host.workspaces;
     let runtime = host.runtime;
     let runtimes = host.runtimes;
-    let workspace_label = move || {
-        if location.get() == Location::Temporary {
-            return copy::text("Temporary session", "临时会话", "暫時工作階段").to_owned();
-        }
+    let workspace_name = move || {
         workspaces.with(|choices| {
             workspace
                 .with(|selected| {
@@ -106,11 +165,20 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                         .find(|choice| selected.as_ref() == Some(&choice.id))
                 })
                 .map(|choice| choice.name.clone())
-                .unwrap_or_else(|| copy::text("Choose project", "选择项目", "選擇專案").to_owned())
+        })
+    };
+    let location_label = move || {
+        SharedString::from(match location.get() {
+            Location::Temporary => {
+                copy::text("Temporary session", "临时会话", "暫時工作階段").to_owned()
+            }
+            _ => workspace_name().unwrap_or_else(|| {
+                copy::text("Choose project", "选择项目", "選擇專案").to_owned()
+            }),
         })
     };
     let runtime_label = move || {
-        runtimes.with(|choices| {
+        SharedString::from(runtimes.with(|choices| {
             runtime
                 .with(|selected| {
                     choices
@@ -121,11 +189,11 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                 .unwrap_or_else(|| {
                     copy::text("Agent and model", "Agent 与模型", "Agent 與模型").to_owned()
                 })
-        })
+        }))
     };
-    let close = host.on_close.clone();
     let prompt = host.prompt;
     let branch = host.worktree_branch;
+    let attachments = host.attachments;
     let can_create = move || {
         !busy.get()
             && runtime.with(Option::is_some)
@@ -137,50 +205,36 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                 }
             }
     };
+    let create = {
+        let host = host.clone();
+        move || {
+            dismiss_keyboard();
+            match location.get_untracked() {
+                Location::Workspace => (host.on_create)(),
+                Location::Worktree => (host.on_create_worktree)(),
+                Location::Temporary => (host.on_create_temporary)(),
+            }
+        }
+    };
+    let on_remove_attachment = host.on_remove_attachment.clone();
     view()
-        .absolute()
-        .inset(px(0.0))
+        .flex_1()
+        .min_h(px(0.0))
         .flex_col()
-        .bg(theme::background)
-        .pt_safe_area()
         .pb_keyboard()
-        .child(chrome::sheet_header(
-            copy::text("New session", "新建会话", "新增工作階段"),
-            move || {
-                dismiss_keyboard();
-                close();
-            },
-        ))
-        .child(
-            view()
-                .flex_1()
-                .min_h(px(0.0))
-                .overflow_hidden()
-                .justify_center()
-                .items_center()
-                .gap(px(theme::SPACING_SM))
-                .child(brand::wordmark())
-                .child(
-                    text(workspace_label)
-                        .w_full()
-                        .text_center()
-                        .px(px(theme::SPACING_LG))
-                        .truncate()
-                        .text_size(px(theme::font_caption()))
-                        .text_color(theme::text_muted),
-                ),
-        )
+        .child(canvas(prompt, input))
         .child(
             view()
                 .w_full()
                 .flex_shrink_0()
                 .gap(px(theme::SPACING_SM))
-                .px(px(theme::SPACING_LG))
-                .pb(px(theme::SPACING_MD))
+                .px(px(theme::SPACING_MD))
+                .pb(px(theme::SPACING_SM))
                 .child(when(
                     move || error.with(Option::is_some),
                     move || {
                         text(move || error.get().unwrap_or_default())
+                            .px(px(theme::SPACING_SM))
                             .text_size(px(theme::font_caption()))
                             .text_color(theme::accent_red)
                     },
@@ -188,13 +242,16 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                 .child(when(
                     move || location.get() == Location::Worktree,
                     move || {
-                        view()
-                            .gap(px(theme::SPACING_XS))
-                            .child(field::text_field(
+                        // A new worktree is a branch of the chosen project:
+                        // its name is asked for where the message is written.
+                        surface::card()
+                            .p(px(theme::SPACING_SM))
+                            .gap(px(theme::SPACING_SM))
+                            .child(field::text_field_well(
                                 branch,
                                 copy::text("Branch name", "分支名", "分支名稱"),
                             ))
-                            .child(field::text_field(
+                            .child(field::text_field_well(
                                 host.base_ref,
                                 copy::text(
                                     "Base ref (optional)",
@@ -205,40 +262,45 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                     },
                 ))
                 .child(
-                    view()
-                        .p(px(theme::SPACING_SM))
-                        .gap(px(theme::SPACING_XS))
-                        .rounded(px(theme::RADIUS_COMPOSER))
-                        .border_1()
-                        .border_color(theme::border_default)
-                        .bg(theme::composer_surface)
-                        .child(new_session_attachments(
-                            host.attachments,
-                            host.on_remove_attachment.clone(),
+                    compose::card()
+                        .child(when(
+                            move || !attachments.with(Vec::is_empty),
+                            move || {
+                                let on_remove = on_remove_attachment.clone();
+                                compose::chips().child(each(
+                                    move || attachments.get(),
+                                    |attachment| attachment.id.clone(),
+                                    move |attachment, _| {
+                                        let on_remove = on_remove.clone();
+                                        compose::chip(
+                                            move || {
+                                                SharedString::from(
+                                                    attachment.with(|item| item.label.clone()),
+                                                )
+                                            },
+                                            move || {
+                                                on_remove(
+                                                    &attachment.with_untracked(|item| {
+                                                        item.id.clone()
+                                                    }),
+                                                )
+                                            },
+                                        )
+                                    },
+                                ))
+                            },
                         ))
                         .child(
-                            input()
-                                .value(move || prompt.get())
-                                .on_change(move |value: &str| prompt.set(value.to_owned()))
-                                .multiline(true)
-                                .h(px(70.0))
-                                .w_full()
-                                .p(px(theme::SPACING_XS))
-                                .placeholder(copy::text(
-                                    "First message",
-                                    "第一条消息",
-                                    "第一則訊息",
-                                ))
-                                .placeholder_color(theme::muted_foreground)
-                                .text_color(theme::foreground)
-                                .text_size(px(theme::font_body())),
+                            compose::field(
+                                prompt,
+                                copy::text("First message", "第一条消息", "第一則訊息"),
+                                |_: &str| {},
+                            )
+                            .element_ref(&input),
                         )
                         .child(
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .child(action::icon_button(
-                                    icon!("plus"),
+                            compose::controls()
+                                .child(compose::add_button(
                                     copy::text("Attach a file", "添加附件", "新增附件"),
                                     move || {
                                         dismiss_keyboard();
@@ -246,78 +308,43 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                                     },
                                 ))
                                 .child(
-                                    button()
+                                    view()
                                         .flex_1()
                                         .min_w(px(0.0))
-                                        .h(px(theme::TOUCH_TARGET))
-                                        .items_start()
-                                        .justify_center()
-                                        .on_press(move || {
-                                            dismiss_keyboard();
-                                            picker.set(Some(Picker::Runtime));
-                                        })
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(theme::SPACING_XS))
+                                        .overflow_hidden()
                                         .child(
-                                            text(runtime_label)
-                                                .truncate()
-                                                .w_full()
-                                                .text_size(px(theme::font_caption()))
-                                                .text_color(theme::foreground),
-                                        ),
+                                            compose::pill(
+                                                icon!("folder"),
+                                                location_label,
+                                                move || {
+                                                    dismiss_keyboard();
+                                                    picker.set(Some(Picker::Location));
+                                                },
+                                            )
+                                            .accessibility_label(copy::text(
+                                                "Choose workspace",
+                                                "选择工作区",
+                                                "選擇工作區",
+                                            )),
+                                        )
+                                        .child(compose::pill(
+                                            icon!("sparkles"),
+                                            runtime_label,
+                                            move || {
+                                                dismiss_keyboard();
+                                                picker.set(Some(Picker::Runtime));
+                                            },
+                                        )),
                                 )
-                                .child(
-                                    action::icon_button(
-                                        icon!("send"),
-                                        copy::text("Create", "创建", "建立"),
-                                        move || {
-                                            dismiss_keyboard();
-                                            match location.get_untracked() {
-                                                Location::Workspace => (host.on_create)(),
-                                                Location::Worktree => (host.on_create_worktree)(),
-                                                Location::Temporary => (host.on_create_temporary)(),
-                                            }
-                                        },
-                                    )
-                                    .size(px(theme::COMPOSER_SEND_SIZE))
-                                    .rounded_full()
-                                    .bg(theme::action_primary)
-                                    .disabled(move || !can_create())
-                                    .disabled_style(|style| style.opacity(0.4)),
-                                ),
-                        ),
-                )
-                .child(
-                    button()
-                        .h(px(theme::TOUCH_TARGET))
-                        .w_full()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .accessibility_label(copy::text(
-                            "Choose workspace",
-                            "选择工作区",
-                            "選擇工作區",
-                        ))
-                        .on_press(move || {
-                            dismiss_keyboard();
-                            picker.set(Some(Picker::Location));
-                        })
-                        .child(
-                            svg(icon!("folder"))
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted),
-                        )
-                        .child(
-                            text(workspace_label)
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(theme::font_caption()))
-                                .text_color(theme::text_secondary),
-                        )
-                        .child(
-                            svg(icon!("chevron-down"))
-                                .size(px(theme::ICON_SM))
-                                .text_color(theme::text_muted),
+                                .child(compose::send_button(
+                                    icon!("send"),
+                                    copy::text("Create", "创建", "建立"),
+                                    can_create,
+                                    create,
+                                )),
                         ),
                 ),
         )
@@ -330,76 +357,204 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
             Picker::Location,
             copy::text("Workspace", "工作区", "工作區"),
             view()
-                .gap(px(theme::SPACING_XS))
-                .child(choice_list(
-                    workspaces,
-                    workspace,
-                    |choice| choice.id.clone(),
-                    |choice| (choice.name.clone(), choice.detail.clone()),
+                .w_full()
+                .gap(px(theme::SPACING_MD))
+                .child(when(
+                    move || !workspaces.with(Vec::is_empty),
                     move || {
-                        location.set(Location::Workspace);
-                        picker.set(None);
+                        chrome::sheet_card().child(choice_list(
+                            workspaces,
+                            icon!("folder"),
+                            |choice: &WorkspaceChoice| choice.id.clone(),
+                            |choice: &WorkspaceChoice| (choice.name.clone(), choice.detail.clone()),
+                            move |id| {
+                                location.get() == Location::Workspace
+                                    && workspace.with(|selected| selected.as_deref() == Some(id))
+                            },
+                            move |id| {
+                                workspace.set(Some(id.to_owned()));
+                                location.set(Location::Workspace);
+                                picker.set(None);
+                            },
+                        ))
                     },
                 ))
-                .child(chrome::sheet_entry(
-                    icon!("git-branch"),
-                    copy::text("New worktree", "新建 Worktree", "新增 Worktree"),
-                    false,
-                    move || {
-                        location.set(Location::Worktree);
-                        picker.set(None);
-                    },
-                ))
-                .child(chrome::sheet_entry(
-                    icon!("box"),
-                    copy::text("Temporary session", "临时会话", "暫時工作階段"),
-                    false,
-                    move || {
-                        location.set(Location::Temporary);
-                        picker.set(None);
-                    },
-                ))
-                .child(field::text_field(
-                    host.title,
-                    copy::text("Title (optional)", "标题（可选）", "標題（選填）"),
-                )),
+                .child(
+                    chrome::sheet_card()
+                        .child(
+                            surface::row_captioned(
+                                icon!("git-branch"),
+                                copy::text("New worktree", "新建 Worktree", "新增 Worktree"),
+                                copy::text(
+                                    "A new branch of the chosen project",
+                                    "基于所选项目新开一个分支",
+                                    "基於所選專案新開一個分支",
+                                ),
+                                move || {
+                                    location.set(Location::Worktree);
+                                    picker.set(None);
+                                },
+                            )
+                            .child(chosen_mark(move || location.get() == Location::Worktree)),
+                        )
+                        .child(surface::row_divider())
+                        .child(
+                            surface::row_captioned(
+                                icon!("box"),
+                                copy::text("Temporary session", "临时会话", "暫時工作階段"),
+                                copy::text(
+                                    "A scratch directory, outside any project",
+                                    "使用临时目录，不属于任何项目",
+                                    "使用暫存目錄，不屬於任何專案",
+                                ),
+                                move || {
+                                    location.set(Location::Temporary);
+                                    picker.set(None);
+                                },
+                            )
+                            .child(chosen_mark(move || location.get() == Location::Temporary)),
+                        ),
+                )
+                .child(
+                    view()
+                        .w_full()
+                        .gap(px(theme::SPACING_SM))
+                        .child(surface::group_label(copy::text(
+                            "Session title",
+                            "会话标题",
+                            "工作階段標題",
+                        )))
+                        .child(field::text_field_well(
+                            host.title,
+                            copy::text("Title (optional)", "标题（可选）", "標題（選填）"),
+                        )),
+                ),
         ))
         .child(choice_sheet(
             picker,
             Picker::Runtime,
             copy::text("Agent and model", "Agent 与模型", "Agent 與模型"),
-            choice_list(
+            chrome::sheet_card().child(choice_list(
                 runtimes,
-                runtime,
-                |choice| choice.id.clone(),
-                |choice| (choice.title.clone(), choice.detail.clone()),
-                move || picker.set(None),
-            ),
+                icon!("sparkles"),
+                |choice: &RuntimeChoice| choice.id.clone(),
+                |choice: &RuntimeChoice| (choice.title.clone(), choice.detail.clone()),
+                move |id| runtime.with(|selected| selected.as_deref() == Some(id)),
+                move |id| {
+                    runtime.set(Some(id.to_owned()));
+                    picker.set(None);
+                },
+            )),
         ))
         .child(choice_sheet(
             picker,
             Picker::Attachment,
             copy::text("Add attachment", "添加附件", "新增附件"),
-            view()
-                .child(chrome::sheet_entry(
+            chrome::sheet_card()
+                .child(surface::row_captioned(
                     icon!("image"),
                     copy::text("Image", "图片", "圖片"),
-                    false,
+                    copy::text(
+                        "Scaled down before it is sent",
+                        "发送前会先缩放",
+                        "傳送前會先縮放",
+                    ),
                     move || {
                         picker.set(None);
                         (host.on_attach_image)();
                     },
                 ))
-                .child(chrome::sheet_entry(
+                .child(surface::row_divider())
+                .child(surface::row_captioned(
                     icon!("file-plus"),
                     copy::text("File", "文件", "檔案"),
-                    false,
+                    copy::text(
+                        "Sent as it is, up to 8 MB",
+                        "原样发送，最大 8 MB",
+                        "原樣傳送，最大 8 MB",
+                    ),
                     move || {
                         picker.set(None);
                         (host.on_attach_file)();
                     },
                 )),
         ))
+}
+
+/// Where the messages will be: a greeting, and a few ways to begin. The ways
+/// to begin give way to the keyboard, the greeting stays.
+fn canvas(prompt: Signal<String>, input: ElementRef) -> impl IntoElement {
+    view()
+        .flex_1()
+        .min_h(px(0.0))
+        .overflow_hidden()
+        .justify_center()
+        .px(px(theme::SPACING_XL))
+        .gap(px(theme::SPACING_SM))
+        .child(
+            view()
+                .size(px(44.0))
+                .mb(px(theme::SPACING_SM))
+                .rounded(px(theme::RADIUS_BUTTON))
+                .bg(theme::fill)
+                .items_center()
+                .justify_center()
+                .child(brand::mark(22.0)),
+        )
+        .child(
+            text(copy::text(
+                "What are we working on?",
+                "这次要做点什么？",
+                "這次要做點什麼？",
+            ))
+            .text_size(px(theme::font_greeting()))
+            .font_weight(FontWeight::BOLD)
+            .text_color(theme::foreground),
+        )
+        .child(
+            text(copy::text(
+                "Describe the task, or begin with one of these.",
+                "描述要做的事，或者从下面选一个开始。",
+                "描述要做的事，或者從下面選一個開始。",
+            ))
+            .text_size(px(theme::font_detail()))
+            .line_height(theme::line_height_for(theme::font_detail()))
+            .text_color(theme::text_secondary),
+        )
+        .child(when(
+            move || keyboard_height().0 == 0.0,
+            move || {
+                view()
+                    .w_full()
+                    .pt(px(theme::SPACING_LG))
+                    .gap(px(theme::SPACING_SM))
+                    .children(starters().map(|starter| {
+                        let Starter {
+                            icon,
+                            title,
+                            caption,
+                            prompt: begin,
+                        } = starter;
+                        surface::card().child(
+                            surface::row_captioned(icon, title, caption, move || {
+                                prompt.set(begin.to_owned());
+                                input.focus();
+                            })
+                            .min_h(px(60.0)),
+                        )
+                    }))
+            },
+        ))
+}
+
+/// The mark a chosen row of a sheet wears at its end.
+fn chosen_mark(chosen: impl Fn() -> bool + 'static) -> impl IntoElement {
+    when(chosen, || {
+        svg(icon!("check"))
+            .size(px(theme::ICON_MD))
+            .flex_shrink_0()
+            .text_color(theme::foreground)
+    })
 }
 
 fn choice_sheet(
@@ -417,143 +572,53 @@ fn choice_sheet(
             .min_h(px(0.0))
             .child(chrome::sheet_header(title, move || picker.set(None)))
             .child(
-                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
-                    view()
-                        .w_full()
-                        .px(px(theme::SPACING_MD))
-                        .pt(px(theme::SPACING_SM))
-                        .pb_safe_area_plus(px(theme::SPACING_LG))
-                        .child(content),
-                ),
+                scroll()
+                    .flex_shrink(1.0)
+                    .min_h(px(0.0))
+                    .child(chrome::sheet_body().child(content)),
             ),
     )
 }
 
-/// A vertical list of choices, each a row; the chosen one is marked.
+/// The rows of one choice: a title, a line of detail, and a mark on the one
+/// that is chosen.
 fn choice_list<T>(
     items: Signal<Vec<T>>,
-    selected: Signal<Option<String>>,
+    icon: ImageSrc,
     id: impl Fn(&T) -> String + Clone + 'static,
     text_of: impl Fn(&T) -> (String, String) + Clone + 'static,
-    on_select: impl Fn() + Copy + 'static,
+    chosen: impl Fn(&str) -> bool + Clone + 'static,
+    on_select: impl Fn(&str) + Clone + 'static,
 ) -> impl IntoElement
 where
     T: Clone + PartialEq + 'static,
 {
     let key_id = id.clone();
-    view()
-        .flex_col()
-        .w_full()
-        .gap(px(theme::SPACING_XS))
-        .child(each(
-            move || items.get(),
-            move |item| key_id(item),
-            move |item, _| choice_row(item, selected, id.clone(), text_of.clone(), on_select),
-        ))
-}
-
-fn choice_row<T>(
-    item: ReadSignal<T>,
-    selected: Signal<Option<String>>,
-    id: impl Fn(&T) -> String + 'static,
-    text_of: impl Fn(&T) -> (String, String) + 'static,
-    on_select: impl Fn() + 'static,
-) -> impl IntoElement
-where
-    T: Clone + PartialEq + 'static,
-{
-    let value = computed(move || item.with(|item| text_of(item)));
-    let key = computed(move || item.with(|item| id(item)));
-    button()
-        .w_full()
-        .min_h(px(48.0))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(move || {
-            if selected.with(|selected| selected.as_deref() == Some(key.get().as_str())) {
-                theme::foreground()
-            } else {
-                theme::border_subtle()
-            }
-        })
-        .bg(move || {
-            if selected.with(|selected| selected.as_deref() == Some(key.get().as_str())) {
-                theme::background_dim()
-            } else {
-                theme::background_card()
-            }
-        })
-        .px(px(theme::SPACING_MD))
-        .py(px(theme::SPACING_XS))
-        .flex_col()
-        .items_start()
-        .on_press(move || {
-            selected.set(Some(key.get_untracked()));
-            on_select();
-        })
-        .child(
-            text(move || value.get().0)
-                .truncate()
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::foreground),
-        )
-        .child(
-            text(move || value.get().1)
-                .truncate()
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-}
-
-fn new_session_attachments(
-    attachments: Signal<Vec<AttachmentItem>>,
-    on_remove: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    view()
-        .w_full()
-        .flex_col()
-        .gap(px(theme::SPACING_XS))
-        .child(when(
-            move || !attachments.with(|items| items.is_empty()),
-            move || {
-                let on_remove = on_remove.clone();
-                view()
-                    .w_full()
-                    .flex_row()
-                    .flex_wrap()
-                    .gap(px(theme::SPACING_XS))
-                    .child(each(
-                        move || attachments.get(),
-                        |attachment| attachment.id.clone(),
-                        move |attachment, _| {
-                            let on_remove = on_remove.clone();
-                            view()
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::SPACING_XS))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::background_dim)
-                                .px(px(theme::SPACING_XS))
-                                .py(px(2.0))
-                                .child(
-                                    text(move || attachment.with(|item| item.label.clone()))
-                                        .text_size(px(theme::font_micro()))
-                                        .text_color(theme::text_secondary),
-                                )
-                                .child(
-                                    button()
-                                        .on_press(move || on_remove(&attachment.get_untracked().id))
-                                        .hit_slop(px(8.0))
-                                        .child(
-                                            text("×")
-                                                .text_size(px(theme::font_caption()))
-                                                .text_color(theme::text_muted),
-                                        ),
-                                )
-                        },
-                    ))
-            },
-        ))
+    view().flex_col().w_full().child(each(
+        move || items.get(),
+        move |item| key_id(item),
+        move |item, _| {
+            let value = {
+                let text_of = text_of.clone();
+                computed(move || item.with(|item| text_of(item)))
+            };
+            let key = {
+                let id = id.clone();
+                computed(move || item.with(|item| id(item)))
+            };
+            let chosen = chosen.clone();
+            let on_select = on_select.clone();
+            surface::row_captioned(
+                icon.clone(),
+                move || SharedString::from(value.get().0),
+                move || SharedString::from(value.get().1),
+                move || on_select(&key.get_untracked()),
+            )
+            .border_b_1()
+            .border_b_color(theme::hairline)
+            .child(chosen_mark(move || chosen(&key.get())))
+        },
+    ))
 }
 
 #[derive(Clone)]
@@ -570,6 +635,8 @@ pub struct ProjectBrowserHost {
 
 type ProjectOpen = Rc<dyn Fn(&str)>;
 
+/// The directory browser a new project is opened from: where it stands, the
+/// way up, the directories below, and the action that opens the one shown.
 pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
     let ProjectBrowserHost {
         open,
@@ -581,127 +648,145 @@ pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
         on_browse,
         on_open,
     } = host;
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(next, _) = event {
-                open.set(*next);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .max_h(px(520.0))
-                .gap(px(theme::SPACING_XS))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(move || {
-                        current.get().unwrap_or_else(|| {
-                            copy::text("New project", "新建项目", "新增專案").to_owned()
-                        })
-                    })
-                    .truncate()
-                    .text_size(px(theme::font_heading()))
-                    .font_weight(FontWeight::SEMIBOLD)
-                    .text_color(theme::foreground),
-                )
-                .child({
-                    let on_browse = on_browse.clone();
-                    when(
-                        move || parent.get().is_some(),
-                        move || {
-                            let on_browse = on_browse.clone();
-                            action::secondary(
-                                copy::text("Parent folder", "上级文件夹", "上層資料夾"),
-                                icon(include_str!("../../assets/icons/chevron-left.svg")),
-                                false,
-                                move || {
-                                    if let Some(path) = parent.get_untracked() {
-                                        on_browse(Some(&path));
-                                    }
-                                },
-                            )
-                            .w_full()
-                            .disabled(move || busy.get())
-                        },
-                    )
-                })
-                .child({
-                    let browse_rows = on_browse.clone();
-                    scroll()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .child(view().w_full().child(each(
-                            move || dirs.get(),
-                            |directory| directory.path.clone(),
-                            move |directory, _| {
-                                let on_browse = browse_rows.clone();
-                                button()
-                                    .on_press(move || {
-                                        on_browse(Some(&directory.get_untracked().path))
-                                    })
-                                    .disabled(move || busy.get())
-                                    .w_full()
-                                    .min_h(px(40.0))
-                                    .px(px(theme::SPACING_SM))
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(theme::SPACING_XS))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::background_dim)
-                                    .child(
-                                        svg(icon(include_str!("../../assets/icons/folder.svg")))
-                                            .w(px(theme::ICON_SM))
-                                            .h(px(theme::ICON_SM))
-                                            .text_color(theme::text_muted),
-                                    )
-                                    .child(
-                                        text(move || directory.get().name)
-                                            .flex_1()
-                                            .truncate()
-                                            .text_size(px(theme::font_body()))
-                                            .text_color(theme::foreground),
-                                    )
-                            },
-                        )))
-                })
-                .child(when(
-                    move || busy.get(),
-                    || {
-                        text(copy::text("Loading…", "正在加载…", "正在載入…"))
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::text_muted)
-                    },
-                ))
-                .child(when(
-                    move || error.with(Option::is_some),
-                    move || {
-                        text(move || error.get().unwrap_or_default())
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::accent_red)
-                    },
-                ))
-                .child({
-                    action::primary(
-                        copy::text("Open project", "打开项目", "開啟專案"),
-                        icon!("folder-open"),
-                        move || {
-                            if let Some(path) = current.get_untracked() {
-                                on_open(&path);
-                            }
-                        },
-                    )
+    chrome::bottom_sheet(
+        move || open.get(),
+        move || open.set(false),
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.8))
+            .min_h(px(0.0))
+            .child(chrome::sheet_header(
+                copy::text("New project", "新建项目", "新增專案"),
+                move || open.set(false),
+            ))
+            .child(
+                view()
                     .w_full()
-                    .disabled(move || busy.get() || current.with(Option::is_none))
-                }),
-        )
-}
-
-/// An SVG from this crate's assets, drawn inline.
-fn icon(markup: &'static str) -> ImageSrc {
-    ImageSrc::svg_markup(markup)
+                    .px(px(theme::SPACING_MD))
+                    .pb(px(theme::SPACING_MD))
+                    .child(
+                        surface::card().child(
+                            view()
+                                .w_full()
+                                .min_h(px(theme::ROW_HEIGHT))
+                                .px(px(surface::ROW_INSET))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_MD))
+                                .child(surface::tile(icon!("folder-open")))
+                                .child(
+                                    text(move || {
+                                        current.get().unwrap_or_else(|| {
+                                            copy::text(
+                                                "Choose a folder",
+                                                "选择一个文件夹",
+                                                "選擇一個資料夾",
+                                            )
+                                            .to_owned()
+                                        })
+                                    })
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_detail()))
+                                    .font_family("monospace")
+                                    .text_color(theme::foreground),
+                                )
+                                .child({
+                                    let on_browse = on_browse.clone();
+                                    when(
+                                        move || parent.with(Option::is_some),
+                                        move || {
+                                            let on_browse = on_browse.clone();
+                                            surface::ghost_button(
+                                                icon!("arrow-to-top"),
+                                                copy::text(
+                                                    "Parent folder",
+                                                    "上级文件夹",
+                                                    "上層資料夾",
+                                                ),
+                                                move || {
+                                                    if let Some(path) = parent.get_untracked() {
+                                                        on_browse(Some(&path));
+                                                    }
+                                                },
+                                            )
+                                            .disabled(move || busy.get())
+                                        },
+                                    )
+                                }),
+                        ),
+                    ),
+            )
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    view()
+                        .w_full()
+                        .px(px(theme::SPACING_MD))
+                        .child(when(
+                            move || !dirs.with(Vec::is_empty),
+                            {
+                                let on_browse = on_browse.clone();
+                                move || {
+                                    let on_browse = on_browse.clone();
+                                    surface::card().child(each(
+                                        move || dirs.get(),
+                                        |directory| directory.path.clone(),
+                                        move |directory, _| {
+                                            let on_browse = on_browse.clone();
+                                            surface::row(
+                                                icon!("folder"),
+                                                move || {
+                                                    SharedString::from(
+                                                        directory.with(|entry| entry.name.clone()),
+                                                    )
+                                                },
+                                                move || {
+                                                    on_browse(Some(
+                                                        &directory
+                                                            .with_untracked(|entry| entry.path.clone()),
+                                                    ))
+                                                },
+                                            )
+                                            .border_b_1()
+                                            .border_b_color(theme::hairline)
+                                            .disabled(move || busy.get())
+                                            .child(surface::chevron())
+                                        },
+                                    ))
+                                }
+                            },
+                        ))
+                        .child(when(
+                            move || busy.get(),
+                            || {
+                                text(copy::text("Loading…", "正在加载…", "正在載入…"))
+                                    .p(px(theme::SPACING_SM))
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::text_muted)
+                            },
+                        ))
+                        .child(when(
+                            move || error.with(Option::is_some),
+                            move || {
+                                text(move || error.get().unwrap_or_default())
+                                    .p(px(theme::SPACING_SM))
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::accent_red)
+                            },
+                        )),
+                ),
+            )
+            .child(
+                chrome::sheet_body().pt(px(theme::SPACING_MD)).child(
+                    action::solid(copy::text("Open project", "打开项目", "開啟專案"), move || {
+                        if let Some(path) = current.get_untracked() {
+                            on_open(&path);
+                        }
+                    })
+                    .w_full()
+                    .disabled(move || busy.get() || current.with(Option::is_none)),
+                ),
+            ),
+    )
 }

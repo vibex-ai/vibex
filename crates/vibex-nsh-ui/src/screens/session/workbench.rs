@@ -1,13 +1,14 @@
-use nsh_base::button;
+//! The workbench: the page beside the conversation that holds the session's
+//! workspace. Files, changes and the terminal are three surfaces of one
+//! place, so they share one head and are switched by one control.
+
 use nsh_core::prelude::*;
 
 use super::{Pager, SessionHost, ShellPage, workbench_surfaces};
-use crate::{copy, theme, ui::action};
+use crate::{copy, theme, ui::surface};
 
-const HEADER_HEIGHT: f32 = 44.0;
-const TAB_HEIGHT: f32 = 32.0;
-const TAB_RADIUS: f32 = 5.0;
-const TAB_GAP: f32 = 2.0;
+/// The workbench's head, as tall as the conversation's.
+const HEADER_HEIGHT: f32 = theme::HEADER_HEIGHT;
 
 #[derive(Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum WorkbenchTab {
@@ -89,127 +90,84 @@ pub(super) fn workbench(
         .flex_1()
         .min_h(px(0.0))
         .pt_safe_area()
-        .bg(theme::sidebar_bg)
+        .bg(theme::background)
+        .test_id("workbench-page")
+        // The head: the way back to the conversation, and the three surfaces
+        // of the session's workspace as one control.
         .child(
             view()
                 .h(px(HEADER_HEIGHT))
                 .flex_shrink_0()
                 .flex_row()
                 .items_center()
-                .gap(px(TAB_GAP))
-                .pl(px(theme::SPACING_XS))
-                .pr(px(TAB_GAP))
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
+                .gap(px(theme::SPACING_SM))
+                .px(px(theme::SPACING_MD))
+                .child(surface::round_button(
+                    icon!("chevron-left"),
+                    copy::text("Close", "关闭", "關閉"),
+                    move || pager.close(),
+                ))
                 .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex_row()
-                        .items_center()
-                        .overflow_hidden()
-                        .gap(px(TAB_GAP))
-                        .children(
-                            [
-                                WorkbenchTab::Files,
-                                WorkbenchTab::Changes,
-                                WorkbenchTab::Terminal,
-                            ]
-                            .map(|candidate| {
-                                button()
-                                    .h(px(TAB_HEIGHT))
-                                    .px(px(theme::SPACING_SM))
-                                    .min_w(px(0.0))
-                                    .flex_row()
-                                    .gap(px(theme::SPACING_XS))
-                                    .rounded(px(TAB_RADIUS))
-                                    .items_center()
-                                    .justify_center()
-                                    .active(|style| style.bg(theme::row_pressed_bg()))
-                                    .style_when(
-                                        move || tab.get() == candidate,
-                                        |style| style.bg(theme::rail_tab_bg()),
+                    surface::segment_track().flex_1().min_w(px(0.0)).children(
+                        [
+                            WorkbenchTab::Files,
+                            WorkbenchTab::Changes,
+                            WorkbenchTab::Terminal,
+                        ]
+                        .map(|candidate| {
+                            surface::segment(
+                                candidate.label(),
+                                move || tab.get() == candidate,
+                                move || {
+                                    dismiss_keyboard();
+                                    tab.set(candidate);
+                                },
+                            )
+                            // What the branch has to pull and to push shows on
+                            // the tab, so it is seen from the other two.
+                            .child(when(
+                                move || candidate == WorkbenchTab::Changes && counts.get().0 > 0,
+                                move || {
+                                    sync_badge(format!("↓{}", counts.get().0), theme::accent_blue)
+                                },
+                            ))
+                            .child(when(
+                                move || candidate == WorkbenchTab::Changes && counts.get().1 > 0,
+                                move || {
+                                    sync_badge(
+                                        format!("↑{}", counts.get().1),
+                                        theme::accent_success,
                                     )
-                                    .accessibility_label(candidate.label())
-                                    .on_press(move || {
-                                        dismiss_keyboard();
-                                        tab.set(candidate);
-                                    })
-                                    .child(
-                                        text(candidate.label())
-                                            .truncate()
-                                            .text_size(px(theme::font_body()))
-                                            .text_color(move || {
-                                                if tab.get() == candidate {
-                                                    theme::foreground()
-                                                } else {
-                                                    theme::text_muted()
-                                                }
-                                            }),
-                                    )
-                                    .child(when(
-                                        move || {
-                                            candidate == WorkbenchTab::Changes && counts.get().0 > 0
-                                        },
-                                        move || {
-                                            sync_badge(
-                                                format!("↓ {}", counts.get().0),
-                                                theme::accent_blue,
-                                            )
-                                        },
-                                    ))
-                                    .child(when(
-                                        move || {
-                                            candidate == WorkbenchTab::Changes && counts.get().1 > 0
-                                        },
-                                        move || {
-                                            sync_badge(
-                                                format!("↑ {}", counts.get().1),
-                                                theme::accent_success,
-                                            )
-                                        },
-                                    ))
-                            }),
-                        ),
-                )
-                .child(
-                    action::icon_button(
-                        icon!("x"),
-                        copy::text("Close", "关闭", "關閉"),
-                        move || pager.close(),
-                    )
-                    .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                    .flex_shrink_0(),
+                                },
+                            ))
+                        }),
+                    ),
                 ),
         )
         .child(when(
             move || host.active.with(Option::is_none),
             || {
-                super::empty_hint(copy::text(
-                    "Select a session first",
-                    "请先选择会话",
-                    "請先選擇工作階段",
-                ))
+                surface::empty_state(
+                    icon!("panel-right"),
+                    copy::text("Select a session first", "请先选择会话", "請先選擇工作階段"),
+                    copy::text(
+                        "Files, changes and the terminal belong to a session's workspace.",
+                        "文件、变更与终端都属于某个会话的工作区。",
+                        "檔案、變更與終端機都屬於某個工作階段的工作區。",
+                    ),
+                )
             },
         ))
         .child(workbench_surfaces(host, tab, terminal_find))
 }
 
 fn sync_badge(label: String, color: fn() -> Hsla) -> impl IntoElement {
-    view()
-        .h(px(18.0))
-        .min_w(px(24.0))
+    text(label)
         .flex_shrink_0()
-        .items_center()
-        .justify_center()
-        .rounded(px(3.0))
-        .bg(move || color().opacity(0.12))
-        .child(
-            text(label)
-                .font_family("monospace")
-                .text_size(px(theme::font_micro()))
-                .text_color(color),
-        )
+        .font_family("monospace")
+        .text_size(px(theme::font_hint()))
+        .font_weight(FontWeight::MEDIUM)
+        .text_color(color)
 }
 
 pub(super) fn tab_panel(

@@ -10,7 +10,10 @@ use nsh_core::{
 use super::{Pager, SessionState, agent_icon, icon};
 use crate::{
     copy, theme,
-    ui::activity::{ActivityClock, activity_ring},
+    ui::{
+        activity::{ActivityClock, activity_ring},
+        surface,
+    },
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
@@ -66,6 +69,8 @@ impl SidebarRowView {
 
 type Rows = Rc<dyn Fn(&str) -> Vec<SidebarRowView>>;
 type RowAction = Rc<dyn Fn(&SidebarRowView)>;
+/// Raises a row's menu, with how far down the page the row was held.
+type RowMenu = Rc<dyn Fn(&SidebarRowView, f32)>;
 type BatchScope = Rc<dyn Fn(&SidebarRowView) -> Vec<String>>;
 type MoveRow = Rc<dyn Fn(&SidebarRowView, f32)>;
 type MoveRowStep = Rc<dyn Fn(&SidebarRowView, bool)>;
@@ -107,7 +112,7 @@ impl SidebarTree {
 pub(super) struct TreeActions {
     pub toggle: RowAction,
     pub select: RowAction,
-    pub menu: RowAction,
+    pub menu: RowMenu,
     pub move_row: MoveRow,
     pub new_session: RowAction,
     pub batch_scope: BatchScope,
@@ -241,10 +246,10 @@ fn row_item(
     let on_menu = {
         let menu = actions.menu.clone();
         let row = row.clone();
-        move || {
+        move |event: &PressEvent| {
             if !state.select_mode.get_untracked() {
                 crate::motion::tick();
-                menu(&row);
+                menu(&row, event.page_position.y.0);
             }
         }
     };
@@ -371,7 +376,7 @@ fn row_item(
                             .disabled(move || ids.with(Vec::is_empty))
                             .disabled_style(|style| style.opacity(0.4))
                             .on_press(move || toggle_batch(state.selected, &ids.get_untracked()))
-                            .child(selection_mark(move || {
+                            .child(surface::check_mark(move || {
                                 let count = selected_count();
                                 (count > 0).then(|| count == ids.with(Vec::len))
                             }))
@@ -429,7 +434,7 @@ fn row_item(
                                             .justify_center()
                                             .child(
                                                 when(selection, move || {
-                                                    selection_mark(move || {
+                                                    surface::check_mark(move || {
                                                         checked.get().then_some(true)
                                                     })
                                                 })
@@ -474,10 +479,10 @@ fn row_item(
                                                 } else {
                                                     theme::font_sidebar_row()
                                                 }))
-                                                .font_weight(if is_empty {
-                                                    FontWeight::NORMAL
-                                                } else {
+                                                .font_weight(if is_container {
                                                     FontWeight::MEDIUM
+                                                } else {
+                                                    FontWeight::NORMAL
                                                 })
                                                 .text_color(if is_empty {
                                                     theme::sidebar_text_muted
@@ -601,49 +606,6 @@ pub(super) fn toggle_batch(selection: Signal<Vec<String>>, ids: &[String]) {
             }
         }
     });
-}
-
-/// The mark a row wears while sessions are being selected: an empty ring, a
-/// filled one with a check, or with a dash for a scope only partly selected.
-fn selection_mark(mark: impl Fn() -> Option<bool> + Copy + 'static) -> impl IntoElement {
-    view()
-        .size(px(theme::SIDEBAR_SELECTION_MARK))
-        .rounded_full()
-        .border(px(1.5))
-        .border_color(move || {
-            if mark().is_some() {
-                theme::primary()
-            } else {
-                theme::sidebar_text_muted()
-            }
-        })
-        .bg(move || {
-            if mark().is_some() {
-                theme::primary()
-            } else {
-                theme::primary().opacity(0.0)
-            }
-        })
-        .items_center()
-        .justify_center()
-        .child(when(
-            move || mark() == Some(true),
-            || {
-                svg(icon!("check"))
-                    .size(px(13.0))
-                    .text_color(theme::primary_foreground)
-            },
-        ))
-        .child(when(
-            move || mark() == Some(false),
-            || {
-                view()
-                    .w(px(9.0))
-                    .h(px(2.0))
-                    .rounded_full()
-                    .bg(theme::primary_foreground)
-            },
-        ))
 }
 
 /// What trails a row's title: how the session stands, when it was last

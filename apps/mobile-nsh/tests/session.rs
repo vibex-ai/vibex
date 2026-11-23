@@ -1,7 +1,7 @@
 //! The session shell's flows, rendered headlessly through the real engine.
 //!
-//! The shell is mounted with a fixture host here: the drawer opens, a session
-//! opens its transcript, and the composer sends. The app's own wiring to the
+//! The shell is mounted with a fixture host here: the sessions page opens, a
+//! session opens its transcript, and the composer sends. The app's own wiring to the
 //! remote backend is tested where that backend is available; these tests keep
 //! the screen's behavior fixed as it grows.
 
@@ -33,6 +33,19 @@ use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
 const COMPOSER: &str = "text:/ commands @files $skills";
+/// The open session's own menu, on the conversation's header. Its name
+/// carries the session's title after it.
+const CONVERSATION_MENU: &str = "role:button[/^Conversation menu/]";
+/// The control that starts a session, on the sessions page. The conversation's
+/// header carries one of the same name, so the page says which.
+const NEW_SESSION: &str = "id:sessions-page >> role:button[New session]";
+
+/// Opens the find bar the way a reader does: from the open session's menu.
+fn find_in_conversation(app: &mut Headless) {
+    app.press(CONVERSATION_MENU).unwrap();
+    app.press("role:button[Find in conversation]").unwrap();
+    app.wait_for("text:Find in conversation").unwrap();
+}
 
 fn entry(id: &str, kind: EntryKind, title: &str, body: &str) -> TimelineEntry {
     TimelineEntry {
@@ -1343,8 +1356,14 @@ fn the_composer_opens_the_runtime_choices() {
     assert!(app.screen().shows("Manual"));
     assert!(app.screen().shows("Queued · 1"));
     assert!(app.screen().shows("Hold this (+1)"));
-    assert!(app.screen().shows("↑"));
-    assert!(app.screen().shows("↓"));
+    for step in ["Move up", "Move down", "Send now", "Remove"] {
+        assert!(
+            app.screen()
+                .matches(&format!("role:button[{step}]"))
+                .unwrap(),
+            "a queued prompt offers {step}"
+        );
+    }
     app.press("Claude 4").unwrap();
     app.wait_for("Agent settings").unwrap();
     assert!(!app.screen().shows("GPT-5"));
@@ -1353,7 +1372,9 @@ fn the_composer_opens_the_runtime_choices() {
     app.press("role:button[Close]").unwrap();
     app.wait_for_gone("GPT-5", std::time::Duration::from_secs(3))
         .unwrap();
-    app.press("role:button[Reasoning]").unwrap();
+    // The Agent's own options open the same sheet on their panel.
+    app.press("role:button[Agent options]").unwrap();
+    app.wait_for("role:button[Reasoning]").unwrap();
     app.wait_for("Default").unwrap();
     app.press("Default").unwrap();
     app.wait_for_gone("Default", std::time::Duration::from_secs(3))
@@ -1364,7 +1385,7 @@ fn the_composer_opens_the_runtime_choices() {
 fn the_attachment_sheet_explains_the_three_sources_and_keeps_the_draft() {
     let mut app = start();
     app.type_text(COMPOSER, "Keep this draft").unwrap();
-    app.press("role:button[Attach a file]").unwrap();
+    app.press("role:button[Add to message]").unwrap();
     app.wait_for("role:button[Photo]").unwrap();
     assert!(app.screen().shows("Scaled down before it is sent"));
     app.wait_for("role:button[Camera]").unwrap();
@@ -1534,7 +1555,7 @@ fn searching_reveals_a_collapsed_activity_without_expanding_its_siblings() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Here is the answer.").unwrap();
     assert!(!app.screen().shows("Read 2 files"));
-    app.press("role:button[Find in conversation]").unwrap();
+    find_in_conversation(&mut app);
     app.type_text("text:Find in conversation", "src/model.rs")
         .unwrap();
     app.wait_for("1/1").unwrap();
@@ -1571,7 +1592,7 @@ fn a_match_in_tool_output_opens_only_the_matching_detail() {
     config.viewport = nsh_core::geometry::Size::new(px(320.0), px(860.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Here is the answer.").unwrap();
-    app.press("role:button[Find in conversation]").unwrap();
+    find_in_conversation(&mut app);
     app.type_text("text:Find in conversation", "Fetched from the worktree")
         .unwrap();
     app.wait_for("1/2").unwrap();
@@ -1589,7 +1610,7 @@ fn a_match_in_tool_output_opens_only_the_matching_detail() {
 #[test]
 fn a_photo_alone_can_be_sent() {
     let mut app = start();
-    app.press("role:button[Attach a file]").unwrap();
+    app.press("role:button[Add to message]").unwrap();
     app.press("role:button[Photo]").unwrap();
     app.press("role:button[Send]").unwrap();
     app.wait_for("sent an attachment").unwrap();
@@ -1804,6 +1825,7 @@ fn the_drawer_selects_sessions_for_a_batch() {
 fn a_message_can_be_scheduled() {
     let mut app = start();
     app.type_text(COMPOSER, "Later").unwrap();
+    app.press("role:button[Add to message]").unwrap();
     app.press("role:button[Schedule message]").unwrap();
     app.wait_for("In 5 minutes").unwrap();
     app.press("In 5 minutes").unwrap();
@@ -1813,7 +1835,7 @@ fn a_message_can_be_scheduled() {
 #[test]
 fn the_conversation_can_be_searched() {
     let mut app = start();
-    app.press("role:button[Find in conversation]").unwrap();
+    find_in_conversation(&mut app);
     app.type_text("text:Find in conversation", "green").unwrap();
     app.wait_for("1/1").unwrap();
     app.press("role:button[Next match]").unwrap();
@@ -1909,10 +1931,40 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     app.type_text("text:Search sessions", "zzz").unwrap();
     app.wait_for_gone("Fix the tests", std::time::Duration::from_secs(5))
         .unwrap();
-    app.press("role:button[New session]").unwrap();
+    app.press(NEW_SESSION).unwrap();
+    // The session is written on the conversation page, which the sessions
+    // page gives way to.
     app.wait_for("Claude · Sonnet").unwrap();
+    app.wait_for_gone(
+        "role:button[Back to session]",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    assert!(app.screen().shows("What are we working on?"));
     app.press("role:button[Create]").unwrap();
     app.wait_for("Created session").unwrap();
+}
+
+#[test]
+fn a_session_is_written_under_the_conversations_own_header() {
+    let mut app = start();
+    app.press("id:conversation-page >> role:button[New session]")
+        .unwrap();
+    app.wait_for("role:button[Choose workspace]").unwrap();
+    // The transcript gives its place to the blank page, and comes back when
+    // the session is given up.
+    assert!(!app.screen().shows("Morning. The build is green."));
+    // A way to begin writes its message into the prompt card.
+    app.press("Tour this project").unwrap();
+    app.wait_for("text:/^Give me a tour of this project/")
+        .unwrap();
+    app.press("role:button[Cancel]").unwrap();
+    app.wait_for("Morning. The build is green.").unwrap();
+    assert!(
+        !app.screen()
+            .matches("role:button[Choose workspace]")
+            .unwrap()
+    );
 }
 
 /// The shell with its terminal open; it writes a line into the terminal after
@@ -2021,7 +2073,8 @@ fn the_file_browser_searches_content() {
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
     app.wait_for("README.md").unwrap();
-    app.press("Name").unwrap();
+    app.press("role:button[Content]").unwrap();
+    app.wait_for("role:button[Case sensitive]").unwrap();
     app.type_text("text:Search files", "hello").unwrap();
     app.wait_for("main.rs:3").unwrap();
     app.press("main.rs:3").unwrap();
@@ -2141,7 +2194,7 @@ fn a_history_row_opens_the_commit_detail() {
 #[test]
 fn a_photo_can_be_attached_and_removed() {
     let mut app = start();
-    app.press("role:button[Attach a file]").unwrap();
+    app.press("role:button[Add to message]").unwrap();
     app.press("role:button[Photo]").unwrap();
     app.wait_for("photo.jpg").unwrap();
     app.press("photo.jpg").unwrap();
@@ -2199,9 +2252,10 @@ fn a_session_can_be_renamed_from_the_drawer() {
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
     app.long_press("role:button[Fix the tests]").unwrap();
-    app.wait_for("role:button[Rename]").unwrap();
-    app.type_text("text:Fix the tests", " v2").unwrap();
     app.press("role:button[Rename]").unwrap();
+    app.wait_for("Rename session").unwrap();
+    app.type_text("text:Fix the tests", " v2").unwrap();
+    app.press("role:button[Save]").unwrap();
     app.wait_for("Fix the tests v2").unwrap();
 }
 
@@ -2302,13 +2356,13 @@ fn vertical_drag_keeps_the_conversation_open() {
 }
 
 #[test]
-fn back_closes_the_drawer_sheet_before_the_drawer() {
+fn back_closes_the_drawer_menu_before_the_drawer() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
     app.long_press("Projects").unwrap();
-    app.wait_for("Sidebar").unwrap();
+    app.wait_for("Select or reorder").unwrap();
     app.back().unwrap();
-    app.wait_for_gone("Sidebar", std::time::Duration::from_secs(3))
+    app.wait_for_gone("Select or reorder", std::time::Duration::from_secs(3))
         .unwrap();
     app.wait_for("role:button[Back to session]").unwrap();
     app.back().unwrap();
@@ -2365,8 +2419,8 @@ fn workspace_tabs_keep_the_preview_and_the_conversation_draft() {
     app.wait_for("Hello").unwrap();
     app.press("role:button[Changes]").unwrap();
     app.wait_for("src/main.rs").unwrap();
-    app.wait_for("↓ 1").unwrap();
-    app.wait_for("↑ 2").unwrap();
+    app.wait_for("↓1").unwrap();
+    app.wait_for("↑2").unwrap();
     app.press("role:button[Files]").unwrap();
     app.wait_for("Hello").unwrap();
     app.back().unwrap();
@@ -2407,7 +2461,7 @@ fn terminal_tabs_switch_and_can_close_a_terminal() {
 fn a_new_worktree_session_can_be_started_from_the_creation_page() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[New session]").unwrap();
+    app.press(NEW_SESSION).unwrap();
     app.wait_for("role:button[Choose workspace]").unwrap();
     app.press("role:button[Choose workspace]").unwrap();
     app.press("New worktree").unwrap();
@@ -2418,10 +2472,10 @@ fn a_new_worktree_session_can_be_started_from_the_creation_page() {
 }
 
 #[test]
-fn backing_out_of_creation_returns_to_the_session_drawer() {
+fn backing_out_of_creation_returns_to_the_open_conversation() {
     let mut app = start();
     app.press("role:button[Sessions]").unwrap();
-    app.press("role:button[New session]").unwrap();
+    app.press(NEW_SESSION).unwrap();
     app.wait_for("role:button[Choose workspace]").unwrap();
     app.back().unwrap();
     app.wait_for_gone(
@@ -2429,7 +2483,12 @@ fn backing_out_of_creation_returns_to_the_session_drawer() {
         std::time::Duration::from_secs(3),
     )
     .unwrap();
-    app.wait_for("role:button[Back to session]").unwrap();
+    app.wait_for("Morning. The build is green.").unwrap();
+    assert!(
+        !app.screen()
+            .matches("role:button[Back to session]")
+            .unwrap()
+    );
 }
 
 #[component]
@@ -2451,8 +2510,7 @@ fn a_long_title_does_not_push_header_controls_out_of_reach() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("role:button[Back to session]").unwrap();
     app.press("role:button[Back to session]").unwrap();
-    app.press("role:button[Find in conversation]").unwrap();
-    app.wait_for("text:Find in conversation").unwrap();
+    find_in_conversation(&mut app);
     app.press("role:button[Files, Git, and terminal]").unwrap();
     app.wait_for("role:button[Terminal]").unwrap();
 }

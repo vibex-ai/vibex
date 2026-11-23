@@ -1,10 +1,11 @@
 //! The three pages of the session workspace, and the gesture between them.
 //!
-//! The conversation is the page in the middle. The sessions page is a drawer
-//! on its left: it never covers the conversation, it pushes it aside, and the
-//! conversation stands beside it as a card with a strip left in reach. The
-//! workbench comes in from the right, as wide as the screen, over a scrim that
-//! dims the conversation as far as the page has come.
+//! The conversation is the page in the middle. The sessions page comes in
+//! from the left and the workbench from the right, each as wide as the screen:
+//! the tree on the left is three levels deep, and a row needs the whole width
+//! to show its level and still have room for a title. The conversation slides
+//! a little with whichever page is coming and dims as far as that page has
+//! come, so the three read as one strip at two depths.
 //!
 //! A horizontal drag anywhere on the workspace moves the pages natively: the
 //! platform writes the finger's travel into one animated value and the pages'
@@ -14,9 +15,9 @@
 
 use std::{cell::Cell, rc::Rc};
 
-use nsh_core::{AccessibilityRole, TransformKind, element::Timing, prelude::*};
+use nsh_core::{element::Timing, prelude::*};
 
-use crate::{copy, motion, theme};
+use crate::{motion, theme};
 
 /// The page the workspace rests on.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -31,8 +32,7 @@ pub enum ShellPage {
 }
 
 impl ShellPage {
-    /// Where the drag value stands with this page fully in, in units of the
-    /// page's own travel ([`Pager::travel`]).
+    /// Where the drag value stands, in pages, with this page fully in.
     const fn open_offset(self) -> f32 {
         match self {
             ShellPage::Home => 0.0,
@@ -46,13 +46,11 @@ impl ShellPage {
 /// them.
 #[derive(Clone, Copy)]
 pub struct Pager {
-    /// The finger's travel in points: the drawer's width with the sessions
-    /// page fully in, minus one screen width with the workbench.
+    /// The finger's travel in points: one screen width with the sessions page
+    /// fully in, minus one with the workbench.
     drag: AnimatedValue,
     /// The screen's width, as an animated value the transforms scale by.
     width: AnimatedValue,
-    /// The sessions drawer's width, likewise.
-    drawer: AnimatedValue,
     /// Which side page a gesture may reveal: a drag that started toward one
     /// never pulls the other out when it crosses back over the middle.
     gate_sessions: AnimatedValue,
@@ -92,7 +90,6 @@ impl Pager {
         let pager = Self {
             drag: animated_value(0.0),
             width: animated_value(width),
-            drawer: animated_value(theme::sessions_drawer_width(width)),
             gate_sessions: animated_value(0.0),
             gate_workbench: animated_value(0.0),
             page: signal(ShellPage::Home),
@@ -108,11 +105,10 @@ impl Pager {
         CURRENT.with(|cell| cell.set(Some(pager)));
         cleanup(|| CURRENT.with(|cell| cell.set(None)));
         // A rotation or a window change moves a resting side page with the
-        // screen it is measured against.
+        // screen it fills.
         effect(move || {
             let width = window().width.0.max(1.0);
             pager.width.set(width);
-            pager.drawer.set(theme::sessions_drawer_width(width));
             let page = pager.page.get_untracked();
             if page != ShellPage::Home {
                 pager.drag.set(pager.rest(page));
@@ -180,20 +176,9 @@ impl Pager {
         untracked(|| window().width.0).max(1.0)
     }
 
-    /// How far the drag value runs to bring `page` fully in: the drawer's
-    /// width for the sessions page, the screen's for the workbench.
-    fn travel(self, page: ShellPage) -> f32 {
-        let width = self.width_now();
-        if page == ShellPage::Sessions {
-            theme::sessions_drawer_width(width)
-        } else {
-            width
-        }
-    }
-
     /// Where the drag value stands with `page` at rest.
     fn rest(self, page: ShellPage) -> f32 {
-        page.open_offset() * self.travel(page)
+        page.open_offset() * self.width_now()
     }
 
     /// Lets one side page answer the drag value, and lays it out.
@@ -228,9 +213,6 @@ impl Pager {
         if self.page.get_untracked() != target {
             self.page.set(target);
         }
-        // The drawer moves the conversation with it, whichever way it goes.
-        let drawer = target == ShellPage::Sessions
-            || (target == ShellPage::Home && self.sessions_shown.get_untracked());
         let to = self.rest(target);
         let opening = target != ShellPage::Home;
         let landed = move || {
@@ -254,22 +236,11 @@ impl Pager {
         // reader has already decided.
         let timing = if opening {
             Timing::new(
-                if drawer {
-                    theme::SESSIONS_OPEN_ANIMATION_MS
-                } else {
-                    theme::DRAWER_OPEN_ANIMATION_MS
-                },
+                theme::DRAWER_OPEN_ANIMATION_MS,
                 Easing::Curve(Curve::Poly(5.0), EaseMode::Out),
             )
         } else {
-            Timing::new(
-                if drawer {
-                    theme::SESSIONS_CLOSE_ANIMATION_MS
-                } else {
-                    theme::DRAWER_CLOSE_ANIMATION_MS
-                },
-                Easing::EaseInOut,
-            )
+            Timing::new(theme::DRAWER_CLOSE_ANIMATION_MS, Easing::EaseInOut)
         };
         let end = self.drag.timing_with(to, timing);
         spawn(async move {
@@ -322,7 +293,7 @@ impl Pager {
             }
         });
         let direction = moved.open_offset();
-        let reveal = (value / self.travel(moved) * direction).clamp(0.0, 1.0);
+        let reveal = (value / self.width_now() * direction).clamp(0.0, 1.0);
         let target = if event.cancelled {
             from
         } else if release_opens(
@@ -393,105 +364,41 @@ pub fn pager(
     sessions: impl IntoElement,
     workbench: impl Fn() -> AnyElement + 'static,
 ) -> impl IntoElement {
-    let reveal_sessions = pager
-        .drag
-        .div(&pager.drawer)
+    let unit = pager.drag.div(&pager.width);
+    let reveal_sessions = unit
         .interpolate(&[0.0, 1.0], &[0.0, 1.0])
         .mul(&pager.gate_sessions);
-    let reveal_workbench = pager
-        .drag
-        .div(&pager.width)
+    let reveal_workbench = unit
         .interpolate(&[-1.0, 0.0], &[1.0, 0.0])
         .mul(&pager.gate_workbench);
-    // The drawer and the conversation move as one sheet: the drawer's trailing
-    // edge is the card's leading edge all the way.
-    let sessions_x = reveal_sessions.sub(1.0).mul(&pager.drawer);
-    let card_x = reveal_sessions.mul(&pager.drawer);
-    let card_scale = reveal_sessions.mul(-theme::SESSIONS_CARD_SHRINK).add(1.0);
-    let card_fade = reveal_sessions.mul(theme::SESSIONS_CARD_FADE);
+    let sessions_x = reveal_sessions.sub(1.0).mul(&pager.width);
     let workbench_x = pager.width.sub(&reveal_workbench.mul(&pager.width));
-    let dim = reveal_workbench.mul(theme::DRAWER_BACKDROP_OPACITY);
-    let drawer_width = || px(theme::sessions_drawer_width(window().width.0.max(1.0)));
-    let beside_drawer = move || pager.sessions_shown.get();
+    // The conversation gives way to the page that is coming, a part of the
+    // distance that page covers.
+    let home_x = reveal_sessions
+        .sub(&reveal_workbench)
+        .mul(&pager.width)
+        .mul(theme::PAGE_PARALLAX);
+    let dim = reveal_sessions
+        .add(&reveal_workbench)
+        .mul(theme::DRAWER_BACKDROP_OPACITY);
 
     view()
         .flex_1()
         .relative()
         .overflow_hidden()
-        // What shows around the card is the drawer's own page.
-        .bg(theme::block_page)
+        .bg(theme::background)
         .pan_values(Some(&pager.drag), None)
         .pan_enabled(true)
         .on_pan_start(move |event: &PanEvent| pager.pan_started(event))
         .on_pan_end(move |event: &PanEvent| pager.pan_ended(event))
         .child(
-            // The conversation. Beside the drawer it is a card: rounded,
-            // lifted, a little shorter, and faded toward the page behind it.
-            // The corner and the lift are switched on with the drawer rather
-            // than animated, which no one sees at the edge of a screen whose
-            // own corners are round.
             view()
                 .flex_1()
                 .min_h(px(0.0))
-                .bg(theme::background)
                 .accessibility_elements_hidden(move || pager.page() != ShellPage::Home)
-                .bind_translate_x(&card_x)
-                .bind_transform(TransformKind::ScaleY, &card_scale)
-                .style_when(beside_drawer, |style| {
-                    style.rounded(px(theme::SESSIONS_CARD_RADIUS)).shadow_xl()
-                })
-                .child(
-                    view()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .style_when(beside_drawer, |style| {
-                            style
-                                .rounded(px(theme::SESSIONS_CARD_RADIUS))
-                                .overflow_hidden()
-                        })
-                        .child(home)
-                        .child(
-                            view()
-                                .absolute()
-                                .inset(px(0.0))
-                                .bg(theme::block_page)
-                                .bind_opacity(&card_fade)
-                                .pointer_events(PointerEvents::None),
-                        ),
-                )
-                .child(
-                    // The card's edge, for the appearance a shadow does not
-                    // show in. Drawn over the card so it never moves the
-                    // conversation's layout.
-                    view()
-                        .absolute()
-                        .inset(px(0.0))
-                        .rounded(px(theme::SESSIONS_CARD_RADIUS))
-                        .border_1()
-                        .border_color(theme::sidebar_hairline)
-                        .pointer_events(PointerEvents::None)
-                        .style_when(move || !beside_drawer(), |style| style.hidden()),
-                ),
-        )
-        .child(
-            // The strip of the conversation left beside the open drawer is
-            // the way back to it. It lies over the card and takes its touches;
-            // the card itself stays live, because the sheets it raises are
-            // its children and must still be reachable from the drawer.
-            view()
-                .absolute()
-                .top(px(0.0))
-                .bottom(px(0.0))
-                .right(px(0.0))
-                .left(drawer_width)
-                .role(AccessibilityRole::Button)
-                .label(copy::text("Back to session", "返回会话", "返回工作階段"))
-                .focusable(true)
-                .on_press(move || pager.close())
-                .style_when(
-                    move || pager.page() != ShellPage::Sessions,
-                    |style| style.hidden(),
-                ),
+                .bind_translate_x(&home_x)
+                .child(home),
         )
         .child(
             view()
@@ -503,23 +410,19 @@ pub fn pager(
         )
         .child(
             side_page(move || pager.sessions_shown.get())
-                .w(drawer_width)
                 .bg(theme::block_page)
                 .bind_translate_x(&sessions_x)
                 .child(sessions),
         )
         .child(
             side_page(move || pager.workbench_shown.get())
-                .w_full()
-                .bg(theme::sidebar_bg)
-                .border_l_1()
-                .border_l_color(theme::border_default)
+                .bg(theme::background)
                 .bind_translate_x(&workbench_x)
                 .child(when(move || pager.workbench_made.get(), workbench)),
         )
 }
 
-/// The frame of a side page: as tall as the workspace, and out of the layout
+/// The frame of a side page: as large as the workspace, and out of the layout
 /// while it is not shown.
 fn side_page(shown: impl Fn() -> bool + 'static) -> View {
     view()
@@ -527,6 +430,7 @@ fn side_page(shown: impl Fn() -> bool + 'static) -> View {
         .top(px(0.0))
         .bottom(px(0.0))
         .left(px(0.0))
+        .w_full()
         .flex_col()
         // The page takes the touches on it: a press on an empty stretch must
         // not reach the conversation underneath.

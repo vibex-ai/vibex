@@ -8,7 +8,7 @@ use nsh_core::{AutoCapitalize, AutoFill, SubmitBehavior, element::Composition};
 
 use crate::{
     copy, theme,
-    ui::{action, field},
+    ui::{action, field, surface},
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -103,72 +103,36 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .bg(theme::background)
         .pb_keyboard()
-        .child(when(
-            move || find_open.get(),
-            move || {
-                view()
-                    .h(px(theme::TOUCH_TARGET))
-                    .flex_shrink_0()
-                    .px(px(theme::SPACING_XS))
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .border_b_1()
-                    .border_b_color(theme::border_subtle)
-                    .child(
-                        field::text_field_flat(
-                            find_query,
-                            copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
-                        )
-                        .auto_focus(true)
-                        .flex_1()
-                        .min_w(px(0.0)),
-                    )
-                    .child(
-                        text(move || {
-                            format!(
-                                "{} {}",
-                                find_count.get(),
-                                copy::text("matches", "个匹配", "個匹配")
-                            )
-                        })
-                        .flex_shrink_0()
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                    )
-                    .child(
-                        action::icon_button(
-                            icon!("x"),
-                            copy::text("Close search", "关闭搜索", "關閉搜尋"),
-                            move || {
-                                find_open.set(false);
-                                dismiss_keyboard();
-                            },
-                        )
-                        .flex_shrink_0(),
-                    )
-            },
-        ))
+        // The head: the terminals of the workspace as tabs, or the one a
+        // terminal session runs in, and the tools that act on the open one.
         .child(
             view()
                 .h(px(theme::TOUCH_TARGET))
                 .flex_shrink_0()
                 .flex_row()
                 .items_center()
-                .pl(px(theme::SPACING_SM))
-                .pr(px(theme::SPACING_XS))
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
+                .gap(px(2.0))
+                .pl(px(theme::SPACING_MD))
+                .pr(px(theme::SPACING_SM))
                 .child(
                     when(attached_session, move || {
-                        text(move || host.title.get().unwrap_or_default())
+                        view()
                             .flex_1()
                             .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::foreground)
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(surface::field_glyph(icon!("square-terminal")))
+                            .child(
+                                text(move || host.title.get().unwrap_or_default())
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_detail()))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::foreground),
+                            )
                     })
                     .otherwise({
                         let select = host.on_select_terminal.clone();
@@ -177,25 +141,15 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                     }),
                 )
                 .child(
-                    button()
-                        .h(px(theme::TOUCH_TARGET))
-                        .px(px(theme::SPACING_SM))
-                        .flex_shrink_0()
-                        .items_center()
-                        .justify_center()
-                        .accessibility_label(copy::text("Keyboard", "键盘", "鍵盤"))
-                        .on_press(move || keyboard.focus())
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .disabled(move || !selected() || busy.get())
-                        .disabled_style(|style| style.opacity(0.4))
-                        .child(
-                            svg(icon!("keyboard"))
-                                .size(px(theme::ICON_MD))
-                                .text_color(theme::text_secondary),
-                        ),
+                    surface::ghost_button(
+                        icon!("keyboard"),
+                        copy::text("Keyboard", "键盘", "鍵盤"),
+                        move || keyboard.focus(),
+                    )
+                    .disabled(move || !selected() || busy.get()),
                 )
                 .child(
-                    action::icon_button(
+                    surface::ghost_button(
                         icon!("search"),
                         copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
                         move || {
@@ -205,67 +159,122 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             }
                         },
                     )
-                    .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                    .flex_shrink_0()
-                    .disabled(move || !selected())
-                    .disabled_style(|style| style.opacity(0.4)),
+                    .disabled(move || !selected()),
                 )
                 .child(when(move || !attached_session(), {
                     let create = host.on_new_terminal.clone();
                     move || {
                         let create = create.clone();
-                        action::icon_button(
+                        surface::ghost_button(
                             icon!("plus"),
                             copy::text("New terminal", "新建终端", "新增終端"),
                             move || create(),
                         )
-                        .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                        .flex_shrink_0()
                         .disabled(move || busy.get())
-                        .disabled_style(|style| style.opacity(0.4))
                     }
                 })),
         )
+        .child(when(
+            move || find_open.get(),
+            move || {
+                view()
+                    .flex_shrink_0()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_SM))
+                    .pt(px(theme::SPACING_XS))
+                    .child(
+                        surface::field_pill()
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .pr(px(theme::SPACING_MD))
+                            .mr(px(theme::SPACING_XS))
+                            .child(surface::field_glyph(icon!("search")))
+                            .child(
+                                field::text_field_bare(
+                                    find_query,
+                                    copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
+                                )
+                                .auto_focus(true)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h_full(),
+                            )
+                            .child(
+                                text(move || {
+                                    format!(
+                                        "{} {}",
+                                        find_count.get(),
+                                        copy::text("matches", "个匹配", "個匹配")
+                                    )
+                                })
+                                .flex_shrink_0()
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::text_muted),
+                            ),
+                    )
+                    .child(surface::ghost_button(
+                        icon!("x"),
+                        copy::text("Close search", "关闭搜索", "關閉搜尋"),
+                        move || {
+                            find_open.set(false);
+                            dismiss_keyboard();
+                        },
+                    ))
+            },
+        ))
         .child(when(move || confirm.with(Option::is_some), {
             let kill = host.on_kill.clone();
             move || {
                 let kill = kill.clone();
+                // Closing a terminal ends what runs in it, so it is asked for
+                // twice: once on the tab, once here.
                 view()
-                    .m(px(theme::SPACING_SM))
-                    .p(px(theme::SPACING_SM))
-                    .gap(px(theme::SPACING_SM))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .bg(theme::background_card)
+                    .flex_shrink_0()
+                    .px(px(theme::SPACING_MD))
+                    .pt(px(theme::SPACING_SM))
                     .child(
-                        text(copy::text(
-                            "Close this terminal and stop its running process?",
-                            "关闭此终端并停止正在运行的进程？",
-                            "關閉此終端機並停止正在執行的程序？",
-                        ))
-                        .text_size(px(theme::font_caption()))
-                        .text_color(theme::text_secondary),
-                    )
-                    .child(
-                        view()
-                            .flex_row()
-                            .justify_end()
-                            .gap(px(theme::SPACING_SM))
-                            .child(action::secondary(
-                                copy::text("Cancel", "取消", "取消"),
-                                icon!("x"),
-                                false,
-                                move || confirm.set(None),
-                            ))
-                            .child(action::destructive(
-                                copy::text("Close terminal", "关闭终端", "關閉終端機"),
-                                icon!("x"),
-                                move || {
-                                    if let Some(id) = confirm.get_untracked() {
-                                        confirm.set(None);
-                                        kill(&id);
-                                    }
-                                },
-                            )),
+                        surface::card()
+                            .p(px(surface::ROW_INSET))
+                            .gap(px(theme::SPACING_MD))
+                            .child(
+                                text(copy::text(
+                                    "Close this terminal and stop its running process?",
+                                    "关闭此终端并停止正在运行的进程？",
+                                    "關閉此終端機並停止正在執行的程序？",
+                                ))
+                                .text_size(px(theme::font_detail()))
+                                .line_height(theme::line_height_for(theme::font_detail()))
+                                .text_color(theme::foreground),
+                            )
+                            .child(
+                                view()
+                                    .flex_row()
+                                    .gap(px(theme::SPACING_SM))
+                                    .child(
+                                        action::tonal(
+                                            copy::text("Cancel", "取消", "取消"),
+                                            move || confirm.set(None),
+                                        )
+                                        .flex_1()
+                                        .min_w(px(0.0)),
+                                    )
+                                    .child(
+                                        action::tonal_danger(
+                                            copy::text("Close terminal", "关闭终端", "關閉終端機"),
+                                            move || {
+                                                if let Some(id) = confirm.get_untracked() {
+                                                    confirm.set(None);
+                                                    kill(&id);
+                                                }
+                                            },
+                                        )
+                                        .flex_1()
+                                        .min_w(px(0.0)),
+                                    ),
+                            ),
                     )
             }
         }))
@@ -274,25 +283,30 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             move || {
                 let retry = retry.clone();
                 view()
+                    .flex_shrink_0()
+                    .mx(px(theme::SPACING_MD))
+                    .mt(px(theme::SPACING_SM))
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
+                    .min_h(px(theme::ROUND_CONTROL))
                     .flex_row()
                     .items_center()
-                    .px(px(theme::SPACING_SM))
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(theme::SPACING_SM))
+                    .rounded(px(theme::RADIUS_CHIP))
+                    .bg(move || theme::tint(theme::accent_red()))
                     .child(
                         text(move || error.get().unwrap_or_default())
                             .flex_1()
                             .min_w(px(0.0))
+                            .py(px(theme::SPACING_SM))
                             .text_size(px(theme::font_caption()))
                             .text_color(theme::accent_red),
                     )
-                    .child(
-                        action::icon_button(
-                            icon!("refresh"),
-                            copy::text("Reconnect terminal", "重连终端", "重新連接終端機"),
-                            move || retry(),
-                        )
-                        .flex_shrink_0(),
-                    )
+                    .child(surface::ghost_button(
+                        icon!("refresh"),
+                        copy::text("Reconnect terminal", "重连终端", "重新連接終端機"),
+                        move || retry(),
+                    ))
             }
         }))
         .child(
@@ -300,6 +314,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .flex_1()
                 .min_h(px(0.0))
                 .w_full()
+                .mt(px(theme::SPACING_XS))
                 .relative()
                 .child({
                     let data = on_text.clone();
@@ -325,11 +340,10 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             .absolute()
                             .inset(px(0.0))
                             .bg(theme::background)
-                            .items_center()
-                            .justify_center()
-                            .child(
-                                text(move || {
-                                    if busy.get() {
+                            .child(surface::empty_state(
+                                icon!("square-terminal"),
+                                move || {
+                                    SharedString::from(if busy.get() {
                                         copy::text(
                                             "Connecting to terminal…",
                                             "正在连接终端…",
@@ -341,11 +355,14 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                                             "选择或新建终端",
                                             "選擇或新增終端機",
                                         )
-                                    }
-                                })
-                                .text_size(px(theme::font_caption()))
-                                .text_color(theme::text_muted),
-                            )
+                                    })
+                                },
+                                copy::text(
+                                    "A terminal runs in the session's workspace on the desktop.",
+                                    "终端运行在桌面端该会话的工作区中。",
+                                    "終端機在桌面端該工作階段的工作區中執行。",
+                                ),
+                            ))
                     },
                 )),
         )
@@ -375,7 +392,8 @@ fn terminal_tabs(
                 .h(px(theme::TOUCH_TARGET))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(6.0))
+                .pr(px(theme::SPACING_SM))
                 .child(each(
                     move || {
                         terminals.with(|choices| {
@@ -390,21 +408,32 @@ fn terminal_tabs(
                     move |choice, _| {
                         let select = select.clone();
                         let id = choice.get_untracked().id;
+                        let chosen =
+                            move || active.with(|active| active.as_deref() == Some(id.as_str()));
+                        // A tab: the terminal's name, and the way to close it
+                        // inside the same pill.
                         view()
-                            .h(px(30.0))
+                            .h(px(theme::CHIP_HEIGHT))
                             .flex_shrink_0()
                             .flex_row()
                             .items_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .style_when(
-                                move || active.with(|active| active.as_deref() == Some(&id)),
-                                |style| style.bg(theme::rail_tab_bg()),
-                            )
+                            .rounded_full()
+                            .bg({
+                                let chosen = chosen.clone();
+                                move || {
+                                    if chosen() {
+                                        theme::fill_strong()
+                                    } else {
+                                        theme::fill()
+                                    }
+                                }
+                            })
                             .child(
                                 button()
                                     .h_full()
                                     .max_w(px(132.0))
-                                    .px(px(theme::SPACING_SM))
+                                    .pl(px(theme::SPACING_MD))
+                                    .pr(px(theme::SPACING_XS))
                                     .justify_center()
                                     .on_press(move || {
                                         dismiss_keyboard();
@@ -413,16 +442,26 @@ fn terminal_tabs(
                                     .child(
                                         text(move || choice.with(|choice| choice.title.clone()))
                                             .truncate()
-                                            .text_size(px(theme::font_caption()))
-                                            .text_color(theme::foreground),
+                                            .text_size(px(theme::font_micro()))
+                                            .font_weight(FontWeight::MEDIUM)
+                                            .text_color(move || {
+                                                if chosen() {
+                                                    theme::foreground()
+                                                } else {
+                                                    theme::text_secondary()
+                                                }
+                                            }),
                                     ),
                             )
                             .child(
                                 button()
                                     .size(px(28.0))
+                                    .mr(px(2.0))
                                     .flex_shrink_0()
                                     .items_center()
                                     .justify_center()
+                                    .rounded_full()
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
                                     .accessibility_label(move || {
                                         Some(
                                             format!(
@@ -475,15 +514,13 @@ fn terminal_keys(
         .scrollbar(false)
         .flex_shrink_0()
         .w_full()
-        .border_t_1()
-        .border_t_color(theme::border_subtle)
         .child(
             view()
-                .h(px(52.0))
+                .h(px(48.0))
                 .flex_row()
                 .items_center()
-                .px(px(theme::SPACING_SM))
-                .gap(px(theme::SPACING_XS))
+                .px(px(theme::SPACING_MD))
+                .gap(px(6.0))
                 .child(key_chip("Esc", || false, move || escape("\x1b")))
                 .child(key_chip(
                     "Ctrl",
@@ -617,26 +654,42 @@ fn terminal_newlines(text: &str) -> String {
     text.replace("\r\n", "\r").replace('\n', "\r")
 }
 
+/// One key of the row the software keyboard lacks. A latched modifier is
+/// filled with the ink until the next character takes it.
 fn key_chip(
     label: &'static str,
-    selected: impl Fn() -> bool + 'static,
+    selected: impl Fn() -> bool + Copy + 'static,
     action: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
-        .h(px(32.0))
-        .px(px(theme::SPACING_SM))
+        .h(px(theme::COMPACT_CONTROL))
+        .min_w(px(40.0))
+        .px(px(10.0))
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .bg(theme::background_dim)
-        .style_when(selected, |style| style.bg(theme::sidebar_selected_bg()))
-        .active(|style| style.bg(theme::row_pressed_bg()))
+        .rounded(px(theme::RADIUS_TILE))
+        .bg(move || {
+            if selected() {
+                theme::action_primary()
+            } else {
+                theme::fill()
+            }
+        })
+        .active(|style| style.opacity(0.6))
         .on_press(action)
         .child(
             text(label)
+                .font_family("monospace")
                 .text_size(px(theme::font_micro()))
-                .text_color(theme::text_secondary),
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(move || {
+                    if selected() {
+                        theme::action_primary_label()
+                    } else {
+                        theme::text_secondary()
+                    }
+                }),
         )
 }
 

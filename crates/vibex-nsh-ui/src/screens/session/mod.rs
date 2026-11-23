@@ -1,18 +1,25 @@
-//! The session shell: the drawer of sessions, the timeline and the composer.
+//! The session shell: the sessions page, the conversation and the workbench.
 //!
-//! The compact phone composition the GPUI client uses, drawn with `nsh`: a
-//! top bar that opens the session drawer, the transcript as a virtualized list
-//! of rows, and a composer pinned above the keyboard. The app's session service
-//! owns the data and the actions; this module binds them and decides how a row
-//! looks.
+//! Three pages side by side, drawn with `nsh`. The conversation is the one in
+//! the middle: a header of three floating controls, the transcript as a
+//! virtualized list of rows, and the prompt card pinned above the keyboard. A
+//! session being written takes the transcript's place on that same page. The
+//! sessions tree fills the page on its left and the workspace's files, changes
+//! and terminal the page on its right. The app's session service owns the data
+//! and the actions; this module binds them and decides how a row looks.
 //!
-//! The timeline renders desktop-projected turns and activity groups as
-//! a virtual list with touch disclosures and native Markdown views.
+//! The timeline renders desktop-projected turns and activity groups as a
+//! virtual list with touch disclosures and native Markdown views. A turn's
+//! working rows hang on one rail, so a run of steps reads as one run.
+//!
+//! A row's commands are behind a long press, in a menu raised beside the
+//! finger ([`crate::ui::menu`]); what a command still has to ask is asked in
+//! a sheet of cards ([`crate::ui::sheet`]).
 
 use std::rc::Rc;
 
 use nsh_base::{
-    ButtonElement, SheetEvent, button, sheet,
+    ButtonElement, button,
     text_view::{MarkdownOptions, text_view},
 };
 use nsh_core::{
@@ -24,7 +31,11 @@ use crate::{
     copy,
     screens::connecting::{self as connecting_screen, ConnectionState},
     theme,
-    ui::{action, field},
+    ui::{
+        action, compose, field,
+        menu::{self, Menu, MenuEntry, MenuSide},
+        surface,
+    },
 };
 
 mod pager;
@@ -724,7 +735,8 @@ pub struct SessionHost {
     pub on_open_dir: OpenPath,
     pub on_open_file: crate::screens::files::OpenFile,
     pub on_files_back: Action,
-    /// The new-session sheet, and what it offers.
+    /// Whether a new session is being written on the conversation page, and
+    /// what it can be started with.
     pub new_session_open: Signal<bool>,
     pub new_workspaces: Signal<Vec<WorkspaceChoice>>,
     pub new_runtimes: Signal<Vec<RuntimeChoice>>,
@@ -874,6 +886,11 @@ pub fn session(host: SessionHost) -> impl IntoElement {
 
 fn surfaces(host: SessionHost) -> impl IntoElement {
     let pager = Pager::new();
+    let overlays = Overlays {
+        menu: signal(None),
+        rename: signal(false),
+        reschedule: signal(None),
+    };
     let initial_tab = if host.git_open.get_untracked() {
         Some(WorkbenchTab::Changes)
     } else if host.terminal_open.get_untracked() {
@@ -889,6 +906,9 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         pager.show_initial(ShellPage::Workbench);
     }
     let rail_host = host.clone();
+    let creating = host.new_session_open;
+    // A raised menu is the first thing the back key puts away.
+    pager.on_pre_back(move || menu::dismiss(overlays.menu));
     pager.on_back({
         let host = host.clone();
         move || match pager.page_untracked() {
@@ -901,11 +921,25 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
                 true
             }
             ShellPage::Workbench => tab.get_untracked().back(&host),
+            // Backing out of a session being written returns to the one that
+            // was open.
+            ShellPage::Home if creating.get_untracked() => {
+                dismiss_keyboard();
+                (host.on_close_new_session)();
+                true
+            }
             ShellPage::Home if host.find_open.get_untracked() => {
                 (host.on_toggle_find)();
                 true
             }
             _ => false,
+        }
+    });
+    // A session is written on the conversation page, whichever page asked
+    // for it.
+    effect(move || {
+        if creating.get() && pager.page_untracked() != ShellPage::Home {
+            pager.close();
         }
     });
     let active = host.active;
@@ -926,64 +960,50 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
             }
         }
     });
-    let open = host.new_session_open;
-    let close = host.on_close_new_session.clone();
-    pager.on_pre_back(move || {
-        if !open.get_untracked() {
-            return false;
-        }
-        dismiss_keyboard();
-        close();
-        true
-    });
-    let create_host = NewSessionHost {
-        workspaces: host.new_workspaces,
-        runtimes: host.new_runtimes,
-        workspace: host.new_workspace,
-        runtime: host.new_runtime,
-        busy: host.new_busy,
-        error: host.new_error,
-        on_close: host.on_close_new_session.clone(),
-        on_create: host.on_create_session.clone(),
-        on_create_temporary: host.on_create_temporary_session.clone(),
-        title: host.new_title,
-        prompt: host.new_prompt,
-        attachments: host.new_attachments,
-        on_attach_image: host.on_attach_new_image.clone(),
-        on_attach_file: host.on_attach_new_file.clone(),
-        on_remove_attachment: host.on_remove_new_attachment.clone(),
-        worktree_branch: host.new_worktree_branch,
-        base_ref: host.new_base_ref,
-        on_create_worktree: host.on_create_worktree_session.clone(),
-    };
     let drawer_host = host.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
         .relative()
-        .child(
-            view()
-                .flex_1()
-                .min_h(px(0.0))
-                .accessibility_elements_hidden(move || open.get())
-                .style_when(
-                    move || open.get(),
-                    |style| style.pointer_events(PointerEvents::None),
-                )
-                .child(pager::pager(
-                    pager,
-                    shell(host, pager, tab),
-                    drawer(drawer_host, pager),
-                    move || {
-                        workbench::workbench(pager, tab, terminal_find, rail_host.clone())
-                            .into_element()
-                    },
-                )),
-        )
-        .child(when(
-            move || open.get(),
-            move || new_session_page(create_host.clone()),
+        .child(pager::pager(
+            pager,
+            shell(host.clone(), pager, tab, overlays),
+            drawer(drawer_host, pager, overlays),
+            move || {
+                workbench::workbench(pager, tab, terminal_find, rail_host.clone()).into_element()
+            },
         ))
+        // The sheets a session's commands lead to belong to no one page: a
+        // row on the sessions page and the conversation's own header raise
+        // the same ones.
+        .child(rename_session_sheet(&host, overlays.rename))
+        .child(scheduled_send_sheet(
+            overlays.reschedule,
+            host.on_reschedule_scheduled_send.clone(),
+        ))
+        .child(move_session_sheet(
+            host.move_open,
+            host.sidebar_sections,
+            host.on_move_session.clone(),
+            host.on_close_move.clone(),
+        ))
+        .child(attachment_preview_sheet(
+            host.attachment_preview,
+            host.on_close_attachment.clone(),
+        ))
+        .child(crate::screens::team::team(crate::screens::team::TeamHost {
+            open: host.team_open,
+            tasks: host.team_tasks,
+            busy: host.team_busy,
+            error: host.team_error,
+            on_refresh: host.on_refresh_team.clone(),
+            on_accept: host.on_accept_team.clone(),
+            on_cancel: host.on_cancel_team.clone(),
+            on_interrupt: host.on_interrupt_team.clone(),
+            on_close: host.on_close_team.clone(),
+        }))
+        .child(project_browser(host.project_browser.clone()))
+        .child(menu::menu_layer(overlays.menu))
 }
 
 fn workbench_surfaces(
@@ -1107,8 +1127,14 @@ pub fn handle_back() -> bool {
     pager::current().is_some_and(Pager::back)
 }
 
-/// The conversation page: header, transcript, cards and composer.
-fn shell(host: SessionHost, pager: Pager, tab: Signal<WorkbenchTab>) -> impl IntoElement {
+/// The conversation page: header, transcript, cards and composer. A session
+/// being written takes the transcript's place under the same header.
+fn shell(
+    host: SessionHost,
+    pager: Pager,
+    tab: Signal<WorkbenchTab>,
+    overlays: Overlays,
+) -> impl IntoElement {
     let connection = host.connection;
     let connection_error = host.connection_error;
     let on_retry = host.on_retry.clone();
@@ -1117,258 +1143,331 @@ fn shell(host: SessionHost, pager: Pager, tab: Signal<WorkbenchTab>) -> impl Int
     let composer_input = element_ref();
     let jump_to_message = signal(None::<i64>);
     let runtime_panel = signal(RuntimePanel::Model);
-    let reschedule_send = signal(None::<(String, u64)>);
+    let creating = host.new_session_open;
+    let create_host = NewSessionHost {
+        workspaces: host.new_workspaces,
+        runtimes: host.new_runtimes,
+        workspace: host.new_workspace,
+        runtime: host.new_runtime,
+        busy: host.new_busy,
+        error: host.new_error,
+        on_create: host.on_create_session.clone(),
+        on_create_temporary: host.on_create_temporary_session.clone(),
+        title: host.new_title,
+        prompt: host.new_prompt,
+        attachments: host.new_attachments,
+        on_attach_image: host.on_attach_new_image.clone(),
+        on_attach_file: host.on_attach_new_file.clone(),
+        on_remove_attachment: host.on_remove_new_attachment.clone(),
+        worktree_branch: host.new_worktree_branch,
+        base_ref: host.new_base_ref,
+        on_create_worktree: host.on_create_worktree_session.clone(),
+    };
 
     view()
         .flex_1()
         .relative()
         .bg(theme::background)
         .flex_col()
-        .child(header(host.clone(), pager))
-        .child(group_tabs(&host))
+        .test_id("conversation-page")
+        .child(header(host.clone(), pager, overlays))
         .child(when(
             move || connection.get() != ConnectionState::Online,
             move || connection_banner(connection, connection_error, on_retry.clone()),
         ))
+        .child(when(
+            move || creating.get(),
+            move || new_session_page(create_host.clone()),
+        ))
         .child(
+            // The conversation stays mounted under a session being written,
+            // so backing out finds it where it was left.
             view()
                 .flex_1()
                 .min_h(px(0.0))
-                .child(timeline_view(host.clone(), jump_to_message, pager, tab))
-                .child(when(move || host.error.get().is_some(), {
-                    let error = host.error;
+                .flex_col()
+                .style_when(move || creating.get(), |style| style.hidden())
+                .child(group_tabs(&host))
+                .child(
+                    view()
+                        .flex_1()
+                        .min_h(px(0.0))
+                        .child(timeline_view(host.clone(), jump_to_message, pager, tab))
+                        .child(when(move || host.error.get().is_some(), {
+                            let error = host.error;
+                            move || {
+                                text(move || error.get().unwrap_or_default())
+                                    .text_size(px(theme::font_caption()))
+                                    .text_color(theme::accent_red)
+                                    .px(px(theme::SPACING_LG))
+                                    .pb(px(theme::SPACING_SM))
+                            }
+                        })),
+                )
+                .child(when(
                     move || {
-                        text(move || error.get().unwrap_or_default())
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::accent_red)
-                            .px(px(theme::SPACING_LG))
-                            .pb(px(theme::SPACING_SM))
-                    }
-                })),
+                        host.draft.with(|draft| draft.starts_with('/'))
+                            && !host.commands.with(|commands| commands.is_empty())
+                    },
+                    {
+                        let commands = host.commands;
+                        let draft = host.draft;
+                        let on_arm = host.on_arm_entry.clone();
+                        move || command_palette(commands, draft, PaletteKind::Slash, on_arm.clone())
+                    },
+                ))
+                .child(when(
+                    move || {
+                        mention_query(&host.draft.get()).is_some()
+                            && !host.mentions.with(|mentions| mentions.is_empty())
+                    },
+                    {
+                        let mentions = host.mentions;
+                        let draft = host.draft;
+                        let on_arm = host.on_arm_entry.clone();
+                        move || {
+                            command_palette(mentions, draft, PaletteKind::Mention, on_arm.clone())
+                        }
+                    },
+                ))
+                .child(when(
+                    move || {
+                        skill_query(&host.draft.get()).is_some()
+                            && !host.skills.with(|skills| skills.is_empty())
+                    },
+                    {
+                        let skills = host.skills;
+                        let draft = host.draft;
+                        let on_arm = host.on_arm_entry.clone();
+                        move || command_palette(skills, draft, PaletteKind::Skill, on_arm.clone())
+                    },
+                ))
+                .child(when(move || host.pending.get().is_some(), {
+                    let pending = host.pending;
+                    let resolving = host.resolving;
+                    let on_permission = host.on_permission.clone();
+                    move || permission_card(pending, resolving, on_permission.clone())
+                }))
+                .child(when(move || host.question.get().is_some(), {
+                    let question = host.question;
+                    let resolving = host.resolving;
+                    let on_question = host.on_question.clone();
+                    move || question_card(question, resolving, on_question.clone())
+                }))
+                .child(when(
+                    move || {
+                        terminal.with(|session| {
+                            session.as_ref().is_some_and(|session| !session.terminal)
+                        })
+                    },
+                    move || composer(composer_host.clone(), composer_input, runtime_panel),
+                )),
         )
-        .child(when(
-            move || {
-                host.draft.with(|draft| draft.starts_with('/'))
-                    && !host.commands.with(|commands| commands.is_empty())
-            },
-            {
-                let commands = host.commands;
-                let draft = host.draft;
-                let on_arm = host.on_arm_entry.clone();
-                move || command_palette(commands, draft, PaletteKind::Slash, on_arm.clone())
-            },
-        ))
-        .child(when(
-            move || {
-                mention_query(&host.draft.get()).is_some()
-                    && !host.mentions.with(|mentions| mentions.is_empty())
-            },
-            {
-                let mentions = host.mentions;
-                let draft = host.draft;
-                let on_arm = host.on_arm_entry.clone();
-                move || command_palette(mentions, draft, PaletteKind::Mention, on_arm.clone())
-            },
-        ))
-        .child(when(
-            move || {
-                skill_query(&host.draft.get()).is_some()
-                    && !host.skills.with(|skills| skills.is_empty())
-            },
-            {
-                let skills = host.skills;
-                let draft = host.draft;
-                let on_arm = host.on_arm_entry.clone();
-                move || command_palette(skills, draft, PaletteKind::Skill, on_arm.clone())
-            },
-        ))
-        .child(when(move || host.pending.get().is_some(), {
-            let pending = host.pending;
-            let resolving = host.resolving;
-            let on_permission = host.on_permission.clone();
-            move || permission_card(pending, resolving, on_permission.clone())
-        }))
-        .child(when(move || host.question.get().is_some(), {
-            let question = host.question;
-            let resolving = host.resolving;
-            let on_question = host.on_question.clone();
-            move || question_card(question, resolving, on_question.clone())
-        }))
-        .child(when(
-            move || {
-                terminal.with(|session| session.as_ref().is_some_and(|session| !session.terminal))
-            },
-            move || composer(composer_host.clone(), composer_input, runtime_panel),
-        ))
         .child(runtime_sheet(host.clone(), runtime_panel))
         .child(history_sheet(host.clone(), jump_to_message, composer_input))
-        .child(session_actions_sheet(&host, reschedule_send))
-        .child(scheduled_send_sheet(
-            reschedule_send,
-            host.on_reschedule_scheduled_send.clone(),
-        ))
-        .child(attachment_preview_sheet(
-            host.attachment_preview,
-            host.on_close_attachment.clone(),
-        ))
-        .child(move_session_sheet(
-            host.move_open,
-            host.sidebar_sections,
-            host.on_move_session.clone(),
-            host.on_close_move.clone(),
-        ))
-        .child(crate::screens::team::team(crate::screens::team::TeamHost {
-            open: host.team_open,
-            tasks: host.team_tasks,
-            busy: host.team_busy,
-            error: host.team_error,
-            on_refresh: host.on_refresh_team.clone(),
-            on_accept: host.on_accept_team.clone(),
-            on_cancel: host.on_cancel_team.clone(),
-            on_interrupt: host.on_interrupt_team.clone(),
-            on_close: host.on_close_team.clone(),
-        }))
-        .child(project_browser(host.project_browser.clone()))
 }
 
-fn header(host: SessionHost, pager: Pager) -> impl IntoElement {
-    let on_open_history = host.on_open_history.clone();
-    let on_toggle_find = host.on_toggle_find.clone();
-    let timeline = host.timeline;
-    let sending = host.sending;
+/// The conversation's top bar: three objects on the page rather than a strip
+/// across it. The way to the sessions, the session's own title and menu, and
+/// the two ways out of it: a new session, and the workbench.
+fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
+    let creating = host.new_session_open;
     let terminal_choices = host.terminal_choices;
     let terminal_running = move || {
         terminal_choices.with(|choices| choices.iter().any(|choice| choice.status == "running"))
     };
     let activity = crate::ui::activity::ActivityClock::start();
     let session = active_session(&host);
-    view()
-        .w_full()
-        .pt_safe_area()
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .child(
-            view()
-                .w_full()
-                .h(px(theme::HEADER_HEIGHT))
-                .flex_shrink_0()
-                .flex_row()
-                .items_center()
-                .child(
-                    action::icon_button(
-                        icon!("menu"),
-                        copy::text("Sessions", "会话", "工作階段"),
-                        move || pager.open(ShellPage::Sessions),
-                    )
-                    .flex_shrink_0(),
-                )
-                .child(
-                    action::icon_button(
-                        icon!("history"),
-                        copy::text("Earlier messages", "历史消息", "歷史訊息"),
-                        move || {
-                            dismiss_keyboard();
-                            on_open_history();
-                        },
-                    )
-                    .flex_shrink_0()
-                    .disabled(move || {
-                        sending.get()
-                            || !timeline.with(|entries| {
-                                entries.iter().any(|entry| entry.kind == EntryKind::User)
-                            })
-                    })
-                    .disabled_style(|style| style.opacity(0.38)),
-                )
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
+    let on_new_session = host.on_new_session.clone();
+    let on_stop_creating = host.on_close_new_session.clone();
+    let has_menu = move || !creating.get() && session.with(Option::is_some);
+    let title = computed(move || {
+        if creating.get() {
+            copy::text("New session", "新建会话", "新增工作階段").to_owned()
+        } else {
+            session.with(|session| {
+                session
+                    .as_ref()
+                    .map_or_else(|| "Vibex".to_owned(), |session| session.title.clone())
+            })
+        }
+    });
+    let open_menu = {
+        let host = host.clone();
+        move || {
+            let Some(current) = session.get_untracked() else {
+                return;
+            };
+            dismiss_keyboard();
+            let mut lead = Vec::new();
+            if !host.find_open.get_untracked() {
+                let find = host.on_toggle_find.clone();
+                lead.push(MenuEntry::new(
+                    icon!("search"),
+                    copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
+                    move || find(),
+                ));
+            }
+            let recallable = !host.sending.get_untracked()
+                && host.timeline.with_untracked(|entries| {
+                    entries.iter().any(|entry| entry.kind == EntryKind::User)
+                });
+            if recallable {
+                let history = host.on_open_history.clone();
+                lead.push(MenuEntry::new(
+                    icon!("history"),
+                    copy::text("Earlier messages", "历史消息", "歷史訊息"),
+                    move || history(),
+                ));
+            }
+            let team = host.on_open_team.clone();
+            lead.push(MenuEntry::new(
+                icon!("bot"),
+                copy::text("Team", "团队", "團隊"),
+                move || team(),
+            ));
+            overlays.menu.set(Some(session_menu(
+                &host,
+                overlays,
+                &current.id,
+                &current.title,
+                (
+                    safe_area().top.0 + theme::HEADER_HEIGHT / 2.0,
+                    MenuSide::Center,
+                ),
+                lead,
+            )));
+        }
+    };
+    view().w_full().pt_safe_area().child(
+        view()
+            .w_full()
+            .h(px(theme::HEADER_HEIGHT))
+            .flex_shrink_0()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .px(px(theme::SPACING_MD))
+            .child(surface::round_button(
+                icon!("menu"),
+                copy::text("Sessions", "会话", "工作階段"),
+                move || pager.open(ShellPage::Sessions),
+            ))
+            .child(
+                view().flex_1().min_w(px(0.0)).items_center().child(
+                    button()
+                        .max_w(relative(1.0))
+                        .h(px(theme::COMPACT_CONTROL + 2.0))
+                        .pl(px(theme::SPACING_MD))
+                        .pr(px(theme::SPACING_MD))
                         .flex_row()
                         .items_center()
-                        .justify_center()
-                        .px(px(theme::SPACING_XS))
-                        .gap(px(theme::SPACING_XS))
-                        .child(
-                            text(move || {
-                                session.with(|session| {
-                                    session.as_ref().map_or_else(
-                                        || "Vibex".to_owned(),
-                                        |session| session.title.clone(),
-                                    )
-                                })
+                        .gap(px(6.0))
+                        .rounded_full()
+                        .bg(theme::fill)
+                        .active(|style| style.opacity(0.6))
+                        .accessibility_label(move || {
+                            SharedString::from(if has_menu() {
+                                format!(
+                                    "{}: {}",
+                                    copy::text("Conversation menu", "会话菜单", "工作階段選單"),
+                                    title.get()
+                                )
+                            } else {
+                                title.get()
                             })
-                            .truncate()
-                            .min_w(px(0.0))
-                            .flex_shrink(1.0)
-                            .overflow_hidden()
-                            .text_size(px(theme::font_heading()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                        )
-                        .child(view().flex_shrink_0().child(dynamic(move || {
-                            match session
-                                .with(|session| session.as_ref().map(|session| session.state))
-                            {
+                        })
+                        .disabled(move || !has_menu())
+                        .on_press(open_menu)
+                        .child(dynamic(move || {
+                            let state = if creating.get() {
+                                None
+                            } else {
+                                session
+                                    .with(|session| session.as_ref().map(|session| session.state))
+                            };
+                            match state {
                                 Some(SessionState::Running) => {
                                     crate::ui::activity::activity_ring(activity, theme::accent_blue)
                                         .into_element()
                                 }
-                                Some(SessionState::Waiting) => text("?")
-                                    .font_weight(FontWeight::BOLD)
-                                    .text_color(theme::accent_yellow)
-                                    .into_element(),
-                                Some(SessionState::Failed) => view()
-                                    .size(px(theme::ICON_STATUS))
-                                    .rounded_full()
-                                    .bg(theme::accent_red)
-                                    .into_element(),
+                                Some(SessionState::Waiting) => {
+                                    surface::status_dot(theme::accent_yellow).into_element()
+                                }
+                                Some(SessionState::Failed) => {
+                                    surface::status_dot(theme::accent_red).into_element()
+                                }
                                 _ => view().into_element(),
                             }
-                        }))),
-                )
-                .child({
-                    let on_toggle_find = on_toggle_find.clone();
-                    action::icon_button(
-                        icon!("search"),
-                        copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
-                        move || on_toggle_find(),
-                    )
-                    .w(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                    .h(px(theme::HEADER_HEIGHT))
-                    .flex_shrink_0()
-                })
-                .child(
-                    button()
-                        .w(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-                        .h(px(theme::HEADER_HEIGHT))
-                        .flex_shrink_0()
-                        .relative()
-                        .items_center()
-                        .justify_center()
-                        .active(|style| style.bg(theme::row_pressed_bg()))
-                        .accessibility_label(copy::text(
-                            "Files, Git, and terminal",
-                            "文件、Git 与终端",
-                            "檔案、Git 與終端機",
-                        ))
-                        .on_press(move || pager.open(ShellPage::Workbench))
+                        }))
                         .child(
-                            svg(icon!("panel-right"))
-                                .size(px(theme::ICON_MD))
-                                .text_color(theme::text_secondary),
+                            text(move || title.get())
+                                .truncate()
+                                .min_w(px(0.0))
+                                .flex_shrink(1.0)
+                                .text_size(px(theme::font_detail()))
+                                .font_weight(FontWeight::SEMIBOLD)
+                                .text_color(theme::foreground),
                         )
-                        .child(when(terminal_running, || {
-                            view()
-                                .absolute()
-                                .top(px(10.0))
-                                .right(px(10.0))
-                                .size(px(theme::SIDEBAR_STATUS_DOT))
-                                .rounded_full()
-                                .bg(theme::accent_success)
-                        })),
+                        .child(
+                            svg(icon!("chevron-down"))
+                                .size(px(12.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted)
+                                .style_when(move || !has_menu(), |style| style.hidden()),
+                        ),
                 ),
-        )
+            )
+            .child(
+                when(
+                    move || creating.get(),
+                    move || {
+                        let stop = on_stop_creating.clone();
+                        surface::round_button(
+                            icon!("x"),
+                            copy::text("Cancel", "取消", "取消"),
+                            move || {
+                                dismiss_keyboard();
+                                stop();
+                            },
+                        )
+                    },
+                )
+                .otherwise(move || {
+                    let on_new_session = on_new_session.clone();
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .child(surface::round_button(
+                            icon!("plus"),
+                            copy::text("New session", "新建会话", "新增工作階段"),
+                            move || {
+                                dismiss_keyboard();
+                                on_new_session();
+                            },
+                        ))
+                        .child(
+                            surface::round_button(
+                                icon!("panel-right"),
+                                copy::text(
+                                    "Files, Git, and terminal",
+                                    "文件、Git 与终端",
+                                    "檔案、Git 與終端機",
+                                ),
+                                move || pager.open(ShellPage::Workbench),
+                            )
+                            .relative()
+                            .child(when(terminal_running, || {
+                                surface::status_dot(theme::accent_success)
+                                    .absolute()
+                                    .top(px(3.0))
+                                    .right(px(3.0))
+                            })),
+                        )
+                }),
+            ),
+    )
 }
 
 fn active_session(host: &SessionHost) -> Memo<Option<SessionSummary>> {
@@ -1413,15 +1512,13 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                 .scrollbar(false)
                 .flex_shrink_0()
                 .w_full()
-                .border_b_1()
-                .border_b_color(theme::border_subtle)
                 .child(
                     view()
-                        .h(px(theme::DRAWER_SECTION_HEIGHT))
-                        .px(px(theme::SPACING_SM))
+                        .h(px(theme::ROUND_CONTROL))
+                        .px(px(theme::SPACING_MD))
                         .flex_row()
                         .items_center()
-                        .gap(px(theme::SPACING_XS))
+                        .gap(px(6.0))
                         .child(each(
                             move || members.get(),
                             String::clone,
@@ -1447,12 +1544,17 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                     .flex_shrink_0()
                                     .flex_row()
                                     .items_center()
-                                    .px(px(theme::SPACING_SM))
-                                    .gap(px(theme::SPACING_XS))
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .style_when(selected, |style| {
-                                        style.bg(theme::sidebar_selected_bg())
+                                    .px(px(theme::SPACING_MD))
+                                    .gap(px(6.0))
+                                    .rounded_full()
+                                    .bg(move || {
+                                        if selected() {
+                                            theme::fill_strong()
+                                        } else {
+                                            theme::fill()
+                                        }
                                     })
+                                    .active(|style| style.opacity(0.6))
                                     .on_press(move || on_select(&id))
                                     .child(dynamic(move || {
                                         svg(icon(agent_icon(&session.with(|session| {
@@ -1460,7 +1562,8 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                                 session.agent.clone()
                                             })
                                         }))))
-                                        .size(px(theme::SIDEBAR_AGENT_LOGO_SIZE))
+                                        .size(px(14.0))
+                                        .flex_shrink_0()
                                         .text_color(theme::text_secondary)
                                     }))
                                     .child(
@@ -1475,8 +1578,15 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                         })
                                         .truncate()
                                         .min_w(px(0.0))
-                                        .text_size(px(theme::font_caption()))
-                                        .text_color(theme::foreground),
+                                        .text_size(px(theme::font_micro()))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(move || {
+                                            if selected() {
+                                                theme::foreground()
+                                            } else {
+                                                theme::text_secondary()
+                                            }
+                                        }),
                                     )
                             },
                         )),
@@ -1497,55 +1607,56 @@ fn connection_banner(
 ) -> impl IntoElement {
     view()
         .w_full()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SPACING_SM))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_XS))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .bg(theme::background_card)
+        .flex_shrink_0()
+        .px(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_XS))
         .child(
             view()
-                .w(px(8.0))
-                .h(px(8.0))
-                .flex_shrink_0()
-                .rounded(px(4.0))
-                .bg(move || match connection.get() {
-                    ConnectionState::Connecting => theme::color_token("warning"),
-                    ConnectionState::Online => theme::color_token("chart-1"),
+                .w_full()
+                .min_h(px(theme::ROUND_CONTROL))
+                .pl(px(surface::ROW_INSET))
+                .pr(px(theme::SPACING_XS))
+                .flex_row()
+                .items_center()
+                .gap(px(10.0))
+                .rounded(px(theme::RADIUS_BUTTON))
+                .bg(theme::fill)
+                .child(surface::status_dot(move || match connection.get() {
+                    ConnectionState::Connecting => theme::accent_yellow(),
+                    ConnectionState::Online => theme::accent_success(),
                     ConnectionState::Offline => theme::accent_red(),
-                }),
-        )
-        .child(
-            text(move || {
-                error.get().unwrap_or_else(|| {
-                    match connection.get() {
-                        ConnectionState::Connecting => {
-                            copy::text("Reconnecting...", "正在重新连接…", "正在重新連線…")
-                        }
-                        ConnectionState::Online => copy::text("Connected", "已连接", "已連線"),
-                        ConnectionState::Offline => {
-                            copy::text("Desktop is unavailable", "桌面端不可用", "桌面版無法使用")
-                        }
-                    }
-                    .into()
-                })
-            })
-            .flex_1()
-            .truncate()
-            .text_size(px(theme::font_caption()))
-            .text_color(theme::text_secondary),
-        )
-        .child(
-            action::secondary(
-                copy::text("Retry", "重试", "重試"),
-                icon(include_str!("../../../assets/icons/refresh.svg")),
-                false,
-                move || on_retry(),
-            )
-            .disabled(move || connection.get() == ConnectionState::Connecting)
-            .disabled_style(|style| style.opacity(0.4)),
+                }))
+                .child(
+                    text(move || {
+                        error.get().unwrap_or_else(|| {
+                            match connection.get() {
+                                ConnectionState::Connecting => copy::text(
+                                    "Reconnecting...",
+                                    "正在重新连接…",
+                                    "正在重新連線…",
+                                ),
+                                ConnectionState::Online => {
+                                    copy::text("Connected", "已连接", "已連線")
+                                }
+                                ConnectionState::Offline => copy::text(
+                                    "Desktop is unavailable",
+                                    "桌面端不可用",
+                                    "桌面版無法使用",
+                                ),
+                            }
+                            .into()
+                        })
+                    })
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(theme::font_caption()))
+                    .text_color(theme::text_secondary),
+                )
+                .child(
+                    action::link(copy::text("Retry", "重试", "重試"), move || on_retry())
+                        .disabled(move || connection.get() == ConnectionState::Connecting),
+                ),
         )
 }
 
@@ -1595,6 +1706,7 @@ fn timeline_view(
         entries: source,
         visible,
         reveal: reveal_row.clone(),
+        clock: crate::ui::activity::ActivityClock::start(),
         open_file: {
             let open_files = host.on_open_files.clone();
             let open_file = host.on_open_file.clone();
@@ -1693,26 +1805,22 @@ fn timeline_view(
             move || active.get().is_none(),
             move || {
                 let on_new = on_new.clone();
-                view()
-                    .flex_1()
-                    .items_center()
-                    .justify_center()
-                    .gap(px(theme::SPACING_SM))
-                    .child(
-                        text(copy::text(
-                            "No session selected",
-                            "未选择会话",
-                            "未選擇工作階段",
-                        ))
-                        .text_color(theme::text_muted)
-                        .text_size(px(theme::font_body())),
-                    )
-                    .child(action::secondary(
+                surface::empty_state(
+                    icon!("message-square"),
+                    copy::text("No session open", "没有打开的会话", "沒有開啟的工作階段"),
+                    copy::text(
+                        "Pick one from the sessions page, or start a new one.",
+                        "从会话页选择一个，或者新建一个。",
+                        "從工作階段頁選擇一個，或者新增一個。",
+                    ),
+                )
+                .child(
+                    action::tonal(
                         copy::text("New session", "新建会话", "新增工作階段"),
-                        icon!("plus"),
-                        false,
                         move || on_new(),
-                    ))
+                    )
+                    .mt(px(theme::SPACING_SM)),
+                )
             },
         ))
         .child(when(
@@ -1728,17 +1836,27 @@ fn timeline_view(
                                 session.as_ref().is_some_and(|session| session.terminal)
                             }) {
                                 let on_terminal = on_terminal.clone();
-                                return view()
-                                    .flex_1()
-                                    .items_center()
-                                    .justify_center()
-                                    .child(action::secondary(
+                                return surface::empty_state(
+                                    icon!("square-terminal"),
+                                    copy::text(
+                                        "This session runs in a terminal",
+                                        "这个会话运行在终端中",
+                                        "這個工作階段在終端機中執行",
+                                    ),
+                                    copy::text(
+                                        "Its screen is on the workbench.",
+                                        "它的画面在工作台里。",
+                                        "它的畫面在工作台裡。",
+                                    ),
+                                )
+                                .child(
+                                    action::tonal(
                                         copy::text("Open terminal", "打开终端", "開啟終端機"),
-                                        icon!("square-terminal"),
-                                        false,
                                         move || on_terminal(),
-                                    ))
-                                    .into_element();
+                                    )
+                                    .mt(px(theme::SPACING_SM)),
+                                )
+                                .into_element();
                             }
                             match status.get() {
                                 ConversationState::Loading => empty_hint(copy::text(
@@ -1747,32 +1865,35 @@ fn timeline_view(
                                     "正在載入工作階段…",
                                 ))
                                 .into_element(),
-                                ConversationState::Ready => empty_hint(copy::text(
-                                    "No messages yet",
-                                    "还没有消息",
-                                    "還沒有訊息",
-                                ))
+                                ConversationState::Ready => surface::empty_state(
+                                    icon!("message-square"),
+                                    copy::text("No messages yet", "还没有消息", "還沒有訊息"),
+                                    copy::text(
+                                        "Write the first one below.",
+                                        "在下方写下第一条消息。",
+                                        "在下方寫下第一則訊息。",
+                                    ),
+                                )
                                 .into_element(),
                                 ConversationState::Failed(error) => {
                                     let on_refresh = on_refresh.clone();
-                                    view()
-                                        .flex_1()
-                                        .items_center()
-                                        .justify_center()
-                                        .gap(px(theme::SPACING_SM))
-                                        .px(px(theme::SPACING_LG))
-                                        .child(
-                                            text(error)
-                                                .text_size(px(theme::font_body()))
-                                                .text_color(theme::accent_red),
-                                        )
-                                        .child(action::secondary(
+                                    surface::empty_state(
+                                        icon!("triangle-alert"),
+                                        error,
+                                        copy::text(
+                                            "The conversation could not be read.",
+                                            "无法读取这个会话。",
+                                            "無法讀取這個工作階段。",
+                                        ),
+                                    )
+                                    .child(
+                                        action::tonal(
                                             copy::text("Retry", "重试", "重試"),
-                                            icon!("refresh"),
-                                            false,
                                             move || on_refresh(),
-                                        ))
-                                        .into_element()
+                                        )
+                                        .mt(px(theme::SPACING_SM)),
+                                    )
+                                    .into_element()
                                 }
                             }
                         }
@@ -1787,41 +1908,6 @@ fn timeline_view(
                     .flex_1()
                     .min_h(px(0.0))
                     .flex_col()
-                    .child(when(move || has_older.get(), {
-                        let on_load_older = on_load_older.clone();
-                        move || {
-                            let on_load_older = on_load_older.clone();
-                            button()
-                                .on_press(move || {
-                                    if !loading_older.get_untracked() {
-                                        on_load_older();
-                                    }
-                                })
-                                .w_full()
-                                .min_h(px(36.0))
-                                .items_center()
-                                .justify_center()
-                                .child(
-                                    text(move || {
-                                        if loading_older.get() {
-                                            copy::text(
-                                                "Loading earlier...",
-                                                "正在加载更早的消息…",
-                                                "正在載入更早的訊息…",
-                                            )
-                                        } else {
-                                            copy::text(
-                                                "Load earlier messages",
-                                                "加载更早的消息",
-                                                "載入更早的訊息",
-                                            )
-                                        }
-                                    })
-                                    .text_size(px(theme::font_caption()))
-                                    .text_color(theme::text_muted),
-                                )
-                        }
-                    }))
                     .child(when(move || find_open.get(), {
                         let close = find_open;
                         let find_reveal = find_reveal.clone();
@@ -1832,6 +1918,47 @@ fn timeline_view(
                                 find_cursor,
                                 find_reveal.clone(),
                                 close,
+                            )
+                        }
+                    }))
+                    .child(when(move || has_older.get(), {
+                        let on_load_older = on_load_older.clone();
+                        move || {
+                            let on_load_older = on_load_older.clone();
+                            view().w_full().items_center().py(px(theme::SPACING_XS)).child(
+                                button()
+                                    .on_press(move || {
+                                        if !loading_older.get_untracked() {
+                                            on_load_older();
+                                        }
+                                    })
+                                    .h(px(theme::CHIP_HEIGHT))
+                                    .px(px(surface::ROW_INSET))
+                                    .rounded_full()
+                                    .bg(theme::fill)
+                                    .items_center()
+                                    .justify_center()
+                                    .active(|style| style.opacity(0.6))
+                                    .child(
+                                        text(move || {
+                                            if loading_older.get() {
+                                                copy::text(
+                                                    "Loading earlier...",
+                                                    "正在加载更早的消息…",
+                                                    "正在載入更早的訊息…",
+                                                )
+                                            } else {
+                                                copy::text(
+                                                    "Load earlier messages",
+                                                    "加载更早的消息",
+                                                    "載入更早的訊息",
+                                                )
+                                            }
+                                        })
+                                        .text_size(px(theme::font_micro()))
+                                        .font_weight(FontWeight::MEDIUM)
+                                        .text_color(theme::text_secondary),
+                                    ),
                             )
                         }
                     }))
@@ -1874,10 +2001,14 @@ fn timeline_view(
                                 })
                                 .flex_1(),
                             )
+                            // The transcript runs out under the header and
+                            // the prompt card rather than being cut by them.
+                            .child(edge_fade(true))
+                            .child(edge_fade(false))
                             .child(when(
                                 move || away_from_end.get() && !find_open.get(),
                                 move || {
-                                    action::icon_button(
+                                    surface::round_button(
                                         icon!("chevron-down"),
                                         copy::text(
                                             "Jump to latest",
@@ -1890,11 +2021,12 @@ fn timeline_view(
                                         },
                                     )
                                     .absolute()
-                                    .bottom(px(theme::SPACING_SM))
+                                    .bottom(px(theme::SPACING_MD))
                                     .right(px(theme::SPACING_LG))
-                                    .bg(theme::background_card)
+                                    .bg(theme::block_surface)
                                     .border_1()
-                                    .border_color(theme::border_subtle)
+                                    .border_color(theme::hairline)
+                                    .shadow_md()
                                 },
                             ))
                     })
@@ -1961,39 +2093,50 @@ fn find_bar(
     });
     view()
         .w_full()
+        .flex_shrink_0()
         .flex_row()
         .items_center()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_XS))
-        .border_b_1()
-        .border_b_color(theme::border_subtle)
-        .bg(theme::background_card)
+        .gap(px(2.0))
+        .pl(px(theme::SPACING_MD))
+        .pr(px(theme::SPACING_SM))
+        .pb(px(theme::SPACING_SM))
         .child(
-            field::text_field_with(
-                query,
-                copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
-                {
-                    let reveal = reveal.clone();
-                    move |_| {
-                        cursor.set(0);
-                        if let Some(id) = matches.with(|matches| matches.first().cloned()) {
-                            reveal(&id);
-                        }
-                    }
-                },
-            )
-            .min_w(px(0.0))
-            .flex_1(),
-        )
-        .child(
-            text(move || count.get())
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
+            surface::field_pill()
+                .flex_1()
+                .min_w(px(0.0))
+                .pr(px(theme::SPACING_MD))
+                .mr(px(theme::SPACING_XS))
+                .child(surface::field_glyph(icon!("search")))
+                .child(
+                    field::text_field_bare_with(
+                        query,
+                        copy::text("Find in conversation", "在会话中查找", "在工作階段中尋找"),
+                        {
+                            let reveal = reveal.clone();
+                            move |_| {
+                                cursor.set(0);
+                                if let Some(id) = matches.with(|matches| matches.first().cloned()) {
+                                    reveal(&id);
+                                }
+                            }
+                        },
+                    )
+                    .auto_focus(true)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .h_full(),
+                )
+                .child(
+                    text(move || count.get())
+                        .flex_shrink_0()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                ),
         )
         .child(find_step(true, matches, cursor, reveal.clone()))
         .child(find_step(false, matches, cursor, reveal))
-        .child(small_action(
+        .child(surface::ghost_button(
+            icon!("x"),
             copy::text("Close", "关闭", "關閉"),
             move || {
                 close.set(false);
@@ -2008,7 +2151,7 @@ fn find_step(
     cursor: Signal<usize>,
     reveal: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
-    action::icon_button(
+    surface::ghost_button(
         if previous {
             icon!("chevron-up")
         } else {
@@ -2035,10 +2178,7 @@ fn find_step(
             }
         },
     )
-    .size(px(theme::HEADER_TRAILING_BUTTON_SIZE))
-    .flex_shrink_0()
     .disabled(move || matches.with(Vec::is_empty))
-    .disabled_style(|style| style.opacity(0.4))
 }
 
 pub(super) fn empty_hint(message: &'static str) -> impl IntoElement {
@@ -2062,6 +2202,184 @@ struct TranscriptActions {
     visible: Memo<Vec<usize>>,
     reveal: RevealRow,
     open_file: Rc<dyn Fn(&str)>,
+    /// The clock every working mark in the transcript turns by.
+    clock: crate::ui::activity::ActivityClock,
+}
+
+/// The line a working row is named on.
+const STEP_HEIGHT: f32 = 38.0;
+/// The column a turn's rail and its nodes take.
+const RAIL_SLOT: f32 = 20.0;
+/// A node on the rail: the glyph of one step.
+const RAIL_NODE: f32 = 20.0;
+/// The gap the rail keeps from a node.
+const RAIL_GAP: f32 = 2.0;
+
+/// How one working row hangs on its turn's rail. A turn's work is a fold and
+/// the rows under it; the rail runs from the fold through each of them, so
+/// they read as one run however many rows it takes.
+#[derive(Clone, Copy)]
+struct Rail {
+    /// The row is inside a fold: the rail reaches it from above.
+    above: Memo<bool>,
+    /// The row after it is inside one too: the rail goes on below.
+    below: Memo<bool>,
+}
+
+/// The strip the transcript fades out in at one of its edges.
+fn edge_fade(top: bool) -> impl IntoElement {
+    let strip = view()
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .h(px(theme::SPACING_MD))
+        .gradient_from(theme::background_adaptive)
+        .gradient_to(theme::background_clear_adaptive)
+        .pointer_events(PointerEvents::None);
+    if top {
+        strip.top(px(0.0)).bg_linear_to_b()
+    } else {
+        strip.bottom(px(0.0)).bg_linear_to_t()
+    }
+}
+
+/// A step of a turn's work: its node on the rail, the line that names it, and
+/// what it opens under that line.
+fn step(
+    rail: Rail,
+    node: impl IntoElement,
+    line: impl IntoElement,
+    body: impl IntoElement,
+) -> impl IntoElement {
+    let node_top = (STEP_HEIGHT - RAIL_NODE) / 2.0;
+    let segment = || {
+        view()
+            .absolute()
+            .left(px((RAIL_SLOT - 1.0) / 2.0))
+            .w(px(1.0))
+            .bg(theme::border_default)
+    };
+    view()
+        .w_full()
+        .min_w(px(0.0))
+        .flex_row()
+        .child(
+            view()
+                .w(px(RAIL_SLOT))
+                .flex_shrink_0()
+                .relative()
+                .child(
+                    segment()
+                        .top(px(0.0))
+                        .h(px(node_top - RAIL_GAP))
+                        .style_when(move || !rail.above.get(), |style| style.hidden()),
+                )
+                .child(
+                    segment()
+                        .top(px(node_top + RAIL_NODE + RAIL_GAP))
+                        .bottom(px(0.0))
+                        .style_when(move || !rail.below.get(), |style| style.hidden()),
+                )
+                .child(
+                    view()
+                        .absolute()
+                        .top(px(node_top))
+                        .left(px(0.0))
+                        .size(px(RAIL_NODE))
+                        .items_center()
+                        .justify_center()
+                        .child(node),
+                ),
+        )
+        .child(
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_col()
+                .pl(px(theme::SPACING_SM))
+                .child(line)
+                .child(body),
+        )
+}
+
+/// A step's node: the glyph of what it did, in the ink of how it went.
+fn step_node(glyph: ImageSrc, ink: impl Fn() -> Hsla + 'static) -> impl IntoElement {
+    svg(glyph).size(px(15.0)).text_color(ink)
+}
+
+/// The line a fold or a group is named on: its name, the working mark while
+/// it runs, and the disclosure when it opens.
+fn step_line(
+    title: Memo<String>,
+    running: Memo<bool>,
+    expanded: Memo<bool>,
+    expandable: Memo<bool>,
+    clock: crate::ui::activity::ActivityClock,
+    on_toggle: impl Fn() + 'static,
+) -> impl IntoElement {
+    button()
+        .w_full()
+        .min_h(px(STEP_HEIGHT))
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_CONTROL))
+        .accessibility_label(move || SharedString::from(title.get()))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled(move || !expandable.get())
+        .on_press(on_toggle)
+        .child(
+            text(move || title.get())
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(theme::font_detail()))
+                .text_color(theme::text_secondary),
+        )
+        .child(when(
+            move || running.get(),
+            move || crate::ui::activity::activity_ring(clock, theme::accent_blue),
+        ))
+        .child(when(
+            move || expandable.get(),
+            move || disclosure_chevron(expanded),
+        ))
+}
+
+/// The line that says the Agent is at work before it has anything to show.
+fn working_row(body: Memo<String>, clock: crate::ui::activity::ActivityClock) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .py(px(theme::SPACING_SM))
+        .child(crate::ui::activity::activity_ring(clock, theme::accent_blue))
+        .child(
+            text(move || body.get())
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(theme::font_detail()))
+                .text_color(theme::text_muted),
+        )
+}
+
+/// A note from the system: said beside the conversation, not in it.
+fn notice_row(body: Memo<String>) -> impl IntoElement {
+    view().w_full().py(px(theme::SPACING_XS)).child(
+        view()
+            .w_full()
+            .rounded(px(theme::RADIUS_CHIP))
+            .bg(theme::fill)
+            .px(px(theme::SPACING_MD))
+            .py(px(theme::SPACING_SM))
+            .child(
+                text(move || body.get())
+                    .text_size(px(theme::font_caption()))
+                    .line_height(theme::line_height_for(theme::font_caption()))
+                    .text_color(theme::text_secondary),
+            ),
+    )
 }
 
 fn entry_row(
@@ -2079,10 +2397,25 @@ fn entry_row(
                 .and_then(|&index| entries.with(|entries| entries.get(index).cloned()))
         })
     });
+    let rail = Rail {
+        above: computed(move || {
+            entry.with(|entry| entry.as_ref().is_some_and(|entry| entry.parent_id.is_some()))
+        }),
+        below: computed(move || {
+            visible.with(|indices| {
+                indices.get(at.index() + 1).is_some_and(|&index| {
+                    entries.with(|entries| {
+                        entries
+                            .get(index)
+                            .is_some_and(|entry| entry.parent_id.is_some())
+                    })
+                })
+            })
+        }),
+    };
     view()
         .w_full()
         .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_SM))
         .style_when(
             move || {
                 entry.with(|entry| {
@@ -2096,11 +2429,12 @@ fn entry_row(
             },
             |style| style.bg(theme::sidebar_selected_bg()),
         )
-        .child(entry_element(entry, actions))
+        .child(entry_element(entry, rail, actions))
 }
 
 fn entry_element(
     entry: Memo<Option<TimelineEntry>>,
+    rail: Rail,
     actions: TranscriptActions,
 ) -> impl IntoElement {
     let TranscriptActions {
@@ -2114,6 +2448,7 @@ fn entry_element(
         entries,
         reveal,
         open_file,
+        clock,
         ..
     } = actions;
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
@@ -2161,7 +2496,6 @@ fn entry_element(
     view()
         .w_full()
         .flex_col()
-        .gap(px(theme::SPACING_XS))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::User)),
             move || {
@@ -2188,6 +2522,8 @@ fn entry_element(
                         expanded,
                         expandable,
                         row_id,
+                        rail,
+                        clock,
                         on_toggle_turn.clone(),
                     )
                 }
@@ -2199,13 +2535,19 @@ fn entry_element(
                 let on_toggle_turn = on_toggle_turn.clone();
                 move || {
                     let toggle = on_toggle_turn.clone();
-                    disclosure_header(
-                        icon!("layers"),
-                        title,
-                        streaming,
-                        expanded,
-                        expandable,
-                        move || toggle(&row_id.get_untracked()),
+                    step(
+                        rail,
+                        step_node(icon!("layers"), move || {
+                            if streaming.get() {
+                                theme::accent_blue()
+                            } else {
+                                theme::text_muted()
+                            }
+                        }),
+                        step_line(title, streaming, expanded, expandable, clock, move || {
+                            toggle(&row_id.get_untracked())
+                        }),
+                        view(),
                     )
                 }
             },
@@ -2222,6 +2564,7 @@ fn entry_element(
                         sequence,
                         prompt,
                         jump,
+                        clock,
                         on_fork.clone(),
                     )
                 }
@@ -2231,7 +2574,17 @@ fn entry_element(
             move || kind.with(|kind| *kind == Some(EntryKind::Reasoning)),
             {
                 let toggle = toggle_detail.clone();
-                move || reasoning_row(body, streaming, expanded, expandable, toggle.clone())
+                move || {
+                    reasoning_row(
+                        body,
+                        streaming,
+                        expanded,
+                        expandable,
+                        rail,
+                        clock,
+                        toggle.clone(),
+                    )
+                }
             },
         ))
         .child(when(
@@ -2244,13 +2597,19 @@ fn entry_element(
                     streaming,
                     expanded,
                     expandable,
+                    rail,
+                    clock,
                     toggle_detail.clone(),
                 )
             },
         ))
         .child(when(
-            move || matches!(kind.get(), Some(EntryKind::Notice | EntryKind::Generating)),
-            move || muted_prose(copy::text("Activity", "活动", "活動"), body),
+            move || kind.get() == Some(EntryKind::Generating),
+            move || working_row(body, clock),
+        ))
+        .child(when(
+            move || kind.get() == Some(EntryKind::Notice),
+            move || notice_row(body),
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Error)),
@@ -2268,6 +2627,8 @@ fn entry_element(
         ))
 }
 
+/// What the reader wrote: a bubble on their side of the page, its one sharp
+/// corner pointing at it.
 fn user_bubble(
     body: Memo<String>,
     meta: Memo<String>,
@@ -2282,21 +2643,24 @@ fn user_bubble(
         .flex_col()
         .items_end()
         .gap(px(theme::SPACING_XS))
+        .pt(px(theme::SPACING_MD))
         .child(when(
             move || !meta.with(String::is_empty),
             move || {
                 text(move || meta.get())
-                    .text_size(px(theme::font_micro()))
+                    .pr(px(theme::SPACING_XS))
+                    .text_size(px(theme::font_hint()))
                     .text_color(theme::text_muted)
             },
         ))
         .child(
             view()
-                .max_w(px(320.0))
-                .rounded(px(14.0))
-                .bg(theme::background_dim)
-                .px(px(theme::SPACING_MD))
-                .py(px(theme::SPACING_SM))
+                .max_w(relative(0.86))
+                .rounded(px(theme::RADIUS_BUBBLE))
+                .rounded_br(px(theme::RADIUS_BUBBLE_TAIL))
+                .bg(theme::bubble)
+                .px(px(surface::ROW_INSET))
+                .py(px(10.0))
                 .child(
                     text(move || body.get())
                         .selectable(true)
@@ -2313,6 +2677,7 @@ fn user_bubble(
             view()
                 .flex_row()
                 .items_center()
+                .mr(px(-6.0))
                 .child(when(
                     move || sequence.get() > 0 && editable_sequence.get() == sequence.get(),
                     move || {
@@ -2353,15 +2718,24 @@ fn message_attachments(
                     })
                     .flex_row()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
-                    .min_h(px(28.0))
-                    .px(px(theme::SPACING_SM))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .border_1()
-                    .border_color(theme::border_subtle)
-                    .bg(theme::background_dim)
+                    .gap(px(6.0))
+                    .h(px(30.0))
+                    .max_w(relative(1.0))
+                    .px(px(10.0))
+                    .rounded_full()
+                    .bg(theme::fill)
+                    .active(|style| style.opacity(0.6))
+                    .child(
+                        svg(icon!("paperclip"))
+                            .size(px(13.0))
+                            .flex_shrink_0()
+                            .text_color(theme::text_muted),
+                    )
                     .child(
                         text(move || item.with(|item| item.label.clone()))
+                            .min_w(px(0.0))
+                            .flex_shrink(1.0)
+                            .truncate()
                             .text_size(px(theme::font_micro()))
                             .text_color(theme::text_secondary),
                     )
@@ -2369,6 +2743,7 @@ fn message_attachments(
         ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn process_header_row(
     started_at_ms: Memo<i64>,
     ended_at_ms: Memo<i64>,
@@ -2376,6 +2751,8 @@ fn process_header_row(
     expanded: Memo<bool>,
     expandable: Memo<bool>,
     row_id: Memo<String>,
+    rail: Rail,
+    clock: crate::ui::activity::ActivityClock,
     on_toggle: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     let title = computed(move || {
@@ -2390,79 +2767,20 @@ fn process_header_row(
         )
     });
     let running = computed(move || !complete.get());
-    disclosure_header(
-        icon!("activity"),
-        title,
-        running,
-        expanded,
-        expandable,
-        move || on_toggle(&row_id.get_untracked()),
-    )
-}
-
-fn disclosure_header(
-    glyph: ImageSrc,
-    title: Memo<String>,
-    running: Memo<bool>,
-    expanded: Memo<bool>,
-    expandable: Memo<bool>,
-    on_toggle: impl Fn() + 'static,
-) -> impl IntoElement {
-    let label = move || SharedString::from(title.get());
-    let content = move || {
-        view()
-            .w_full()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::SPACING_SM))
-            .child(
-                svg(glyph.clone())
-                    .size(px(theme::ICON_SM))
-                    .flex_shrink_0()
-                    .text_color(theme::text_muted),
-            )
-            .child(
-                text(move || title.get())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .text_size(px(theme::font_detail()))
-                    .text_color(theme::text_secondary),
-            )
-            .child(when(
-                move || running.get(),
-                || {
-                    text(copy::text("Running", "运行中", "執行中"))
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted)
-                },
-            ))
-            .child(when(
-                move || expandable.get(),
-                move || disclosure_chevron(expanded),
-            ))
-    };
-    let action = Rc::new(on_toggle);
-    when(move || expandable.get(), {
-        let content = content.clone();
-        move || {
-            let action = action.clone();
-            button()
-                .w_full()
-                .min_h(px(theme::TOUCH_TARGET))
-                .justify_center()
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .accessibility_label(label)
-                .on_press(move || action())
-                .child(content())
-        }
-    })
-    .otherwise(move || {
-        view()
-            .w_full()
-            .min_h(px(theme::TOUCH_TARGET))
-            .justify_center()
-            .child(content())
-    })
+    view().w_full().pt(px(theme::SPACING_XS)).child(step(
+        rail,
+        step_node(icon!("activity"), move || {
+            if running.get() {
+                theme::accent_blue()
+            } else {
+                theme::text_muted()
+            }
+        }),
+        step_line(title, running, expanded, expandable, clock, move || {
+            on_toggle(&row_id.get_untracked())
+        }),
+        view(),
+    ))
 }
 
 fn disclosure_chevron(expanded: Memo<bool>) -> impl IntoElement {
@@ -2472,7 +2790,7 @@ fn disclosure_chevron(expanded: Memo<bool>) -> impl IntoElement {
         } else {
             icon!("chevron-right")
         })
-        .size(px(theme::ICON_SM))
+        .size(px(14.0))
         .flex_shrink_0()
         .text_color(theme::text_muted)
     })
@@ -2492,6 +2810,9 @@ fn work_duration(started_at_ms: i64, ended_at_ms: i64, complete: bool) -> String
     }
 }
 
+/// What the Agent answered: its name over the prose, and under it what the
+/// reader can do with the answer.
+#[allow(clippy::too_many_arguments)]
 fn agent_prose(
     title: Memo<String>,
     body: Memo<String>,
@@ -2499,31 +2820,37 @@ fn agent_prose(
     sequence: Memo<i64>,
     prompt: Memo<Option<i64>>,
     jump: Signal<Option<i64>>,
+    clock: crate::ui::activity::ActivityClock,
     on_fork: Rc<dyn Fn(i64)>,
 ) -> impl IntoElement {
     let images = computed(move || markdown_images(&body.get()));
     view()
         .w_full()
         .flex_col()
-        .gap(px(theme::SPACING_XS))
+        .gap(px(6.0))
+        .pt(px(theme::SPACING_SM))
+        .pb(px(theme::SPACING_XS))
         .child(
             view()
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .gap(px(6.0))
+                .min_h(px(crate::ui::activity::ACTIVITY_SLOT))
+                .child(dynamic(move || {
+                    svg(icon(agent_icon(&title.get())))
+                        .size(px(14.0))
+                        .flex_shrink_0()
+                        .text_color(theme::text_secondary)
+                }))
                 .child(
                     text(move || title.get())
                         .text_size(px(theme::font_micro()))
                         .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_muted),
+                        .text_color(theme::text_secondary),
                 )
                 .child(when(
                     move || streaming.get(),
-                    || {
-                        text("…")
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_muted)
-                    },
+                    move || crate::ui::activity::activity_ring(clock, theme::accent_blue),
                 )),
         )
         .child(
@@ -2541,7 +2868,7 @@ fn agent_prose(
                 view()
                     .w_full()
                     .flex_col()
-                    .gap(px(theme::SPACING_XS))
+                    .gap(px(theme::SPACING_SM))
                     .child(each(
                         move || images.get(),
                         |source| source.clone(),
@@ -2549,6 +2876,7 @@ fn agent_prose(
                             image(move || ImageSrc::from(source.get_untracked()))
                                 .w_full()
                                 .max_h(px(320.0))
+                                .rounded(px(theme::RADIUS_CHIP))
                                 .object_fit(nsh_core::ResizeMode::Contain)
                         },
                     ))
@@ -2561,6 +2889,7 @@ fn agent_prose(
                 view()
                     .flex_row()
                     .items_center()
+                    .ml(px(-8.0))
                     .child(copy_message(body))
                     .child(share_message(body))
                     .child(when(
@@ -2613,20 +2942,32 @@ fn markdown_images(text: &str) -> Vec<String> {
     images
 }
 
+/// One of the quiet controls under a message.
 fn row_action(icon: ImageSrc, label: &'static str, action: impl Fn() + 'static) -> ButtonElement {
-    action::icon_button(icon, label, action)
-        .size(px(theme::TOUCH_TARGET))
+    button()
+        .accessibility_label(label)
+        .on_press(action)
+        .size(px(theme::CHIP_HEIGHT))
         .flex_shrink_0()
+        .rounded_full()
+        .items_center()
+        .justify_center()
+        .hit_slop(px(6.0))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .disabled_style(|style| style.opacity(0.4))
+        .child(svg(icon).size(px(15.0)).text_color(theme::text_muted))
 }
 
 fn copy_message(body: Memo<String>) -> ButtonElement {
     row_action(
         icon!("copy"),
         copy::text("Copy", "复制", "複製"),
-        move || set_clipboard(body.get_untracked()),
+        move || {
+            crate::motion::tick();
+            set_clipboard(body.get_untracked())
+        },
     )
     .disabled(move || body.with(String::is_empty))
-    .disabled_style(|style| style.opacity(0.4))
 }
 
 fn share_message(body: Memo<String>) -> ButtonElement {
@@ -2641,60 +2982,6 @@ fn share_message(body: Memo<String>) -> ButtonElement {
         },
     )
     .disabled(move || body.with(String::is_empty))
-    .disabled_style(|style| style.opacity(0.4))
-}
-
-fn small_action_reactive(
-    label: impl Fn() -> &'static str + 'static,
-    on_press: impl Fn() + 'static,
-) -> ButtonElement {
-    button()
-        .on_press(on_press)
-        .min_h(px(28.0))
-        .px(px(theme::SPACING_SM))
-        .items_center()
-        .justify_center()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .active(|style| style.opacity(0.7))
-        .child(
-            text(label)
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-}
-
-fn small_action(label: &'static str, on_press: impl Fn() + 'static) -> ButtonElement {
-    button()
-        .on_press(on_press)
-        .min_h(px(28.0))
-        .px(px(theme::SPACING_SM))
-        .items_center()
-        .justify_center()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .active(|style| style.opacity(0.7))
-        .child(
-            text(label)
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-}
-
-fn muted_prose(label: &'static str, body: Memo<String>) -> impl IntoElement {
-    view()
-        .w_full()
-        .flex_col()
-        .gap(px(theme::SPACING_XS))
-        .child(
-            text(label)
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::font_detail()))
-                .line_height(theme::line_height_for(theme::font_detail()))
-                .text_color(theme::text_secondary),
-        )
 }
 
 fn reasoning_row(
@@ -2702,29 +2989,30 @@ fn reasoning_row(
     streaming: Memo<bool>,
     expanded: Memo<bool>,
     expandable: Memo<bool>,
+    rail: Rail,
+    clock: crate::ui::activity::ActivityClock,
     toggle: Rc<dyn Fn()>,
 ) -> impl IntoElement {
     let title = computed(move || copy::text("Thought", "思考", "思考").to_owned());
-    view()
-        .w_full()
-        .min_w(px(0.0))
-        .child(disclosure_header(
-            icon!("brain"),
-            title,
-            streaming,
-            expanded,
-            expandable,
-            move || toggle(),
-        ))
-        .child(when(
+    step(
+        rail,
+        step_node(icon!("brain"), move || {
+            if streaming.get() {
+                theme::accent_blue()
+            } else {
+                theme::text_muted()
+            }
+        }),
+        step_line(title, streaming, expanded, expandable, clock, move || {
+            toggle()
+        }),
+        when(
             move || expanded.get(),
             move || {
                 view()
                     .w_full()
                     .min_w(px(0.0))
-                    .pl(px(theme::SPACING_MD))
-                    .border_l_1()
-                    .border_color(theme::border_subtle)
+                    .pb(px(theme::SPACING_SM))
                     .style_when(
                         move || streaming.get(),
                         |style| {
@@ -2747,9 +3035,11 @@ fn reasoning_row(
                             .text_color(theme::text_muted),
                     )
             },
-        ))
+        ),
+    )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn activity_row(
     title: Memo<String>,
     body: Memo<String>,
@@ -2757,8 +3047,11 @@ fn activity_row(
     running: Memo<bool>,
     expanded: Memo<bool>,
     expandable: Memo<bool>,
+    rail: Rail,
+    clock: crate::ui::activity::ActivityClock,
     on_toggle: Rc<dyn Fn()>,
 ) -> impl IntoElement {
+    // A row filed under a group steps in from the rows of the fold itself.
     let grouped = computed(move || {
         entry.with(|entry| {
             entry
@@ -2794,122 +3087,119 @@ fn activity_row(
         });
         SharedString::from(label)
     };
-    view()
-        .w_full()
-        .min_w(px(0.0))
-        .style_when(
-            move || grouped.get(),
-            |style| {
-                style
-                    .pl(px(theme::SPACING_SM))
-                    .border_l_1()
-                    .border_color(theme::border_subtle)
-            },
-        )
-        .child(
-            button()
-                .w_full()
-                .min_h(px(theme::TOUCH_TARGET))
-                .flex_row()
-                .items_center()
-                .gap(px(theme::SPACING_SM))
-                .accessibility_label(label)
-                .active(|style| style.bg(theme::row_pressed_bg()))
-                .disabled(move || !expandable.get())
-                .on_press(move || on_toggle())
-                .child(dynamic(move || {
-                    svg(activity_glyph_icon(activity.with(|value| {
-                        value
-                            .as_ref()
-                            .map(|activity| activity.glyph)
-                            .unwrap_or(ActivityGlyph::Tool)
-                    })))
-                    .size(px(theme::ICON_SM))
-                    .flex_shrink_0()
-                    .text_color(move || {
-                        if failed.get() {
-                            theme::accent_red()
-                        } else {
-                            theme::text_muted()
-                        }
-                    })
-                }))
-                .child(
-                    view()
-                        .flex_1()
-                        .min_w(px(0.0))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_XS))
-                        .child(
-                            text(move || title.get())
+    let ink = move || {
+        if failed.get() {
+            theme::accent_red()
+        } else if running.get() {
+            theme::accent_blue()
+        } else {
+            theme::text_muted()
+        }
+    };
+    step(
+        rail,
+        dynamic(move || {
+            svg(activity_glyph_icon(activity.with(|value| {
+                value
+                    .as_ref()
+                    .map(|activity| activity.glyph)
+                    .unwrap_or(ActivityGlyph::Tool)
+            })))
+            .size(px(15.0))
+            .text_color(ink)
+        }),
+        button()
+            .w_full()
+            .min_h(px(STEP_HEIGHT))
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACING_SM))
+            .rounded(px(theme::RADIUS_CONTROL))
+            .style_when(
+                move || grouped.get(),
+                |style| style.pl(px(theme::SPACING_SM)),
+            )
+            .accessibility_label(label)
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .disabled(move || !expandable.get())
+            .on_press(move || on_toggle())
+            .child(
+                view()
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .flex_row()
+                    .items_center()
+                    .gap(px(6.0))
+                    .child(
+                        text(move || title.get())
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(theme::font_detail()))
+                            .text_color(theme::text_secondary),
+                    )
+                    .child(when(
+                        move || !target.with(String::is_empty),
+                        move || {
+                            text(move || target.get())
+                                .flex_1()
                                 .min_w(px(0.0))
                                 .truncate()
                                 .text_size(px(theme::font_detail()))
-                                .text_color(theme::text_secondary),
-                        )
-                        .child(when(
-                            move || !target.with(String::is_empty),
-                            move || {
-                                text(move || target.get())
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(theme::font_detail()))
-                                    .text_color(theme::text_muted)
-                            },
-                        )),
-                )
-                .child(
-                    text(move || {
-                        if failed.get() {
-                            copy::text("Failed", "失败", "失敗").to_owned()
-                        } else if running.get() {
-                            copy::text("Running", "运行中", "執行中").to_owned()
-                        } else {
-                            activity.with(|value| {
-                                value
-                                    .as_ref()
-                                    .and_then(|activity| activity.duration.clone())
-                                    .unwrap_or_default()
-                            })
-                        }
-                    })
-                    .flex_shrink_0()
-                    .text_size(px(theme::font_micro()))
-                    .text_color(move || {
-                        if failed.get() {
-                            theme::accent_red()
-                        } else {
-                            theme::text_muted()
-                        }
-                    }),
-                )
-                .child(when(
-                    move || expandable.get(),
-                    move || disclosure_chevron(expanded),
-                )),
-        )
-        .child(when(
-            move || failed.get() && !expanded.get(),
-            move || {
-                text(move || {
-                    activity.with(|value| {
+                                .text_color(theme::text_muted)
+                        },
+                    )),
+            )
+            .child(dynamic(move || {
+                if failed.get() {
+                    text(copy::text("Failed", "失败", "失敗"))
+                        .flex_shrink_0()
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::accent_red)
+                        .into_element()
+                } else if running.get() {
+                    crate::ui::activity::activity_ring(clock, theme::accent_blue).into_element()
+                } else {
+                    text(activity.with(|value| {
                         value
                             .as_ref()
-                            .and_then(|activity| activity.error.clone())
+                            .and_then(|activity| activity.duration.clone())
                             .unwrap_or_default()
+                    }))
+                    .flex_shrink_0()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+                    .into_element()
+                }
+            }))
+            .child(when(
+                move || expandable.get(),
+                move || disclosure_chevron(expanded),
+            )),
+        view()
+            .w_full()
+            .min_w(px(0.0))
+            .child(when(
+                move || failed.get() && !expanded.get(),
+                move || {
+                    text(move || {
+                        activity.with(|value| {
+                            value
+                                .as_ref()
+                                .and_then(|activity| activity.error.clone())
+                                .unwrap_or_default()
+                        })
                     })
-                })
-                .truncate()
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::accent_red)
-            },
-        ))
-        .child(when(
-            move || expanded.get(),
-            move || activity_details_view(activity, body),
-        ))
+                    .truncate()
+                    .pb(px(theme::SPACING_XS))
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::accent_red)
+                },
+            ))
+            .child(when(
+                move || expanded.get(),
+                move || activity_details_view(activity, body),
+            )),
+    )
 }
 
 fn activity_glyph_icon(glyph: ActivityGlyph) -> ImageSrc {
@@ -2954,10 +3244,8 @@ fn activity_details_view(
         view()
             .w_full()
             .min_w(px(0.0))
-            .gap(px(theme::SPACING_XS))
-            .pl(px(theme::SPACING_MD))
-            .border_l_1()
-            .border_color(theme::border_subtle)
+            .gap(px(theme::SPACING_SM))
+            .pb(px(theme::SPACING_SM))
             .when(details.is_empty(), |body| {
                 body.child(
                     text(if details_loading {
@@ -2974,9 +3262,16 @@ fn activity_details_view(
             .children(details.into_iter().map(|detail| {
                 let label = copy::text("Copy {label}", "复制{label}", "複製{label}")
                     .replace("{label}", &detail.label);
+                // One block of a step's detail: what it is, the way to take
+                // it away, and the text itself in a well.
                 view()
                     .w_full()
                     .min_w(px(0.0))
+                    .rounded(px(theme::RADIUS_CHIP))
+                    .bg(theme::fill)
+                    .pl(px(theme::SPACING_MD))
+                    .pr(px(theme::SPACING_XS))
+                    .pb(px(theme::SPACING_SM))
                     .child(
                         view()
                             .w_full()
@@ -2986,14 +3281,18 @@ fn activity_details_view(
                                 text(detail.label)
                                     .flex_1()
                                     .min_w(px(0.0))
-                                    .text_size(px(theme::font_micro()))
+                                    .text_size(px(theme::font_hint()))
+                                    .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme::text_muted),
                             )
                             .child(
                                 row_action(
                                     icon!("copy"),
                                     copy::text("Copy detail", "复制详情", "複製詳細資料"),
-                                    move || set_clipboard(detail.copy.clone()),
+                                    move || {
+                                        crate::motion::tick();
+                                        set_clipboard(detail.copy.clone())
+                                    },
                                 )
                                 .accessibility_label(label),
                             ),
@@ -3002,9 +3301,11 @@ fn activity_details_view(
                         scroll().max_h(px(192.0)).w_full().child(
                             text(detail.text)
                                 .w_full()
+                                .pr(px(theme::SPACING_SM))
                                 .font_family("monospace")
                                 .selectable(true)
-                                .text_size(px(theme::font_caption()))
+                                .text_size(px(theme::font_micro()))
+                                .line_height(theme::line_height_for(theme::font_micro()))
                                 .text_color(theme::text_secondary),
                         ),
                     )
@@ -3012,6 +3313,7 @@ fn activity_details_view(
     })
 }
 
+/// The files a turn changed: a card with a row a file.
 fn changes_card(
     title: Memo<String>,
     entry: Memo<Option<TimelineEntry>>,
@@ -3029,130 +3331,194 @@ fn changes_card(
     });
     let expanded = signal(false);
     let expandable = computed(move || files.with(|files| files.len() > PREVIEW_FILES));
-    view()
-        .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_card)
-        .px(px(theme::SPACING_MD))
-        .gap(px(theme::SPACING_XS))
-        .child(disclosure_header(
-            icon!("file-code"),
-            title,
-            computed(|| false),
-            computed(move || expanded.get()),
-            expandable,
-            move || expanded.update(|expanded| *expanded = !*expanded),
-        ))
-        .child(each(
-            move || {
-                files.with(|files| {
-                    files
-                        .iter()
-                        .take(if expanded.get() {
-                            files.len()
-                        } else {
-                            PREVIEW_FILES
-                        })
-                        .cloned()
-                        .collect::<Vec<_>>()
-                })
-            },
-            |file| file.path.clone(),
-            move |file, _| {
-                let open_file = open_file.clone();
-                let reveal = reveal.clone();
-                view()
+    view().w_full().py(px(theme::SPACING_SM)).child(
+        surface::card()
+            .child(
+                button()
                     .w_full()
-                    .min_w(px(0.0))
+                    .min_h(px(theme::ROW_HEIGHT))
+                    .px(px(surface::ROW_INSET))
                     .flex_row()
                     .items_center()
-                    .border_t_1()
-                    .border_color(theme::border_subtle)
+                    .gap(px(theme::SPACING_MD))
+                    .accessibility_label(move || SharedString::from(title.get()))
+                    .active(|style| style.bg(theme::row_pressed_bg()))
+                    .disabled(move || !expandable.get())
+                    .on_press(move || expanded.update(|expanded| *expanded = !*expanded))
+                    .child(surface::tile(icon!("file-code")))
                     .child(
-                        button()
+                        text(move || title.get())
                             .flex_1()
                             .min_w(px(0.0))
-                            .min_h(px(theme::TOUCH_TARGET))
-                            .justify_center()
-                            .items_start()
-                            .accessibility_label(move || {
-                                file.with(|file| SharedString::from(file.path.clone()))
-                            })
-                            .disabled(move || file.with(|file| file.deleted))
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .child(
-                                text(move || file.with(|file| file.path.clone()))
-                                    .w_full()
-                                    .truncate()
-                                    .text_size(px(theme::font_caption()))
-                                    .text_color(theme::text_secondary),
-                            )
-                            .on_press(move || {
-                                open_file(&file.with_untracked(|file| file.path.clone()))
-                            }),
+                            .truncate()
+                            .text_size(px(theme::font_detail()))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::foreground),
                     )
-                    .child(
-                        action::icon_button(
+                    .child(when(
+                        move || expandable.get(),
+                        move || disclosure_chevron(computed(move || expanded.get())),
+                    )),
+            )
+            .child(each(
+                move || {
+                    files.with(|files| {
+                        files
+                            .iter()
+                            .take(if expanded.get() {
+                                files.len()
+                            } else {
+                                PREVIEW_FILES
+                            })
+                            .cloned()
+                            .collect::<Vec<_>>()
+                    })
+                },
+                |file| file.path.clone(),
+                move |file, _| {
+                    let open_file = open_file.clone();
+                    let reveal = reveal.clone();
+                    let name = move || {
+                        file.with(|file| {
+                            file.path
+                                .rsplit('/')
+                                .next()
+                                .unwrap_or(&file.path)
+                                .to_owned()
+                        })
+                    };
+                    let folder = move || {
+                        file.with(|file| {
+                            file.path
+                                .rsplit_once('/')
+                                .map_or_else(String::new, |(folder, _)| folder.to_owned())
+                        })
+                    };
+                    view()
+                        .w_full()
+                        .min_w(px(0.0))
+                        .flex_row()
+                        .items_center()
+                        .border_t_1()
+                        .border_color(theme::hairline)
+                        .pr(px(theme::SPACING_SM))
+                        .child(
+                            button()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .min_h(px(theme::TOUCH_TARGET + 2.0))
+                                .pl(px(surface::ROW_INSET))
+                                .justify_center()
+                                .items_start()
+                                .accessibility_label(move || {
+                                    file.with(|file| SharedString::from(file.path.clone()))
+                                })
+                                .disabled(move || file.with(|file| file.deleted))
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .child(
+                                    text(name)
+                                        .w_full()
+                                        .truncate()
+                                        .text_size(px(theme::font_caption()))
+                                        .font_family("monospace")
+                                        .text_color(move || {
+                                            if file.with(|file| file.deleted) {
+                                                theme::text_muted()
+                                            } else {
+                                                theme::foreground()
+                                            }
+                                        }),
+                                )
+                                .child(when(
+                                    move || !folder().is_empty(),
+                                    move || {
+                                        text(folder)
+                                            .w_full()
+                                            .truncate()
+                                            .text_size(px(theme::font_hint()))
+                                            .text_color(theme::text_muted)
+                                    },
+                                ))
+                                .on_press(move || {
+                                    open_file(&file.with_untracked(|file| file.path.clone()))
+                                }),
+                        )
+                        .child(surface::ghost_button(
                             icon!("chevrons-right-left"),
                             copy::text("View changes", "查看变更", "檢視變更"),
                             move || reveal(&file.with_untracked(|file| file.row_id.clone()), true),
-                        )
-                        .flex_shrink_0(),
-                    )
-            },
-        ))
+                        ))
+                },
+            )),
+    )
 }
 
+/// A question the Agent asked and how it was answered, kept in the record.
 fn decision_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> impl IntoElement {
-    view()
-        .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_default)
-        .bg(theme::background_card)
-        .p(px(theme::SPACING_MD))
-        .gap(px(theme::SPACING_XS))
-        .child(
-            view()
-                .flex_row()
-                .items_center()
-                .gap(px(theme::SPACING_SM))
-                .child(
-                    text(move || title.get())
-                        .flex_1()
-                        .truncate()
-                        .text_size(px(theme::font_detail()))
-                        .font_weight(FontWeight::MEDIUM)
-                        .text_color(theme::foreground),
-                )
-                .child(
-                    text(move || meta.get())
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_muted),
-                ),
-        )
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::font_caption()))
-                .line_height(theme::line_height_for(theme::font_caption()))
-                .text_color(theme::text_secondary),
-        )
+    view().w_full().py(px(6.0)).child(
+        surface::card()
+            .px(px(surface::ROW_INSET))
+            .py(px(theme::SPACING_MD))
+            .gap(px(theme::SPACING_XS))
+            .child(
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        text(move || title.get())
+                            .flex_1()
+                            .min_w(px(0.0))
+                            .truncate()
+                            .text_size(px(theme::font_detail()))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::foreground),
+                    )
+                    .child(when(
+                        move || !meta.with(String::is_empty),
+                        move || {
+                            surface::badge(
+                                move || SharedString::from(meta.get()),
+                                theme::text_secondary,
+                            )
+                        },
+                    )),
+            )
+            .child(when(
+                move || !body.with(String::is_empty),
+                move || {
+                    text(move || body.get())
+                        .text_size(px(theme::font_caption()))
+                        .line_height(theme::line_height_for(theme::font_caption()))
+                        .text_color(theme::text_secondary)
+                },
+            )),
+    )
 }
 
+/// A failure: what went wrong, on the tint failures are told by.
 fn error_card(body: Memo<String>) -> impl IntoElement {
-    view()
-        .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::accent_red)
-        .p(px(theme::SPACING_MD))
-        .child(
-            text(move || body.get())
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::accent_red),
-        )
+    view().w_full().py(px(6.0)).child(
+        view()
+            .w_full()
+            .flex_row()
+            .items_start()
+            .gap(px(10.0))
+            .rounded(px(theme::RADIUS_GROUP))
+            .bg(move || theme::tint(theme::accent_red()))
+            .px(px(surface::ROW_INSET))
+            .py(px(theme::SPACING_MD))
+            .child(surface::status_dot(theme::accent_red).mt(px(6.0)))
+            .child(
+                text(move || body.get())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .selectable(true)
+                    .text_size(px(theme::font_detail()))
+                    .line_height(theme::line_height_for(theme::font_detail()))
+                    .text_color(theme::accent_red),
+            ),
+    )
 }
 
 /// The `/` command palette, above the composer.
@@ -3167,40 +3533,41 @@ fn command_palette(
 ) -> impl IntoElement {
     view()
         .w_full()
-        .max_h(px(240.0))
-        .border_t_1()
-        .border_t_color(theme::border_subtle)
-        .bg(theme::background_card)
+        .flex_shrink_0()
+        .px(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_XS))
         .child(
-            scroll()
-                .max_h(px(240.0))
-                .child(view().flex_col().p(px(theme::SPACING_XS)).child(each(
-                    move || {
-                        let query = draft.with(|draft| {
-                            draft
-                                .strip_prefix('/')
-                                .unwrap_or_default()
-                                .trim()
-                                .to_lowercase()
-                        });
-                        commands.with(|commands| {
-                            commands
-                                .iter()
-                                .filter(|command| {
-                                    query.is_empty()
-                                        || command.label.to_lowercase().contains(&query)
-                                        || command.insertion.to_lowercase().contains(&query)
-                                })
-                                .cloned()
-                                .collect::<Vec<_>>()
-                        })
-                    },
-                    |command| command.id.clone(),
-                    {
-                        let on_arm = on_arm.clone();
-                        move |command, _| command_row(command, draft, kind, on_arm.clone())
-                    },
-                ))),
+            surface::card().max_h(px(240.0)).shadow_md().child(
+                scroll()
+                    .max_h(px(240.0))
+                    .child(view().flex_col().child(each(
+                        move || {
+                            let query = draft.with(|draft| {
+                                draft
+                                    .strip_prefix('/')
+                                    .unwrap_or_default()
+                                    .trim()
+                                    .to_lowercase()
+                            });
+                            commands.with(|commands| {
+                                commands
+                                    .iter()
+                                    .filter(|command| {
+                                        query.is_empty()
+                                            || command.label.to_lowercase().contains(&query)
+                                            || command.insertion.to_lowercase().contains(&query)
+                                    })
+                                    .cloned()
+                                    .collect::<Vec<_>>()
+                            })
+                        },
+                        |command| command.id.clone(),
+                        {
+                            let on_arm = on_arm.clone();
+                            move |command, _| command_row(command, draft, kind, on_arm.clone())
+                        },
+                    ))),
+            ),
         )
 }
 
@@ -3222,24 +3589,32 @@ fn command_row(
             });
         })
         .w_full()
-        .rounded(px(theme::RADIUS_CONTROL))
-        .px(px(theme::SPACING_SM))
-        .py(px(theme::SPACING_XS))
+        .min_h(px(theme::TOUCH_TARGET))
+        .px(px(surface::ROW_INSET))
+        .py(px(theme::SPACING_SM))
         .flex_col()
         .items_start()
-        .active(|style| style.opacity(0.85))
+        .justify_center()
+        .gap(px(1.0))
+        .border_b_1()
+        .border_b_color(theme::hairline)
+        .active(|style| style.bg(theme::row_pressed_bg()))
         .child(
             text(move || command.get().label)
+                .truncate()
                 .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(theme::foreground),
         )
-        .child(
-            text(move || command.get().description)
-                .truncate()
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
+        .child(when(
+            move || command.with(|command| !command.description.is_empty()),
+            move || {
+                text(move || command.get().description)
+                    .truncate()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+            },
+        ))
 }
 
 /// The permission card, above the composer.
@@ -3254,7 +3629,14 @@ fn permission_card(
 ) -> impl IntoElement {
     let request = pending.get_untracked().expect("shown while pending");
     let request_id = request.request_id.clone();
-    let buttons = request.options.into_iter().map({
+    // Two answers stand side by side, the one that lets the Agent go on at
+    // the trailing edge; more than two stack, in the runtime's order.
+    let paired = request.options.len() == 2;
+    let mut options = request.options;
+    if paired {
+        options.sort_by_key(|option| option.choice == PermissionChoice::Allow);
+    }
+    let buttons = options.into_iter().map({
         let on_permission = on_permission.clone();
         let request_id = request_id.clone();
         move |option| {
@@ -3262,51 +3644,40 @@ fn permission_card(
             let choice = option.choice;
             let on_permission = on_permission.clone();
             let button = if choice == PermissionChoice::Allow {
-                action::primary(
-                    option.label,
-                    icon(include_str!("../../../assets/icons/check.svg")),
-                    move || on_permission(&id, choice),
-                )
+                action::solid(option.label, move || on_permission(&id, choice))
             } else {
-                action::secondary(
-                    option.label,
-                    icon(include_str!("../../../assets/icons/x.svg")),
-                    false,
-                    move || on_permission(&id, choice),
-                )
+                action::tonal(option.label, move || on_permission(&id, choice))
             };
-            button
-                .w_full()
-                .disabled(move || resolving.get())
-                .disabled_style(|style| style.opacity(0.5))
+            let button = if paired {
+                button.flex_1().min_w(px(0.0))
+            } else {
+                button.w_full()
+            };
+            button.disabled(move || resolving.get())
         }
     });
     view()
         .w_full()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_MD))
-        .border_t_1()
-        .border_t_color(theme::border_subtle)
-        .bg(theme::background_card)
+        .flex_shrink_0()
+        .px(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_XS))
         .child(
-            text(request.title)
-                .text_size(px(theme::font_body()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::foreground),
-        )
-        .children(request.details.into_iter().map(|detail| {
-            text(detail)
-                .text_size(px(theme::font_caption()))
-                .text_color(theme::text_secondary)
-        }))
-        .child(
-            view()
-                .flex_col()
-                .w_full()
-                .gap(px(theme::SPACING_SM))
-                .pt(px(theme::SPACING_XS))
-                .children(buttons),
+            waiting_card(request.title)
+                .children(request.details.into_iter().map(|detail| {
+                    text(detail)
+                        .text_size(px(theme::font_caption()))
+                        .line_height(theme::line_height_for(theme::font_caption()))
+                        .text_color(theme::text_secondary)
+                }))
+                .child(
+                    view()
+                        .w_full()
+                        .gap(px(theme::SPACING_SM))
+                        .pt(px(theme::SPACING_XS))
+                        .when(paired, |row| row.flex_row())
+                        .when(!paired, |column| column.flex_col())
+                        .children(buttons),
+                ),
         )
 }
 
@@ -3341,7 +3712,7 @@ fn question_card(
             required.push((id.clone(), kind.clone()));
         }
         let placeholder = title.clone();
-        let mut column = view().w_full().gap(px(2.0)).child(
+        let mut column = view().w_full().gap(px(theme::SPACING_XS)).child(
             text(title)
                 .text_size(px(theme::font_detail()))
                 .font_weight(FontWeight::MEDIUM)
@@ -3358,7 +3729,7 @@ fn question_card(
             QuestionFieldKind::Text { default } => {
                 let value = signal(default.unwrap_or_default());
                 texts.push((id.clone(), value));
-                column = column.child(field::text_field(value, move || placeholder.clone()));
+                column = column.child(field::text_field_well(value, move || placeholder.clone()));
             }
             QuestionFieldKind::Choice { options, default } => {
                 let selected = signal(default);
@@ -3468,68 +3839,55 @@ fn question_card(
 
     view()
         .w_full()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_LG))
-        .py(px(theme::SPACING_MD))
-        .border_t_1()
-        .border_t_color(theme::border_subtle)
-        .bg(theme::background_card)
+        .flex_shrink_0()
+        .px(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_XS))
         .child(
-            text(request.title)
-                .text_size(px(theme::font_body()))
-                .font_weight(FontWeight::SEMIBOLD)
-                .text_color(theme::foreground),
-        )
-        .child(
-            text(request.message)
-                .text_size(px(theme::font_caption()))
-                .text_color(theme::text_secondary),
-        )
-        // A question can carry more fields than a phone's card can show at
-        // once; the fields scroll while the title and the submit stay put.
-        .child(
-            scroll().max_h(px(280.0)).child(
-                view()
-                    .w_full()
-                    .flex_col()
-                    .gap(px(theme::SPACING_SM))
-                    .children(elements),
-            ),
-        )
-        .child(when(
-            move || error.get().is_some(),
-            move || {
-                text(move || error.get().unwrap_or_default())
-                    .text_size(px(theme::font_caption()))
-                    .text_color(theme::accent_red)
-            },
-        ))
-        .child(
-            view()
-                .flex_row()
-                .w_full()
-                .gap(px(theme::SPACING_SM))
-                .pt(px(theme::SPACING_XS))
+            waiting_card(request.title)
                 .child(
-                    action::primary(
-                        copy::text("Submit", "提交", "提交"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        submit,
-                    )
-                    .flex_1()
-                    .disabled(move || resolving.get())
-                    .disabled_style(|style| style.opacity(0.5)),
+                    text(request.message)
+                        .text_size(px(theme::font_caption()))
+                        .line_height(theme::line_height_for(theme::font_caption()))
+                        .text_color(theme::text_secondary),
                 )
+                // A question can carry more fields than a phone's card can
+                // show at once; the fields scroll while the title and the
+                // submit stay put.
                 .child(
-                    action::secondary(
-                        copy::text("Decline", "拒绝", "拒絕"),
-                        icon(include_str!("../../../assets/icons/x.svg")),
-                        false,
-                        decline,
-                    )
-                    .flex_1()
-                    .disabled(move || resolving.get())
-                    .disabled_style(|style| style.opacity(0.5)),
+                    scroll().max_h(px(280.0)).child(
+                        view()
+                            .w_full()
+                            .flex_col()
+                            .gap(px(theme::SPACING_MD))
+                            .children(elements),
+                    ),
+                )
+                .child(when(
+                    move || error.get().is_some(),
+                    move || {
+                        text(move || error.get().unwrap_or_default())
+                            .text_size(px(theme::font_caption()))
+                            .text_color(theme::accent_red)
+                    },
+                ))
+                .child(
+                    view()
+                        .flex_row()
+                        .w_full()
+                        .gap(px(theme::SPACING_SM))
+                        .pt(px(theme::SPACING_XS))
+                        .child(
+                            action::tonal(copy::text("Decline", "拒绝", "拒絕"), decline)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .disabled(move || resolving.get()),
+                        )
+                        .child(
+                            action::solid(copy::text("Submit", "提交", "提交"), submit)
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .disabled(move || resolving.get()),
+                        ),
                 ),
         )
 }
@@ -3537,52 +3895,23 @@ fn question_card(
 /// One selectable row of a choice field.
 fn choice_button(label: String, value: String, selected: Signal<Option<String>>) -> ButtonElement {
     let pressed = value.clone();
-    let border_value = value.clone();
-    let fill_value = value.clone();
-    let text_value = value;
-    button()
-        .on_press(move || selected.set(Some(pressed.clone())))
-        .w_full()
-        .min_h(px(theme::TOUCH_TARGET))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(move || {
-            if selected.with(|selected| selected.as_deref() == Some(border_value.as_str())) {
-                theme::foreground()
-            } else {
-                theme::border_subtle()
-            }
-        })
-        .bg(move || {
-            if selected.with(|selected| selected.as_deref() == Some(fill_value.as_str())) {
-                theme::background_card()
-            } else {
-                theme::background_dim()
-            }
-        })
-        .items_center()
-        .justify_center()
-        .child(
-            text(label)
-                .text_size(px(theme::font_detail()))
-                .text_color(move || {
-                    if selected.with(|selected| selected.as_deref() == Some(text_value.as_str())) {
-                        theme::foreground()
-                    } else {
-                        theme::text_secondary()
-                    }
-                }),
-        )
+    let chosen = computed(move || selected.with(|selected| selected.as_deref() == Some(&value)));
+    option_row(
+        label,
+        move || chosen.get(),
+        move || selected.set(Some(pressed.clone())),
+    )
+    .w_full()
 }
 
 /// One toggle row of a multi-select field.
 fn multi_button(label: String, value: String, chosen: Signal<Vec<String>>) -> ButtonElement {
     let pressed = value.clone();
-    let border_value = value.clone();
-    let fill_value = value.clone();
-    let text_value = value;
-    button()
-        .on_press(move || {
+    let ticked = computed(move || chosen.with(|chosen| chosen.contains(&value)));
+    option_row(
+        label,
+        move || ticked.get(),
+        move || {
             chosen.update(|chosen| {
                 if let Some(index) = chosen.iter().position(|item| item == &pressed) {
                     chosen.remove(index);
@@ -3590,75 +3919,201 @@ fn multi_button(label: String, value: String, chosen: Signal<Vec<String>>) -> Bu
                     chosen.push(pressed.clone());
                 }
             });
-        })
-        .w_full()
-        .min_h(px(theme::TOUCH_TARGET))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(move || {
-            if chosen.with(|chosen| chosen.contains(&border_value)) {
-                theme::foreground()
-            } else {
-                theme::border_subtle()
-            }
-        })
-        .bg(move || {
-            if chosen.with(|chosen| chosen.contains(&fill_value)) {
-                theme::background_card()
-            } else {
-                theme::background_dim()
-            }
-        })
-        .items_center()
-        .justify_center()
-        .child(
-            text(label)
-                .text_size(px(theme::font_detail()))
-                .text_color(move || {
-                    if chosen.with(|chosen| chosen.contains(&text_value)) {
-                        theme::foreground()
-                    } else {
-                        theme::text_secondary()
-                    }
-                }),
-        )
+        },
+    )
+    .w_full()
 }
 
 /// One side of a yes/no field.
 fn boolean_button(label: String, value: bool, selected: Signal<Option<bool>>) -> ButtonElement {
+    option_row(
+        label,
+        move || selected.with(|selected| *selected == Some(value)),
+        move || selected.set(Some(value)),
+    )
+    .flex_1()
+    .min_w(px(0.0))
+}
+
+/// The card the Agent waits on the reader in: what it needs, said once, and
+/// the answers under it. It stands over the composer rather than in the
+/// transcript, because nothing moves until it is answered.
+fn waiting_card(title: String) -> View {
+    surface::card()
+        .px(px(surface::ROW_INSET))
+        .py(px(surface::ROW_INSET))
+        .gap(px(theme::SPACING_SM))
+        .shadow_md()
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_start()
+                .gap(px(theme::SPACING_SM))
+                .child(surface::status_dot(theme::accent_yellow).mt(px(7.0)))
+                .child(
+                    text(title)
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .text_size(px(theme::font_body()))
+                        .font_weight(FontWeight::SEMIBOLD)
+                        .text_color(theme::foreground),
+                ),
+        )
+}
+
+/// One answer among several: a line on a wash, marked once it is chosen.
+fn option_row(
+    label: String,
+    selected: impl Fn() -> bool + Copy + 'static,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
     button()
-        .on_press(move || selected.set(Some(value)))
-        .flex_1()
+        .on_press(on_press)
         .min_h(px(theme::TOUCH_TARGET))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(move || {
-            if selected.with(|selected| *selected == Some(value)) {
-                theme::foreground()
-            } else {
-                theme::border_subtle()
-            }
-        })
-        .bg(move || {
-            if selected.with(|selected| *selected == Some(value)) {
-                theme::background_card()
-            } else {
-                theme::background_dim()
-            }
-        })
+        .px(px(surface::ROW_INSET))
+        .flex_row()
         .items_center()
-        .justify_center()
+        .gap(px(theme::SPACING_MD))
+        .rounded(px(theme::RADIUS_BUTTON))
+        .bg(move || {
+            if selected() {
+                theme::fill_strong()
+            } else {
+                theme::fill()
+            }
+        })
+        .active(|style| style.opacity(0.7))
         .child(
             text(label)
+                .flex_1()
+                .min_w(px(0.0))
                 .text_size(px(theme::font_detail()))
-                .text_color(move || {
-                    if selected.with(|selected| *selected == Some(value)) {
-                        theme::foreground()
-                    } else {
-                        theme::text_secondary()
-                    }
-                }),
+                .text_color(theme::foreground),
         )
+        .child(surface::check_mark(move || selected().then_some(true)))
+}
+
+/// A line above the prompt card that says how the next message stands, with
+/// the one thing to do about it.
+fn composer_notice(
+    message: &'static str,
+    action_label: &'static str,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .min_h(px(theme::ROUND_CONTROL))
+        .pl(px(surface::ROW_INSET))
+        .pr(px(theme::SPACING_XS))
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_SM))
+        .rounded(px(theme::RADIUS_BUTTON))
+        .bg(theme::fill)
+        .child(
+            text(message)
+                .flex_1()
+                .min_w(px(0.0))
+                .text_size(px(theme::font_caption()))
+                .text_color(theme::text_secondary),
+        )
+        .child(action::link(action_label, on_press))
+}
+
+/// What can be added to the message being written: something attached to it,
+/// or an hour to hold it until.
+fn composer_add_sheet(
+    open: Signal<bool>,
+    photo: Action,
+    camera: Action,
+    file: Action,
+    can_schedule: impl Fn() -> bool + 'static,
+    on_schedule: Action,
+) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
+    let attach = move |icon: ImageSrc,
+                       label: &'static str,
+                       detail: &'static str,
+                       action: Action| {
+        surface::row_captioned(icon, label, detail, move || {
+            open.set(false);
+            action();
+        })
+        .accessibility_label(label)
+    };
+    bottom_sheet(
+        move || open.get(),
+        move || open.set(false),
+        view()
+            .w_full()
+            .child(sheet_header(
+                copy::text("Add to message", "添加到消息", "加入訊息"),
+                move || open.set(false),
+            ))
+            .child(
+                sheet_body()
+                    .child(
+                        sheet_card()
+                            .child(attach(
+                                icon!("image"),
+                                copy::text("Photo", "图片", "圖片"),
+                                copy::text(
+                                    "Scaled down before it is sent",
+                                    "发送前会先缩放",
+                                    "傳送前會先縮放",
+                                ),
+                                photo,
+                            ))
+                            .child(surface::row_divider())
+                            .child(attach(
+                                icon!("file-video-camera"),
+                                copy::text("Camera", "拍照", "拍照"),
+                                copy::text(
+                                    "Take a photograph now",
+                                    "现在拍一张照片",
+                                    "現在拍一張照片",
+                                ),
+                                camera,
+                            ))
+                            .child(surface::row_divider())
+                            .child(attach(
+                                icon!("file-plus"),
+                                copy::text("File", "文件", "檔案"),
+                                copy::text(
+                                    "Sent as it is, up to 8 MB",
+                                    "原样发送，最大 8 MB",
+                                    "原樣傳送，最大 8 MB",
+                                ),
+                                file,
+                            )),
+                    )
+                    .child(
+                        sheet_card().child(
+                            surface::row_captioned(
+                                icon!("clock"),
+                                copy::text("Send later", "稍后发送", "稍後傳送"),
+                                copy::text(
+                                    "Hold what is written until a later hour",
+                                    "把已写好的消息留到稍后再发",
+                                    "把已寫好的訊息留到稍後再傳",
+                                ),
+                                move || {
+                                    open.set(false);
+                                    on_schedule();
+                                },
+                            )
+                            .accessibility_label(copy::text(
+                                "Schedule message",
+                                "定时发送",
+                                "定時傳送",
+                            ))
+                            .disabled(move || !can_schedule())
+                            .child(surface::chevron()),
+                        ),
+                    ),
+            ),
+    )
 }
 
 /// The composer, kept above the software keyboard.
@@ -3713,7 +4168,7 @@ fn composer(
     let needs_continue = host.needs_continue;
     let on_continue_turn = host.on_continue_turn.clone();
     let plan_open = signal(false);
-    let on_open_runtime = {
+    let on_open_runtime: Rc<dyn Fn(RuntimePanel)> = {
         let open = host.on_open_runtime.clone();
         Rc::new(move |panel| {
             dismiss_keyboard();
@@ -3754,109 +4209,64 @@ fn composer(
             }
         })
     };
-    let attach_open = signal(false);
+    let add_open = signal(false);
     let has_content = computed(move || {
         !draft.with(|draft| draft.trim().is_empty()) || !attachments.with(Vec::is_empty)
     });
-    view()
+    let can_send = move || !sending.get() && active.with(Option::is_some) && has_content.get();
+    // What the Agent itself can be told beside the model: how hard to think,
+    // how far to act, and its own switches.
+    let tunable = move || {
+        !runtime_reasoning.with(Vec::is_empty)
+            || !runtime_modes.with(Vec::is_empty)
+            || !runtime_features.with(Vec::is_empty)
+    };
+    // The notices, the cards and the prompt card stand in one column. The
+    // sheets the card raises are kept out of it: they take no room, and a gap
+    // beside one would still be a gap.
+    let column = view()
         .w_full()
         .flex_col()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_MD))
-        .py(px(theme::SPACING_SM))
-        .bg(theme::background)
-        .pb_keyboard()
+        .gap(px(theme::SPACING_SM))
         .child(when(move || needs_continue.get(), {
             let on_continue_turn = on_continue_turn.clone();
             move || {
-                view()
-                    .w_full()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .px(px(theme::SPACING_SM))
-                    .py(px(theme::SPACING_XS))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .bg(theme::background_dim)
-                    .child(
-                        text(copy::text(
-                            "The last turn was paused.",
-                            "上一回合已暂停。",
-                            "上一回合已暫停。",
-                        ))
-                        .flex_1()
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_secondary),
-                    )
-                    .child(action::secondary(
-                        copy::text("Continue", "继续", "繼續"),
-                        icon(include_str!("../../../assets/icons/send.svg")),
-                        false,
-                        {
-                            let on_continue_turn = on_continue_turn.clone();
-                            move || on_continue_turn()
-                        },
-                    ))
+                let on_continue_turn = on_continue_turn.clone();
+                composer_notice(
+                    copy::text(
+                        "The last turn was paused.",
+                        "上一回合已暂停。",
+                        "上一回合已暫停。",
+                    ),
+                    copy::text("Continue", "继续", "繼續"),
+                    move || on_continue_turn(),
+                )
             }
         }))
         .child(when(move || editing.get(), {
             let on_cancel_edit = on_cancel_edit.clone();
             move || {
-                view()
-                    .w_full()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .px(px(theme::SPACING_SM))
-                    .py(px(theme::SPACING_XS))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .bg(theme::background_dim)
-                    .child(
-                        text(copy::text(
-                            "Replacing the last message",
-                            "正在替换上一条消息",
-                            "正在取代上一則訊息",
-                        ))
-                        .flex_1()
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_secondary),
-                    )
-                    .child(small_action(copy::text("Cancel", "取消", "取消"), {
-                        let on_cancel_edit = on_cancel_edit.clone();
-                        move || on_cancel_edit()
-                    }))
+                let on_cancel_edit = on_cancel_edit.clone();
+                composer_notice(
+                    copy::text(
+                        "Replacing the last message",
+                        "正在替换上一条消息",
+                        "正在取代上一則訊息",
+                    ),
+                    copy::text("Cancel", "取消", "取消"),
+                    move || on_cancel_edit(),
+                )
             }
         }))
-        .child(crate::ui::sheet::bottom_sheet(
-            move || schedule_open.get(),
-            {
-                let close = on_close_schedule.clone();
-                move || close()
-            },
-            schedule_picker(on_close_schedule, on_schedule),
-        ))
         .child(when(move || scheduled.get(), {
             let on_cancel_schedule = on_cancel_schedule.clone();
             move || {
-                view()
-                    .w_full()
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .px(px(theme::SPACING_SM))
-                    .py(px(theme::SPACING_XS))
-                    .rounded(px(theme::RADIUS_CONTROL))
-                    .bg(theme::background_dim)
-                    .child(
-                        text(copy::text("Message scheduled", "消息已定时", "訊息已定時"))
-                            .flex_1()
-                            .text_size(px(theme::font_micro()))
-                            .text_color(theme::text_secondary),
-                    )
-                    .child(small_action(copy::text("Cancel", "取消", "取消"), {
-                        let on_cancel_schedule = on_cancel_schedule.clone();
-                        move || on_cancel_schedule()
-                    }))
+                let on_cancel_schedule = on_cancel_schedule.clone();
+                composer_notice(
+                    copy::text("Message scheduled", "消息已定时", "訊息已定時"),
+                    copy::text("Cancel", "取消", "取消"),
+                    move || on_cancel_schedule(),
+                )
             }
         }))
         .child(when(move || !queued.with(|queued| queued.is_empty()), {
@@ -3886,22 +4296,26 @@ fn composer(
             move || plan_bar(plan, plan_open),
         ))
         .child(
-            view()
-                .w_full()
-                .relative()
-                .flex_col()
-                .rounded(px(theme::RADIUS_COMPOSER))
-                .bg(theme::composer_surface)
-                .border_1()
-                .border_color(theme::border_default)
-                .p(px(theme::SPACING_MD))
-                .gap(px(theme::SPACING_SM))
+            compose::card()
                 .child(when(
                     move || !attachments.with(Vec::is_empty),
-                    move || attachment_chips(attachments, on_remove_attachment.clone()),
+                    move || {
+                        let on_remove = on_remove_attachment.clone();
+                        compose::chips().child(each(
+                            move || attachments.get(),
+                            |item| item.id.clone(),
+                            move |item, _| {
+                                let on_remove = on_remove.clone();
+                                compose::chip(
+                                    move || SharedString::from(item.with(|item| item.label.clone())),
+                                    move || on_remove(&item.with_untracked(|item| item.id.clone())),
+                                )
+                            },
+                        ))
+                    },
                 ))
                 .child(
-                    field::text_field_flat_with(
+                    compose::field(
                         draft,
                         copy::text(
                             "/ commands @files $skills",
@@ -3923,135 +4337,145 @@ fn composer(
                             }
                         },
                     )
-                    .element_ref(&composer_input)
-                    .multiline(true)
-                    .h(nsh_core::geometry::Length::Auto)
-                    .min_h(px(theme::TOUCH_TARGET))
-                    .max_h(px(120.0))
-                    .pl(px(0.0))
-                    .pr(move || {
-                        px(if active.with(Option::is_some) && !editing.get() {
-                            theme::TOUCH_TARGET
-                        } else {
-                            0.0
-                        })
-                    })
-                    .text_size(px(theme::font_composer())),
+                    .element_ref(&composer_input),
                 )
-                .child(when(
-                    move || active.with(Option::is_some) && !editing.get(),
-                    {
-                        move || {
-                            let open = on_open_schedule.clone();
-                            action::icon_button(
-                                icon!("clock"),
-                                copy::text("Schedule message", "定时发送", "定時傳送"),
-                                move || {
-                                    dismiss_keyboard();
-                                    open();
-                                },
-                            )
-                            .absolute()
-                            .top(px(theme::SPACING_XS))
-                            .right(px(theme::SPACING_XS))
-                            .disabled(move || !has_content.get() || sending.get())
-                            .disabled_style(|style| style.opacity(0.38))
-                        }
-                    },
-                ))
                 .child(
-                    view()
-                        .h(px(theme::TOUCH_TARGET))
-                        .flex_row()
-                        .items_center()
+                    compose::controls()
                         .child(
-                            action::icon_button(
-                                icon!("plus"),
-                                copy::text("Attach a file", "添加附件", "新增附件"),
+                            compose::add_button(
+                                copy::text("Add to message", "添加到消息", "加入訊息"),
                                 move || {
                                     dismiss_keyboard();
-                                    attach_open.set(true);
+                                    add_open.set(true);
                                 },
                             )
-                            .size(px(theme::TOUCH_TARGET))
-                            .ml(px(-theme::SPACING_MD))
-                            .flex_shrink_0()
-                            .disabled(move || sending.get() || active.with(Option::is_none))
-                            .disabled_style(|style| style.opacity(0.38)),
+                            .disabled(move || sending.get() || active.with(Option::is_none)),
                         )
-                        .child(runtime_chip_row(
-                            runtime_summary,
-                            runtime_reasoning,
-                            runtime_modes,
-                            runtime_features,
-                            move || sending.get() || runtime_busy.get(),
-                            on_open_runtime,
-                        ))
+                        .child(
+                            view()
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(2.0))
+                                .overflow_hidden()
+                                .child({
+                                    let on_open = on_open_runtime.clone();
+                                    compose::pill_in(
+                                        icon!("sparkles"),
+                                        move || {
+                                            SharedString::from(runtime_summary.with(|summary| {
+                                                summary.as_ref().map_or_else(
+                                                    || copy::text("Model", "模型", "模型").to_owned(),
+                                                    |summary| summary.model.clone(),
+                                                )
+                                            }))
+                                        },
+                                        move || {
+                                            if runtime_summary.with(|summary| {
+                                                summary
+                                                    .as_ref()
+                                                    .is_some_and(|summary| !summary.available)
+                                            }) {
+                                                theme::accent_yellow()
+                                            } else {
+                                                theme::text_secondary()
+                                            }
+                                        },
+                                        move || on_open(RuntimePanel::Model),
+                                    )
+                                    .disabled(move || sending.get() || runtime_busy.get())
+                                })
+                                .child(when(tunable, {
+                                    let on_open = on_open_runtime.clone();
+                                    move || {
+                                        let on_open = on_open.clone();
+                                        compose::option(
+                                            icon!("sliders-horizontal"),
+                                            copy::text("Agent options", "Agent 选项", "Agent 選項"),
+                                            move || {
+                                                runtime_summary.with(|summary| {
+                                                    summary.as_ref().is_some_and(|summary| {
+                                                        summary.reasoning_set
+                                                            || summary.mode_set
+                                                            || summary.options_set
+                                                    })
+                                                })
+                                            },
+                                            move || {
+                                                on_open(
+                                                    if !runtime_reasoning.with(Vec::is_empty) {
+                                                        RuntimePanel::Reasoning
+                                                    } else if !runtime_modes.with(Vec::is_empty) {
+                                                        RuntimePanel::Mode
+                                                    } else {
+                                                        RuntimePanel::Options
+                                                    },
+                                                )
+                                            },
+                                        )
+                                        .disabled(move || sending.get() || runtime_busy.get())
+                                    }
+                                })),
+                        )
                         .child(when(
                             move || show_token_usage.get(),
                             move || token_chip(token_usage),
                         ))
                         .child(dynamic(move || {
-                            let stop = running.get() && !has_content.get();
-                            let (glyph, label, perform) = if stop {
-                                (
+                            if running.get() && !has_content.get() {
+                                let stop = on_interrupt.clone();
+                                compose::send_button(
                                     icon!("stop"),
                                     copy::text("Stop", "停止", "停止"),
-                                    on_interrupt.clone(),
-                                )
-                            } else if editing.get() {
-                                (
-                                    icon!("send"),
-                                    copy::text("Replace message", "替换消息", "取代訊息"),
-                                    submit.clone(),
-                                )
-                            } else if running.get() {
-                                (
-                                    icon!("send"),
-                                    copy::text(
-                                        "Queue for the turn",
-                                        "排入队列，回合结束后发送",
-                                        "排入佇列，回合結束後傳送",
-                                    ),
-                                    submit.clone(),
+                                    || true,
+                                    move || stop(),
                                 )
                             } else {
-                                (
+                                let submit = submit.clone();
+                                compose::send_button(
                                     icon!("send"),
-                                    copy::text("Send", "发送", "傳送"),
-                                    submit.clone(),
+                                    if editing.get() {
+                                        copy::text("Replace message", "替换消息", "取代訊息")
+                                    } else if running.get() {
+                                        copy::text(
+                                            "Queue for the turn",
+                                            "排入队列，回合结束后发送",
+                                            "排入佇列，回合結束後傳送",
+                                        )
+                                    } else {
+                                        copy::text("Send", "发送", "傳送")
+                                    },
+                                    can_send,
+                                    move || submit(),
                                 )
-                            };
-                            button()
-                                .size(px(theme::COMPOSER_SEND_SIZE))
-                                .flex_shrink_0()
-                                .rounded_full()
-                                .items_center()
-                                .justify_center()
-                                .bg(theme::action_primary)
-                                .active(|style| style.opacity(0.75))
-                                .accessibility_label(label)
-                                .on_press(move || perform())
-                                .disabled(move || {
-                                    sending.get()
-                                        || active.with(Option::is_none)
-                                        || !stop && !has_content.get()
-                                })
-                                .disabled_style(|style| style.opacity(0.38))
-                                .child(
-                                    svg(glyph)
-                                        .size(px(theme::ICON_MD))
-                                        .text_color(theme::action_primary_label),
-                                )
-                                .ml(px(theme::SPACING_XS))
+                            }
                         })),
                 ),
-        )
-        .child(composer_attachments_sheet(
-            attach_open,
+        );
+    view()
+        .w_full()
+        .flex_shrink_0()
+        .flex_col()
+        .px(px(theme::SPACING_MD))
+        .pt(px(theme::SPACING_XS))
+        .pb_keyboard_plus(px(theme::SPACING_SM))
+        .child(column)
+        .child(composer_add_sheet(
+            add_open,
             host.on_attach_image,
             host.on_attach_camera,
             host.on_attach_file,
+            move || can_send() && !editing.get(),
+            on_open_schedule,
+        ))
+        .child(delay_sheet(
+            move || schedule_open.get(),
+            {
+                let close = on_close_schedule.clone();
+                move || close()
+            },
+            move |seconds| on_schedule(seconds),
         ))
         // `pb_keyboard` covers the keyboard while it is up; with it down the
         // composer still has to clear the home indicator.
@@ -4061,145 +4485,7 @@ fn composer(
         ))
 }
 
-fn composer_attachments_sheet(
-    open: Signal<bool>,
-    photo: Action,
-    camera: Action,
-    file: Action,
-) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_header};
-    let title = copy::text("Attach", "添加附件", "新增附件");
-    bottom_sheet(
-        move || open.get(),
-        move || open.set(false),
-        view()
-            .child(sheet_header(title, move || open.set(false)))
-            .child(
-                view().pb_safe_area_plus(px(theme::SPACING_SM)).children(
-                    [
-                        (
-                            icon!("image"),
-                            copy::text("Photo", "图片", "圖片"),
-                            copy::text(
-                                "Scaled down before it is sent",
-                                "发送前会先缩放",
-                                "傳送前會先縮放",
-                            ),
-                            photo,
-                        ),
-                        (
-                            icon!("file-video-camera"),
-                            copy::text("Camera", "拍照", "拍照"),
-                            copy::text("Take a photograph now", "现在拍一张照片", "現在拍一張照片"),
-                            camera,
-                        ),
-                        (
-                            icon!("file-plus"),
-                            copy::text("File", "文件", "檔案"),
-                            copy::text(
-                                "Sent as it is, up to 8 MB",
-                                "原样发送，最大 8 MB",
-                                "原樣傳送，最大 8 MB",
-                            ),
-                            file,
-                        ),
-                    ]
-                    .map(|(glyph, label, detail, action)| {
-                        button()
-                            .w_full()
-                            .px(px(theme::SPACING_LG))
-                            .py(px(theme::SPACING_SM))
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_MD))
-                            .accessibility_label(label)
-                            .active(|style| style.bg(theme::row_pressed_bg()))
-                            .on_press(move || {
-                                open.set(false);
-                                action();
-                            })
-                            .child(
-                                view()
-                                    .size(px(theme::TOUCH_TARGET))
-                                    .flex_shrink_0()
-                                    .rounded_full()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(theme::background_dim)
-                                    .child(
-                                        svg(glyph)
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::text_secondary),
-                                    ),
-                            )
-                            .child(
-                                view()
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .child(
-                                        text(label)
-                                            .text_size(px(theme::font_body()))
-                                            .text_color(theme::foreground),
-                                    )
-                                    .child(
-                                        text(detail)
-                                            .text_size(px(theme::font_micro()))
-                                            .text_color(theme::text_muted),
-                                    ),
-                            )
-                    }),
-                ),
-            ),
-    )
-}
-
 /// The prompts written ahead of the running turn.
-fn schedule_picker(on_close: Action, on_schedule: Rc<dyn Fn(u64)>) -> impl IntoElement {
-    let choices = [
-        (
-            copy::text("In 5 minutes", "5 分钟后", "5 分鐘後"),
-            5 * 60u64,
-        ),
-        (
-            copy::text("In 30 minutes", "30 分钟后", "30 分鐘後"),
-            30 * 60u64,
-        ),
-        (copy::text("In 1 hour", "1 小时后", "1 小時後"), 60 * 60u64),
-    ];
-    view()
-        .w_full()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SPACING_XS))
-        .px(px(theme::SPACING_SM))
-        .py(px(theme::SPACING_XS))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .bg(theme::background_dim)
-        .child(
-            text(copy::text("Send later", "稍后发送", "稍後傳送"))
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_secondary),
-        )
-        .child(each(
-            move || {
-                choices
-                    .iter()
-                    .map(|(label, seconds)| (*label, *seconds))
-                    .collect::<Vec<_>>()
-            },
-            |(_, seconds)| *seconds,
-            move |choice, _| {
-                let (label, seconds) = choice.get_untracked();
-                let on_schedule = on_schedule.clone();
-                small_action(label, move || on_schedule(seconds))
-            },
-        ))
-        .child(small_action(
-            copy::text("Close", "关闭", "關閉"),
-            move || on_close(),
-        ))
-}
-
 #[allow(clippy::too_many_arguments)]
 fn queue_card(
     queued: Signal<Vec<QueuedMessageView>>,
@@ -4212,19 +4498,15 @@ fn queue_card(
     on_clear: Action,
     on_toggle_paused: Action,
 ) -> impl IntoElement {
-    view()
-        .w_full()
-        .gap(px(theme::SPACING_XS))
-        .p(px(theme::SPACING_SM))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_card)
+    surface::card()
         .child(
             view()
+                .w_full()
+                .min_h(px(theme::TOUCH_TARGET))
+                .pl(px(surface::ROW_INSET))
+                .pr(px(theme::SPACING_XS))
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_SM))
                 .child(
                     text(move || {
                         format!(
@@ -4234,31 +4516,33 @@ fn queue_card(
                         )
                     })
                     .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
                     .text_size(px(theme::font_caption()))
                     .font_weight(FontWeight::SEMIBOLD)
                     .text_color(theme::text_secondary),
                 )
-                .child(small_action_reactive(
+                .child(action::link(
                     move || {
-                        if manual.get_untracked() {
+                        SharedString::from(if manual.get() {
                             copy::text("Auto", "自动", "自動")
                         } else {
                             copy::text("Manual", "手动", "手動")
-                        }
+                        })
                     },
                     move || on_toggle_manual(),
                 ))
-                .child(small_action_reactive(
+                .child(action::link(
                     move || {
-                        if paused.get_untracked() {
+                        SharedString::from(if paused.get() {
                             copy::text("Resume", "继续", "繼續")
                         } else {
                             copy::text("Pause", "暂停", "暫停")
-                        }
+                        })
                     },
                     move || on_toggle_paused(),
                 ))
-                .child(small_action(
+                .child(action::link(
                     copy::text("Clear", "清空", "清空"),
                     move || on_clear(),
                 )),
@@ -4273,9 +4557,14 @@ fn queue_card(
                 let dragging = signal(false);
                 view()
                     .w_full()
+                    .min_h(px(theme::TOUCH_TARGET))
+                    .pl(px(surface::ROW_INSET))
+                    .pr(px(theme::SPACING_XS))
                     .flex_row()
                     .items_center()
-                    .gap(px(theme::SPACING_XS))
+                    .border_t_1()
+                    .border_color(theme::hairline)
+                    .style_when(move || dragging.get(), |style| style.bg(theme::fill()))
                     .on_long_press(move || dragging.set(true))
                     .on_pan_end({
                         let on_move = on_move.clone();
@@ -4302,23 +4591,34 @@ fn queue_card(
                             })
                         })
                         .flex_1()
+                        .min_w(px(0.0))
                         .truncate()
-                        .text_size(px(theme::font_micro()))
-                        .text_color(theme::text_secondary),
+                        .text_size(px(theme::font_caption()))
+                        .text_color(theme::foreground),
                     )
                     .child({
                         let on_move = on_move.clone();
-                        move || small_action("↑", move || on_move(id, -1))
-                    }())
+                        row_action(
+                            icon!("chevron-up"),
+                            copy::text("Move up", "上移", "上移"),
+                            move || on_move(id, -1),
+                        )
+                    })
                     .child({
                         let on_move = on_move.clone();
-                        move || small_action("↓", move || on_move(id, 1))
-                    }())
-                    .child(small_action(
-                        copy::text("Send", "发送", "傳送"),
+                        row_action(
+                            icon!("chevron-down"),
+                            copy::text("Move down", "下移", "下移"),
+                            move || on_move(id, 1),
+                        )
+                    })
+                    .child(row_action(
+                        icon!("send"),
+                        copy::text("Send now", "立即发送", "立即傳送"),
                         move || send(id),
                     ))
-                    .child(small_action(
+                    .child(row_action(
+                        icon!("x"),
                         copy::text("Remove", "移除", "移除"),
                         move || remove(id),
                     ))
@@ -4334,19 +4634,23 @@ fn goal_bar(
     let pause = on_control.clone();
     let resume = on_control.clone();
     let clear = on_control;
-    view()
-        .w_full()
-        .gap(px(theme::SPACING_XS))
-        .p(px(theme::SPACING_SM))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_card)
+    surface::card()
+        .pl(px(surface::ROW_INSET))
+        .pr(px(theme::SPACING_XS))
+        .py(px(theme::SPACING_SM))
+        .gap(px(2.0))
         .child(
             view()
+                .w_full()
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_SM))
+                .child(
+                    svg(icon!("crosshair"))
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted),
+                )
                 .child(
                     text(move || {
                         goal.with(|goal| {
@@ -4356,15 +4660,20 @@ fn goal_bar(
                         })
                     })
                     .flex_1()
+                    .min_w(px(0.0))
                     .truncate()
                     .text_size(px(theme::font_detail()))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::foreground),
                 )
                 .child(
                     text(move || {
                         goal.with(|goal| goal.as_ref().map(goal_phase_label).unwrap_or_default())
                     })
+                    .flex_shrink_0()
+                    .pr(px(theme::SPACING_SM))
                     .text_size(px(theme::font_micro()))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(move || {
                         goal.with(|goal| {
                             goal.as_ref()
@@ -4372,38 +4681,34 @@ fn goal_bar(
                                 .unwrap_or_else(theme::text_muted)
                         })
                     }),
-                )
-                .child(small_action(
-                    copy::text("Clear", "清除", "清除"),
-                    move || clear(GoalControl::Clear),
-                )),
+                ),
         )
-        .child(when(
-            move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.progress.is_some())),
-            move || {
-                text(move || {
-                    goal.with(|goal| {
-                        goal.as_ref()
-                            .and_then(|goal| goal.progress.clone())
-                            .unwrap_or_default()
-                    })
-                })
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted)
-            },
-        ))
         .child(
             view()
+                .w_full()
                 .flex_row()
                 .items_center()
-                .gap(px(theme::SPACING_XS))
+                .child(
+                    text(move || {
+                        goal.with(|goal| {
+                            goal.as_ref()
+                                .and_then(|goal| goal.progress.clone())
+                                .unwrap_or_default()
+                        })
+                    })
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted),
+                )
                 .child(when(
                     move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.can_pause)),
                     {
                         let pause = pause.clone();
                         move || {
                             let pause = pause.clone();
-                            small_action(copy::text("Pause", "暂停", "暫停"), move || {
+                            action::link(copy::text("Pause", "暂停", "暫停"), move || {
                                 pause(GoalControl::Pause)
                             })
                         }
@@ -4415,8 +4720,20 @@ fn goal_bar(
                         let resume = resume.clone();
                         move || {
                             let resume = resume.clone();
-                            small_action(copy::text("Resume", "继续", "繼續"), move || {
+                            action::link(copy::text("Resume", "继续", "繼續"), move || {
                                 resume(GoalControl::Resume)
+                            })
+                        }
+                    },
+                ))
+                .child(when(
+                    move || goal.with(|goal| goal.as_ref().is_some_and(|goal| goal.can_clear)),
+                    {
+                        let clear = clear.clone();
+                        move || {
+                            let clear = clear.clone();
+                            action::link(copy::text("Clear", "清除", "清除"), move || {
+                                clear(GoalControl::Clear)
                             })
                         }
                     },
@@ -4449,34 +4766,61 @@ fn goal_phase_color(goal: &GoalView) -> Hsla {
 
 /// The Agent's current plan, with its steps one tap away.
 fn plan_bar(plan: Signal<Option<PlanView>>, open: Signal<bool>) -> impl IntoElement {
-    view()
-        .w_full()
-        .gap(px(theme::SPACING_XS))
-        .p(px(theme::SPACING_SM))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_card)
+    let expanded = computed(move || open.get());
+    surface::card()
         .child(
-            view()
+            button()
+                .w_full()
+                .min_h(px(theme::ROW_HEIGHT))
+                .pl(px(surface::ROW_INSET))
+                .pr(px(theme::SPACING_MD))
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_SM))
+                .accessibility_label(copy::text("Steps", "步骤", "步驟"))
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .on_press(move || open.update(|open| *open = !*open))
                 .child(
-                    text(move || {
-                        plan.with(|plan| {
-                            plan.as_ref()
-                                .map(|plan| plan.title.clone())
-                                .filter(|title| !title.trim().is_empty())
-                                .unwrap_or_else(|| {
-                                    copy::text("Current plan", "当前计划", "目前計劃").to_owned()
+                    svg(icon!("list-checks"))
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::text_muted),
+                )
+                .child(
+                    view()
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .flex_col()
+                        .child(
+                            text(move || {
+                                plan.with(|plan| {
+                                    plan.as_ref()
+                                        .map(|plan| plan.title.clone())
+                                        .filter(|title| !title.trim().is_empty())
+                                        .unwrap_or_else(|| {
+                                            copy::text("Current plan", "当前计划", "目前計劃")
+                                                .to_owned()
+                                        })
                                 })
-                        })
-                    })
-                    .flex_1()
-                    .truncate()
-                    .text_size(px(theme::font_detail()))
-                    .text_color(theme::foreground),
+                            })
+                            .truncate()
+                            .text_size(px(theme::font_detail()))
+                            .font_weight(FontWeight::MEDIUM)
+                            .text_color(theme::foreground),
+                        )
+                        .child(
+                            text(move || {
+                                plan.with(|plan| {
+                                    plan.as_ref()
+                                        .and_then(|plan| plan.steps.get(plan.current))
+                                        .map(|step| step.title.clone())
+                                        .unwrap_or_default()
+                                })
+                            })
+                            .truncate()
+                            .text_size(px(theme::font_micro()))
+                            .text_color(theme::text_muted),
+                        ),
                 )
                 .child(
                     text(move || {
@@ -4486,75 +4830,68 @@ fn plan_bar(plan: Signal<Option<PlanView>>, open: Signal<bool>) -> impl IntoElem
                                 .unwrap_or_default()
                         })
                     })
+                    .flex_shrink_0()
                     .text_size(px(theme::font_micro()))
+                    .font_weight(FontWeight::MEDIUM)
                     .text_color(theme::text_muted),
                 )
-                .child(small_action(
-                    copy::text("Steps", "步骤", "步驟"),
-                    move || open.update(|open| *open = !*open),
-                )),
-        )
-        .child(
-            text(move || {
-                plan.with(|plan| {
-                    plan.as_ref()
-                        .and_then(|plan| plan.steps.get(plan.current))
-                        .map(|step| step.title.clone())
-                        .unwrap_or_default()
-                })
-            })
-            .truncate()
-            .text_size(px(theme::font_micro()))
-            .text_color(theme::text_muted),
+                .child(disclosure_chevron(expanded)),
         )
         .child(when(
             move || open.get(),
             move || {
-                view().w_full().flex_col().gap(px(2.0)).child(each(
-                    move || {
-                        plan.with(|plan| {
-                            plan.as_ref()
-                                .map(|plan| plan.steps.clone())
-                                .unwrap_or_default()
-                        })
-                    },
-                    |step| step.title.clone(),
-                    move |step, _| {
-                        view()
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_XS))
-                            .child(
-                                text(move || match step.with(|step| step.state) {
-                                    PlanStepState::Completed => "✓",
-                                    PlanStepState::Running => "◐",
-                                    PlanStepState::Failed => "×",
-                                    PlanStepState::Pending => "·",
-                                })
-                                .text_size(px(theme::font_micro()))
-                                .text_color(move || {
-                                    match step.with(|step| step.state) {
-                                        PlanStepState::Completed => theme::color_token("chart-1"),
-                                        PlanStepState::Running => theme::color_token("warning"),
-                                        PlanStepState::Failed => theme::accent_red(),
-                                        PlanStepState::Pending => theme::text_muted(),
-                                    }
-                                }),
-                            )
-                            .child(
-                                text(move || step.with(|step| step.title.clone()))
-                                    .flex_1()
-                                    .truncate()
-                                    .text_size(px(theme::font_micro()))
-                                    .text_color(theme::text_secondary),
-                            )
-                    },
-                ))
+                view()
+                    .w_full()
+                    .flex_col()
+                    .px(px(surface::ROW_INSET))
+                    .py(px(theme::SPACING_SM))
+                    .gap(px(theme::SPACING_SM))
+                    .border_t_1()
+                    .border_color(theme::hairline)
+                    .child(each(
+                        move || {
+                            plan.with(|plan| {
+                                plan.as_ref()
+                                    .map(|plan| plan.steps.clone())
+                                    .unwrap_or_default()
+                            })
+                        },
+                        |step| step.title.clone(),
+                        move |step, _| {
+                            let ink = move || match step.with(|step| step.state) {
+                                PlanStepState::Completed => theme::accent_success(),
+                                PlanStepState::Running => theme::accent_blue(),
+                                PlanStepState::Failed => theme::accent_red(),
+                                PlanStepState::Pending => theme::text_muted().opacity(0.5),
+                            };
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .child(surface::status_dot(ink))
+                                .child(
+                                    text(move || step.with(|step| step.title.clone()))
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .truncate()
+                                        .text_size(px(theme::font_caption()))
+                                        .text_color(move || {
+                                            if step.with(|step| step.state)
+                                                == PlanStepState::Pending
+                                            {
+                                                theme::text_muted()
+                                            } else {
+                                                theme::text_secondary()
+                                            }
+                                        }),
+                                )
+                        },
+                    ))
             },
         ))
 }
 
-/// The composer's runtime chips: the model, and the Agent's own options.
+/// The panels of the runtime sheet: the model, and the Agent's own options.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum RuntimePanel {
     Model,
@@ -4564,133 +4901,15 @@ enum RuntimePanel {
 }
 
 impl RuntimePanel {
-    fn title(self) -> &'static str {
+    /// The panel's name on the sheet's segmented control.
+    fn label(self) -> &'static str {
         match self {
-            Self::Model => copy::text("Agent settings", "Agent 设置", "Agent 設定"),
+            Self::Model => copy::text("Model", "模型", "模型"),
             Self::Reasoning => copy::text("Reasoning", "推理", "推理"),
             Self::Mode => copy::text("Mode", "模式", "模式"),
-            Self::Options => copy::text("Session options", "会话选项", "工作階段選項"),
+            Self::Options => copy::text("Options", "选项", "選項"),
         }
     }
-}
-
-fn runtime_chip_row(
-    summary: Signal<Option<RuntimeSummaryView>>,
-    reasoning: Signal<Vec<RuntimeChoiceView>>,
-    modes: Signal<Vec<RuntimeChoiceView>>,
-    features: Signal<Vec<RuntimeFeatureView>>,
-    busy: impl Fn() -> bool + Copy + 'static,
-    on_open: Rc<dyn Fn(RuntimePanel)>,
-) -> impl IntoElement {
-    view()
-        .flex_1()
-        .min_w(px(0.0))
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SPACING_XS))
-        .child({
-            let on_open = on_open.clone();
-            button()
-                .on_press(move || on_open(RuntimePanel::Model))
-                .flex_1()
-                .min_w(px(0.0))
-                .h(px(theme::TOUCH_TARGET))
-                .flex_row()
-                .items_center()
-                .gap(px(theme::SPACING_XS))
-                .rounded(px(theme::RADIUS_CONTROL))
-                .px(px(theme::SPACING_XS))
-                .active(|style| style.opacity(0.8))
-                .disabled(busy)
-                .disabled_style(|style| style.opacity(0.42))
-                .child(
-                    svg(icon!("sparkles"))
-                        .size(px(theme::ICON_MD))
-                        .flex_shrink_0()
-                        .text_color(theme::text_muted),
-                )
-                .child(
-                    text(move || {
-                        summary.with(|summary| {
-                            summary
-                                .as_ref()
-                                .map(|summary| summary.model.clone())
-                                .unwrap_or_else(|| copy::text("Model", "模型", "模型").to_owned())
-                        })
-                    })
-                    .min_w(px(0.0))
-                    .truncate()
-                    .text_size(px(theme::font_caption()))
-                    .text_color(move || {
-                        if summary.with(|summary| {
-                            summary.as_ref().is_some_and(|summary| !summary.available)
-                        }) {
-                            theme::color_token("warning")
-                        } else {
-                            theme::text_secondary()
-                        }
-                    }),
-                )
-        })
-        .child(when(
-            move || reasoning.with(|choices| !choices.is_empty()),
-            {
-                let on_open = on_open.clone();
-                move || {
-                    let on_open = on_open.clone();
-                    composer_option(
-                        icon!("brain"),
-                        copy::text("Reasoning", "推理", "推理"),
-                        move || {
-                            summary.with(|summary| {
-                                summary
-                                    .as_ref()
-                                    .is_some_and(|summary| summary.reasoning_set)
-                            })
-                        },
-                        busy,
-                        Rc::new(move || on_open(RuntimePanel::Reasoning)),
-                    )
-                }
-            },
-        ))
-        .child(when(move || modes.with(|choices| !choices.is_empty()), {
-            let on_open = on_open.clone();
-            move || {
-                let on_open = on_open.clone();
-                composer_option(
-                    icon!("shield-alert"),
-                    copy::text("Mode", "模式", "模式"),
-                    move || {
-                        summary.with(|summary| {
-                            summary.as_ref().is_some_and(|summary| summary.mode_set)
-                        })
-                    },
-                    busy,
-                    Rc::new(move || on_open(RuntimePanel::Mode)),
-                )
-            }
-        }))
-        .child(when(
-            move || features.with(|features| !features.is_empty()),
-            {
-                let on_open = on_open.clone();
-                move || {
-                    let on_open = on_open.clone();
-                    composer_option(
-                        icon!("sliders-horizontal"),
-                        copy::text("Session options", "会话选项", "工作階段選項"),
-                        move || {
-                            summary.with(|summary| {
-                                summary.as_ref().is_some_and(|summary| summary.options_set)
-                            })
-                        },
-                        busy,
-                        Rc::new(move || on_open(RuntimePanel::Options)),
-                    )
-                }
-            },
-        ))
 }
 
 fn token_chip(usage: Signal<Option<TokenUsageView>>) -> impl IntoElement {
@@ -4724,7 +4943,7 @@ fn token_chip(usage: Signal<Option<TokenUsageView>>) -> impl IntoElement {
                     .min(100);
                 let color = match percent {
                     91.. => theme::accent_red(),
-                    70..=90 => theme::color_token("warning"),
+                    70..=90 => theme::accent_yellow(),
                     _ => theme::text_muted(),
                 };
                 let ring = Painter::new()
@@ -4788,40 +5007,13 @@ fn compact_tokens(tokens: u64) -> String {
     }
 }
 
-fn composer_option(
-    icon: ImageSrc,
-    label: &'static str,
-    selected: impl Fn() -> bool + 'static,
-    busy: impl Fn() -> bool + 'static,
-    on_press: Action,
-) -> ButtonElement {
-    button()
-        .size(px(theme::COMPOSER_OPTION_SIZE))
-        .flex_shrink_0()
-        .items_center()
-        .justify_center()
-        .rounded_full()
-        .accessibility_label(label)
-        .on_press(move || on_press())
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .disabled(busy)
-        .disabled_style(|style| style.opacity(0.42))
-        .child(svg(icon).size(px(theme::ICON_MD)).text_color(move || {
-            if selected() {
-                theme::foreground()
-            } else {
-                theme::text_secondary()
-            }
-        }))
-}
-
 /// The prompts already sent, one tap from the composer.
 fn history_sheet(
     host: SessionHost,
     jump: Signal<Option<i64>>,
     composer_input: ElementRef,
 ) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_header};
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
     let open = host.history_open;
     let history = host.history;
     let limit = signal(12usize);
@@ -4851,11 +5043,8 @@ fn history_sheet(
             ))
             .child(
                 scroll().min_h(px(0.0)).flex_shrink(1.0).child(
-                    view()
-                        .w_full()
-                        .px(px(theme::SPACING_MD))
-                        .pb_safe_area_plus(px(theme::SPACING_MD))
-                        .child(each(
+                    sheet_body()
+                        .child(sheet_card().child(each(
                             move || {
                                 history.with(|history| {
                                     history
@@ -4870,15 +5059,20 @@ fn history_sheet(
                                 let close = close.clone();
                                 let recall = recall.clone();
                                 view()
+                                    .w_full()
                                     .flex_row()
                                     .items_center()
+                                    .pr(px(theme::SPACING_SM))
                                     .border_b_1()
-                                    .border_b_color(theme::border_subtle)
+                                    .border_b_color(theme::hairline)
                                     .child(
                                         button()
                                             .flex_1()
                                             .min_w(px(0.0))
-                                            .min_h(px(theme::TOUCH_TARGET))
+                                            .min_h(px(theme::ROW_HEIGHT))
+                                            .pl(px(surface::ROW_INSET))
+                                            .pr(px(theme::SPACING_SM))
+                                            .py(px(theme::SPACING_SM))
                                             .items_start()
                                             .justify_center()
                                             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -4891,11 +5085,14 @@ fn history_sheet(
                                                     entry.with(|entry| entry.text.clone())
                                                 })
                                                 .number_of_lines(2u32)
-                                                .text_size(px(theme::font_body()))
+                                                .text_size(px(theme::font_detail()))
+                                                .line_height(theme::line_height_for(
+                                                    theme::font_detail(),
+                                                ))
                                                 .text_color(theme::foreground),
                                             ),
                                     )
-                                    .child(row_action(
+                                    .child(surface::ghost_button(
                                         icon!("text-cursor-input"),
                                         copy::text("Use in composer", "带入输入框", "帶入輸入框"),
                                         move || {
@@ -4907,27 +5104,14 @@ fn history_sheet(
                                         },
                                     ))
                             },
-                        ))
+                        )))
                         .child(when(
                             move || history.with(Vec::len) > limit.get(),
                             move || {
-                                button()
-                                    .h(px(theme::TOUCH_TARGET))
-                                    .flex_row()
-                                    .items_center()
-                                    .justify_center()
-                                    .gap(px(theme::SPACING_XS))
-                                    .on_press(move || limit.update(|limit| *limit += 12))
-                                    .child(
-                                        svg(icon!("arrow-to-top"))
-                                            .size(px(theme::ICON_SM))
-                                            .text_color(theme::accent_blue),
-                                    )
-                                    .child(
-                                        text(copy::text("Show older", "显示更早", "顯示更早"))
-                                            .text_size(px(theme::font_caption()))
-                                            .text_color(theme::accent_blue),
-                                    )
+                                view().w_full().items_center().child(action::link(
+                                    copy::text("Show older", "显示更早", "顯示更早"),
+                                    move || limit.update(|limit| *limit += 12),
+                                ))
                             },
                         )),
                 ),
@@ -4935,20 +5119,38 @@ fn history_sheet(
     )
 }
 
-/// The runtime sheet: the model list and the Agent's own option groups.
+/// The runtime sheet: what runs the session, and how. One sheet with a panel
+/// a kind of choice: the model, and the Agent's own option groups.
 fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_header};
+    use crate::ui::sheet::{bottom_sheet, sheet_card, sheet_header};
     let open = host.runtime_open;
     let close = host.on_close_runtime;
     let query = signal(String::new());
     let agent = signal(None::<String>);
     let options = host.runtime_options;
     let busy = host.runtime_busy;
+    let reasoning = host.runtime_reasoning;
+    let modes = host.runtime_modes;
+    let features = host.runtime_features;
     effect(move || {
         if !open.get() {
             query.set(String::new());
             agent.set(None);
         }
+    });
+    // The panels the runtime has something to offer on.
+    let panels = computed(move || {
+        let mut panels = vec![RuntimePanel::Model];
+        if !reasoning.with(Vec::is_empty) {
+            panels.push(RuntimePanel::Reasoning);
+        }
+        if !modes.with(Vec::is_empty) {
+            panels.push(RuntimePanel::Mode);
+        }
+        if !features.with(Vec::is_empty) {
+            panels.push(RuntimePanel::Options);
+        }
+        panels
     });
     let agents = computed(move || {
         options.with(|options| {
@@ -5000,55 +5202,78 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
         },
         view()
             .w_full()
-            .max_h(move || px(window().height.0 * 0.75))
+            .max_h(move || px(window().height.0 * 0.78))
             .min_h(px(0.0))
             .child(sheet_header(
-                move || SharedString::from(panel.get().title()),
+                copy::text("Agent settings", "Agent 设置", "Agent 設定"),
                 move || {
                     dismiss_keyboard();
                     close();
                 },
             ))
             .child(when(
+                move || panels.with(|panels| panels.len() > 1),
+                move || {
+                    view()
+                        .w_full()
+                        .flex_shrink_0()
+                        .px(px(theme::SPACING_MD))
+                        .pb(px(theme::SPACING_MD))
+                        .child(dynamic(move || {
+                            let mut track = surface::segment_track();
+                            for candidate in panels.get() {
+                                track = track.child(surface::segment(
+                                    candidate.label(),
+                                    move || panel.get() == candidate,
+                                    move || {
+                                        dismiss_keyboard();
+                                        panel.set(candidate);
+                                    },
+                                ));
+                            }
+                            track
+                        }))
+                },
+            ))
+            .child(when(
                 move || panel.get() == RuntimePanel::Model,
                 move || {
                     view()
+                        .w_full()
+                        .flex_shrink_0()
+                        .gap(px(theme::SPACING_SM))
+                        .pb(px(theme::SPACING_SM))
                         .child(
                             scroll().horizontal().scrollbar(false).w_full().child(
                                 view()
                                     .flex_row()
-                                    .px(px(theme::SPACING_SM))
-                                    .gap(px(theme::SPACING_XS))
-                                    .border_b_1()
-                                    .border_color(theme::border_subtle)
+                                    .px(px(theme::SPACING_MD))
+                                    .gap(px(6.0))
                                     .child(each(
                                         move || agents.get(),
                                         |row| row.0.clone(),
                                         move |row, _| {
-                                            button()
-                                                .size(px(theme::TOUCH_TARGET))
-                                                .flex_shrink_0()
-                                                .items_center()
-                                                .justify_center()
-                                                .accessibility_label(move || {
-                                                    row.with(|row| {
-                                                        SharedString::from(row.1.clone())
-                                                    })
+                                            let chosen = move || {
+                                                active_agent.with(|id| {
+                                                    row.with(|row| id.as_ref() == Some(&row.0))
                                                 })
-                                                .style_when(
-                                                    move || {
-                                                        active_agent.with(|id| {
-                                                            row.with(|row| {
-                                                                id.as_ref() == Some(&row.0)
-                                                            })
-                                                        })
-                                                    },
-                                                    |style| {
-                                                        style
-                                                            .border_b_1()
-                                                            .border_color(theme::accent_blue)
-                                                    },
-                                                )
+                                            };
+                                            button()
+                                                .h(px(theme::SEGMENT_HEIGHT))
+                                                .px(px(theme::SPACING_MD))
+                                                .flex_shrink_0()
+                                                .flex_row()
+                                                .items_center()
+                                                .gap(px(6.0))
+                                                .rounded_full()
+                                                .bg(move || {
+                                                    if chosen() {
+                                                        theme::action_primary()
+                                                    } else {
+                                                        theme::fill()
+                                                    }
+                                                })
+                                                .active(|style| style.opacity(0.7))
                                                 .on_press(move || {
                                                     agent.set(Some(
                                                         row.with_untracked(|row| row.0.clone()),
@@ -5058,24 +5283,44 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                     svg(icon(agent_icon(
                                                         &row.with(|row| row.0.clone()),
                                                     )))
-                                                    .size(px(theme::ICON_MD))
-                                                    .text_color(theme::text_secondary)
+                                                    .size(px(14.0))
+                                                    .flex_shrink_0()
+                                                    .text_color(move || {
+                                                        if chosen() {
+                                                            theme::action_primary_label()
+                                                        } else {
+                                                            theme::text_secondary()
+                                                        }
+                                                    })
                                                 }))
+                                                .child(
+                                                    text(move || row.with(|row| row.1.clone()))
+                                                        .text_size(px(theme::font_caption()))
+                                                        .font_weight(FontWeight::MEDIUM)
+                                                        .text_color(move || {
+                                                            if chosen() {
+                                                                theme::action_primary_label()
+                                                            } else {
+                                                                theme::text_secondary()
+                                                            }
+                                                        }),
+                                                )
                                         },
                                     )),
                             ),
                         )
                         .child(
-                            view()
-                                .px(px(theme::SPACING_MD))
-                                .pt(px(theme::SPACING_SM))
+                            surface::field_pill()
+                                .mx(px(theme::SPACING_MD))
+                                .child(surface::field_glyph(icon!("search")))
                                 .child(
-                                    field::text_field_flat(
+                                    field::text_field_bare(
                                         query,
                                         copy::text("Search models", "搜索模型", "搜尋模型"),
                                     )
-                                    .rounded(px(theme::RADIUS_CONTROL))
-                                    .bg(theme::background_dim),
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .h_full(),
                                 ),
                         )
                 },
@@ -5084,59 +5329,92 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 scroll().flex_shrink(1.0).min_h(px(0.0)).child(
                     view()
                         .w_full()
-                        .gap(px(theme::SPACING_XS))
                         .px(px(theme::SPACING_MD))
-                        .pt(px(theme::SPACING_SM))
-                        .pb_safe_area_plus(px(theme::SPACING_MD))
+                        .pb_safe_area_plus(px(theme::SPACING_LG))
                         .child(when(move || panel.get() == RuntimePanel::Model, {
                             let choose = host.on_choose_runtime.clone();
                             move || {
+                                let choose = choose.clone();
                                 view()
-                                    .gap(px(theme::SPACING_XS))
-                                    .child(each(move || filtered.get(), |row| row.id.clone(), {
-                                        let choose = choose.clone();
-                                        move |option: ReadSignal<RuntimeOptionView>, _| {
+                                    .w_full()
+                                    .child(when(
+                                        move || !filtered.with(Vec::is_empty),
+                                        move || {
                                             let choose = choose.clone();
-                                            button()
-                                                .w_full()
-                                                .min_h(px(48.0))
-                                                .px(px(theme::SPACING_SM))
-                                                .py(px(theme::SPACING_XS))
-                                                .items_start()
-                                                .rounded(px(theme::RADIUS_CONTROL))
-                                                .style_when(
-                                                    move || option.with(|option| option.selected),
-                                                    |style| style.bg(theme::sidebar_selected_bg()),
-                                                )
-                                                .on_press(move || {
-                                                    dismiss_keyboard();
-                                                    option.with(|option| choose(&option.id));
-                                                })
-                                                .disabled(move || {
-                                                    busy.get()
-                                                        || !option.with(|option| option.available)
-                                                })
-                                                .disabled_style(|style| style.opacity(0.45))
-                                                .child(
-                                                    text(move || {
-                                                        option.with(|option| option.model.clone())
-                                                    })
-                                                    .w_full()
-                                                    .truncate()
-                                                    .text_size(px(theme::font_detail()))
-                                                    .text_color(theme::foreground),
-                                                )
-                                                .child(
-                                                    text(move || {
-                                                        option.with(|option| option.detail.clone())
-                                                    })
-                                                    .w_full()
-                                                    .truncate()
-                                                    .text_size(px(theme::font_micro()))
-                                                    .text_color(theme::text_muted),
-                                                )
-                                        }
-                                    }))
+                                            sheet_card().child(each(
+                                                move || filtered.get(),
+                                                |row| row.id.clone(),
+                                                move |option: ReadSignal<RuntimeOptionView>, _| {
+                                                    let choose = choose.clone();
+                                                    button()
+                                                        .w_full()
+                                                        .min_h(px(theme::ROW_HEIGHT))
+                                                        .px(px(surface::ROW_INSET))
+                                                        .py(px(theme::SPACING_SM))
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(theme::SPACING_MD))
+                                                        .border_b_1()
+                                                        .border_b_color(theme::hairline)
+                                                        .active(|style| {
+                                                            style.bg(theme::row_pressed_bg())
+                                                        })
+                                                        .on_press(move || {
+                                                            dismiss_keyboard();
+                                                            option.with(|option| choose(&option.id));
+                                                        })
+                                                        .disabled(move || {
+                                                            busy.get()
+                                                                || !option
+                                                                    .with(|option| option.available)
+                                                        })
+                                                        .disabled_style(|style| style.opacity(0.45))
+                                                        .child(
+                                                            view()
+                                                                .flex_1()
+                                                                .min_w(px(0.0))
+                                                                .flex_col()
+                                                                .gap(px(1.0))
+                                                                .child(
+                                                                    text(move || {
+                                                                        option.with(|option| {
+                                                                            option.model.clone()
+                                                                        })
+                                                                    })
+                                                                    .truncate()
+                                                                    .text_size(px(
+                                                                        theme::font_detail(),
+                                                                    ))
+                                                                    .text_color(theme::foreground),
+                                                                )
+                                                                .child(
+                                                                    text(move || {
+                                                                        option.with(|option| {
+                                                                            option.detail.clone()
+                                                                        })
+                                                                    })
+                                                                    .truncate()
+                                                                    .text_size(px(
+                                                                        theme::font_micro(),
+                                                                    ))
+                                                                    .text_color(theme::text_muted),
+                                                                ),
+                                                        )
+                                                        .child(when(
+                                                            move || {
+                                                                option.with(|option| option.selected)
+                                                            },
+                                                            || {
+                                                                svg(icon!("check"))
+                                                                    .size(px(theme::ICON_MD))
+                                                                    .flex_shrink_0()
+                                                                    .text_color(theme::foreground)
+                                                            },
+                                                        ))
+                                                },
+                                            ))
+                                        },
+                                    ))
                                     .child(when(
                                         move || filtered.with(Vec::is_empty),
                                         move || {
@@ -5151,6 +5429,7 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                     )
                                                 }
                                             })
+                                            .p(px(theme::SPACING_SM))
                                             .text_size(px(theme::font_caption()))
                                             .text_color(theme::text_muted)
                                         },
@@ -5161,7 +5440,7 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || panel.get() == RuntimePanel::Reasoning,
                             move || {
                                 choice_section(
-                                    host.runtime_reasoning,
+                                    reasoning,
                                     busy,
                                     host.on_choose_reasoning.clone(),
                                     finish_reasoning.clone(),
@@ -5172,7 +5451,7 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || panel.get() == RuntimePanel::Mode,
                             move || {
                                 choice_section(
-                                    host.runtime_modes,
+                                    modes,
                                     busy,
                                     host.on_choose_mode.clone(),
                                     finish_mode.clone(),
@@ -5183,7 +5462,7 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                             move || panel.get() == RuntimePanel::Options,
                             move || {
                                 feature_section(
-                                    host.runtime_features,
+                                    features,
                                     busy,
                                     host.on_choose_feature.clone(),
                                     finish_options.clone(),
@@ -5193,13 +5472,6 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 ),
             ),
     )
-}
-
-fn section_label(label: &'static str) -> impl IntoElement {
-    text(label)
-        .text_size(px(theme::font_micro()))
-        .font_weight(FontWeight::SEMIBOLD)
-        .text_color(theme::text_muted)
 }
 
 fn choice_section(
@@ -5220,15 +5492,15 @@ fn choice_section(
                 let value = choice.with(|choice| choice.value.clone());
                 let on_choose = on_choose.clone();
                 let close = close.clone();
-                runtime_choice_chip(
+                surface::choice_pill(
                     move || choice.with(|choice| choice.label.clone()),
                     move || choice.with(|choice| choice.selected),
-                    busy,
                     move || {
                         on_choose(&value);
                         close();
                     },
                 )
+                .disabled(move || busy.get())
             },
         ))
 }
@@ -5242,11 +5514,7 @@ fn feature_section(
     view()
         .w_full()
         .flex_col()
-        .gap(px(theme::SPACING_XS))
-        .child(when(
-            move || !features.with(|features| features.is_empty()),
-            || section_label(copy::text("Session options", "会话选项", "工作階段選項")),
-        ))
+        .gap(px(theme::SPACING_LG))
         .child(each(
             move || features.get(),
             |feature| feature.id.clone(),
@@ -5255,21 +5523,28 @@ fn feature_section(
                 let close = close.clone();
                 view()
                     .w_full()
-                    .gap(px(theme::SPACING_XS))
-                    .pb(px(theme::SPACING_SM))
+                    .gap(px(theme::SPACING_SM))
                     .child(
-                        text(move || feature.with(|feature| feature.label.clone()))
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::text_secondary),
+                        view()
+                            .w_full()
+                            .px(px(theme::SPACING_XS))
+                            .gap(px(2.0))
+                            .child(
+                                text(move || feature.with(|feature| feature.label.clone()))
+                                    .text_size(px(theme::font_detail()))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::foreground),
+                            )
+                            .child(when(
+                                move || feature.with(|feature| !feature.detail.is_empty()),
+                                move || {
+                                    text(move || feature.with(|feature| feature.detail.clone()))
+                                        .text_size(px(theme::font_micro()))
+                                        .line_height(theme::line_height_for(theme::font_micro()))
+                                        .text_color(theme::text_muted)
+                                },
+                            )),
                     )
-                    .child(when(
-                        move || feature.with(|feature| !feature.detail.is_empty()),
-                        move || {
-                            text(move || feature.with(|feature| feature.detail.clone()))
-                                .text_size(px(theme::font_micro()))
-                                .text_color(theme::text_muted)
-                        },
-                    ))
                     .child(dynamic(move || {
                         let snapshot = feature.get();
                         let mut choices =
@@ -5302,684 +5577,686 @@ fn feature_section(
                                 let id = snapshot.id.clone();
                                 let on_choose = on_choose.clone();
                                 let close = close.clone();
-                                runtime_choice_chip(
+                                surface::choice_pill(
                                     move || label.clone(),
                                     move || selected,
-                                    busy,
                                     move || {
                                         on_choose(&id, value.as_deref());
                                         close();
                                     },
                                 )
+                                .disabled(move || busy.get())
                             }))
                     }))
             },
         ))
 }
 
-fn runtime_choice_chip(
-    label: impl Fn() -> String + 'static,
-    selected: impl Fn() -> bool + Copy + 'static,
-    busy: Signal<bool>,
-    on_choose: impl Fn() + 'static,
-) -> ButtonElement {
-    button()
-        .h(px(theme::TOUCH_TARGET))
-        .min_w(px(0.0))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(move || {
-            if selected() {
-                theme::accent_blue()
-            } else {
-                theme::border_default()
-            }
-        })
-        .bg(move || {
-            if selected() {
-                theme::background_card()
-            } else {
-                theme::background_dim()
-            }
-        })
-        .px(px(theme::SPACING_MD))
-        .items_center()
-        .justify_center()
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .disabled(move || busy.get())
-        .disabled_style(|style| style.opacity(0.42))
-        .on_press(on_choose)
-        .child(
-            text(label)
-                .truncate()
-                .text_size(px(theme::font_caption()))
-                .text_color(theme::text_secondary),
-        )
+/// What floats over the workspace's three pages: the menu a held row raises
+/// and the sheets its commands lead to. One set serves every page, so a
+/// session's commands read the same from its row and from its own header.
+#[derive(Clone, Copy)]
+struct Overlays {
+    menu: Signal<Option<Menu>>,
+    /// Whether the session the host's `session_actions` names is being
+    /// renamed.
+    rename: Signal<bool>,
+    /// The held send being moved to another hour.
+    reschedule: Signal<Option<(String, u64)>>,
 }
 
-/// The pending attachments, each removable.
-fn attachment_chips(
-    attachments: Signal<Vec<AttachmentItem>>,
-    on_remove: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    view()
-        .w_full()
-        .flex_row()
-        .flex_wrap()
-        .gap(px(theme::SPACING_XS))
-        .child(each(
-            move || attachments.get(),
-            |item| item.id.clone(),
-            move |item, _| attachment_chip(item, on_remove.clone()),
+/// The sheets a folder's or a group's menu leads to.
+#[derive(Clone, Copy)]
+struct SectionSheets {
+    /// The folder or group being renamed, and the name being written for it.
+    rename_folder: Signal<Option<String>>,
+    rename_group: Signal<Option<String>>,
+    name: Signal<String>,
+    /// The folder whose archive window is being chosen.
+    archive: Signal<Option<String>>,
+    /// The group whose members are being edited, and the ones ticked so far.
+    members: Signal<Option<String>>,
+    members_selected: Signal<Vec<String>>,
+}
+
+/// The commands of one session, as its row and its own header both raise
+/// them. `lead` goes first: what only the place that raised the menu offers.
+/// A row also offers its own place in the tree; a header has none to offer.
+fn session_menu(
+    host: &SessionHost,
+    overlays: Overlays,
+    id: &str,
+    title: &str,
+    place: (f32, MenuSide),
+    lead: Vec<MenuEntry>,
+) -> Menu {
+    let in_tree = lead.is_empty();
+    // The service's own commands (rename, move, archive, delete) act on the
+    // session named here.
+    (host.on_session_menu)(id, title);
+    let listed =
+        |list: Signal<Vec<String>>| list.with_untracked(|list| list.iter().any(|item| item == id));
+    let pinned = listed(host.pinned);
+    let auto_continue = listed(host.auto_continue_sessions);
+    let paused = listed(host.auto_continue_paused);
+    let send = host
+        .scheduled_sends
+        .with_untracked(|sends| sends.iter().find(|send| send.session_id == id).cloned());
+    let summary = host.sessions.with_untracked(|sessions| {
+        sessions
+            .iter()
+            .find(|session| session.id == id)
+            .cloned()
+    });
+    let sections = host.sidebar_sections.get_untracked();
+    // A session belongs to at most one group, so leaving it and joining one
+    // are the two halves of one question.
+    let group = sections
+        .iter()
+        .find(|section| {
+            section.kind == SidebarSectionKind::Group
+                && section.session_ids.iter().any(|member| member == id)
+        })
+        .cloned();
+    // Groups the session could join: the same project and worktree, since a
+    // group is a pane layout over one checkout.
+    let joinable = summary.as_ref().map_or_else(Vec::new, |session| {
+        sections
+            .iter()
+            .filter(|section| {
+                section.kind == SidebarSectionKind::Group
+                    && section.project_id.as_deref() == Some(session.project_id.as_str())
+                    && section.workspace_id.as_deref() == Some(session.workspace_id.as_str())
+                    && !section.session_ids.iter().any(|member| member == id)
+            })
+            .cloned()
+            .collect()
+    });
+    let row = in_tree
+        .then(|| host.sidebar.row(SidebarRowKind::Session, id))
+        .flatten();
+    let (up, down) = row
+        .as_ref()
+        .map_or((false, false), |row| (host.sidebar.row_move_targets)(row));
+    let caption = summary.as_ref().map_or_else(String::new, |session| {
+        if session.project_name.is_empty() {
+            session.agent.clone()
+        } else {
+            format!("{} · {}", session.agent, session.project_name)
+        }
+    });
+    let mark = summary
+        .as_ref()
+        .map(|session| icon(agent_icon(&session.agent)));
+    let id = id.to_owned();
+    // A command that needs no sheet lets go of the session once it ran.
+    let done = host.on_close_session_actions.clone();
+
+    let mut menu = Menu::at(place.0)
+        .side(place.1)
+        .about(mark, title.to_owned(), caption)
+        .on_dismiss({
+            let done = done.clone();
+            move || done()
+        });
+    for entry in lead {
+        menu = menu.entry(entry);
+    }
+    menu = menu
+        .entry(MenuEntry::new(
+            icon!("pencil"),
+            copy::text("Rename", "重命名", "重新命名"),
+            move || overlays.rename.set(true),
         ))
-}
-
-fn attachment_chip(
-    item: ReadSignal<AttachmentItem>,
-    on_remove: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    button()
-        .flex_row()
-        .items_center()
-        .gap(px(theme::SPACING_XS))
-        .min_h(px(28.0))
-        .px(px(theme::SPACING_SM))
-        .rounded(px(theme::RADIUS_CONTROL))
-        .border_1()
-        .border_color(theme::border_subtle)
-        .bg(theme::background_dim)
-        .on_press(move || {
-            let id = item.get_untracked().id;
-            on_remove(&id);
-        })
-        .child(
-            text(move || item.with(|item| item.label.clone()))
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_secondary),
-        )
-        .child(
-            text("×")
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted),
-        )
-}
-
-/// What the sessions page keeps behind its header's menu: the commands that
-/// act on the whole tree rather than on a row.
-struct DrawerMenu {
-    select: Action,
-    detailed: Signal<bool>,
-    toggle_hierarchy: Action,
-    collapse_all: Action,
-    locate: Action,
-    new_folder: Action,
-}
-
-fn drawer_root_menu(open: Signal<bool>, menu: DrawerMenu) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_entry, sheet_header};
-    let detailed = menu.detailed;
-    let entry = move |icon: ImageSrc, label: &'static str, action: Action| {
-        sheet_entry(icon, label, false, move || {
-            open.set(false);
-            action();
-        })
-    };
-    bottom_sheet(
-        move || open.get(),
-        move || open.set(false),
-        view()
-            .child(sheet_header(
-                copy::text("Sidebar", "侧栏", "側欄"),
-                move || open.set(false),
+        .entry(MenuEntry::new(
+            icon!("pin"),
+            if pinned {
+                copy::text("Unpin", "取消置顶", "取消置頂")
+            } else {
+                copy::text("Pin", "置顶", "置頂")
+            },
+            {
+                let toggle = host.on_toggle_pin.clone();
+                let done = done.clone();
+                let id = id.clone();
+                move || {
+                    toggle(&id);
+                    done();
+                }
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("git-branch"),
+            copy::text("Fork session", "分叉会话", "分支會話"),
+            {
+                let fork = host.on_fork_sessions.clone();
+                let done = done.clone();
+                let id = id.clone();
+                move || {
+                    fork(std::slice::from_ref(&id));
+                    done();
+                }
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("zap"),
+            if auto_continue {
+                copy::text("Disable auto continue", "关闭自动继续", "關閉自動繼續")
+            } else {
+                copy::text("Auto continue", "自动继续", "自動繼續")
+            },
+            {
+                let toggle = host.on_set_session_auto_continue.clone();
+                let done = done.clone();
+                let id = id.clone();
+                move || {
+                    toggle(&id, !auto_continue);
+                    done();
+                }
+            },
+        ))
+        .entry_if(paused, || {
+            let resume = host.on_resume_auto_continue.clone();
+            let done = done.clone();
+            let id = id.clone();
+            MenuEntry::new(
+                icon!("rotate-ccw"),
+                copy::text("Resume auto continue", "恢复自动继续", "恢復自動繼續"),
+                move || {
+                    resume(&id);
+                    done();
+                },
+            )
+        });
+    if let Some(send) = send {
+        let cancel = host.on_cancel_scheduled_send.clone();
+        let done = done.clone();
+        let later = (send.session_id.clone(), send.message_id);
+        menu = menu
+            .entry(MenuEntry::new(
+                icon!("clock"),
+                copy::text("Send later instead", "改期发送", "改期傳送"),
+                {
+                    let done = done.clone();
+                    move || {
+                        // The sheet carries the send it moves.
+                        overlays.reschedule.set(Some(later.clone()));
+                        done();
+                    }
+                },
             ))
+            .entry(
+                MenuEntry::new(
+                    icon!("x"),
+                    copy::text("Cancel scheduled send", "取消定时发送", "取消定時傳送"),
+                    move || {
+                        cancel(&send.session_id, send.message_id);
+                        done();
+                    },
+                )
+                .danger(),
+            );
+    }
+    if let Some(group) = group {
+        let set_members = host.on_set_group_members.clone();
+        let done = done.clone();
+        let id = id.clone();
+        menu = menu.entry(MenuEntry::new(
+            icon!("layers"),
+            copy::text("Remove from session group", "移出会话组", "移出會話組"),
+            move || {
+                let members = group
+                    .session_ids
+                    .iter()
+                    .filter(|member| **member != id)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                set_members(&group.id, &members);
+                done();
+            },
+        ));
+    }
+    for group in joinable {
+        let set_members = host.on_set_group_members.clone();
+        let done = done.clone();
+        let id = id.clone();
+        menu = menu.entry(MenuEntry::new(
+            icon!("layers"),
+            add_to_group_label(&group.name),
+            move || {
+                let mut members = group.session_ids.clone();
+                members.push(id.clone());
+                set_members(&group.id, &members);
+                done();
+            },
+        ));
+    }
+    menu = menu.entry(MenuEntry::new(
+        icon!("folder"),
+        copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
+        {
+            let open = host.on_open_move.clone();
+            let done = done.clone();
+            move || {
+                // The sheet takes the session with it.
+                open();
+                done();
+            }
+        },
+    ));
+    if let Some(row) = row {
+        for (applies, upwards) in [(up, true), (down, false)] {
+            let step = host.sidebar.on_move_row_step.clone();
+            let done = done.clone();
+            let row = row.clone();
+            menu = menu.entry_if(applies, || {
+                MenuEntry::new(
+                    if upwards {
+                        icon!("chevron-up")
+                    } else {
+                        icon!("chevron-down")
+                    },
+                    if upwards {
+                        copy::text("Move up", "上移", "上移")
+                    } else {
+                        copy::text("Move down", "下移", "下移")
+                    },
+                    move || {
+                        step(&row, upwards);
+                        done();
+                    },
+                )
+            });
+        }
+    }
+    menu.entry(MenuEntry::new(
+        icon!("package"),
+        copy::text("Archive", "归档", "封存"),
+        {
+            let archive = host.on_archive_session.clone();
+            move || archive()
+        },
+    ))
+    .entry(
+        MenuEntry::new(
+            icon!("trash-2"),
+            copy::text("Delete", "删除", "刪除"),
+            {
+                let delete = host.on_delete_session.clone();
+                move || delete()
+            },
+        )
+        .danger(),
+    )
+}
+
+/// The commands of a project or of one of its worktrees.
+fn scope_menu(
+    host: &SessionHost,
+    row: &SidebarRowView,
+    anchor: f32,
+    on_new_session: Rc<dyn Fn(&SidebarRowView)>,
+) -> Menu {
+    let project = row.kind == SidebarRowKind::Project;
+    let (mark, _) = row
+        .project_mark
+        .clone()
+        .unwrap_or_else(|| (icon!("boxes"), theme::text_secondary()));
+    let menu = Menu::at(anchor)
+        .about(
+            Some(if project { mark } else { icon!("git-branch") }),
+            row.title.clone(),
+            if project {
+                copy::text("Project", "项目", "專案")
+            } else {
+                copy::text("Worktree", "Worktree", "Worktree")
+            },
+        )
+        .entry(MenuEntry::new(
+            icon!("plus"),
+            copy::text("New session", "新建会话", "新增工作階段"),
+            {
+                let row = row.clone();
+                move || on_new_session(&row)
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("folder-plus"),
+            copy::text("New folder", "新建文件夹", "新增資料夾"),
+            {
+                let create = host.sidebar.on_new_folder.clone();
+                let row = row.clone();
+                move || create(&row)
+            },
+        ));
+    if !project {
+        return menu;
+    }
+    let sessions = host.sessions;
+    menu.entry(MenuEntry::new(
+        icon!("git-branch"),
+        if row.project_starts_in_worktree {
+            copy::text(
+                "Start sessions in the checkout",
+                "默认在当前检出中开始",
+                "預設在目前檢出中開始",
+            )
+        } else {
+            copy::text(
+                "Start sessions in a new worktree",
+                "默认在新建 Worktree 中开始",
+                "預設在新建 Worktree 中開始",
+            )
+        },
+        {
+            let toggle = host.on_toggle_project_new_session_location.clone();
+            let id = row.id.clone();
+            move || toggle(&id)
+        },
+    ))
+    .entry(
+        MenuEntry::new(
+            icon!("trash-2"),
+            copy::text("Remove project", "移除项目", "移除專案"),
+            {
+                let remove = host.on_remove_project.clone();
+                let project_id = row.id.clone();
+                move || {
+                    let count = sessions.with_untracked(|sessions| {
+                        sessions
+                            .iter()
+                            .filter(|session| session.project_id == project_id)
+                            .count()
+                    });
+                    let remove = remove.clone();
+                    let project_id = project_id.clone();
+                    spawn(async move {
+                        let answer = nsh_base::alert_dialog()
+                            .title(copy::text(
+                                "Remove this project?",
+                                "移除该项目？",
+                                "移除該專案？",
+                            ))
+                            .description(format!(
+                                "{} {}",
+                                count,
+                                copy::text(
+                                    "sessions leave the workbench with it. Nothing on disk is deleted.",
+                                    "个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                                    "個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                                )
+                            ))
+                            .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                            .destructive("remove", copy::text("Remove", "移除", "移除"))
+                            .show()
+                            .await;
+                        if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("remove"))
+                        {
+                            remove(&project_id);
+                        }
+                    });
+                }
+            },
+        )
+        .danger(),
+    )
+}
+
+/// The commands of a folder.
+fn folder_menu(
+    host: &SessionHost,
+    row: &SidebarRowView,
+    anchor: f32,
+    sheets: SectionSheets,
+    on_new_session: Rc<dyn Fn(&SidebarRowView)>,
+) -> Menu {
+    let id = row.id.clone();
+    let days = host.sidebar_sections.with_untracked(|sections| {
+        sections
+            .iter()
+            .find(|section| section.kind == SidebarSectionKind::Folder && section.id == id)
+            .and_then(|section| section.auto_archive_after_days)
+    });
+    let (up, down) = (host.sidebar.row_move_targets)(row);
+    let mut menu = Menu::at(anchor)
+        .about(
+            Some(icon!("folder")),
+            row.title.clone(),
+            copy::text("Folder", "文件夹", "資料夾"),
+        )
+        .entry(MenuEntry::new(
+            icon!("message-square"),
+            new_chat_in_folder_label(&row.title),
+            {
+                let row = row.clone();
+                move || on_new_session(&row)
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("pencil"),
+            copy::text("Rename", "重命名", "重新命名"),
+            {
+                let id = id.clone();
+                let title = row.title.clone();
+                move || {
+                    sheets.name.set(title.clone());
+                    sheets.rename_folder.set(Some(id.clone()));
+                }
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("folder-plus"),
+            copy::text("New folder", "新建文件夹", "新增資料夾"),
+            {
+                let open = host.on_open_subfolder.clone();
+                let id = id.clone();
+                move || open(&id)
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("package"),
+            format!(
+                "{} · {}",
+                copy::text("Scheduled archive", "定时归档", "定時封存"),
+                folder_archive_label(days)
+            ),
+            {
+                let id = id.clone();
+                move || sheets.archive.set(Some(id.clone()))
+            },
+        ));
+    for (applies, upwards) in [(up, true), (down, false)] {
+        let step = host.sidebar.on_move_row_step.clone();
+        let row = row.clone();
+        menu = menu.entry_if(applies, || {
+            MenuEntry::new(
+                if upwards {
+                    icon!("chevron-up")
+                } else {
+                    icon!("chevron-down")
+                },
+                if upwards {
+                    copy::text("Move up", "上移", "上移")
+                } else {
+                    copy::text("Move down", "下移", "下移")
+                },
+                move || step(&row, upwards),
+            )
+        });
+    }
+    menu.entry(
+        MenuEntry::new(
+            icon!("trash-2"),
+            copy::text("Delete", "删除", "刪除"),
+            {
+                let delete = host.on_delete_folder.clone();
+                move || delete(&id)
+            },
+        )
+        .danger(),
+    )
+}
+
+/// The commands of a session group.
+fn group_menu(
+    host: &SessionHost,
+    row: &SidebarRowView,
+    anchor: f32,
+    sheets: SectionSheets,
+) -> Menu {
+    let id = row.id.clone();
+    let section = host.sidebar_sections.with_untracked(|sections| {
+        sections
+            .iter()
+            .find(|section| section.kind == SidebarSectionKind::Group && section.id == id)
+            .cloned()
+    });
+    let pinned = section.as_ref().is_some_and(|section| section.pinned);
+    let auto_continue = section.as_ref().is_some_and(|section| section.auto_continue);
+    let members = section.map(|section| section.session_ids).unwrap_or_default();
+    Menu::at(anchor)
+        .about(
+            Some(icon!("layers")),
+            row.title.clone(),
+            copy::text("Session group", "会话分组", "工作階段分組"),
+        )
+        .entry(MenuEntry::new(
+            icon!("pencil"),
+            copy::text("Rename", "重命名", "重新命名"),
+            {
+                let id = id.clone();
+                let title = row.title.clone();
+                move || {
+                    sheets.name.set(title.clone());
+                    sheets.rename_group.set(Some(id.clone()));
+                }
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("pin"),
+            if pinned {
+                copy::text("Unpin", "取消置顶", "取消置頂")
+            } else {
+                copy::text("Pin", "置顶", "置頂")
+            },
+            {
+                let pin = host.on_set_group_pinned.clone();
+                let id = id.clone();
+                move || pin(&id, !pinned)
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("zap"),
+            if auto_continue {
+                copy::text("Disable auto continue", "关闭自动继续", "關閉自動繼續")
+            } else {
+                copy::text("Auto continue", "自动继续", "自動繼續")
+            },
+            {
+                let toggle = host.on_set_group_auto_continue.clone();
+                let id = id.clone();
+                move || toggle(&id, !auto_continue)
+            },
+        ))
+        .entry(MenuEntry::new(
+            icon!("user"),
+            copy::text("Edit members", "编辑成员", "編輯成員"),
+            {
+                let id = id.clone();
+                move || {
+                    sheets.members_selected.set(members.clone());
+                    sheets.members.set(Some(id.clone()));
+                }
+            },
+        ))
+        .entry(
+            MenuEntry::new(
+                icon!("layers"),
+                copy::text("Dissolve group", "解散分组", "解散群組"),
+                {
+                    let dissolve = host.on_delete_group.clone();
+                    move || dissolve(&id)
+                },
+            )
+            .danger(),
+        )
+}
+
+/// A sheet that asks for one name: the field, and the action that takes it.
+#[allow(clippy::too_many_arguments)]
+fn name_sheet(
+    open: impl Fn() -> bool + 'static,
+    title: &'static str,
+    placeholder: &'static str,
+    name: Signal<String>,
+    action_label: &'static str,
+    busy: impl Fn() -> bool + 'static,
+    on_submit: impl Fn() + 'static,
+    on_close: impl Fn() + Clone + 'static,
+) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_header};
+    bottom_sheet(
+        open,
+        on_close.clone(),
+        view()
+            .w_full()
+            .child(sheet_header(title, move || {
+                dismiss_keyboard();
+                on_close();
+            }))
             .child(
                 sheet_body()
-                    .child(entry(
-                        icon!("list-checks"),
-                        copy::text("Select or reorder", "选择或排序", "選取或排序"),
-                        menu.select,
-                    ))
-                    .child(sheet_entry(
-                        icon!("git-branch"),
-                        move || {
-                            if detailed.get() {
-                                copy::text(
-                                    "Hide worktrees",
-                                    "隐藏 Worktree 层级",
-                                    "隱藏 Worktree 層級",
-                                )
-                            } else {
-                                copy::text(
-                                    "Show worktrees",
-                                    "显示 Worktree 层级",
-                                    "顯示 Worktree 層級",
-                                )
-                            }
-                        },
-                        false,
-                        {
-                            let toggle = menu.toggle_hierarchy;
-                            move || {
-                                open.set(false);
-                                toggle();
-                            }
-                        },
-                    ))
-                    .child(entry(
-                        icon!("chevrons-down-up"),
-                        copy::text(
-                            "Collapse or expand projects",
-                            "折叠或展开项目",
-                            "摺疊或展開專案",
-                        ),
-                        menu.collapse_all,
-                    ))
-                    .child(entry(
-                        icon!("crosshair"),
-                        copy::text("Locate current session", "定位当前会话", "定位目前工作階段"),
-                        menu.locate,
-                    ))
-                    .child(entry(
-                        icon!("folder-plus"),
-                        copy::text("New folder", "新建文件夹", "新增資料夾"),
-                        menu.new_folder,
-                    )),
+                    .child(field::text_field_well(name, placeholder))
+                    .child(
+                        action::solid(action_label, move || {
+                            dismiss_keyboard();
+                            on_submit();
+                        })
+                        .w_full()
+                        .disabled(move || busy() || name.with(|name| name.trim().is_empty())),
+                    ),
             ),
     )
 }
 
-fn sheet_grabber() -> impl IntoElement {
-    view()
-        .w(px(36.0))
-        .h(px(4.0))
-        .rounded(px(2.0))
-        .bg(theme::muted_foreground().opacity(0.4))
-}
-
-fn sheet_action(
-    label: impl IntoReactive<SharedString>,
-    icon: ImageSrc,
-    danger: bool,
-    disabled: Option<Signal<bool>>,
-    on_press: impl Fn() + 'static,
-) -> ButtonElement {
-    let ink: fn() -> Hsla = if danger {
-        theme::accent_red
-    } else {
-        theme::foreground
-    };
-    button()
-        .w_full()
-        .h(px(48.0))
-        .px(px(10.0))
-        .flex_row()
-        .items_center()
-        .gap(px(12.0))
-        .rounded(px(10.0))
-        .active(|style| style.bg(theme::background_dim()))
-        .disabled(move || disabled.is_some_and(|busy| busy.get()))
-        .disabled_style(|style| style.opacity(0.4))
-        .on_press(on_press)
-        .child(
-            svg(icon)
-                .w(px(18.0))
-                .h(px(18.0))
-                .flex_shrink_0()
-                .text_color(ink),
-        )
-        .child(
-            text(label)
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(theme::font_detail()))
-                .text_color(ink),
-        )
-}
-
-fn session_actions_sheet(
-    host: &SessionHost,
-    reschedule: Signal<Option<(String, u64)>>,
-) -> impl IntoElement + use<> {
+/// Renames the session the host's `session_actions` names.
+fn rename_session_sheet(host: &SessionHost, open: Signal<bool>) -> impl IntoElement + use<> {
     let actions = host.session_actions;
-    let rename = host.session_rename;
     let busy = host.session_busy;
-    let on_close = host.on_close_session_actions.clone();
-    let on_rename = host.on_rename_session.clone();
-    let on_move = host.on_open_move.clone();
-    let auto_continue = host.auto_continue_sessions;
-    let on_toggle_auto_continue = host.on_set_session_auto_continue.clone();
-    let paused = host.auto_continue_paused;
-    let on_resume_auto_continue = host.on_resume_auto_continue.clone();
-    let scheduled_sends = host.scheduled_sends;
-    let on_cancel_scheduled = host.on_cancel_scheduled_send.clone();
-    let pinned = host.pinned;
-    let on_toggle_pin = host.on_toggle_pin.clone();
-    let on_fork = host.on_fork_sessions.clone();
-    let sections = host.sidebar_sections;
-    let sessions = host.sessions;
-    let on_set_group_members = host.on_set_group_members.clone();
-    let tree = host.sidebar.clone();
-    let on_move_row_step = host.sidebar.on_move_row_step.clone();
-    let row_move_targets = host.sidebar.row_move_targets.clone();
-    let on_archive = host.on_archive_session.clone();
-    let on_delete = host.on_delete_session.clone();
-    let on_open_team = host.on_open_team.clone();
-    let open = computed(move || actions.get().is_some());
-    // The group the session already belongs to. A session belongs to at most
-    // one, so leaving it and joining one are the two halves of one question.
-    let group = computed(move || {
-        let id = actions.get()?;
-        sections.with(|sections| {
-            sections
-                .iter()
-                .find(|section| {
-                    section.kind == SidebarSectionKind::Group
-                        && section.session_ids.iter().any(|member| member == &id)
-                })
-                .cloned()
-        })
+    let rename = host.on_rename_session.clone();
+    let close = host.on_close_session_actions.clone();
+    // The service lets go of the session once it carries its new name.
+    effect(move || {
+        if actions.get().is_none() {
+            open.set(false);
+        }
     });
-    // Groups the session could join: the same project and worktree, since a
-    // group is a pane layout over one checkout.
-    let join_groups = computed(move || {
-        let id = actions.get()?;
-        let (project_id, workspace_id) = sessions.with(|sessions| {
-            sessions
-                .iter()
-                .find(|session| session.id == id)
-                .map(|session| (session.project_id.clone(), session.workspace_id.clone()))
-        })?;
-        Some(sections.with(|sections| {
-            sections
-                .iter()
-                .filter(|section| {
-                    section.kind == SidebarSectionKind::Group
-                        && section.project_id.as_deref() == Some(project_id.as_str())
-                        && section.workspace_id.as_deref() == Some(workspace_id.as_str())
-                        && !section.session_ids.iter().any(|member| member == &id)
-                })
-                .cloned()
-                .collect::<Vec<_>>()
-        }))
-    });
-    let send = computed(move || {
-        let id = actions.get()?;
-        scheduled_sends.with(|sends| sends.iter().find(|send| send.session_id == id).cloned())
-    });
-    let auto_continue_on = computed(move || {
-        actions.with(|id| {
-            id.as_ref().is_some_and(|id| {
-                auto_continue.with(|sessions| sessions.iter().any(|candidate| candidate == id))
-            })
-        })
-    });
-    let pinned_now = computed(move || {
-        actions.with(|id| {
-            id.as_ref().is_some_and(|id| {
-                pinned.with(|pinned| pinned.iter().any(|candidate| candidate == id))
-            })
-        })
-    });
-    let paused_now = computed(move || {
-        actions.with(|id| {
-            id.as_ref().is_some_and(|id| {
-                paused.with(|paused| paused.iter().any(|candidate| candidate == id))
-            })
-        })
-    });
-    let move_row = computed(move || {
-        let id = actions.get()?;
-        let row = tree.row(SidebarRowKind::Session, &id)?;
-        let targets = row_move_targets(&row);
-        Some((row, targets))
-    });
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change({
-            let on_close = on_close.clone();
-            move |event: &SheetEvent| {
-                if let SheetEvent::OpenChange(next, _) = event
-                    && !next
-                {
-                    on_close();
-                }
+    name_sheet(
+        move || open.get(),
+        copy::text("Rename session", "重命名会话", "重新命名工作階段"),
+        copy::text("Session title", "会话标题", "工作階段標題"),
+        host.session_rename,
+        copy::text("Save", "保存", "儲存"),
+        move || busy.get(),
+        move || rename(),
+        move || {
+            if open.get_untracked() {
+                open.set(false);
+                close();
             }
-        })
-        .child(
-            view()
-                .w_full()
-                .flex_col()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(theme::RADIUS_SHEET))
-                .child(sheet_grabber())
-                .child(
-                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
-                        text(copy::text("Session", "会话", "工作階段"))
-                            .text_size(px(theme::font_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                    ),
-                )
-                .child(
-                    view()
-                        .w_full()
-                        .flex_row()
-                        .items_end()
-                        .gap(px(theme::SPACING_SM))
-                        .child(field::text_field(
-                            rename,
-                            copy::text("Session title", "会话标题", "工作階段標題"),
-                        ))
-                        .child({
-                            let on_rename = on_rename.clone();
-                            action::primary(
-                                copy::text("Rename", "重命名", "重新命名"),
-                                icon(include_str!("../../../assets/icons/check.svg")),
-                                move || on_rename(),
-                            )
-                            .disabled(move || {
-                                busy.get() || rename.with(|title| title.trim().is_empty())
-                            })
-                            .disabled_style(|style| style.opacity(0.4))
-                        }),
-                )
-                .child(
-                    scroll().max_h(px(480.0)).child(
-                        view()
-                            .w_full()
-                            .pt(px(4.0))
-                            .child({
-                                let on_archive = on_archive.clone();
-                                sheet_action(
-                                    copy::text("Archive", "归档", "封存"),
-                                    icon(include_str!("../../../assets/icons/package.svg")),
-                                    false,
-                                    Some(busy),
-                                    move || on_archive(),
-                                )
-                            })
-                            .child({
-                                let on_delete = on_delete.clone();
-                                sheet_action(
-                                    copy::text("Delete", "删除", "刪除"),
-                                    icon(include_str!("../../../assets/icons/trash-2.svg")),
-                                    true,
-                                    Some(busy),
-                                    move || on_delete(),
-                                )
-                            })
-                            .child(when(move || group.with(Option::is_some), {
-                                let on_set_group_members = on_set_group_members.clone();
-                                move || {
-                                    let on_set_group_members = on_set_group_members.clone();
-                                    sheet_action(
-                                        copy::text(
-                                            "Remove from session group",
-                                            "移出会话组",
-                                            "移出會話組",
-                                        ),
-                                        icon(include_str!("../../../assets/icons/layers.svg")),
-                                        false,
-                                        None,
-                                        move || {
-                                            let Some(group) = group.get_untracked() else {
-                                                return;
-                                            };
-                                            let Some(id) = actions.get_untracked() else {
-                                                return;
-                                            };
-                                            let members = group
-                                                .session_ids
-                                                .iter()
-                                                .filter(|member| **member != id)
-                                                .cloned()
-                                                .collect::<Vec<_>>();
-                                            on_set_group_members(&group.id, &members);
-                                        },
-                                    )
-                                }
-                            }))
-                            .child(each(
-                                move || join_groups.get().unwrap_or_default(),
-                                |group| group.id.clone(),
-                                {
-                                    let on_set_group_members = on_set_group_members.clone();
-                                    move |group, _| {
-                                        let on_set_group_members = on_set_group_members.clone();
-                                        let target: SidebarSectionView = group.get_untracked();
-                                        let name = target.name.clone();
-                                        let label = add_to_group_label(&name);
-                                        sheet_action(
-                                            label,
-                                            icon(include_str!("../../../assets/icons/layers.svg")),
-                                            false,
-                                            None,
-                                            move || {
-                                                let Some(id) = actions.get_untracked() else {
-                                                    return;
-                                                };
-                                                let mut members = group.get_untracked().session_ids;
-                                                members.push(id);
-                                                on_set_group_members(&target.id, &members);
-                                            },
-                                        )
-                                    }
-                                },
-                            ))
-                            .child(when(move || send.with(Option::is_some), {
-                                let on_cancel_scheduled = on_cancel_scheduled.clone();
-                                move || {
-                                    let on_cancel_scheduled = on_cancel_scheduled.clone();
-                                    sheet_action(
-                                        copy::text(
-                                            "Cancel scheduled send",
-                                            "取消定时发送",
-                                            "取消定時傳送",
-                                        ),
-                                        icon(include_str!("../../../assets/icons/x.svg")),
-                                        true,
-                                        None,
-                                        move || {
-                                            let Some(send) = send.get_untracked() else {
-                                                return;
-                                            };
-                                            on_cancel_scheduled(&send.session_id, send.message_id);
-                                        },
-                                    )
-                                }
-                            }))
-                            .child(when(move || send.with(Option::is_some), {
-                                let on_close = on_close.clone();
-                                move || {
-                                    let on_close = on_close.clone();
-                                    sheet_action(
-                                        copy::text("Send later instead", "改期发送", "改期傳送"),
-                                        icon(include_str!("../../../assets/icons/clock.svg")),
-                                        false,
-                                        None,
-                                        move || {
-                                            let Some(send) = send.get_untracked() else {
-                                                return;
-                                            };
-                                            on_close();
-                                            reschedule
-                                                .set(Some((send.session_id, send.message_id)));
-                                        },
-                                    )
-                                }
-                            }))
-                            .child(when(move || paused_now.get(), {
-                                let on_resume_auto_continue = on_resume_auto_continue.clone();
-                                move || {
-                                    let on_resume_auto_continue = on_resume_auto_continue.clone();
-                                    sheet_action(
-                                        copy::text(
-                                            "Resume auto continue",
-                                            "恢复自动继续",
-                                            "恢復自動繼續",
-                                        ),
-                                        icon(include_str!("../../../assets/icons/rotate-ccw.svg")),
-                                        false,
-                                        None,
-                                        move || {
-                                            if let Some(id) = actions.get_untracked() {
-                                                on_resume_auto_continue(&id);
-                                            }
-                                        },
-                                    )
-                                }
-                            }))
-                            .child({
-                                let on_fork = on_fork.clone();
-                                sheet_action(
-                                    copy::text("Fork session", "分叉会话", "分支會話"),
-                                    icon(include_str!("../../../assets/icons/git-branch.svg")),
-                                    false,
-                                    None,
-                                    move || {
-                                        if let Some(id) = actions.get_untracked() {
-                                            on_fork(std::slice::from_ref(&id));
-                                        }
-                                    },
-                                )
-                            })
-                            .child({
-                                let on_toggle_auto_continue = on_toggle_auto_continue.clone();
-                                sheet_action(
-                                    move || {
-                                        if auto_continue_on.get() {
-                                            copy::text(
-                                                "Disable auto continue",
-                                                "关闭自动继续",
-                                                "關閉自動繼續",
-                                            )
-                                        } else {
-                                            copy::text("Auto continue", "自动继续", "自動繼續")
-                                        }
-                                    },
-                                    icon(include_str!("../../../assets/icons/send.svg")),
-                                    false,
-                                    None,
-                                    move || {
-                                        if let Some(id) = actions.get_untracked() {
-                                            on_toggle_auto_continue(
-                                                &id,
-                                                !auto_continue_on.get_untracked(),
-                                            );
-                                        }
-                                    },
-                                )
-                            })
-                            .child({
-                                let on_toggle_pin = on_toggle_pin.clone();
-                                sheet_action(
-                                    move || {
-                                        if pinned_now.get() {
-                                            copy::text("Unpin", "取消置顶", "取消置頂")
-                                        } else {
-                                            copy::text("Pin", "置顶", "置頂")
-                                        }
-                                    },
-                                    icon(include_str!("../../../assets/icons/pin.svg")),
-                                    false,
-                                    None,
-                                    move || {
-                                        if let Some(id) = actions.get_untracked() {
-                                            on_toggle_pin(&id);
-                                        }
-                                    },
-                                )
-                            })
-                            .child(when(
-                                move || {
-                                    move_row.with(|state| {
-                                        state.as_ref().is_some_and(|(_, (up, _))| *up)
-                                    })
-                                },
-                                {
-                                    let on_move_row_step = on_move_row_step.clone();
-                                    move || {
-                                        let on_move_row_step = on_move_row_step.clone();
-                                        sheet_action(
-                                            copy::text("Move up", "上移", "上移"),
-                                            icon(include_str!(
-                                                "../../../assets/icons/chevron-up.svg"
-                                            )),
-                                            false,
-                                            None,
-                                            move || {
-                                                if let Some((row, _)) = move_row.get_untracked() {
-                                                    on_move_row_step(&row, true);
-                                                }
-                                            },
-                                        )
-                                    }
-                                },
-                            ))
-                            .child(when(
-                                move || {
-                                    move_row.with(|state| {
-                                        state.as_ref().is_some_and(|(_, (_, down))| *down)
-                                    })
-                                },
-                                {
-                                    let on_move_row_step = on_move_row_step.clone();
-                                    move || {
-                                        let on_move_row_step = on_move_row_step.clone();
-                                        sheet_action(
-                                            copy::text("Move down", "下移", "下移"),
-                                            icon(include_str!(
-                                                "../../../assets/icons/chevron-down.svg"
-                                            )),
-                                            false,
-                                            None,
-                                            move || {
-                                                if let Some((row, _)) = move_row.get_untracked() {
-                                                    on_move_row_step(&row, false);
-                                                }
-                                            },
-                                        )
-                                    }
-                                },
-                            ))
-                            .child({
-                                let on_move = on_move.clone();
-                                sheet_action(
-                                    copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
-                                    icon(include_str!("../../../assets/icons/folder.svg")),
-                                    false,
-                                    None,
-                                    move || on_move(),
-                                )
-                            })
-                            .child({
-                                let on_open_team = on_open_team.clone();
-                                sheet_action(
-                                    copy::text("Team", "团队", "團隊"),
-                                    icon(include_str!("../../../assets/icons/bot.svg")),
-                                    false,
-                                    None,
-                                    move || on_open_team(),
-                                )
-                            }),
-                    ),
-                ),
-        )
+        },
+    )
 }
 
-/// Moves one held send to a new hour. The same three answers the composer's
-/// schedule menu offers, because a deadline is a deadline whichever side of
-/// the conversation set it.
-fn scheduled_send_sheet(
-    open: Signal<Option<(String, u64)>>,
-    on_reschedule: RescheduleScheduledAction,
+/// The three hours a message can be held until, as both the composer's
+/// schedule and a held send's new deadline ask them: a deadline is a deadline
+/// whichever side of the conversation set it.
+fn delay_sheet(
+    open: impl Fn() -> bool + 'static,
+    on_close: impl Fn() + Clone + 'static,
+    on_pick: impl Fn(u64) + Clone + 'static,
 ) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
     let choices = [
         (
             copy::text("In 5 minutes", "5 分钟后", "5 分鐘後"),
@@ -5991,65 +6268,43 @@ fn scheduled_send_sheet(
         ),
         (copy::text("In 1 hour", "1 小时后", "1 小時後"), 60 * 60u64),
     ];
-    sheet()
-        .open(move || Some(open.get().is_some()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                open.set(None);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .flex_col()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(theme::RADIUS_SHEET))
-                .child(sheet_grabber())
-                .child(
-                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
-                        text(copy::text("Send later", "稍后发送", "稍後傳送"))
-                            .text_size(px(theme::font_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                    ),
-                )
-                .child(
-                    view()
-                        .w_full()
-                        .pt(px(4.0))
-                        .children(choices.iter().map(|(label, seconds)| {
-                            let label = *label;
-                            let seconds = *seconds;
-                            let on_reschedule = on_reschedule.clone();
-                            sheet_action(
-                                label,
-                                icon(include_str!("../../../assets/icons/clock.svg")),
-                                false,
-                                None,
-                                move || {
-                                    let Some((session_id, message_id)) = open.get_untracked()
-                                    else {
-                                        return;
-                                    };
-                                    open.set(None);
-                                    on_reschedule(&session_id, message_id, seconds);
-                                },
-                            )
-                        }))
-                        .child(sheet_action(
-                            copy::text("Cancel", "取消", "取消"),
-                            icon(include_str!("../../../assets/icons/x.svg")),
-                            false,
-                            None,
-                            move || open.set(None),
-                        )),
-                ),
-        )
+    let mut card = sheet_card();
+    for (index, (label, seconds)) in choices.into_iter().enumerate() {
+        let on_pick = on_pick.clone();
+        if index > 0 {
+            card = card.child(surface::row_divider());
+        }
+        card = card.child(surface::row(icon!("clock"), label, move || on_pick(seconds)));
+    }
+    bottom_sheet(
+        open,
+        on_close.clone(),
+        view()
+            .w_full()
+            .child(sheet_header(
+                copy::text("Send later", "稍后发送", "稍後傳送"),
+                on_close,
+            ))
+            .child(sheet_body().child(card)),
+    )
+}
+
+/// Moves one held send to a new hour.
+fn scheduled_send_sheet(
+    open: Signal<Option<(String, u64)>>,
+    on_reschedule: RescheduleScheduledAction,
+) -> impl IntoElement {
+    delay_sheet(
+        move || open.with(Option::is_some),
+        move || open.set(None),
+        move |seconds| {
+            let Some((session_id, message_id)) = open.get_untracked() else {
+                return;
+            };
+            open.set(None);
+            on_reschedule(&session_id, message_id, seconds);
+        },
+    )
 }
 
 fn move_session_sheet(
@@ -6058,6 +6313,7 @@ fn move_session_sheet(
     on_move: MoveSessionAction,
     on_close: Action,
 ) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
     let folders = computed(move || {
         sections.with(|sections| {
             sections
@@ -6067,173 +6323,135 @@ fn move_session_sheet(
                 .collect::<Vec<_>>()
         })
     });
-    sheet()
-        .open(move || Some(open.get().is_some()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                on_close();
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .gap(px(theme::SPACING_XS))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Move to folder", "移动到文件夹", "移動到資料夾"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child({
-                    let on_move = on_move.clone();
-                    button()
-                        .on_press(move || {
-                            if let Some(id) = open.get_untracked() {
-                                on_move(&id, None);
-                            }
-                        })
-                        .w_full()
-                        .min_h(px(44.0))
-                        .px(px(theme::SPACING_SM))
-                        .items_center()
-                        .rounded(px(theme::RADIUS_CONTROL))
-                        .bg(theme::background_dim)
-                        .child(
-                            text(copy::text("No folder", "不放入文件夹", "不放入資料夾"))
-                                .text_size(px(theme::font_body()))
-                                .text_color(theme::foreground),
-                        )
-                })
-                .child(each(
-                    move || folders.get(),
-                    |folder| folder.id.clone(),
-                    move |folder, _| {
-                        let on_move = on_move.clone();
-                        button()
-                            .on_press(move || {
-                                if let Some(id) = open.get_untracked() {
-                                    let folder = folder.get_untracked();
-                                    on_move(&id, Some(&folder.id));
-                                }
+    bottom_sheet(
+        move || open.with(Option::is_some),
+        {
+            let on_close = on_close.clone();
+            move || on_close()
+        },
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.7))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Move to folder", "移动到文件夹", "移動到資料夾"),
+                move || on_close(),
+            ))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    sheet_body().child(
+                        sheet_card()
+                            .child({
+                                let on_move = on_move.clone();
+                                surface::row(
+                                    icon!("x"),
+                                    copy::text("No folder", "不放入文件夹", "不放入資料夾"),
+                                    move || {
+                                        if let Some(id) = open.get_untracked() {
+                                            on_move(&id, None);
+                                        }
+                                    },
+                                )
                             })
-                            .w_full()
-                            .min_h(px(44.0))
-                            .px(px(theme::SPACING_SM))
-                            .items_center()
-                            .rounded(px(theme::RADIUS_CONTROL))
-                            .bg(theme::background_dim)
-                            .child(
-                                text(move || folder.get().name)
-                                    .text_size(px(theme::font_body()))
-                                    .text_color(theme::foreground),
-                            )
-                    },
-                )),
-        )
+                            .child(each(
+                                move || folders.get(),
+                                |folder| folder.id.clone(),
+                                move |folder, _| {
+                                    let on_move = on_move.clone();
+                                    view().w_full().child(surface::row_divider()).child(
+                                        surface::row(
+                                            icon!("folder"),
+                                            move || folder.with(|folder| folder.name.clone()),
+                                            move || {
+                                                if let Some(id) = open.get_untracked() {
+                                                    on_move(
+                                                        &id,
+                                                        Some(&folder.with_untracked(|folder| {
+                                                            folder.id.clone()
+                                                        })),
+                                                    );
+                                                }
+                                            },
+                                        ),
+                                    )
+                                },
+                            )),
+                    ),
+                ),
+            ),
+    )
 }
 
 fn attachment_preview_sheet(
     preview: Signal<Option<AttachmentItem>>,
     close: Action,
 ) -> impl IntoElement {
-    sheet()
-        .side(Placement::Bottom)
-        .open(move || Some(preview.with(Option::is_some)))
-        .close_on_swipe(true)
-        .on_open_change({
-            let close = close.clone();
-            move |event: &SheetEvent| {
-                if let SheetEvent::OpenChange(false, _) = event {
-                    close();
-                }
-            }
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_header};
+    let image_shown = move || {
+        preview.with(|preview| {
+            preview
+                .as_ref()
+                .is_some_and(|preview| preview.mime_type.starts_with("image/"))
         })
-        .child(
-            view()
-                .w_full()
-                .max_h(px(560.0))
-                .flex_col()
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .child(
-                    view()
-                        .w_full()
-                        .h(px(48.0))
-                        .flex_row()
-                        .items_center()
-                        .px(px(theme::SPACING_MD))
-                        .gap(px(theme::SPACING_SM))
-                        .border_b_1()
-                        .border_b_color(theme::border_subtle)
-                        .child(
-                            text(copy::text("Attachment", "附件", "附件"))
-                                .flex_1()
-                                .text_size(px(theme::font_heading()))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::foreground),
-                        )
-                        .child(action::icon_button(
-                            icon(include_str!("../../../assets/icons/x.svg")),
-                            copy::text("Close", "关闭", "關閉"),
-                            {
-                                let close = close.clone();
-                                move || close()
-                            },
-                        )),
-                )
-                .child(when(
-                    move || {
-                        preview.with(|preview| {
-                            preview
-                                .as_ref()
-                                .is_some_and(|preview| preview.mime_type.starts_with("image/"))
-                        })
-                    },
-                    move || {
-                        view().p(px(theme::SPACING_MD)).items_center().child(
-                            image(move || {
-                                ImageSrc::from(preview.with(|preview| {
-                                    preview
-                                        .as_ref()
-                                        .map(|preview| preview.uri.clone())
-                                        .unwrap_or_default()
-                                }))
-                            })
-                            .w_full()
-                            .object_fit(nsh_core::ResizeMode::Contain),
-                        )
-                    },
-                ))
-                .child(when(
-                    move || {
-                        preview.with(|preview| {
-                            preview
-                                .as_ref()
-                                .is_some_and(|preview| !preview.mime_type.starts_with("image/"))
-                        })
-                    },
-                    move || {
-                        text(move || {
-                            preview.with(|preview| {
+    };
+    bottom_sheet(
+        move || preview.with(Option::is_some),
+        {
+            let close = close.clone();
+            move || close()
+        },
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.8))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Attachment", "附件", "附件"),
+                move || close(),
+            ))
+            .child(
+                sheet_body()
+                    .child(when(image_shown, move || {
+                        image(move || {
+                            ImageSrc::from(preview.with(|preview| {
                                 preview
                                     .as_ref()
-                                    .map(|preview| preview.label.clone())
+                                    .map(|preview| preview.uri.clone())
                                     .unwrap_or_default()
-                            })
+                            }))
                         })
-                        .px(px(theme::SPACING_MD))
-                        .py(px(theme::SPACING_LG))
-                        .text_size(px(theme::font_detail()))
-                        .text_color(theme::text_secondary)
-                    },
-                )),
-        )
+                        .w_full()
+                        .rounded(px(theme::RADIUS_GROUP))
+                        .object_fit(nsh_core::ResizeMode::Contain)
+                    }))
+                    .child(
+                        surface::card().child(
+                            view()
+                                .w_full()
+                                .min_h(px(theme::ROW_HEIGHT))
+                                .px(px(surface::ROW_INSET))
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_MD))
+                                .child(surface::tile(icon!("paperclip")))
+                                .child(
+                                    text(move || {
+                                        preview.with(|preview| {
+                                            preview
+                                                .as_ref()
+                                                .map(|preview| preview.label.clone())
+                                                .unwrap_or_default()
+                                        })
+                                    })
+                                    .flex_1()
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_body()))
+                                    .text_color(theme::foreground),
+                                ),
+                        ),
+                    ),
+            ),
+    )
 }
 
 /// The mark a session's Agent wears in the drawer.
@@ -6256,30 +6474,6 @@ fn agent_icon(agent: &str) -> &'static str {
     } else {
         include_str!("../../../assets/icons/bot.svg")
     }
-}
-
-/// A round control on the sessions page: a glyph in a well.
-fn drawer_round_button(
-    icon: ImageSrc,
-    label: &'static str,
-    on_press: impl Fn() + 'static,
-) -> ButtonElement {
-    button()
-        .accessibility_label(label)
-        .on_press(on_press)
-        .size(px(DRAWER_CONTROL_HEIGHT))
-        .flex_shrink_0()
-        .rounded_full()
-        .bg(theme::sidebar_well)
-        .items_center()
-        .justify_center()
-        .active(|style| style.opacity(0.6))
-        .child(
-            svg(icon)
-                .w(px(theme::ICON_MD))
-                .h(px(theme::ICON_MD))
-                .text_color(theme::foreground),
-        )
 }
 
 /// A quiet action written out in words, with an optional glyph before them.
@@ -6349,18 +6543,14 @@ fn drawer_batch_action(
         )
 }
 
-/// The search field and the round controls beside it.
-const DRAWER_CONTROL_HEIGHT: f32 = 40.0;
 /// The brand tile at the head of the sessions page.
 const DRAWER_BRAND_TILE: f32 = 38.0;
 
-fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
-    let menu_host = host.clone();
+fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
+    let menu = overlays.menu;
     let sessions = host.sessions;
     let active = host.active;
     let query = signal(String::new());
-    let root_menu = signal(false);
-    let scope_menu = signal(None::<SidebarRowView>);
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
     pager.on_sessions_back(move || {
@@ -6377,31 +6567,40 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
     });
     let locate = signal(None::<String>);
     let sidebar_sections = host.sidebar_sections;
-    let folder_open = host.folder_open;
-    let folder_name = host.folder_name;
-    let on_open_subfolder = host.on_open_subfolder.clone();
-    let on_close_folder = host.on_close_folder.clone();
-    let on_create_folder = host.on_create_folder.clone();
-    let on_rename_folder = host.on_rename_folder.clone();
-    let on_delete_folder = host.on_delete_folder.clone();
-    let folder_actions = signal(None::<String>);
-    let folder_archive = signal(None::<String>);
-    let folder_rename = signal(String::new());
-    let group_actions = signal(None::<String>);
-    let group_rename = signal(String::new());
-    let members_group = signal(None::<String>);
-    let members_selected = signal(Vec::<String>::new());
-    let on_set_group_members = host.on_set_group_members.clone();
-    let on_set_group_pinned = host.on_set_group_pinned.clone();
-    let on_set_group_auto_continue = host.on_set_group_auto_continue.clone();
-    let on_rename_group = host.on_rename_group.clone();
-    let on_delete_group = host.on_delete_group.clone();
-
+    let sheets = SectionSheets {
+        rename_folder: signal(None),
+        rename_group: signal(None),
+        name: signal(String::new()),
+        archive: signal(None),
+        members: signal(None),
+        members_selected: signal(Vec::new()),
+    };
     let group_open = signal(false);
     let group_name = signal(String::new());
-    let on_create_group = host.on_create_group.clone();
     let runtime = host.runtime;
-    let on_new_session = host.on_new_session.clone();
+    // A session is written on the conversation page. Asking for one while
+    // another is already being written points that one at the place asked
+    // for, so the page is turned to it either way.
+    let writing = host.new_session_open;
+    let to_writing = move || {
+        if writing.get_untracked() {
+            pager.close();
+        }
+    };
+    let on_new_session: Action = {
+        let open = host.on_new_session.clone();
+        Rc::new(move || {
+            open();
+            to_writing();
+        })
+    };
+    let on_new_session_in: Rc<dyn Fn(&SidebarRowView)> = {
+        let open = host.sidebar.on_new_session.clone();
+        Rc::new(move |row| {
+            open(row);
+            to_writing();
+        })
+    };
     let on_switch_runtime = host.on_switch_runtime.clone();
     let on_open_settings = host.on_open_settings.clone();
     let connection = host.connection;
@@ -6449,15 +6648,6 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                 == ids.len()
         })
     });
-    let on_locate = {
-        let reveal = host.sidebar.on_reveal_active.clone();
-        move || {
-            query.set(String::new());
-            dismiss_keyboard();
-            locate.set(active.get_untracked());
-            reveal();
-        }
-    };
     let all_selected = computed(move || {
         matching.with(|matching| {
             !matching.is_empty()
@@ -6469,40 +6659,105 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
         select_mode.set(false);
         selected.set(Vec::new());
     };
-    let menu = DrawerMenu {
-        select: Rc::new(move || select_mode.set(true)),
-        detailed: host.sidebar.detailed,
-        toggle_hierarchy: host.sidebar.on_toggle_hierarchy.clone(),
-        collapse_all: host.sidebar.on_collapse_all.clone(),
-        locate: Rc::new(on_locate),
-        new_folder: host.on_open_folder.clone(),
-    };
+    // The commands that act on the whole tree rather than on a row.
+    let root_menu: Rc<dyn Fn(f32, MenuSide)> = Rc::new({
+        let tree = host.sidebar.clone();
+        let new_folder = host.on_open_folder.clone();
+        move |anchor, side| {
+            dismiss_keyboard();
+            let reveal = tree.on_reveal_active.clone();
+            let new_folder = new_folder.clone();
+            menu.set(Some(
+                Menu::at(anchor)
+                    .side(side)
+                    .entry(MenuEntry::new(
+                        icon!("list-checks"),
+                        copy::text("Select or reorder", "选择或排序", "選取或排序"),
+                        move || select_mode.set(true),
+                    ))
+                    .entry(MenuEntry::new(
+                        icon!("git-branch"),
+                        if tree.detailed.get_untracked() {
+                            copy::text("Hide worktrees", "隐藏 Worktree 层级", "隱藏 Worktree 層級")
+                        } else {
+                            copy::text("Show worktrees", "显示 Worktree 层级", "顯示 Worktree 層級")
+                        },
+                        {
+                            let toggle = tree.on_toggle_hierarchy.clone();
+                            move || toggle()
+                        },
+                    ))
+                    .entry(MenuEntry::new(
+                        icon!("chevrons-down-up"),
+                        copy::text(
+                            "Collapse or expand projects",
+                            "折叠或展开项目",
+                            "摺疊或展開專案",
+                        ),
+                        {
+                            let collapse = tree.on_collapse_all.clone();
+                            move || collapse()
+                        },
+                    ))
+                    .entry(MenuEntry::new(
+                        icon!("crosshair"),
+                        copy::text("Locate current session", "定位当前会话", "定位目前工作階段"),
+                        move || {
+                            query.set(String::new());
+                            locate.set(active.get_untracked());
+                            reveal();
+                        },
+                    ))
+                    .entry(MenuEntry::new(
+                        icon!("folder-plus"),
+                        copy::text("New folder", "新建文件夹", "新增資料夾"),
+                        move || new_folder(),
+                    )),
+            ));
+        }
+    });
     let tree_actions = tree::TreeActions {
         toggle: host.sidebar.on_toggle_row.clone(),
         select: {
             let select = host.on_select.clone();
-            Rc::new(move |row| select(&row.id))
+            let creating = host.new_session_open;
+            let stop_creating = host.on_close_new_session.clone();
+            Rc::new(move |row| {
+                // Opening a session puts away the one that was being written.
+                if creating.get_untracked() {
+                    stop_creating();
+                }
+                select(&row.id)
+            })
         },
         menu: {
-            let menu = host.on_session_menu.clone();
-            Rc::new(move |row| match row.kind {
-                SidebarRowKind::Session => menu(&row.id, &row.title),
-                SidebarRowKind::Folder => {
-                    folder_rename.set(row.title.clone());
-                    folder_actions.set(Some(row.id.clone()));
-                }
-                SidebarRowKind::Group => {
-                    group_rename.set(row.title.clone());
-                    group_actions.set(Some(row.id.clone()));
-                }
-                SidebarRowKind::Project | SidebarRowKind::Workspace => {
-                    scope_menu.set(Some(row.clone()))
-                }
-                SidebarRowKind::EmptyWorkspace => {}
+            let host = host.clone();
+            let on_new_session_in = on_new_session_in.clone();
+            Rc::new(move |row, anchor| {
+                dismiss_keyboard();
+                let raised = match row.kind {
+                    SidebarRowKind::Session => session_menu(
+                        &host,
+                        overlays,
+                        &row.id,
+                        &row.title,
+                        (anchor, MenuSide::Leading),
+                        Vec::new(),
+                    ),
+                    SidebarRowKind::Folder => {
+                        folder_menu(&host, row, anchor, sheets, on_new_session_in.clone())
+                    }
+                    SidebarRowKind::Group => group_menu(&host, row, anchor, sheets),
+                    SidebarRowKind::Project | SidebarRowKind::Workspace => {
+                        scope_menu(&host, row, anchor, on_new_session_in.clone())
+                    }
+                    SidebarRowKind::EmptyWorkspace => return,
+                };
+                menu.set(Some(raised));
             })
         },
         move_row: host.sidebar.on_move_row.clone(),
-        new_session: host.sidebar.on_new_session.clone(),
+        new_session: on_new_session_in,
         batch_scope: host.sidebar.batch_scope.clone(),
     };
     view()
@@ -6511,15 +6766,17 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
         .relative()
         .flex_col()
         .bg(theme::block_page)
+        .test_id("sessions-page")
         .pt_safe_area()
         .pb_safe_area_plus(px(theme::SPACING_SM))
-        // The head: what this is and where it runs, and the tree's own menu.
+        // The head: what this is and where it runs, the tree's own menu, and
+        // the way back to the conversation.
         .child(
             view()
                 .flex_shrink_0()
                 .pl(px(theme::SPACING_LG))
-                .pr(px(theme::SPACING_SM))
-                .pt(px(theme::SPACING_MD))
+                .pr(px(theme::SPACING_MD))
+                .pt(px(theme::SPACING_SM))
                 .pb(px(theme::SPACING_SM))
                 .flex_row()
                 .items_center()
@@ -6624,15 +6881,37 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                                 copy::text("Done", "完成", "完成"),
                                 leave_selection,
                             )
+                            .into_element()
                         },
                     )
-                    .otherwise(move || {
-                        action::icon_button(
-                            icon!("ellipsis"),
-                            copy::text("Sidebar options", "侧栏选项", "側欄選項"),
-                            move || root_menu.set(true),
-                        )
-                        .rounded_full()
+                    .otherwise({
+                        let root_menu = root_menu.clone();
+                        move || {
+                            let root_menu = root_menu.clone();
+                            view()
+                                .flex_row()
+                                .items_center()
+                                .gap(px(theme::SPACING_SM))
+                                .child(surface::ghost_button(
+                                    icon!("ellipsis"),
+                                    copy::text("Sidebar options", "侧栏选项", "側欄選項"),
+                                    move || {
+                                        root_menu(
+                                            safe_area().top.0 + theme::SPACING_XL,
+                                            MenuSide::Trailing,
+                                        )
+                                    },
+                                ))
+                                // The page fills the screen, so the way back
+                                // is a control of its own, where the
+                                // conversation lies.
+                                .child(surface::round_button(
+                                    icon!("chevron-right"),
+                                    copy::text("Back to session", "返回会话", "返回工作階段"),
+                                    move || pager.close(),
+                                ))
+                                .into_element()
+                        }
                     }),
                 ),
         )
@@ -6646,23 +6925,10 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                 .items_center()
                 .gap(px(theme::SPACING_SM))
                 .child(
-                    view()
+                    surface::field_pill()
                         .flex_1()
                         .min_w(px(0.0))
-                        .h(px(DRAWER_CONTROL_HEIGHT))
-                        .pl(px(theme::SPACING_MD))
-                        .pr(px(theme::SPACING_XS))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        .rounded(px(theme::SIDEBAR_ROW_RADIUS))
-                        .bg(theme::sidebar_well)
-                        .child(
-                            svg(icon!("search"))
-                                .size(px(theme::ICON_SM))
-                                .flex_shrink_0()
-                                .text_color(theme::sidebar_text_muted),
-                        )
+                        .child(surface::field_glyph(icon!("search")))
                         .child(
                             field::text_field_bare(
                                 query,
@@ -6675,33 +6941,19 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                         .child(when(
                             move || !query.with(String::is_empty),
                             move || {
-                                button()
-                                    .size(px(32.0))
-                                    .flex_shrink_0()
-                                    .items_center()
-                                    .justify_center()
-                                    .rounded_full()
-                                    .active(|style| style.opacity(0.6))
-                                    .accessibility_label(copy::text(
-                                        "Clear search",
-                                        "清除搜索",
-                                        "清除搜尋",
-                                    ))
-                                    .on_press(move || {
+                                surface::field_clear(
+                                    copy::text("Clear search", "清除搜索", "清除搜尋"),
+                                    move || {
                                         query.set(String::new());
                                         dismiss_keyboard();
-                                    })
-                                    .child(
-                                        svg(icon!("x"))
-                                            .size(px(14.0))
-                                            .text_color(theme::sidebar_text_muted),
-                                    )
+                                    },
+                                )
                             },
                         )),
                 )
                 .child({
                     let on_new_session = on_new_session.clone();
-                    drawer_round_button(
+                    surface::round_button(
                         icon!("plus"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         move || on_new_session(),
@@ -6724,9 +6976,12 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                         .min_w(px(0.0))
                         .h(px(32.0))
                         .justify_center()
-                        .on_long_press(move || {
-                            crate::motion::tick();
-                            root_menu.set(true)
+                        .on_long_press({
+                            let root_menu = root_menu.clone();
+                            move |event: &PressEvent| {
+                                crate::motion::tick();
+                                root_menu(event.page_position.y.0, MenuSide::Leading)
+                            }
                         })
                         .child(
                             text(copy::text("Projects", "项目", "專案"))
@@ -6964,382 +7219,90 @@ fn drawer(host: SessionHost, pager: Pager) -> impl IntoElement {
                 }
             }),
         )
-        .child(group_actions_sheet(
-            group_actions,
-            group_rename,
-            on_rename_group.clone(),
-            on_delete_group.clone(),
-            sidebar_sections,
-            on_set_group_pinned.clone(),
-            on_set_group_auto_continue.clone(),
+        .child(name_sheet(
+            move || sheets.rename_folder.with(Option::is_some),
+            copy::text("Rename folder", "重命名文件夹", "重新命名資料夾"),
+            copy::text("Folder name", "文件夹名称", "資料夾名稱"),
+            sheets.name,
+            copy::text("Save", "保存", "儲存"),
+            || false,
             {
-                let sections = sidebar_sections;
-                Rc::new(move || {
-                    if let Some(id) = group_actions.get_untracked() {
-                        let members = sections.with(|sections| {
-                            sections
-                                .iter()
-                                .find(|section| section.id == id)
-                                .map(|section| section.session_ids.clone())
-                                .unwrap_or_default()
-                        });
-                        members_selected.set(members);
-                        members_group.set(Some(id));
-                        group_actions.set(None);
+                let rename = host.on_rename_folder.clone();
+                move || {
+                    if let Some(id) = sheets.rename_folder.get_untracked() {
+                        rename(&id, sheets.name.get_untracked().trim());
+                        sheets.rename_folder.set(None);
                     }
-                })
+                }
             },
+            move || sheets.rename_folder.set(None),
+        ))
+        .child(name_sheet(
+            move || sheets.rename_group.with(Option::is_some),
+            copy::text("Rename group", "重命名分组", "重新命名分組"),
+            copy::text("Group name", "分组名称", "分組名稱"),
+            sheets.name,
+            copy::text("Save", "保存", "儲存"),
+            || false,
+            {
+                let rename = host.on_rename_group.clone();
+                move || {
+                    if let Some(id) = sheets.rename_group.get_untracked() {
+                        rename(&id, sheets.name.get_untracked().trim());
+                        sheets.rename_group.set(None);
+                    }
+                }
+            },
+            move || sheets.rename_group.set(None),
         ))
         .child(group_members_sheet(
-            members_group,
-            members_selected,
+            sheets.members,
+            sheets.members_selected,
             sessions,
-            on_set_group_members.clone(),
+            host.on_set_group_members.clone(),
         ))
-        .child(group_sheet(
-            group_open,
+        .child(name_sheet(
+            move || group_open.get(),
+            copy::text("New group", "新建分组", "新增分組"),
+            copy::text("Group name", "分组名称", "分組名稱"),
             group_name,
-            on_create_group.clone(),
-            selected,
-        ))
-        .child(folder_actions_sheet(
-            &menu_host,
-            folder_actions,
-            folder_rename,
-            on_rename_folder.clone(),
-            on_delete_folder.clone(),
+            copy::text("Create", "创建", "建立"),
+            move || selected.with(Vec::is_empty),
             {
-                let on_open_subfolder = on_open_subfolder.clone();
-                Rc::new(move || {
-                    if let Some(id) = folder_actions.get_untracked() {
-                        folder_actions.set(None);
-                        on_open_subfolder(&id);
-                    }
-                })
+                let create = host.on_create_group.clone();
+                move || {
+                    let ids = selected.get_untracked();
+                    create(group_name.get_untracked().trim(), &ids);
+                    group_name.set(String::new());
+                    group_open.set(false);
+                }
             },
-            Rc::new(move |id: &str| folder_archive.set(Some(id.to_owned()))),
+            move || group_open.set(false),
         ))
         .child(folder_archive_sheet(
-            folder_archive,
-            menu_host.sidebar_sections,
-            menu_host.on_set_folder_auto_archive.clone(),
+            sheets.archive,
+            sidebar_sections,
+            host.on_set_folder_auto_archive.clone(),
         ))
-        .child(folder_sheet(
-            folder_open,
-            folder_name,
-            on_close_folder.clone(),
-            on_create_folder.clone(),
+        .child(name_sheet(
+            {
+                let open = host.folder_open;
+                move || open.get()
+            },
+            copy::text("New folder", "新建文件夹", "新增資料夾"),
+            copy::text("Folder name", "文件夹名称", "資料夾名稱"),
+            host.folder_name,
+            copy::text("Create", "创建", "建立"),
+            || false,
+            {
+                let create = host.on_create_folder.clone();
+                move || create()
+            },
+            {
+                let close = host.on_close_folder.clone();
+                move || close()
+            },
         ))
-        .child(drawer_root_menu(root_menu, menu))
-        .child(drawer_scope_menu(scope_menu, &menu_host))
-}
-
-fn drawer_scope_menu(
-    scope: Signal<Option<SidebarRowView>>,
-    host: &SessionHost,
-) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_entry, sheet_header};
-    let tree = host.sidebar.clone();
-    let on_toggle_location = host.on_toggle_project_new_session_location.clone();
-    let on_remove = host.on_remove_project.clone();
-    let sessions = host.sessions;
-    let row = computed(move || scope.get());
-    bottom_sheet(
-        move || scope.with(Option::is_some),
-        move || scope.set(None),
-        view()
-            .child(sheet_header(
-                move || {
-                    scope.with(|scope| {
-                        scope
-                            .as_ref()
-                            .map_or_else(String::new, |row| row.title.clone())
-                    })
-                },
-                move || scope.set(None),
-            ))
-            .child(
-                sheet_body()
-                    .child(sheet_entry(
-                        icon!("plus"),
-                        copy::text("New session", "新建会话", "新增工作階段"),
-                        false,
-                        {
-                            let tree = tree.clone();
-                            move || {
-                                if let Some(row) = scope.get_untracked() {
-                                    scope.set(None);
-                                    (tree.on_new_session)(&row);
-                                }
-                            }
-                        },
-                    ))
-                    .child(sheet_entry(
-                        icon!("folder-open"),
-                        copy::text("New folder", "新建文件夹", "新增資料夾"),
-                        false,
-                        {
-                            let tree = tree.clone();
-                            move || {
-                                if let Some(row) = scope.get_untracked() {
-                                    scope.set(None);
-                                    (tree.on_new_folder)(&row);
-                                }
-                            }
-                        },
-                    ))
-                    .child(when(
-                        move || row.with(|row| row.as_ref().is_some_and(|row| row.kind == SidebarRowKind::Project)),
-                        {
-                            let on_toggle_location = on_toggle_location.clone();
-                            move || {
-                                let on_toggle_location = on_toggle_location.clone();
-                                sheet_entry(
-                                    icon!("git-branch"),
-                                    move || {
-                                        let starts_in_worktree = row.with(|row| {
-                                            row.as_ref()
-                                                .is_some_and(|row| row.project_starts_in_worktree)
-                                        });
-                                        if starts_in_worktree {
-                                            copy::text(
-                                                "Start sessions in the checkout",
-                                                "默认在当前检出中开始",
-                                                "預設在目前檢出中開始",
-                                            )
-                                        } else {
-                                            copy::text(
-                                                "Start sessions in a new worktree",
-                                                "默认在新建 Worktree 中开始",
-                                                "預設在新建 Worktree 中開始",
-                                            )
-                                        }
-                                    },
-                                    false,
-                                    move || {
-                                        if let Some(row) = scope.get_untracked() {
-                                            scope.set(None);
-                                            on_toggle_location(&row.id);
-                                        }
-                                    },
-                                )
-                            }
-                        },
-                    ))
-                    .child(when(
-                        move || row.with(|row| row.as_ref().is_some_and(|row| row.kind == SidebarRowKind::Project)),
-                        move || {
-                            let on_remove = on_remove.clone();
-                            sheet_entry(
-                                icon!("trash-2"),
-                                copy::text("Remove project", "移除项目", "移除專案"),
-                                true,
-                                move || {
-                                    let Some(row) = scope.get_untracked() else {
-                                        return;
-                                    };
-                                    scope.set(None);
-                                    let project_id = row.id;
-                                    let count = sessions.with(|sessions| {
-                                        sessions
-                                            .iter()
-                                            .filter(|session| session.project_id == project_id)
-                                            .count()
-                                    });
-                                    let on_remove = on_remove.clone();
-                                    spawn(async move {
-                                        let answer = nsh_base::alert_dialog()
-                                            .title(copy::text(
-                                                "Remove this project?",
-                                                "移除该项目？",
-                                                "移除該專案？",
-                                            ))
-                                            .description(format!(
-                                                "{} {}",
-                                                count,
-                                                copy::text(
-                                                    "sessions leave the workbench with it. Nothing on disk is deleted.",
-                                                    "个会话会一并移出工作台，磁盘上的文件不会被删除。",
-                                                    "個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
-                                                )
-                                            ))
-                                            .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                                            .destructive(
-                                                "remove",
-                                                copy::text("Remove", "移除", "移除"),
-                                            )
-                                            .show()
-                                            .await;
-                                        if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("remove"))
-                                        {
-                                            on_remove(&project_id);
-                                        }
-                                    });
-                                },
-                            )
-                        },
-                    )),
-            ),
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-fn group_actions_sheet(
-    action: Signal<Option<String>>,
-    name: Signal<String>,
-    on_rename: FolderNameAction,
-    on_delete: Rc<dyn Fn(&str)>,
-    sections: Signal<Vec<SidebarSectionView>>,
-    on_pin: SessionToggle,
-    on_auto_continue: SessionToggle,
-    on_members: Action,
-) -> impl IntoElement {
-    let open = computed(move || action.get().is_some());
-    let pinned = computed(move || {
-        let Some(id) = action.get() else {
-            return false;
-        };
-        sections.with(|sections| {
-            sections
-                .iter()
-                .find(|section| section.id == id)
-                .is_some_and(|section| section.pinned)
-        })
-    });
-    let auto_continue = computed(move || {
-        let Some(id) = action.get() else {
-            return false;
-        };
-        sections.with(|sections| {
-            sections
-                .iter()
-                .find(|section| section.id == id)
-                .is_some_and(|section| section.auto_continue)
-        })
-    });
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                action.set(None);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .flex_col()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(theme::RADIUS_SHEET))
-                .child(sheet_grabber())
-                .child(
-                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
-                        text(copy::text("Session group", "会话分组", "工作階段分組"))
-                            .text_size(px(theme::font_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                    ),
-                )
-                .child(field::text_field(
-                    name,
-                    copy::text("Group name", "分组名称", "分組名稱"),
-                ))
-                .child({
-                    let on_rename = on_rename.clone();
-                    action::primary(
-                        copy::text("Rename", "重命名", "重新命名"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        move || {
-                            if let Some(id) = action.get_untracked()
-                                && !name.with(|name| name.trim().is_empty())
-                            {
-                                on_rename(&id, &name.get_untracked());
-                                action.set(None);
-                            }
-                        },
-                    )
-                    .w_full()
-                })
-                .child(
-                    view()
-                        .w_full()
-                        .pt(px(4.0))
-                        .child({
-                            let on_pin = on_pin.clone();
-                            sheet_action(
-                                move || {
-                                    if pinned.get() {
-                                        copy::text("Unpin", "取消置顶", "取消置頂")
-                                    } else {
-                                        copy::text("Pin", "置顶", "置頂")
-                                    }
-                                },
-                                icon(include_str!("../../../assets/icons/pin.svg")),
-                                false,
-                                None,
-                                move || {
-                                    if let Some(id) = action.get_untracked() {
-                                        on_pin(&id, !pinned.get_untracked());
-                                        action.set(None);
-                                    }
-                                },
-                            )
-                        })
-                        .child({
-                            let on_auto_continue = on_auto_continue.clone();
-                            sheet_action(
-                                move || {
-                                    if auto_continue.get() {
-                                        copy::text(
-                                            "Disable auto continue",
-                                            "关闭自动继续",
-                                            "關閉自動繼續",
-                                        )
-                                    } else {
-                                        copy::text("Auto continue", "自动继续", "自動繼續")
-                                    }
-                                },
-                                icon(include_str!("../../../assets/icons/rotate-ccw.svg")),
-                                false,
-                                None,
-                                move || {
-                                    if let Some(id) = action.get_untracked() {
-                                        on_auto_continue(&id, !auto_continue.get_untracked());
-                                    }
-                                },
-                            )
-                        })
-                        .child({
-                            let on_members = on_members.clone();
-                            sheet_action(
-                                copy::text("Edit members", "编辑成员", "編輯成員"),
-                                icon(include_str!("../../../assets/icons/user.svg")),
-                                false,
-                                None,
-                                move || on_members(),
-                            )
-                        })
-                        .child({
-                            let on_delete = on_delete.clone();
-                            sheet_action(
-                                copy::text("Dissolve group", "解散分组", "解散群組"),
-                                icon(include_str!("../../../assets/icons/layers.svg")),
-                                true,
-                                None,
-                                move || {
-                                    if let Some(id) = action.get_untracked() {
-                                        on_delete(&id);
-                                        action.set(None);
-                                    }
-                                },
-                            )
-                        }),
-                ),
-        )
 }
 
 fn group_members_sheet(
@@ -7348,351 +7311,81 @@ fn group_members_sheet(
     sessions: Signal<Vec<SessionSummary>>,
     on_save: CreateGroupAction,
 ) -> impl IntoElement {
-    sheet()
-        .open(move || Some(group.get().is_some()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                group.set(None);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .max_h(px(520.0))
-                .gap(px(theme::SPACING_XS))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("Group members", "分组成员", "分組成員"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(scroll().max_h(px(360.0)).child(
-                    view().w_full().flex_col().gap(px(2.0)).child(each(
-                        move || sessions.get(),
-                        |session| session.id.clone(),
-                        move |session, _| {
-                            let id = session.get_untracked().id;
-                            let checked = members.with(|members| members.contains(&id));
-                            button()
-                                .on_press(move || {
-                                    members.update(|members| {
-                                        if let Some(index) =
-                                            members.iter().position(|candidate| candidate == &id)
-                                        {
-                                            members.remove(index);
-                                        } else {
-                                            members.push(id.clone());
-                                        }
-                                    });
-                                })
-                                .w_full()
-                                .min_h(px(40.0))
-                                .px(px(theme::SPACING_SM))
-                                .flex_row()
-                                .items_center()
-                                .gap(px(theme::SPACING_SM))
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::background_dim)
-                                .child(
-                                    text(if checked { "✓" } else { "·" })
-                                        .text_size(px(theme::font_caption()))
-                                        .text_color(theme::text_secondary),
-                                )
-                                .child(
-                                    text(move || session.get().title)
-                                        .flex_1()
-                                        .truncate()
-                                        .text_size(px(theme::font_body()))
-                                        .text_color(theme::foreground),
-                                )
-                        },
-                    )),
-                ))
-                .child({
-                    let on_save = on_save.clone();
-                    action::primary(
-                        copy::text("Save", "保存", "儲存"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        move || {
-                            if let Some(group_id) = group.get_untracked() {
-                                let ids = members.get_untracked();
-                                on_save(&group_id, &ids);
-                                group.set(None);
-                            }
-                        },
-                    )
-                    .w_full()
-                }),
-        )
-}
-
-fn group_sheet(
-    open: Signal<bool>,
-    name: Signal<String>,
-    on_create: CreateGroupAction,
-    members: Signal<Vec<String>>,
-) -> impl IntoElement {
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                open.set(false);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .gap(px(theme::SPACING_SM))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("New group", "新建分组", "新增分組"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(field::text_field(
-                    name,
-                    copy::text("Group name", "分组名称", "分組名稱"),
-                ))
-                .child({
-                    let on_create = on_create.clone();
-                    action::primary(
-                        copy::text("Create", "创建", "建立"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        move || {
-                            let ids = members.get_untracked();
-                            let group = name.get_untracked();
-                            if !ids.is_empty() && !group.trim().is_empty() {
-                                on_create(&group, &ids);
-                                name.set(String::new());
-                                open.set(false);
-                            }
-                        },
-                    )
-                    .w_full()
-                }),
-        )
-}
-
-fn folder_actions_sheet(
-    host: &SessionHost,
-    action: Signal<Option<String>>,
-    name: Signal<String>,
-    on_rename: FolderNameAction,
-    on_delete: Rc<dyn Fn(&str)>,
-    on_new_subfolder: Action,
-    on_archive: Rc<dyn Fn(&str)>,
-) -> impl IntoElement {
-    let open = computed(move || action.get().is_some());
-    let tree = host.sidebar.clone();
-    let sections = host.sidebar_sections;
-    let on_new_session = host.sidebar.on_new_session.clone();
-    let on_move_row_step = host.sidebar.on_move_row_step.clone();
-    let row_move_targets = host.sidebar.row_move_targets.clone();
-    let label_tree = tree.clone();
-    let new_session_label = computed(move || {
-        let id = action.get()?;
-        let row = label_tree.row(SidebarRowKind::Folder, &id)?;
-        Some(new_chat_in_folder_label(&row.title))
-    });
-    let archive_label = computed(move || {
-        let id = action.get()?;
-        let days = sections.with(|sections| {
-            sections
-                .iter()
-                .find(|section| section.kind == SidebarSectionKind::Folder && section.id == id)
-                .and_then(|section| section.auto_archive_after_days)
-        });
-        Some(format!(
-            "{} · {}",
-            copy::text("Scheduled archive", "定时归档", "定時封存"),
-            folder_archive_label(days)
-        ))
-    });
-    let move_tree = tree.clone();
-    let move_row = computed(move || {
-        let id = action.get()?;
-        let row = move_tree.row(SidebarRowKind::Folder, &id)?;
-        let targets = row_move_targets(&row);
-        Some((row, targets))
-    });
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                action.set(None);
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .flex_col()
-                .items_center()
-                .gap(px(8.0))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(theme::RADIUS_SHEET))
-                .child(sheet_grabber())
-                .child(
-                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
-                        text(copy::text("Folder", "文件夹", "資料夾"))
-                            .text_size(px(theme::font_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                    ),
-                )
-                .child(field::text_field(
-                    name,
-                    copy::text("Folder name", "文件夹名称", "資料夾名稱"),
-                ))
-                .child({
-                    let on_rename = on_rename.clone();
-                    action::primary(
-                        copy::text("Rename", "重命名", "重新命名"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        move || {
-                            if let Some(id) = action.get_untracked()
-                                && !name.with(|name| name.trim().is_empty())
-                            {
-                                on_rename(&id, &name.get_untracked());
-                                action.set(None);
-                            }
-                        },
-                    )
-                    .w_full()
-                })
-                .child(
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
+    bottom_sheet(
+        move || group.with(Option::is_some),
+        move || group.set(None),
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.75))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Group members", "分组成员", "分組成員"),
+                move || group.set(None),
+            ))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
                     view()
                         .w_full()
-                        .pt(px(4.0))
-                        .child({
-                            let on_new_session = on_new_session.clone();
-                            sheet_action(
-                                move || {
-                                    new_session_label
-                                        .get()
-                                        .unwrap_or_else(|| "New session".to_owned())
-                                },
-                                icon(include_str!("../../../assets/icons/message-square.svg")),
-                                false,
-                                None,
-                                move || {
-                                    let Some(id) = action.get_untracked() else {
-                                        return;
-                                    };
-                                    action.set(None);
-                                    if let Some(row) = tree.row(SidebarRowKind::Folder, &id) {
-                                        on_new_session(&row);
-                                    }
-                                },
-                            )
-                        })
-                        .child({
-                            let on_new_subfolder = on_new_subfolder.clone();
-                            sheet_action(
-                                copy::text("New folder", "新建文件夹", "新增資料夾"),
-                                icon(include_str!("../../../assets/icons/folder-plus.svg")),
-                                false,
-                                None,
-                                move || on_new_subfolder(),
-                            )
-                        })
-                        .child({
-                            let on_archive = on_archive.clone();
-                            sheet_action(
-                                move || {
-                                    archive_label
-                                        .get()
-                                        .unwrap_or_else(|| "Scheduled archive".to_owned())
-                                },
-                                icon(include_str!("../../../assets/icons/package.svg")),
-                                false,
-                                None,
-                                move || {
-                                    if let Some(id) = action.get_untracked() {
-                                        action.set(None);
-                                        on_archive(&id);
-                                    }
-                                },
-                            )
-                        })
-                        .child({
-                            let on_delete = on_delete.clone();
-                            sheet_action(
-                                copy::text("Delete", "删除", "刪除"),
-                                icon(include_str!("../../../assets/icons/trash-2.svg")),
-                                true,
-                                None,
-                                move || {
-                                    if let Some(id) = action.get_untracked() {
-                                        on_delete(&id);
-                                        action.set(None);
-                                    }
-                                },
-                            )
-                        })
-                        .child(when(
-                            move || {
-                                move_row
-                                    .with(|state| state.as_ref().is_some_and(|(_, (up, _))| *up))
-                            },
-                            {
-                                let on_move_row_step = on_move_row_step.clone();
-                                move || {
-                                    let on_move_row_step = on_move_row_step.clone();
-                                    sheet_action(
-                                        copy::text("Move up", "上移", "上移"),
-                                        icon(include_str!("../../../assets/icons/chevron-up.svg")),
-                                        false,
-                                        None,
-                                        move || {
-                                            if let Some((row, _)) = move_row.get_untracked() {
-                                                on_move_row_step(&row, true);
+                        .px(px(theme::SPACING_MD))
+                        .pt(px(theme::SPACING_XS))
+                        .child(sheet_card().child(each(
+                            move || sessions.get(),
+                            |session| session.id.clone(),
+                            move |session, _| {
+                                let id = session.with_untracked(|session| session.id.clone());
+                                let ticked = {
+                                    let id = id.clone();
+                                    computed(move || members.with(|members| members.contains(&id)))
+                                };
+                                button()
+                                    .on_press(move || {
+                                        members.update(|members| {
+                                            if let Some(index) =
+                                                members.iter().position(|member| member == &id)
+                                            {
+                                                members.remove(index);
+                                            } else {
+                                                members.push(id.clone());
                                             }
-                                        },
+                                        });
+                                    })
+                                    .w_full()
+                                    .min_h(px(theme::ROW_HEIGHT))
+                                    .px(px(surface::ROW_INSET))
+                                    .flex_row()
+                                    .items_center()
+                                    .gap(px(theme::SPACING_MD))
+                                    .border_b_1()
+                                    .border_b_color(theme::hairline)
+                                    .active(|style| style.bg(theme::row_pressed_bg()))
+                                    .child(surface::check_mark(move || {
+                                        ticked.get().then_some(true)
+                                    }))
+                                    .child(
+                                        text(move || session.with(|session| session.title.clone()))
+                                            .flex_1()
+                                            .min_w(px(0.0))
+                                            .truncate()
+                                            .text_size(px(theme::font_body()))
+                                            .text_color(theme::foreground),
                                     )
-                                }
                             },
-                        ))
-                        .child(when(
-                            move || {
-                                move_row.with(|state| {
-                                    state.as_ref().is_some_and(|(_, (_, down))| *down)
-                                })
-                            },
-                            {
-                                let on_move_row_step = on_move_row_step.clone();
-                                move || {
-                                    let on_move_row_step = on_move_row_step.clone();
-                                    sheet_action(
-                                        copy::text("Move down", "下移", "下移"),
-                                        icon(include_str!(
-                                            "../../../assets/icons/chevron-down.svg"
-                                        )),
-                                        false,
-                                        None,
-                                        move || {
-                                            if let Some((row, _)) = move_row.get_untracked() {
-                                                on_move_row_step(&row, false);
-                                            }
-                                        },
-                                    )
-                                }
-                            },
-                        )),
+                        ))),
                 ),
-        )
+            )
+            .child(
+                sheet_body().pt(px(theme::SPACING_MD)).child(
+                    action::solid(copy::text("Save", "保存", "儲存"), move || {
+                        if let Some(group_id) = group.get_untracked() {
+                            on_save(&group_id, &members.get_untracked());
+                            group.set(None);
+                        }
+                    })
+                    .w_full(),
+                ),
+            ),
+    )
 }
 
 /// The schedules a folder can archive on. `None` turns the window off; every
@@ -7703,82 +7396,78 @@ fn folder_archive_sheet(
     sections: Signal<Vec<SidebarSectionView>>,
     on_set: FolderArchiveAction,
 ) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
     // The desktop's `SIDEBAR_AUTO_ARCHIVE_MAX_DAYS`; a value it accepts has to
     // be settable here, or the sheet would show a window the row cannot use.
     const MAX_DAYS: u8 = 14;
-    let choices = (0..=MAX_DAYS)
-        .map(|days| (days > 0).then_some(days))
-        .collect::<Vec<_>>();
-    sheet()
-        .open(move || Some(open.get().is_some()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                open.set(None);
-            }
+    let current = computed(move || {
+        let id = open.get()?;
+        sections.with(|sections| {
+            sections
+                .iter()
+                .find(|section| section.kind == SidebarSectionKind::Folder && section.id == id)
+                .map(|section| section.auto_archive_after_days)
         })
-        .child(
-            view()
+    });
+    let mut card = sheet_card();
+    for days in (0..=MAX_DAYS).map(|days| (days > 0).then_some(days)) {
+        let on_set = on_set.clone();
+        card = card.child(
+            button()
+                .on_press(move || {
+                    let Some(id) = open.get_untracked() else {
+                        return;
+                    };
+                    open.set(None);
+                    on_set(&id, days);
+                })
                 .w_full()
-                .flex_col()
+                .min_h(px(theme::MENU_ROW_HEIGHT))
+                .px(px(theme::SPACING_LG))
+                .flex_row()
                 .items_center()
-                .gap(px(8.0))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(theme::RADIUS_SHEET))
-                .child(sheet_grabber())
+                .gap(px(theme::SPACING_MD))
+                .when(days.is_some(), |row| {
+                    row.border_t_1().border_t_color(theme::hairline)
+                })
+                .active(|style| style.bg(theme::row_pressed_bg()))
                 .child(
-                    view().w_full().pt(px(8.0)).pb(px(4.0)).child(
-                        text(copy::text("Scheduled archive", "定时归档", "定時封存"))
-                            .text_size(px(theme::font_title()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .text_color(theme::foreground),
-                    ),
+                    text(folder_archive_label(days))
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(theme::font_body()))
+                        .text_color(theme::foreground),
                 )
-                .child(scroll().max_h(px(420.0)).child(
-                    view().w_full().flex_col().gap(px(2.0)).child(each(
-                        move || choices.clone(),
-                        |days| days.map_or_else(|| "off".to_owned(), |days| days.to_string()),
-                        {
-                            let on_set = on_set.clone();
-                            move |days, _| {
-                                let on_set = on_set.clone();
-                                let days = days.get_untracked();
-                                let current = open.with(|id| {
-                                    id.as_ref().is_some_and(|id| {
-                                        sections.with(|sections| {
-                                            sections.iter().any(|section| {
-                                                section.kind == SidebarSectionKind::Folder
-                                                    && &section.id == id
-                                                    && section.auto_archive_after_days == days
-                                            })
-                                        })
-                                    })
-                                });
-                                let label = if current {
-                                    format!("✓ {}", folder_archive_label(days))
-                                } else {
-                                    folder_archive_label(days)
-                                };
-                                sheet_action(
-                                    label,
-                                    icon(include_str!("../../../assets/icons/package.svg")),
-                                    false,
-                                    None,
-                                    move || {
-                                        let Some(id) = open.get_untracked() else {
-                                            return;
-                                        };
-                                        open.set(None);
-                                        on_set(&id, days);
-                                    },
-                                )
-                            }
-                        },
-                    )),
+                .child(when(
+                    move || current.get() == Some(days),
+                    || {
+                        svg(icon!("check"))
+                            .size(px(theme::ICON_MD))
+                            .flex_shrink_0()
+                            .text_color(theme::foreground)
+                    },
                 )),
-        )
+        );
+    }
+    bottom_sheet(
+        move || open.with(Option::is_some),
+        move || open.set(None),
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.75))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Scheduled archive", "定时归档", "定時封存"),
+                move || open.set(None),
+            ))
+            .child(
+                scroll()
+                    .flex_shrink(1.0)
+                    .min_h(px(0.0))
+                    .child(sheet_body().child(card)),
+            ),
+    )
 }
 
 /// The entry that adds a session to one group, named after the group the way
@@ -7815,52 +7504,6 @@ fn folder_archive_label(days: Option<u8>) -> String {
         _ if days == 1 => "After 1 day".to_owned(),
         _ => format!("After {days} days"),
     }
-}
-
-fn folder_sheet(
-    open: Signal<bool>,
-    name: Signal<String>,
-    on_close: Action,
-    on_create: Action,
-) -> impl IntoElement {
-    sheet()
-        .open(move || Some(open.get()))
-        .close_on_swipe(true)
-        .on_open_change(move |event: &SheetEvent| {
-            if let SheetEvent::OpenChange(false, _) = event {
-                on_close();
-            }
-        })
-        .child(
-            view()
-                .w_full()
-                .gap(px(theme::SPACING_SM))
-                .p(px(theme::SPACING_MD))
-                .pb_safe_area_plus(px(theme::SPACING_LG))
-                .bg(theme::background_card)
-                .rounded_t(px(16.0))
-                .child(
-                    text(copy::text("New folder", "新建文件夹", "新增資料夾"))
-                        .text_size(px(theme::font_heading()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::foreground),
-                )
-                .child(field::text_field(
-                    name,
-                    copy::text("Folder name", "文件夹名称", "資料夾名稱"),
-                ))
-                .child({
-                    let on_create = on_create.clone();
-                    action::primary(
-                        copy::text("Create", "创建", "建立"),
-                        icon(include_str!("../../../assets/icons/check.svg")),
-                        move || on_create(),
-                    )
-                    .w_full()
-                    .disabled(move || name.with(|name| name.trim().is_empty()))
-                    .disabled_style(|style| style.opacity(0.4))
-                }),
-        )
 }
 
 /// What was typed after `@` when it is still one reference, if any.
