@@ -6498,6 +6498,14 @@ fn menu_row(row: &SidebarRowView, top: f32) -> menu::MenuRow {
         height: theme::sidebar_row_height(),
         mark,
         title: row.title.clone().into(),
+        title_size: if matches!(
+            row.kind,
+            SidebarRowKind::Session | SidebarRowKind::EmptyWorkspace
+        ) {
+            theme::font_detail()
+        } else {
+            theme::font_sidebar_row()
+        },
         trailing: trailing.into(),
     }
 }
@@ -7172,38 +7180,23 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 }
             }),
         )
-        // The row a finger is carrying: the card travels with the finger and
-        // the line marks the slot it would land in.
+        // The row a finger is carrying, at its own size: the list opens the
+        // slot it would land in beneath it.
         .child(dynamic(move || match drag.get() {
             Some(dragged) => {
-                let height = theme::sidebar_row_height();
-                let slots = (dragged.delta / height).round();
-                let line_top = dragged.top + slots * height;
                 let card = menu::MenuRow {
                     top: dragged.top,
-                    height,
+                    height: theme::sidebar_row_height(),
                     mark: dragged.mark.clone(),
                     title: dragged.title.clone(),
+                    title_size: dragged.title_size,
                     trailing: dragged.trailing.clone(),
                 };
                 view()
                     .absolute()
                     .inset(px(0.0))
                     .pointer_events(PointerEvents::None)
-                    .child(menu::lifted_row(
-                        &card,
-                        dragged.top + dragged.delta - 2.0,
-                    ))
-                    .child(
-                        view()
-                            .absolute()
-                            .top(px(line_top))
-                            .left(px(theme::SIDEBAR_LIST_PADDING))
-                            .right(px(theme::SIDEBAR_LIST_PADDING))
-                            .h(px(2.0))
-                            .rounded_full()
-                            .bg(theme::accent_blue()),
-                    )
+                    .child(menu::carried_row(&card, dragged.top + dragged.delta))
                     .into_element()
             }
             None => view().absolute().into_element(),

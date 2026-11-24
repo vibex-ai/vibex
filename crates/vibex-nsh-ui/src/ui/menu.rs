@@ -81,8 +81,10 @@ pub struct MenuRow {
     pub height: f32,
     /// The mark the row leads with.
     pub mark: Option<ImageSrc>,
-    /// Its title.
+    /// Its title, at the step the list gives it.
     pub title: SharedString,
+    /// The title's type size.
+    pub title_size: f32,
     /// What trails the title: when it was last touched, how many it holds.
     pub trailing: SharedString,
 }
@@ -335,15 +337,23 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
 /// The card a lifted row is drawn on: its mark, title and trailing detail,
 /// a shade larger than its place in the list, standing at `top`.
 ///
-/// The menu draws the row it was raised from with it; a drag keeps drawing
-/// it under the finger as the row travels.
+/// The menu draws the row it was raised from with it.
 pub fn lifted_row(row: &MenuRow, top: f32) -> View {
+    row_card(row, top, LIFTED_ROW_GROWTH)
+}
+
+/// The same card at the row's own size: what a drag carries under the finger.
+pub fn carried_row(row: &MenuRow, top: f32) -> View {
+    row_card(row, top, 0.0)
+}
+
+fn row_card(row: &MenuRow, top: f32, growth: f32) -> View {
     let mut card = view()
         .absolute()
         .top(px(top))
         .left(px(MENU_ATTACH_INSET))
         .w(move || px((window().width.0 - MENU_ATTACH_INSET * 2.0).max(1.0)))
-        .h(px(row.height + LIFTED_ROW_GROWTH * 2.0))
+        .h(px(row.height + growth * 2.0))
         .rounded(px(theme::RADIUS_GROUP))
         .bg(theme::block_surface)
         .shadow_lg()
@@ -367,7 +377,7 @@ pub fn lifted_row(row: &MenuRow, top: f32) -> View {
             .flex_1()
             .min_w(px(0.0))
             .truncate()
-            .text_size(px(theme::font_body()))
+            .text_size(px(row.title_size))
             .font_weight(FontWeight::MEDIUM)
             .text_color(theme::foreground),
     )

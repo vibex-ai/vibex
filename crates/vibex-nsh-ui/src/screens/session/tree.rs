@@ -16,9 +16,10 @@ use crate::{
     },
 };
 
-/// How far a held row must travel before the drag takes the touches, so a
-/// hand that rests on the row keeps it for the menu.
-const DRAG_SLOP: f32 = 8.0;
+/// How far a held row must travel before it takes the touches for a drag:
+/// past the hand's own tremor, under the list's scroll slop, so carrying a
+/// row wins the gesture against scrolling.
+const DRAG_SLOP: f32 = 3.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SidebarRowKind {
@@ -83,6 +84,8 @@ pub struct DraggedRow {
     pub delta: f32,
     pub mark: Option<ImageSrc>,
     pub title: SharedString,
+    /// The title's type size, as the row sets it.
+    pub title_size: f32,
     pub trailing: SharedString,
 }
 
@@ -153,6 +156,24 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = element_ref();
+    // The carried row and the slot it is over, as values that only change
+    // when the finger crosses a row: a row between the two moves over as a
+    // step, not on every pixel of the drag.
+    let carried = computed(move || {
+        state
+            .drag
+            .with(|drag| drag.as_ref().map(|drag| drag.key.clone()))
+    });
+    let slot = computed(move || {
+        state.drag.with(|drag| {
+            drag.as_ref().map(|drag| {
+                (
+                    drag.key.clone(),
+                    (drag.delta / theme::sidebar_row_height().max(1.0)).round() as i32,
+                )
+            })
+        })
+    });
     effect(move || {
         if let Some(id) = state.locate.get()
             && let Some(index) = rows.with(|rows| {
@@ -196,7 +217,18 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                         let actions = actions.clone();
                         move || match row.get() {
                             Some(row) => {
-                                row_item(row, state, actions.clone(), clock).into_element()
+                                let key = row.key();
+                                let is_carried = carried
+                                    .with(|carried| carried.as_deref() == Some(key.as_str()));
+                                // A carried row reads only its own name, so it
+                                // is not rebuilt while the finger moves.
+                                let shift = if is_carried {
+                                    0.0
+                                } else {
+                                    drag_shift(rows, slot.get(), position.index())
+                                };
+                                row_item(row, state, actions.clone(), clock, shift, is_carried)
+                                    .into_element()
                             }
                             None => view().into_element(),
                         }
@@ -211,6 +243,27 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             .element_ref(&list_ref)
             .flex_1(),
         )
+}
+
+/// How far a row moves over to open the slot the carried row would land in.
+fn drag_shift(rows: Memo<Vec<SidebarRowView>>, slot: Option<(String, i32)>, index: usize) -> f32 {
+    let Some((key, slots)) = slot else {
+        return 0.0;
+    };
+    let height = theme::sidebar_row_height();
+    rows.with(|rows| {
+        let Some(from) = rows.iter().position(|row| row.key() == key) else {
+            return 0.0;
+        };
+        let target = (from as i32 + slots).clamp(0, rows.len().saturating_sub(1) as i32) as usize;
+        if from < target && index > from && index <= target {
+            -height
+        } else if target < from && index >= target && index < from {
+            height
+        } else {
+            0.0
+        }
+    })
 }
 
 /// What trails a row's title, as the card a drag carries shows it.
@@ -229,6 +282,8 @@ fn row_item(
     state: TreeState,
     actions: TreeActions,
     clock: ActivityClock,
+    shift: f32,
+    carried: bool,
 ) -> impl IntoElement {
     let id = row.id.clone();
     let is_session = row.kind == SidebarRowKind::Session;
@@ -312,21 +367,16 @@ fn row_item(
     let on_hold_released = move |_: &PressEvent| {
         held.set(false);
     };
-    // What the page draws while the finger carries this row: the row itself,
-    // off its place, and the slot it would land in.
-    let carried = computed({
-        let key = row.key();
-        move || {
-            state
-                .drag
-                .with(|drag| drag.as_ref().is_some_and(|drag| drag.key == key))
-        }
-    });
     let start_drag = {
         let drag = state.drag;
         let key = row.key();
         let mark = logo.clone();
         let title: SharedString = row.title.clone().into();
+        let title_size = if is_session || is_empty {
+            theme::font_detail()
+        } else {
+            theme::font_sidebar_row()
+        };
         let trailing: SharedString = row_trailing(&row).into();
         move || {
             dragging.set(true);
@@ -336,6 +386,7 @@ fn row_item(
                 delta: 0.0,
                 mark: Some(mark.clone()),
                 title: title.clone(),
+                title_size,
                 trailing: trailing.clone(),
             }));
         }
@@ -380,6 +431,8 @@ fn row_item(
             held.set(false);
         }
     };
+    // A held row takes the touches as its first travel starts, before the
+    // list's own drag can begin, and keeps them while it is carried.
     let on_drag_claim = move |request: &ClaimRequest| {
         if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
             request.claim();
@@ -396,9 +449,14 @@ fn row_item(
         .px(px(inset))
         .py(px(theme::SIDEBAR_ROW_GAP))
         .relative()
-        // A carried row is drawn by the page instead, so the list must not
-        // leave a second copy behind.
-        .style_when(move || carried.get(), |style| style.opacity(0.0))
+        // A row between the carried row and the slot it would land in moves
+        // one place over, opening that slot; the carried row itself is drawn
+        // by the page, so its own place stays empty. The step is a transform,
+        // so the rows slide into place rather than jumping.
+        .translate_y(px(shift))
+        .transition_transform()
+        .duration(160.0)
+        .when(carried, |row| row.opacity(0.0))
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
             view()
@@ -523,6 +581,7 @@ fn row_item(
                                 // only once a held row moves; a scroll that
                                 // starts on a row still scrolls.
                                 .claim_touches(TouchClaim::on_move().ask(on_drag_claim))
+                                .keep_touches(true)
                                 .on_responder_grant(move |_: &ResponderEvent| {
                                     if held.get_untracked() {
                                         start_drag();
