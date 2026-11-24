@@ -6912,7 +6912,6 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         selected,
                         locate,
                         drag,
-                        menu: overlays.menu,
                     },
                     tree_actions,
                 ))

@@ -289,60 +289,23 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
     let lifted_card = row
         .as_ref()
         .map(|row| lifted_row(row, row.top - LIFTED_ROW_GROWTH).bind_opacity(&reveal));
-    // The dim and the blur take everything except the row a menu was raised
-    // from: that band stays the page's, so the finger that is holding the row
-    // can still claim it and carry it, while a press anywhere else puts the
-    // menu away.
-    let scrim_at = |top: f32, height: Option<f32>, left: f32, right: f32| {
-        let band = view()
-            .absolute()
-            .top(px(top))
-            .left(px(left))
-            .right(px(right))
-            .bg(theme::menu_scrim)
-            .backdrop_blur(px(MENU_BLUR))
-            .bind_opacity(&reveal)
-            .role(AccessibilityRole::Button)
-            .label(copy::text("Dismiss menu", "关闭菜单", "關閉選單"))
-            .focusable(true)
-            .on_press(move || {
-                dismiss(menu);
-            });
-        match height {
-            Some(height) => band.h(px(height)),
-            None => band.bottom(px(0.0)),
-        }
-    };
-    let mut scrims = Vec::new();
-    match row.as_ref() {
-        Some(row) => {
-            let card_top = (row.top - LIFTED_ROW_GROWTH).max(0.0);
-            let card_bottom = row.top + row.height + LIFTED_ROW_GROWTH;
-            let card_height = card_bottom - card_top;
-            let page_width = window().width.0;
-            if card_top > 0.0 {
-                scrims.push(scrim_at(0.0, Some(card_top), 0.0, 0.0));
-            }
-            scrims.push(scrim_at(card_bottom, None, 0.0, 0.0));
-            scrims.push(scrim_at(
-                card_top,
-                Some(card_height),
-                0.0,
-                page_width - MENU_ATTACH_INSET,
-            ));
-            scrims.push(scrim_at(
-                card_top,
-                Some(card_height),
-                page_width - MENU_ATTACH_INSET,
-                0.0,
-            ));
-        }
-        None => scrims.push(scrim_at(0.0, None, 0.0, 0.0)),
-    }
     view()
         .absolute()
         .inset(px(0.0))
-        .children(scrims)
+        .child(
+            view()
+                .absolute()
+                .inset(px(0.0))
+                .bg(theme::menu_scrim)
+                .backdrop_blur(px(MENU_BLUR))
+                .bind_opacity(&reveal)
+                .role(AccessibilityRole::Button)
+                .label(copy::text("Dismiss menu", "关闭菜单", "關閉選單"))
+                .focusable(true)
+                .on_press(move || {
+                    dismiss(menu);
+                }),
+        )
         .children(lifted_card)
         .child(
             view()

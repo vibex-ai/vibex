@@ -7,7 +7,7 @@ use std::{
 use nsh_base::button;
 use nsh_core::{
     AccessibilityRole,
-    element::{ImageSrc, Position, Scrollable},
+    element::{ImageSrc, Position},
     prelude::*,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     copy, theme,
     ui::{
         activity::{ActivityClock, activity_ring},
-        menu, surface,
+        surface,
     },
 };
 
@@ -154,20 +154,16 @@ pub(super) struct TreeState {
     pub locate: Signal<Option<String>>,
     /// The row a finger is carrying, shared with the page that draws it.
     pub drag: Signal<Option<DraggedRow>>,
-    /// The menu the page has raised, so a press on the very row it is about
-    /// puts it away instead of acting on the row.
-    pub menu: Signal<Option<menu::Menu>>,
 }
 
 pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = element_ref();
-    // Each row keeps one animated offset for as long as the page lives, so
-    // the rows around a carried row can slide aside and back even while the
-    // list rebuilds its rows.
-    let shifts: Rc<RefCell<HashMap<String, (AnimatedValue, f32)>>> =
-        Rc::new(RefCell::new(HashMap::new()));
+    // Each row keeps one offset signal for as long as the page lives, so the
+    // rows around a carried row can slide aside and back without rebuilding
+    // the list, and the transform's transition carries the movement.
+    let shifts: Rc<RefCell<HashMap<String, Signal<f32>>>> = Rc::new(RefCell::new(HashMap::new()));
     // The carried row and the slot it is over, as values that only change
     // when the finger crosses a row: a row between the two moves over as a
     // step, not on every pixel of the drag.
@@ -186,14 +182,30 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             })
         })
     });
-    // The list stays still while one of its rows is about to be carried: a
-    // menu that is up, or a row already in hand, owns the gesture.
-    let list_locked = computed(move || {
-        state.drag.with(Option::is_some)
-            || state
-                .menu
-                .with(|menu| menu.as_ref().is_some_and(|menu| menu.row.is_some()))
-    });
+    // When the finger crosses a row, the rows between the carried row and
+    // that slot move over one place; the signals carry the transition.
+    {
+        let shifts = shifts.clone();
+        let rows = state.rows;
+        let carried = carried;
+        effect(move || {
+            let slot = slot.get();
+            let carried = carried.get();
+            rows.with(|rows| {
+                let mut shifts = shifts.borrow_mut();
+                for (index, row) in rows.iter().enumerate() {
+                    let key = row.key();
+                    let target = if carried.as_deref() == Some(key.as_str()) {
+                        0.0
+                    } else {
+                        drag_shift(rows, slot.clone(), index)
+                    };
+                    let shift = *shifts.entry(key).or_insert_with(|| signal(0.0));
+                    shift.set(target);
+                }
+            });
+        });
+    }
     effect(move || {
         if let Some(id) = state.locate.get()
             && let Some(index) = rows.with(|rows| {
@@ -241,15 +253,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                                 let key = row.key();
                                 let is_carried = carried
                                     .with(|carried| carried.as_deref() == Some(key.as_str()));
-                                // A carried row reads only its own name, so it
-                                // is not rebuilt while the finger moves.
-                                let shift = (!is_carried).then(|| {
-                                    shift_value(
-                                        &shifts,
-                                        &key,
-                                        drag_shift(rows, slot.get(), position.index()),
-                                    )
-                                });
+                                let shift = shift_signal(&shifts, &key);
                                 row_item(row, state, actions.clone(), clock, shift, is_carried)
                                     .into_element()
                             }
@@ -264,48 +268,35 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             })
             .estimated_item_size(px(theme::sidebar_row_height()))
             .element_ref(&list_ref)
-            .scrollable(move || !list_locked.get())
             .flex_1(),
         )
 }
 
-/// One row's offset while another row is carried, easing to `target`: the
-/// rows between the carried row and its slot slide over and back.
-fn shift_value(
-    shifts: &Rc<RefCell<HashMap<String, (AnimatedValue, f32)>>>,
-    key: &str,
-    target: f32,
-) -> AnimatedValue {
-    let mut shifts = shifts.borrow_mut();
-    let entry = shifts
+/// The offset signal of one row, made on first use and kept by the page.
+fn shift_signal(shifts: &Rc<RefCell<HashMap<String, Signal<f32>>>>, key: &str) -> Signal<f32> {
+    *shifts
+        .borrow_mut()
         .entry(key.to_owned())
-        .or_insert_with(|| (animated_value(0.0), 0.0));
-    if (entry.1 - target).abs() > 0.01 {
-        entry.1 = target;
-        let _ = entry.0.timing(target, 160.0, Easing::EaseOut);
-    }
-    entry.0
+        .or_insert(signal(0.0))
 }
 
 /// How far a row moves over to open the slot the carried row would land in.
-fn drag_shift(rows: Memo<Vec<SidebarRowView>>, slot: Option<(String, i32)>, index: usize) -> f32 {
+fn drag_shift(rows: &[SidebarRowView], slot: Option<(String, i32)>, index: usize) -> f32 {
     let Some((key, slots)) = slot else {
         return 0.0;
     };
     let height = theme::sidebar_row_height();
-    rows.with(|rows| {
-        let Some(from) = rows.iter().position(|row| row.key() == key) else {
-            return 0.0;
-        };
-        let target = (from as i32 + slots).clamp(0, rows.len().saturating_sub(1) as i32) as usize;
-        if from < target && index > from && index <= target {
-            -height
-        } else if target < from && index >= target && index < from {
-            height
-        } else {
-            0.0
-        }
-    })
+    let Some(from) = rows.iter().position(|row| row.key() == key) else {
+        return 0.0;
+    };
+    let target = (from as i32 + slots).clamp(0, rows.len().saturating_sub(1) as i32) as usize;
+    if from < target && index > from && index <= target {
+        -height
+    } else if target < from && index >= target && index < from {
+        height
+    } else {
+        0.0
+    }
 }
 
 /// What trails a row's title, as the card a drag carries shows it.
@@ -324,7 +315,7 @@ fn row_item(
     state: TreeState,
     actions: TreeActions,
     clock: ActivityClock,
-    shift: Option<AnimatedValue>,
+    shift: Signal<f32>,
     carried: bool,
 ) -> impl IntoElement {
     let id = row.id.clone();
@@ -360,10 +351,6 @@ fn row_item(
         let toggle = actions.toggle;
         let select = actions.select;
         move || {
-            if state.menu.with_untracked(Option::is_some) {
-                menu::dismiss(state.menu);
-                return;
-            }
             if !is_session {
                 toggle(&row);
             } else if state.select_mode.get_untracked() {
@@ -409,9 +396,6 @@ fn row_item(
                 menu(&menu_row, row_top.get_untracked());
             }
         }
-    };
-    let on_hold_released = move |_: &PressEvent| {
-        held.set(false);
     };
     let start_drag = {
         let drag = state.drag;
@@ -478,7 +462,10 @@ fn row_item(
         }
     };
     // A held row takes the touches as its first travel starts, before the
-    // list's own drag can begin, and keeps them while it is carried.
+    // list's own drag can begin, and keeps them while it is carried. The
+    // flag is cleared by the next press going down, not by this press being
+    // released: a press that moves is cancelled, and that release arrives
+    // before the claim does, which used to disarm the drag.
     let on_drag_claim = move |request: &ClaimRequest| {
         if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
             request.claim();
@@ -497,8 +484,11 @@ fn row_item(
         .relative()
         // A row between the carried row and the slot it would land in moves
         // one place over, opening that slot; the carried row itself is drawn
-        // by the page, so its own place stays empty.
-        .when_some(shift, |row, shift| row.bind_translate_y(&shift))
+        // by the page, so its own place stays empty. The transform animates,
+        // so the rows slide rather than jump.
+        .translate_y(move || px(shift.get()))
+        .transition_transform()
+        .duration(160.0)
         .when(carried, |row| row.opacity(0.0))
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
@@ -618,8 +608,8 @@ fn row_item(
                                 .focusable(true)
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_press(main_action)
+                                .on_press_down(move |_: &PressEvent| held.set(false))
                                 .on_long_press(on_hold)
-                                .on_press_up(on_hold_released)
                                 // The drag takes the touches from the list
                                 // only once a held row moves; a scroll that
                                 // starts on a row still scrolls.
