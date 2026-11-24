@@ -121,20 +121,22 @@ pub fn connecting(host: ConnectingHost) -> impl IntoElement {
                 }))
                 .child({
                     let on_switch = on_switch.clone();
-                    crate::ui::action::secondary(
+                    // Page-level alternatives take the filled block, not an
+                    // outline: these buttons sit directly on the page, and the
+                    // pairing page's own entries are the same shape. An
+                    // outlined row here reads as a card the page does not have.
+                    crate::ui::action::block(
                         copy::text("Switch runtime", "切换运行时", "切換執行環境"),
                         icon(include_str!("../../assets/icons/refresh.svg")),
-                        false,
                         move || on_switch(),
                     )
                     .w_full()
                 })
                 .child({
                     let on_disconnect = on_disconnect.clone();
-                    crate::ui::action::secondary(
+                    crate::ui::action::block(
                         copy::text("Disconnect", "断开连接", "中斷連線"),
                         icon(include_str!("../../assets/icons/plug-zap.svg")),
-                        false,
                         move || on_disconnect(),
                     )
                     .w_full()
