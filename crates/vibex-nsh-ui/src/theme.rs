@@ -509,7 +509,7 @@ pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 /// Where a folder draws the guide down its child column: under the middle of
 /// its own disclosure.
-pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = SIDEBAR_ROW_INSET + SIDEBAR_CHEVRON_SLOT / 2.0;
+pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = SIDEBAR_ROW_INSET + SIDEBAR_ICON_SLOT / 2.0;
 /// The radius of a row's plate.
 pub const SIDEBAR_ROW_RADIUS: f32 = 12.0;
 /// The radius of the card around a worktree and its sessions.

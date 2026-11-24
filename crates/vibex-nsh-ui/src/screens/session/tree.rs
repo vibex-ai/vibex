@@ -533,6 +533,26 @@ fn row_item(
         .transition_transform()
         .duration(160.0)
         .when(carried, |row| row.opacity(0.0))
+        // An open folder's children hang from a line centred under its
+        // icon, right where the leading chevron used to be.
+        .children(
+            (row.kind == SidebarRowKind::Folder && !row.collapsed).then(|| {
+                view()
+                    .absolute()
+                    .left(px(inset
+                        + row.indent
+                        + card_inset
+                        + theme::SIDEBAR_ROW_INSET
+                        + theme::SIDEBAR_ICON_SLOT / 2.0))
+                    .top(px(
+                        theme::sidebar_row_height() / 2.0 + theme::SIDEBAR_PROJECT_LOGO_SIZE / 2.0
+                    ))
+                    .bottom(px(0.0))
+                    .w(px(1.0))
+                    .bg(theme::sidebar_tree_guide())
+                    .pointer_events(PointerEvents::None)
+            }),
+        )
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
             view()
@@ -675,24 +695,6 @@ fn row_item(
                                     .items_center()
                                     .child(
                                         view()
-                                            .w(px(theme::SIDEBAR_CHEVRON_SLOT))
-                                            .flex_shrink_0()
-                                            .items_center()
-                                            .justify_center()
-                                            .when(is_container, |slot| {
-                                                slot.child(
-                                                    svg(if row.collapsed {
-                                                        icon!("chevron-right")
-                                                    } else {
-                                                        icon!("chevron-down")
-                                                    })
-                                                    .size(px(theme::SIDEBAR_CHEVRON_SIZE))
-                                                    .text_color(theme::sidebar_text_muted),
-                                                )
-                                            }),
-                                    )
-                                    .child(
-                                        view()
                                             .w(px(theme::SIDEBAR_ICON_SLOT))
                                             .flex_shrink_0()
                                             .items_center()
@@ -775,6 +777,28 @@ fn row_item(
                                                         .text_color(theme::sidebar_text_muted),
                                                 )
                                             },
+                                        )
+                                        // A folder or worktree keeps its
+                                        // disclosure beside its name: the
+                                        // leading gutter belongs to the tree
+                                        // now.
+                                        .children(
+                                            matches!(
+                                                row.kind,
+                                                SidebarRowKind::Folder | SidebarRowKind::Workspace
+                                            )
+                                            .then(
+                                                || {
+                                                    svg(if row.collapsed {
+                                                        icon!("chevron-right")
+                                                    } else {
+                                                        icon!("chevron-down")
+                                                    })
+                                                    .size(px(theme::SIDEBAR_CHEVRON_SIZE))
+                                                    .flex_shrink_0()
+                                                    .text_color(theme::sidebar_text_muted)
+                                                },
+                                            ),
                                         ),
                                 )
                                 .children(detail.into_iter().map(|detail| {
