@@ -485,22 +485,27 @@ pub fn floating_pane() -> Hsla {
 /// the edge, a wide one for the depth — which is what reads as a surface rather
 /// than a smudge.
 pub fn floating_pane_shadow() -> [BoxShadow; 2] {
-    let ink = hsla(0.0, 0.0, 0.0, if dark() { 0.50 } else { 0.20 });
+    // One soft drop, with the faintest contact shadow under it. A single wide
+    // shadow alone leaves the pane looking like it floats a little too high;
+    // two heavy ones make it look stamped on. The light palette needs far less
+    // ink than the dark one to read at all.
+    let drop = hsla(0.0, 0.0, 0.0, if dark() { 0.34 } else { 0.10 });
+    let contact = hsla(0.0, 0.0, 0.0, if dark() { 0.20 } else { 0.05 });
     [
         BoxShadow {
             offset_x: Points::ZERO,
             offset_y: Points(1.0),
-            blur: Points(3.0),
+            blur: Points(2.0),
             spread: Points(0.0),
-            color: ink.into(),
+            color: contact.into(),
             inset: false,
         },
         BoxShadow {
             offset_x: Points::ZERO,
-            offset_y: Points(8.0),
-            blur: Points(24.0),
-            spread: Points(-4.0),
-            color: ink.into(),
+            offset_y: Points(4.0),
+            blur: Points(14.0),
+            spread: Points(-1.0),
+            color: drop.into(),
             inset: false,
         },
     ]

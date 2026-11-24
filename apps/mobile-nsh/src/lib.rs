@@ -31,7 +31,11 @@ pub mod theme_gen;
 
 use std::{rc::Rc, time::Duration};
 
-use nsh_core::{platform::Lifecycle, prelude::*};
+use nsh_core::{
+    element::{screen, stack},
+    platform::Lifecycle,
+    prelude::*,
+};
 use pairing::PairingService;
 use session::SessionService;
 use settings::SettingsState;
@@ -137,30 +141,46 @@ pub fn App() -> impl IntoElement {
     };
     let settings_host = settings_host(&pairing, &settings, settings_open, settings_page, services);
 
-    view()
-        .flex_1()
-        .relative()
-        .bg(|| vibex_nsh_ui::theme::block_page())
-        .child(dynamic({
-            let pairing = pairing.clone();
-            let settings = settings.clone();
-            let open_settings = open_settings.clone();
-            move || {
-                // The copy is read while the tree is built, so the language is
-                // a rebuild of the surface rather than a value looked up per
-                // frame.
-                let _ = settings.revision.get();
-                root_view(
-                    pairing.clone(),
-                    open_settings.clone(),
-                    services,
-                    service_error,
-                    boot_connection,
-                    attempt,
-                    settings_host.clone(),
-                )
-            }
-        }))
+    // A screen is what carries a status-bar setting, and a screen lives in a
+    // stack. The bar's glyphs follow the appearance the app is drawn in rather
+    // than the system's: `nsh.json` leaves the app following the system, and a
+    // phone in dark mode drew white glyphs over this app's light page.
+    let bar = move || nsh_core::StatusBarSetting {
+        style: Some(if nsh_core::element::dark() {
+            nsh_core::StatusBarStyle::Light
+        } else {
+            nsh_core::StatusBarStyle::Dark
+        }),
+        hidden: None,
+        animated: None,
+    };
+    stack().flex_1().child(
+        screen()
+            .status_bar(bar)
+            .flex_1()
+            .relative()
+            .bg(|| vibex_nsh_ui::theme::block_page())
+            .child(dynamic({
+                let pairing = pairing.clone();
+                let settings = settings.clone();
+                let open_settings = open_settings.clone();
+                move || {
+                    // The copy is read while the tree is built, so the language is
+                    // a rebuild of the surface rather than a value looked up per
+                    // frame.
+                    let _ = settings.revision.get();
+                    root_view(
+                        pairing.clone(),
+                        open_settings.clone(),
+                        services,
+                        service_error,
+                        boot_connection,
+                        attempt,
+                        settings_host.clone(),
+                    )
+                }
+            })),
+    )
 }
 
 /// Builds the surface for the current connection, language and switcher state.
