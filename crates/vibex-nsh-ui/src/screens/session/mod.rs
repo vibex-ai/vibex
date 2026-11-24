@@ -6494,6 +6494,7 @@ fn menu_row(row: &SidebarRowView, top: f32) -> menu::MenuRow {
         String::new()
     };
     menu::MenuRow {
+        key: row.key(),
         top,
         height: theme::sidebar_row_height(),
         mark,
@@ -6515,6 +6516,9 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     // The row a finger is carrying. Raising a row's menu and carrying the
     // row begin with the same hold, so the first travel puts the menu away.
     let drag = signal(None::<tree::DraggedRow>);
+    // The row being carried belongs to the page rather than to a row: the
+    // list rebuilds its rows while a gesture is in flight.
+    let shifts = signal(std::collections::HashMap::new());
     effect(move || {
         if drag.with(Option::is_some) {
             menu::dismiss(menu);
@@ -6912,6 +6916,8 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         selected,
                         locate,
                         drag,
+                        menu: overlays.menu,
+                        shifts,
                     },
                     tree_actions,
                 ))
@@ -7185,6 +7191,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         .child(dynamic(move || match drag.get() {
             Some(dragged) => {
                 let card = menu::MenuRow {
+                    key: dragged.key.clone(),
                     top: dragged.top,
                     height: theme::sidebar_row_height(),
                     mark: dragged.mark.clone(),

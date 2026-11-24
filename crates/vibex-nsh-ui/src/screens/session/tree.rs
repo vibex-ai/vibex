@@ -1,8 +1,4 @@
-use std::{
-    cell::{Cell, RefCell},
-    collections::HashMap,
-    rc::Rc,
-};
+use std::{collections::HashMap, rc::Rc};
 
 use nsh_base::button;
 use nsh_core::{
@@ -16,7 +12,7 @@ use crate::{
     copy, theme,
     ui::{
         activity::{ActivityClock, activity_ring},
-        surface,
+        menu, surface,
     },
 };
 
@@ -71,7 +67,7 @@ pub struct SidebarRowView {
 }
 
 impl SidebarRowView {
-    fn key(&self) -> String {
+    pub(super) fn key(&self) -> String {
         format!("{:?}:{}", self.kind, self.id)
     }
 }
@@ -154,16 +150,19 @@ pub(super) struct TreeState {
     pub locate: Signal<Option<String>>,
     /// The row a finger is carrying, shared with the page that draws it.
     pub drag: Signal<Option<DraggedRow>>,
+    /// The menu the page has raised: it names the row a hold is about, so a
+    /// drag is decided from page state and survives the list rebuilding the
+    /// row under the finger.
+    pub menu: Signal<Option<menu::Menu>>,
+    /// How far each row has moved over to open the carried row's slot, by
+    /// key. The page owns it, like the carry itself.
+    pub shifts: Signal<HashMap<String, f32>>,
 }
 
 pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = element_ref();
-    // Each row keeps one offset signal for as long as the page lives, so the
-    // rows around a carried row can slide aside and back without rebuilding
-    // the list, and the transform's transition carries the movement.
-    let shifts: Rc<RefCell<HashMap<String, Signal<f32>>>> = Rc::new(RefCell::new(HashMap::new()));
     // The carried row and the slot it is over, as values that only change
     // when the finger crosses a row: a row between the two moves over as a
     // step, not on every pixel of the drag.
@@ -185,14 +184,14 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     // When the finger crosses a row, the rows between the carried row and
     // that slot move over one place; the signals carry the transition.
     {
-        let shifts = shifts.clone();
         let rows = state.rows;
         let carried = carried;
+        let shifts = state.shifts;
         effect(move || {
             let slot = slot.get();
             let carried = carried.get();
             rows.with(|rows| {
-                let mut shifts = shifts.borrow_mut();
+                let mut wanted = HashMap::new();
                 for (index, row) in rows.iter().enumerate() {
                     let key = row.key();
                     let target = if carried.as_deref() == Some(key.as_str()) {
@@ -200,9 +199,11 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                     } else {
                         drag_shift(rows, slot.clone(), index)
                     };
-                    let shift = *shifts.entry(key).or_insert_with(|| signal(0.0));
-                    shift.set(target);
+                    if target != 0.0 {
+                        wanted.insert(key, target);
+                    }
                 }
+                shifts.set(wanted);
             });
         });
     }
@@ -247,14 +248,11 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                         computed(move || rows.with(|rows| rows.get(position.index()).cloned()));
                     dynamic({
                         let actions = actions.clone();
-                        let shifts = shifts.clone();
                         move || match row.get() {
                             Some(row) => {
-                                let key = row.key();
                                 let is_carried = carried
-                                    .with(|carried| carried.as_deref() == Some(key.as_str()));
-                                let shift = shift_signal(&shifts, &key);
-                                row_item(row, state, actions.clone(), clock, shift, is_carried)
+                                    .with(|carried| carried.as_deref() == Some(row.key().as_str()));
+                                row_item(row, state, actions.clone(), clock, is_carried)
                                     .into_element()
                             }
                             None => view().into_element(),
@@ -270,14 +268,6 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             .element_ref(&list_ref)
             .flex_1(),
         )
-}
-
-/// The offset signal of one row, made on first use and kept by the page.
-fn shift_signal(shifts: &Rc<RefCell<HashMap<String, Signal<f32>>>>, key: &str) -> Signal<f32> {
-    *shifts
-        .borrow_mut()
-        .entry(key.to_owned())
-        .or_insert(signal(0.0))
 }
 
 /// How far a row moves over to open the slot the carried row would land in.
@@ -315,7 +305,6 @@ fn row_item(
     state: TreeState,
     actions: TreeActions,
     clock: ActivityClock,
-    shift: Signal<f32>,
     carried: bool,
 ) -> impl IntoElement {
     let id = row.id.clone();
@@ -379,27 +368,27 @@ fn row_item(
     // A row's commands are behind a press held still, and a drag that
     // follows the hold moves the row. Holding raises the menu at once; a
     // finger that then travels puts it away and carries the row instead.
-    let held = signal(false);
-    let row_top = signal(0.0);
-    let traveled = Rc::new(Cell::new(0.0f32));
+    //
+    // What is carried lives in the page, not in this row: the list rebuilds
+    // its rows while a gesture is in flight, and a row held in a local
+    // signal would forget the press it is in the middle of.
+    let key = row.key();
+    let shift_key = key.clone();
     let on_hold = {
         let menu = actions.menu.clone();
         let menu_row = row.clone();
         move |event: &PressEvent| {
             if !state.select_mode.get_untracked() {
                 crate::motion::tick();
-                held.set(true);
                 // Where the row's top is, not where the finger is: the menu
                 // stands against the row itself. The press lands in the row's
                 // inner content, which starts one row gap below its top.
-                row_top.set(event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP);
-                menu(&menu_row, row_top.get_untracked());
+                let top = event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP;
+                menu(&menu_row, top);
             }
         }
     };
     let start_drag = {
-        let drag = state.drag;
-        let key = row.key();
         let mark = logo.clone();
         let title: SharedString = row.title.clone().into();
         let title_size = if is_session || is_empty {
@@ -408,11 +397,18 @@ fn row_item(
             theme::font_sidebar_row()
         };
         let trailing: SharedString = row_trailing(&row).into();
+        let key = key.clone();
         move || {
-            dragging.set(true);
-            drag.set(Some(DraggedRow {
+            let Some(top) = state.menu.with_untracked(|menu| {
+                menu.as_ref()
+                    .and_then(|menu| menu.row.as_ref())
+                    .map(|row| row.top)
+            }) else {
+                return;
+            };
+            state.drag.set(Some(DraggedRow {
                 key: key.clone(),
-                top: row_top.get_untracked(),
+                top,
                 delta: 0.0,
                 mark: Some(mark.clone()),
                 title: title.clone(),
@@ -422,53 +418,62 @@ fn row_item(
         }
     };
     let on_drag_move = {
-        let travel = traveled.clone();
-        let drag = state.drag;
+        let key = key.clone();
         move |event: &ResponderEvent| {
-            if dragging.get_untracked() {
-                let delta = event.gesture.delta.y.0;
-                travel.set(delta);
-                drag.update(|current| {
-                    if let Some(current) = current {
-                        current.delta = delta;
-                    }
-                });
-            }
+            let delta = event.gesture.delta.y.0;
+            state.drag.update(|drag| {
+                if let Some(drag) = drag
+                    && drag.key == key
+                {
+                    drag.delta = delta;
+                }
+            });
         }
     };
     let on_drag_end = {
+        let key = key.clone();
         let move_row = actions.move_row.clone();
         let moved_row = row.clone();
-        let travel = traveled.clone();
-        let drag = state.drag;
         move |_: &ResponderEvent| {
-            let moved = travel.replace(0.0);
-            if dragging.get_untracked() {
-                dragging.set(false);
-                move_row(&moved_row, moved);
+            let delta = state.drag.with_untracked(|drag| {
+                drag.as_ref()
+                    .filter(|drag| drag.key == key)
+                    .map_or(0.0, |drag| drag.delta)
+            });
+            let ours = state
+                .drag
+                .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
+            if ours {
+                state.drag.set(None);
+                move_row(&moved_row, delta);
             }
-            drag.set(None);
-            held.set(false);
         }
     };
     let on_drag_cancelled = {
-        let travel = traveled.clone();
-        let drag = state.drag;
+        let key = key.clone();
         move |_: &ResponderEvent| {
-            travel.set(0.0);
-            dragging.set(false);
-            drag.set(None);
-            held.set(false);
+            let ours = state
+                .drag
+                .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
+            if ours {
+                state.drag.set(None);
+            }
         }
     };
-    // A held row takes the touches as its first travel starts, before the
-    // list's own drag can begin, and keeps them while it is carried. The
-    // flag is cleared by the next press going down, not by this press being
-    // released: a press that moves is cancelled, and that release arrives
-    // before the claim does, which used to disarm the drag.
-    let on_drag_claim = move |request: &ClaimRequest| {
-        if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
-            request.claim();
+    // The row is armed by the hold and taken by the first travel, which is
+    // decided again on every move from page state, so a row rebuilt under
+    // the finger still claims the gesture.
+    let on_drag_claim = {
+        let key = key.clone();
+        move |request: &ClaimRequest| {
+            let armed = state.menu.with_untracked(|menu| {
+                menu.as_ref()
+                    .and_then(|menu| menu.row.as_ref())
+                    .is_some_and(|row| row.key == key)
+            });
+            if armed && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
+                request.claim();
+            }
         }
     };
     let active = is_session && row.active;
@@ -486,7 +491,11 @@ fn row_item(
         // one place over, opening that slot; the carried row itself is drawn
         // by the page, so its own place stays empty. The transform animates,
         // so the rows slide rather than jump.
-        .translate_y(move || px(shift.get()))
+        .translate_y(move || {
+            px(state
+                .shifts
+                .with(|shifts| shifts.get(&shift_key).copied().unwrap_or(0.0)))
+        })
         .transition_transform()
         .duration(160.0)
         .when(carried, |row| row.opacity(0.0))
@@ -547,7 +556,7 @@ fn row_item(
                 })
                 .when(active && in_card, |plate| plate.bg(theme::sidebar_well))
                 .style_when(
-                    move || dragging.get() || held.get(),
+                    move || dragging.get() || carried,
                     |style| style.bg(theme::sidebar_well()),
                 )
                 .child(when(scope_selection, {
@@ -608,7 +617,6 @@ fn row_item(
                                 .focusable(true)
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_press(main_action)
-                                .on_press_down(move |_: &PressEvent| held.set(false))
                                 .on_long_press(on_hold)
                                 // The drag takes the touches from the list
                                 // only once a held row moves; a scroll that
@@ -616,9 +624,7 @@ fn row_item(
                                 .claim_touches(TouchClaim::on_move().ask(on_drag_claim))
                                 .keep_touches(true)
                                 .on_responder_grant(move |_: &ResponderEvent| {
-                                    if held.get_untracked() {
-                                        start_drag();
-                                    }
+                                    start_drag();
                                 })
                                 .on_responder_move(on_drag_move)
                                 .on_responder_release(on_drag_end)

@@ -5298,26 +5298,31 @@ impl SessionService {
         )
         .then(|| self.sidebar_snapshot.borrow().revision);
         let service = self.clone();
-        spawn(async move {
-            match service.submit_sidebar(mutation.clone(), revision).await {
-                Ok(()) => {
-                    if let Some(done) = done.as_ref() {
-                        done();
+        // Under an owner of its own: the call comes from a row of a list that
+        // may be rebuilt at any moment, and a task spawned under that row's
+        // owner is cancelled with it before its first poll.
+        Owner::detached().run(move || {
+            spawn(async move {
+                match service.submit_sidebar(mutation.clone(), revision).await {
+                    Ok(()) => {
+                        if let Some(done) = done.as_ref() {
+                            done();
+                        }
                     }
-                }
-                Err(error)
-                    if retries > 0
-                        && (error.kind == BackendErrorKind::Conflict
-                            || error.code.contains("stale_revision")) =>
-                {
-                    if service.reload_sidebar().await.is_ok() {
-                        service.sidebar_mutation_attempt(mutation, retries - 1, done);
-                    } else {
-                        service.fail(&error);
+                    Err(error)
+                        if retries > 0
+                            && (error.kind == BackendErrorKind::Conflict
+                                || error.code.contains("stale_revision")) =>
+                    {
+                        if service.reload_sidebar().await.is_ok() {
+                            service.sidebar_mutation_attempt(mutation, retries - 1, done);
+                        } else {
+                            service.fail(&error);
+                        }
                     }
+                    Err(error) => service.fail(&error),
                 }
-                Err(error) => service.fail(&error),
-            }
+            });
         });
     }
 

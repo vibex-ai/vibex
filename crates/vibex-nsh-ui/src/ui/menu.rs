@@ -75,6 +75,9 @@ impl MenuEntry {
 /// The row a long press lifted: where it stands, and what it says.
 #[derive(Clone)]
 pub struct MenuRow {
+    /// The row's key in the list, so the row that raised the menu knows it
+    /// is the one being carried.
+    pub key: String,
     /// How far down the page the row's top edge is.
     pub top: f32,
     /// The row's height.
