@@ -1973,6 +1973,16 @@ impl DirectWebSocketTransport {
             state.session_epoch = Some(server_info.session_epoch);
             state.transition(RemoteConnectionState::Syncing);
         }
+        // The handshake has to ask for catch-up from the position this client
+        // last applied, but the events of this socket are numbered from 1.
+        // Capture the cursors first, then rewind the one channel whose live
+        // events carry their own authoritative payloads, so the resync this
+        // handshake earns is followed by live events the client can apply
+        // instead of reading them as duplicates of the previous connection.
+        let cursors = self.cursors();
+        if let Ok(mut sync) = self.inner.sync.lock() {
+            sync.rewind_connection_channel("agent_session");
+        }
         let subscription = self
             .subscribe(RemoteSubscribeRequestV2 {
                 subscription_id: format!("subscription_{}", self.config.client_id),
@@ -1988,7 +1998,7 @@ impl DirectWebSocketTransport {
                     "runtime".to_string(),
                 ],
                 session_ids: None,
-                cursors: self.cursors(),
+                cursors,
             })
             .await;
         let subscription = match subscription {
@@ -2736,6 +2746,13 @@ impl RelayE2eeTransport {
             state.session_epoch = Some(server_info.session_epoch);
             state.transition(RemoteConnectionState::Syncing);
         }
+        // Relay reuses this transport's inner state across sockets, so the
+        // Agent timeline cursor must be rewound exactly as the Direct handshake
+        // rewinds it: see `rewind_connection_channel`.
+        let cursors = self.cursors();
+        if let Ok(mut sync) = self.inner.sync.lock() {
+            sync.rewind_connection_channel("agent_session");
+        }
         let subscription = self
             .subscribe(RemoteSubscribeRequestV2 {
                 subscription_id: format!("subscription_{}", self.config.remote.client_id),
@@ -2751,7 +2768,7 @@ impl RelayE2eeTransport {
                     "runtime".to_string(),
                 ],
                 session_ids: None,
-                cursors: self.cursors(),
+                cursors,
             })
             .await?;
         for resync in subscription.resync_required {
@@ -6080,6 +6097,50 @@ mod tests {
                 ("sidebar", 4),
                 ("git", 7)
             ]
+        );
+    }
+
+    #[test]
+    fn a_reconnected_agent_stream_is_not_read_as_a_duplicate_replay() {
+        let config = test_config("https://desktop.example");
+        let transport = DirectWebSocketTransport::new(config).unwrap();
+        let dispatch = |channel: &str, generation: u64, sequence: u64| {
+            let message = RemoteJsonMessageV2::Event(RemoteEventV2 {
+                event_id: vibex_core::EventId::new(),
+                channel: channel.to_string(),
+                generation,
+                sequence,
+                correlation_id: None,
+                payload: None,
+                emitted_at_ms: 0,
+            });
+            dispatch_text(&transport.inner, &serde_json::to_string(&message).unwrap());
+        };
+        // The first connection carried the timeline up to sequence 40.
+        dispatch("agent_session", 7, 1);
+        {
+            let mut sync = transport.inner.sync.lock().unwrap();
+            sync.apply_snapshot("agent_session", 7, 40, None).unwrap();
+        }
+        // The next socket numbers its first timeline event 1 again, exactly as
+        // both Gateway pumps start their per-connection counter over.
+        transport.inner.events.lock().unwrap().clear();
+        {
+            let mut sync = transport.inner.sync.lock().unwrap();
+            sync.rewind_connection_channel("agent_session");
+        }
+        dispatch("agent_session", 7, 1);
+
+        let queued = transport.inner.events.lock().unwrap();
+        assert!(
+            matches!(
+                queued.front(),
+                Some(RemoteTransportEvent::Event(RemoteInboundEvent {
+                    decision: SyncDecision::Apply,
+                    ..
+                }))
+            ),
+            "an event of the new connection must be applied, not dropped as a replay"
         );
     }
 

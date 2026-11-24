@@ -2938,7 +2938,7 @@ WebRemoteBackend::resolve_unknown_mutation(RequestId) -> MessageSubmissionState
 BackendFacade::{capabilities, replace_capabilities}
 
 DomainSyncEngine::{observe, observe_invalidation, apply_replay_page, apply_snapshot,
-  reset_for_reconnect, reset_for_session_epoch}
+  reset_for_reconnect, reset_for_session_epoch, rewind_connection_channel}
 RemoteEventV2.sequence = connection-scoped channel/domain sequence
 TimelineLiveEvent.sequence = authoritative per-session timeline sequence in payload
 timeline_domain_event(RemoteLiveEventEnvelope, generation, &mut domain_sequence)
@@ -3029,6 +3029,18 @@ CredentialStore / ClientIdentityStore
   emit `Lagged`/`Resync`, rewind local cursors where necessary, and require an
   authoritative snapshot/catch-up before live application resumes. Replay pages
   update authority but are not re-injected into the wire event queue.
+- The Agent timeline stream is renumbered per connection: both Gateway pumps
+  start their outer counter at 1 on every socket, while the client keeps the
+  cursor it last applied for the handshake. A transport must therefore capture
+  its cursors for the handshake and then rewind the `agent_session` domain
+  (`DomainSyncEngine::rewind_connection_channel`) immediately before
+  subscribing on a new connection — Direct and Relay alike. Without the rewind
+  the stale cursor outranks the new stream, every live event is dropped as a
+  duplicate replay, and the transcript only moves when something else reloads
+  it. Only the timeline is rewound: its live events carry authoritative
+  payloads, and the resync the handshake earns is answered by a reload. The
+  projection domains keep their cursors, which is what the handshake and the
+  client-side catch-up read use to notice what a reconnect missed.
 - Agent live events have two independent sequence spaces. The outer
   `RemoteEventV2.sequence` is contiguous across every `agent_session` event sent
   on one connection, including events from different sessions. The serialized

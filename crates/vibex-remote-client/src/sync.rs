@@ -208,6 +208,40 @@ impl DomainSyncEngine {
         self.pending_events.clear();
     }
 
+    /// Rewinds one channel before a new wire connection subscribes to it.
+    ///
+    /// The outer `RemoteEventV2.sequence` is numbered per connection and per
+    /// channel: the Gateway's timeline pump and its domain fan-out both start
+    /// at 1 on every socket and stamp their own counter, while the cursor is
+    /// kept across the reconnect so the handshake can ask for authoritative
+    /// catch-up.  Binding the two naively leaves the client holding a cursor
+    /// above the new stream, and `observe` reads every event of the new
+    /// connection as a duplicate replay.  The transcript then stops moving
+    /// until something else reloads it, which is what a reader sees as a send
+    /// that only appears once the turn ends.
+    ///
+    /// The caller captures `cursors()` *before* calling this, so the handshake
+    /// still carries the position it last applied and the server answers with
+    /// a resync the owner must satisfy from the authority.  Only the Agent
+    /// timeline is rewound: it is the one append-only stream whose live events
+    /// carry authoritative payloads, and the owner reloads it on every resync.
+    /// The remaining domains must keep their positions, because their cursors
+    /// are what the handshake and the client-side catch-up read use to notice
+    /// what a reconnect missed.
+    pub fn rewind_connection_channel(&mut self, domain: &str) {
+        if let Some(cursor) = self.domains.get_mut(domain) {
+            cursor.generation = 0;
+            cursor.cursor = 0;
+            cursor.snapshot_version = None;
+        }
+        // A gap on the channel being rewound is about to be answered by the
+        // resync the server sends for it; the queue that held the events
+        // around that gap is meaningless across the connection boundary.
+        if self.paused {
+            self.resume_after_refetch();
+        }
+    }
+
     pub fn pause_for_resync(&mut self) {
         self.paused = true;
     }
@@ -650,5 +684,56 @@ mod tests {
         );
         assert_eq!(engine.domain("agent_session").unwrap().cursor, 2);
         assert!(engine.take_pending().is_empty());
+    }
+
+    /// A reconnect opens a new sequence space for the Agent timeline: the
+    /// Gateway numbers the first event of a new connection 1 again while this
+    /// engine still holds the position it last applied. Handing that cursor
+    /// back to the wire leaves `observe` reading the whole new stream as a
+    /// replay, so the rewind must be the last thing done before subscribing.
+    #[test]
+    fn a_reconnected_timeline_stream_is_applied_from_its_first_event() {
+        let mut engine = DomainSyncEngine::new(8);
+        engine.register_domains(["agent_session", "sidebar"]);
+        engine.apply_snapshot("agent_session", 7, 41, None).unwrap();
+        engine.apply_snapshot("sidebar", 7, 3, None).unwrap();
+
+        engine.rewind_connection_channel("agent_session");
+
+        assert_eq!(
+            engine.observe(event("agent_session", 0, 1)),
+            SyncDecision::Apply
+        );
+        assert_eq!(engine.domain("agent_session").unwrap().cursor, 1);
+        // The projection channel keeps its position: its cursor is what the
+        // handshake asks for from the authority.
+        assert_eq!(engine.domain("sidebar").unwrap().cursor, 3);
+        assert_eq!(
+            engine.observe_invalidation(event("sidebar", 7, 3)),
+            SyncDecision::IgnoreDuplicate
+        );
+    }
+
+    /// The rewound channel must not stay paused behind a gap that belonged to
+    /// the closed connection, or the next live event would be queued instead
+    /// of applied.
+    #[test]
+    fn rewinding_a_paused_channel_resumes_it() {
+        let mut engine = DomainSyncEngine::new(8);
+        engine.register_domain("agent_session");
+        engine.apply_snapshot("agent_session", 1, 2, None).unwrap();
+        assert!(matches!(
+            engine.observe(event("agent_session", 1, 5)),
+            SyncDecision::CatchUp { .. }
+        ));
+        assert!(engine.is_paused());
+
+        engine.rewind_connection_channel("agent_session");
+
+        assert!(!engine.is_paused());
+        assert_eq!(
+            engine.observe(event("agent_session", 0, 1)),
+            SyncDecision::Apply
+        );
     }
 }
