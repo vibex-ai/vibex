@@ -16,6 +16,9 @@ use crate::{
     },
 };
 
+/// How near the list's edge a carried row starts scrolling it.
+const DRAG_EDGE: f32 = 56.0;
+
 /// How far a held row must travel before it takes the touches for a drag:
 /// past the hand's own tremor, under the list's scroll slop, so carrying a
 /// row wins the gesture against scrolling.
@@ -157,12 +160,20 @@ pub(super) struct TreeState {
     /// How far each row has moved over to open the carried row's slot, by
     /// key. The page owns it, like the carry itself.
     pub shifts: Signal<HashMap<String, f32>>,
+    /// The list's viewport on the page (top, height), its scroll offset and
+    /// how far a drag near an edge has scrolled it so far.
+    pub list: Signal<Option<(f32, f32)>>,
+    pub list_offset: Signal<f32>,
+    pub scroll_travel: Signal<f32>,
+    pub auto_scroll: Signal<f32>,
+    /// The list itself, for the page's edge scrolling.
+    pub list_ref: ElementRef,
 }
 
 pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
-    let list_ref = element_ref();
+    let list_ref = state.list_ref;
     // The carried row and the slot it is over, as values that only change
     // when the finger crosses a row: a row between the two moves over as a
     // step, not on every pixel of the drag.
@@ -172,11 +183,12 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             .with(|drag| drag.as_ref().map(|drag| drag.key.clone()))
     });
     let slot = computed(move || {
+        let scrolled = state.scroll_travel.get();
         state.drag.with(|drag| {
             drag.as_ref().map(|drag| {
                 (
                     drag.key.clone(),
-                    (drag.delta / theme::sidebar_row_height().max(1.0)).round() as i32,
+                    ((drag.delta + scrolled) / theme::sidebar_row_height().max(1.0)).round() as i32,
                 )
             })
         })
@@ -266,6 +278,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             })
             .estimated_item_size(px(theme::sidebar_row_height()))
             .element_ref(&list_ref)
+            .on_scroll(move |event: &ScrollEvent| state.list_offset.set(event.offset.y.0))
             .flex_1(),
         )
 }
@@ -406,6 +419,8 @@ fn row_item(
             }) else {
                 return;
             };
+            state.scroll_travel.set(0.0);
+            state.auto_scroll.set(0.0);
             state.drag.set(Some(DraggedRow {
                 key: key.clone(),
                 top,
@@ -428,6 +443,21 @@ fn row_item(
                     drag.delta = delta;
                 }
             });
+            // Near an edge of the list the page scrolls it, so a row can be
+            // carried past what is on screen.
+            let y = event.page.y.0;
+            let edge = state.list.with_untracked(|list| {
+                list.map_or(0.0, |(top, height)| {
+                    if y < top + DRAG_EDGE {
+                        -1.0
+                    } else if y > top + height - DRAG_EDGE {
+                        1.0
+                    } else {
+                        0.0
+                    }
+                })
+            });
+            state.auto_scroll.set(edge);
         }
     };
     let on_drag_end = {
@@ -439,7 +469,9 @@ fn row_item(
                 drag.as_ref()
                     .filter(|drag| drag.key == key)
                     .map_or(0.0, |drag| drag.delta)
-            });
+            }) + state.scroll_travel.get_untracked();
+            state.auto_scroll.set(0.0);
+            state.scroll_travel.set(0.0);
             let ours = state
                 .drag
                 .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
@@ -458,6 +490,8 @@ fn row_item(
             if ours {
                 state.drag.set(None);
             }
+            state.auto_scroll.set(0.0);
+            state.scroll_travel.set(0.0);
         }
     };
     // The row is armed by the hold and taken by the first travel, which is

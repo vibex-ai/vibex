@@ -6511,6 +6511,11 @@ fn menu_row(row: &SidebarRowView, top: f32) -> menu::MenuRow {
     }
 }
 
+/// How far a tick of the list's edge scrolling moves it, and how often it
+/// ticks while a carried row rests near an edge.
+const DRAG_SCROLL_STEP: f32 = 8.0;
+const DRAG_SCROLL_TICK_MS: u64 = 16;
+
 fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
     let menu = overlays.menu;
     // The row a finger is carrying. Raising a row's menu and carrying the
@@ -6519,6 +6524,39 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     // The row being carried belongs to the page rather than to a row: the
     // list rebuilds its rows while a gesture is in flight.
     let shifts = signal(std::collections::HashMap::new());
+    // The list's viewport and scroll, so a carried row near an edge keeps
+    // the list scrolling under it.
+    let list = signal(None::<(f32, f32)>);
+    let list_offset = signal(0.0f32);
+    let scroll_travel = signal(0.0f32);
+    let auto_scroll = signal(0.0f32);
+    let list_ref = element_ref();
+    {
+        let list_ref = list_ref;
+        let list_offset = list_offset;
+        let scroll_travel = scroll_travel;
+        let auto_scroll = auto_scroll;
+        effect(move || {
+            // One ticker per page: it runs only while a row is carried near
+            // an edge, and moves the list a step at a time.
+            let _ = set_interval(
+                std::time::Duration::from_millis(DRAG_SCROLL_TICK_MS),
+                move || {
+                    if drag.with_untracked(Option::is_none) {
+                        return;
+                    }
+                    let edge = auto_scroll.get_untracked();
+                    if edge == 0.0 {
+                        return;
+                    }
+                    let offset = (list_offset.get_untracked() + edge * DRAG_SCROLL_STEP).max(0.0);
+                    list_offset.set(offset);
+                    scroll_travel.update(|travel| *travel += edge * DRAG_SCROLL_STEP);
+                    list_ref.scroll_to_offset(px(offset), false);
+                },
+            );
+        });
+    }
     effect(move || {
         if drag.with(Option::is_some) {
             menu::dismiss(menu);
@@ -6907,6 +6945,9 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 .min_h(px(0.0))
                 .flex_col()
                 .relative()
+                .on_layout(move |bounds: &Bounds<Points>| {
+                    list.set(Some((bounds.origin.y.0, bounds.size.height.0)));
+                })
                 .child(tree::list(
                     tree::TreeState {
                         pager,
@@ -6918,6 +6959,11 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         drag,
                         menu: overlays.menu,
                         shifts,
+                        list,
+                        list_offset,
+                        scroll_travel,
+                        auto_scroll,
+                        list_ref,
                     },
                     tree_actions,
                 ))
