@@ -1,4 +1,8 @@
-use std::{cell::Cell, rc::Rc};
+use std::{
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    rc::Rc,
+};
 
 use nsh_base::button;
 use nsh_core::{
@@ -156,6 +160,11 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = element_ref();
+    // Each row keeps one animated offset for as long as the page lives, so
+    // the rows around a carried row can slide aside and back even while the
+    // list rebuilds its rows.
+    let shifts: Rc<RefCell<HashMap<String, (AnimatedValue, f32)>>> =
+        Rc::new(RefCell::new(HashMap::new()));
     // The carried row and the slot it is over, as values that only change
     // when the finger crosses a row: a row between the two moves over as a
     // step, not on every pixel of the drag.
@@ -215,6 +224,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                         computed(move || rows.with(|rows| rows.get(position.index()).cloned()));
                     dynamic({
                         let actions = actions.clone();
+                        let shifts = shifts.clone();
                         move || match row.get() {
                             Some(row) => {
                                 let key = row.key();
@@ -222,11 +232,13 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                                     .with(|carried| carried.as_deref() == Some(key.as_str()));
                                 // A carried row reads only its own name, so it
                                 // is not rebuilt while the finger moves.
-                                let shift = if is_carried {
-                                    0.0
-                                } else {
-                                    drag_shift(rows, slot.get(), position.index())
-                                };
+                                let shift = (!is_carried).then(|| {
+                                    shift_value(
+                                        &shifts,
+                                        &key,
+                                        drag_shift(rows, slot.get(), position.index()),
+                                    )
+                                });
                                 row_item(row, state, actions.clone(), clock, shift, is_carried)
                                     .into_element()
                             }
@@ -243,6 +255,24 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             .element_ref(&list_ref)
             .flex_1(),
         )
+}
+
+/// One row's offset while another row is carried, easing to `target`: the
+/// rows between the carried row and its slot slide over and back.
+fn shift_value(
+    shifts: &Rc<RefCell<HashMap<String, (AnimatedValue, f32)>>>,
+    key: &str,
+    target: f32,
+) -> AnimatedValue {
+    let mut shifts = shifts.borrow_mut();
+    let entry = shifts
+        .entry(key.to_owned())
+        .or_insert_with(|| (animated_value(0.0), 0.0));
+    if (entry.1 - target).abs() > 0.01 {
+        entry.1 = target;
+        let _ = entry.0.timing(target, 160.0, Easing::EaseOut);
+    }
+    entry.0
 }
 
 /// How far a row moves over to open the slot the carried row would land in.
@@ -282,7 +312,7 @@ fn row_item(
     state: TreeState,
     actions: TreeActions,
     clock: ActivityClock,
-    shift: f32,
+    shift: Option<AnimatedValue>,
     carried: bool,
 ) -> impl IntoElement {
     let id = row.id.clone();
@@ -451,11 +481,8 @@ fn row_item(
         .relative()
         // A row between the carried row and the slot it would land in moves
         // one place over, opening that slot; the carried row itself is drawn
-        // by the page, so its own place stays empty. The step is a transform,
-        // so the rows slide into place rather than jumping.
-        .translate_y(px(shift))
-        .transition_transform()
-        .duration(160.0)
+        // by the page, so its own place stays empty.
+        .when_some(shift, |row, shift| row.bind_translate_y(&shift))
         .when(carried, |row| row.opacity(0.0))
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
