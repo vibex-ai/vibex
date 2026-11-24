@@ -469,21 +469,41 @@ pub fn raised() -> Hsla {
 
 /// The pane a control floats in over the conversation.
 ///
-/// Not a surface of its own: a translucent wash of the page's own tone, so what
-/// scrolls under it still shows through and the bar reads as glass rather than
-/// as a strip cut out of the page. Its hairline and shadow are what keep it
-/// legible over a message.
+/// A plain translucent fill, with no border: the shape is the shadow's job, and
+/// an outline over a message reads as a box drawn on the page rather than a
+/// surface hovering above it.
 pub fn floating_pane() -> Hsla {
-    // The page tone, nearly opaque: enough of the message under it shows to
-    // know something is passing, not so much that the glyph competes with it.
-    let page = background();
-    page.alpha(if dark() { 0.72 } else { 0.80 })
+    // The card tone at 72%: enough of the message under it shows through that
+    // the bar reads as glass, not so much that a glyph competes with it.
+    background_card().alpha(0.72)
 }
 
-/// The hairline around a [`floating_pane`]: the edge that says where the pane
-/// ends over a busy background.
-pub fn floating_pane_edge() -> Hsla {
-    foreground().alpha(if dark() { 0.10 } else { 0.07 })
+/// The shadow a floating pane casts.
+///
+/// Soft, wide, and low: the pane has no border to say where it ends, so the
+/// shadow has to lift it off the page on its own. Two layers — a tight one for
+/// the edge, a wide one for the depth — which is what reads as a surface rather
+/// than a smudge.
+pub fn floating_pane_shadow() -> [BoxShadow; 2] {
+    let ink = hsla(0.0, 0.0, 0.0, if dark() { 0.50 } else { 0.20 });
+    [
+        BoxShadow {
+            offset_x: Points::ZERO,
+            offset_y: Points(1.0),
+            blur: Points(3.0),
+            spread: Points(0.0),
+            color: ink.into(),
+            inset: false,
+        },
+        BoxShadow {
+            offset_x: Points::ZERO,
+            offset_y: Points(8.0),
+            blur: Points(24.0),
+            spread: Points(-4.0),
+            color: ink.into(),
+            inset: false,
+        },
+    ]
 }
 
 /// The scrim under a floating menu.

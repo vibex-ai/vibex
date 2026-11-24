@@ -90,7 +90,7 @@ pub(super) fn workbench(
         .flex_1()
         .min_h(px(0.0))
         .pt_safe_area()
-        .bg(theme::background)
+        .bg(theme::block_page)
         .test_id("workbench-page")
         // The head: the way back to the conversation, and the three surfaces
         // of the session's workspace as one control.

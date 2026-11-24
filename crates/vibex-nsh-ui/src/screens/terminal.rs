@@ -339,7 +339,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         view()
                             .absolute()
                             .inset(px(0.0))
-                            .bg(theme::background)
+                            .bg(theme::block_page)
                             .child(surface::empty_state(
                                 icon!("square-terminal"),
                                 move || {

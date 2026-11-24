@@ -387,7 +387,7 @@ pub fn pager(
         .flex_1()
         .relative()
         .overflow_hidden()
-        .bg(theme::background)
+        .bg(theme::block_page)
         .pan_values(Some(&pager.drag), None)
         .pan_enabled(true)
         .on_pan_start(move |event: &PanEvent| pager.pan_started(event))
@@ -416,7 +416,7 @@ pub fn pager(
         )
         .child(
             side_page(move || pager.workbench_shown.get())
-                .bg(theme::background)
+                .bg(theme::block_page)
                 .bind_translate_x(&workbench_x)
                 .child(when(move || pager.workbench_made.get(), workbench)),
         )
