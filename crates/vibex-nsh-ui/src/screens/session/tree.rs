@@ -272,12 +272,16 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                         computed(move || visible.with(|rows| rows.get(position.index()).cloned()));
                     dynamic({
                         let actions = actions.clone();
+                        // A row is made from its own view alone: what the
+                        // page does *with* a row (carrying it, opening its
+                        // slot) is bound into the element it already made,
+                        // never read here. Reading the carry here rebuilt
+                        // the row the moment a drag began, and the rebuilt
+                        // element never held the touch the gesture had
+                        // already fixed on the old one.
                         move || match row.get() {
                             Some(row) => {
-                                let is_carried = carried
-                                    .with(|carried| carried.as_deref() == Some(row.key().as_str()));
-                                row_item(row, state, actions.clone(), clock, is_carried)
-                                    .into_element()
+                                row_item(row, state, actions.clone(), clock).into_element()
                             }
                             None => view().into_element(),
                         }
@@ -306,7 +310,9 @@ fn without_subtree(rows: &[SidebarRowView], key: &str) -> Vec<SidebarRowView> {
     while end < rows.len() && rows[end].indent > indent {
         end += 1;
     }
-    let mut out = rows[..index].to_vec();
+    // The row itself stays: it is the one the finger holds, and rebuilding
+    // it would drop the touch the gesture is fixed on.
+    let mut out = rows[..=index].to_vec();
     out.extend_from_slice(&rows[end..]);
     out
 }
@@ -346,7 +352,6 @@ fn row_item(
     state: TreeState,
     actions: TreeActions,
     clock: ActivityClock,
-    carried: bool,
 ) -> impl IntoElement {
     let id = row.id.clone();
     let is_session = row.kind == SidebarRowKind::Session;
@@ -419,6 +424,16 @@ fn row_item(
     // signal would forget the press it is in the middle of.
     let key = row.key();
     let shift_key = key.clone();
+    // Whether the page is carrying this row. It is a binding, not a value
+    // the row is built with: a drag starting must not rebuild the element
+    // the touch was fixed on, so the row reads the carry in the places that
+    // draw it (its own fade and plate) instead of being made again.
+    let carried_key = key.clone();
+    let is_carried = computed(move || {
+        state
+            .drag
+            .with(|drag| drag.as_ref().is_some_and(|drag| drag.key == carried_key))
+    });
     let on_hold = {
         let menu = actions.menu.clone();
         let menu_row = row.clone();
@@ -597,7 +612,7 @@ fn row_item(
         })
         .transition_transform()
         .duration(160.0)
-        .when(carried, |row| row.opacity(0.0))
+        .opacity(move || if is_carried.get() { 0.0_f32 } else { 1.0 })
         // An open folder's children hang from a line centred under its
         // icon, right where the leading chevron used to be.
         .children(
@@ -675,7 +690,7 @@ fn row_item(
                 })
                 .when(active && in_card, |plate| plate.bg(theme::sidebar_well))
                 .style_when(
-                    move || dragging.get() || carried,
+                    move || dragging.get() || is_carried.get(),
                     |style| style.bg(theme::sidebar_well()),
                 )
                 .child(when(scope_selection, {

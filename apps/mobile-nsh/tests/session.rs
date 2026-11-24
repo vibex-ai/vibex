@@ -481,7 +481,7 @@ fn sidebar_fixture(
             let sections = sections.get();
             let active = active.get();
             let pinned = pinned.get();
-            let make_row = |session: &SessionSummary| SidebarRowView {
+            let make_row = |session: &SessionSummary, indent: f32| SidebarRowView {
                 id: session.id.clone(),
                 title: session.title.clone(),
                 detail: session.agent.clone(),
@@ -489,7 +489,7 @@ fn sidebar_fixture(
                 active: active.as_deref() == Some(&session.id),
                 pinned: pinned.contains(&session.id),
                 state: Some(session.state),
-                indent: 12.0,
+                indent,
                 ..Default::default()
             };
             let query = query.to_lowercase();
@@ -510,7 +510,7 @@ fn sidebar_fixture(
                             .iter()
                             .any(|section| section.session_ids.contains(&session.id))
                     })
-                    .map(make_row),
+                    .map(|session| make_row(session, 12.0)),
             );
             for section in sections {
                 rows.push(SidebarRowView {
@@ -531,7 +531,15 @@ fn sidebar_fixture(
                             .iter()
                             .filter(matches)
                             .filter(|session| section.session_ids.contains(&session.id))
-                            .map(make_row),
+                            // A folder's sessions hang one step in from it, as
+                            // they do in the app: the step is what tells a
+                            // folder's subtree from the rows around it.
+                            .map(|session| {
+                                make_row(
+                                    session,
+                                    12.0 + vibex_nsh_ui::theme::SIDEBAR_FOLDER_CHILD_INDENT,
+                                )
+                            }),
                     );
                 }
             }
@@ -2512,4 +2520,67 @@ fn a_long_title_does_not_push_header_controls_out_of_reach() {
     find_in_conversation(&mut app);
     app.press("role:button[Files, Git, and terminal]").unwrap();
     app.wait_for("role:button[Terminal]").unwrap();
+}
+
+#[test]
+fn dragging_an_open_folder_row_collapses_it_and_carries_the_row_with_the_finger() {
+    let mut config = EngineConfig::new(Root::of::<FolderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Work]").unwrap();
+    assert!(
+        app.screen().shows("Fix the tests"),
+        "the folder starts open"
+    );
+    // Every node drawing the folder's title, top to bottom: the row's own
+    // place and, once it is carried, the copy the page draws under the
+    // finger.
+    let rows = |app: &Headless| {
+        let mut tops: Vec<f32> = app
+            .screen()
+            .layout_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == "Work")
+            })
+            .map(|node| node.bounds.origin.y.0)
+            .collect();
+        tops.sort_by(|a, b| a.partial_cmp(b).expect("row tops are finite"));
+        tops
+    };
+    let resting = rows(&app);
+    assert_eq!(resting.len(), 1, "the folder row is on screen once");
+    app.long_press("role:button[Work]").unwrap();
+    app.wait_for("Rename").unwrap();
+    app.drag_and_hold(
+        "role:button[Work]",
+        nsh_core::geometry::Point::new(px(0.0), px(80.0)),
+    )
+    .unwrap();
+    // The row is carried with the finger: the page draws it where the finger
+    // is, not where it was picked up.
+    let carried = rows(&app);
+    let followed = carried
+        .iter()
+        .any(|top| (top - resting[0] - 70.0).abs() < 12.0);
+    assert!(
+        followed,
+        "the carried row follows the finger: it rested at {resting:?} and is at {carried:?}"
+    );
+    // The menu gives way to the drag, and the open folder's children leave
+    // the list so the row is carried alone.
+    assert!(!app.screen().shows("Rename"), "the drag puts the menu away");
+    assert!(
+        !app.screen().shows("Fix the tests"),
+        "an open folder's children collapse as it is carried"
+    );
+    app.drop_held().unwrap();
+    assert!(
+        !app.screen().shows("Fix the tests"),
+        "the folder stays collapsed once the row is dropped"
+    );
 }
