@@ -1186,6 +1186,11 @@ fn shell(
                 .flex_1()
                 .min_h(px(0.0))
                 .flex_col()
+                // The bar floats over the page, so the conversation starts
+                // under it: the tabs and the first row clear the bar and the
+                // status bar both, and a message scrolled up runs beneath the
+                // panes instead of stopping at a hard edge.
+                .pt_safe_area_plus(px(theme::HEADER_HEIGHT))
                 .style_when(move || creating.get(), |style| style.hidden())
                 .child(group_tabs(&host))
                 .child(
@@ -1278,7 +1283,10 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     };
     let activity = crate::ui::activity::ActivityClock::start();
     let session = active_session(&host);
-    let on_new_session = host.on_new_session.clone();
+    // The row's own rule: the pulse is the primary accent, and green only when
+    // the session keeps going by itself. The header reads the same list the row
+    // does, so the two marks never disagree about the same session.
+    let auto_continue = host.auto_continue_sessions;
     let on_stop_creating = host.on_close_new_session.clone();
     let has_menu = move || !creating.get() && session.with(Option::is_some);
     let title = computed(move || {
@@ -1298,6 +1306,9 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
             let Some(current) = session.get_untracked() else {
                 return;
             };
+            // The tick a held drawer row gives the hand: the header raises the
+            // same card, so opening it feels the same.
+            crate::motion::tick();
             dismiss_keyboard();
             let mut lead = Vec::new();
             if !host.find_open.get_untracked() {
@@ -1326,20 +1337,46 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 copy::text("Team", "团队", "團隊"),
                 move || team(),
             ));
-            overlays.menu.set(Some(session_menu(
-                &host,
-                overlays,
-                &current.id,
-                &current.title,
-                (
-                    safe_area().top.0 + theme::HEADER_HEIGHT / 2.0,
-                    MenuSide::Center,
-                ),
-                lead,
-            )));
+            // The header stands the menu under the bar and lifts the bar out
+            // of the page, which is what a long press does to a drawer row: the
+            // same card, the same shadow, so the menu belongs to something
+            // rather than floating over a dimmed page.
+            let header_top = safe_area().top.0;
+            let raised = menu::MenuRow {
+                key: current.id.clone(),
+                top: header_top,
+                height: theme::HEADER_HEIGHT,
+                mark: Some(icon(agent_icon(&current.agent))),
+                title: current.title.clone().into(),
+                title_size: theme::font_detail(),
+                trailing: String::new().into(),
+            };
+            overlays.menu.set(Some(
+                session_menu(
+                    &host,
+                    overlays,
+                    &current.id,
+                    &current.title,
+                    (header_top + theme::HEADER_HEIGHT / 2.0, MenuSide::Center),
+                    lead,
+                )
+                .from_row(raised),
+            ));
         }
     };
-    view().w_full().pt_safe_area().child(
+    // The bar floats over the conversation rather than sitting on top of it:
+    // its controls are translucent panes with a shadow, so a message scrolls
+    // underneath and reads through the gaps instead of being cut off at a
+    // hard edge. `pt_safe_area` keeps the panes below the status bar.
+    view()
+        .w_full()
+        .absolute()
+        .top_0()
+        .left_0()
+        .right_0()
+        .z_index(2)
+        .pt_safe_area()
+        .child(
         view()
             .w_full()
             .h(px(theme::HEADER_HEIGHT))
@@ -1348,11 +1385,17 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
             .items_center()
             .gap(px(theme::SPACING_SM))
             .px(px(theme::SPACING_MD))
-            .child(surface::round_button(
-                icon!("menu"),
-                copy::text("Sessions", "会话", "工作階段"),
-                move || pager.open(ShellPage::Sessions),
-            ))
+            .child(
+                surface::round_button(
+                    icon!("menu"),
+                    copy::text("Sessions", "会话", "工作階段"),
+                    move || pager.open(ShellPage::Sessions),
+                )
+                .bg(theme::floating_pane)
+                .border_1()
+                .border_color(theme::floating_pane_edge)
+                .shadow_sm(),
+            )
             .child(
                 view().flex_1().min_w(px(0.0)).items_center().child(
                     button()
@@ -1364,7 +1407,10 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         .items_center()
                         .gap(px(6.0))
                         .rounded_full()
-                        .bg(theme::fill)
+                        .bg(theme::floating_pane)
+                        .border_1()
+                        .border_color(theme::floating_pane_edge)
+                        .shadow_sm()
                         .active(|style| style.opacity(0.6))
                         .accessibility_label(move || {
                             SharedString::from(if has_menu() {
@@ -1388,12 +1434,32 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                             };
                             match state {
                                 Some(SessionState::Running) => {
-                                    crate::ui::activity::activity_ring(activity, theme::accent_blue)
-                                        .into_element()
+                                    let continues = session.with(|session| {
+                                        session.as_ref().is_some_and(|session| {
+                                            auto_continue.with(|continuing| {
+                                                continuing.iter().any(|id| id == &session.id)
+                                            })
+                                        })
+                                    });
+                                    crate::ui::activity::activity_ring(
+                                        activity,
+                                        if continues {
+                                            theme::accent_green
+                                        } else {
+                                            theme::primary
+                                        },
+                                    )
+                                    .into_element()
                                 }
-                                Some(SessionState::Waiting) => {
-                                    surface::status_dot(theme::accent_yellow).into_element()
-                                }
+                                // The desktop answers this state with its
+                                // question-mark icon everywhere it reports it,
+                                // so the header draws the same mark as the row
+                                // instead of a dot that reads as one more
+                                // status.
+                                Some(SessionState::Waiting) => svg(icon!("circle-question-mark"))
+                                    .size(px(theme::SIDEBAR_META_ICON))
+                                    .text_color(theme::accent_yellow)
+                                    .into_element(),
                                 Some(SessionState::Failed) => {
                                     surface::status_dot(theme::accent_red).into_element()
                                 }
@@ -1434,19 +1500,13 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     },
                 )
                 .otherwise(move || {
-                    let on_new_session = on_new_session.clone();
                     view()
                         .flex_row()
                         .items_center()
                         .gap(px(theme::SPACING_SM))
-                        .child(surface::round_button(
-                            icon!("plus"),
-                            copy::text("New session", "新建会话", "新增工作階段"),
-                            move || {
-                                dismiss_keyboard();
-                                on_new_session();
-                            },
-                        ))
+                        // The drawer owns "new session": its own control is the
+                        // one place to start one, so the header does not offer a
+                        // second way to the same page.
                         .child(
                             surface::round_button(
                                 icon!("panel-right"),
@@ -1457,6 +1517,10 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 ),
                                 move || pager.open(ShellPage::Workbench),
                             )
+                            .bg(theme::floating_pane)
+                            .border_1()
+                            .border_color(theme::floating_pane_edge)
+                            .shadow_sm()
                             .relative()
                             .child(when(terminal_running, || {
                                 surface::status_dot(theme::accent_success)
@@ -1798,6 +1862,8 @@ fn timeline_view(
     let has_older = host.has_older;
     let loading_older = host.loading_older;
     let on_load_older = host.on_load_older.clone();
+    // The ring the "earlier messages" strip turns while a page is on its way.
+    let older_clock = crate::ui::activity::ActivityClock::start();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -1921,46 +1987,35 @@ fn timeline_view(
                             )
                         }
                     }))
-                    .child(when(move || has_older.get(), {
-                        let on_load_older = on_load_older.clone();
-                        move || {
-                            let on_load_older = on_load_older.clone();
-                            view().w_full().items_center().py(px(theme::SPACING_XS)).child(
-                                button()
-                                    .on_press(move || {
-                                        if !loading_older.get_untracked() {
-                                            on_load_older();
-                                        }
-                                    })
-                                    .h(px(theme::CHIP_HEIGHT))
-                                    .px(px(surface::ROW_INSET))
-                                    .rounded_full()
-                                    .bg(theme::fill)
+                    // The older messages come by themselves: scrolling near the
+                    // top of what is loaded asks for the next page, and the
+                    // strip above the transcript says it is on its way. A
+                    // button would have made the reader stop and press it at
+                    // the one moment they were already reading backwards.
+                    .child(when(move || loading_older.get(), move || {
+                        view()
+                            .w_full()
+                            .items_center()
+                            .py(px(theme::SPACING_XS))
+                            .child(
+                                view()
+                                    .flex_row()
                                     .items_center()
-                                    .justify_center()
-                                    .active(|style| style.opacity(0.6))
+                                    .gap(px(theme::SPACING_SM))
+                                    .child(crate::ui::activity::activity_ring(
+                                        older_clock,
+                                        theme::primary,
+                                    ))
                                     .child(
-                                        text(move || {
-                                            if loading_older.get() {
-                                                copy::text(
-                                                    "Loading earlier...",
-                                                    "正在加载更早的消息…",
-                                                    "正在載入更早的訊息…",
-                                                )
-                                            } else {
-                                                copy::text(
-                                                    "Load earlier messages",
-                                                    "加载更早的消息",
-                                                    "載入更早的訊息",
-                                                )
-                                            }
-                                        })
+                                        text(copy::text(
+                                            "Loading earlier...",
+                                            "正在加载更早的消息…",
+                                            "正在載入更早的訊息…",
+                                        ))
                                         .text_size(px(theme::font_micro()))
-                                        .font_weight(FontWeight::MEDIUM)
-                                        .text_color(theme::text_secondary),
+                                        .text_color(theme::text_muted),
                                     ),
                             )
-                        }
                     }))
                     .child({
                         let actions = row_actions.clone();
@@ -1989,15 +2044,30 @@ fn timeline_view(
                                 })
                                 .estimated_item_size(px(72.0))
                                 .element_ref(&list_ref)
+                                .test_id("transcript")
                                 .alignment(ListAlignment::Bottom)
                                 .follow_end(px(120.0))
-                                .on_scroll(move |event: &ScrollEvent| {
+                                .on_scroll({
+                                    let on_load_older = on_load_older.clone();
+                                    move |event: &ScrollEvent| {
                                     away_from_end.set(
                                         event.content_size.height.0
                                             - event.size.height.0
                                             - event.offset.y.0
                                             > 120.0,
                                     );
+                                    // Reading near the top is the ask: fetch the
+                                    // next page then, not when a button is
+                                    // pressed. `loading_older` is the guard, so
+                                    // a scroll that keeps firing while the page
+                                    // is in flight asks once.
+                                    if event.offset.y.0 <= OLDER_TRIGGER
+                                        && has_older.get_untracked()
+                                        && !loading_older.get_untracked()
+                                    {
+                                        on_load_older();
+                                    }
+                                }
                                 })
                                 .flex_1(),
                             )
@@ -2207,6 +2277,11 @@ struct TranscriptActions {
 }
 
 /// The line a working row is named on.
+/// How near the top of the transcript the reader scrolls before the older
+/// messages are asked for. A few rows of lead, so the page is already there by
+/// the time the finger reaches the first one.
+const OLDER_TRIGGER: f32 = 240.0;
+
 const STEP_HEIGHT: f32 = 38.0;
 /// The column a turn's rail and its nodes take.
 const RAIL_SLOT: f32 = 20.0;
@@ -2355,7 +2430,7 @@ fn step_line(
         )
         .child(when(
             move || running.get(),
-            move || crate::ui::activity::activity_ring(clock, theme::accent_blue),
+            move || crate::ui::activity::activity_ring(clock, theme::primary),
         ))
         .child(when(
             move || expandable.get(),
@@ -2371,7 +2446,7 @@ fn working_row(body: Memo<String>, clock: crate::ui::activity::ActivityClock) ->
         .items_center()
         .gap(px(theme::SPACING_SM))
         .py(px(theme::SPACING_SM))
-        .child(crate::ui::activity::activity_ring(clock, theme::accent_blue))
+        .child(crate::ui::activity::activity_ring(clock, theme::primary))
         .child(
             text(move || body.get())
                 .flex_1()
@@ -2867,7 +2942,7 @@ fn agent_prose(
                 )
                 .child(when(
                     move || streaming.get(),
-                    move || crate::ui::activity::activity_ring(clock, theme::accent_blue),
+                    move || crate::ui::activity::activity_ring(clock, theme::primary),
                 )),
         )
         .child(
@@ -3174,7 +3249,7 @@ fn activity_row(
                         .text_color(theme::accent_red)
                         .into_element()
                 } else if running.get() {
-                    crate::ui::activity::activity_ring(clock, theme::accent_blue).into_element()
+                    crate::ui::activity::activity_ring(clock, theme::primary).into_element()
                 } else {
                     text(activity.with(|value| {
                         value
@@ -5347,7 +5422,10 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                     view()
                         .w_full()
                         .px(px(theme::SPACING_MD))
-                        .pb_safe_area_plus(px(theme::SPACING_LG))
+                        // This sheet has a search field above it: the
+                        // keyboard's room comes out of the list, so a focused
+                        // field is not pushed under the sheet's lip.
+                        .pb_keyboard_plus(px(theme::SPACING_LG))
                         .child(when(move || panel.get() == RuntimePanel::Model, {
                             let choose = host.on_choose_runtime.clone();
                             move || {
@@ -6791,7 +6869,9 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         .bg(theme::background)
         .test_id("sessions-page")
         .pt_safe_area()
-        .pb_safe_area_plus(px(theme::SPACING_SM))
+        // The page carries the drawer's search field: the keyboard takes its
+        // room out of the list rather than pushing the whole page up.
+        .pb_keyboard_plus(px(theme::SPACING_SM))
         // The head: the product's own lockup, the tree's own menu, and the
         // way back to the conversation. The page is the phone's home surface,
         // so it wears the whole word at the header's own step rather than a

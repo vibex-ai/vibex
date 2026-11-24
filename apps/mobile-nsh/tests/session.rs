@@ -242,6 +242,18 @@ fn FolderShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A shell whose first session is parked on the reader.
+#[component]
+fn WaitingShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.update(|sessions| {
+        if let Some(session) = sessions.first_mut() {
+            session.state = SessionState::Waiting;
+        }
+    });
+    session::session(host)
+}
+
 /// A title far wider than the drawer, for the ellipsis check.
 const DRAWER_LONG_TITLE: &str =
     "A session title long enough that the drawer has to cut it with an ellipsis";
@@ -439,11 +451,28 @@ fn RuntimeShell() -> impl IntoElement {
     session::session(host)
 }
 
-/// A transcript that knows it has older history.
+/// A transcript that knows it has older history, and is long enough to scroll.
 #[component]
 fn OlderShell() -> impl IntoElement {
     let mut host = host_with(None, None);
     host.has_older = signal(true);
+    // Enough turns to fill the viewport several times: a list that fits cannot
+    // be scrolled, and the older page is asked for by scrolling.
+    let mut entries = Vec::new();
+    for index in 0..24 {
+        entries.push(entry(
+            &format!("s1:pad:{index}"),
+            EntryKind::Agent,
+            "Claude",
+            &format!("A paragraph of history, number {index}, long enough to take a row or two of the transcript."),
+        ));
+    }
+    host.timeline = signal(entries);
+    // The app's own seam: asking for the older page puts the strip up while the
+    // page is in flight.
+    let loading = signal(false);
+    host.loading_older = loading;
+    host.on_load_older = Rc::new(move || loading.set(true));
     session::session(host)
 }
 
@@ -918,6 +947,9 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let project_browser_open = signal(false);
     let project_dir_path = signal(Some("/workspace".to_owned()));
     let project_dir_parent = signal(None);
+    // Two roots, as a runtime configured with more than its home offers: the
+    // sheet lists them so the reader can jump between them.
+    let project_roots = signal(vec!["/workspace".to_owned(), "/srv/projects".to_owned()]);
     let on_create_worktree_session = Rc::new(move || {
         if new_worktree_branch.get_untracked().trim().is_empty() {
             return;
@@ -1287,6 +1319,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             dirs: project_dirs,
             current: project_dir_path,
             parent: project_dir_parent,
+            roots: project_roots,
             busy: signal(false),
             error: signal(None),
             on_browse: Rc::new(move |path| project_dir_path.set(path.map(str::to_owned))),
@@ -1439,11 +1472,20 @@ fn the_history_sheet_lists_earlier_prompts() {
 }
 
 #[test]
-fn older_history_offers_its_read() {
+fn older_history_loads_itself_as_the_reader_scrolls_to_the_top() {
     let mut config = EngineConfig::new(Root::of::<OlderShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("Load earlier messages").unwrap();
+    app.wait_for("Good morning").unwrap();
+    // No button to press: the older messages come when the reader reaches for
+    // them, so the strip is not in the way of the transcript.
+    assert!(
+        !app.screen().shows("Load earlier messages"),
+        "the older messages are not behind a button"
+    );
+    // Scrolling up is what asks for them.
+    app.scroll("id:transcript", px(-2000.0)).unwrap();
+    app.wait_for("Loading earlier...").unwrap();
 }
 
 #[test]
@@ -1955,8 +1997,11 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
 #[test]
 fn a_session_is_written_under_the_conversations_own_header() {
     let mut app = start();
-    app.press("id:conversation-page >> role:button[New session]")
-        .unwrap();
+    // "New session" lives in the drawer: the conversation's header has no
+    // second way to the same page.
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[New session]").unwrap();
+    app.press("role:button[New session]").unwrap();
     app.wait_for("role:button[Choose workspace]").unwrap();
     // The transcript gives its place to the blank page, and comes back when
     // the session is given up.
@@ -2582,5 +2627,89 @@ fn dragging_an_open_folder_row_collapses_it_and_carries_the_row_with_the_finger(
     assert!(
         !app.screen().shows("Fix the tests"),
         "the folder stays collapsed once the row is dropped"
+    );
+}
+
+#[test]
+fn a_waiting_session_row_draws_the_desktops_question_mark_icon() {
+    let mut config = EngineConfig::new(Root::of::<WaitingShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Good morning]").unwrap();
+    // The desktop marks the state with `icons/circle-question-mark.svg`; the
+    // phone typed a "?" glyph instead, which is the one thing a shared mark
+    // must not be. The mark is an icon, so the row carries no "?" text.
+    let question_texts: Vec<_> = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .filter(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text.trim() == "?")
+        })
+        .collect();
+    assert!(
+        question_texts.is_empty(),
+        "the waiting mark is the desktop's icon, not a typed glyph"
+    );
+}
+
+#[test]
+fn the_new_project_sheet_offers_the_runtimes_places_and_a_path_to_type() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press("role:button[New project]").unwrap();
+    app.wait_for("demo").unwrap();
+    // The roots the runtime allows are listed, so a reader can jump to one
+    // instead of climbing back to it.
+    // Each place is named by its last segment, as a file browser names them.
+    assert!(
+        app.screen().shows("workspace") && app.screen().shows("projects"),
+        "both browse roots are offered as places"
+    );
+    // And the path is a field: a directory the list would take many steps to
+    // reach can be typed instead.
+    // The path is the field: tapping it turns the line into an input, so a
+    // directory the list would take many steps to reach can be typed.
+    // The field opens on the directory being browsed, so the reader edits a
+    // path rather than retyping one.
+    app.press("text:/workspace").unwrap();
+    app.clear("id:project-path").unwrap();
+    app.type_text("id:project-path", "/srv/projects/vibex")
+        .unwrap();
+    app.press("role:button[Open]").unwrap();
+    app.wait_for("/srv/projects/vibex").unwrap();
+}
+
+#[test]
+fn the_conversation_header_raises_itself_when_its_menu_opens() {
+    let mut app = start();
+    app.wait_for("Good morning").unwrap();
+    // The header is a bar on the page until its menu is asked for; opening the
+    // menu lifts it out of the page the way a held drawer row is lifted.
+    let header_text = |app: &Headless| {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .filter(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == "Good morning")
+            })
+            .map(|node| node.bounds.origin.y.0)
+            .collect::<Vec<_>>()
+    };
+    let before = header_text(&app);
+    app.press(CONVERSATION_MENU).unwrap();
+    app.wait_for("Find in conversation").unwrap();
+    let after = header_text(&app);
+    // The lifted card is drawn over the page, so the title appears twice: once
+    // in the header's place and once in the card standing over it.
+    assert!(
+        after.len() > before.len(),
+        "the header is lifted into a card: {before:?} -> {after:?}"
     );
 }

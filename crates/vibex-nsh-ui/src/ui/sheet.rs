@@ -100,6 +100,10 @@ pub fn sheet_body() -> View {
         .gap(px(theme::SPACING_MD))
         .px(px(theme::SPACING_MD))
         .pt(px(theme::SPACING_XS))
+        // The sheet itself rises above the keyboard (`keyboard_lift`), so its
+        // body pads only for the home indicator. Padding for the keyboard here
+        // as well would add the keyboard's height to the sheet's content and
+        // stretch a short sheet most of the way up the screen.
         .pb_safe_area_plus(px(theme::SPACING_LG))
 }
 

@@ -253,6 +253,10 @@ pub struct SessionService {
     project_browser_open: Signal<bool>,
     project_dir_path: Signal<Option<String>>,
     project_dir_parent: Signal<Option<String>>,
+    /// The directories the runtime offers as starting points. A device with
+    /// full control sees the host's own roots here; a read-only one sees only
+    /// the paths it is allowed to browse.
+    project_roots: Signal<Vec<String>>,
     project_busy: Signal<bool>,
     project_error: Signal<Option<SharedString>>,
     new_title: Signal<String>,
@@ -479,6 +483,7 @@ impl SessionService {
             project_browser_open: signal(false),
             project_dir_path: signal(None),
             project_dir_parent: signal(None),
+            project_roots: signal(Vec::new()),
             project_busy: signal(false),
             project_error: signal(None),
             new_title: signal(String::new()),
@@ -1216,6 +1221,7 @@ impl SessionService {
                 dirs: self.project_dirs,
                 current: self.project_dir_path,
                 parent: self.project_dir_parent,
+                roots: self.project_roots,
                 busy: self.project_busy,
                 error: self.project_error,
                 on_open: {
@@ -4919,7 +4925,6 @@ impl SessionService {
                                 })
                                 .unwrap_or_default(),
                             indent: row.indent,
-                            guides: sidebar::folder_guides(&rows, index),
                             card: cards[index].as_ref().map(|card| {
                                 vibex_nsh_ui::screens::session::SidebarCardSlice {
                                     indent: card.indent,
@@ -5707,6 +5712,7 @@ impl SessionService {
                     );
                     service.project_dir_path.set(Some(listing.path));
                     service.project_dir_parent.set(listing.parent);
+                    service.project_roots.set(listing.roots);
                 }
                 Ok(Err(error)) => service.project_error.set(Some(error_text(&error))),
                 Err(error) => service.project_error.set(Some(

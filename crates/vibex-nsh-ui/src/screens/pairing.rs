@@ -388,7 +388,10 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .bg(theme::block_page)
         .px(px(theme::SPACING_XL))
         .pt_safe_area()
-        .pb_safe_area_plus(px(theme::SPACING_LG))
+        // The keyboard takes its room out of the page rather than pushing the
+        // whole page up: a field near the top would otherwise be scrolled off
+        // the screen the moment it was focused.
+        .pb_keyboard_plus(px(theme::SPACING_LG))
         .child(page)
         .child(manual_sheet(host.clone(), manual_open, draft, server))
         .child(nearby_sheet(host.clone(), nearby_open, clock))
@@ -741,6 +744,9 @@ fn manual_sheet(
                         .gap(px(theme::SPACING_SM))
                         .px(px(theme::SPACING_MD))
                         .pt(px(theme::SPACING_MD))
+                        // The sheet rises above the keyboard itself; its body
+                        // pads only for the home indicator. Padding for the
+                        // keyboard here too would stretch the sheet upward.
                         .pb_safe_area_plus(px(theme::SPACING_LG))
                         .child(when(
                             move || needs_address(&draft.get()),
@@ -1393,6 +1399,10 @@ fn rename_dialog(
         .z_index(20)
         .bg(nsh_core::color::black().opacity(0.72))
         .p(px(theme::SPACING_LG))
+        // The dialog holds a field: the keyboard's room comes out of the
+        // overlay, so the card stays centred in what is left instead of being
+        // pushed off the top of the screen.
+        .pb_keyboard_plus(px(theme::SPACING_LG))
         .items_center()
         .justify_center()
         .on_press(|| {})
