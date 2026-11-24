@@ -1513,8 +1513,10 @@ impl VibexWorkbench {
             self.composer_queue
                 .retain(|message| message.dispatch_key != dispatch_key);
             // The turn is already in the transcript, so the pending row this
-            // launch never installed has nothing left to wait for.
-            self.discard_optimistic_user_message(&session_id);
+            // launch never installed has nothing left to wait for. Keyed by the
+            // entry's own submission: another send's unsent row is not this
+            // queue entry's to drop.
+            self.discard_optimistic_user_message(&session_id, &dispatch_key);
             eprintln!(
                 "vibex-foundation: dropped a restored queued message the authority already accepted ({:?})",
                 state.status

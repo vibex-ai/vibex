@@ -692,10 +692,11 @@ fn an_unsent_message_can_be_recovered_or_discarded(cx: &mut TestAppContext) {
     cx.update(|window, cx| {
         workbench.update(cx, |workbench, cx| {
             let session_id = session(0).id.clone();
-            let install = |workbench: &mut VibexWorkbench, text: &str| {
+            let install = |workbench: &mut VibexWorkbench, key: &str, text: &str| {
                 workbench.install_optimistic_user_message(OptimisticUserMessage {
                     mentions: Vec::new(),
                     session_id: session_id.clone(),
+                    message_idempotency_key: Some(key.to_string()),
                     item_id: TimelineItemId::new(),
                     after_sequence: 0,
                     submitted_at_ms: unix_timestamp_ms(),
@@ -705,7 +706,7 @@ fn an_unsent_message_can_be_recovered_or_discarded(cx: &mut TestAppContext) {
             };
 
             // Discard: the row and the status both go.
-            install(workbench, "discard me");
+            install(workbench, "submission-discard", "discard me");
             workbench.discard_failed_submission(&session_id, "submission-discard".to_string(), cx);
             assert!(
                 !workbench
@@ -715,7 +716,7 @@ fn an_unsent_message_can_be_recovered_or_discarded(cx: &mut TestAppContext) {
             );
 
             // Retry: the text comes back as the composer's draft.
-            install(workbench, "recover me");
+            install(workbench, "submission-retry", "recover me");
             workbench.requeue_failed_submission(&session_id, "submission-retry", window, cx);
             assert!(
                 !workbench
@@ -791,6 +792,58 @@ fn a_failed_submission_row_is_terminal_and_stops_being_polled(cx: &mut TestAppCo
             assert!(composer_submission_row_is_terminal(state.status));
             state.status = MessageSubmissionStatus::AwaitingRuntime;
             assert!(!composer_submission_row_is_terminal(state.status));
+        });
+    });
+}
+
+/// A second send does not overwrite the refused message before it.
+///
+/// The optimistic store held one row per session, so sending again replaced the
+/// refused message's projection. The failed submission never writes a
+/// `user_message` item, so that projection was the message's only copy: it left
+/// the timeline, the composer, and every retry path at once.
+#[gpui::test]
+fn a_second_send_keeps_the_refused_message_it_follows(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let install = |workbench: &mut VibexWorkbench, key: &str, text: &str, at: i64| {
+                workbench.install_optimistic_user_message(OptimisticUserMessage {
+                    mentions: Vec::new(),
+                    session_id: session_id.clone(),
+                    message_idempotency_key: Some(key.to_string()),
+                    item_id: TimelineItemId::new(),
+                    after_sequence: 0,
+                    submitted_at_ms: at,
+                    text: text.to_string(),
+                    attachments: Vec::new(),
+                });
+            };
+            install(workbench, "submission-refused", "the draft I typed", 10);
+            install(workbench, "submission-next", "and then another", 20);
+
+            let rows = workbench
+                .optimistic_user_messages
+                .get(session_id.as_str())
+                .expect("both unsent rows are still held");
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].text, "the draft I typed");
+            assert_eq!(rows[1].text, "and then another");
+
+            // Retrying the refused one recovers its own text, not the newest.
+            workbench.requeue_failed_submission(&session_id, "submission-refused", window, cx);
+            let input = workbench.ensure_composer_input(window, cx);
+            assert_eq!(input.read(cx).value(), "the draft I typed");
+            let rows = workbench
+                .optimistic_user_messages
+                .get(session_id.as_str())
+                .expect("the newer send is untouched");
+            assert_eq!(rows.len(), 1);
+            assert_eq!(
+                rows[0].message_idempotency_key.as_deref(),
+                Some("submission-next")
+            );
         });
     });
 }

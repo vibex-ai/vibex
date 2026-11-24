@@ -2077,7 +2077,15 @@ Remote history attach role  -> viewer
   retry when a target is remembered.
 - Terminal message submission failure -> clear pending Agent state but keep the
   captured user message visible until an authoritative matching row replaces it
-  or an explicit cancellation removes it.
+  or an explicit cancellation removes it. The projection store keeps one row per
+  unsent submission rather than one row per session, because a refused send
+  writes no authoritative `user_message` item: a later send in the same session
+  replaces nothing, and the older row stays on screen until its own Retry or
+  Discard. Retry, Discard and the `recoverable` test all address a row by its
+  submission key, never by session id. A session's first message is projected
+  under the same key its durable submission uses, and its locator is registered
+  like any other send's, so a refused first message reaches the same row instead
+  of an empty transcript and an unactionable notification.
 - Terminal message submission status row -> every terminal outcome, `Failed`
   included, paints the refusal icon and its dismiss (and, when the optimistic
   draft is still held, retry) controls. A row that only offers `Cancelled` a

@@ -7978,7 +7978,12 @@ struct ConversationTurnsCacheKey {
     session_state: Option<AgentSessionState>,
     agent_turn_pending: bool,
     pending_edit: Option<(VibexSessionId, i64, i64)>,
-    optimistic_message: Option<(VibexSessionId, String, i64)>,
+    /// The unsent rows the projection appended, in the order it appended them.
+    ///
+    /// Every one of them is part of the shape a cached turn list was built
+    /// with, so appending another send, retiring a confirmed one, or dropping a
+    /// refused one all have to miss the cache.
+    optimistic_messages: Vec<(VibexSessionId, String, i64)>,
     reasoning_display_mode: ReasoningDisplayMode,
     /// Where the window's leading turn begins, when a read placed it. A read
     /// that lands one changes the projection without moving a single item.
@@ -8024,8 +8029,8 @@ fn refresh_conversation_turns_cache_incrementally(
         || previous_key.reasoning_display_mode != next_key.reasoning_display_mode
         || previous_key.pending_edit.is_some()
         || next_key.pending_edit.is_some()
-        || previous_key.optimistic_message.is_some()
-        || next_key.optimistic_message.is_some()
+        || !previous_key.optimistic_messages.is_empty()
+        || !next_key.optimistic_messages.is_empty()
         || previous_key.item_count > next_key.item_count
         || next_key.item_count != timeline.items.len()
         // A prefix kept from the cache still carries the projection it was
@@ -8849,6 +8854,15 @@ impl PendingUserMessageEdit {
 #[derive(Clone)]
 struct OptimisticUserMessage {
     session_id: VibexSessionId,
+    /// The durable submission this row speaks for, when the send minted one.
+    ///
+    /// A row outlives its send in exactly one case: the runtime refused the
+    /// message, so no authoritative row will ever replace it and the text
+    /// exists nowhere else. That row is retried, discarded and recovered *by
+    /// this key*, so a later send in the same session cannot speak for it.
+    /// `None` covers the projections that are not a durable submission at all —
+    /// native steering injects into a live turn and mints no submission record.
+    message_idempotency_key: Option<String>,
     item_id: TimelineItemId,
     after_sequence: i64,
     submitted_at_ms: i64,
@@ -8866,42 +8880,18 @@ impl OptimisticUserMessage {
         )
     }
 
-    fn is_confirmed_by(&self, timeline: &TimelineModel) -> bool {
-        timeline.session_id.as_ref() == Some(&self.session_id)
-            && timeline.items.iter().any(|item| {
-                item.sequence > self.after_sequence
-                    && matches!(
-                        &item.payload,
-                        TimelinePayload::UserMessage(message)
-                            if message.text.trim() == self.text.trim()
-                                && message.attachments == self.attachments
-                    )
-            })
-    }
-
-    fn projected_items(&self, timeline: &TimelineModel) -> Option<Vec<TimelineItem>> {
-        if timeline
-            .session_id
-            .as_ref()
-            .is_some_and(|session_id| session_id != &self.session_id)
-            || self.is_confirmed_by(timeline)
-        {
-            return None;
-        }
-        let mut items = timeline.items.clone();
+    /// The row this message projects at `sequence`.
+    fn projected_item(&self, sequence: i64) -> TimelineItem {
         let payload = TimelinePayload::UserMessage(UserMessagePayload {
             text: self.text.clone(),
             attachments: self.attachments.clone(),
             mentions: self.mentions.clone(),
             ..Default::default()
         });
-        items.push(TimelineItem {
+        TimelineItem {
             id: self.item_id.clone(),
             session_id: self.session_id.clone(),
-            sequence: items
-                .last()
-                .map(|item| item.sequence.saturating_add(1))
-                .unwrap_or(1),
+            sequence,
             timestamp_ms: self.submitted_at_ms,
             source: TimelineSource::User,
             kind: payload.kind(),
@@ -8911,29 +8901,117 @@ impl OptimisticUserMessage {
             execution_attribution: None,
             payload_depth: vibex_core::TimelinePayloadDepth::Detail,
             payload,
-        });
-        Some(items)
+        }
+    }
+
+    /// The same projection for this one row, for the tests that pin the
+    /// authoritative-row match.
+    #[cfg(test)]
+    fn projected_items(&self, timeline: &TimelineModel) -> Option<Vec<TimelineItem>> {
+        let rows = BTreeMap::from([(self.session_id.as_str().to_string(), vec![self.clone()])]);
+        timeline_with_optimistic_user_messages(timeline, &rows, Some(&self.session_id))
     }
 }
 
-/// The optimistic first message a live view may project ahead of the authority.
+/// The unsent rows `timeline` has already recorded, one authoritative row per
+/// unsent one.
 ///
-/// The borrowed view knows which session it belongs to before that session's
-/// authoritative timeline binds the id, which is exactly the window a brand-new
-/// session renders in: the id is optimistic, no item exists yet, and the turn is
-/// already pending. Keying the lookup on `timeline.session_id` alone dropped the
-/// user's own message there and left an item-less pending turn on screen, so the
-/// view's session is the fallback key.
-///
-/// `projected_items` still refuses to project into a timeline that belongs to a
-/// different session, so this cannot leak one session's message into another.
-fn optimistic_user_message_for_view<'a>(
+/// A text match alone would retire two different sends of the same words when
+/// only the first had been delivered; pairing them consumes each authoritative
+/// row once, so the second send keeps standing until its own row lands.
+fn confirmed_optimistic_rows(
+    rows: &[&OptimisticUserMessage],
     timeline: &TimelineModel,
-    messages: &'a BTreeMap<String, OptimisticUserMessage>,
+) -> BTreeSet<usize> {
+    let mut confirmed = BTreeSet::new();
+    if rows
+        .first()
+        .is_none_or(|row| timeline.session_id.as_ref() != Some(&row.session_id))
+    {
+        return confirmed;
+    }
+    for item in &timeline.items {
+        let TimelinePayload::UserMessage(message) = &item.payload else {
+            continue;
+        };
+        let Some(index) = rows.iter().enumerate().position(|(index, row)| {
+            !confirmed.contains(&index)
+                && item.sequence > row.after_sequence
+                && message.text.trim() == row.text.trim()
+                && message.attachments == row.attachments
+        }) else {
+            continue;
+        };
+        confirmed.insert(index);
+    }
+    confirmed
+}
+
+/// The rows `timeline` has not answered yet, oldest first.
+fn unconfirmed_optimistic_rows<'a>(
+    rows: &'a [OptimisticUserMessage],
+    timeline: &TimelineModel,
+) -> Vec<&'a OptimisticUserMessage> {
+    let refs = rows.iter().collect::<Vec<_>>();
+    let confirmed = confirmed_optimistic_rows(&refs, timeline);
+    refs.into_iter()
+        .enumerate()
+        .filter(|(index, _)| !confirmed.contains(index))
+        .map(|(_, row)| row)
+        .collect()
+}
+
+/// Every unsent row a live view may project ahead of the authority, oldest
+/// first.
+///
+/// The store keeps several rows per session on purpose: a refused send leaves a
+/// message the authority never recorded, and the reader's next send must not
+/// overwrite it. They are appended in submission order so the projection reads
+/// the way the reader typed, and every later row sorts after the ones already on
+/// screen.
+fn optimistic_user_messages_for_view<'a>(
+    timeline: &TimelineModel,
+    messages: &'a BTreeMap<String, Vec<OptimisticUserMessage>>,
     view_session_id: Option<&VibexSessionId>,
-) -> Option<&'a OptimisticUserMessage> {
+) -> Vec<&'a OptimisticUserMessage> {
+    let Some(session_id) = timeline.session_id.as_ref().or(view_session_id) else {
+        return Vec::new();
+    };
+    messages
+        .get(session_id.as_str())
+        .map(|rows| rows.iter().collect())
+        .unwrap_or_default()
+}
+
+/// The rows of `timeline` with every unsent message projected after them.
+///
+/// `None` when nothing is left to project, so a caller can fall back to the
+/// authoritative projection without rebuilding it.
+fn timeline_with_optimistic_user_messages(
+    timeline: &TimelineModel,
+    messages: &BTreeMap<String, Vec<OptimisticUserMessage>>,
+    view_session_id: Option<&VibexSessionId>,
+) -> Option<Vec<TimelineItem>> {
     let session_id = timeline.session_id.as_ref().or(view_session_id)?;
-    messages.get(session_id.as_str())
+    if timeline
+        .session_id
+        .as_ref()
+        .is_some_and(|bound| bound != session_id)
+    {
+        return None;
+    }
+    let refs = optimistic_user_messages_for_view(timeline, messages, Some(session_id));
+    let rows = refs.iter().map(|row| (*row).clone()).collect::<Vec<_>>();
+    let pending = unconfirmed_optimistic_rows(&rows, timeline);
+    let mut items = timeline.items.clone();
+    for message in &pending {
+        let sequence = items
+            .last()
+            .map(|item| item.sequence.saturating_add(1))
+            .unwrap_or(1);
+        items.push(message.projected_item(sequence));
+    }
+    (!pending.is_empty()).then_some(items)
 }
 
 fn agent_answer_actions(has_timestamp: bool) -> impl Iterator<Item = AgentAnswerAction> {
@@ -12828,8 +12906,13 @@ pub struct VibexWorkbench {
     /// Last runtime activation generation probed for native steering, so a
     /// runtime switch re-probes once instead of on every selection event.
     native_steering_probed_generations: BTreeMap<String, i64>,
-    /// Goal objective being edited inline in the composer goal bar.
-    optimistic_user_messages: BTreeMap<String, OptimisticUserMessage>,
+    /// Unsent user messages per session, oldest first.
+    ///
+    /// Usually one row, and it retires the moment the authoritative timeline
+    /// carries the durable row. A refused send writes no such row, so it stays
+    /// here until the reader retries or discards it — and the next send in the
+    /// same session appends beside it instead of replacing it.
+    optimistic_user_messages: BTreeMap<String, Vec<OptimisticUserMessage>>,
     startup_loading: bool,
     startup_loading_indicator_visible: bool,
     startup_loading_started_at: Instant,
@@ -31263,10 +31346,25 @@ impl VibexWorkbench {
         )
     }
 
+    /// Retains one more unsent message for its session.
+    ///
+    /// The store keeps every row whose send has not been answered yet, in the
+    /// order the reader sent them. A refused send never produces the
+    /// authoritative row that would retire it, so replacing the session's slot
+    /// deleted the only copy of a message the reader had just written.
     fn install_optimistic_user_message(&mut self, message: OptimisticUserMessage) {
         let session_id = message.session_id.clone();
-        self.optimistic_user_messages
-            .insert(session_id.as_str().to_string(), message);
+        let rows = self
+            .optimistic_user_messages
+            .entry(session_id.as_str().to_string())
+            .or_default();
+        // A second projection for the same submission is the same message, not
+        // a new one: the send paths re-install when a queue entry is dispatched
+        // after its install site already ran.
+        if let Some(key) = message.message_idempotency_key.as_deref() {
+            rows.retain(|row| row.message_idempotency_key.as_deref() != Some(key));
+        }
+        rows.push(message);
         if self.selected_session_id.as_ref() == Some(&session_id) {
             self.invalidate_timeline_render_caches();
             self.rebuild_timeline_sizes();
@@ -31276,7 +31374,35 @@ impl VibexWorkbench {
         }
     }
 
-    fn discard_optimistic_user_message(&mut self, session_id: &VibexSessionId) -> bool {
+    /// Removes the unsent row that speaks for one durable submission.
+    ///
+    /// Keyed rather than session-wide: the reader's other unsent messages — the
+    /// earlier send the runtime refused, in particular — are not this
+    /// submission's to discard.
+    fn discard_optimistic_user_message(
+        &mut self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: &str,
+    ) -> bool {
+        let Some(rows) = self.optimistic_user_messages.get_mut(session_id.as_str()) else {
+            return false;
+        };
+        let before = rows.len();
+        rows.retain(|row| row.message_idempotency_key.as_deref() != Some(message_idempotency_key));
+        let removed = rows.len() != before;
+        if rows.is_empty() {
+            self.optimistic_user_messages.remove(session_id.as_str());
+        }
+        if removed && self.selected_session_id.as_ref() == Some(session_id) {
+            self.invalidate_timeline_render_caches();
+            self.rebuild_timeline_sizes();
+        }
+        removed
+    }
+
+    /// Drops every unsent row of a session, for the paths that remove the
+    /// session itself rather than one message.
+    fn discard_optimistic_user_messages(&mut self, session_id: &VibexSessionId) -> bool {
         if self
             .optimistic_user_messages
             .remove(session_id.as_str())
@@ -31295,16 +31421,30 @@ impl VibexWorkbench {
         let Some(session_id) = self.selected_session_id.clone() else {
             return false;
         };
-        let confirmed = self
-            .optimistic_user_messages
-            .get(session_id.as_str())
-            .is_some_and(|message| message.is_confirmed_by(&self.timeline));
-        if !confirmed {
+        let Some(mut rows) = self.optimistic_user_messages.remove(session_id.as_str()) else {
             return false;
+        };
+        // Rows retire one at a time, each against the authoritative row it
+        // actually produced. Dropping the whole slot on one match took the
+        // older, still-unsent message with it — the same loss the single-slot
+        // store caused on install.
+        let before = rows.len();
+        let confirmed = confirmed_optimistic_rows(&rows.iter().collect::<Vec<_>>(), &self.timeline);
+        let mut index = 0;
+        rows.retain(|_| {
+            let keep = !confirmed.contains(&index);
+            index += 1;
+            keep
+        });
+        let reconciled = rows.len() != before;
+        if !rows.is_empty() {
+            self.optimistic_user_messages
+                .insert(session_id.as_str().to_string(), rows);
         }
-        self.optimistic_user_messages.remove(session_id.as_str());
-        self.invalidate_timeline_render_caches();
-        true
+        if reconciled {
+            self.invalidate_timeline_render_caches();
+        }
+        reconciled
     }
 
     fn optimistic_user_message_attachments_for_row(
@@ -31312,11 +31452,43 @@ impl VibexWorkbench {
         row: &TimelineRow,
     ) -> Option<Vec<MessageAttachment>> {
         let session_id = self.selected_session_id.as_ref()?;
-        let message = self.optimistic_user_messages.get(session_id.as_str())?;
-        row.item_ids
+        let rows = self.optimistic_user_messages.get(session_id.as_str())?;
+        rows.iter()
+            .find(|message| {
+                row.item_ids
+                    .iter()
+                    .any(|item_id| item_id == message.item_id.as_str())
+            })
+            .map(|message| message.attachments.clone())
+    }
+
+    /// Every unsent row the borrowed view still projects, oldest first.
+    fn pending_optimistic_user_messages(&self) -> Vec<&OptimisticUserMessage> {
+        let Some(session_id) = self
+            .timeline
+            .session_id
+            .as_ref()
+            .or(self.view_session_id.as_ref())
+        else {
+            return Vec::new();
+        };
+        let Some(rows) = self.optimistic_user_messages.get(session_id.as_str()) else {
+            return Vec::new();
+        };
+        unconfirmed_optimistic_rows(rows, &self.timeline)
+    }
+
+    /// The unsent row that speaks for one durable submission, if it is still
+    /// held.
+    fn optimistic_user_message_for_submission(
+        &self,
+        session_id: &VibexSessionId,
+        message_idempotency_key: &str,
+    ) -> Option<&OptimisticUserMessage> {
+        self.optimistic_user_messages
+            .get(session_id.as_str())?
             .iter()
-            .any(|item_id| item_id == message.item_id.as_str())
-            .then(|| message.attachments.clone())
+            .find(|row| row.message_idempotency_key.as_deref() == Some(message_idempotency_key))
     }
 
     fn apply_runtime_selection_state(
@@ -31659,13 +31831,11 @@ impl VibexWorkbench {
                 self.timeline.leading_turn_start,
             );
         }
-        if let Some(items) = optimistic_user_message_for_view(
+        if let Some(items) = timeline_with_optimistic_user_messages(
             &self.timeline,
             &self.optimistic_user_messages,
             self.view_session_id.as_ref(),
-        )
-        .and_then(|message| message.projected_items(&self.timeline))
-        {
+        ) {
             return timeline_conversation_turns_with_leading_turn_start(
                 &items,
                 self.live_agent_session_state(),
@@ -31693,12 +31863,11 @@ impl VibexWorkbench {
                 .pending_user_message_edit
                 .as_ref()
                 .map(PendingUserMessageEdit::cache_key),
-            optimistic_message: optimistic_user_message_for_view(
-                &self.timeline,
-                &self.optimistic_user_messages,
-                self.view_session_id.as_ref(),
-            )
-            .map(OptimisticUserMessage::cache_key),
+            optimistic_messages: self
+                .pending_optimistic_user_messages()
+                .iter()
+                .map(|message| message.cache_key())
+                .collect(),
             reasoning_display_mode: self.ui_state.session.reasoning_display_mode,
             leading_turn_start: self.timeline.leading_turn_start,
         }
@@ -36507,14 +36676,18 @@ impl VibexWorkbench {
             })
             .filter(|content| !content.text().trim().is_empty())
             .collect::<Vec<_>>();
-        if let Some(pending) = self.optimistic_user_messages.get(session_id.as_str())
-            && !pending.is_confirmed_by(&self.timeline)
-            && !pending.text.trim().is_empty()
-        {
-            entries.push(composer_content_with_mentions(
-                &pending.text,
-                &pending.mentions,
-            ));
+        // Every unsent row is recallable, oldest first: a refused message is the
+        // one the reader most often wants back, and the authoritative list will
+        // never carry it.
+        if let Some(pending) = self.optimistic_user_messages.get(session_id.as_str()) {
+            entries.extend(
+                unconfirmed_optimistic_rows(pending, &self.timeline)
+                    .into_iter()
+                    .filter(|message| !message.text.trim().is_empty())
+                    .map(|message| {
+                        composer_content_with_mentions(&message.text, &message.mentions)
+                    }),
+            );
         }
         entries
     }
@@ -37758,6 +37931,7 @@ impl VibexWorkbench {
         self.install_optimistic_user_message(OptimisticUserMessage {
             mentions: mentions.clone(),
             session_id: session_id.clone(),
+            message_idempotency_key: Some(idempotency_key.clone()),
             item_id: TimelineItemId::new(),
             after_sequence,
             submitted_at_ms: unix_timestamp_ms(),
@@ -37979,6 +38153,7 @@ impl VibexWorkbench {
         let optimistic_message = (!is_command).then(|| OptimisticUserMessage {
             mentions: mentions.clone(),
             session_id: session_id.clone(),
+            message_idempotency_key: Some(idempotency_key.clone()),
             item_id: TimelineItemId::new(),
             after_sequence: self.session_view_end_sequence(&session_id).unwrap_or(0),
             submitted_at_ms: unix_timestamp_ms(),
@@ -39233,11 +39408,11 @@ impl VibexWorkbench {
         message_idempotency_key: String,
         cx: &mut Context<Self>,
     ) {
-        // A newer dispatch owns the session's optimistic row now; the row being
-        // dismissed belongs to the failed message, which has no other trace.
-        if !self.session_turn_pending(session_id) {
-            self.discard_optimistic_user_message(session_id);
-        }
+        // Only this submission's row goes. A newer send in the same session owns
+        // a row of its own now, and the gate that used to skip the discard
+        // whenever a turn was pending deleted nothing at all in that case — the
+        // refused message stayed on the timeline with its bar dismissed.
+        self.discard_optimistic_user_message(session_id, &message_idempotency_key);
         self.dismiss_submission_status(message_idempotency_key, cx);
     }
 
@@ -39347,10 +39522,15 @@ impl VibexWorkbench {
                     // draft is still held in the optimistic message, so it can
                     // be handed back to the composer as an ordinary draft and
                     // sent again under a fresh key.
+                    // Only the row that speaks for this submission is
+                    // recoverable, so a later send's draft cannot be claimed by
+                    // an older failure's Retry button.
                     let recoverable = terminal
                         && self
-                            .optimistic_user_messages
-                            .get(state.session_id.as_str())
+                            .optimistic_user_message_for_submission(
+                                &state.session_id,
+                                &state.message_idempotency_key,
+                            )
                             .is_some_and(|message| {
                                 !message.text.trim().is_empty() || !message.attachments.is_empty()
                             });
@@ -39470,14 +39650,13 @@ impl VibexWorkbench {
         cx: &mut Context<Self>,
     ) {
         let Some(message) = self
-            .optimistic_user_messages
-            .get(session_id.as_str())
+            .optimistic_user_message_for_submission(session_id, message_idempotency_key)
             .cloned()
         else {
             self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
             return;
         };
-        self.discard_optimistic_user_message(session_id);
+        self.discard_optimistic_user_message(session_id, message_idempotency_key);
         self.dismiss_submission_status(message_idempotency_key.to_string(), cx);
         // The text an unsent message carries may refer to its attachments by
         // marker, so the two have to be rebuilt together: a bare text restore
@@ -43051,6 +43230,9 @@ impl VibexWorkbench {
         self.install_optimistic_user_message(OptimisticUserMessage {
             mentions: message.mentions.clone(),
             session_id: session_id.clone(),
+            // Steering injects into a live turn and mints no durable
+            // submission, so this row is not one a status row can recover.
+            message_idempotency_key: None,
             item_id: TimelineItemId::new(),
             after_sequence,
             submitted_at_ms: unix_timestamp_ms(),
@@ -43985,7 +44167,12 @@ impl VibexWorkbench {
         if interrupted {
             self.agent_action_pending = false;
         }
-        self.discard_optimistic_user_message(session_id);
+        self.discard_optimistic_user_messages(session_id);
+        // The session never existed, so its durable submission never will
+        // either: a locator left behind would poll a key the authority has no
+        // record of.
+        self.composer_submission_locators
+            .retain(|locator| locator.session_id != *session_id);
         self.set_session_turn_pending(session_id, false);
         self.forget_session_view(session_id.as_str());
         self.composer_drafts.forget(session_id.as_str());
@@ -45478,15 +45665,30 @@ impl VibexWorkbench {
                 optimistic_session.title.clone(),
             );
         }
-        let optimistic_message = has_initial_message.then(|| OptimisticUserMessage {
-            mentions: mentions.clone(),
-            session_id: optimistic_session_id.clone(),
-            item_id: TimelineItemId::new(),
-            after_sequence: 0,
-            submitted_at_ms: optimistic_submitted_at_ms,
-            text: text.clone(),
-            attachments: attachments.clone(),
+        // The key the first message will be submitted under, minted here so the
+        // projection and the durable submission it stands for share one
+        // identity: the failure row is recovered by this key, and a later send
+        // in the same session cannot adopt it.
+        let initial_message_idempotency_key = has_initial_message.then(|| {
+            format!(
+                "gpui:new-session:{}:{}",
+                optimistic_session_id.as_str(),
+                optimistic_submitted_at_ms
+            )
         });
+        let optimistic_message =
+            initial_message_idempotency_key
+                .clone()
+                .map(|message_idempotency_key| OptimisticUserMessage {
+                    mentions: mentions.clone(),
+                    session_id: optimistic_session_id.clone(),
+                    message_idempotency_key: Some(message_idempotency_key),
+                    item_id: TimelineItemId::new(),
+                    after_sequence: 0,
+                    submitted_at_ms: optimistic_submitted_at_ms,
+                    text: text.clone(),
+                    attachments: attachments.clone(),
+                });
         self.new_session_workspace.begin_submission();
         self.new_session_error = None;
         self.clear_new_session_message_draft(window, cx);
@@ -45499,6 +45701,25 @@ impl VibexWorkbench {
             initial_turn_interrupt_tx,
             cx,
         );
+        // The first message is a durable submission like any other, so its
+        // outcome is observed the same way. Without the locator a refused first
+        // message produced no composer row at all: the session opened on an
+        // empty transcript and the only account of the failure was a
+        // notification that could not hand the text back.
+        //
+        // A command picked from the Composer menu is not a submission: it
+        // executes against the session and mints no durable row, so asking the
+        // authority for one would poll a key that never exists.
+        if command_invocation.is_none()
+            && let Some(message_idempotency_key) = initial_message_idempotency_key.clone()
+        {
+            self.composer_submission_locators
+                .push(ComposerSubmissionLocator {
+                    session_id: optimistic_session_id.clone(),
+                    message_idempotency_key,
+                });
+            self.start_submission_poll(window, cx);
+        }
         if let Some(at_ms) = scheduled_at_ms {
             self.composer_queue_serial = self.composer_queue_serial.saturating_add(1).max(1);
             self.composer_queue.push(ComposerQueueMessage {
@@ -45520,6 +45741,7 @@ impl VibexWorkbench {
         }
         let pending_session_id = optimistic_session_id.clone();
         let backend = self.backend.clone();
+        let submission_message_idempotency_key = initial_message_idempotency_key;
         let (created_tx, mut created_rx) = mpsc::unbounded_channel();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             // Every step of new-session creation is an authority operation, so
@@ -45660,11 +45882,19 @@ impl VibexWorkbench {
                                 mentions,
                                 message: SendAgentMessageRequest {
                                     session_id: session_id.clone(),
-                                    message_idempotency_key: format!(
-                                        "gpui:new-session:{}:{}",
-                                        session_id.as_str(),
-                                        unix_timestamp_ms()
-                                    ),
+                                    // The key the projection that opened this
+                                    // session was installed under, so the
+                                    // failure row that may follow can be
+                                    // recovered by it.
+                                    message_idempotency_key: submission_message_idempotency_key
+                                        .clone()
+                                        .unwrap_or_else(|| {
+                                            format!(
+                                                "gpui:new-session:{}:{}",
+                                                session_id.as_str(),
+                                                unix_timestamp_ms()
+                                            )
+                                        }),
                                     desired_runtime: desired_runtime.clone(),
                                     text: text.clone(),
                                     attachments: initial_attachments.clone(),
@@ -111327,7 +111557,7 @@ mod tests {
             session_state: Some(AgentSessionState::Running),
             agent_turn_pending: false,
             pending_edit: None,
-            optimistic_message: None,
+            optimistic_messages: Vec::new(),
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
             leading_turn_start: None,
         };
@@ -111355,7 +111585,7 @@ mod tests {
             session_state: Some(AgentSessionState::Running),
             agent_turn_pending: false,
             pending_edit: None,
-            optimistic_message: None,
+            optimistic_messages: Vec::new(),
             reasoning_display_mode: ReasoningDisplayMode::LatestAtBottom,
             leading_turn_start: None,
         };
@@ -127789,6 +128019,14 @@ mod tests {
             .expect("authoritative creation should remain asynchronous");
 
         assert!(optimistic_message < open && open < background_creation);
+        // The first message is a durable submission, so its outcome is
+        // observed like any other send's: a refused first message has to reach
+        // the composer row that can hand its text back.
+        let locator = submit
+            .find("self.composer_submission_locators")
+            .expect("the first message should be observed as a durable submission");
+        assert!(optimistic_message < locator);
+        assert!(submit.contains("self.start_submission_poll(window, cx);"));
         assert!(submit.contains("defer_runtime_materialization: deferred_creation"));
         assert!(submit.contains(".create_session("));
         assert!(
@@ -136857,6 +137095,7 @@ mod tests {
         let optimistic = OptimisticUserMessage {
             mentions: Vec::new(),
             session_id: session_id.clone(),
+            message_idempotency_key: Some("gpui:queued:first".into()),
             item_id: TimelineItemId::new(),
             after_sequence: 1,
             submitted_at_ms: 20,
@@ -136922,24 +137161,25 @@ mod tests {
         let submitted_at_ms = 1_789_981_200_000;
         let messages = BTreeMap::from([(
             session_id.as_str().to_string(),
-            OptimisticUserMessage {
+            vec![OptimisticUserMessage {
                 mentions: Vec::new(),
                 session_id: session_id.clone(),
+                message_idempotency_key: Some("gpui:new-session:first".into()),
                 item_id: TimelineItemId::new(),
                 after_sequence: 0,
                 submitted_at_ms,
                 text: "hi".into(),
                 attachments: Vec::new(),
-            },
+            }],
         )]);
         // The borrowed view has no authoritative timeline yet: this is the
         // window a brand-new session renders in.
         let timeline = TimelineModel::default();
         assert!(timeline.session_id.is_none());
 
-        let projected = optimistic_user_message_for_view(&timeline, &messages, Some(&session_id))
-            .and_then(|message| message.projected_items(&timeline))
-            .expect("a pending new session must project its first message");
+        let projected =
+            timeline_with_optimistic_user_messages(&timeline, &messages, Some(&session_id))
+                .expect("a pending new session must project its first message");
         let turns = timeline_conversation_turns(&projected, Some(AgentSessionState::Running), true);
         assert_eq!(turns.len(), 1);
         assert_eq!(
@@ -136950,7 +137190,7 @@ mod tests {
         assert_eq!(turns[0].started_at_ms, submitted_at_ms);
 
         // Without the view's session there is no key to look the message up.
-        assert!(optimistic_user_message_for_view(&timeline, &messages, None).is_none());
+        assert!(timeline_with_optimistic_user_messages(&timeline, &messages, None).is_none());
 
         // A timeline already bound to another session wins the lookup and never
         // receives this session's optimistic row.
@@ -136958,13 +137198,131 @@ mod tests {
         bound_elsewhere
             .replace_authoritative(VibexSessionId::parse("session_other").unwrap(), Vec::new());
         assert!(
-            optimistic_user_message_for_view(&bound_elsewhere, &messages, Some(&session_id))
+            timeline_with_optimistic_user_messages(&bound_elsewhere, &messages, Some(&session_id))
                 .is_none()
         );
+    }
+
+    /// A refused send keeps its row when the reader sends again.
+    ///
+    /// The store used to hold one row per session and the next send replaced
+    /// it, so a message the runtime never accepted vanished from the screen.
+    /// Nothing authoritative had ever recorded it: the failed submission wrote
+    /// no `user_message` item and the text lived only in that projection.
+    #[test]
+    fn a_refused_message_survives_the_next_send_in_its_session() {
+        let session_id = VibexSessionId::parse("session_refused_send").unwrap();
+        let row = |key: &str, text: &str, submitted_at_ms: i64| OptimisticUserMessage {
+            mentions: Vec::new(),
+            session_id: session_id.clone(),
+            message_idempotency_key: Some(key.to_string()),
+            item_id: TimelineItemId::new(),
+            after_sequence: 0,
+            submitted_at_ms,
+            text: text.to_string(),
+            attachments: Vec::new(),
+        };
+        let mut messages = BTreeMap::<String, Vec<OptimisticUserMessage>>::new();
+        let install = |messages: &mut BTreeMap<String, Vec<OptimisticUserMessage>>,
+                       message: OptimisticUserMessage| {
+            messages
+                .entry(session_id.as_str().to_string())
+                .or_default()
+                .push(message);
+        };
+        install(
+            &mut messages,
+            row("submission-refused", "the long draft", 10),
+        );
+        install(
+            &mut messages,
+            row("submission-second", "a second thought", 20),
+        );
+
+        let timeline = TimelineModel::default();
+        let projected =
+            timeline_with_optimistic_user_messages(&timeline, &messages, Some(&session_id))
+                .expect("both unsent rows project");
+        assert_eq!(projected.len(), 2);
+        let texts = projected
+            .iter()
+            .filter_map(|item| match &item.payload {
+                TimelinePayload::UserMessage(message) => Some(message.text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            texts,
+            ["the long draft", "a second thought"],
+            "the earlier refused message stays above the newer one"
+        );
         assert!(
-            messages[&session_id.as_str().to_string()]
-                .projected_items(&bound_elsewhere)
-                .is_none()
+            projected[0].sequence < projected[1].sequence,
+            "the projection orders them the way they were sent"
+        );
+
+        // The authority answers only the second send: that row retires and the
+        // refused one keeps standing in the transcript.
+        let mut delivered = TimelineModel::default();
+        delivered.replace_authoritative(
+            session_id.clone(),
+            [timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "a second thought".into(),
+                    ..Default::default()
+                }),
+            )],
+        );
+        let rows = messages.get(session_id.as_str()).unwrap();
+        let confirmed = confirmed_optimistic_rows(&rows.iter().collect::<Vec<_>>(), &delivered);
+        assert_eq!(
+            confirmed,
+            BTreeSet::from([1]),
+            "the newest send is the one the authority answered"
+        );
+        let projected =
+            timeline_with_optimistic_user_messages(&delivered, &messages, Some(&session_id))
+                .expect("the refused row is still unsent");
+        assert_eq!(projected.len(), 2);
+        assert_eq!(projected.last().map(|item| item.sequence), Some(2));
+
+        // Two sends of the same words are still two messages: the one
+        // authoritative row retires only the send it answered, so the refused
+        // copy does not disappear behind its twin.
+        let mut twins = BTreeMap::<String, Vec<OptimisticUserMessage>>::new();
+        twins.insert(
+            session_id.as_str().to_string(),
+            vec![
+                row("submission-refused", "same words", 10),
+                row("submission-retried", "same words", 20),
+            ],
+        );
+        let mut one_answer = TimelineModel::default();
+        one_answer.replace_authoritative(
+            session_id.clone(),
+            [timeline_item_with_payload(
+                &session_id,
+                1,
+                TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "same words".into(),
+                    ..Default::default()
+                }),
+            )],
+        );
+        let projected =
+            timeline_with_optimistic_user_messages(&one_answer, &twins, Some(&session_id))
+                .expect("one of the two sends is still unsent");
+        assert_eq!(
+            projected
+                .iter()
+                .filter(|item| matches!(item.payload, TimelinePayload::UserMessage(_)))
+                .count(),
+            2,
+            "one delivered row must not retire two sends"
         );
     }
 

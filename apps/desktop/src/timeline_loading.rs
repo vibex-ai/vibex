@@ -274,7 +274,7 @@ impl VibexWorkbench {
                 && key.agent_turn_pending == prepared.pending
                 && key.reasoning_display_mode == prepared.reasoning
                 && key.pending_edit.is_none()
-                && key.optimistic_message.is_none())
+                && key.optimistic_messages.is_empty())
             .then_some(key);
             self.timeline_turn_layout_signature_cache.clear();
             self.sync_conversation_turns_render_cache();
