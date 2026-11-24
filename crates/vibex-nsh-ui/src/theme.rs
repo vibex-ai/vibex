@@ -270,6 +270,16 @@ pub fn page_adaptive() -> AdaptiveColor {
     }
 }
 
+/// [`page_adaptive`] with no opacity, for a gradient that fades back into the
+/// page it started from.
+pub fn page_clear_adaptive() -> AdaptiveColor {
+    let page = page_adaptive();
+    AdaptiveColor {
+        light: page.light.alpha(0.0),
+        dark: page.dark.alpha(0.0),
+    }
+}
+
 /// The page behind a column of filled blocks.
 ///
 /// The blocks are the lighter surface in both appearances: the card tone in

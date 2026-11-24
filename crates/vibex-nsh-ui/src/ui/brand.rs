@@ -22,7 +22,14 @@ pub fn mark(size: f32) -> impl IntoElement {
 /// The launch lockup: the mark and the product word, side by side, as the
 /// pairing and connecting pages show it.
 pub fn wordmark() -> impl IntoElement {
-    let size = theme::font_wordmark();
+    wordmark_at(theme::font_wordmark())
+}
+
+/// The same lockup at `size`, for a surface that is not a launch page.
+///
+/// The mark's geometry is scaled from the label, so the two stay one word on
+/// one baseline at every step the caller asks for.
+pub fn wordmark_at(size: f32) -> impl IntoElement {
     let mark = theme::wordmark_mark(size);
     view()
         .flex_row()

@@ -2228,13 +2228,30 @@ struct Rail {
 
 /// The strip the transcript fades out in at one of its edges.
 fn edge_fade(top: bool) -> impl IntoElement {
+    edge_fade_between(
+        top,
+        theme::SPACING_MD,
+        theme::background_adaptive,
+        theme::background_clear_adaptive,
+    )
+}
+
+/// A strip that fades `opaque` into `clear` at one edge of the surface it
+/// overlays, so content runs out under the band above or below it instead of
+/// being cut by a rule. `top` puts the opaque end at the top.
+fn edge_fade_between(
+    top: bool,
+    height: f32,
+    opaque: fn() -> AdaptiveColor,
+    clear: fn() -> AdaptiveColor,
+) -> impl IntoElement {
     let strip = view()
         .absolute()
         .left(px(0.0))
         .right(px(0.0))
-        .h(px(theme::SPACING_MD))
-        .gradient_from(theme::background_adaptive)
-        .gradient_to(theme::background_clear_adaptive)
+        .h(px(height))
+        .gradient_from(opaque)
+        .gradient_to(clear)
         .pointer_events(PointerEvents::None);
     if top {
         strip.top(px(0.0)).bg_linear_to_b()
@@ -6543,9 +6560,6 @@ fn drawer_batch_action(
         )
 }
 
-/// The brand tile at the head of the sessions page.
-const DRAWER_BRAND_TILE: f32 = 38.0;
-
 fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
     let menu = overlays.menu;
     let sessions = host.sessions;
@@ -6769,8 +6783,10 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         .test_id("sessions-page")
         .pt_safe_area()
         .pb_safe_area_plus(px(theme::SPACING_SM))
-        // The head: what this is and where it runs, the tree's own menu, and
-        // the way back to the conversation.
+        // The head: the product's own lockup, the tree's own menu, and the
+        // way back to the conversation. The page is the phone's home surface,
+        // so it wears the whole word at the header's own step rather than a
+        // tile and a title; the runtime it is bound to lives in the foot.
         .child(
             view()
                 .flex_shrink_0()
@@ -6781,97 +6797,12 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 .flex_row()
                 .items_center()
                 .gap(px(theme::SPACING_SM))
-                .child({
-                    let on_switch = on_switch_runtime.clone();
-                    button()
+                .child(
+                    view()
                         .flex_1()
                         .min_w(px(0.0))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_MD))
-                        .active(|style| style.opacity(0.7))
-                        .accessibility_label(copy::text(
-                            "Switch runtime",
-                            "切换运行时",
-                            "切換執行環境",
-                        ))
-                        .on_press(move || {
-                            pager.close();
-                            on_switch()
-                        })
-                        .child(
-                            view()
-                                .size(px(DRAWER_BRAND_TILE))
-                                .flex_shrink_0()
-                                .rounded(px(11.0))
-                                .bg(theme::block_surface)
-                                .shadow_xs()
-                                .items_center()
-                                .justify_center()
-                                .child(crate::ui::brand::mark(20.0)),
-                        )
-                        .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex_col()
-                                .child(
-                                    text("Vibex")
-                                        .text_size(px(theme::font_heading()))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::foreground),
-                                )
-                                .child(
-                                    view()
-                                        .w_full()
-                                        .min_w(px(0.0))
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(6.0))
-                                        .child(
-                                            view()
-                                                .size(px(theme::ICON_STATUS))
-                                                .flex_shrink_0()
-                                                .rounded_full()
-                                                .bg(move || match connection.get() {
-                                                    ConnectionState::Online => {
-                                                        theme::accent_success()
-                                                    }
-                                                    ConnectionState::Connecting => {
-                                                        theme::accent_yellow()
-                                                    }
-                                                    ConnectionState::Offline => {
-                                                        theme::text_muted()
-                                                    }
-                                                }),
-                                        )
-                                        .child(
-                                            text(move || {
-                                                runtime.get().unwrap_or_else(|| {
-                                                    copy::text(
-                                                        "No runtime",
-                                                        "未连接运行时",
-                                                        "未連線執行環境",
-                                                    )
-                                                    .into()
-                                                })
-                                            })
-                                            .flex_shrink(1.0)
-                                            .min_w(px(0.0))
-                                            .truncate()
-                                            .text_size(px(theme::font_hint()))
-                                            .font_weight(FontWeight::MEDIUM)
-                                            .text_color(theme::sidebar_text_muted),
-                                        )
-                                        .child(
-                                            svg(icon!("chevron-down"))
-                                                .size(px(10.0))
-                                                .flex_shrink_0()
-                                                .text_color(theme::sidebar_text_muted),
-                                        ),
-                                ),
-                        )
-                })
+                        .child(crate::ui::brand::wordmark_at(theme::font_title())),
+                )
                 .child(
                     when(
                         move || select_mode.get(),
@@ -7001,18 +6932,34 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     .accessibility_label(copy::text("New project", "新建项目", "新增專案"))
                 }),
         )
-        .child(tree::list(
-            tree::TreeState {
-                pager,
-                rows,
-                query,
-                select_mode,
-                selected,
-                locate,
-            },
-            tree_actions,
-        ))
-        // The foot: settings, or what to do with the sessions being selected.
+        // The rows run out under the foot rather than being cut by a rule, the
+        // way the transcript runs out under the conversation's header.
+        .child(
+            view()
+                .flex_1()
+                .min_h(px(0.0))
+                .flex_col()
+                .relative()
+                .child(tree::list(
+                    tree::TreeState {
+                        pager,
+                        rows,
+                        query,
+                        select_mode,
+                        selected,
+                        locate,
+                    },
+                    tree_actions,
+                ))
+                .child(edge_fade_between(
+                    false,
+                    theme::SPACING_LG,
+                    theme::page_adaptive,
+                    theme::page_clear_adaptive,
+                )),
+        )
+        // The foot: what the page is bound to, or what to do with the sessions
+        // being selected.
         .child(
             when(move || select_mode.get(), {
                 let on_pin_sessions = host.on_pin_sessions.clone();
@@ -7028,8 +6975,6 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         .w_full()
                         .flex_shrink_0()
                         .flex_col()
-                        .border_t_1()
-                        .border_t_color(theme::sidebar_hairline)
                         .px(px(theme::SIDEBAR_LIST_PADDING))
                         .pt(px(theme::SPACING_XS))
                         .child(
@@ -7180,25 +7125,84 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
             })
             .otherwise({
                 let on_open_settings = on_open_settings.clone();
+                let on_switch = on_switch_runtime.clone();
                 move || {
                     let on_open_settings = on_open_settings.clone();
+                    let on_switch = on_switch.clone();
                     view()
                         .w_full()
                         .flex_shrink_0()
                         .flex_row()
-                        .border_t_1()
-                        .border_t_color(theme::sidebar_hairline)
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
                         .px(px(theme::SIDEBAR_LIST_PADDING))
-                        .pt(px(6.0))
+                        .pt(px(theme::SPACING_XS))
+                        // Which runtime this page is bound to. The dot is the
+                        // only place the link's state is drawn; the words stay
+                        // in the control's name. The row is the way into the
+                        // runtime list, so it keeps the remaining width.
                         .child(
                             button()
-                                .h(px(46.0))
-                                .px(px(theme::SPACING_MD))
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .h(px(theme::TOUCH_TARGET))
                                 .flex_row()
                                 .items_center()
-                                .gap(px(theme::SPACING_MD))
-                                .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                                .gap(px(theme::SPACING_SM))
+                                .px(px(theme::SPACING_SM))
+                                .rounded(px(theme::RADIUS_CONTROL))
                                 .active(|style| style.bg(theme::row_pressed_bg()))
+                                .accessibility_label(copy::text(
+                                    "Switch runtime",
+                                    "切换运行时",
+                                    "切換執行環境",
+                                ))
+                                .on_press(move || {
+                                    pager.close();
+                                    on_switch()
+                                })
+                                .child(
+                                    view()
+                                        .size(px(theme::ICON_STATUS))
+                                        .flex_shrink_0()
+                                        .rounded_full()
+                                        .bg(move || match connection.get() {
+                                            ConnectionState::Online => theme::accent_success(),
+                                            ConnectionState::Connecting => theme::accent_yellow(),
+                                            ConnectionState::Offline => theme::text_muted(),
+                                        }),
+                                )
+                                .child(
+                                    text(move || {
+                                        runtime.get().unwrap_or_else(|| {
+                                            copy::text(
+                                                "No runtime",
+                                                "未连接运行时",
+                                                "未連線執行環境",
+                                            )
+                                            .into()
+                                        })
+                                    })
+                                    .flex_shrink(1.0)
+                                    .min_w(px(0.0))
+                                    .truncate()
+                                    .text_size(px(theme::font_body()))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::sidebar_text_secondary),
+                                ),
+                        )
+                        // The way into settings, as the block a page-level
+                        // action takes: the icon alone, on its own colour.
+                        .child(
+                            button()
+                                .size(px(theme::TOUCH_TARGET))
+                                .flex_shrink_0()
+                                .rounded(px(theme::RADIUS_CONTROL))
+                                .bg(theme::block_surface)
+                                .shadow_xs()
+                                .items_center()
+                                .justify_center()
+                                .active(|style| style.opacity(0.85))
                                 .accessibility_label(copy::text("Settings", "设置", "設定"))
                                 .on_press(move || {
                                     pager.close();
@@ -7206,14 +7210,8 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 })
                                 .child(
                                     svg(icon!("settings"))
-                                        .w(px(20.0))
-                                        .h(px(20.0))
+                                        .size(px(theme::ICON_MD))
                                         .text_color(theme::text_secondary),
-                                )
-                                .child(
-                                    text(copy::text("Settings", "设置", "設定"))
-                                        .text_size(px(theme::font_body()))
-                                        .text_color(theme::foreground),
                                 ),
                         )
                 }
