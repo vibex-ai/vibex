@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest as _, Sha256};
@@ -1198,6 +1198,64 @@ impl GitWorkbenchState {
         }
     }
 
+    /// [`Self::path_selection_state`] for many paths at once.
+    ///
+    /// The single-path form walks the whole status snapshot and rebuilds the
+    /// selected set on every call, so asking it once per tree row costs
+    /// `O(rows × changes)` allocations. The right rail rebuilds its projection
+    /// whenever the workbench notifies, so on a repository with thousands of
+    /// untracked files that held the desktop main thread for seconds every
+    /// poll. Here each change is visited once and its `(available, selected)`
+    /// counts are added to every ancestor directory, which answers the same
+    /// questions in `O(changes × depth + paths)`.
+    ///
+    /// The result is keyed by the caller's spelling of each path; the lookup
+    /// normalizes it exactly like the single-path form.
+    pub fn path_selection_states<I>(&self, paths: I) -> BTreeMap<String, GitPathSelectionState>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let available = self
+            .status
+            .as_ref()
+            .into_iter()
+            .flat_map(|status| status.changes.iter())
+            .filter(|change| !self.is_lifecycle_conflict(&change.path))
+            .map(|change| change.path.as_str())
+            .collect::<BTreeSet<_>>();
+        let selected = self.selected_path_set();
+        // (available, selected) counts per path: every change path, every one
+        // of its ancestor directories, and "" for the root, which contains all
+        // of them.
+        let mut counts = HashMap::<&str, (usize, usize)>::with_capacity(available.len() * 2);
+        for &candidate in &available {
+            let is_selected = usize::from(selected.contains(candidate));
+            for key in std::iter::once("")
+                .chain(
+                    candidate
+                        .match_indices('/')
+                        .map(|(index, _)| &candidate[..index]),
+                )
+                .chain(std::iter::once(candidate))
+            {
+                let count = counts.entry(key).or_insert((0, 0));
+                count.0 += 1;
+                count.1 += is_selected;
+            }
+        }
+        paths
+            .into_iter()
+            .map(|path| {
+                let state = match counts.get(normalize_path(&path).as_str()) {
+                    None | Some((0, _)) | Some((_, 0)) => GitPathSelectionState::Unchecked,
+                    Some((total, chosen)) if chosen == total => GitPathSelectionState::Checked,
+                    Some(_) => GitPathSelectionState::Indeterminate,
+                };
+                (path, state)
+            })
+            .collect()
+    }
+
     pub fn selected_paths(&self, staged: bool) -> Vec<String> {
         self.selected_changes
             .iter()
@@ -2209,6 +2267,119 @@ mod tests {
             GitPathSelectionState::Unchecked
         );
         assert_eq!(state.selected_change_paths(), vec!["Cargo.toml"]);
+    }
+
+    #[test]
+    fn batch_path_selection_states_agree_with_the_single_path_form() {
+        fn change(path: &str, staged: bool, unstaged: bool) -> GitChange {
+            GitChange {
+                path: path.into(),
+                original_path: None,
+                kind: GitChangeKind::Modified,
+                staged,
+                unstaged,
+                additions: 1,
+                deletions: 0,
+            }
+        }
+
+        let workspace_id = WorkspaceId::new();
+        let mut response = status(&workspace_id);
+        response.changes = vec![
+            change("src/generated/one.rs", true, true),
+            change("src/generated/two.rs", false, true),
+            change("src/lib.rs", true, true),
+            change("docs/guide/intro.md", false, true),
+            change("Cargo.toml", false, true),
+            change("src/conflict.rs", false, true),
+        ];
+        let mut state = GitWorkbenchState::default();
+        state.reset_workspace(workspace_id);
+        let ticket = state.begin_query(GitQueryKind::Status, "status").unwrap();
+        assert!(state.apply_status(&ticket, response));
+        assert!(state.set_lifecycle_conflict_paths(vec!["src/conflict.rs".into()]));
+
+        // The status is applied with every available change selected.
+        assert_eq!(
+            state.path_selection_states([String::new()]).get(""),
+            Some(&GitPathSelectionState::Checked)
+        );
+        assert_batch_selection_matches_single(&state);
+
+        assert!(state.select_path("src/generated/one.rs", false));
+        assert_batch_selection_matches_single(&state);
+
+        assert!(state.select_path_prefix("src", false));
+        assert_eq!(
+            state.path_selection_states(["src".to_string(), "src/generated".to_string()]),
+            BTreeMap::from([
+                ("src".to_string(), GitPathSelectionState::Unchecked),
+                (
+                    "src/generated".to_string(),
+                    GitPathSelectionState::Unchecked
+                ),
+            ])
+        );
+        assert_batch_selection_matches_single(&state);
+
+        state.select_all(None);
+        assert_batch_selection_matches_single(&state);
+        assert_eq!(
+            state.path_selection_states([String::new()]).get(""),
+            Some(&GitPathSelectionState::Checked)
+        );
+    }
+
+    /// Answers for paths the batch form must agree with the single-path form
+    /// on: the root, directories, files, a lifecycle conflict, unknown paths
+    /// and spellings that need normalizing.
+    fn assert_batch_selection_matches_single(state: &GitWorkbenchState) {
+        let paths = [
+            "",
+            "src",
+            "src/generated",
+            "src/generated/one.rs",
+            "src/generated/two.rs",
+            "src/lib.rs",
+            "src/conflict.rs",
+            "docs",
+            "docs/guide",
+            "docs/guide/intro.md",
+            "Cargo.toml",
+            "src/gen",
+            "missing",
+            "./src/generated/",
+            "/src/",
+            "  src/lib.rs  ",
+            "src/generated/one.rs/",
+        ]
+        .map(str::to_string);
+        let batch = state.path_selection_states(paths.clone());
+        assert_eq!(batch.len(), paths.len());
+        for path in paths {
+            assert_eq!(
+                batch.get(&path).copied(),
+                Some(state.path_selection_state(&path)),
+                "path {path:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_empty_workbench_reports_every_path_as_unchecked_in_one_batch() {
+        let state = GitWorkbenchState::default();
+        assert_eq!(
+            state.path_selection_states([
+                String::new(),
+                "src".to_string(),
+                "./src/lib.rs".to_string()
+            ]),
+            BTreeMap::from([
+                (String::new(), GitPathSelectionState::Unchecked),
+                ("src".to_string(), GitPathSelectionState::Unchecked),
+                ("./src/lib.rs".to_string(), GitPathSelectionState::Unchecked),
+            ])
+        );
     }
 
     #[test]

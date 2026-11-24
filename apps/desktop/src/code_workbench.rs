@@ -1308,13 +1308,11 @@ fn right_rail_git_selection_states(
     // projection, but must not make its checkbox (or the root checkbox) appear
     // unchecked.
     paths.insert(String::new());
-    paths
-        .into_iter()
-        .map(|path| {
-            let state = git.path_selection_state(&path);
-            (path, state)
-        })
-        .collect()
+    // One pass over the status snapshot for all rows at once. Asking
+    // `path_selection_state` per row rebuilt the available and selected sets
+    // every time, which is O(rows × changes) and held the main thread for
+    // seconds on a repository with thousands of untracked files.
+    git.path_selection_states(paths)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
