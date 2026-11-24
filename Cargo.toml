@@ -125,12 +125,18 @@ gpui-kit-assets = "0.10.0"
 # The kit's motion layer, which `Plot::hover` implementations sample. Same
 # version the component crate already resolves, so the graph keeps one copy.
 gpui-base = "0.10.0"
-# The native mobile client's UI stack (Native Shell, nsh.dev). Exact pins: an
-# upgrade is a reviewed change, and every nsh crate in the graph must stay on
-# one version. `svg` draws the brand mark and icons natively; `nsh-base` ships
-# unstyled behavior only, so the app's look lives in `crates/vibex-nsh-ui`.
-nsh-core = { version = "=0.6.1", default-features = false, features = ["svg"] }
-nsh-base = { version = "=0.6.1", default-features = false, features = ["term", "editor", "highlight"] }
+# The native mobile client's UI stack (Native Shell, nsh.dev). Every nsh crate
+# in the graph must stay on one version. `svg` draws the brand mark and icons
+# natively; `nsh-base` ships unstyled behavior only, so the app's look lives in
+# `crates/vibex-nsh-ui`.
+#
+# Pinned to our fork of 0.6.1: upstream never told a dialog's window about its
+# own keyboard, so `env(keyboard-inset-height)` read zero inside a modal and a
+# sheet holding a field laid its content out under the keys. The fix is one
+# commit on top of the release (`fix/android-modal-keyboard-env`), offered
+# upstream; move these back to the released version once it lands.
+nsh-core = { git = "https://github.com/PeatBoy/nsh", branch = "fix/android-modal-keyboard-env", default-features = false, features = ["svg"] }
+nsh-base = { git = "https://github.com/PeatBoy/nsh", branch = "fix/android-modal-keyboard-env", default-features = false, features = ["term", "editor", "highlight"] }
 image = { version = "=0.25.10", default-features = false }
 # The Linux backend is chosen per target in the desktop crate: `ksni` on Linux
 # so the tray does not drag in the GTK 3 binding, and no default feature
