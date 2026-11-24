@@ -6504,6 +6504,14 @@ fn menu_row(row: &SidebarRowView, top: f32) -> menu::MenuRow {
 
 fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
     let menu = overlays.menu;
+    // The row a finger is carrying. Raising a row's menu and carrying the
+    // row begin with the same hold, so the first travel puts the menu away.
+    let drag = signal(None::<tree::DraggedRow>);
+    effect(move || {
+        if drag.with(Option::is_some) {
+            menu::dismiss(menu);
+        }
+    });
     let sessions = host.sessions;
     let active = host.active;
     let query = signal(String::new());
@@ -6895,6 +6903,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         select_mode,
                         selected,
                         locate,
+                        drag,
                     },
                     tree_actions,
                 ))
@@ -7163,6 +7172,42 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 }
             }),
         )
+        // The row a finger is carrying: the card travels with the finger and
+        // the line marks the slot it would land in.
+        .child(dynamic(move || match drag.get() {
+            Some(dragged) => {
+                let height = theme::sidebar_row_height();
+                let slots = (dragged.delta / height).round();
+                let line_top = dragged.top + slots * height;
+                let card = menu::MenuRow {
+                    top: dragged.top,
+                    height,
+                    mark: dragged.mark.clone(),
+                    title: dragged.title.clone(),
+                    trailing: dragged.trailing.clone(),
+                };
+                view()
+                    .absolute()
+                    .inset(px(0.0))
+                    .pointer_events(PointerEvents::None)
+                    .child(menu::lifted_row(
+                        &card,
+                        dragged.top + dragged.delta - 2.0,
+                    ))
+                    .child(
+                        view()
+                            .absolute()
+                            .top(px(line_top))
+                            .left(px(theme::SIDEBAR_LIST_PADDING))
+                            .right(px(theme::SIDEBAR_LIST_PADDING))
+                            .h(px(2.0))
+                            .rounded_full()
+                            .bg(theme::accent_blue()),
+                    )
+                    .into_element()
+            }
+            None => view().absolute().into_element(),
+        }))
         .child(name_sheet(
             move || sheets.rename_folder.with(Option::is_some),
             copy::text("Rename folder", "重命名文件夹", "重新命名資料夾"),

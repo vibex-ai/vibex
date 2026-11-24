@@ -284,48 +284,9 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
     });
     // The row itself, lifted over the scrim: the page behind it is blurred,
     // and this is what the reader pressed, a shade larger than its place.
-    let lifted_card = row.map(|row| {
-        let mut card = view()
-            .absolute()
-            .top(px(row.top - LIFTED_ROW_GROWTH))
-            .left(px(MENU_ATTACH_INSET))
-            .w(move || px((window().width.0 - MENU_ATTACH_INSET * 2.0).max(1.0)))
-            .h(px(row.height + LIFTED_ROW_GROWTH * 2.0))
-            .rounded(px(theme::RADIUS_GROUP))
-            .bg(theme::block_surface)
-            .shadow_lg()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::SPACING_MD))
-            .px(px(theme::SPACING_LG))
-            // The card is the row's picture, not a control: a press on it
-            // dismisses the menu like a press beside it.
-            .pointer_events(PointerEvents::None)
-            .bind_opacity(&reveal);
-        if let Some(mark) = row.mark {
-            card = card.child(
-                svg(mark)
-                    .size(px(theme::ICON_MD))
-                    .flex_shrink_0()
-                    .text_color(theme::text_secondary),
-            );
-        }
-        card.child(
-            text(row.title)
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(theme::font_body()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::foreground),
-        )
-        .children((!row.trailing.is_empty()).then(|| {
-            text(row.trailing)
-                .flex_shrink_0()
-                .text_size(px(theme::font_micro()))
-                .text_color(theme::text_muted)
-        }))
-    });
+    let lifted_card = row
+        .as_ref()
+        .map(|row| lifted_row(row, row.top - LIFTED_ROW_GROWTH).bind_opacity(&reveal));
     view()
         .absolute()
         .inset(px(0.0))
@@ -369,4 +330,51 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
                         .child(view().w_full().flex_col().children(rows)),
                 ),
         )
+}
+
+/// The card a lifted row is drawn on: its mark, title and trailing detail,
+/// a shade larger than its place in the list, standing at `top`.
+///
+/// The menu draws the row it was raised from with it; a drag keeps drawing
+/// it under the finger as the row travels.
+pub fn lifted_row(row: &MenuRow, top: f32) -> View {
+    let mut card = view()
+        .absolute()
+        .top(px(top))
+        .left(px(MENU_ATTACH_INSET))
+        .w(move || px((window().width.0 - MENU_ATTACH_INSET * 2.0).max(1.0)))
+        .h(px(row.height + LIFTED_ROW_GROWTH * 2.0))
+        .rounded(px(theme::RADIUS_GROUP))
+        .bg(theme::block_surface)
+        .shadow_lg()
+        .flex_row()
+        .items_center()
+        .gap(px(theme::SPACING_MD))
+        .px(px(theme::SPACING_LG))
+        // The card is the row's picture, not a control: a press on it
+        // dismisses the menu like a press beside it.
+        .pointer_events(PointerEvents::None);
+    if let Some(mark) = row.mark.clone() {
+        card = card.child(
+            svg(mark)
+                .size(px(theme::ICON_MD))
+                .flex_shrink_0()
+                .text_color(theme::text_secondary),
+        );
+    }
+    card.child(
+        text(row.title.clone())
+            .flex_1()
+            .min_w(px(0.0))
+            .truncate()
+            .text_size(px(theme::font_body()))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::foreground),
+    )
+    .children((!row.trailing.is_empty()).then(|| {
+        text(row.trailing.clone())
+            .flex_shrink_0()
+            .text_size(px(theme::font_micro()))
+            .text_color(theme::text_muted)
+    }))
 }

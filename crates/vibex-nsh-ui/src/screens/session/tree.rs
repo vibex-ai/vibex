@@ -71,6 +71,21 @@ impl SidebarRowView {
     }
 }
 
+/// The row a finger is carrying: where it started, how far it has come, and
+/// what the page draws in its place while it travels.
+#[derive(Clone, PartialEq)]
+pub struct DraggedRow {
+    /// The row's key, so the list hides the copy it is carrying.
+    pub key: String,
+    /// The row's top edge on the page, where it started.
+    pub top: f32,
+    /// How far the finger has carried it.
+    pub delta: f32,
+    pub mark: Option<ImageSrc>,
+    pub title: SharedString,
+    pub trailing: SharedString,
+}
+
 type Rows = Rc<dyn Fn(&str) -> Vec<SidebarRowView>>;
 type RowAction = Rc<dyn Fn(&SidebarRowView)>;
 /// Raises a row's menu, with how far down the page the row was held.
@@ -130,6 +145,8 @@ pub(super) struct TreeState {
     pub select_mode: Signal<bool>,
     pub selected: Signal<Vec<String>>,
     pub locate: Signal<Option<String>>,
+    /// The row a finger is carrying, shared with the page that draws it.
+    pub drag: Signal<Option<DraggedRow>>,
 }
 
 pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
@@ -196,6 +213,17 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
         )
 }
 
+/// What trails a row's title, as the card a drag carries shows it.
+fn row_trailing(row: &SidebarRowView) -> String {
+    if !row.metadata.is_empty() {
+        row.metadata.clone()
+    } else if row.count > 0 {
+        row.count.to_string()
+    } else {
+        String::new()
+    }
+}
+
 fn row_item(
     row: SidebarRowView,
     state: TreeState,
@@ -245,67 +273,6 @@ fn row_item(
             }
         }
     };
-    // A row's commands are behind a press held still, and a drag that
-    // follows the hold moves the row. Holding arms it; releasing without a
-    // drag raises the menu. This is the desktop sidebar's gesture: the row
-    // travels with the same measure, and the menu waits for a still finger.
-    let held = signal(false);
-    let row_top = signal(0.0);
-    let traveled = Rc::new(Cell::new(0.0f32));
-    let on_hold = move |event: &PressEvent| {
-        if !state.select_mode.get_untracked() {
-            crate::motion::tick();
-            held.set(true);
-            // Where the row's top is, not where the finger is: the menu
-            // stands against the row itself. The press lands in the row's
-            // inner content, which starts one row gap below its top.
-            row_top.set(event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP);
-        }
-    };
-    let on_hold_released = {
-        let menu = actions.menu.clone();
-        let row = row.clone();
-        move |_: &PressEvent| {
-            if held.get_untracked() && !dragging.get_untracked() {
-                menu(&row, row_top.get_untracked());
-            }
-            held.set(false);
-        }
-    };
-    let on_drag_move = {
-        let travel = traveled.clone();
-        move |event: &ResponderEvent| {
-            if dragging.get_untracked() {
-                travel.set(event.gesture.delta.y.0);
-            }
-        }
-    };
-    let on_drag_end = {
-        let menu_row = row.clone();
-        let move_row = actions.move_row.clone();
-        let travel = traveled.clone();
-        move |_: &ResponderEvent| {
-            let moved = travel.replace(0.0);
-            if dragging.get_untracked() {
-                dragging.set(false);
-                move_row(&menu_row, moved);
-            }
-            held.set(false);
-        }
-    };
-    let on_drag_cancelled = {
-        let travel = traveled.clone();
-        move |_: &ResponderEvent| {
-            travel.set(0.0);
-            dragging.set(false);
-            held.set(false);
-        }
-    };
-    let on_drag_claim = move |request: &ClaimRequest| {
-        if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
-            request.claim();
-        }
-    };
     let (logo, logo_color) = row.project_mark.clone().unwrap_or_else(|| {
         (
             match row.kind {
@@ -321,6 +288,103 @@ fn row_item(
             theme::sidebar_text_secondary(),
         )
     });
+    // A row's commands are behind a press held still, and a drag that
+    // follows the hold moves the row. Holding raises the menu at once; a
+    // finger that then travels puts it away and carries the row instead.
+    let held = signal(false);
+    let row_top = signal(0.0);
+    let traveled = Rc::new(Cell::new(0.0f32));
+    let on_hold = {
+        let menu = actions.menu.clone();
+        let menu_row = row.clone();
+        move |event: &PressEvent| {
+            if !state.select_mode.get_untracked() {
+                crate::motion::tick();
+                held.set(true);
+                // Where the row's top is, not where the finger is: the menu
+                // stands against the row itself. The press lands in the row's
+                // inner content, which starts one row gap below its top.
+                row_top.set(event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP);
+                menu(&menu_row, row_top.get_untracked());
+            }
+        }
+    };
+    let on_hold_released = move |_: &PressEvent| {
+        held.set(false);
+    };
+    // What the page draws while the finger carries this row: the row itself,
+    // off its place, and the slot it would land in.
+    let carried = computed({
+        let key = row.key();
+        move || {
+            state
+                .drag
+                .with(|drag| drag.as_ref().is_some_and(|drag| drag.key == key))
+        }
+    });
+    let start_drag = {
+        let drag = state.drag;
+        let key = row.key();
+        let mark = logo.clone();
+        let title: SharedString = row.title.clone().into();
+        let trailing: SharedString = row_trailing(&row).into();
+        move || {
+            dragging.set(true);
+            drag.set(Some(DraggedRow {
+                key: key.clone(),
+                top: row_top.get_untracked(),
+                delta: 0.0,
+                mark: Some(mark.clone()),
+                title: title.clone(),
+                trailing: trailing.clone(),
+            }));
+        }
+    };
+    let on_drag_move = {
+        let travel = traveled.clone();
+        let drag = state.drag;
+        move |event: &ResponderEvent| {
+            if dragging.get_untracked() {
+                let delta = event.gesture.delta.y.0;
+                travel.set(delta);
+                drag.update(|current| {
+                    if let Some(current) = current {
+                        current.delta = delta;
+                    }
+                });
+            }
+        }
+    };
+    let on_drag_end = {
+        let move_row = actions.move_row.clone();
+        let moved_row = row.clone();
+        let travel = traveled.clone();
+        let drag = state.drag;
+        move |_: &ResponderEvent| {
+            let moved = travel.replace(0.0);
+            if dragging.get_untracked() {
+                dragging.set(false);
+                move_row(&moved_row, moved);
+            }
+            drag.set(None);
+            held.set(false);
+        }
+    };
+    let on_drag_cancelled = {
+        let travel = traveled.clone();
+        let drag = state.drag;
+        move |_: &ResponderEvent| {
+            travel.set(0.0);
+            dragging.set(false);
+            drag.set(None);
+            held.set(false);
+        }
+    };
+    let on_drag_claim = move |request: &ClaimRequest| {
+        if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
+            request.claim();
+        }
+    };
     let active = is_session && row.active;
     let detail = (row.kind == SidebarRowKind::Workspace
         && row.detail != row.title
@@ -332,6 +396,9 @@ fn row_item(
         .px(px(inset))
         .py(px(theme::SIDEBAR_ROW_GAP))
         .relative()
+        // A carried row is drawn by the page instead, so the list must not
+        // leave a second copy behind.
+        .style_when(move || carried.get(), |style| style.opacity(0.0))
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
             view()
@@ -458,7 +525,7 @@ fn row_item(
                                 .claim_touches(TouchClaim::on_move().ask(on_drag_claim))
                                 .on_responder_grant(move |_: &ResponderEvent| {
                                     if held.get_untracked() {
-                                        dragging.set(true);
+                                        start_drag();
                                     }
                                 })
                                 .on_responder_move(on_drag_move)
