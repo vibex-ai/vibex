@@ -6521,6 +6521,10 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     // The row a finger is carrying. Raising a row's menu and carrying the
     // row begin with the same hold, so the first travel puts the menu away.
     let drag = signal(None::<tree::DraggedRow>);
+    // The nested row a drag has collapsed locally, so its children leave
+    // the list at once without waiting for the backend. The row itself is
+    // untouched, so the element holding the touch is not rebuilt.
+    let drag_collapse = signal(None::<String>);
     // The row being carried belongs to the page rather than to a row: the
     // list rebuilds its rows while a gesture is in flight.
     let shifts = signal(std::collections::HashMap::new());
@@ -6957,6 +6961,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         selected,
                         locate,
                         drag,
+                        drag_collapse,
                         menu: overlays.menu,
                         shifts,
                         list,

@@ -166,6 +166,11 @@ pub(super) struct TreeState {
     pub list_offset: Signal<f32>,
     pub scroll_travel: Signal<f32>,
     pub auto_scroll: Signal<f32>,
+    /// The key of the nested row a drag has collapsed locally, so its
+    /// children leave the list without waiting for the backend to confirm
+    /// the collapse. The row itself is untouched, so the element that
+    /// holds the touch is not rebuilt under the finger.
+    pub drag_collapse: Signal<Option<String>>,
     /// The list itself, for the page's edge scrolling.
     pub list_ref: ElementRef,
 }
@@ -174,6 +179,13 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = state.list_ref;
+    // The rows the list shows: when a drag has collapsed a nested row, its
+    // children are gone from the list while the row itself stays, so the
+    // row that holds the touch is not rebuilt under the finger.
+    let visible = computed(move || match state.drag_collapse.get() {
+        Some(key) => without_subtree(&rows.get(), &key),
+        None => rows.get(),
+    });
     // The carried row and the slot it is over, as values that only change
     // when the finger crosses a row: a row between the two moves over as a
     // step, not on every pixel of the drag.
@@ -196,7 +208,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     // When the finger crosses a row, the rows between the carried row and
     // that slot move over one place; the signals carry the transition.
     {
-        let rows = state.rows;
+        let rows = visible;
         let carried = carried;
         let shifts = state.shifts;
         effect(move || {
@@ -221,7 +233,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     }
     effect(move || {
         if let Some(id) = state.locate.get()
-            && let Some(index) = rows.with(|rows| {
+            && let Some(index) = visible.with(|rows| {
                 rows.iter()
                     .position(|row| row.kind == SidebarRowKind::Session && row.id == id)
             })
@@ -239,7 +251,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
         .flex_1()
         .min_h(px(0.0))
         .child(when(
-            move || rows.with(Vec::is_empty),
+            move || visible.with(Vec::is_empty),
             move || {
                 super::empty_hint(if state.query.with(|query| query.trim().is_empty()) {
                     copy::text("No sessions yet", "还没有会话", "還沒有工作階段")
@@ -254,10 +266,10 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
         ))
         .child(
             virtual_list(
-                move || rows.with(Vec::len),
+                move || visible.with(Vec::len),
                 move |position: Position| {
                     let row =
-                        computed(move || rows.with(|rows| rows.get(position.index()).cloned()));
+                        computed(move || visible.with(|rows| rows.get(position.index()).cloned()));
                     dynamic({
                         let actions = actions.clone();
                         move || match row.get() {
@@ -274,13 +286,29 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                 },
             )
             .keys(move || {
-                rows.with(|rows| rows.iter().map(SidebarRowView::key).collect::<Vec<_>>())
+                visible.with(|rows| rows.iter().map(SidebarRowView::key).collect::<Vec<_>>())
             })
             .estimated_item_size(px(theme::sidebar_row_height()))
             .element_ref(&list_ref)
             .on_scroll(move |event: &ScrollEvent| state.list_offset.set(event.offset.y.0))
             .flex_1(),
         )
+}
+
+/// The rows without the subtree of the row named by `key`: the row itself
+/// stays, the rows under it (greater indent, until the indent returns) go.
+fn without_subtree(rows: &[SidebarRowView], key: &str) -> Vec<SidebarRowView> {
+    let Some(index) = rows.iter().position(|row| row.key() == key) else {
+        return rows.to_vec();
+    };
+    let indent = rows[index].indent;
+    let mut end = index + 1;
+    while end < rows.len() && rows[end].indent > indent {
+        end += 1;
+    }
+    let mut out = rows[..index].to_vec();
+    out.extend_from_slice(&rows[end..]);
+    out
 }
 
 /// How far a row moves over to open the slot the carried row would land in.
@@ -417,8 +445,10 @@ fn row_item(
         let key = key.clone();
         // A folder or group dragged while open collapses first: the drag
         // carries one row, and the row cannot be dropped into the space its
-        // own children used to occupy.
-        let toggle = actions.toggle.clone();
+        // own children used to occupy. The collapse is applied locally so
+        // the children leave the list at once; the row itself is untouched,
+        // so the element holding the touch is not rebuilt under the finger.
+        // The backend collapse is applied when the drag ends.
         let drag_row = row.clone();
         move || {
             // The list rebuilds the row when a nested row collapses as the
@@ -439,7 +469,7 @@ fn row_item(
                 return;
             };
             if is_nested && !drag_row.collapsed {
-                toggle(&drag_row);
+                state.drag_collapse.set(Some(key.clone()));
             }
             state.scroll_travel.set(0.0);
             state.auto_scroll.set(0.0);
@@ -485,6 +515,7 @@ fn row_item(
     let on_drag_end = {
         let key = key.clone();
         let move_row = actions.move_row.clone();
+        let toggle = actions.toggle.clone();
         let moved_row = row.clone();
         move |_: &ResponderEvent| {
             let delta = state.drag.with_untracked(|drag| {
@@ -499,6 +530,12 @@ fn row_item(
                 .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
             if ours {
                 state.drag.set(None);
+                // The local collapse ends with the drag; the backend applies
+                // the real one, so a nested row that was open stays closed.
+                state.drag_collapse.set(None);
+                if is_nested && !moved_row.collapsed {
+                    toggle(&moved_row);
+                }
                 move_row(&moved_row, delta);
             }
         }
@@ -511,6 +548,8 @@ fn row_item(
                 .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
             if ours {
                 state.drag.set(None);
+                // A cancelled drag leaves the row as it was.
+                state.drag_collapse.set(None);
             }
             state.auto_scroll.set(0.0);
             state.scroll_travel.set(0.0);
