@@ -421,6 +421,16 @@ fn row_item(
         let toggle = actions.toggle.clone();
         let drag_row = row.clone();
         move || {
+            // The list rebuilds the row when a nested row collapses as the
+            // drag begins, and the rebuilt element is granted the touch
+            // again. A row already being carried keeps its carry rather
+            // than starting over.
+            if state
+                .drag
+                .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key))
+            {
+                return;
+            }
             let Some(top) = state.menu.with_untracked(|menu| {
                 menu.as_ref()
                     .and_then(|menu| menu.row.as_ref())
@@ -508,7 +518,9 @@ fn row_item(
     };
     // The row is armed by the hold and taken by the first travel, which is
     // decided again on every move from page state, so a row rebuilt under
-    // the finger still claims the gesture.
+    // the finger still claims the gesture. The menu names the row a hold
+    // is about; once the drag has begun the carry itself names it, so a
+    // row rebuilt by the collapse a drag triggered still claims.
     let on_drag_claim = {
         let key = key.clone();
         move |request: &ClaimRequest| {
@@ -516,7 +528,9 @@ fn row_item(
                 menu.as_ref()
                     .and_then(|menu| menu.row.as_ref())
                     .is_some_and(|row| row.key == key)
-            });
+            }) || state
+                .drag
+                .with_untracked(|drag| drag.as_ref().is_some_and(|drag| drag.key == key));
             if armed && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
                 request.claim();
             }
