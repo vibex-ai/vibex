@@ -627,6 +627,10 @@ pub struct ProjectBrowserHost {
     pub dirs: Signal<Vec<DirectoryEntry>>,
     pub current: Signal<Option<String>>,
     pub parent: Signal<Option<String>>,
+    /// The directories the runtime offers as starting points, in its own
+    /// order. The sheet lists them so a reader can jump between the places the
+    /// host allows instead of climbing to them one folder at a time.
+    pub roots: Signal<Vec<String>>,
     pub busy: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
     pub on_browse: BrowseDirs,
@@ -643,11 +647,17 @@ pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
         dirs,
         current,
         parent,
+        roots,
         busy,
         error,
         on_browse,
         on_open,
     } = host;
+    // The path the reader is typing, and whether the field is showing: the
+    // sheet opens on the list, and a reader who knows where they are going can
+    // type it instead of walking there.
+    let typed = signal(String::new());
+    let typing = signal(false);
     chrome::bottom_sheet(
         move || open.get(),
         move || open.set(false),
@@ -675,22 +685,92 @@ pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
                                 .gap(px(theme::SPACING_MD))
                                 .child(surface::tile(icon!("folder-open")))
                                 .child(
-                                    text(move || {
-                                        current.get().unwrap_or_else(|| {
-                                            copy::text(
-                                                "Choose a folder",
-                                                "选择一个文件夹",
-                                                "選擇一個資料夾",
-                                            )
-                                            .to_owned()
-                                        })
-                                    })
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .text_size(px(theme::font_detail()))
-                                    .font_family("monospace")
-                                    .text_color(theme::foreground),
+                                    // The path is the field: tap it and type a
+                                    // directory the list would take too many
+                                    // steps to reach.
+                                    view()
+                                        .flex_1()
+                                        .min_w(px(0.0))
+                                        .child(when(
+                                            move || typing.get(),
+                                            {
+                                                let on_browse = on_browse.clone();
+                                                move || {
+                                                    let on_browse = on_browse.clone();
+                                                    view()
+                                                        .w_full()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(theme::SPACING_SM))
+                                                        .child(
+                                                            view().flex_1().min_w(px(0.0)).child(
+                                                                field::text_field_well(
+                                                                    typed,
+                                                                    copy::text(
+                                                                        "Type a folder path",
+                                                                        "输入文件夹路径",
+                                                                        "輸入資料夾路徑",
+                                                                    ),
+                                                                )
+                                                                .test_id("project-path"),
+                                                            ),
+                                                        )
+                                                        .child(surface::ghost_button(
+                                                            icon!("check"),
+                                                            copy::text("Open", "打开", "開啟"),
+                                                            move || {
+                                                                let path = typed
+                                                                    .get_untracked()
+                                                                    .trim()
+                                                                    .to_owned();
+                                                                if !path.is_empty() {
+                                                                    on_browse(Some(&path));
+                                                                    typing.set(false);
+                                                                }
+                                                            },
+                                                        ))
+                                                }
+                                            },
+                                        ))
+                                        .child(when(
+                                            move || !typing.get(),
+                                            move || {
+                                                // The path reads as a field
+                                                // you can type into, so it is
+                                                // one press away from being
+                                                // exactly that.
+                                                view()
+                                                    .w_full()
+                                                    .flex_row()
+                                                    .items_center()
+                                                    .active(|style| style.opacity(0.6))
+                                                    .on_press(move || {
+                                                        typed.set(
+                                                            current
+                                                                .get_untracked()
+                                                                .unwrap_or_default(),
+                                                        );
+                                                        typing.set(true);
+                                                    })
+                                                    .child(
+                                                        text(move || {
+                                                            current.get().unwrap_or_else(|| {
+                                                                copy::text(
+                                                                    "Choose a folder",
+                                                                    "选择一个文件夹",
+                                                                    "選擇一個資料夾",
+                                                                )
+                                                                .to_owned()
+                                                            })
+                                                        })
+                                                        .w_full()
+                                                        .truncate()
+                                                        .text_size(px(theme::font_detail()))
+                                                        .font_family("monospace")
+                                                        .text_color(theme::foreground),
+                                                    )
+                                            },
+                                        )),
                                 )
                                 .child({
                                     let on_browse = on_browse.clone();
@@ -717,6 +797,51 @@ pub fn project_browser_sheet(host: ProjectBrowserHost) -> impl IntoElement {
                                 }),
                         ),
                     ),
+            )
+            .child(
+                // The places the runtime offers, as the desktop's picker offers
+                // its own: one tap to a root instead of climbing back to it.
+                // They are the roots the authority allows, so a reader can see
+                // where they are before walking there.
+                view().w_full().px(px(theme::SPACING_MD)).pb(px(theme::SPACING_SM)).child(
+                    when(
+                        move || roots.with(Vec::len) > 1,
+                        {
+                            let on_browse = on_browse.clone();
+                            move || {
+                                let on_browse = on_browse.clone();
+                                surface::card().child(each(
+                                    move || roots.get(),
+                                    |root| root.clone(),
+                                    move |root, _| {
+                                        let on_browse = on_browse.clone();
+                                        surface::row(
+                                            icon!("folder"),
+                                            move || {
+                                                SharedString::from(root.with(|path| {
+                                                    path.rsplit('/')
+                                                        .next()
+                                                        .filter(|name| !name.is_empty())
+                                                        .unwrap_or(path.as_str())
+                                                        .to_owned()
+                                                }))
+                                            },
+                                            move || {
+                                                on_browse(Some(
+                                                    &root.with_untracked(|path| path.clone()),
+                                                ))
+                                            },
+                                        )
+                                        .border_b_1()
+                                        .border_b_color(theme::hairline)
+                                        .disabled(move || busy.get())
+                                        .child(surface::chevron())
+                                    },
+                                ))
+                            }
+                        },
+                    ),
+                ),
             )
             .child(
                 scroll().flex_shrink(1.0).min_h(px(0.0)).child(

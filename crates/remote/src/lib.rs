@@ -6322,6 +6322,7 @@ fn ensure_temporary_session_root(root: &Path) -> VibexResult<String> {
 fn browse_authority_directories(
     runtime: &RemoteWorkbenchRuntime,
     requested: Option<&str>,
+    whole_filesystem: bool,
 ) -> VibexResult<vibex_core::RemoteWorkspaceDirectoryListing> {
     let roots = resolved_browse_roots(runtime.browse_roots())?;
     let target = match requested.map(str::trim).filter(|path| !path.is_empty()) {
@@ -6343,23 +6344,34 @@ fn browse_authority_directories(
         )
         .with_recovery_hint("Choose one of the listed browse roots, or a directory inside one"));
     }
-    let root = roots
-        .iter()
-        .find(|root| canonical.starts_with(root))
-        .ok_or_else(|| {
-            VibexError::validation(
-                "remote_directory_outside_roots",
-                "the requested directory is outside the authority's browse roots",
-            )
-            .with_recovery_hint("Browse one of the roots the runtime exposes")
-        })?;
+    // A device with full control browses the host as the host itself does: the
+    // filesystem's own root is its boundary, and "up" stops there. Everything
+    // else stays inside the configured roots.
+    let root = if whole_filesystem {
+        Path::new("/").to_path_buf()
+    } else {
+        roots
+            .iter()
+            .find(|root| canonical.starts_with(root))
+            .ok_or_else(|| {
+                VibexError::validation(
+                    "remote_directory_outside_roots",
+                    "the requested directory is outside the authority's browse roots",
+                )
+                .with_recovery_hint("Browse one of the roots the runtime exposes")
+            })?
+            .clone()
+    };
     let entries = list_browse_directories(&canonical)?;
-    let parent = (canonical != *root)
+    let parent = (canonical != root)
         .then(|| canonical.parent().map(Path::to_path_buf))
         .flatten()
-        .filter(|parent| parent.starts_with(root))
+        .filter(|parent| parent.starts_with(&root))
         .map(|parent| parent.to_string_lossy().into_owned());
     Ok(vibex_core::RemoteWorkspaceDirectoryListing {
+        // The picker offers these as quick locations. A full-control device
+        // starts from the filesystem root and still keeps the configured
+        // roots as its shortcuts.
         roots: roots
             .iter()
             .map(|root| root.to_string_lossy().into_owned())
@@ -6684,14 +6696,24 @@ async fn dispatch_workbench_request(
                 .map_err(remote_payload_encode_error)
         }
         RemoteWorkbenchRequest::BrowseDirectories(request) => {
-            authorize_workbench_action(
+            let auth = authorize_workbench_action(
                 runtime,
                 request.auth,
                 RemoteActionClass::ReadProject,
                 Some(request_id),
                 correlation_id,
             )?;
-            let listing = browse_authority_directories(runtime, request.path.as_deref())?;
+            let listing = browse_authority_directories(
+                runtime,
+                request.path.as_deref(),
+                // A device that may drive the terminal can already run any
+                // command on this host, so fencing its directory picker to the
+                // browse roots buys no safety and only makes the picker
+                // useless: the reader can open a shell in `/` but not look at
+                // it. Devices that may only read, or only answer prompts, keep
+                // the roots — for them the boundary is the whole permission.
+                auth.permission_level == RemoteDevicePermissionLevel::FullControl,
+            )?;
             serde_json::to_value(RemoteWorkbenchBrowseDirectoriesResponse { listing })
                 .map_err(remote_payload_encode_error)
         }
@@ -12229,7 +12251,7 @@ mod tests {
         let runtime = RemoteWorkbenchRuntime::new(temp_db_path("browse"), TerminalManager::new())
             .with_browse_roots(vec![root.path().to_path_buf()]);
 
-        let listing = browse_authority_directories(&runtime, None).unwrap();
+        let listing = browse_authority_directories(&runtime, None, false).unwrap();
         assert_eq!(listing.path, canonical_root.to_string_lossy());
         assert_eq!(listing.roots, vec![canonical_root.to_string_lossy()]);
         assert!(
@@ -12244,7 +12266,7 @@ mod tests {
         assert_eq!(names, vec!["Alpha", "projects"]);
 
         let nested =
-            browse_authority_directories(&runtime, Some(&projects.to_string_lossy())).unwrap();
+            browse_authority_directories(&runtime, Some(&projects.to_string_lossy()), false).unwrap();
         assert_eq!(
             nested.path,
             projects.canonicalize().unwrap().to_string_lossy()
@@ -12278,7 +12300,7 @@ mod tests {
                 .with_browse_roots(vec![root.path().to_path_buf()]);
 
         let escaped =
-            browse_authority_directories(&runtime, Some(&outside.path().to_string_lossy()))
+            browse_authority_directories(&runtime, Some(&outside.path().to_string_lossy()), false)
                 .unwrap_err();
         assert_eq!(escaped.code, "remote_directory_outside_roots");
         assert!(
@@ -12289,16 +12311,69 @@ mod tests {
         );
 
         let missing =
-            browse_authority_directories(&runtime, Some("/vibex-browse-missing-root-sentinel"))
+            browse_authority_directories(&runtime, Some("/vibex-browse-missing-root-sentinel"), false)
                 .unwrap_err();
         assert_eq!(missing.code, "remote_directory_unavailable");
 
         let file = browse_authority_directories(
             &runtime,
             Some(&root.path().join("notes.txt").to_string_lossy()),
+            false,
         )
         .unwrap_err();
         assert_eq!(file.code, "remote_directory_not_directory");
+    }
+
+    /// A device with full control browses the whole host, not just the roots.
+    ///
+    /// It can already open a terminal and run anything, so fencing its picker
+    /// to the browse roots protects nothing and leaves the reader unable to
+    /// open a project outside them. The filesystem root becomes its boundary:
+    /// "up" stops at `/`, and the configured roots are still offered as
+    /// shortcuts.
+    #[test]
+    fn a_full_control_device_browses_the_whole_filesystem() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("projects")).unwrap();
+        let runtime =
+            RemoteWorkbenchRuntime::new(temp_db_path("browse-full"), TerminalManager::new())
+                .with_browse_roots(vec![root.path().to_path_buf()]);
+
+        // A directory outside the configured roots now lists, and is its own
+        // starting point rather than a refusal.
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
+        let listing = browse_authority_directories(
+            &runtime,
+            Some(&outside.path().to_string_lossy()),
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            listing.path,
+            outside.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "elsewhere");
+        // The configured roots stay as shortcuts, so the picker can still offer
+        // the host's usual starting places.
+        assert_eq!(
+            listing.roots,
+            vec![root.path().canonicalize().unwrap().to_string_lossy()]
+        );
+
+        // The filesystem root is the top: the climb stops there instead of at
+        // the configured root.
+        let top = browse_authority_directories(&runtime, Some("/"), true).unwrap();
+        assert_eq!(top.path, "/");
+        assert!(
+            top.parent.is_none(),
+            "the filesystem root is the top of a full-control browse"
+        );
+        assert!(
+            top.entries.iter().any(|entry| entry.name == "tmp"),
+            "the whole filesystem is listed, not the configured roots"
+        );
     }
 
     /// A symlinked directory is visible from inside the root, but following it
@@ -12313,7 +12388,7 @@ mod tests {
             RemoteWorkbenchRuntime::new(temp_db_path("browse-link"), TerminalManager::new())
                 .with_browse_roots(vec![root.path().to_path_buf()]);
 
-        let listing = browse_authority_directories(&runtime, None).unwrap();
+        let listing = browse_authority_directories(&runtime, None, false).unwrap();
         assert_eq!(listing.entries.len(), 1);
         assert_eq!(listing.entries[0].name, "escape");
         assert!(
@@ -12322,7 +12397,7 @@ mod tests {
         );
 
         let escaped =
-            browse_authority_directories(&runtime, Some(&listing.entries[0].path)).unwrap_err();
+            browse_authority_directories(&runtime, Some(&listing.entries[0].path), false).unwrap_err();
         assert_eq!(escaped.code, "remote_directory_outside_roots");
     }
 

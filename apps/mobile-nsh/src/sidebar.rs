@@ -487,6 +487,13 @@ pub fn sidebar_rows(input: SidebarRowInput<'_>) -> Vec<SidebarRow> {
             {
                 return true;
             }
+            if organization
+                .folders_for_project(&project.id)
+                .iter()
+                .any(|(_, folder)| folder.name.to_lowercase().contains(&query))
+            {
+                return true;
+            }
             sessions_by_project
                 .get(&project.id)
                 .is_some_and(|sessions| {
@@ -622,6 +629,34 @@ fn push_root_children(
                     continue;
                 };
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
+                // The children are built before the row is, even while the
+                // folder is folded shut: a search reaches inside it, and a
+                // heading whose children were never built could not answer for
+                // them.
+                let mut children = Vec::new();
+                push_root_children(
+                    &mut children,
+                    input,
+                    organization,
+                    project_ids,
+                    project_labels,
+                    workspaces_by_project,
+                    sessions_by_project,
+                    sessions_by_workspace,
+                    query,
+                    Some(&folder_id),
+                    depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
+                );
+                // A search that answers nothing inside the folder leaves no
+                // heading behind: an empty folder in the results says the
+                // query found something, which it did not.
+                if !query.is_empty()
+                    && !folder.name.to_lowercase().contains(query)
+                    && children.is_empty()
+                {
+                    continue;
+                }
                 rows.push(SidebarRow {
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
@@ -646,20 +681,7 @@ fn push_root_children(
                 if collapsed && query.is_empty() {
                     continue;
                 }
-                push_root_children(
-                    rows,
-                    input,
-                    organization,
-                    project_ids,
-                    project_labels,
-                    workspaces_by_project,
-                    sessions_by_project,
-                    sessions_by_workspace,
-                    query,
-                    Some(&folder_id),
-                    depth + 1,
-                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
-                );
+                rows.extend(children);
             }
             SidebarOrganizationItem::Session(_) | SidebarOrganizationItem::Group(_) => {}
         }
@@ -740,6 +762,29 @@ fn push_project_children(
                     continue;
                 };
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
+                // Built before the heading, so a search can answer for what is
+                // inside a folded folder.
+                let mut children = Vec::new();
+                push_project_children(
+                    &mut children,
+                    input,
+                    organization,
+                    project_id,
+                    workspaces_by_project,
+                    sessions_by_project,
+                    sessions_by_workspace,
+                    query,
+                    Some(&folder_id),
+                    depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
+                    false,
+                );
+                if !query.is_empty()
+                    && !folder.name.to_lowercase().contains(query)
+                    && children.is_empty()
+                {
+                    continue;
+                }
                 rows.push(SidebarRow {
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
@@ -764,20 +809,7 @@ fn push_project_children(
                 if collapsed && query.is_empty() {
                     continue;
                 }
-                push_project_children(
-                    rows,
-                    input,
-                    organization,
-                    project_id,
-                    workspaces_by_project,
-                    sessions_by_project,
-                    sessions_by_workspace,
-                    query,
-                    Some(&folder_id),
-                    depth + 1,
-                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
-                    false,
-                );
+                rows.extend(children);
             }
             SidebarOrganizationItem::Group(group_id) => {
                 push_group_rows(
@@ -963,6 +995,28 @@ fn push_workspace_children(
                     continue;
                 };
                 let collapsed = organization.collapsed_folder_ids.contains(&folder_id);
+                // Built before the heading, so a search can answer for what is
+                // inside a folded folder.
+                let mut children = Vec::new();
+                push_workspace_children(
+                    &mut children,
+                    input,
+                    organization,
+                    project_id,
+                    workspace_id,
+                    workspace_sessions,
+                    session_ids,
+                    query,
+                    Some(&folder_id),
+                    depth + 1,
+                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
+                );
+                if !query.is_empty()
+                    && !folder.name.to_lowercase().contains(query)
+                    && children.is_empty()
+                {
+                    continue;
+                }
                 rows.push(SidebarRow {
                     item: SidebarOrganizationItem::Folder(folder_id.clone()),
                     kind: SidebarRowKind::Folder,
@@ -987,19 +1041,7 @@ fn push_workspace_children(
                 if collapsed && query.is_empty() {
                     continue;
                 }
-                push_workspace_children(
-                    rows,
-                    input,
-                    organization,
-                    project_id,
-                    workspace_id,
-                    workspace_sessions,
-                    session_ids,
-                    query,
-                    Some(&folder_id),
-                    depth + 1,
-                    indent + theme::SIDEBAR_FOLDER_CHILD_INDENT,
-                );
+                rows.extend(children);
             }
             SidebarOrganizationItem::Group(group_id) => {
                 push_group_rows(
@@ -1386,26 +1428,6 @@ pub fn ancestors_of(rows: &[SidebarRow], index: usize) -> BTreeSet<String> {
         }
     }
     ancestors
-}
-
-/// Guide lines a row sits behind, as x offsets. The Desktop draws one down the
-/// child column of every open folder; a flat row list has to re-derive them
-/// from its ancestors, one line per enclosing folder.
-pub fn folder_guides(rows: &[SidebarRow], index: usize) -> Vec<f32> {
-    let Some(row) = rows.get(index) else {
-        return Vec::new();
-    };
-    let mut guides = Vec::new();
-    let mut depth = row.depth;
-    for candidate in rows[..index].iter().rev() {
-        if candidate.depth < depth {
-            depth = candidate.depth;
-            if candidate.kind == SidebarRowKind::Folder {
-                guides.push(candidate.indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET);
-            }
-        }
-    }
-    guides
 }
 
 /// Where a row falls inside the card the Desktop wraps around a worktree and
@@ -2330,24 +2352,6 @@ mod tests {
     }
 
     #[test]
-    fn a_row_sits_behind_one_guide_per_enclosing_folder() {
-        let rows = vec![
-            row(SidebarRowKind::Project, "project", 0),
-            row(SidebarRowKind::Folder, "outer", 1),
-            row(SidebarRowKind::Folder, "inner", 2),
-            row(SidebarRowKind::Session, "session", 3),
-        ];
-        assert!(folder_guides(&rows, 0).is_empty());
-        assert_eq!(
-            folder_guides(&rows, 3),
-            vec![
-                rows[2].indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET,
-                rows[1].indent + theme::SIDEBAR_FOLDER_GUIDE_OFFSET,
-            ]
-        );
-    }
-
-    #[test]
     fn a_worktree_card_spans_its_sessions_and_an_empty_placeholder() {
         let mut rows = vec![
             row(SidebarRowKind::Project, "project", 0),
@@ -2385,6 +2389,107 @@ mod tests {
         assert_eq!(
             cards[5].as_ref().map(|card| card.edge),
             Some(SidebarCardEdge::Bottom)
+        );
+    }
+
+    /// A folder whose name does not answer the query, and that holds nothing
+    /// that does, is not a row: a heading in the results says the query found
+    /// something inside it, which it did not.
+    #[test]
+    fn a_folder_nothing_matches_inside_is_not_a_row_when_searching() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder(
+            "folder",
+            "v.0.1.10",
+            Some("project_project".to_string()),
+            None
+        ));
+        let sessions = vec![
+            session("session-a", "project", "Filed"),
+            session("session-b", "project", "gpu-pre 与 gpu-fast 对比"),
+        ];
+        let projects = session_projects(&sessions);
+        view.organization.reconcile(
+            &["project_project".to_string()],
+            &projects
+                .iter()
+                .map(|(session_id, project_id)| (session_id.clone(), project_id.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(view.organization.move_many_into(
+            &[SidebarOrganizationItem::Session(
+                "session_session-a".to_string()
+            )],
+            "folder",
+            &projects,
+        ));
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &[SidebarProject {
+                id: "project_project".to_string(),
+                label: "vibex".to_string(),
+            }],
+            workspaces: &[],
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "gpu",
+        });
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert!(
+            !labels.contains(&"v.0.1.10"),
+            "an empty folder heading was left in the results: {labels:?}"
+        );
+        assert!(
+            labels.contains(&"gpu-pre 与 gpu-fast 对比"),
+            "the session that answers the query is missing: {labels:?}"
+        );
+    }
+
+    /// A folder the query names is a row even when nothing inside it matches:
+    /// the reader asked for the folder.
+    #[test]
+    fn a_folder_the_query_names_stays_a_row() {
+        let mut view = SidebarOrganizationView::default();
+        assert!(view.organization.create_folder(
+            "folder",
+            "Agent 委托测试",
+            Some("project_project".to_string()),
+            None
+        ));
+        let sessions = vec![
+            session("session-a", "project", "Filed"),
+            session("session-b", "project", "gpu-pre 与 gpu-fast 对比"),
+        ];
+        let projects = session_projects(&sessions);
+        view.organization.reconcile(
+            &["project_project".to_string()],
+            &projects
+                .iter()
+                .map(|(session_id, project_id)| (session_id.clone(), project_id.clone()))
+                .collect::<Vec<_>>(),
+        );
+        assert!(view.organization.move_many_into(
+            &[SidebarOrganizationItem::Session(
+                "session_session-a".to_string()
+            )],
+            "folder",
+            &projects,
+        ));
+        let rows = sidebar_rows(SidebarRowInput {
+            view: &view,
+            projects: &[SidebarProject {
+                id: "project_project".to_string(),
+                label: "vibex".to_string(),
+            }],
+            workspaces: &[],
+            sessions: &sessions,
+            selected_session_id: None,
+            query: "agent",
+        });
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert!(
+            labels.contains(&"Agent 委托测试"),
+            "the folder the query names was dropped: {labels:?}"
         );
     }
 
