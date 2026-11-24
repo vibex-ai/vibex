@@ -4269,6 +4269,18 @@ fn composer_submission_failure_reached_provider(state: &MessageSubmissionState) 
     state.status == MessageSubmissionStatus::Failed && state.dispatched_at_ms.is_some()
 }
 
+/// Whether the composer row for `state` is a finished outcome the reader can
+/// clear, rather than one still in flight.
+///
+/// The renderer keeps only actionable terminal rows, so this is `true` for
+/// every row it receives. Gating the icon and the dismiss control on
+/// `Cancelled` alone left the far more common outcome — a message the authority
+/// refused to send — painted with a spinner that claimed the send was still
+/// running, and with no way to close it.
+fn composer_submission_row_is_terminal(status: MessageSubmissionStatus) -> bool {
+    status.is_terminal()
+}
+
 fn ambiguous_message_submission_notice() -> &'static str {
     locale::text(
         "There was a problem sending your message. Please try again shortly.",
@@ -39130,12 +39142,12 @@ impl VibexWorkbench {
         // message it spoke for and held that session's queue forever.
         let mut unadmitted_session_ids = BTreeSet::new();
         for state in &states {
-            if matches!(
-                state.status,
-                MessageSubmissionStatus::Completed
-                    | MessageSubmissionStatus::AmbiguousPromptDispatch
-            ) || composer_submission_failure_reached_provider(state)
-            {
+            // A terminal submission has nothing left to observe. Keeping its
+            // locator made the poll re-read the same outcome every half second
+            // for the rest of the run and push it back onto the composer, so a
+            // row the reader closed returned on the next tick — an unsent
+            // message that could never be gotten rid of.
+            if state.status.is_terminal() {
                 self.composer_submission_locators.retain(|locator| {
                     !(locator.session_id == state.session_id
                         && locator.message_idempotency_key == state.message_idempotency_key)
@@ -39285,7 +39297,7 @@ impl VibexWorkbench {
                 .min_w_0()
                 .gap(px(6.0))
                 .children(rows.into_iter().map(|state| {
-                    let terminal = state.status == MessageSubmissionStatus::Cancelled;
+                    let terminal = composer_submission_row_is_terminal(state.status);
                     let label = match state.status {
                         MessageSubmissionStatus::AwaitingRuntime
                         | MessageSubmissionStatus::ReadyToDispatch => {

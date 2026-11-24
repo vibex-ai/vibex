@@ -969,6 +969,40 @@ impl MessageSubmissionCoordinator {
                     self.record_queue_wait(record, RuntimeMetricResult::Success);
                     return Ok(true);
                 }
+                // A commit settles the selection on what the target binding
+                // could apply. An Agent that has no reasoning dimension, or a
+                // Model that publishes no mode, drops that control while the
+                // switch still commits the runtime that was asked for. An
+                // exact comparison then read that settlement as "another
+                // runtime took over" and failed the very message the switch it
+                // waited for had just made deliverable — the message could
+                // never be sent, for a control the Agent never offered.
+                //
+                // The message stays on the runtime it named only when the
+                // committed binding is this switch's own target: a later
+                // commit is a different runtime, and that remains a genuine
+                // divergence.
+                if state.status == SessionRuntimeSelectionStatus::Ready
+                    && runtime_switch.target_binding_id.is_some()
+                    && state.current_binding_id == runtime_switch.target_binding_id
+                    && settled_runtime_target(&record.desired_runtime_selection, &state.effective)
+                {
+                    let mut conn = self.open_connection()?;
+                    MessageSubmissionRepository::normalize_runtime_selection(
+                        &mut conn,
+                        &record.submission_id,
+                        &record.desired_runtime_selection,
+                        &state.effective,
+                    )?;
+                    MessageSubmissionRepository::advance_status(
+                        &conn,
+                        &record.submission_id,
+                        MessageSubmissionStatus::AwaitingRuntime,
+                        MessageSubmissionStatus::ReadyToDispatch,
+                    )?;
+                    self.record_queue_wait(record, RuntimeMetricResult::Success);
+                    return Ok(true);
+                }
                 MessageSubmissionRepository::fail(
                     &conn,
                     &record.submission_id,
@@ -1523,6 +1557,28 @@ fn is_runtime_revision_conflict(error: &VibexError) -> bool {
     )
 }
 
+/// Whether a committed switch delivered the runtime a queued message asked for.
+///
+/// The commit writes the selection the target binding converged on, so an
+/// optional control the Agent could not apply is absent from the effective
+/// selection while the route itself — Agent, auth source and Model — is exactly
+/// the one requested. Treating that as a different runtime failed the message
+/// on a control the Agent never offered, which is the state a reader then could
+/// not clear.
+///
+/// What still counts as a different runtime: another Agent, another auth
+/// source, another Model. The commit never substitutes those, so a divergence
+/// there means a later selection took the session instead of the switch this
+/// message waited for.
+fn settled_runtime_target(
+    requested: &SessionRuntimeSelection,
+    effective: &SessionRuntimeSelection,
+) -> bool {
+    requested.agent_id == effective.agent_id
+        && requested.auth_source == effective.auth_source
+        && requested.model == effective.model
+}
+
 fn safe_error_code(code: &str) -> String {
     let code = code
         .chars()
@@ -1561,9 +1617,9 @@ mod tests {
     use vibex_core::{
         AcpAdapterId, AgentId, AgentMessagePayload, AgentSession, AgentSessionSafety,
         AgentSessionState, MAX_MESSAGE_IDEMPOTENCY_KEY_LEN, ProviderProfileId, RequestId,
-        RuntimeSelectionActionableError, SessionRuntimeSelection, TimelineErrorPayload,
-        TimelineRedactionState, TimelineSource, UserMessageDelivery, UserMessagePayload,
-        WorkspaceMode, unix_timestamp_ms,
+        RuntimeBindingId, RuntimeSelectionActionableError, SessionRuntimeSelection,
+        TimelineErrorPayload, TimelineRedactionState, TimelineSource, UserMessageDelivery,
+        UserMessagePayload, WorkspaceMode, unix_timestamp_ms,
     };
     use vibex_db::{RuntimeSwitchReserveRequest, SessionRepository, WorkspaceRepository};
 
@@ -2291,6 +2347,31 @@ mod tests {
         (submission, runtime_switch.switch_id)
     }
 
+    /// The same fixture, with the switch pointing at a real target binding.
+    ///
+    /// A commit that settled the runtime is only distinguishable from another
+    /// selection taking the session over by the binding it committed, so the
+    /// convergent case needs the switch's own target row to compare against.
+    fn enqueue_with_committed_switch_and_target(
+        db_path: &Path,
+        session_id: &VibexSessionId,
+        key: &str,
+        desired: &SessionRuntimeSelection,
+    ) -> (MessageSubmissionRecord, RuntimeSwitchId, RuntimeBindingId) {
+        let (submission, switch_id) =
+            enqueue_with_committed_switch(db_path, session_id, key, desired);
+        let binding_id = RuntimeBindingId::new();
+        {
+            let conn = open_database(db_path).unwrap();
+            conn.execute(
+                "UPDATE runtime_switches SET target_binding_id = ?2 WHERE switch_id = ?1",
+                rusqlite::params![switch_id.as_str(), binding_id.as_str()],
+            )
+            .unwrap();
+        }
+        (submission, switch_id, binding_id)
+    }
+
     #[tokio::test]
     async fn prepared_submission_does_not_dispatch_until_wait_starts() {
         let db_path = temp_db_path("prepared-cancellation-fence");
@@ -2756,6 +2837,78 @@ mod tests {
             Some("message_submission_runtime_changed_after_commit")
         );
         assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 0);
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn committed_switch_settles_the_optional_controls_the_binding_dropped() {
+        let db_path = temp_db_path("committed-runtime-settled");
+        let initial = selection("gpt-5");
+        let desired = SessionRuntimeSelection {
+            reasoning_effort: Some("max".to_string()),
+            ..selection("gpt-5.1")
+        };
+        // The Agent has no reasoning dimension for this Model, so the commit
+        // drops the control the message named and keeps the route.
+        let settled = selection("gpt-5.1");
+        let session_id = seed_session(&db_path, "committed-runtime-settled", initial.clone());
+        let (coordinator, runtime, dispatcher) = harness(&db_path, &session_id, initial, false);
+        let (submission, _switch_id, target_binding_id) = enqueue_with_committed_switch_and_target(
+            &db_path,
+            &session_id,
+            "committed-runtime-settled",
+            &desired,
+        );
+        runtime.states.lock().unwrap().insert(
+            session_id.clone(),
+            AgentSessionRuntimeSelectionState {
+                desired: settled.clone(),
+                effective: settled.clone(),
+                status: SessionRuntimeSelectionStatus::Ready,
+                session_revision: 1,
+                selection_revision: 2,
+                current_binding_id: Some(target_binding_id),
+                activation_generation: 1,
+                pending_switch_id: None,
+                actionable_error: None,
+            },
+        );
+
+        tokio::time::timeout(
+            Duration::from_secs(1),
+            coordinator.drive_submission(&submission),
+        )
+        .await
+        .expect("a converged switch must release its submission")
+        .unwrap();
+
+        let ready = coordinator
+            .required_submission(&submission.submission_id)
+            .unwrap();
+        assert_eq!(
+            ready.status,
+            MessageSubmissionStatus::ReadyToDispatch,
+            "a control the Agent dropped is not a different runtime"
+        );
+        assert_eq!(ready.desired_runtime_selection, settled);
+        let payload = {
+            let conn = open_database(&db_path).unwrap();
+            MessageSubmissionRepository::get_payload(&conn, &submission.submission_id)
+                .unwrap()
+                .unwrap()
+        };
+        assert_eq!(
+            payload.request.desired_runtime, settled,
+            "the durable payload must name the runtime that will answer"
+        );
+        assert_eq!(payload.request.reasoning_effort, None);
+
+        coordinator.drive_submission(&ready).await.unwrap();
+        let completed = coordinator
+            .required_submission(&submission.submission_id)
+            .unwrap();
+        assert_eq!(completed.status, MessageSubmissionStatus::Completed);
+        assert_eq!(dispatcher.calls.load(Ordering::SeqCst), 1);
         cleanup_db(db_path);
     }
 

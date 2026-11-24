@@ -4706,6 +4706,15 @@ agent_message_submission_payloads(
   selection before classifying the submission: advance to Ready when the fresh state
   is Ready/effective at the requested runtime, and fail only when that fresh state
   still diverges.
+- The commit writes the selection the target binding converged on, not the one that
+  was requested: an optional control the Agent cannot express (Reasoning Effort, Mode,
+  a generic config value) is absent from the committed effective selection. That
+  settlement is not a different runtime. When the fresh state is Ready, still points
+  at this switch's own target binding, and names the same Agent, auth source and
+  Model, the message worker must adopt it: rewrite the durable submission and payload
+  through `normalize_runtime_selection`, then advance to `ReadyToDispatch`. A
+  different Agent, auth source or Model — or a switch that never recorded this target
+  binding — remains `message_submission_runtime_changed_after_commit`.
 - Runtime resolution may canonicalize an explicit control before the Ready gate
   (for example, Pi maps reasoning/mode values to `off` when the selected model
   does not advertise reasoning). When the resolved selection differs, the message

@@ -2078,6 +2078,12 @@ Remote history attach role  -> viewer
 - Terminal message submission failure -> clear pending Agent state but keep the
   captured user message visible until an authoritative matching row replaces it
   or an explicit cancellation removes it.
+- Terminal message submission status row -> every terminal outcome, `Failed`
+  included, paints the refusal icon and its dismiss (and, when the optimistic
+  draft is still held, retry) controls. A row that only offers `Cancelled` a
+  close button leaves a refused send with a spinner and no way out. Once the
+  row is observed terminal it also stops being polled: a terminal submission
+  has nothing left to observe, and re-reading it re-added the dismissed row.
 - Ambiguous message dispatch -> show uncertain delivery and never auto-resend.
 - User interrupt before initial prompt dispatch -> clear the optimistic turn and
   show no failure notification; do not claim that the provider was interrupted.

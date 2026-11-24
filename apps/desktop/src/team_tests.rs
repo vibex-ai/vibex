@@ -729,6 +729,72 @@ fn an_unsent_message_can_be_recovered_or_discarded(cx: &mut TestAppContext) {
     });
 }
 
+/// An unsent message's row is dismissed for good.
+///
+/// The row used to be gated on `Cancelled`, so the far more common outcome — a
+/// message the authority refused to send — was painted with a spinner and
+/// without a close button. It now belongs to the terminal outcomes, and closing
+/// it also releases the poll locator: a terminal submission has nothing left to
+/// observe, and re-reading it every half second put the closed row back.
+#[gpui::test]
+fn a_failed_submission_row_is_terminal_and_stops_being_polled(cx: &mut TestAppContext) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    cx.update(|window, cx| {
+        workbench.update(cx, |workbench, cx| {
+            let session_id = session(0).id.clone();
+            let mut state = MessageSubmissionState {
+                submission_id: MessageSubmissionId::new(),
+                session_id: session_id.clone(),
+                message_idempotency_key: "submission-terminal".to_string(),
+                submission_sequence: 1,
+                desired_runtime: selection("root-model"),
+                required_switch_id: None,
+                status: MessageSubmissionStatus::Failed,
+                user_message_timeline_item_id: None,
+                error_code: Some("message_submission_runtime_changed_after_commit".to_string()),
+                error_detail_redacted: Some("required runtime is no longer effective".to_string()),
+                created_at_ms: 1,
+                updated_at_ms: 2,
+                dispatched_at_ms: None,
+            };
+            workbench
+                .composer_submission_locators
+                .push(ComposerSubmissionLocator {
+                    session_id: session_id.clone(),
+                    message_idempotency_key: state.message_idempotency_key.clone(),
+                });
+            assert!(
+                composer_submission_row_is_terminal(state.status),
+                "a refused send is a finished outcome, not a spinner"
+            );
+
+            // The first poll read both records the message and settles the row.
+            workbench.apply_submission_states(vec![state.clone()], window, cx);
+            assert!(
+                workbench.composer_submission_locators.is_empty(),
+                "a terminal submission must stop being polled"
+            );
+            assert_eq!(workbench.composer_submission_states, vec![state.clone()]);
+
+            // Closing the row takes it out of the composer and keeps it gone.
+            workbench.dismiss_submission_status(state.message_idempotency_key.clone(), cx);
+            assert!(workbench.composer_submission_states.is_empty());
+            workbench.apply_submission_states(Vec::new(), window, cx);
+            assert!(
+                workbench.composer_submission_states.is_empty(),
+                "a dismissed terminal row must not come back on the next tick"
+            );
+
+            // A cancelled submission is still terminal, and an in-flight one
+            // still shows the spinner the reader is waiting on.
+            state.status = MessageSubmissionStatus::Cancelled;
+            assert!(composer_submission_row_is_terminal(state.status));
+            state.status = MessageSubmissionStatus::AwaitingRuntime;
+            assert!(!composer_submission_row_is_terminal(state.status));
+        });
+    });
+}
+
 /// Moving a message in front of a schedule makes it the head, and a session
 /// that is already settled sends it without waiting for the deadline that used
 /// to stand in front of it.
