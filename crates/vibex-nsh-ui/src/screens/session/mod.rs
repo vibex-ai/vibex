@@ -2314,11 +2314,14 @@ struct Rail {
 
 /// The strip the transcript fades out in at one of its edges.
 fn edge_fade(top: bool) -> impl IntoElement {
+    // The strip fades the page's own tone, which is the tone the conversation
+    // is drawn on: a fade from the flat background left a paler band at each
+    // end of the list wherever the page took its stepped tone.
     edge_fade_between(
         top,
         theme::SPACING_MD,
-        theme::background_adaptive,
-        theme::background_clear_adaptive,
+        theme::page_adaptive,
+        theme::page_clear_adaptive,
     )
 }
 

@@ -456,7 +456,12 @@ fn appearance_from_storage(value: &str) -> Appearance {
     match value {
         "light" => Appearance::Light,
         "dark" => Appearance::Dark,
-        _ => Appearance::System,
+        "system" => Appearance::System,
+        // Nothing stored yet, or a value from a build that wrote none: the app
+        // paints a light page, so it starts light. Following the system here
+        // left a phone in dark mode drawing white status-bar glyphs over that
+        // light page, since the bar reads the appearance and the page does not.
+        _ => Appearance::Light,
     }
 }
 
