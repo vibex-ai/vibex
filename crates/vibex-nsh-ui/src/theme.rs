@@ -467,6 +467,25 @@ pub fn raised() -> Hsla {
     }
 }
 
+/// The pane a control floats in over the conversation.
+///
+/// Not a surface of its own: a translucent wash of the page's own tone, so what
+/// scrolls under it still shows through and the bar reads as glass rather than
+/// as a strip cut out of the page. Its hairline and shadow are what keep it
+/// legible over a message.
+pub fn floating_pane() -> Hsla {
+    // The page tone, nearly opaque: enough of the message under it shows to
+    // know something is passing, not so much that the glyph competes with it.
+    let page = background();
+    page.alpha(if dark() { 0.72 } else { 0.80 })
+}
+
+/// The hairline around a [`floating_pane`]: the edge that says where the pane
+/// ends over a busy background.
+pub fn floating_pane_edge() -> Hsla {
+    foreground().alpha(if dark() { 0.10 } else { 0.07 })
+}
+
 /// The scrim under a floating menu.
 pub fn menu_scrim() -> Hsla {
     backdrop(if dark() { 0.5 } else { 0.28 })
@@ -507,9 +526,6 @@ pub const SIDEBAR_PROJECT_SESSION_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 pub const SIDEBAR_WORKSPACE_SESSION_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
 /// Indent of the rows filed inside a folder.
 pub const SIDEBAR_FOLDER_CHILD_INDENT: f32 = SIDEBAR_CHEVRON_SLOT;
-/// Where a folder draws the guide down its child column: under the middle of
-/// its own disclosure.
-pub const SIDEBAR_FOLDER_GUIDE_OFFSET: f32 = SIDEBAR_ROW_INSET + SIDEBAR_ICON_SLOT / 2.0;
 /// The radius of a row's plate.
 pub const SIDEBAR_ROW_RADIUS: f32 = 12.0;
 /// The radius of the card around a worktree and its sessions.
@@ -525,7 +541,10 @@ pub const SIDEBAR_STATUS_DOT: f32 = 8.0;
 /// The unread dot, deliberately smaller than a status dot.
 pub const SIDEBAR_UNREAD_DOT: f32 = 7.0;
 /// The glyphs trailing a row: a pin, a pause, a schedule.
-pub const SIDEBAR_META_ICON: f32 = 13.0;
+///
+/// The desktop's own size (`icons/*.svg` at 14 in its sidebar rows), so the
+/// two clients draw the same marks at the same weight.
+pub const SIDEBAR_META_ICON: f32 = 14.0;
 /// The round control at the end of a project or worktree row.
 pub const SIDEBAR_ROW_ACTION: f32 = 28.0;
 /// The mark a row wears while sessions are being selected.
@@ -563,6 +582,22 @@ pub fn sidebar_bg() -> Hsla {
 /// The plate of the selected row on a side page.
 pub fn sidebar_selected_bg() -> Hsla {
     color_token("sidebar-accent")
+}
+
+/// The plate of the session the drawer has open.
+///
+/// The accent alone is too quiet against the page: in the light palette it is
+/// barely a shade off the sidebar, and the open row read as no row at all.
+/// The desktop moves it away from the page — up in the dark palette, down in
+/// the light one — so the chosen row is the one the eye lands on. The steps
+/// are the desktop's own, so the two clients pick the same row out of a list.
+pub fn sidebar_open_row_bg() -> Hsla {
+    let accent = color_token("sidebar-accent");
+    if dark() {
+        accent.lighten(0.24)
+    } else {
+        accent.darken(0.04)
+    }
 }
 
 /// Tool glyphs and the footer's label.

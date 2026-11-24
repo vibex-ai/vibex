@@ -52,7 +52,6 @@ pub struct SidebarRowView {
     pub detail: String,
     pub metadata: String,
     pub indent: f32,
-    pub guides: Vec<f32>,
     pub card: Option<SidebarCardSlice>,
     pub count: usize,
     pub project_mark: Option<(ImageSrc, Hsla)>,
@@ -374,7 +373,6 @@ fn row_item(
     );
     let card = row.card.clone();
     let in_card = card.is_some();
-    let card_indent = card.as_ref().map(|card| card.indent);
     let card_inset = if in_card {
         theme::SIDEBAR_CARD_INSET
     } else {
@@ -613,26 +611,6 @@ fn row_item(
         .transition_transform()
         .duration(160.0)
         .opacity(move || if is_carried.get() { 0.0_f32 } else { 1.0 })
-        // An open folder's children hang from a line centred under its
-        // icon, right where the leading chevron used to be.
-        .children(
-            (row.kind == SidebarRowKind::Folder && !row.collapsed).then(|| {
-                view()
-                    .absolute()
-                    .left(px(inset
-                        + row.indent
-                        + card_inset
-                        + theme::SIDEBAR_ROW_INSET
-                        + theme::SIDEBAR_ICON_SLOT / 2.0))
-                    .top(px(
-                        theme::sidebar_row_height() / 2.0 + theme::SIDEBAR_PROJECT_LOGO_SIZE / 2.0
-                    ))
-                    .bottom(px(0.0))
-                    .w(px(1.0))
-                    .bg(theme::sidebar_tree_guide())
-                    .pointer_events(PointerEvents::None)
-            }),
-        )
         .children(card.into_iter().map(|card| {
             // One row's slice of the card a worktree shares with its sessions.
             view()
@@ -658,25 +636,13 @@ fn row_item(
                 })
                 .pointer_events(PointerEvents::None)
         }))
-        .children(row.guides.iter().map(|guide| {
-            // A guide that starts inside the card moves in with its rows.
-            let shift = if card_indent.is_some_and(|indent| *guide >= indent) {
-                theme::SIDEBAR_CARD_INSET
-            } else {
-                0.0
-            };
-            view()
-                .absolute()
-                .top_0()
-                .bottom_0()
-                .left(px(inset + guide + shift))
-                .w(px(1.0))
-                .bg(theme::sidebar_tree_guide)
-                .pointer_events(PointerEvents::None)
-        }))
         .child(
-            // The plate: the open session's is raised off the page, or sunk
-            // into the card it is already on.
+            // The plate: the open session's is raised off the page, or set
+            // into the card it is already on. Both take the sidebar's accent
+            // moved away from the page, because the surface they used to take
+            // — the page's card — is within a hair of the sidebar itself, and
+            // the open row read as no row at all. Only the one off a card is
+            // raised: inside one, a shadow would sit on the card's own edge.
             view()
                 .ml(px(row.indent + card_inset))
                 .mr(px(card_inset))
@@ -686,9 +652,11 @@ fn row_item(
                 .items_center()
                 .rounded(px(theme::SIDEBAR_ROW_RADIUS))
                 .when(active && !in_card, |plate| {
-                    plate.bg(theme::block_surface).shadow_xs()
+                    plate.bg(theme::sidebar_open_row_bg()).shadow_xs()
                 })
-                .when(active && in_card, |plate| plate.bg(theme::sidebar_well))
+                .when(active && in_card, |plate| {
+                    plate.bg(theme::sidebar_open_row_bg())
+                })
                 .style_when(
                     move || dragging.get() || is_carried.get(),
                     |style| style.bg(theme::sidebar_well()),
@@ -998,10 +966,12 @@ fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement 
         .ml(px(theme::SPACING_SM))
         .flex_shrink_0();
     if row.pinned {
+        // The pin is the one trailing mark in colour: the desktop paints it in
+        // the attention yellow so a kept row stands out of the quiet column.
         row_view = row_view.child(
             svg(icon!("pin"))
                 .size(px(theme::SIDEBAR_META_ICON))
-                .text_color(muted)
+                .text_color(theme::accent_yellow)
                 .label(copy::text("Pinned", "已置顶", "已釘選")),
         );
     }
@@ -1025,19 +995,29 @@ fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement 
         row.state
     };
     row_view = match state {
+        // The desktop's own colours: a working session pulses in the primary
+        // accent, and green once it will keep going by itself. The phone had
+        // its own pair here — blue and purple — which read as two states the
+        // desktop does not have.
         Some(SessionState::Running) => row_view.child(activity_ring(
             clock,
             if row.auto_continue {
-                theme::accent_purple
+                theme::accent_green
             } else {
-                theme::accent_blue
+                theme::primary
             },
         )),
+        // The desktop answers this state with its question-mark icon rather
+        // than a typed glyph, so the two clients draw the same mark.
         Some(SessionState::Waiting) => row_view.child(
-            text("?")
-                .text_size(px(theme::font_sidebar_meta()))
-                .font_weight(FontWeight::BOLD)
-                .text_color(theme::accent_yellow),
+            svg(icon!("circle-question-mark"))
+                .size(px(theme::SIDEBAR_META_ICON))
+                .text_color(theme::accent_yellow)
+                .label(copy::text(
+                    "Waiting for your approval or input",
+                    "等待你的确认或输入",
+                    "等待你的確認或輸入",
+                )),
         ),
         Some(SessionState::Failed) => row_view.child(
             view()
@@ -1053,11 +1033,14 @@ fn row_metadata(row: &SidebarRowView, clock: ActivityClock) -> impl IntoElement 
         _ => row_view,
     };
     if row.unread {
+        // The desktop's unread dot is the primary accent, not a hue of its
+        // own: it is the same blue the working mark takes, so "new" and
+        // "running" belong to one family.
         row_view = row_view.child(
             view()
                 .size(px(theme::SIDEBAR_UNREAD_DOT))
                 .rounded_full()
-                .bg(theme::accent_blue),
+                .bg(theme::primary),
         );
     }
     row_view
