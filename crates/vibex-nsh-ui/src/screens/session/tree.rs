@@ -331,6 +331,10 @@ fn row_item(
             | SidebarRowKind::Folder
             | SidebarRowKind::Group
     );
+    // Folder and group rows take the list's smaller title step, the same
+    // one the sessions under them use, so the tree's row titles read as one
+    // size below the project and workspace scopes.
+    let is_nested = matches!(row.kind, SidebarRowKind::Folder | SidebarRowKind::Group);
     let adds_sessions = matches!(
         row.kind,
         SidebarRowKind::Project | SidebarRowKind::Workspace
@@ -350,7 +354,7 @@ fn row_item(
     let dragging = signal(false);
     let main_action = {
         let row = row.clone();
-        let toggle = actions.toggle;
+        let toggle = actions.toggle.clone();
         let select = actions.select;
         move || {
             if !is_session {
@@ -404,13 +408,18 @@ fn row_item(
     let start_drag = {
         let mark = logo.clone();
         let title: SharedString = row.title.clone().into();
-        let title_size = if is_session || is_empty {
+        let title_size = if is_session || is_empty || is_nested {
             theme::font_detail()
         } else {
             theme::font_sidebar_row()
         };
         let trailing: SharedString = row_trailing(&row).into();
         let key = key.clone();
+        // A folder or group dragged while open collapses first: the drag
+        // carries one row, and the row cannot be dropped into the space its
+        // own children used to occupy.
+        let toggle = actions.toggle.clone();
+        let drag_row = row.clone();
         move || {
             let Some(top) = state.menu.with_untracked(|menu| {
                 menu.as_ref()
@@ -419,6 +428,9 @@ fn row_item(
             }) else {
                 return;
             };
+            if is_nested && !drag_row.collapsed {
+                toggle(&drag_row);
+            }
             state.scroll_travel.set(0.0);
             state.auto_scroll.set(0.0);
             state.drag.set(Some(DraggedRow {
@@ -742,15 +754,19 @@ fn row_item(
                                                 .overflow_hidden()
                                                 .truncate()
                                                 // A session's name is the
-                                                // list's prose; the scopes
-                                                // above it keep the larger
-                                                // step, so the tree's shape
-                                                // still reads at a glance.
-                                                .text_size(px(if is_empty || is_session {
-                                                    theme::font_detail()
-                                                } else {
-                                                    theme::font_sidebar_row()
-                                                }))
+                                                // list's prose; the folders
+                                                // and groups that hold them
+                                                // take the same step, while
+                                                // the project and workspace
+                                                // scopes above keep the
+                                                // larger one.
+                                                .text_size(px(
+                                                    if is_empty || is_session || is_nested {
+                                                        theme::font_detail()
+                                                    } else {
+                                                        theme::font_sidebar_row()
+                                                    },
+                                                ))
                                                 .font_weight(if is_container {
                                                     FontWeight::MEDIUM
                                                 } else {
