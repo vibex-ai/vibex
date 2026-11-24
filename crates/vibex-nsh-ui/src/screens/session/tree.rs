@@ -1,4 +1,4 @@
-use std::rc::Rc;
+use std::{cell::Cell, rc::Rc};
 
 use nsh_base::button;
 use nsh_core::{
@@ -15,6 +15,10 @@ use crate::{
         surface,
     },
 };
+
+/// How far a held row must travel before the drag takes the touches, so a
+/// hand that rests on the row keeps it for the menu.
+const DRAG_SLOP: f32 = 8.0;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
 pub enum SidebarRowKind {
@@ -241,22 +245,65 @@ fn row_item(
             }
         }
     };
-    // A row's commands are behind a long press: the row itself stays a title
-    // and what trails it.
-    let on_menu = {
+    // A row's commands are behind a press held still, and a drag that
+    // follows the hold moves the row. Holding arms it; releasing without a
+    // drag raises the menu. This is the desktop sidebar's gesture: the row
+    // travels with the same measure, and the menu waits for a still finger.
+    let held = signal(false);
+    let row_top = signal(0.0);
+    let traveled = Rc::new(Cell::new(0.0f32));
+    let on_hold = move |event: &PressEvent| {
+        if !state.select_mode.get_untracked() {
+            crate::motion::tick();
+            held.set(true);
+            // Where the row's top is, not where the finger is: the menu
+            // stands against the row itself. The press lands in the row's
+            // inner content, which starts one row gap below its top.
+            row_top.set(event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP);
+        }
+    };
+    let on_hold_released = {
         let menu = actions.menu.clone();
         let row = row.clone();
-        move |event: &PressEvent| {
-            if !state.select_mode.get_untracked() {
-                crate::motion::tick();
-                // Where the row's top is, not where the finger is: the menu
-                // stands against the row itself. The press lands in the row's
-                // inner content, which starts one row gap below its top.
-                menu(
-                    &row,
-                    event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP,
-                );
+        move |_: &PressEvent| {
+            if held.get_untracked() && !dragging.get_untracked() {
+                menu(&row, row_top.get_untracked());
             }
+            held.set(false);
+        }
+    };
+    let on_drag_move = {
+        let travel = traveled.clone();
+        move |event: &ResponderEvent| {
+            if dragging.get_untracked() {
+                travel.set(event.gesture.delta.y.0);
+            }
+        }
+    };
+    let on_drag_end = {
+        let menu_row = row.clone();
+        let move_row = actions.move_row.clone();
+        let travel = traveled.clone();
+        move |_: &ResponderEvent| {
+            let moved = travel.replace(0.0);
+            if dragging.get_untracked() {
+                dragging.set(false);
+                move_row(&menu_row, moved);
+            }
+            held.set(false);
+        }
+    };
+    let on_drag_cancelled = {
+        let travel = traveled.clone();
+        move |_: &ResponderEvent| {
+            travel.set(0.0);
+            dragging.set(false);
+            held.set(false);
+        }
+    };
+    let on_drag_claim = move |request: &ClaimRequest| {
+        if held.get_untracked() && request.event.gesture.delta.y.0.abs() > DRAG_SLOP {
+            request.claim();
         }
     };
     let (logo, logo_color) = row.project_mark.clone().unwrap_or_else(|| {
@@ -342,7 +389,7 @@ fn row_item(
                 })
                 .when(active && in_card, |plate| plate.bg(theme::sidebar_well))
                 .style_when(
-                    move || dragging.get(),
+                    move || dragging.get() || held.get(),
                     |style| style.bg(theme::sidebar_well()),
                 )
                 .child(when(scope_selection, {
@@ -403,7 +450,20 @@ fn row_item(
                                 .focusable(true)
                                 .active(|style| style.bg(theme::row_pressed_bg()))
                                 .on_press(main_action)
-                                .on_long_press(on_menu)
+                                .on_long_press(on_hold)
+                                .on_press_up(on_hold_released)
+                                // The drag takes the touches from the list
+                                // only once a held row moves; a scroll that
+                                // starts on a row still scrolls.
+                                .claim_touches(TouchClaim::on_move().ask(on_drag_claim))
+                                .on_responder_grant(move |_: &ResponderEvent| {
+                                    if held.get_untracked() {
+                                        dragging.set(true);
+                                    }
+                                })
+                                .on_responder_move(on_drag_move)
+                                .on_responder_release(on_drag_end)
+                                .on_responder_terminate(on_drag_cancelled)
                         })
                         .child(when(
                             move || !scope_selection(),
@@ -480,7 +540,12 @@ fn row_item(
                                                 .max_w(relative(1.0))
                                                 .overflow_hidden()
                                                 .truncate()
-                                                .text_size(px(if is_empty {
+                                                // A session's name is the
+                                                // list's prose; the scopes
+                                                // above it keep the larger
+                                                // step, so the tree's shape
+                                                // still reads at a glance.
+                                                .text_size(px(if is_empty || is_session {
                                                     theme::font_detail()
                                                 } else {
                                                     theme::font_sidebar_row()

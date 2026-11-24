@@ -1405,7 +1405,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 .truncate()
                                 .min_w(px(0.0))
                                 .flex_shrink(1.0)
-                                .text_size(px(theme::font_micro()))
+                                .text_size(px(theme::font_detail()))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
                         )
