@@ -7,7 +7,7 @@ use std::{
 use nsh_base::button;
 use nsh_core::{
     AccessibilityRole,
-    element::{ImageSrc, Position},
+    element::{ImageSrc, Position, Scrollable},
     prelude::*,
 };
 
@@ -16,7 +16,7 @@ use crate::{
     copy, theme,
     ui::{
         activity::{ActivityClock, activity_ring},
-        surface,
+        menu, surface,
     },
 };
 
@@ -154,6 +154,9 @@ pub(super) struct TreeState {
     pub locate: Signal<Option<String>>,
     /// The row a finger is carrying, shared with the page that draws it.
     pub drag: Signal<Option<DraggedRow>>,
+    /// The menu the page has raised, so a press on the very row it is about
+    /// puts it away instead of acting on the row.
+    pub menu: Signal<Option<menu::Menu>>,
 }
 
 pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
@@ -182,6 +185,14 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
                 )
             })
         })
+    });
+    // The list stays still while one of its rows is about to be carried: a
+    // menu that is up, or a row already in hand, owns the gesture.
+    let list_locked = computed(move || {
+        state.drag.with(Option::is_some)
+            || state
+                .menu
+                .with(|menu| menu.as_ref().is_some_and(|menu| menu.row.is_some()))
     });
     effect(move || {
         if let Some(id) = state.locate.get()
@@ -253,6 +264,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             })
             .estimated_item_size(px(theme::sidebar_row_height()))
             .element_ref(&list_ref)
+            .scrollable(move || !list_locked.get())
             .flex_1(),
         )
 }
@@ -348,6 +360,10 @@ fn row_item(
         let toggle = actions.toggle;
         let select = actions.select;
         move || {
+            if state.menu.with_untracked(Option::is_some) {
+                menu::dismiss(state.menu);
+                return;
+            }
             if !is_session {
                 toggle(&row);
             } else if state.select_mode.get_untracked() {
