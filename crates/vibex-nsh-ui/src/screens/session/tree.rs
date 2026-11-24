@@ -249,7 +249,13 @@ fn row_item(
         move |event: &PressEvent| {
             if !state.select_mode.get_untracked() {
                 crate::motion::tick();
-                menu(&row, event.page_position.y.0);
+                // Where the row's top is, not where the finger is: the menu
+                // stands against the row itself. The press lands in the row's
+                // inner content, which starts one row gap below its top.
+                menu(
+                    &row,
+                    event.page_position.y.0 - event.position.y.0 - theme::SIDEBAR_ROW_GAP,
+                );
             }
         }
     };

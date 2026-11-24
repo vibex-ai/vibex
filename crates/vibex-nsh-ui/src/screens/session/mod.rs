@@ -6471,6 +6471,37 @@ fn drawer_batch_action(
         )
 }
 
+/// What a lifted row shows over the scrim: the mark it leads with, its title,
+/// and what trails it in the list.
+fn menu_row(row: &SidebarRowView, top: f32) -> menu::MenuRow {
+    let mark = row.project_mark.clone().map(|(mark, _)| mark).or_else(|| {
+        Some(match row.kind {
+            SidebarRowKind::Project => icon!("boxes"),
+            SidebarRowKind::Workspace => icon!("git-branch"),
+            SidebarRowKind::Folder if row.collapsed => icon!("folder"),
+            SidebarRowKind::Folder => icon!("folder-open"),
+            SidebarRowKind::Group => icon!("layers"),
+            SidebarRowKind::Session | SidebarRowKind::EmptyWorkspace => {
+                icon(agent_icon(&row.detail))
+            }
+        })
+    });
+    let trailing = if !row.metadata.is_empty() {
+        row.metadata.clone()
+    } else if row.count > 0 {
+        row.count.to_string()
+    } else {
+        String::new()
+    };
+    menu::MenuRow {
+        top,
+        height: theme::sidebar_row_height(),
+        mark,
+        title: row.title.clone().into(),
+        trailing: trailing.into(),
+    }
+}
+
 fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
     let menu = overlays.menu;
     let sessions = host.sessions;
@@ -6678,7 +6709,9 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     }
                     SidebarRowKind::EmptyWorkspace => return,
                 };
-                menu.set(Some(raised));
+                // The row is lifted with the menu, so the card stands against
+                // the thing it is about rather than beside the finger.
+                menu.set(Some(raised.from_row(menu_row(row, anchor))));
             })
         },
         move_row: host.sidebar.on_move_row.clone(),

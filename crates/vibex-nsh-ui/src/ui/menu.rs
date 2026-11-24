@@ -1,9 +1,9 @@
 //! The floating menu a long press raises.
 //!
-//! A row's commands are not on the row. Holding it dims the page and raises a
-//! card beside the finger: what was pressed at its head, then one command a
-//! line, the word on the leading side and its glyph on the trailing one. A
-//! press anywhere else puts it away.
+//! A row's commands are not on the row. Holding it lifts the row out of the
+//! page, blurs what lies around it and stands a card against the row's near
+//! edge: one command a line, the word on the leading side and its glyph on the
+//! trailing one. A press anywhere else puts it away.
 //!
 //! The menu is a snapshot: its entries are decided when it is raised, since
 //! nothing under a modal layer changes while it is up.
@@ -15,12 +15,18 @@ use nsh_core::{AccessibilityRole, element::ImageSrc, prelude::*};
 
 use crate::{copy, motion, theme};
 
-/// How far from the press the card stands.
+/// How far from the press a menu with no row stands.
 const MENU_OFFSET: f32 = 26.0;
 /// The card's distance from the screen's edges.
 const MENU_MARGIN: f32 = 16.0;
-/// The line that names what the menu is about.
-const MENU_HEADER_HEIGHT: f32 = 54.0;
+/// The inset a card keeps when it answers a row of the page.
+const MENU_ATTACH_INSET: f32 = 12.0;
+/// The gap between the card and the row it answers.
+const MENU_ATTACH_GAP: f32 = 8.0;
+/// How much a lifted row grows past its place in the list.
+const LIFTED_ROW_GROWTH: f32 = 2.0;
+/// How far the page behind a menu is blurred.
+const MENU_BLUR: f32 = 14.0;
 /// How long the scrim takes to come up.
 const MENU_FADE_MS: f32 = 140.0;
 
@@ -66,18 +72,29 @@ impl MenuEntry {
     }
 }
 
-/// A raised menu: where it was asked for, what it is about and what it offers.
+/// The row a long press lifted: where it stands, and what it says.
+#[derive(Clone)]
+pub struct MenuRow {
+    /// How far down the page the row's top edge is.
+    pub top: f32,
+    /// The row's height.
+    pub height: f32,
+    /// The mark the row leads with.
+    pub mark: Option<ImageSrc>,
+    /// Its title.
+    pub title: SharedString,
+    /// What trails the title: when it was last touched, how many it holds.
+    pub trailing: SharedString,
+}
+
+/// A raised menu: where it was asked for and what it offers.
 #[derive(Clone, Default)]
 pub struct Menu {
     /// How far down the page the press landed.
     pub anchor: f32,
     pub side: MenuSide,
-    /// The mark of what was pressed.
-    pub mark: Option<ImageSrc>,
-    /// Its name; empty for a menu that belongs to the page itself.
-    pub title: SharedString,
-    /// The line under the name: what kind of thing it is.
-    pub caption: SharedString,
+    /// The row that raised the menu, when a long press did.
+    pub row: Option<MenuRow>,
     pub entries: Vec<MenuEntry>,
     /// Hears the menu being put away without a command.
     dismissed: Option<Rc<dyn Fn()>>,
@@ -97,16 +114,9 @@ impl Menu {
         self
     }
 
-    /// Names what the menu is about.
-    pub fn about(
-        mut self,
-        mark: Option<ImageSrc>,
-        title: impl Into<SharedString>,
-        caption: impl Into<SharedString>,
-    ) -> Self {
-        self.mark = mark;
-        self.title = title.into();
-        self.caption = caption.into();
+    /// Lifts `row` out of the page and stands the card against its near edge.
+    pub fn from_row(mut self, row: MenuRow) -> Self {
+        self.row = Some(row);
         self
     }
 
@@ -160,31 +170,40 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
     let Menu {
         anchor,
         side,
-        mark,
-        title,
-        caption,
+        row,
         entries,
         dismissed: _,
     } = current;
-    let headed = !title.is_empty();
-    // The rows, the line that names them, and the card's own edge.
-    let content = entries.len() as f32 * theme::MENU_ROW_HEIGHT
-        + if headed { MENU_HEADER_HEIGHT } else { 0.0 }
-        + 2.0;
+    // The rows and the card's own edge.
+    let content = entries.len() as f32 * theme::MENU_ROW_HEIGHT + 2.0;
     // The room between the status bar and the home indicator.
     let bounds = || {
         let floor = safe_area().top.0 + MENU_MARGIN;
         let ceiling = window().height.0 - safe_area().bottom.0 - MENU_MARGIN;
         (floor, ceiling.max(floor + theme::MENU_ROW_HEIGHT))
     };
+    let attached = row.is_some();
+    let row_for_top = row.clone();
     let height = move || {
         let (floor, ceiling) = bounds();
         content.min(ceiling - floor)
     };
-    // Under the press where there is room, over it where there is not.
+    // A lifted row puts the card against its near edge: under the row while
+    // the room below it holds the card, over it when it does not. A menu with
+    // no row follows the press instead.
     let top = move || {
         let (floor, ceiling) = bounds();
         let height = height();
+        if let Some(row) = row_for_top.as_ref() {
+            let card_top = row.top - LIFTED_ROW_GROWTH;
+            let card_bottom = row.top + row.height + LIFTED_ROW_GROWTH;
+            let below = card_bottom + MENU_ATTACH_GAP;
+            if below + height <= ceiling {
+                return px(below);
+            }
+            let above = card_top - MENU_ATTACH_GAP - height;
+            return px(above.min((ceiling - height).max(floor)).max(floor));
+        }
         let below = anchor + MENU_OFFSET;
         let top = if below + height <= ceiling {
             below
@@ -193,15 +212,22 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
         };
         px(top.clamp(floor, (ceiling - height).max(floor)))
     };
-    let width = || (window().width.0 - MENU_MARGIN * 2.0).clamp(1.0, theme::MENU_WIDTH);
-    let left = move || {
-        let room = window().width.0;
-        px(match side {
-            MenuSide::Leading => MENU_MARGIN + theme::SPACING_SM,
-            MenuSide::Center => (room - width()) / 2.0,
-            MenuSide::Trailing => room - width() - MENU_MARGIN,
+    let width = move || {
+        if attached {
+            return (window().width.0 - MENU_ATTACH_INSET * 2.0).max(1.0);
         }
-        .max(MENU_MARGIN))
+        (window().width.0 - MENU_MARGIN * 2.0).clamp(1.0, theme::MENU_WIDTH)
+    };
+    let left = move || {
+        if attached {
+            return MENU_ATTACH_INSET;
+        }
+        match side {
+            MenuSide::Leading => MENU_MARGIN + theme::SPACING_SM,
+            MenuSide::Center => (window().width.0 - width()) / 2.0,
+            MenuSide::Trailing => window().width.0 - width() - MENU_MARGIN,
+        }
+        .max(MENU_MARGIN)
     };
     let reveal = animated_value(if motion::reduce_motion() { 1.0 } else { 0.0 });
     if !motion::reduce_motion() {
@@ -233,7 +259,7 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
             .flex_row()
             .items_center()
             .gap(px(theme::SPACING_MD))
-            .when(index > 0 || headed, |row| {
+            .when(index > 0, |row| {
                 row.border_t_1().border_t_color(theme::hairline)
             })
             .active(|style| style.bg(theme::row_pressed_bg()))
@@ -256,6 +282,50 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
                     .text_color(glyph),
             )
     });
+    // The row itself, lifted over the scrim: the page behind it is blurred,
+    // and this is what the reader pressed, a shade larger than its place.
+    let lifted_card = row.map(|row| {
+        let mut card = view()
+            .absolute()
+            .top(px(row.top - LIFTED_ROW_GROWTH))
+            .left(px(MENU_ATTACH_INSET))
+            .w(move || px((window().width.0 - MENU_ATTACH_INSET * 2.0).max(1.0)))
+            .h(px(row.height + LIFTED_ROW_GROWTH * 2.0))
+            .rounded(px(theme::RADIUS_GROUP))
+            .bg(theme::block_surface)
+            .shadow_lg()
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACING_MD))
+            .px(px(theme::SPACING_LG))
+            // The card is the row's picture, not a control: a press on it
+            // dismisses the menu like a press beside it.
+            .pointer_events(PointerEvents::None)
+            .bind_opacity(&reveal);
+        if let Some(mark) = row.mark {
+            card = card.child(
+                svg(mark)
+                    .size(px(theme::ICON_MD))
+                    .flex_shrink_0()
+                    .text_color(theme::text_secondary),
+            );
+        }
+        card.child(
+            text(row.title)
+                .flex_1()
+                .min_w(px(0.0))
+                .truncate()
+                .text_size(px(theme::font_body()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::foreground),
+        )
+        .children((!row.trailing.is_empty()).then(|| {
+            text(row.trailing)
+                .flex_shrink_0()
+                .text_size(px(theme::font_micro()))
+                .text_color(theme::text_muted)
+        }))
+    });
     view()
         .absolute()
         .inset(px(0.0))
@@ -264,6 +334,7 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
                 .absolute()
                 .inset(px(0.0))
                 .bg(theme::menu_scrim)
+                .backdrop_blur(px(MENU_BLUR))
                 .bind_opacity(&reveal)
                 .role(AccessibilityRole::Button)
                 .label(copy::text("Dismiss menu", "关闭菜单", "關閉選單"))
@@ -272,11 +343,12 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
                     dismiss(menu);
                 }),
         )
+        .children(lifted_card)
         .child(
             view()
                 .absolute()
                 .top(top)
-                .left(left)
+                .left(move || px(left()))
                 .w(move || px(width()))
                 .max_h(move || px(height()))
                 .flex_col()
@@ -290,41 +362,6 @@ fn layer(menu: Signal<Option<Menu>>, current: Menu) -> impl IntoElement {
                 // The card takes its own touches: a press between two rows
                 // must not fall through to the scrim.
                 .on_press(|| {})
-                .children(headed.then(|| {
-                    view()
-                        .w_full()
-                        .h(px(MENU_HEADER_HEIGHT))
-                        .flex_shrink_0()
-                        .px(px(theme::SPACING_LG))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_MD))
-                        .children(mark.map(|mark| {
-                            svg(mark)
-                                .size(px(theme::ICON_MD))
-                                .flex_shrink_0()
-                                .text_color(theme::text_secondary)
-                        }))
-                        .child(
-                            view()
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .flex_col()
-                                .child(
-                                    text(title)
-                                        .truncate()
-                                        .text_size(px(theme::font_detail()))
-                                        .font_weight(FontWeight::SEMIBOLD)
-                                        .text_color(theme::foreground),
-                                )
-                                .children((!caption.is_empty()).then(|| {
-                                    text(caption)
-                                        .truncate()
-                                        .text_size(px(theme::font_hint()))
-                                        .text_color(theme::text_muted)
-                                })),
-                        )
-                }))
                 .child(
                     scroll()
                         .flex_shrink(1.0)
