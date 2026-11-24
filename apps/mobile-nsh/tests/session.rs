@@ -205,19 +205,20 @@ fn TurnShell() -> impl IntoElement {
         row_id: tool.id.clone(),
         deleted: false,
     });
-    host.timeline = signal(vec![
-        user,
-        header,
-        tool,
-        permission,
-        changes,
-        entry(
-            "a1",
-            EntryKind::Agent,
-            "Claude",
-            "![shot](https://example.com/shot.png)\nDone",
-        ),
-    ]);
+    // The answer is the turn's conclusion, so it is the row that carries the
+    // actions; the process rows above it are the Agent's working notes.
+    // A process row: the Agent thinking aloud between tool calls. It is prose
+    // alone — no name above it, no actions under it.
+    let mut process = entry("pr1", EntryKind::Agent, "Claude", "Checking the build first.");
+    process.turn_id = "t1".to_owned();
+    let mut answer = entry(
+        "a1",
+        EntryKind::Agent,
+        "Claude",
+        "![shot](https://example.com/shot.png)\nDone",
+    );
+    answer.conclusion = true;
+    host.timeline = signal(vec![user, header, process, tool, permission, changes, answer]);
     session::session(host)
 }
 
@@ -460,12 +461,15 @@ fn OlderShell() -> impl IntoElement {
     // be scrolled, and the older page is asked for by scrolling.
     let mut entries = Vec::new();
     for index in 0..24 {
-        entries.push(entry(
+        // Each is a turn's answer, the row the reader came for.
+        let mut answer = entry(
             &format!("s1:pad:{index}"),
             EntryKind::Agent,
             "Claude",
             &format!("A paragraph of history, number {index}, long enough to take a row or two of the transcript."),
-        ));
+        );
+        answer.conclusion = true;
+        entries.push(answer);
     }
     host.timeline = signal(entries);
     // The app's own seam: asking for the older page puts the strip up while the
@@ -2712,4 +2716,31 @@ fn the_conversation_header_raises_itself_when_its_menu_opens() {
         after.len() > before.len(),
         "the header is lifted into a card: {before:?} -> {after:?}"
     );
+}
+
+#[test]
+fn a_process_row_is_its_prose_without_a_name_or_actions() {
+    let mut config = EngineConfig::new(Root::of::<TurnShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Worked for 2s").unwrap();
+    // The turn's answer carries the actions; the process rows above it do not
+    // repeat them, so the transcript has one set of controls per turn.
+    assert!(
+        app.screen().matches("role:button[Fork]").unwrap(),
+        "the answer keeps the row actions"
+    );
+    // The answer is named once, by the Agent that wrote it; a process row is
+    // its prose alone.
+    let named = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .filter(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == "Claude")
+        })
+        .count();
+    assert_eq!(named, 1, "only the answer carries the Agent's name");
 }

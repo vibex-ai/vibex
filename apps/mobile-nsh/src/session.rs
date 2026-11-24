@@ -3280,6 +3280,19 @@ impl SessionService {
         let mut entries = Vec::new();
         let show_reasoning = self.show_reasoning.get_untracked();
         let locale = copy::language().locale();
+        // The Agent the open session runs on, for the working header's mark.
+        let turn_agent = active
+            .as_deref()
+            .and_then(|active| {
+                self.sessions
+                    .with_untracked(|sessions| {
+                        sessions
+                            .iter()
+                            .find(|session| session.id == active)
+                            .map(|session| session.agent.clone())
+                    })
+            })
+            .unwrap_or_default();
         let disclosures = self.turn_disclosures.borrow();
         for turn in &turns {
             let finished = activity::turn_finished(turn);
@@ -3296,7 +3309,7 @@ impl SessionService {
                 .iter()
                 .any(|row| show_reasoning || row.kind != TimelineRowKind::Reasoning)
             {
-                let mut header = process_header(turn);
+                let mut header = process_header(turn, &turn_agent);
                 header.expandable = answered && !turn.pending_permission;
                 header.expanded =
                     !header.expandable || disclosures.get(&header.id).copied().unwrap_or(!finished);
@@ -3357,7 +3370,9 @@ impl SessionService {
                 entries.push(entry);
             }
             if let Some(row) = turn.conclusion_row.as_ref() {
-                entries.push(self.entry_from_row(row, turn, &model.items));
+                let mut entry = self.entry_from_row(row, turn, &model.items);
+                entry.conclusion = true;
+                entries.push(entry);
             } else if !finished && !turn.pending_permission {
                 if let Some(thought) = turn
                     .live_status
@@ -3470,6 +3485,11 @@ impl SessionService {
             complete: finished,
             parent_id: None,
             changed_files: Vec::new(),
+            agent: String::new(),
+            conclusion: false,
+            reaction: (kind == EntryKind::User)
+                .then(|| user_message_reaction(&row.item_ids, items))
+                .flatten(),
             activity: shared.map(|shared| ActivityView {
                 glyph: activity_glyph(shared.icon()),
                 target: shared.target().to_owned(),
@@ -8643,7 +8663,7 @@ fn row_attachments(row: &TimelineRow, payload: Option<&TimelinePayload>) -> Vec<
         .collect()
 }
 
-fn process_header(turn: &TimelineConversationTurn) -> TimelineEntry {
+fn process_header(turn: &TimelineConversationTurn, agent: &str) -> TimelineEntry {
     let finished = activity::turn_finished(turn);
     TimelineEntry {
         id: format!("turn-header:{}", turn.id),
@@ -8653,6 +8673,9 @@ fn process_header(turn: &TimelineConversationTurn) -> TimelineEntry {
         started_at_ms: turn.started_at_ms,
         ended_at_ms: turn.ended_at_ms.unwrap_or(0),
         complete: finished,
+        // The working header leads with the Agent's own mark, as the desktop's
+        // does, so a turn reads as run by the Agent it names.
+        agent: agent.to_owned(),
         ..TimelineEntry::default()
     }
 }
@@ -8724,6 +8747,36 @@ fn row_payload<'a>(
     items: &'a [vibex_core::TimelineItem],
 ) -> Option<&'a TimelinePayload> {
     row_item(row, items).map(|item| &item.payload)
+}
+
+/// The emoji the Agent set on a message, read from the notice it left.
+///
+/// The Agent answers a message with a reaction through its own tool; the
+/// runtime records that as a system notice whose correlation id names the
+/// message it was set on. The newest one wins, so a message the Agent reacted
+/// to twice shows the mark it was left with.
+fn user_message_reaction(
+    item_ids: &[String],
+    items: &[vibex_core::TimelineItem],
+) -> Option<SharedString> {
+    use vibex_core::{TimelinePayload, VIBEX_USE_REACTION_CORRELATION_PREFIX};
+    items
+        .iter()
+        .filter_map(|item| {
+            let TimelinePayload::SystemNotice(notice) = &item.payload else {
+                return None;
+            };
+            let target = item
+                .provider_correlation_id
+                .as_deref()?
+                .strip_prefix(VIBEX_USE_REACTION_CORRELATION_PREFIX)?;
+            item_ids
+                .iter()
+                .any(|item_id| item_id == target)
+                .then(|| (item.sequence, notice.message.clone()))
+        })
+        .max_by_key(|(sequence, _)| *sequence)
+        .map(|(_, emoji)| SharedString::from(emoji))
 }
 
 fn row_item<'a>(

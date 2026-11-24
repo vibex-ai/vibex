@@ -190,6 +190,20 @@ pub struct TimelineEntry {
     pub parent_id: Option<String>,
     pub activity: Option<ActivityView>,
     pub changed_files: Vec<TurnFileChange>,
+    /// The Agent that ran the turn, for the working header's mark. Empty when
+    /// the row does not know, which draws the default one.
+    pub agent: String,
+    /// Whether this is the turn's answer, the one row that concludes it.
+    ///
+    /// A turn's process rows are the Agent's working notes; only the answer is
+    /// what the reader came for, so only it carries the row's actions.
+    pub conclusion: bool,
+    /// The emoji the Agent set on this message, when it set one.
+    ///
+    /// It rides on the bubble rather than in the prose: the Agent answers a
+    /// message with a reaction through its own tool, and the reader sees it as
+    /// the mark they would have left themselves.
+    pub reaction: Option<SharedString>,
 }
 
 /// What the open session is running on, for the composer's chips.
@@ -1167,7 +1181,10 @@ fn shell(
     view()
         .flex_1()
         .relative()
-        .bg(theme::background)
+        // The page tone the cards sit on: where a palette makes the card and
+        // the page the same white, this is the step between them, and the
+        // floating bar's glass has something to be glass over.
+        .bg(theme::block_page)
         .flex_col()
         .test_id("conversation-page")
         .child(header(host.clone(), pager, overlays))
@@ -1392,9 +1409,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     move || pager.open(ShellPage::Sessions),
                 )
                 .bg(theme::floating_pane)
-                .border_1()
-                .border_color(theme::floating_pane_edge)
-                .shadow_sm(),
+                .shadow(theme::floating_pane_shadow()),
             )
             .child(
                 view().flex_1().min_w(px(0.0)).items_center().child(
@@ -1408,9 +1423,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         .gap(px(6.0))
                         .rounded_full()
                         .bg(theme::floating_pane)
-                        .border_1()
-                        .border_color(theme::floating_pane_edge)
-                        .shadow_sm()
+                        .shadow(theme::floating_pane_shadow())
                         .active(|style| style.opacity(0.6))
                         .accessibility_label(move || {
                             SharedString::from(if has_menu() {
@@ -1518,9 +1531,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 move || pager.open(ShellPage::Workbench),
                             )
                             .bg(theme::floating_pane)
-                            .border_1()
-                            .border_color(theme::floating_pane_edge)
-                            .shadow_sm()
+                            .shadow(theme::floating_pane_shadow())
                             .relative()
                             .child(when(terminal_running, || {
                                 surface::status_dot(theme::accent_success)
@@ -2550,6 +2561,10 @@ fn entry_element(
         computed(move || entry.with(|e| e.as_ref().map(|e| e.title.clone()).unwrap_or_default()));
     let meta =
         computed(move || entry.with(|e| e.as_ref().map(|e| e.meta.clone()).unwrap_or_default()));
+    let agent =
+        computed(move || entry.with(|e| e.as_ref().map(|e| e.agent.clone()).unwrap_or_default()));
+    let conclusion = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.conclusion)));
+    let reaction = computed(move || entry.with(|e| e.as_ref().and_then(|e| e.reaction.clone())));
     let streaming = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.streaming)));
     let attachments = computed(move || {
         entry.with(|e| {
@@ -2595,6 +2610,7 @@ fn entry_element(
                     body,
                     meta,
                     attachments,
+                    reaction,
                     sequence,
                     editable_sequence,
                     on_edit_message.clone(),
@@ -2614,6 +2630,7 @@ fn entry_element(
                         expanded,
                         expandable,
                         row_id,
+                        agent,
                         rail,
                         clock,
                         on_toggle_turn.clone(),
@@ -2657,6 +2674,7 @@ fn entry_element(
                         prompt,
                         jump,
                         clock,
+                        conclusion,
                         on_fork.clone(),
                     )
                 }
@@ -2725,6 +2743,7 @@ fn user_bubble(
     body: Memo<String>,
     meta: Memo<String>,
     attachments: Memo<Vec<AttachmentItem>>,
+    reaction: Memo<Option<SharedString>>,
     sequence: Memo<i64>,
     editable_sequence: Signal<i64>,
     on_edit: EditMessage,
@@ -2765,6 +2784,24 @@ fn user_bubble(
             move || !attachments.with(|items| items.is_empty()),
             move || message_attachments(attachments, on_open_attachment.clone()),
         ))
+        // The Agent's reaction, on the bubble's own edge: the mark a reader
+        // would have left, set by the Agent that answered them.
+        .child(when(move || reaction.with(Option::is_some), move || {
+            view()
+                .h(px(22.0))
+                .px(px(theme::SPACING_SM))
+                .mr(px(theme::SPACING_XS))
+                .items_center()
+                .justify_center()
+                .rounded_full()
+                .bg(theme::block_surface)
+                .border_1()
+                .border_color(theme::hairline)
+                .child(
+                    text(move || reaction.with(|reaction| reaction.clone()).unwrap_or_default())
+                        .text_size(px(theme::font_caption())),
+                )
+        }))
         .child(
             view()
                 .flex_row()
@@ -2843,6 +2880,7 @@ fn process_header_row(
     expanded: Memo<bool>,
     expandable: Memo<bool>,
     row_id: Memo<String>,
+    agent: Memo<String>,
     rail: Rail,
     clock: crate::ui::activity::ActivityClock,
     on_toggle: Rc<dyn Fn(&str)>,
@@ -2859,15 +2897,13 @@ fn process_header_row(
         )
     });
     let running = computed(move || !complete.get());
+    // The mark is the Agent that ran the turn, as the desktop's header leads
+    // with it: the fold is a summary of that Agent's work, so it says whose.
     view().w_full().pt(px(theme::SPACING_XS)).child(step(
         rail,
-        step_node(icon!("activity"), move || {
-            if running.get() {
-                theme::accent_blue()
-            } else {
-                theme::text_muted()
-            }
-        }),
+        svg(agent_icon(&agent.get()))
+            .size(px(15.0))
+            .text_color(theme::text_muted),
         step_line(title, running, expanded, expandable, clock, move || {
             on_toggle(&row_id.get_untracked())
         }),
@@ -2913,6 +2949,7 @@ fn agent_prose(
     prompt: Memo<Option<i64>>,
     jump: Signal<Option<i64>>,
     clock: crate::ui::activity::ActivityClock,
+    conclusion: Memo<bool>,
     on_fork: Rc<dyn Fn(i64)>,
 ) -> impl IntoElement {
     let images = computed(move || markdown_images(&body.get()));
@@ -2922,7 +2959,10 @@ fn agent_prose(
         .gap(px(6.0))
         .pt(px(theme::SPACING_SM))
         .pb(px(theme::SPACING_XS))
-        .child(
+        // A process row is the Agent thinking aloud between tool calls, so it
+        // is the prose alone: a name and a mark above every paragraph would
+        // bury what it is actually saying. The turn's answer keeps both.
+        .child(when(move || conclusion.get(), move || {
             view()
                 .flex_row()
                 .items_center()
@@ -2943,8 +2983,8 @@ fn agent_prose(
                 .child(when(
                     move || streaming.get(),
                     move || crate::ui::activity::activity_ring(clock, theme::primary),
-                )),
-        )
+                ))
+        }))
         .child(
             text_view()
                 .markdown(move || Some(body.get().into()))
@@ -2975,7 +3015,7 @@ fn agent_prose(
             },
         ))
         .child(when(
-            move || !streaming.get() && !body.with(String::is_empty),
+            move || conclusion.get() && !streaming.get() && !body.with(String::is_empty),
             move || {
                 let fork = on_fork.clone();
                 view()
@@ -3296,20 +3336,24 @@ fn activity_row(
 
 fn activity_glyph_icon(glyph: ActivityGlyph) -> ImageSrc {
     match glyph {
+        // The desktop's own marks for each kind of work, so a command or an
+        // edit reads the same on both clients: a closed folder for a listing,
+        // a pencil for an edit, a person for a hand-off, a signal for a retry,
+        // and a spark for anything the others do not name.
         ActivityGlyph::Command => icon!("terminal"),
         ActivityGlyph::Search => icon!("search"),
-        ActivityGlyph::Directory => icon!("folder-open"),
+        ActivityGlyph::Directory => icon!("folder"),
         ActivityGlyph::Read => icon!("file-text"),
-        ActivityGlyph::Edit => icon!("file-code"),
+        ActivityGlyph::Edit => icon!("pencil"),
         ActivityGlyph::Create => icon!("file-plus"),
         ActivityGlyph::Delete => icon!("trash-2"),
         ActivityGlyph::Plan => icon!("list-checks"),
-        ActivityGlyph::Agent => icon!("bot"),
+        ActivityGlyph::Agent => icon!("user"),
         ActivityGlyph::Image => icon!("image"),
         ActivityGlyph::Integration => icon!("plug-zap"),
         ActivityGlyph::Web => icon!("globe"),
-        ActivityGlyph::Retry => icon!("refresh"),
-        ActivityGlyph::Tool => icon!("wrench"),
+        ActivityGlyph::Retry => icon!("wifi-outlined"),
+        ActivityGlyph::Tool => icon!("zap"),
     }
 }
 
@@ -6866,7 +6910,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         // The two side pages are one product surface with the conversation
         // between them, so this page takes the same tone as the pages it
         // slides over rather than the dimmed field grouped pages use.
-        .bg(theme::background)
+        .bg(theme::block_page)
         .test_id("sessions-page")
         .pt_safe_area()
         // The page carries the drawer's search field: the keyboard takes its
