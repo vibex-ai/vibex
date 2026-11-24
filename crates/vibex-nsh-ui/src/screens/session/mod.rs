@@ -6779,7 +6779,10 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         .h_full()
         .relative()
         .flex_col()
-        .bg(theme::block_page)
+        // The two side pages are one product surface with the conversation
+        // between them, so this page takes the same tone as the pages it
+        // slides over rather than the dimmed field grouped pages use.
+        .bg(theme::background)
         .test_id("sessions-page")
         .pt_safe_area()
         .pb_safe_area_plus(px(theme::SPACING_SM))
@@ -6954,8 +6957,8 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 .child(edge_fade_between(
                     false,
                     theme::SPACING_LG,
-                    theme::page_adaptive,
-                    theme::page_clear_adaptive,
+                    theme::background_adaptive,
+                    theme::background_clear_adaptive,
                 )),
         )
         // The foot: what the page is bound to, or what to do with the sessions
@@ -7186,23 +7189,22 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                     .flex_shrink(1.0)
                                     .min_w(px(0.0))
                                     .truncate()
-                                    .text_size(px(theme::font_body()))
+                                    .text_size(px(theme::font_detail()))
                                     .font_weight(FontWeight::MEDIUM)
                                     .text_color(theme::sidebar_text_secondary),
                                 ),
                         )
-                        // The way into settings, as the block a page-level
-                        // action takes: the icon alone, on its own colour.
+                        // The way into settings, as the round block the
+                        // page's own controls wear: the icon alone.
                         .child(
                             button()
                                 .size(px(theme::TOUCH_TARGET))
                                 .flex_shrink_0()
-                                .rounded(px(theme::RADIUS_CONTROL))
-                                .bg(theme::block_surface)
-                                .shadow_xs()
+                                .rounded_full()
+                                .bg(theme::fill)
                                 .items_center()
                                 .justify_center()
-                                .active(|style| style.opacity(0.85))
+                                .active(|style| style.opacity(0.6))
                                 .accessibility_label(copy::text("Settings", "设置", "設定"))
                                 .on_press(move || {
                                     pager.close();
