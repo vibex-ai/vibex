@@ -1405,7 +1405,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 .truncate()
                                 .min_w(px(0.0))
                                 .flex_shrink(1.0)
-                                .text_size(px(theme::font_detail()))
+                                .text_size(px(theme::font_micro()))
                                 .font_weight(FontWeight::SEMIBOLD)
                                 .text_color(theme::foreground),
                         )
@@ -5638,7 +5638,6 @@ struct SectionSheets {
 
 /// The commands of one session, as its row and its own header both raise
 /// them. `lead` goes first: what only the place that raised the menu offers.
-/// A row also offers its own place in the tree; a header has none to offer.
 fn session_menu(
     host: &SessionHost,
     overlays: Overlays,
@@ -5647,7 +5646,6 @@ fn session_menu(
     place: (f32, MenuSide),
     lead: Vec<MenuEntry>,
 ) -> Menu {
-    let in_tree = lead.is_empty();
     // The service's own commands (rename, move, archive, delete) act on the
     // session named here.
     (host.on_session_menu)(id, title);
@@ -5689,33 +5687,14 @@ fn session_menu(
             .cloned()
             .collect()
     });
-    let row = in_tree
-        .then(|| host.sidebar.row(SidebarRowKind::Session, id))
-        .flatten();
-    let (up, down) = row
-        .as_ref()
-        .map_or((false, false), |row| (host.sidebar.row_move_targets)(row));
-    let caption = summary.as_ref().map_or_else(String::new, |session| {
-        if session.project_name.is_empty() {
-            session.agent.clone()
-        } else {
-            format!("{} · {}", session.agent, session.project_name)
-        }
-    });
-    let mark = summary
-        .as_ref()
-        .map(|session| icon(agent_icon(&session.agent)));
     let id = id.to_owned();
     // A command that needs no sheet lets go of the session once it ran.
     let done = host.on_close_session_actions.clone();
 
-    let mut menu = Menu::at(place.0)
-        .side(place.1)
-        .about(mark, title.to_owned(), caption)
-        .on_dismiss({
-            let done = done.clone();
-            move || done()
-        });
+    let mut menu = Menu::at(place.0).side(place.1).on_dismiss({
+        let done = done.clone();
+        move || done()
+    });
     for entry in lead {
         menu = menu.entry(entry);
     }
@@ -5861,31 +5840,6 @@ fn session_menu(
             }
         },
     ));
-    if let Some(row) = row {
-        for (applies, upwards) in [(up, true), (down, false)] {
-            let step = host.sidebar.on_move_row_step.clone();
-            let done = done.clone();
-            let row = row.clone();
-            menu = menu.entry_if(applies, || {
-                MenuEntry::new(
-                    if upwards {
-                        icon!("chevron-up")
-                    } else {
-                        icon!("chevron-down")
-                    },
-                    if upwards {
-                        copy::text("Move up", "上移", "上移")
-                    } else {
-                        copy::text("Move down", "下移", "下移")
-                    },
-                    move || {
-                        step(&row, upwards);
-                        done();
-                    },
-                )
-            });
-        }
-    }
     menu.entry(MenuEntry::new(
         icon!("package"),
         copy::text("Archive", "归档", "封存"),
@@ -5915,20 +5869,7 @@ fn scope_menu(
     on_new_session: Rc<dyn Fn(&SidebarRowView)>,
 ) -> Menu {
     let project = row.kind == SidebarRowKind::Project;
-    let (mark, _) = row
-        .project_mark
-        .clone()
-        .unwrap_or_else(|| (icon!("boxes"), theme::text_secondary()));
     let menu = Menu::at(anchor)
-        .about(
-            Some(if project { mark } else { icon!("git-branch") }),
-            row.title.clone(),
-            if project {
-                copy::text("Project", "项目", "專案")
-            } else {
-                copy::text("Worktree", "Worktree", "Worktree")
-            },
-        )
         .entry(MenuEntry::new(
             icon!("plus"),
             copy::text("New session", "新建会话", "新增工作階段"),
@@ -6034,13 +5975,7 @@ fn folder_menu(
             .find(|section| section.kind == SidebarSectionKind::Folder && section.id == id)
             .and_then(|section| section.auto_archive_after_days)
     });
-    let (up, down) = (host.sidebar.row_move_targets)(row);
-    let mut menu = Menu::at(anchor)
-        .about(
-            Some(icon!("folder")),
-            row.title.clone(),
-            copy::text("Folder", "文件夹", "資料夾"),
-        )
+    let menu = Menu::at(anchor)
         .entry(MenuEntry::new(
             icon!("message-square"),
             new_chat_in_folder_label(&row.title),
@@ -6082,25 +6017,6 @@ fn folder_menu(
                 move || sheets.archive.set(Some(id.clone()))
             },
         ));
-    for (applies, upwards) in [(up, true), (down, false)] {
-        let step = host.sidebar.on_move_row_step.clone();
-        let row = row.clone();
-        menu = menu.entry_if(applies, || {
-            MenuEntry::new(
-                if upwards {
-                    icon!("chevron-up")
-                } else {
-                    icon!("chevron-down")
-                },
-                if upwards {
-                    copy::text("Move up", "上移", "上移")
-                } else {
-                    copy::text("Move down", "下移", "下移")
-                },
-                move || step(&row, upwards),
-            )
-        });
-    }
     menu.entry(
         MenuEntry::new(
             icon!("trash-2"),
@@ -6132,11 +6048,6 @@ fn group_menu(
     let auto_continue = section.as_ref().is_some_and(|section| section.auto_continue);
     let members = section.map(|section| section.session_ids).unwrap_or_default();
     Menu::at(anchor)
-        .about(
-            Some(icon!("layers")),
-            row.title.clone(),
-            copy::text("Session group", "会话分组", "工作階段分組"),
-        )
         .entry(MenuEntry::new(
             icon!("pencil"),
             copy::text("Rename", "重命名", "重新命名"),

@@ -1704,8 +1704,7 @@ fn a_group_opens_its_actions() {
     app.press("role:button[Sessions]").unwrap();
     app.wait_for("Pair").unwrap();
     app.long_press("role:button[Pair]").unwrap();
-    app.wait_for("Session group").unwrap();
-    assert!(app.screen().shows("Pin"));
+    app.wait_for("Pin").unwrap();
     assert!(app.screen().shows("Auto continue"));
     assert!(app.screen().shows("Dissolve group"));
     app.press("Edit members").unwrap();
