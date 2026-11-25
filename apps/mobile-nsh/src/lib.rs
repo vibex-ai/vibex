@@ -157,6 +157,10 @@ pub fn App() -> impl IntoElement {
     stack().flex_1().child(
         screen()
             .status_bar(bar)
+            // The app draws its own bars, so the screen's native header is not
+            // shown: left on, it took a bar's height plus the status bar's at
+            // the top of every page and the app's own content started below it.
+            .header_visible(false)
             .flex_1()
             .relative()
             .bg(|| vibex_nsh_ui::theme::block_page())

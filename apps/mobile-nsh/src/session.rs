@@ -3284,13 +3284,12 @@ impl SessionService {
         let turn_agent = active
             .as_deref()
             .and_then(|active| {
-                self.sessions
-                    .with_untracked(|sessions| {
-                        sessions
-                            .iter()
-                            .find(|session| session.id == active)
-                            .map(|session| session.agent.clone())
-                    })
+                self.sessions.with_untracked(|sessions| {
+                    sessions
+                        .iter()
+                        .find(|session| session.id == active)
+                        .map(|session| session.agent.clone())
+                })
             })
             .unwrap_or_default();
         let disclosures = self.turn_disclosures.borrow();
