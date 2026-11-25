@@ -135,3 +135,46 @@ fn undrawable_svg_is_refused() {
     assert_eq!(svg_png("", 32), None);
     assert_eq!(svg_png("<svg/>", 0), None);
 }
+
+/// Every mark named by the model and provider tables must also resolve through
+/// `mark_bytes`, so a matched model or provider never silently drops back to a
+/// generic glyph.
+#[test]
+fn every_model_and_provider_mark_is_bundled() {
+    for (name, mark) in OPENROUTER_PROVIDER_BRANDS {
+        assert!(
+            mark_bytes(mark.path).is_some(),
+            "provider brand {name} names {} but it is not bundled",
+            mark.path
+        );
+    }
+    for (prefix, mark) in OPENROUTER_MODEL_BRAND_PREFIXES {
+        assert!(
+            mark_bytes(mark.path).is_some(),
+            "model prefix {prefix} names {} but it is not bundled",
+            mark.path
+        );
+    }
+    for rule in OPENROUTER_MODEL_BRANDS {
+        assert!(
+            mark_bytes(rule.asset.path).is_some(),
+            "model rule {} names {} but it is not bundled",
+            rule.keyword,
+            rule.asset.path
+        );
+    }
+    for sample in [
+        "openrouter",
+        "deepseek",
+        "deepseek-chat",
+        "gpt-5",
+        "claude-4",
+    ] {
+        let mark = model_mark(sample).expect("known brand should resolve");
+        assert!(
+            mark_bytes(mark.path).is_some(),
+            "{sample} resolved to {} which is not bundled",
+            mark.path
+        );
+    }
+}

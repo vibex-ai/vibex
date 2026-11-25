@@ -2282,13 +2282,19 @@ impl SessionService {
                     agent_id: option.selection.agent_id.as_str().to_owned(),
                     agent: option.agent_label.clone(),
                     model: option.model_label.clone(),
-                    detail: option.auth_source_label.clone(),
+                    // The provider name lives on the outer fold header rather
+                    // than repeating under every model inside it.
+                    detail: String::new(),
                     selected: matches_model(option),
                     available: option.availability == RuntimeOptionAvailability::Available,
                     // The provider, account or route this option draws from:
                     // what the picker groups by, so a reader sees which models
                     // come from where instead of one flat list.
                     source_key: runtime_source_key(&option.selection.auth_source),
+                    source_label: runtime_source_label(
+                        &option.selection.auth_source,
+                        &option.auth_source_label,
+                    ),
                     model_id: option
                         .selection
                         .model
@@ -5708,7 +5714,10 @@ impl SessionService {
                         .map(|(index, option)| RuntimeChoice {
                             id: index.to_string(),
                             title: format!("{} · {}", option.agent_label, option.model_label),
-                            detail: option.auth_source_label.clone(),
+                            detail: runtime_source_label(
+                                &option.selection.auth_source,
+                                &option.auth_source_label,
+                            ),
                         })
                         .collect::<Vec<_>>();
                     if runtime_choices.is_empty() {
@@ -8977,6 +8986,37 @@ fn runtime_source_key(source: &vibex_core::RuntimeAuthSource) -> String {
     }
 }
 
+/// The reader-facing name of a runtime auth source for fold headers and lists.
+///
+/// Matches desktop and GPUI mobile: an Agent account is localized by kind, and
+/// a provider profile or route group keeps the name its owner gave it without
+/// falling back to a raw id.
+fn runtime_source_label(source: &vibex_core::RuntimeAuthSource, raw_label: &str) -> String {
+    match source {
+        vibex_core::RuntimeAuthSource::AgentAccount { .. } => {
+            copy::text("Agent account", "Agent 账户", "Agent 帳戶").to_owned()
+        }
+        vibex_core::RuntimeAuthSource::ProviderProfile {
+            provider_profile_id,
+        } => {
+            let label = raw_label.trim();
+            if label.is_empty() || label == provider_profile_id.as_str() {
+                copy::text("Provider", "供应商", "供應商").to_owned()
+            } else {
+                raw_label.to_owned()
+            }
+        }
+        vibex_core::RuntimeAuthSource::ModelRoute { model_route_id } => {
+            let label = raw_label.trim();
+            if label.is_empty() || label == model_route_id.as_str() {
+                copy::text("Route group", "路由组", "路由組").to_owned()
+            } else {
+                raw_label.to_owned()
+            }
+        }
+    }
+}
+
 /// The requests the transcript already carries an answer for.
 ///
 /// Answering appends a resolution row rather than rewriting the request's own,
@@ -9490,6 +9530,53 @@ mod tests {
         let mut pending = Vec::new();
         assert_eq!(decode_terminal_bytes(&mut pending, b"\xffready"), "�ready");
         assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn runtime_source_label_names_providers_routes_and_accounts() {
+        let previous = super::copy::preference();
+        super::copy::set_preference(super::copy::LanguagePreference::SimplifiedChinese);
+
+        let provider = vibex_core::RuntimeAuthSource::ProviderProfile {
+            provider_profile_id: vibex_core::ProviderProfileId::parse("provider_openrouter")
+                .unwrap(),
+        };
+        assert_eq!(
+            super::runtime_source_label(&provider, "OpenRouter"),
+            "OpenRouter"
+        );
+        assert_eq!(
+            super::runtime_source_label(&provider, "provider_openrouter"),
+            "供应商"
+        );
+        assert_eq!(super::runtime_source_label(&provider, "  "), "供应商");
+
+        let route = vibex_core::RuntimeAuthSource::ModelRoute {
+            model_route_id: vibex_core::ModelRouteId::parse("model_route_fast").unwrap(),
+        };
+        assert_eq!(
+            super::runtime_source_label(&route, "Fast coding"),
+            "Fast coding"
+        );
+        assert_eq!(
+            super::runtime_source_label(&route, "model_route_fast"),
+            "路由组"
+        );
+
+        let account = vibex_core::RuntimeAuthSource::AgentAccount {
+            auth_context_id: vibex_core::AgentAuthContextId::new(),
+        };
+        assert_eq!(
+            super::runtime_source_label(&account, "Agent account"),
+            "Agent 账户"
+        );
+
+        super::copy::set_preference(super::copy::LanguagePreference::English);
+        assert_eq!(
+            super::runtime_source_label(&account, "Agent account"),
+            "Agent account"
+        );
+        super::copy::set_preference(previous);
     }
 }
 

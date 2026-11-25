@@ -246,12 +246,17 @@ pub struct RuntimeOptionView {
     pub agent_id: String,
     pub agent: String,
     pub model: String,
+    /// Optional secondary note shown under the model name; empty when the
+    /// fold header already names the provider.
     pub detail: String,
     pub selected: bool,
     pub available: bool,
     /// The provider profile, account or route the option draws from, as a
     /// stable key to group by.
     pub source_key: String,
+    /// The display name of the provider profile, account or route shown on the
+    /// fold header.
+    pub source_label: String,
     /// The model's own id, for its brand mark.
     pub model_id: String,
 }
@@ -5613,9 +5618,14 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 .filter(|option| {
                     agent.as_ref() == Some(&option.agent_id)
                         && (search.is_empty()
-                            || [&option.model, &option.detail]
-                                .iter()
-                                .any(|text| text.to_lowercase().contains(&search)))
+                            || [
+                                &option.model,
+                                &option.model_id,
+                                &option.source_label,
+                                &option.detail,
+                            ]
+                            .iter()
+                            .any(|text| text.to_lowercase().contains(&search)))
                 })
                 .cloned()
                 .collect::<Vec<_>>()
@@ -5633,32 +5643,41 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 .find(|(key, _, _)| *key == option.source_key)
             {
                 Some((_, _, options)) => options.push(option),
-                None => groups.push((
-                    option.source_key.clone(),
-                    // The source's name, not the model's subtitle: a fold is
-                    // titled by where its models come from.
-                    option.agent.clone(),
-                    vec![option],
-                )),
+                None => {
+                    // The provider, account or route's own name: a fold is
+                    // titled by where its models come from, never by the Agent.
+                    let label = if !option.source_label.is_empty() {
+                        option.source_label.clone()
+                    } else if !option.detail.is_empty() {
+                        option.detail.clone()
+                    } else {
+                        option.agent.clone()
+                    };
+                    groups.push((option.source_key.clone(), label, vec![option]));
+                }
             }
         }
         groups
     });
     // A fold starts closed unless it holds the current choice: a reader who
     // opens the picker to see what they are on should not have to open a fold
-    // to find it, and every other source starts out of the way.
+    // to find it, and every other source starts out of the way. While searching,
+    // every matching fold opens so matches are immediately visible.
     let collapsed = signal(Vec::<String>::new());
     effect(move || {
         // Recomputed whenever the visible set changes — a new Agent, a new
         // search — because the folds that are worth opening change with it.
+        let searching = !query.get().trim().is_empty();
         let groups = grouped.get();
-        collapsed.set(
+        collapsed.set(if searching {
+            Vec::new()
+        } else {
             groups
                 .iter()
                 .filter(|(_, _, options)| !options.iter().any(|option| option.selected))
                 .map(|(key, _, _)| key.clone())
-                .collect(),
-        );
+                .collect()
+        });
     });
     let finish_reasoning = close.clone();
     let finish_mode = close.clone();
@@ -5844,7 +5863,15 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                         // The source's own mark, so a fold says
                                                         // whose models are under it before the
                                                         // name is read.
-                                                        let source_mark = agent_icon(&options[0].agent_id);
+                                                        let source_mark = source_mark_svg(
+                                                            &key,
+                                                            &label,
+                                                            &options[0].agent_id,
+                                                            options.iter().find_map(|option| {
+                                                                (!option.model_id.is_empty())
+                                                                    .then_some(option.model_id.as_str())
+                                                            }),
+                                                        );
                                                         let selected_here = options.iter().any(|o| o.selected);
                                                         sheet_card()
                                                             .child(
@@ -5862,11 +5889,11 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                                     .child(
                                                                         view()
                                                                             .flex_shrink_0()
-                                                                            .child(svg(ImageSrc::svg_markup(
-                                                                                source_mark,
-                                                                            ))
-                                                                            .size(px(theme::ICON_MD))
-                                                                            .text_color(theme::foreground)),
+                                                                            .child(
+                                                                                svg(source_mark)
+                                                                                    .size(px(theme::ICON_MD))
+                                                                                    .text_color(theme::foreground),
+                                                                            ),
                                                                     )
                                                                     .child(
                                                                         text(label)
@@ -5958,11 +5985,13 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                                                                                 .text_size(px(theme::font_detail()))
                                                                                                 .text_color(theme::foreground),
                                                                                         )
-                                                                                        .child(
-                                                                                            text(detail)
-                                                                                                .truncate()
-                                                                                                .text_size(px(theme::font_micro()))
-                                                                                                .text_color(theme::text_muted),
+                                                                                        .children(
+                                                                                            (!detail.is_empty()).then(|| {
+                                                                                                text(detail)
+                                                                                                    .truncate()
+                                                                                                    .text_size(px(theme::font_micro()))
+                                                                                                    .text_color(theme::text_muted)
+                                                                                            }),
                                                                                         ),
                                                                                 )
                                                                                 .child(when(
@@ -6944,6 +6973,36 @@ fn model_mark_svg(model_id: &str) -> ImageSrc {
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(ImageSrc::svg_markup)
         .unwrap_or_else(|| icon!("sparkles"))
+}
+
+/// The mark a source fold wears in the runtime picker.
+///
+/// Matches desktop and GPUI mobile: an Agent account wears the Agent's own
+/// mark, a route group wears the branch glyph, and a provider profile wears
+/// its brand mark (resolved from the provider's name, then its first model id)
+/// falling back to the database glyph when no brand owns it.
+fn source_mark_svg(
+    source_key: &str,
+    source_label: &str,
+    agent_id: &str,
+    first_model_id: Option<&str>,
+) -> ImageSrc {
+    if source_key.starts_with("account:") {
+        return ImageSrc::svg_markup(agent_icon(agent_id));
+    }
+    if source_key.starts_with("route:") {
+        return icon!("git-branch");
+    }
+    [Some(source_label), first_model_id]
+        .into_iter()
+        .flatten()
+        .find_map(|candidate| {
+            vibex_brands::model_mark(candidate)
+                .and_then(|mark| vibex_brands::mark_bytes(mark.path))
+                .and_then(|bytes| std::str::from_utf8(bytes).ok())
+                .map(ImageSrc::svg_markup)
+        })
+        .unwrap_or_else(|| icon!("database"))
 }
 
 /// The mark a session's Agent wears in the drawer.

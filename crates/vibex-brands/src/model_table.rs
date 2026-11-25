@@ -37,10 +37,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "alibaba",
         colored_model_asset("model-providers/alibaba.svg"),
     ),
-    (
-        "amazon",
-        colored_model_asset("model-providers/amazon.svg"),
-    ),
+    ("amazon", colored_model_asset("model-providers/amazon.svg")),
     (
         "anthracite-org",
         colored_model_asset("model-providers/anthracite-org.svg"),
@@ -53,14 +50,8 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "arcee-ai",
         colored_model_asset("model-providers/arcee-ai.svg"),
     ),
-    (
-        "baai",
-        themed_model_asset("model-providers/baai.svg"),
-    ),
-    (
-        "baidu",
-        colored_model_asset("model-providers/baidu.svg"),
-    ),
+    ("baai", themed_model_asset("model-providers/baai.svg")),
+    ("baidu", colored_model_asset("model-providers/baidu.svg")),
     (
         "black-forest-labs",
         colored_model_asset("model-providers/black-forest-labs.svg"),
@@ -81,10 +72,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "cognitivecomputations",
         colored_model_asset("model-providers/cognitivecomputations.svg"),
     ),
-    (
-        "cohere",
-        colored_model_asset("model-providers/cohere.svg"),
-    ),
+    ("cohere", colored_model_asset("model-providers/cohere.svg")),
     (
         "deepgram",
         themed_model_asset("model-providers/deepgram.svg"),
@@ -105,22 +93,13 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "fish-audio",
         colored_model_asset("model-providers/fish-audio.svg"),
     ),
-    (
-        "google",
-        colored_model_asset("model-providers/google.svg"),
-    ),
-    (
-        "gryphe",
-        colored_model_asset("model-providers/gryphe.svg"),
-    ),
+    ("google", colored_model_asset("model-providers/google.svg")),
+    ("gryphe", colored_model_asset("model-providers/gryphe.svg")),
     (
         "hexgrad",
         colored_model_asset("model-providers/hexgrad.svg"),
     ),
-    (
-        "heygen",
-        colored_model_asset("model-providers/heygen.svg"),
-    ),
+    ("heygen", colored_model_asset("model-providers/heygen.svg")),
     (
         "ibm-granite",
         themed_model_asset("model-providers/ibm-granite.svg"),
@@ -137,10 +116,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "intfloat",
         colored_model_asset("model-providers/intfloat.svg"),
     ),
-    (
-        "krea",
-        colored_model_asset("model-providers/krea.svg"),
-    ),
+    ("krea", colored_model_asset("model-providers/krea.svg")),
     (
         "kwaipilot",
         colored_model_asset("model-providers/kwaipilot.svg"),
@@ -149,22 +125,13 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "kwaivgi",
         colored_model_asset("model-providers/kwaivgi.svg"),
     ),
-    (
-        "liquid",
-        themed_model_asset("model-providers/liquid.svg"),
-    ),
-    (
-        "mancer",
-        colored_model_asset("model-providers/mancer.svg"),
-    ),
+    ("liquid", themed_model_asset("model-providers/liquid.svg")),
+    ("mancer", colored_model_asset("model-providers/mancer.svg")),
     (
         "meituan",
         colored_model_asset("model-providers/meituan.svg"),
     ),
-    (
-        "meta",
-        colored_model_asset("model-providers/meta.svg"),
-    ),
+    ("meta", colored_model_asset("model-providers/meta.svg")),
     (
         "meta-llama",
         colored_model_asset("model-providers/meta-llama.svg"),
@@ -181,30 +148,12 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "mistralai",
         colored_model_asset("model-providers/mistral.svg"),
     ),
-    (
-        "moonshotai",
-        themed_model_asset("model-providers/kimi.svg"),
-    ),
-    (
-        "morph",
-        colored_model_asset("model-providers/morph.svg"),
-    ),
-    (
-        "nex-agi",
-        themed_model_asset("model-providers/nex-agi.svg"),
-    ),
-    (
-        "nousresearch",
-        themed_model_asset("icons/vibex/agents/hermes.svg"),
-    ),
-    (
-        "nvidia",
-        colored_model_asset("model-providers/nvidia.svg"),
-    ),
-    (
-        "openai",
-        themed_model_asset("model-providers/openai.svg"),
-    ),
+    ("moonshotai", themed_model_asset("model-providers/kimi.svg")),
+    ("morph", colored_model_asset("model-providers/morph.svg")),
+    ("nex-agi", themed_model_asset("model-providers/nex-agi.svg")),
+    ("nousresearch", themed_model_asset("agents/hermes.svg")),
+    ("nvidia", colored_model_asset("model-providers/nvidia.svg")),
+    ("openai", themed_model_asset("model-providers/openai.svg")),
     (
         "openrouter",
         colored_model_asset("model-providers/openrouter.svg"),
@@ -217,46 +166,19 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "perplexity",
         colored_model_asset("model-providers/perplexity.svg"),
     ),
-    (
-        "poolside",
-        themed_model_asset("icons/vibex/agents/poolside.svg"),
-    ),
-    (
-        "qwen",
-        colored_model_asset("model-providers/qwen.svg"),
-    ),
-    (
-        "recraft",
-        themed_model_asset("model-providers/recraft.svg"),
-    ),
-    (
-        "rekaai",
-        colored_model_asset("model-providers/rekaai.svg"),
-    ),
-    (
-        "relace",
-        colored_model_asset("model-providers/relace.svg"),
-    ),
-    (
-        "runway",
-        colored_model_asset("model-providers/runway.svg"),
-    ),
-    (
-        "sakana",
-        colored_model_asset("model-providers/sakana.svg"),
-    ),
-    (
-        "sao10k",
-        colored_model_asset("model-providers/sao10k.svg"),
-    ),
+    ("poolside", themed_model_asset("agents/poolside.svg")),
+    ("qwen", colored_model_asset("model-providers/qwen.svg")),
+    ("recraft", themed_model_asset("model-providers/recraft.svg")),
+    ("rekaai", colored_model_asset("model-providers/rekaai.svg")),
+    ("relace", colored_model_asset("model-providers/relace.svg")),
+    ("runway", colored_model_asset("model-providers/runway.svg")),
+    ("sakana", colored_model_asset("model-providers/sakana.svg")),
+    ("sao10k", colored_model_asset("model-providers/sao10k.svg")),
     (
         "sentence-transformers",
         colored_model_asset("model-providers/sentence-transformers.svg"),
     ),
-    (
-        "sesame",
-        colored_model_asset("model-providers/sesame.svg"),
-    ),
+    ("sesame", colored_model_asset("model-providers/sesame.svg")),
     (
         "sourceful",
         colored_model_asset("model-providers/sourceful.svg"),
@@ -281,10 +203,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "thinkingmachines",
         colored_model_asset("model-providers/thinkingmachines.svg"),
     ),
-    (
-        "undi95",
-        colored_model_asset("model-providers/undi95.svg"),
-    ),
+    ("undi95", colored_model_asset("model-providers/undi95.svg")),
     (
         "upstage",
         colored_model_asset("model-providers/upstage.svg"),
@@ -293,38 +212,17 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "voyageai",
         colored_model_asset("model-providers/voyageai.svg"),
     ),
-    (
-        "writer",
-        themed_model_asset("model-providers/writer.svg"),
-    ),
-    (
-        "x-ai",
-        themed_model_asset("model-providers/xai.svg"),
-    ),
-    (
-        "xiaomi",
-        colored_model_asset("model-providers/xiaomi.svg"),
-    ),
-    (
-        "z-ai",
-        themed_model_asset("model-providers/zhipu.svg"),
-    ),
-    (
-        "groq",
-        themed_model_asset("model-providers/groq.svg"),
-    ),
-    (
-        "nebius",
-        themed_model_asset("model-providers/nebius.svg"),
-    ),
+    ("writer", themed_model_asset("model-providers/writer.svg")),
+    ("x-ai", themed_model_asset("model-providers/xai.svg")),
+    ("xiaomi", colored_model_asset("model-providers/xiaomi.svg")),
+    ("z-ai", themed_model_asset("model-providers/zhipu.svg")),
+    ("groq", themed_model_asset("model-providers/groq.svg")),
+    ("nebius", themed_model_asset("model-providers/nebius.svg")),
     (
         "sambanova",
         themed_model_asset("model-providers/sambanova.svg"),
     ),
-    (
-        "novita",
-        colored_model_asset("model-providers/novita.svg"),
-    ),
+    ("novita", colored_model_asset("model-providers/novita.svg")),
     (
         "deepinfra",
         colored_model_asset("model-providers/deepinfra.svg"),
@@ -337,18 +235,12 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "cerebras",
         colored_model_asset("model-providers/cerebras.svg"),
     ),
-    (
-        "ai21",
-        colored_model_asset("model-providers/ai21.svg"),
-    ),
+    ("ai21", colored_model_asset("model-providers/ai21.svg")),
     (
         "baichuan",
         themed_model_asset("model-providers/baichuan.svg"),
     ),
-    (
-        "yi",
-        colored_model_asset("model-providers/yi.svg"),
-    ),
+    ("yi", colored_model_asset("model-providers/yi.svg")),
     (
         "iflytek",
         colored_model_asset("model-providers/iflytek.svg"),
@@ -365,10 +257,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "aihubmix",
         colored_model_asset("model-providers/aihubmix.svg"),
     ),
-    (
-        "vercel",
-        themed_model_asset("model-providers/vercel.svg"),
-    ),
+    ("vercel", themed_model_asset("model-providers/vercel.svg")),
     (
         "moonshot-ai",
         themed_model_asset("model-providers/kimi.svg"),
@@ -377,26 +266,11 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "moonshotai-cn",
         themed_model_asset("model-providers/kimi.svg"),
     ),
-    (
-        "z-ai",
-        themed_model_asset("model-providers/zhipu.svg"),
-    ),
-    (
-        "zai",
-        themed_model_asset("model-providers/zhipu.svg"),
-    ),
-    (
-        "zhipuai",
-        themed_model_asset("model-providers/zhipu.svg"),
-    ),
-    (
-        "xai",
-        themed_model_asset("model-providers/xai.svg"),
-    ),
-    (
-        "x-ai",
-        themed_model_asset("model-providers/xai.svg"),
-    ),
+    ("z-ai", themed_model_asset("model-providers/zhipu.svg")),
+    ("zai", themed_model_asset("model-providers/zhipu.svg")),
+    ("zhipuai", themed_model_asset("model-providers/zhipu.svg")),
+    ("xai", themed_model_asset("model-providers/xai.svg")),
+    ("x-ai", themed_model_asset("model-providers/xai.svg")),
     (
         "mistral",
         colored_model_asset("model-providers/mistral.svg"),
@@ -493,10 +367,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "fireworks-ai",
         colored_model_asset("model-providers/fireworks.svg"),
     ),
-    (
-        "github",
-        themed_model_asset("model-providers/github.svg"),
-    ),
+    ("github", themed_model_asset("model-providers/github.svg")),
     (
         "opencode",
         themed_model_asset("model-providers/opencode.svg"),
@@ -509,10 +380,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "opencode-zen",
         themed_model_asset("model-providers/opencode.svg"),
     ),
-    (
-        "clinepass",
-        themed_model_asset("model-providers/cline.svg"),
-    ),
+    ("clinepass", themed_model_asset("model-providers/cline.svg")),
     (
         "commandcode",
         themed_model_asset("model-providers/commandcode.svg"),
@@ -521,10 +389,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "novita-ai",
         colored_model_asset("model-providers/novita.svg"),
     ),
-    (
-        "reka",
-        colored_model_asset("model-providers/rekaai.svg"),
-    ),
+    ("reka", colored_model_asset("model-providers/rekaai.svg")),
     (
         "anyrouter",
         themed_model_asset("model-providers/anyrouter.svg"),
@@ -537,10 +402,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "open-design",
         themed_model_asset("model-providers/opendesign.svg"),
     ),
-    (
-        "ollama",
-        themed_model_asset("model-providers/ollama.svg"),
-    ),
+    ("ollama", themed_model_asset("model-providers/ollama.svg")),
     (
         "lmstudio",
         themed_model_asset("model-providers/lmstudio.svg"),
@@ -549,10 +411,7 @@ pub const OPENROUTER_PROVIDER_BRANDS: &[(&str, Mark)] = &[
         "lm-studio",
         themed_model_asset("model-providers/lmstudio.svg"),
     ),
-    (
-        "magpie",
-        themed_model_asset("model-providers/magpie.svg"),
-    ),
+    ("magpie", themed_model_asset("model-providers/magpie.svg")),
 ];
 
 pub const OPENROUTER_MODEL_BRAND_PREFIXES: &[(&str, Mark)] = &[
@@ -588,10 +447,7 @@ pub const OPENROUTER_MODEL_BRAND_PREFIXES: &[(&str, Mark)] = &[
         "flux-tts",
         themed_model_asset("model-providers/deepgram.svg"),
     ),
-    (
-        "nova-3",
-        themed_model_asset("model-providers/deepgram.svg"),
-    ),
+    ("nova-3", themed_model_asset("model-providers/deepgram.svg")),
     (
         "rerank-4",
         colored_model_asset("model-providers/cohere.svg"),
@@ -641,11 +497,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "codestral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "ministral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "riverflow",
@@ -653,11 +509,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "deepseek",
-        asset: colored_model_asset("icons/vibex/agents/deepseek-harness.svg"),
+        asset: colored_model_asset("agents/deepseek-harness.svg"),
     },
     ModelBrandRule {
         keyword: "devstral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "mythomax",
@@ -721,11 +577,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "mistral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "mixtral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "orpheus",
@@ -737,23 +593,23 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "qwen2.5",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "qwen3.5",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "qwen3.6",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "qwen3.7",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "qwen3.8",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "recraft",
@@ -769,11 +625,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "voxtral",
-        asset: colored_model_asset("icons/vibex/agents/mistral-vibe.svg"),
+        asset: colored_model_asset("agents/mistral-vibe.svg"),
     },
     ModelBrandRule {
         keyword: "whisper",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "avatar",
@@ -781,7 +637,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "claude",
-        asset: colored_model_asset("icons/vibex/claude.svg"),
+        asset: colored_model_asset("claude.svg"),
     },
     ModelBrandRule {
         keyword: "flux.2",
@@ -793,7 +649,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "gemini",
-        asset: colored_model_asset("icons/vibex/gemini.svg"),
+        asset: colored_model_asset("gemini.svg"),
     },
     ModelBrandRule {
         keyword: "hailuo",
@@ -801,7 +657,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "hermes",
-        asset: themed_model_asset("icons/vibex/agents/hermes.svg"),
+        asset: themed_model_asset("agents/hermes.svg"),
     },
     ModelBrandRule {
         keyword: "kokoro",
@@ -809,7 +665,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "laguna",
-        asset: themed_model_asset("icons/vibex/agents/poolside.svg"),
+        asset: themed_model_asset("agents/poolside.svg"),
     },
     ModelBrandRule {
         keyword: "magnum",
@@ -849,7 +705,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "chirp",
-        asset: colored_model_asset("icons/vibex/gemini.svg"),
+        asset: colored_model_asset("gemini.svg"),
     },
     ModelBrandRule {
         keyword: "ernie",
@@ -857,7 +713,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "gemma",
-        asset: colored_model_asset("icons/vibex/gemini.svg"),
+        asset: colored_model_asset("gemini.svg"),
     },
     ModelBrandRule {
         keyword: "kling",
@@ -869,7 +725,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "lyria",
-        asset: colored_model_asset("icons/vibex/gemini.svg"),
+        asset: colored_model_asset("gemini.svg"),
     },
     ModelBrandRule {
         keyword: "morph",
@@ -885,7 +741,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "qwen3",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "solar",
@@ -925,11 +781,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "grok",
-        asset: themed_model_asset("icons/vibex/agents/grok.svg"),
+        asset: themed_model_asset("agents/grok.svg"),
     },
     ModelBrandRule {
         keyword: "kimi",
-        asset: colored_model_asset("icons/vibex/agents/kimi.svg"),
+        asset: colored_model_asset("agents/kimi.svg"),
     },
     ModelBrandRule {
         keyword: "krea",
@@ -965,7 +821,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "qwen",
-        asset: colored_model_asset("icons/vibex/qwen.svg"),
+        asset: colored_model_asset("qwen.svg"),
     },
     ModelBrandRule {
         keyword: "reka",
@@ -985,7 +841,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "sora",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "step",
@@ -993,7 +849,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "text",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "all",
@@ -1013,11 +869,11 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "glm",
-        asset: themed_model_asset("icons/vibex/agents/glm-acp-agent.svg"),
+        asset: themed_model_asset("agents/glm-acp-agent.svg"),
     },
     ModelBrandRule {
         keyword: "gpt",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "gte",
@@ -1049,7 +905,7 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "veo",
-        asset: colored_model_asset("icons/vibex/gemini.svg"),
+        asset: colored_model_asset("gemini.svg"),
     },
     ModelBrandRule {
         keyword: "wan",
@@ -1069,15 +925,15 @@ pub const OPENROUTER_MODEL_BRANDS: &[ModelBrandRule] = &[
     },
     ModelBrandRule {
         keyword: "o1",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "o3",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "o4",
-        asset: themed_model_asset("icons/vibex/openai.svg"),
+        asset: themed_model_asset("openai.svg"),
     },
     ModelBrandRule {
         keyword: "s1",
@@ -1167,3 +1023,394 @@ pub fn model_mark(model: &str) -> Option<Mark> {
     }
     None
 }
+
+/// Every model-provider mark referenced by the model tables above.
+///
+/// Bundled from the desktop asset pack alongside [`MARK_ASSETS`] so
+/// [`mark_bytes`] serves every [`Mark::path`] returned by [`model_mark`].
+const MODEL_PROVIDER_MARK_ASSETS: &[(&str, &[u8])] = &[
+    (
+        "model-providers/ai21.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/ai21.svg"),
+    ),
+    (
+        "model-providers/aihubmix.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/aihubmix.svg"),
+    ),
+    (
+        "model-providers/aion-labs.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/aion-labs.svg"),
+    ),
+    (
+        "model-providers/alibaba.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/alibaba.svg"),
+    ),
+    (
+        "model-providers/amazon.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/amazon.svg"),
+    ),
+    (
+        "model-providers/anthracite-org.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/anthracite-org.svg"),
+    ),
+    (
+        "model-providers/anthropic.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/anthropic.svg"),
+    ),
+    (
+        "model-providers/anyrouter.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/anyrouter.svg"),
+    ),
+    (
+        "model-providers/arcee-ai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/arcee-ai.svg"),
+    ),
+    (
+        "model-providers/baai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/baai.svg"),
+    ),
+    (
+        "model-providers/baichuan.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/baichuan.svg"),
+    ),
+    (
+        "model-providers/baidu.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/baidu.svg"),
+    ),
+    (
+        "model-providers/black-forest-labs.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/black-forest-labs.svg"),
+    ),
+    (
+        "model-providers/bytedance-seed.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/bytedance-seed.svg"),
+    ),
+    (
+        "model-providers/bytedance.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/bytedance.svg"),
+    ),
+    (
+        "model-providers/canopylabs.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/canopylabs.svg"),
+    ),
+    (
+        "model-providers/cerebras.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/cerebras.svg"),
+    ),
+    (
+        "model-providers/cline.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/cline.svg"),
+    ),
+    (
+        "model-providers/cognitivecomputations.svg",
+        include_bytes!(
+            "../../../apps/desktop/assets/icons/model-providers/cognitivecomputations.svg"
+        ),
+    ),
+    (
+        "model-providers/cohere.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/cohere.svg"),
+    ),
+    (
+        "model-providers/commandcode.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/commandcode.svg"),
+    ),
+    (
+        "model-providers/deepgram.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/deepgram.svg"),
+    ),
+    (
+        "model-providers/deepinfra.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/deepinfra.svg"),
+    ),
+    (
+        "model-providers/deepseek.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/deepseek.svg"),
+    ),
+    (
+        "model-providers/dots-studio.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/dots-studio.svg"),
+    ),
+    (
+        "model-providers/fireworks.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/fireworks.svg"),
+    ),
+    (
+        "model-providers/fish-audio.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/fish-audio.svg"),
+    ),
+    (
+        "model-providers/github.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/github.svg"),
+    ),
+    (
+        "model-providers/google.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/google.svg"),
+    ),
+    (
+        "model-providers/groq.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/groq.svg"),
+    ),
+    (
+        "model-providers/gryphe.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/gryphe.svg"),
+    ),
+    (
+        "model-providers/hexgrad.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/hexgrad.svg"),
+    ),
+    (
+        "model-providers/heygen.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/heygen.svg"),
+    ),
+    (
+        "model-providers/hyperbolic.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/hyperbolic.svg"),
+    ),
+    (
+        "model-providers/ibm-granite.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/ibm-granite.svg"),
+    ),
+    (
+        "model-providers/iflytek.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/iflytek.svg"),
+    ),
+    (
+        "model-providers/inception.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/inception.svg"),
+    ),
+    (
+        "model-providers/inclusionai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/inclusionai.svg"),
+    ),
+    (
+        "model-providers/intfloat.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/intfloat.svg"),
+    ),
+    (
+        "model-providers/kimi.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/kimi.svg"),
+    ),
+    (
+        "model-providers/krea.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/krea.svg"),
+    ),
+    (
+        "model-providers/kwaipilot.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/kwaipilot.svg"),
+    ),
+    (
+        "model-providers/kwaivgi.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/kwaivgi.svg"),
+    ),
+    (
+        "model-providers/liquid.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/liquid.svg"),
+    ),
+    (
+        "model-providers/lmstudio.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/lmstudio.svg"),
+    ),
+    (
+        "model-providers/magpie.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/magpie.svg"),
+    ),
+    (
+        "model-providers/mai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/mai.svg"),
+    ),
+    (
+        "model-providers/mancer.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/mancer.svg"),
+    ),
+    (
+        "model-providers/meituan.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/meituan.svg"),
+    ),
+    (
+        "model-providers/meta-llama.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/meta-llama.svg"),
+    ),
+    (
+        "model-providers/meta.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/meta.svg"),
+    ),
+    (
+        "model-providers/microsoft.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/microsoft.svg"),
+    ),
+    (
+        "model-providers/minimax.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/minimax.svg"),
+    ),
+    (
+        "model-providers/mistral.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/mistral.svg"),
+    ),
+    (
+        "model-providers/modelscope.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/modelscope.svg"),
+    ),
+    (
+        "model-providers/morph.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/morph.svg"),
+    ),
+    (
+        "model-providers/nebius.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/nebius.svg"),
+    ),
+    (
+        "model-providers/nex-agi.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/nex-agi.svg"),
+    ),
+    (
+        "model-providers/novita.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/novita.svg"),
+    ),
+    (
+        "model-providers/nvidia.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/nvidia.svg"),
+    ),
+    (
+        "model-providers/ollama.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/ollama.svg"),
+    ),
+    (
+        "model-providers/openai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/openai.svg"),
+    ),
+    (
+        "model-providers/opencode.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/opencode.svg"),
+    ),
+    (
+        "model-providers/opendesign.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/opendesign.svg"),
+    ),
+    (
+        "model-providers/openrouter.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/openrouter.svg"),
+    ),
+    (
+        "model-providers/perceptron.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/perceptron.svg"),
+    ),
+    (
+        "model-providers/perplexity.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/perplexity.svg"),
+    ),
+    (
+        "model-providers/qwen.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/qwen.svg"),
+    ),
+    (
+        "model-providers/recraft.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/recraft.svg"),
+    ),
+    (
+        "model-providers/rekaai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/rekaai.svg"),
+    ),
+    (
+        "model-providers/relace.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/relace.svg"),
+    ),
+    (
+        "model-providers/runway.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/runway.svg"),
+    ),
+    (
+        "model-providers/sakana.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/sakana.svg"),
+    ),
+    (
+        "model-providers/sambanova.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/sambanova.svg"),
+    ),
+    (
+        "model-providers/sao10k.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/sao10k.svg"),
+    ),
+    (
+        "model-providers/sentence-transformers.svg",
+        include_bytes!(
+            "../../../apps/desktop/assets/icons/model-providers/sentence-transformers.svg"
+        ),
+    ),
+    (
+        "model-providers/sesame.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/sesame.svg"),
+    ),
+    (
+        "model-providers/siliconflow.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/siliconflow.svg"),
+    ),
+    (
+        "model-providers/sourceful.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/sourceful.svg"),
+    ),
+    (
+        "model-providers/stepfun.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/stepfun.svg"),
+    ),
+    (
+        "model-providers/tencent.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/tencent.svg"),
+    ),
+    (
+        "model-providers/thedrummer.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/thedrummer.svg"),
+    ),
+    (
+        "model-providers/thenlper.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/thenlper.svg"),
+    ),
+    (
+        "model-providers/thinkingmachines.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/thinkingmachines.svg"),
+    ),
+    (
+        "model-providers/together.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/together.svg"),
+    ),
+    (
+        "model-providers/undi95.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/undi95.svg"),
+    ),
+    (
+        "model-providers/upstage.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/upstage.svg"),
+    ),
+    (
+        "model-providers/vercel.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/vercel.svg"),
+    ),
+    (
+        "model-providers/volcengine.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/volcengine.svg"),
+    ),
+    (
+        "model-providers/voyageai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/voyageai.svg"),
+    ),
+    (
+        "model-providers/writer.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/writer.svg"),
+    ),
+    (
+        "model-providers/xai.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/xai.svg"),
+    ),
+    (
+        "model-providers/xiaomi.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/xiaomi.svg"),
+    ),
+    (
+        "model-providers/yi.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/yi.svg"),
+    ),
+    (
+        "model-providers/zhipu.svg",
+        include_bytes!("../../../apps/desktop/assets/icons/model-providers/zhipu.svg"),
+    ),
+];

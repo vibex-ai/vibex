@@ -110,12 +110,16 @@ pub fn agent_mark(identity: &str) -> Option<Mark> {
 pub fn mark_bytes(path: &str) -> Option<&'static [u8]> {
     MARK_ASSETS
         .iter()
+        .chain(MODEL_PROVIDER_MARK_ASSETS.iter())
         .find_map(|(candidate, bytes)| (*candidate == path).then_some(*bytes))
 }
 
 /// Every mark this crate can serve, for a caller that wants to enumerate them.
 pub fn marks() -> impl Iterator<Item = (&'static str, &'static [u8])> {
-    MARK_ASSETS.iter().copied()
+    MARK_ASSETS
+        .iter()
+        .chain(MODEL_PROVIDER_MARK_ASSETS.iter())
+        .copied()
 }
 
 /// A mark rendered to a PNG the caller can hand to a terminal.

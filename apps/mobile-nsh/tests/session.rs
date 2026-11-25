@@ -395,10 +395,11 @@ fn RuntimeShell() -> impl IntoElement {
             agent_id: "claude".to_owned(),
             agent: "Claude".to_owned(),
             model: "Claude 4".to_owned(),
-            detail: "Pro".to_owned(),
+            detail: String::new(),
             selected: true,
             available: true,
             source_key: "provider:claude".to_owned(),
+            source_label: "Pro".to_owned(),
             model_id: "claude-4".to_owned(),
         },
         RuntimeOptionView {
@@ -406,11 +407,24 @@ fn RuntimeShell() -> impl IntoElement {
             agent_id: "codex".to_owned(),
             agent: "Codex".to_owned(),
             model: "GPT-5".to_owned(),
-            detail: "Team".to_owned(),
+            detail: String::new(),
             selected: false,
             available: true,
             source_key: "provider:codex".to_owned(),
+            source_label: "Team".to_owned(),
             model_id: "gpt-5".to_owned(),
+        },
+        RuntimeOptionView {
+            id: "2".to_owned(),
+            agent_id: "codex".to_owned(),
+            agent: "Codex".to_owned(),
+            model: "o3".to_owned(),
+            detail: String::new(),
+            selected: false,
+            available: true,
+            source_key: "provider:openrouter".to_owned(),
+            source_label: "OpenRouter".to_owned(),
+            model_id: "openai/o3".to_owned(),
         },
     ]);
     host.runtime_reasoning = signal(vec![RuntimeChoiceView {
@@ -1415,15 +1429,25 @@ fn the_composer_opens_the_runtime_choices() {
     }
     app.press("Claude 4").unwrap();
     app.wait_for("Agent settings").unwrap();
+    // The fold header shows the provider's name ("Pro"), not the Agent's name.
+    assert!(app.screen().shows("Pro"));
     assert!(!app.screen().shows("GPT-5"));
-    app.press("role:button[Codex] >> nth=0").unwrap();
-    // The picker groups models under their source, and a source holding no
-    // current choice starts folded — so the Codex models are one press away
-    // rather than listed outright. The fold's header carries the source's
-    // name, which is also the Agent tab's label.
-    app.wait_for("role:button[Codex] >> nth=1").unwrap();
-    app.press("role:button[Codex] >> nth=1").unwrap();
+    app.press("role:button[Codex]").unwrap();
+    // The picker groups models under their provider, and a provider holding no
+    // current choice starts folded — so the Codex providers show their own
+    // names ("Team", "OpenRouter") rather than repeating the Agent name.
+    app.wait_for("role:button[Team]").unwrap();
+    assert!(app.screen().shows("OpenRouter"));
+    assert!(
+        !app.screen().matches("role:button[Codex] >> nth=1").unwrap(),
+        "provider fold headers must not repeat the Agent name"
+    );
+    app.press("role:button[Team]").unwrap();
     app.wait_for("GPT-5").unwrap();
+    assert!(
+        !app.screen().matches("role:button[GPT-5 Team]").unwrap(),
+        "the provider name stays on the fold header rather than inside the model row"
+    );
     app.press("role:button[Close]").unwrap();
     app.wait_for_gone("GPT-5", std::time::Duration::from_secs(3))
         .unwrap();
