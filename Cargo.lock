@@ -11133,6 +11133,7 @@ version = "0.1.9"
 dependencies = [
  "nsh-base",
  "nsh-core",
+ "vibex-brands",
  "vibex-locale",
 ]
 
