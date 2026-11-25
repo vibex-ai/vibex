@@ -9,9 +9,19 @@ use nsh_base::{ButtonElement, Input, button};
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use super::field;
-use crate::theme;
+use crate::{copy, theme};
 
-/// The card itself: rounder than any other surface, and lifted off the page.
+/// The prompt hint shared by both an open session and a new session.
+pub fn placeholder() -> &'static str {
+    copy::text(
+        "/ commands @files & refs $skills",
+        "/ 命令短语 @文件委派引用 $技能",
+        "/ 命令短語 @檔案委派參照 $技能",
+    )
+}
+
+/// The card itself: rounder than any other surface, a borderless filled block
+/// lifted cleanly off the page tone.
 pub fn card() -> View {
     view()
         .w_full()
@@ -19,13 +29,11 @@ pub fn card() -> View {
         .flex_col()
         .rounded(px(theme::RADIUS_COMPOSER))
         .bg(theme::composer_surface)
-        .border_1()
-        .border_color(theme::border_default)
         .shadow_sm()
-        .p(px(6.0))
+        .p(px(theme::SPACING_SM))
 }
 
-/// The field: it grows with what is written, up to a few lines.
+/// The field: starts as a single breathing line and grows with what is written.
 pub fn field(
     value: Signal<String>,
     placeholder: impl IntoReactive<String>,
@@ -34,9 +42,10 @@ pub fn field(
     field::text_field_flat_with(value, placeholder, on_change)
         .multiline(true)
         .h(nsh_core::geometry::Length::Auto)
-        .min_h(px(theme::TOUCH_TARGET))
         .max_h(px(132.0))
-        .px(px(theme::SPACING_SM + 2.0))
+        .px(px(theme::SPACING_SM))
+        .pt(px(6.0))
+        .pb(px(8.0))
         .text_size(px(theme::font_composer()))
 }
 
@@ -115,6 +124,66 @@ pub fn pill_in(
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(ink),
         )
+        .child(
+            svg(icon!("chevron-down"))
+                .size(px(11.0))
+                .flex_shrink_0()
+                .text_color(theme::text_muted),
+        )
+}
+
+/// The unified Agent & model trigger on the composer's control row.
+///
+/// Matches desktop's runtime trigger: a brand mark on the left, the model name
+/// that truncates when width is tight, an optional non-truncating reasoning
+/// depth on its right, and the disclosure chevron.
+pub fn runtime_pill(
+    icon: impl Fn() -> ImageSrc + 'static,
+    value: impl IntoReactive<SharedString>,
+    detail: impl Fn() -> Option<SharedString> + Clone + 'static,
+    ink: impl Fn() -> Hsla + 'static,
+    on_press: impl Fn() + 'static,
+) -> ButtonElement {
+    let show_detail = detail.clone();
+    button()
+        .on_press(on_press)
+        .h(px(theme::CHIP_HEIGHT))
+        .min_w(px(0.0))
+        .flex_shrink(1.0)
+        .pl(px(10.0))
+        .pr(px(theme::SPACING_SM))
+        .flex_row()
+        .items_center()
+        .gap(px(6.0))
+        .rounded_full()
+        .bg(theme::fill)
+        .active(|style| style.opacity(0.6))
+        .disabled_style(|style| style.opacity(0.42))
+        .child(dynamic(move || {
+            svg(icon())
+                .size(px(14.0))
+                .flex_shrink_0()
+                .text_color(theme::text_secondary)
+        }))
+        .child(
+            text(value)
+                .min_w(px(0.0))
+                .flex_shrink(1.0)
+                .truncate()
+                .text_size(px(theme::font_caption()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(ink),
+        )
+        .child(when(
+            move || show_detail().is_some(),
+            move || {
+                let detail = detail.clone();
+                text(move || detail().unwrap_or_default())
+                    .flex_shrink_0()
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+            },
+        ))
         .child(
             svg(icon!("chevron-down"))
                 .size(px(11.0))

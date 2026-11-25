@@ -705,8 +705,18 @@ pub fn row_pressed_bg() -> Hsla {
 }
 
 /// The surface the reader writes on, and a sent message's plate.
+///
+/// The prompt card wears no border, so its fill has to stand clearly off
+/// [`block_page`]: lifted between `card` and `secondary` in dark mode, and
+/// the crisp card surface over the secondary page tone in light mode.
 pub fn composer_surface() -> Hsla {
-    color_token("composer-surface")
+    if dark() {
+        blend(background_card(), color_token("secondary"), 0.55)
+    } else if background_card() != block_page() {
+        background_card()
+    } else {
+        blend(block_page(), foreground(), 0.04)
+    }
 }
 
 /// A finished or connected state.

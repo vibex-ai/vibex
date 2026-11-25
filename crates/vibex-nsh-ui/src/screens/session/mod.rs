@@ -225,10 +225,12 @@ pub enum MessageDelivery {
     Resend,
 }
 
-/// What the open session is running on, for the composer's chips.
+/// What the session is running on, for the composer's runtime trigger.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RuntimeSummaryView {
+    pub agent_id: String,
     pub agent: String,
+    pub model_id: String,
     pub model: String,
     pub reasoning: String,
     pub mode: String,
@@ -237,6 +239,25 @@ pub struct RuntimeSummaryView {
     pub reasoning_set: bool,
     pub mode_set: bool,
     pub available: bool,
+}
+
+/// The state and callbacks shared by the Agent settings sheet in both an open
+/// session and a session being created.
+#[derive(Clone)]
+pub struct RuntimePickerHost {
+    pub summary: Signal<Option<RuntimeSummaryView>>,
+    pub options: Signal<Vec<RuntimeOptionView>>,
+    pub reasoning: Signal<Vec<RuntimeChoiceView>>,
+    pub modes: Signal<Vec<RuntimeChoiceView>>,
+    pub features: Signal<Vec<RuntimeFeatureView>>,
+    pub open: Signal<bool>,
+    pub busy: Signal<bool>,
+    pub on_open: Action,
+    pub on_close: Action,
+    pub on_choose_runtime: Rc<dyn Fn(&str)>,
+    pub on_choose_reasoning: Rc<dyn Fn(&str)>,
+    pub on_choose_mode: Rc<dyn Fn(&str)>,
+    pub on_choose_feature: ChooseFeature,
 }
 
 /// One Agent + auth source + model the runtime can run.
@@ -527,7 +548,7 @@ type OpenDiff = CollapseAction;
 type SessionMenu = FolderNameAction;
 
 use crate::screens::new_session::{
-    NewSessionHost, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice,
+    NewSessionHost, ProjectBrowserHost, WorkspaceChoice,
     new_session as new_session_page, project_browser_sheet as project_browser,
 };
 
@@ -782,9 +803,8 @@ pub struct SessionHost {
     /// what it can be started with.
     pub new_session_open: Signal<bool>,
     pub new_workspaces: Signal<Vec<WorkspaceChoice>>,
-    pub new_runtimes: Signal<Vec<RuntimeChoice>>,
     pub new_workspace: Signal<Option<String>>,
-    pub new_runtime: Signal<Option<String>>,
+    pub new_runtime: RuntimePickerHost,
     pub new_busy: Signal<bool>,
     pub new_error: Signal<Option<SharedString>>,
     pub on_create_session: Action,
@@ -964,11 +984,15 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
                 true
             }
             ShellPage::Workbench => tab.get_untracked().back(&host),
-            // Backing out of a session being written returns to the one that
-            // was open.
+            // Backing out of a session being written puts its Agent settings
+            // sheet away first, then returns to the open session.
             ShellPage::Home if creating.get_untracked() => {
                 dismiss_keyboard();
-                (host.on_close_new_session)();
+                if host.new_runtime.open.get_untracked() {
+                    (host.new_runtime.on_close)();
+                } else {
+                    (host.on_close_new_session)();
+                }
                 true
             }
             ShellPage::Home if host.find_open.get_untracked() => {
@@ -1193,9 +1217,8 @@ fn shell(
     let tabs_above_for_banner = group_tabs_visible(&host);
     let create_host = NewSessionHost {
         workspaces: host.new_workspaces,
-        runtimes: host.new_runtimes,
         workspace: host.new_workspace,
-        runtime: host.new_runtime,
+        runtime: host.new_runtime.clone(),
         busy: host.new_busy,
         error: host.new_error,
         on_create: host.on_create_session.clone(),
@@ -1350,7 +1373,24 @@ fn shell(
                     move || composer(composer_host.clone(), composer_input, runtime_panel),
                 )),
         )
-        .child(runtime_sheet(host.clone(), runtime_panel))
+        .child(runtime_sheet(
+            RuntimePickerHost {
+                summary: host.runtime_summary,
+                options: host.runtime_options,
+                reasoning: host.runtime_reasoning,
+                modes: host.runtime_modes,
+                features: host.runtime_features,
+                open: host.runtime_open,
+                busy: host.runtime_busy,
+                on_open: host.on_open_runtime.clone(),
+                on_close: host.on_close_runtime.clone(),
+                on_choose_runtime: host.on_choose_runtime.clone(),
+                on_choose_reasoning: host.on_choose_reasoning.clone(),
+                on_choose_mode: host.on_choose_mode.clone(),
+                on_choose_feature: host.on_choose_feature.clone(),
+            },
+            runtime_panel,
+        ))
         .child(history_sheet(host.clone(), jump_to_message, composer_input))
 }
 
@@ -4575,9 +4615,6 @@ fn composer(
     let attachments = host.attachments;
     let on_remove_attachment = host.on_remove_attachment.clone();
     let runtime_summary = host.runtime_summary;
-    let runtime_reasoning = host.runtime_reasoning;
-    let runtime_modes = host.runtime_modes;
-    let runtime_features = host.runtime_features;
     let runtime_busy = host.runtime_busy;
     let token_usage = host.token_usage;
     let show_token_usage = host.show_token_usage;
@@ -4652,13 +4689,6 @@ fn composer(
         !draft.with(|draft| draft.trim().is_empty()) || !attachments.with(Vec::is_empty)
     });
     let can_send = move || !sending.get() && active.with(Option::is_some) && has_content.get();
-    // What the Agent itself can be told beside the model: how hard to think,
-    // how far to act, and its own switches.
-    let tunable = move || {
-        !runtime_reasoning.with(Vec::is_empty)
-            || !runtime_modes.with(Vec::is_empty)
-            || !runtime_features.with(Vec::is_empty)
-    };
     // The notices, the cards and the prompt card stand in one column. The
     // sheets the card raises are kept out of it: they take no room, and a gap
     // beside one would still be a gap.
@@ -4755,11 +4785,7 @@ fn composer(
                 .child(
                     compose::field(
                         draft,
-                        copy::text(
-                            "/ commands @files $skills",
-                            "/ 命令 @文件 $技能",
-                            "/ 命令 @檔案 $技能",
-                        ),
+                        compose::placeholder(),
                         move |text: &str| {
                             match text.strip_prefix('/') {
                                 Some(query) => on_query(query),
@@ -4795,66 +4821,12 @@ fn composer(
                                 .min_w(px(0.0))
                                 .flex_row()
                                 .items_center()
-                                .gap(px(2.0))
                                 .overflow_hidden()
-                                .child({
-                                    let on_open = on_open_runtime.clone();
-                                    compose::pill_in(
-                                        icon!("sparkles"),
-                                        move || {
-                                            SharedString::from(runtime_summary.with(|summary| {
-                                                summary.as_ref().map_or_else(
-                                                    || copy::text("Model", "模型", "模型").to_owned(),
-                                                    |summary| summary.model.clone(),
-                                                )
-                                            }))
-                                        },
-                                        move || {
-                                            if runtime_summary.with(|summary| {
-                                                summary
-                                                    .as_ref()
-                                                    .is_some_and(|summary| !summary.available)
-                                            }) {
-                                                theme::accent_yellow()
-                                            } else {
-                                                theme::text_secondary()
-                                            }
-                                        },
-                                        move || on_open(RuntimePanel::Model),
-                                    )
-                                    .disabled(move || sending.get() || runtime_busy.get())
-                                })
-                                .child(when(tunable, {
-                                    let on_open = on_open_runtime.clone();
-                                    move || {
-                                        let on_open = on_open.clone();
-                                        compose::option(
-                                            icon!("sliders-horizontal"),
-                                            copy::text("Agent options", "Agent 选项", "Agent 選項"),
-                                            move || {
-                                                runtime_summary.with(|summary| {
-                                                    summary.as_ref().is_some_and(|summary| {
-                                                        summary.reasoning_set
-                                                            || summary.mode_set
-                                                            || summary.options_set
-                                                    })
-                                                })
-                                            },
-                                            move || {
-                                                on_open(
-                                                    if !runtime_reasoning.with(Vec::is_empty) {
-                                                        RuntimePanel::Reasoning
-                                                    } else if !runtime_modes.with(Vec::is_empty) {
-                                                        RuntimePanel::Mode
-                                                    } else {
-                                                        RuntimePanel::Options
-                                                    },
-                                                )
-                                            },
-                                        )
-                                        .disabled(move || sending.get() || runtime_busy.get())
-                                    }
-                                })),
+                                .child(runtime_trigger(
+                                    runtime_summary,
+                                    move || sending.get() || runtime_busy.get(),
+                                    move || on_open_runtime(RuntimePanel::Model),
+                                )),
                         )
                         .child(when(
                             move || show_token_usage.get(),
@@ -5331,7 +5303,7 @@ fn plan_bar(plan: Signal<Option<PlanView>>, open: Signal<bool>) -> impl IntoElem
 
 /// The panels of the runtime sheet: the model, and the Agent's own options.
 #[derive(Clone, Copy, PartialEq, Eq)]
-enum RuntimePanel {
+pub(crate) enum RuntimePanel {
     Model,
     Reasoning,
     Mode,
@@ -5559,21 +5531,22 @@ fn history_sheet(
 
 /// The runtime sheet: what runs the session, and how. One sheet with a panel
 /// a kind of choice: the model, and the Agent's own option groups.
-fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoElement {
+pub(crate) fn runtime_sheet(host: RuntimePickerHost, panel: Signal<RuntimePanel>) -> impl IntoElement {
     use crate::ui::sheet::{bottom_sheet, sheet_card, sheet_header};
-    let open = host.runtime_open;
-    let close = host.on_close_runtime;
+    let open = host.open;
+    let close = host.on_close;
     let query = signal(String::new());
     let agent = signal(None::<String>);
-    let options = host.runtime_options;
-    let busy = host.runtime_busy;
-    let reasoning = host.runtime_reasoning;
-    let modes = host.runtime_modes;
-    let features = host.runtime_features;
+    let options = host.options;
+    let busy = host.busy;
+    let reasoning = host.reasoning;
+    let modes = host.modes;
+    let features = host.features;
     effect(move || {
         if !open.get() {
             query.set(String::new());
             agent.set(None);
+            panel.set(RuntimePanel::Model);
         }
     });
     // The panels the runtime has something to offer on.
@@ -5589,6 +5562,12 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
             panels.push(RuntimePanel::Options);
         }
         panels
+    });
+    effect(move || {
+        let current = panel.get_untracked();
+        if !panels.with(|panels| panels.contains(&current)) {
+            panel.set(RuntimePanel::Model);
+        }
     });
     let agents = computed(move || {
         options.with(|options| {
@@ -7014,6 +6993,63 @@ fn model_mark_svg(model_id: &str) -> ImageSrc {
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(ImageSrc::svg_markup)
         .unwrap_or_else(|| icon!("sparkles"))
+}
+
+fn runtime_mark_svg(model_id: &str, agent_id: &str) -> ImageSrc {
+    vibex_brands::model_mark(model_id)
+        .or_else(|| vibex_brands::agent_mark(agent_id))
+        .and_then(|mark| vibex_brands::mark_bytes(mark.path))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(ImageSrc::svg_markup)
+        .unwrap_or_else(|| icon!("sparkles"))
+}
+
+/// The unified composer trigger for Agent settings, shared between open
+/// sessions and the new-session screen.
+pub(crate) fn runtime_trigger(
+    summary: Signal<Option<RuntimeSummaryView>>,
+    disabled: impl Fn() -> bool + 'static,
+    on_open: impl Fn() + 'static,
+) -> nsh_base::ButtonElement {
+    compose::runtime_pill(
+        move || {
+            summary.with(|summary| {
+                summary.as_ref().map_or_else(
+                    || icon!("sparkles"),
+                    |summary| runtime_mark_svg(&summary.model_id, &summary.agent_id),
+                )
+            })
+        },
+        move || {
+            SharedString::from(summary.with(|summary| {
+                summary.as_ref().map_or_else(
+                    || copy::text("Model", "模型", "模型").to_owned(),
+                    |summary| summary.model.clone(),
+                )
+            }))
+        },
+        move || {
+            summary.with(|summary| {
+                summary
+                    .as_ref()
+                    .filter(|summary| summary.reasoning_set && !summary.reasoning.is_empty())
+                    .map(|summary| SharedString::from(summary.reasoning.clone()))
+            })
+        },
+        move || {
+            if summary.with(|summary| {
+                summary
+                    .as_ref()
+                    .is_some_and(|summary| !summary.available)
+            }) {
+                theme::accent_yellow()
+            } else {
+                theme::foreground()
+            }
+        },
+        on_open,
+    )
+    .disabled(disabled)
 }
 
 /// The mark a source fold wears in the runtime picker.

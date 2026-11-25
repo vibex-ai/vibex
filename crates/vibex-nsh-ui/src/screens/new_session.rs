@@ -14,9 +14,12 @@
 
 use std::rc::Rc;
 
+use nsh_base::button;
 use nsh_core::{element::ImageSrc, prelude::*};
 
-use crate::screens::session::{AttachmentItem, BrowseDirs};
+use crate::screens::session::{
+    self, AttachmentItem, BrowseDirs, RuntimePanel, RuntimePickerHost,
+};
 
 type Action = Rc<dyn Fn()>;
 
@@ -39,23 +42,14 @@ pub struct WorkspaceChoice {
     pub detail: String,
 }
 
-/// A runtime the new session can run on.
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub struct RuntimeChoice {
-    pub id: String,
-    pub title: String,
-    pub detail: String,
-}
-
 /// What the page may do, and the state it shows.
 #[derive(Clone)]
 pub struct NewSessionHost {
     pub workspaces: Signal<Vec<WorkspaceChoice>>,
-    pub runtimes: Signal<Vec<RuntimeChoice>>,
     /// The chosen workspace's id.
     pub workspace: Signal<Option<String>>,
-    /// The chosen runtime's id.
-    pub runtime: Signal<Option<String>>,
+    /// The Agent settings picker shared with open sessions.
+    pub runtime: RuntimePickerHost,
     pub busy: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
     pub on_create: Rc<dyn Fn()>,
@@ -84,7 +78,6 @@ enum Location {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Picker {
     Location,
-    Runtime,
     Attachment,
 }
 
@@ -149,13 +142,16 @@ fn starters() -> [Starter; 3] {
 pub fn new_session(host: NewSessionHost) -> impl IntoElement {
     let picker = signal(None::<Picker>);
     let location = signal(Location::Workspace);
+    let runtime_panel = signal(RuntimePanel::Model);
     let input = element_ref();
     let error = host.error;
     let busy = host.busy;
     let workspace = host.workspace;
     let workspaces = host.workspaces;
-    let runtime = host.runtime;
-    let runtimes = host.runtimes;
+    let runtime = host.runtime.clone();
+    let runtime_summary = runtime.summary;
+    let runtime_busy = runtime.busy;
+    let on_open_runtime = runtime.on_open.clone();
     let workspace_name = move || {
         workspaces.with(|choices| {
             workspace
@@ -167,36 +163,33 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                 .map(|choice| choice.name.clone())
         })
     };
+    let location_icon = move || match location.get() {
+        Location::Workspace => icon!("folder"),
+        Location::Worktree => icon!("git-branch"),
+        Location::Temporary => icon!("box"),
+    };
     let location_label = move || {
         SharedString::from(match location.get() {
             Location::Temporary => {
                 copy::text("Temporary session", "临时会话", "暫時工作階段").to_owned()
             }
-            _ => workspace_name().unwrap_or_else(|| {
+            Location::Worktree => workspace_name()
+                .map(|name| format!("{name} · Worktree"))
+                .unwrap_or_else(|| {
+                    copy::text("New worktree", "新建 Worktree", "新增 Worktree").to_owned()
+                }),
+            Location::Workspace => workspace_name().unwrap_or_else(|| {
                 copy::text("Choose project", "选择项目", "選擇專案").to_owned()
             }),
         })
-    };
-    let runtime_label = move || {
-        SharedString::from(runtimes.with(|choices| {
-            runtime
-                .with(|selected| {
-                    choices
-                        .iter()
-                        .find(|choice| selected.as_ref() == Some(&choice.id))
-                })
-                .map(|choice| choice.title.clone())
-                .unwrap_or_else(|| {
-                    copy::text("Agent and model", "Agent 与模型", "Agent 與模型").to_owned()
-                })
-        }))
     };
     let prompt = host.prompt;
     let branch = host.worktree_branch;
     let attachments = host.attachments;
     let can_create = move || {
         !busy.get()
-            && runtime.with(Option::is_some)
+            && runtime_summary
+                .with(|summary| summary.as_ref().is_some_and(|summary| summary.available))
             && match location.get() {
                 Location::Temporary => true,
                 Location::Workspace => workspace.with(Option::is_some),
@@ -222,7 +215,16 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
         .min_h(px(0.0))
         .flex_col()
         .pb_keyboard()
-        .child(canvas(prompt, input))
+        .child(canvas(
+            prompt,
+            input,
+            location_icon,
+            location_label,
+            move || {
+                dismiss_keyboard();
+                picker.set(Some(Picker::Location));
+            },
+        ))
         .child(
             view()
                 .w_full()
@@ -291,12 +293,8 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                             },
                         ))
                         .child(
-                            compose::field(
-                                prompt,
-                                copy::text("First message", "第一条消息", "第一則訊息"),
-                                |_: &str| {},
-                            )
-                            .element_ref(&input),
+                            compose::field(prompt, compose::placeholder(), |_: &str| {})
+                                .element_ref(&input),
                         )
                         .child(
                             compose::controls()
@@ -313,29 +311,14 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                                         .min_w(px(0.0))
                                         .flex_row()
                                         .items_center()
-                                        .gap(px(theme::SPACING_XS))
                                         .overflow_hidden()
-                                        .child(
-                                            compose::pill(
-                                                icon!("folder"),
-                                                location_label,
-                                                move || {
-                                                    dismiss_keyboard();
-                                                    picker.set(Some(Picker::Location));
-                                                },
-                                            )
-                                            .accessibility_label(copy::text(
-                                                "Choose workspace",
-                                                "选择工作区",
-                                                "選擇工作區",
-                                            )),
-                                        )
-                                        .child(compose::pill(
-                                            icon!("sparkles"),
-                                            runtime_label,
+                                        .child(session::runtime_trigger(
+                                            runtime_summary,
+                                            move || busy.get() || runtime_busy.get(),
                                             move || {
                                                 dismiss_keyboard();
-                                                picker.set(Some(Picker::Runtime));
+                                                runtime_panel.set(RuntimePanel::Model);
+                                                on_open_runtime();
                                             },
                                         )),
                                 )
@@ -430,22 +413,7 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                         )),
                 ),
         ))
-        .child(choice_sheet(
-            picker,
-            Picker::Runtime,
-            copy::text("Agent and model", "Agent 与模型", "Agent 與模型"),
-            chrome::sheet_card().child(choice_list(
-                runtimes,
-                icon!("sparkles"),
-                |choice: &RuntimeChoice| choice.id.clone(),
-                |choice: &RuntimeChoice| (choice.title.clone(), choice.detail.clone()),
-                move |id| runtime.with(|selected| selected.as_deref() == Some(id)),
-                move |id| {
-                    runtime.set(Some(id.to_owned()));
-                    picker.set(None);
-                },
-            )),
-        ))
+        .child(session::runtime_sheet(runtime, runtime_panel))
         .child(choice_sheet(
             picker,
             Picker::Attachment,
@@ -481,9 +449,16 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
         ))
 }
 
-/// Where the messages will be: a greeting, and a few ways to begin. The ways
-/// to begin give way to the keyboard, the greeting stays.
-fn canvas(prompt: Signal<String>, input: ElementRef) -> impl IntoElement {
+/// Where the messages will be: a greeting, the workspace picker, and a few
+/// ways to begin. The starters give way to the keyboard; the greeting and
+/// workspace picker stay.
+fn canvas(
+    prompt: Signal<String>,
+    input: ElementRef,
+    location_icon: impl Fn() -> ImageSrc + 'static,
+    location_label: impl IntoReactive<SharedString>,
+    on_choose_location: impl Fn() + 'static,
+) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -521,12 +496,61 @@ fn canvas(prompt: Signal<String>, input: ElementRef) -> impl IntoElement {
             .line_height(theme::line_height_for(theme::font_detail()))
             .text_color(theme::text_secondary),
         )
+        .child(
+            view()
+                .w_full()
+                .flex_row()
+                .items_center()
+                .pt(px(theme::SPACING_SM))
+                .child(
+                    button()
+                        .accessibility_label(copy::text(
+                            "Choose workspace",
+                            "选择工作区",
+                            "選擇工作區",
+                        ))
+                        .on_press(on_choose_location)
+                        .h(px(34.0))
+                        .max_w(relative(1.0))
+                        .min_w(px(0.0))
+                        .flex_shrink(1.0)
+                        .pl(px(12.0))
+                        .pr(px(10.0))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(6.0))
+                        .rounded_full()
+                        .bg(theme::background_card)
+                        .active(|style| style.opacity(0.65))
+                        .child(dynamic(move || {
+                            svg(location_icon())
+                                .size(px(14.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_secondary)
+                        }))
+                        .child(
+                            text(location_label)
+                                .min_w(px(0.0))
+                                .flex_shrink(1.0)
+                                .truncate()
+                                .text_size(px(theme::font_caption()))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::foreground),
+                        )
+                        .child(
+                            svg(icon!("chevron-down"))
+                                .size(px(11.0))
+                                .flex_shrink_0()
+                                .text_color(theme::text_muted),
+                        ),
+                ),
+        )
         .child(when(
             move || keyboard_height().0 == 0.0,
             move || {
                 view()
                     .w_full()
-                    .pt(px(theme::SPACING_LG))
+                    .pt(px(theme::SPACING_MD))
                     .gap(px(theme::SPACING_SM))
                     .children(starters().map(|starter| {
                         let Starter {

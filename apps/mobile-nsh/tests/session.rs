@@ -17,22 +17,20 @@ use vibex_nsh_ui::screens::git::{
     BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeConflictRow,
     WorktreeOperationRow, WorktreeRow,
 };
-use vibex_nsh_ui::screens::new_session::{
-    DirectoryEntry, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice,
-};
+use vibex_nsh_ui::screens::new_session::{DirectoryEntry, ProjectBrowserHost, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
     self, ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
     ComposerHistoryEntry, ConversationState, EntryKind, GoalPhaseView, GoalView, PendingPermission,
     PendingQuestion, PermissionChoice, PermissionOption, PlanStepState, PlanStepView, PlanView,
     QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView, RuntimeOptionView,
-    RuntimeSummaryView, SessionHost, SessionState, SessionSummary, SidebarRowKind, SidebarRowView,
-    SidebarSectionKind, SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
-    TurnFileChange,
+    RuntimePickerHost, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
+    SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView, SidebarTree,
+    TimelineEntry, TokenUsageView, TurnFileChange,
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
 
-const COMPOSER: &str = "text:/ commands @files $skills";
+const COMPOSER: &str = "text:/ commands @files & refs $skills";
 /// The open session's own menu, on the conversation's header. Its name
 /// carries the session's title after it.
 const CONVERSATION_MENU: &str = "role:button[/^Conversation menu/]";
@@ -414,7 +412,9 @@ fn HistoryShell() -> impl IntoElement {
 fn RuntimeShell() -> impl IntoElement {
     let mut host = host_with(None, None);
     host.runtime_summary = signal(Some(RuntimeSummaryView {
+        agent_id: "claude".to_owned(),
         agent: "Claude".to_owned(),
+        model_id: "claude-4".to_owned(),
         model: "Claude 4".to_owned(),
         reasoning: "High".to_owned(),
         mode: "Default".to_owned(),
@@ -985,13 +985,109 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         name: "Vibex".to_owned(),
         detail: "/code/vibex".to_owned(),
     }]);
-    let new_runtimes = signal(vec![RuntimeChoice {
-        id: "0".to_owned(),
-        title: "Claude · Sonnet".to_owned(),
-        detail: "Subscription".to_owned(),
-    }]);
     let new_workspace = signal(Some("w1".to_owned()));
-    let new_runtime = signal(Some("0".to_owned()));
+    let new_runtime_open = signal(false);
+    let new_runtime_summary = signal(Some(RuntimeSummaryView {
+        agent_id: "claude".to_owned(),
+        agent: "Claude".to_owned(),
+        model_id: "claude-sonnet-4".to_owned(),
+        model: "Sonnet".to_owned(),
+        reasoning: "Default".to_owned(),
+        mode: "Default".to_owned(),
+        options_set: false,
+        reasoning_set: false,
+        mode_set: false,
+        available: true,
+    }));
+    let new_runtime_options = signal(vec![
+        RuntimeOptionView {
+            id: "0".to_owned(),
+            agent_id: "claude".to_owned(),
+            agent: "Claude".to_owned(),
+            model: "Sonnet".to_owned(),
+            detail: String::new(),
+            selected: true,
+            available: true,
+            source_key: "provider:claude".to_owned(),
+            source_label: "Pro".to_owned(),
+            model_id: "claude-sonnet-4".to_owned(),
+        },
+        RuntimeOptionView {
+            id: "1".to_owned(),
+            agent_id: "codex".to_owned(),
+            agent: "Codex".to_owned(),
+            model: "GPT-5".to_owned(),
+            detail: String::new(),
+            selected: false,
+            available: true,
+            source_key: "provider:codex".to_owned(),
+            source_label: "Team".to_owned(),
+            model_id: "gpt-5".to_owned(),
+        },
+    ]);
+    let new_runtime_reasoning = signal(vec![
+        RuntimeChoiceView {
+            value: "default".to_owned(),
+            label: "Default".to_owned(),
+            selected: true,
+        },
+        RuntimeChoiceView {
+            value: "high".to_owned(),
+            label: "High".to_owned(),
+            selected: false,
+        },
+    ]);
+    let new_runtime = RuntimePickerHost {
+        summary: new_runtime_summary,
+        options: new_runtime_options,
+        reasoning: new_runtime_reasoning,
+        modes: signal(Vec::new()),
+        features: signal(Vec::new()),
+        open: new_runtime_open,
+        busy: signal(false),
+        on_open: Rc::new(move || new_runtime_open.set(true)),
+        on_close: Rc::new(move || new_runtime_open.set(false)),
+        on_choose_runtime: Rc::new(move |id: &str| {
+            let mut chosen = None;
+            new_runtime_options.update(|options| {
+                for option in options.iter_mut() {
+                    option.selected = option.id == id;
+                    if option.selected {
+                        chosen = Some(option.clone());
+                    }
+                }
+            });
+            if let Some(option) = chosen {
+                new_runtime_summary.update(|summary| {
+                    if let Some(summary) = summary.as_mut() {
+                        summary.agent_id = option.agent_id;
+                        summary.agent = option.agent;
+                        summary.model_id = option.model_id;
+                        summary.model = option.model;
+                    }
+                });
+            }
+        }),
+        on_choose_reasoning: Rc::new(move |value: &str| {
+            let mut label = "Default".to_owned();
+            new_runtime_reasoning.update(|choices| {
+                for choice in choices.iter_mut() {
+                    choice.selected = choice.value == value;
+                    if choice.selected {
+                        label = choice.label.clone();
+                    }
+                }
+            });
+            new_runtime_summary.update(|summary| {
+                if let Some(summary) = summary.as_mut() {
+                    summary.reasoning = label;
+                    summary.reasoning_set = value != "default";
+                }
+            });
+        }),
+        on_choose_mode: Rc::new(|_| {}),
+        on_choose_feature: Rc::new(|_, _| {}),
+    };
     let new_busy = signal(false);
     let new_error = signal(None::<SharedString>);
     let new_worktree_branch = signal(String::new());
@@ -1363,7 +1459,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_delete_session,
         new_session_open,
         new_workspaces,
-        new_runtimes,
         new_workspace,
         new_runtime,
         new_busy,
@@ -1461,6 +1556,38 @@ fn the_composer_opens_the_runtime_choices() {
             "a queued prompt offers {step}"
         );
     }
+    // The standalone Agent options button is gone: reasoning depth is shown on
+    // the right side of the single runtime trigger pill instead.
+    assert!(
+        !app.screen().matches("role:button[Agent options]").unwrap(),
+        "normal composer should not render a separate Agent options button"
+    );
+    let model_bounds = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == "Claude 4")
+        })
+        .map(|node| node.bounds)
+        .expect("Claude 4 label on composer pill");
+    let reasoning_bounds = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| {
+            node.text
+                .as_ref()
+                .is_some_and(|text| text.text.text == "High")
+        })
+        .map(|node| node.bounds)
+        .expect("High reasoning depth on composer pill");
+    assert!(
+        reasoning_bounds.origin.x.0 > model_bounds.origin.x.0,
+        "reasoning depth should sit to the right of the model name ({model_bounds:?} vs {reasoning_bounds:?})"
+    );
     app.press("Claude 4").unwrap();
     app.wait_for("Agent settings").unwrap();
     // The fold header shows the provider's name ("Pro"), not the Agent's name.
@@ -1482,12 +1609,8 @@ fn the_composer_opens_the_runtime_choices() {
         !app.screen().matches("role:button[GPT-5 Team]").unwrap(),
         "the provider name stays on the fold header rather than inside the model row"
     );
-    app.press("role:button[Close]").unwrap();
-    app.wait_for_gone("GPT-5", std::time::Duration::from_secs(3))
-        .unwrap();
-    // The Agent's own options open the same sheet on their panel.
-    app.press("role:button[Agent options]").unwrap();
-    app.wait_for("role:button[Reasoning]").unwrap();
+    // Reasoning lives inside the same Agent settings sheet as a segment tab.
+    app.press("role:button[Reasoning]").unwrap();
     app.wait_for("Default").unwrap();
     app.press("Default").unwrap();
     app.wait_for_gone("Default", std::time::Duration::from_secs(3))
@@ -2124,7 +2247,7 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     app.press(NEW_SESSION).unwrap();
     // The session is written on the conversation page, which the sessions
     // page gives way to.
-    app.wait_for("Claude · Sonnet").unwrap();
+    app.wait_for("Sonnet").unwrap();
     app.wait_for_gone(
         "role:button[Back to session]",
         std::time::Duration::from_secs(3),
@@ -3036,4 +3159,93 @@ fn opening_agent_settings_reveals_an_offscreen_selected_agent_chip() {
         )),
         "opening the sheet should jump the horizontal Agent strip without animation"
     );
+}
+
+
+#[test]
+fn composer_input_defaults_to_a_single_line_and_grows_for_multiline_text() {
+    let mut app = start();
+    app.wait_for(COMPOSER).unwrap();
+    let input_id = app.screen().id(COMPOSER).unwrap();
+    let nodes = app.screen().layout_nodes();
+    let input_node = nodes
+        .iter()
+        .find(|node| node.id == input_id)
+        .expect("composer input node");
+    let card_node = nodes
+        .iter()
+        .find(|node| node.id == input_node.parent)
+        .expect("composer card node");
+    let initial_height = input_node.bounds.size.height.0;
+    assert!(
+        initial_height < 42.0,
+        "empty composer input should default to a single line with breathing padding, got {initial_height}pt"
+    );
+    assert!(
+        input_node.bounds.origin.y.0 >= card_node.bounds.origin.y.0 + 7.5,
+        "composer input should have breathing room from the top of the card ({:?} inside {:?})",
+        input_node.bounds,
+        card_node.bounds
+    );
+    app.type_text(COMPOSER, "Line one\nLine two\nLine three")
+        .unwrap();
+    let multiline_height = app
+        .screen()
+        .layout_nodes()
+        .into_iter()
+        .find(|node| node.id == input_id)
+        .map(|node| node.bounds.size.height.0)
+        .expect("multiline composer input node");
+    assert!(
+        multiline_height > initial_height + 20.0,
+        "multiline text should expand the composer input ({initial_height}pt -> {multiline_height}pt)"
+    );
+}
+
+#[test]
+fn new_session_places_workspace_above_composer_and_uses_unified_agent_settings() {
+    let mut app = start();
+    app.press("role:button[Sessions]").unwrap();
+    app.press(NEW_SESSION).unwrap();
+    app.wait_for("role:button[Choose workspace]").unwrap();
+    app.wait_for(COMPOSER).unwrap();
+
+    let workspace_id = app.screen().id("role:button[Choose workspace]").unwrap();
+    let composer_id = app.screen().id(COMPOSER).unwrap();
+    let nodes = app.screen().layout_nodes();
+    let workspace_bounds = nodes
+        .iter()
+        .find(|node| node.id == workspace_id)
+        .map(|node| node.bounds)
+        .expect("workspace trigger on new-session page");
+    let composer_bounds = nodes
+        .iter()
+        .find(|node| node.id == composer_id)
+        .map(|node| node.bounds)
+        .expect("new-session composer input");
+    assert!(
+        workspace_bounds.origin.y.0 + workspace_bounds.size.height.0 < composer_bounds.origin.y.0,
+        "workspace picker must live on the page above the composer ({workspace_bounds:?} vs {composer_bounds:?})"
+    );
+
+    // Tapping the new-session runtime pill opens the unified Agent settings sheet,
+    // not the removed "Agent and model" picker.
+    app.press("Sonnet").unwrap();
+    app.wait_for("Agent settings").unwrap();
+    assert!(!app.screen().shows("Agent and model"));
+    assert!(app.screen().shows("Pro"));
+    app.press("role:button[Codex]").unwrap();
+    app.wait_for("role:button[Team]").unwrap();
+    app.press("role:button[Team]").unwrap();
+    app.wait_for("GPT-5").unwrap();
+    app.press("GPT-5").unwrap();
+    app.press("role:button[Reasoning]").unwrap();
+    app.wait_for("High").unwrap();
+    app.press("High").unwrap();
+    app.wait_for_gone("Agent settings", std::time::Duration::from_secs(3))
+        .unwrap();
+
+    // The composer pill reflects both the new model and the reasoning depth on its right.
+    assert!(app.screen().shows("GPT-5"));
+    assert!(app.screen().shows("High"));
 }

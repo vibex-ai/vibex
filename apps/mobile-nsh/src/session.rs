@@ -74,7 +74,7 @@ use vibex_nsh_ui::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
         WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
     },
-    screens::new_session::{DirectoryEntry, ProjectBrowserHost, RuntimeChoice, WorkspaceChoice},
+    screens::new_session::{DirectoryEntry, ProjectBrowserHost, WorkspaceChoice},
     screens::session::{
         ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
         ComposerHistoryEntry, ConversationState, EntryKind, GoalControl, GoalPhaseView, GoalView,
@@ -82,7 +82,8 @@ use vibex_nsh_ui::{
         PlanStepState,
         PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
         QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
-        RuntimeOptionView, RuntimeSummaryView, ScheduledSendView, SessionHost, SessionState,
+        RuntimeOptionView, RuntimePickerHost, RuntimeSummaryView, ScheduledSendView, SessionHost,
+        SessionState,
         SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView,
         SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
     },
@@ -271,10 +272,15 @@ pub struct SessionService {
     /// header over it, and the runtime's own rows replace it when they arrive.
     pending_turn: Signal<Option<PendingTurn>>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
-    new_runtimes: Signal<Vec<RuntimeChoice>>,
     new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
+    new_runtime_selection: Rc<RefCell<Option<SessionRuntimeSelection>>>,
+    new_runtime_summary: Signal<Option<RuntimeSummaryView>>,
+    new_runtime_option_views: Signal<Vec<RuntimeOptionView>>,
+    new_runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
+    new_runtime_modes: Signal<Vec<RuntimeChoiceView>>,
+    new_runtime_features: Signal<Vec<RuntimeFeatureView>>,
+    new_runtime_open: Signal<bool>,
     new_workspace: Signal<Option<String>>,
-    new_runtime: Signal<Option<String>>,
     new_worktree_branch: Signal<String>,
     new_base_ref: Signal<String>,
     project_dirs: Signal<Vec<DirectoryEntry>>,
@@ -501,10 +507,15 @@ impl SessionService {
             new_session_open: signal(false),
             pending_turn: signal(None),
             new_workspaces: signal(Vec::new()),
-            new_runtimes: signal(Vec::new()),
             new_runtime_options: Rc::new(RefCell::new(Vec::new())),
+            new_runtime_selection: Rc::new(RefCell::new(None)),
+            new_runtime_summary: signal(None),
+            new_runtime_option_views: signal(Vec::new()),
+            new_runtime_reasoning: signal(Vec::new()),
+            new_runtime_modes: signal(Vec::new()),
+            new_runtime_features: signal(Vec::new()),
+            new_runtime_open: signal(false),
             new_workspace: signal(None),
-            new_runtime: signal(None),
             new_worktree_branch: signal(String::new()),
             new_base_ref: signal(String::new()),
             project_dirs: signal(Vec::new()),
@@ -932,9 +943,42 @@ impl SessionService {
             },
             new_session_open: self.new_session_open,
             new_workspaces: self.new_workspaces,
-            new_runtimes: self.new_runtimes,
             new_workspace: self.new_workspace,
-            new_runtime: self.new_runtime,
+            new_runtime: RuntimePickerHost {
+                summary: self.new_runtime_summary,
+                options: self.new_runtime_option_views,
+                reasoning: self.new_runtime_reasoning,
+                modes: self.new_runtime_modes,
+                features: self.new_runtime_features,
+                open: self.new_runtime_open,
+                busy: self.new_busy,
+                on_open: {
+                    let service = self.clone();
+                    Rc::new(move || service.new_runtime_open.set(true))
+                },
+                on_close: {
+                    let service = self.clone();
+                    Rc::new(move || service.new_runtime_open.set(false))
+                },
+                on_choose_runtime: {
+                    let service = self.clone();
+                    Rc::new(move |id: &str| service.choose_new_runtime(id))
+                },
+                on_choose_reasoning: {
+                    let service = self.clone();
+                    Rc::new(move |value: &str| service.choose_new_reasoning(value))
+                },
+                on_choose_mode: {
+                    let service = self.clone();
+                    Rc::new(move |value: &str| service.choose_new_mode(value))
+                },
+                on_choose_feature: {
+                    let service = self.clone();
+                    Rc::new(move |id: &str, value: Option<&str>| {
+                        service.choose_new_feature(id, value)
+                    })
+                },
+            },
             new_worktree_branch: self.new_worktree_branch,
             new_base_ref: self.new_base_ref,
             new_title: self.new_title,
@@ -1308,7 +1352,10 @@ impl SessionService {
             },
             on_close_new_session: {
                 let service = self.clone();
-                Rc::new(move || service.new_session_open.set(false))
+                Rc::new(move || {
+                    service.new_runtime_open.set(false);
+                    service.new_session_open.set(false);
+                })
             },
             on_create_worktree_session: {
                 let service = self.clone();
@@ -2211,188 +2258,84 @@ impl SessionService {
         selection: &SessionRuntimeSelection,
         catalog: &SessionRuntimeOptionCatalog,
     ) {
-        let matches_model = |option: &SessionRuntimeOption| {
-            let candidate = &option.selection;
-            candidate.agent_id == selection.agent_id
-                && candidate.auth_source == selection.auth_source
-                && candidate.model == selection.model
+        let views = build_runtime_views(Some(selection), &catalog.options);
+        self.runtime_summary.set(views.summary);
+        self.runtime_option_views.set(views.options);
+        self.runtime_reasoning.set(views.reasoning);
+        self.runtime_modes.set(views.modes);
+        self.runtime_features.set(views.features);
+    }
+
+    fn rebuild_new_runtime_views(&self) {
+        let selection = self.new_runtime_selection.borrow().clone();
+        let options = self.new_runtime_options.borrow();
+        let views = build_runtime_views(selection.as_ref(), &options);
+        self.new_runtime_summary.set(views.summary);
+        self.new_runtime_option_views.set(views.options);
+        self.new_runtime_reasoning.set(views.reasoning);
+        self.new_runtime_modes.set(views.modes);
+        self.new_runtime_features.set(views.features);
+    }
+
+    fn choose_new_runtime(&self, id: &str) {
+        let Ok(index) = id.parse::<usize>() else {
+            return;
         };
-        let option = catalog.options.iter().find(|option| matches_model(option));
-        let model = match &selection.model {
-            RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
-            _ => copy::text("Default", "默认", "預設").to_owned(),
+        let option = self.new_runtime_options.borrow().get(index).cloned();
+        let Some(option) = option else {
+            return;
         };
-        let reasoning_label = option
-            .and_then(|option| {
-                selection.reasoning_effort.as_ref().and_then(|value| {
-                    option
-                        .reasoning_efforts
-                        .iter()
-                        .find(|candidate| &candidate.value == value)
-                        .map(|candidate| {
-                            candidate
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| candidate.value.clone())
-                        })
-                })
-            })
-            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
-        let mode_label = option
-            .and_then(|option| {
-                selection.mode_id.as_ref().and_then(|value| {
-                    option
-                        .modes
-                        .iter()
-                        .find(|candidate| &candidate.value == value)
-                        .map(|candidate| {
-                            candidate
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| candidate.value.clone())
-                        })
-                })
-            })
-            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
-        self.runtime_summary.set(Some(RuntimeSummaryView {
-            agent: option
-                .map(|option| option.agent_label.clone())
-                .unwrap_or_else(|| selection.agent_id.as_str().to_owned()),
-            model: option
-                .map(|option| option.model_label.clone())
-                .unwrap_or(model),
-            reasoning: reasoning_label,
-            mode: mode_label,
-            options_set: !selection.config_values.is_empty(),
-            reasoning_set: selection.reasoning_effort.is_some(),
-            mode_set: selection.mode_id.is_some(),
-            available: option
-                .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available),
-        }));
-        self.runtime_option_views.set(
-            catalog
-                .options
-                .iter()
-                .enumerate()
-                .map(|(index, option)| RuntimeOptionView {
-                    id: index.to_string(),
-                    agent_id: option.selection.agent_id.as_str().to_owned(),
-                    agent: option.agent_label.clone(),
-                    model: option.model_label.clone(),
-                    // The provider name lives on the outer fold header rather
-                    // than repeating under every model inside it.
-                    detail: String::new(),
-                    selected: matches_model(option),
-                    available: option.availability == RuntimeOptionAvailability::Available,
-                    // The provider, account or route this option draws from:
-                    // what the picker groups by, so a reader sees which models
-                    // come from where instead of one flat list.
-                    source_key: runtime_source_key(&option.selection.auth_source),
-                    source_label: runtime_source_label(
-                        &option.selection.auth_source,
-                        &option.auth_source_label,
-                    ),
-                    model_id: option
-                        .selection
-                        .model
-                        .model_id()
-                        .unwrap_or_default()
-                        .to_owned(),
-                })
-                .collect(),
-        );
-        let reasoning = option
-            .filter(|option| !option.reasoning_efforts.is_empty())
-            .map(|option| {
-                let mut choices = vec![RuntimeChoiceView {
-                    value: "default".to_owned(),
-                    label: copy::text("Default", "默认", "預設").to_owned(),
-                    selected: selection.reasoning_effort.is_none(),
-                }];
-                choices.extend(option.reasoning_efforts.iter().map(|candidate| {
-                    RuntimeChoiceView {
-                        value: candidate.value.clone(),
-                        label: candidate
-                            .label
-                            .clone()
-                            .unwrap_or_else(|| candidate.value.clone()),
-                        selected: selection.reasoning_effort.as_deref()
-                            == Some(candidate.value.as_str()),
-                    }
-                }));
-                choices
-            })
-            .unwrap_or_default();
-        self.runtime_reasoning.set(reasoning);
-        let modes = option
-            .filter(|option| !option.modes.is_empty())
-            .map(|option| {
-                let mut choices = vec![RuntimeChoiceView {
-                    value: "default".to_owned(),
-                    label: copy::text("Default", "默认", "預設").to_owned(),
-                    selected: selection.mode_id.is_none(),
-                }];
-                choices.extend(option.modes.iter().map(|candidate| {
-                    RuntimeChoiceView {
-                        value: candidate.value.clone(),
-                        label: candidate
-                            .label
-                            .clone()
-                            .unwrap_or_else(|| candidate.value.clone()),
-                        selected: selection.mode_id.as_deref() == Some(candidate.value.as_str()),
-                    }
-                }));
-                choices
-            })
-            .unwrap_or_default();
-        self.runtime_modes.set(modes);
-        let features = option
-            .map(|option| {
-                option
-                    .features
-                    .iter()
-                    .filter(|feature| feature.kind != SessionRuntimeFeatureKind::String)
-                    .map(|feature| {
-                        let current = selection
-                            .config_values
-                            .get(&feature.id)
-                            .cloned()
-                            .or_else(|| {
-                                feature
-                                    .current_value
-                                    .as_ref()
-                                    .map(|value| value.value.clone())
-                            })
-                            .or_else(|| {
-                                feature
-                                    .default_value
-                                    .as_ref()
-                                    .map(|value| value.value.clone())
-                            });
-                        RuntimeFeatureView {
-                            id: feature.id.clone(),
-                            label: feature.label.clone(),
-                            detail: feature.description.clone().unwrap_or_default(),
-                            toggle: feature.kind == SessionRuntimeFeatureKind::Toggle,
-                            explicit_value: selection.config_values.get(&feature.id).cloned(),
-                            values: feature
-                                .values
-                                .iter()
-                                .map(|value| RuntimeChoiceView {
-                                    value: value.value.clone(),
-                                    label: value
-                                        .label
-                                        .clone()
-                                        .unwrap_or_else(|| value.value.clone()),
-                                    selected: current.as_deref() == Some(value.value.as_str()),
-                                })
-                                .collect(),
-                        }
-                    })
-                    .collect()
-            })
-            .unwrap_or_default();
-        self.runtime_features.set(features);
+        if option.availability != RuntimeOptionAvailability::Available {
+            return;
+        }
+        if let Some(current) = self.new_runtime_selection.borrow().as_ref()
+            && current.agent_id == option.selection.agent_id
+            && current.auth_source == option.selection.auth_source
+            && current.model == option.selection.model
+        {
+            return;
+        }
+        *self.new_runtime_selection.borrow_mut() = Some(option.selection);
+        self.rebuild_new_runtime_views();
+    }
+
+    fn choose_new_reasoning(&self, value: &str) {
+        {
+            let mut slot = self.new_runtime_selection.borrow_mut();
+            let Some(selection) = slot.as_mut() else {
+                return;
+            };
+            selection.reasoning_effort = (value != "default").then(|| value.to_owned());
+        }
+        self.rebuild_new_runtime_views();
+    }
+
+    fn choose_new_mode(&self, value: &str) {
+        {
+            let mut slot = self.new_runtime_selection.borrow_mut();
+            let Some(selection) = slot.as_mut() else {
+                return;
+            };
+            selection.mode_id = (value != "default").then(|| value.to_owned());
+        }
+        self.rebuild_new_runtime_views();
+    }
+
+    fn choose_new_feature(&self, id: &str, value: Option<&str>) {
+        {
+            let mut slot = self.new_runtime_selection.borrow_mut();
+            let Some(selection) = slot.as_mut() else {
+                return;
+            };
+            if let Some(value) = value {
+                selection
+                    .config_values
+                    .insert(id.to_owned(), value.to_owned());
+            } else {
+                selection.config_values.remove(id);
+            }
+        }
+        self.rebuild_new_runtime_views();
     }
 
     fn choose_runtime(&self, id: &str) {
@@ -4394,12 +4337,6 @@ impl SessionService {
             ));
             return;
         }
-        let Some(runtime_id) = self.new_runtime.get_untracked() else {
-            return;
-        };
-        let Ok(index) = runtime_id.parse::<usize>() else {
-            return;
-        };
         let Some(base) = self.workspace_records.with(|workspaces| {
             workspaces
                 .iter()
@@ -4408,7 +4345,7 @@ impl SessionService {
         }) else {
             return;
         };
-        let Some(option) = self.new_runtime_options.borrow().get(index).cloned() else {
+        let Some(selection) = self.new_runtime_selection.borrow().clone() else {
             return;
         };
         let draft = self.new_session_draft();
@@ -4449,7 +4386,7 @@ impl SessionService {
                 }
             };
             let request = CreateAgentSessionRequest {
-                runtime: option.selection,
+                runtime: selection,
                 workspace_root: worktree.workspace.root_path,
                 workspace_mode: worktree.workspace.mode,
                 title: draft.title.clone(),
@@ -5671,10 +5608,15 @@ impl SessionService {
             self.new_base_ref.set(String::new());
         }
         self.new_workspaces.set(Vec::new());
-        self.new_runtimes.set(Vec::new());
         self.new_workspace.set(None);
-        self.new_runtime.set(None);
+        self.new_runtime_open.set(false);
         self.new_runtime_options.borrow_mut().clear();
+        *self.new_runtime_selection.borrow_mut() = None;
+        self.new_runtime_summary.set(None);
+        self.new_runtime_option_views.set(Vec::new());
+        self.new_runtime_reasoning.set(Vec::new());
+        self.new_runtime_modes.set(Vec::new());
+        self.new_runtime_features.set(Vec::new());
         self.new_busy.set(true);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
@@ -5698,26 +5640,11 @@ impl SessionService {
                             detail: space.workspace.root_path.clone(),
                         })
                         .collect::<Vec<_>>();
-                    let available = catalog
-                        .options
-                        .into_iter()
-                        .filter(|option| {
-                            option.availability == RuntimeOptionAvailability::Available
-                        })
-                        .collect::<Vec<_>>();
-                    let runtime_choices = available
+                    let options = catalog.options;
+                    let has_available = options
                         .iter()
-                        .enumerate()
-                        .map(|(index, option)| RuntimeChoice {
-                            id: index.to_string(),
-                            title: format!("{} · {}", option.agent_label, option.model_label),
-                            detail: runtime_source_label(
-                                &option.selection.auth_source,
-                                &option.auth_source_label,
-                            ),
-                        })
-                        .collect::<Vec<_>>();
-                    if runtime_choices.is_empty() {
+                        .any(|option| option.availability == RuntimeOptionAvailability::Available);
+                    if !has_available {
                         service.new_error.set(Some(
                             copy::text(
                                 "No ready Agent is available on this runtime.",
@@ -5742,20 +5669,34 @@ impl SessionService {
                             .filter(|id| workspace_choices.iter().any(|choice| &choice.id == id))
                             .or_else(|| workspace_choices.first().map(|choice| choice.id.clone())),
                     );
-                    let preferred = service.runtime_state.borrow().as_ref().and_then(|state| {
-                        available
-                            .iter()
-                            .position(|option| option.selection == state.desired)
-                            .map(|index| index.to_string())
-                    });
-                    service.new_runtime.set(
-                        preferred
-                            .or_else(|| runtime_choices.first().map(|choice| choice.id.clone())),
-                    );
+                    let preferred = service
+                        .runtime_state
+                        .borrow()
+                        .as_ref()
+                        .and_then(|state| {
+                            options
+                                .iter()
+                                .any(|option| {
+                                    option.availability == RuntimeOptionAvailability::Available
+                                        && option.selection.agent_id == state.desired.agent_id
+                                        && option.selection.auth_source == state.desired.auth_source
+                                        && option.selection.model == state.desired.model
+                                })
+                                .then(|| state.desired.clone())
+                        })
+                        .or_else(|| {
+                            options
+                                .iter()
+                                .find(|option| {
+                                    option.availability == RuntimeOptionAvailability::Available
+                                })
+                                .map(|option| option.selection.clone())
+                        });
                     service.new_workspaces.set(workspace_choices);
-                    service.new_runtimes.set(runtime_choices);
                     service.workspace_records.set(spaces);
-                    *service.new_runtime_options.borrow_mut() = available;
+                    *service.new_runtime_options.borrow_mut() = options;
+                    *service.new_runtime_selection.borrow_mut() = preferred;
+                    service.rebuild_new_runtime_views();
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -5773,20 +5714,14 @@ impl SessionService {
         let Some(workspace_id) = self.new_workspace.get_untracked() else {
             return;
         };
-        let Some(runtime_id) = self.new_runtime.get_untracked() else {
-            return;
-        };
-        let Ok(index) = runtime_id.parse::<usize>() else {
-            return;
-        };
         let workspace = self.workspace_records.with(|workspaces| {
             workspaces
                 .iter()
                 .find(|space| space.workspace.id.as_str() == workspace_id)
                 .cloned()
         });
-        let option = self.new_runtime_options.borrow().get(index).cloned();
-        let (Some(workspace), Some(option)) = (workspace, option) else {
+        let selection = self.new_runtime_selection.borrow().clone();
+        let (Some(workspace), Some(selection)) = (workspace, selection) else {
             return;
         };
         self.new_busy.set(true);
@@ -5806,7 +5741,7 @@ impl SessionService {
         // the session would never be made at all.
         detach(async move {
             let request = CreateAgentSessionRequest {
-                runtime: option.selection,
+                runtime: selection,
                 workspace_root: workspace.workspace.root_path.clone(),
                 workspace_mode: workspace.workspace.mode,
                 title: draft.title.clone(),
@@ -5856,6 +5791,7 @@ impl SessionService {
             .clone()
             .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.trim().to_owned()))
             .unwrap_or_else(|| copy::text("New session", "新建会话", "新增工作階段").to_owned());
+        self.new_runtime_open.set(false);
         self.new_session_open.set(false);
         self.new_session_folder.set(None);
         // A row of its own in the drawer, so the session the reader is on is
@@ -6088,14 +6024,7 @@ impl SessionService {
         if self.new_busy.get_untracked() {
             return;
         }
-        let Some(runtime_id) = self.new_runtime.get_untracked() else {
-            return;
-        };
-        let Ok(index) = runtime_id.parse::<usize>() else {
-            return;
-        };
-        let option = self.new_runtime_options.borrow().get(index).cloned();
-        let Some(option) = option else {
+        let Some(selection) = self.new_runtime_selection.borrow().clone() else {
             return;
         };
         self.new_busy.set(true);
@@ -6124,7 +6053,7 @@ impl SessionService {
                 }
             };
             let request = CreateAgentSessionRequest {
-                runtime: option.selection,
+                runtime: selection,
                 workspace_root: root,
                 workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
                 title: draft.title.clone(),
@@ -8955,6 +8884,211 @@ fn patch_line_counts(payload: Option<&TimelinePayload>) -> Option<(u32, u32)> {
 /// The picker groups by this: a flat list of every model says nothing about
 /// where each one comes from, and a reader choosing a model is choosing a
 /// source as much as a name.
+struct RuntimeViews {
+    summary: Option<RuntimeSummaryView>,
+    options: Vec<RuntimeOptionView>,
+    reasoning: Vec<RuntimeChoiceView>,
+    modes: Vec<RuntimeChoiceView>,
+    features: Vec<RuntimeFeatureView>,
+}
+
+fn build_runtime_views(
+    selection: Option<&SessionRuntimeSelection>,
+    options: &[SessionRuntimeOption],
+) -> RuntimeViews {
+    let matches_model = |option: &SessionRuntimeOption| {
+        selection.is_some_and(|selection| {
+            let candidate = &option.selection;
+            candidate.agent_id == selection.agent_id
+                && candidate.auth_source == selection.auth_source
+                && candidate.model == selection.model
+        })
+    };
+    let option = selection.and_then(|_| options.iter().find(|option| matches_model(option)));
+    let summary = selection.map(|selection| {
+        let model = match &selection.model {
+            RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
+            _ => copy::text("Default", "默认", "預設").to_owned(),
+        };
+        let model_id = option
+            .and_then(|option| option.selection.model.model_id())
+            .or_else(|| selection.model.model_id())
+            .unwrap_or_default()
+            .to_owned();
+        let reasoning_label = option
+            .and_then(|option| {
+                selection.reasoning_effort.as_ref().and_then(|value| {
+                    option
+                        .reasoning_efforts
+                        .iter()
+                        .find(|candidate| &candidate.value == value)
+                        .map(|candidate| {
+                            candidate
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| candidate.value.clone())
+                        })
+                })
+            })
+            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
+        let mode_label = option
+            .and_then(|option| {
+                selection.mode_id.as_ref().and_then(|value| {
+                    option
+                        .modes
+                        .iter()
+                        .find(|candidate| &candidate.value == value)
+                        .map(|candidate| {
+                            candidate
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| candidate.value.clone())
+                        })
+                })
+            })
+            .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
+        RuntimeSummaryView {
+            agent_id: selection.agent_id.as_str().to_owned(),
+            agent: option
+                .map(|option| option.agent_label.clone())
+                .unwrap_or_else(|| selection.agent_id.as_str().to_owned()),
+            model_id,
+            model: option
+                .map(|option| option.model_label.clone())
+                .unwrap_or(model),
+            reasoning: reasoning_label,
+            mode: mode_label,
+            options_set: !selection.config_values.is_empty(),
+            reasoning_set: selection.reasoning_effort.is_some(),
+            mode_set: selection.mode_id.is_some(),
+            available: option
+                .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available),
+        }
+    });
+    let option_views = options
+        .iter()
+        .enumerate()
+        .map(|(index, option)| RuntimeOptionView {
+            id: index.to_string(),
+            agent_id: option.selection.agent_id.as_str().to_owned(),
+            agent: option.agent_label.clone(),
+            model: option.model_label.clone(),
+            // The provider name lives on the outer fold header rather than
+            // repeating under every model inside it.
+            detail: String::new(),
+            selected: matches_model(option),
+            available: option.availability == RuntimeOptionAvailability::Available,
+            // The provider, account or route this option draws from: what the
+            // picker groups by, so a reader sees which models come from where
+            // instead of one flat list.
+            source_key: runtime_source_key(&option.selection.auth_source),
+            source_label: runtime_source_label(
+                &option.selection.auth_source,
+                &option.auth_source_label,
+            ),
+            model_id: option
+                .selection
+                .model
+                .model_id()
+                .unwrap_or_default()
+                .to_owned(),
+        })
+        .collect();
+    let reasoning = match (selection, option) {
+        (Some(selection), Some(option)) if !option.reasoning_efforts.is_empty() => {
+            let mut choices = vec![RuntimeChoiceView {
+                value: "default".to_owned(),
+                label: copy::text("Default", "默认", "預設").to_owned(),
+                selected: selection.reasoning_effort.is_none(),
+            }];
+            choices.extend(option.reasoning_efforts.iter().map(|candidate| {
+                RuntimeChoiceView {
+                    value: candidate.value.clone(),
+                    label: candidate
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| candidate.value.clone()),
+                    selected: selection.reasoning_effort.as_deref()
+                        == Some(candidate.value.as_str()),
+                }
+            }));
+            choices
+        }
+        _ => Vec::new(),
+    };
+    let modes = match (selection, option) {
+        (Some(selection), Some(option)) if !option.modes.is_empty() => {
+            let mut choices = vec![RuntimeChoiceView {
+                value: "default".to_owned(),
+                label: copy::text("Default", "默认", "預設").to_owned(),
+                selected: selection.mode_id.is_none(),
+            }];
+            choices.extend(option.modes.iter().map(|candidate| RuntimeChoiceView {
+                value: candidate.value.clone(),
+                label: candidate
+                    .label
+                    .clone()
+                    .unwrap_or_else(|| candidate.value.clone()),
+                selected: selection.mode_id.as_deref() == Some(candidate.value.as_str()),
+            }));
+            choices
+        }
+        _ => Vec::new(),
+    };
+    let features = match (selection, option) {
+        (Some(selection), Some(option)) => option
+            .features
+            .iter()
+            .filter(|feature| feature.kind != SessionRuntimeFeatureKind::String)
+            .map(|feature| {
+                let current = selection
+                    .config_values
+                    .get(&feature.id)
+                    .cloned()
+                    .or_else(|| {
+                        feature
+                            .current_value
+                            .as_ref()
+                            .map(|value| value.value.clone())
+                    })
+                    .or_else(|| {
+                        feature
+                            .default_value
+                            .as_ref()
+                            .map(|value| value.value.clone())
+                    });
+                RuntimeFeatureView {
+                    id: feature.id.clone(),
+                    label: feature.label.clone(),
+                    detail: feature.description.clone().unwrap_or_default(),
+                    toggle: feature.kind == SessionRuntimeFeatureKind::Toggle,
+                    explicit_value: selection.config_values.get(&feature.id).cloned(),
+                    values: feature
+                        .values
+                        .iter()
+                        .map(|value| RuntimeChoiceView {
+                            value: value.value.clone(),
+                            label: value
+                                .label
+                                .clone()
+                                .unwrap_or_else(|| value.value.clone()),
+                            selected: current.as_deref() == Some(value.value.as_str()),
+                        })
+                        .collect(),
+                }
+            })
+            .collect(),
+        _ => Vec::new(),
+    };
+    RuntimeViews {
+        summary,
+        options: option_views,
+        reasoning,
+        modes,
+        features,
+    }
+}
+
 fn runtime_source_key(source: &vibex_core::RuntimeAuthSource) -> String {
     match source {
         vibex_core::RuntimeAuthSource::ProviderProfile {
