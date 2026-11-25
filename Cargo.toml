@@ -3,7 +3,6 @@ members = [
   "apps/desktop",
   "apps/server",
   "apps/relay-server",
-  "apps/mobile",
   "apps/mobile-nsh",
   "crates/app-update",
   "crates/agent",
@@ -41,6 +40,13 @@ members = [
   "crates/vibex-tui",
   "apps/tui",
 ]
+# The legacy GPUI mobile client is frozen while `apps/mobile-nsh` replaces it,
+# and it cannot share this graph: it pins `gpui-pre-mobile`, whose `gpui-pre`
+# pin (0.3.12) is outside the range the desktop's gpui-kit 0.11 requires
+# (0.3.14). Cargo cannot hold two exact pins in one `0.3` range, so the crate
+# is kept out of the workspace until the migration ends and it is deleted. It
+# keeps its own sources and lockfile; build it from its own directory.
+exclude = ["apps/mobile"]
 resolver = "3"
 
 [workspace.package]
@@ -116,27 +122,25 @@ reqwest = { version = "0.13.4", features = ["json", "stream", "socks"] }
 rcgen = { version = "0.14.9", default-features = false, features = ["ring"] }
 rustls = { version = "0.23", default-features = false, features = ["aws_lc_rs", "std", "tls12"] }
 fs2 = "0.4.3"
-gpui = { package = "gpui-fast", version = "=0.1.16" }
-gpui_platform = { package = "gpui-fast-platform", version = "=0.1.16", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
+gpui = { package = "gpui-fast", version = "=0.1.19" }
+gpui_platform = { package = "gpui-fast-platform", version = "=0.1.19", features = ["font-kit", "runtime_shaders", "wayland", "x11"] }
 gpui_tokio = { package = "gpui-tokio", path = "crates/gpui-tokio" }
-gpui-component = "0.10.0"
-gpui-fps = "0.10.0"
-gpui-kit-assets = "0.10.0"
+gpui-component = "0.11.0"
+gpui-fps = "0.11.0"
+gpui-kit-assets = "0.11.0"
 # The kit's motion layer, which `Plot::hover` implementations sample. Same
 # version the component crate already resolves, so the graph keeps one copy.
-gpui-base = "0.10.0"
+gpui-base = "0.11.0"
 # The native mobile client's UI stack (Native Shell, nsh.dev). Every nsh crate
 # in the graph must stay on one version. `svg` draws the brand mark and icons
 # natively; `nsh-base` ships unstyled behavior only, so the app's look lives in
 # `crates/vibex-nsh-ui`.
 #
-# Pinned to our fork of 0.6.1: upstream never told a dialog's window about its
-# own keyboard, so `env(keyboard-inset-height)` read zero inside a modal and a
-# sheet holding a field laid its content out under the keys. The fix is one
-# commit on top of the release (`fix/android-modal-keyboard-env`), offered
-# upstream; move these back to the released version once it lands.
-nsh-core = { git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false, features = ["svg"] }
-nsh-base = { git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false, features = ["term", "editor", "highlight"] }
+# On the released 0.7.0: it carries the fix our fork of 0.6.1 held, so a dialog's
+# window now reports the keyboard it raises to `env(keyboard-inset-height)`
+# (longbridge/nsh#3154), and the fork is gone.
+nsh-core = { version = "0.7.0", default-features = false, features = ["svg"] }
+nsh-base = { version = "0.7.0", default-features = false, features = ["term", "editor", "highlight"] }
 image = { version = "=0.25.10", default-features = false }
 # The Linux backend is chosen per target in the desktop crate: `ksni` on Linux
 # so the tray does not drag in the GTK 3 binding, and no default feature

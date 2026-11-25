@@ -26,8 +26,8 @@ use futures_channel::oneshot;
 use futures_util::future::BoxFuture;
 use futures_util::{AsyncReadExt as _, StreamExt as _};
 use gpui::http_client::{
-    AsyncBody, FollowRedirects, HttpClient, Inner, RedirectPolicy, Request, RequestTimeout,
-    Response, StatusCode, Url,
+    AsyncBody, HttpClient, Inner, RedirectPolicy, Request, RequestTimeout, Response, StatusCode,
+    Url,
     http::{Extensions, HeaderValue},
 };
 
@@ -199,12 +199,8 @@ async fn execute(
 /// Whether a request asked for redirects to be followed.
 ///
 /// [`HttpClient::get`] encodes its `follow_redirects` flag as a
-/// [`RedirectPolicy`] extension, and the explicit [`FollowRedirects`] marker
-/// wins when a caller sets both.
+/// [`RedirectPolicy`] extension.
 fn follows_redirects(extensions: &Extensions) -> bool {
-    if let Some(FollowRedirects(follow)) = extensions.get::<FollowRedirects>() {
-        return *follow;
-    }
     matches!(
         extensions.get::<RedirectPolicy>(),
         Some(RedirectPolicy::FollowLimit(_) | RedirectPolicy::FollowAll)

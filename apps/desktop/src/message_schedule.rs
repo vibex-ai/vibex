@@ -2,7 +2,7 @@
 //! until its deadline; only the ordinary submission path creates a timeline turn.
 
 use super::*;
-use chrono::{Local, NaiveDateTime, TimeZone as _};
+use chrono::{Datelike as _, Local, NaiveDateTime, TimeZone as _, Timelike as _};
 use gpui::{App, InteractiveElement as _, KeyBinding};
 // The popover answers Enter and Space with its own confirm action; the panel
 // claims it while it is open.
@@ -240,14 +240,35 @@ impl MessageScheduleEditorView {
             .unwrap_or_else(|| Local::now().naive_local());
         let calendar = cx.new(|cx| {
             let mut state = CalendarState::new(window, cx);
-            state.set_date(Date::Single(Some(local.date())), window, cx);
+            state.set_date(
+                Date::Single(Some(
+                    jiff::civil::Date::new(
+                        local.year() as i16,
+                        local.month() as i8,
+                        local.day() as i8,
+                    )
+                    .expect("chrono and jiff agree on a valid civil date"),
+                )),
+                window,
+                cx,
+            );
             state
         });
         let time_field = cx.new(|cx| {
             let mut state = TimeFieldState::new(window, cx)
                 .precision(TimePrecision::Second)
                 .hour_cycle(HourCycle::H23);
-            state.set_time(local.time(), window, cx);
+            state.set_time(
+                jiff::civil::Time::new(
+                    local.hour() as i8,
+                    local.minute() as i8,
+                    local.second() as i8,
+                    0,
+                )
+                .expect("chrono and jiff agree on a valid civil time"),
+                window,
+                cx,
+            );
             state
         });
         let duration = match initial {
@@ -312,7 +333,20 @@ impl MessageScheduleEditorView {
                 "請選擇日期和時間。",
             )
         })?;
-        local_deadline(NaiveDateTime::new(date, self.time_field.read(cx).time()))
+        local_deadline(NaiveDateTime::new(
+            chrono::NaiveDate::from_ymd_opt(
+                date.year() as i32,
+                date.month() as u32,
+                date.day() as u32,
+            )
+            .ok_or("That date is out of range.")?,
+            chrono::NaiveTime::from_hms_opt(
+                self.time_field.read(cx).time().hour() as u32,
+                self.time_field.read(cx).time().minute() as u32,
+                self.time_field.read(cx).time().second() as u32,
+            )
+            .ok_or("That time is out of range.")?,
+        ))
     }
 
     fn validate(&mut self, cx: &mut Context<Self>) -> Option<MessageSchedule> {

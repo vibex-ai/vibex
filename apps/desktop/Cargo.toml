@@ -68,6 +68,10 @@ tray-icon.workspace = true
 base64.workspace = true
 uuid.workspace = true
 chrono = "0.4.45"
+# The calendar and time field components take jiff civil types since
+# gpui-kit 0.11; the desktop converts at the boundary and keeps chrono
+# internally.
+jiff = "1.0"
 futures-channel.workspace = true
 # `AsyncReadExt` bridges GPUI's request bodies; `StreamExt` reads response
 # bodies under the remote-resource byte cap.
@@ -97,7 +101,7 @@ vibex-ui = { path = "../../crates/vibex-ui" }
 vibex-terminal = { path = "../../crates/terminal" }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-gpui_wgpu = { package = "gpui-fast-wgpu", version = "=0.1.16" }
+gpui_wgpu = { package = "gpui-fast-wgpu", version = "=0.1.19" }
 libc.workspace = true
 # GTK 3 is still read for the desktop's caption layout and initialized so the
 # AppIndicator-era trays keep working; the crate line is 0.19 so it pulls a

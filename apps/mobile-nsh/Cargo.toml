@@ -34,7 +34,7 @@ vibex-nsh-ui = { path = "../../crates/vibex-nsh-ui" }
 vibex-ui = { path = "../../crates/vibex-ui", default-features = false }
 
 [target.'cfg(target_os = "ios")'.dependencies]
-nsh-platform-ios = { git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false }
+nsh-platform-ios = { version = "0.7.0", default-features = false }
 objc2 = "0.6.5"
 objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
   "std",
@@ -48,12 +48,12 @@ objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
 # when the Android package is built from the app's workspace (the generated
 # runner depends on the same package), so `platform/android.rs` failed to
 # compile. The alias keeps the same package and version.
-nsh-android = { package = "nsh-platform-android", git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false }
+nsh-android = { package = "nsh-platform-android", version = "0.7.0", default-features = false }
 jni = "0.22"
 
 [dev-dependencies]
 # The headless driver: mounts the real root with no platform, so the app's
 # flows are tested as the engine renders them.
-nsh-engine = { git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false }
-nsh-testing = { git = "https://github.com/PeatBoy/nsh", branch = "vibex-0.6.1-keyboard", default-features = false }
+nsh-engine = { version = "0.7.0", default-features = false }
+nsh-testing = { version = "0.7.0", default-features = false }
 tempfile = "3"

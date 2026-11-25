@@ -662,8 +662,18 @@ fn schedule_panel_confirms_from_the_time_field_with_enter(cx: &mut TestAppContex
     // Point the calendar and the time at a deadline the editor cannot have
     // guessed, then leave the keyboard in the time field, which is where the
     // absolute editor starts the reader.
-    let date = Local::now().date_naive() + chrono::Days::new(2);
-    let time = chrono::NaiveTime::from_hms_opt(9, 30, 15).unwrap();
+    let local_date = Local::now().date_naive() + chrono::Days::new(2);
+    let date = {
+        use chrono::Datelike as _;
+        jiff::civil::Date::new(
+            local_date.year() as i16,
+            local_date.month() as i8,
+            local_date.day() as i8,
+        )
+        .unwrap()
+    };
+    let local_time = chrono::NaiveTime::from_hms_opt(9, 30, 15).unwrap();
+    let time = jiff::civil::Time::new(9, 30, 15, 0).unwrap();
     cx.update(|window, cx| {
         view.update(cx, |view, cx| {
             view.calendar.update(cx, |calendar, cx| {
@@ -688,7 +698,7 @@ fn schedule_panel_confirms_from_the_time_field_with_enter(cx: &mut TestAppContex
     });
     cx.simulate_keystrokes("enter");
     draw_frames(cx);
-    let deadline = local_deadline(NaiveDateTime::new(date, time)).unwrap();
+    let deadline = local_deadline(NaiveDateTime::new(local_date, local_time)).unwrap();
     assert_eq!(*results.borrow(), vec![Some(MessageSchedule::At(deadline))]);
     assert_eq!(closed.get(), 1, "confirming closes the popover");
 }

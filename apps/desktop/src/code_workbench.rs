@@ -19239,6 +19239,12 @@ fn local_date_bounds(date: chrono::NaiveDate) -> (i64, i64) {
     (start, end)
 }
 
+fn chrono_date_to_jiff(date: chrono::NaiveDate) -> jiff::civil::Date {
+    use chrono::Datelike as _;
+    jiff::civil::Date::new(date.year() as i16, date.month() as i8, date.day() as i8)
+        .expect("chrono and jiff agree on a valid civil date")
+}
+
 fn git_history_filter_date(after_ms: Option<i64>, before_ms: Option<i64>) -> Date {
     let start = after_ms.and_then(|value| {
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value)
@@ -19248,12 +19254,25 @@ fn git_history_filter_date(after_ms: Option<i64>, before_ms: Option<i64>) -> Dat
         chrono::DateTime::<chrono::Utc>::from_timestamp_millis(value.saturating_sub(1))
             .map(|value| value.with_timezone(&chrono::Local).date_naive())
     });
-    Date::Range(start, end)
+    Date::Range(start.map(chrono_date_to_jiff), end.map(chrono_date_to_jiff))
+}
+
+fn jiff_date_to_chrono(date: jiff::civil::Date) -> chrono::NaiveDate {
+    chrono::NaiveDate::from_ymd_opt(date.year() as i32, date.month() as u32, date.day() as u32)
+        .expect("jiff and chrono agree on a valid civil date")
 }
 
 fn git_history_date_bounds(date: Date) -> (Option<i64>, Option<i64>) {
-    let start = date.start().map(local_date_bounds).map(|(start, _)| start);
-    let end = date.end().map(local_date_bounds).map(|(_, end)| end);
+    let start = date
+        .start()
+        .map(jiff_date_to_chrono)
+        .map(local_date_bounds)
+        .map(|(start, _)| start);
+    let end = date
+        .end()
+        .map(jiff_date_to_chrono)
+        .map(local_date_bounds)
+        .map(|(_, end)| end);
     (start, end)
 }
 
@@ -25129,11 +25148,17 @@ mod tests {
     fn git_history_date_ranges_round_trip_local_calendar_days() {
         let start = chrono::NaiveDate::from_ymd_opt(2026, 8, 17).unwrap();
         let end = chrono::NaiveDate::from_ymd_opt(2026, 8, 19).unwrap();
-        let (after_ms, before_ms) = git_history_date_bounds(Date::Range(Some(start), Some(end)));
+        let (after_ms, before_ms) = git_history_date_bounds(Date::Range(
+            Some(chrono_date_to_jiff(start)),
+            Some(chrono_date_to_jiff(end)),
+        ));
         assert!(before_ms.unwrap() > after_ms.unwrap());
         assert_eq!(
             git_history_filter_date(after_ms, before_ms),
-            Date::Range(Some(start), Some(end))
+            Date::Range(
+                Some(chrono_date_to_jiff(start)),
+                Some(chrono_date_to_jiff(end))
+            )
         );
     }
 

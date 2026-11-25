@@ -10,7 +10,7 @@ use std::rc::Rc;
 use nsh_base::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
-use nsh_testing::Headless;
+use nsh_testing::{DragOptions, Headless};
 use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView, FileSearchRow};
 use vibex_nsh_ui::screens::git::{
@@ -1560,6 +1560,8 @@ fn ActivityTimelineShell() -> impl IntoElement {
                 failed: false,
                 error: None,
                 duration: None,
+                added_lines: None,
+                removed_lines: None,
                 details_pending: false,
                 details_loading: false,
                 details: vec![ActivityDetail {
@@ -2373,19 +2375,19 @@ fn a_draft_can_be_submitted_while_a_turn_is_running() {
 fn both_side_pages_open_and_close_with_horizontal_drags() {
     let mut app = start();
     let travel = |distance| nsh_core::geometry::Point::new(px(distance), px(0.0));
-    app.drag("role:button[Sessions]", travel(130.0)).unwrap();
+    app.drag("role:button[Sessions]", travel(130.0), DragOptions::default()).unwrap();
     app.wait_for("role:button[Back to session]").unwrap();
-    app.drag("role:button[Back to session]", travel(-130.0))
+    app.drag("role:button[Back to session]", travel(-130.0), DragOptions::default())
         .unwrap();
     app.wait_for_gone(
         "role:button[Back to session]",
         std::time::Duration::from_secs(3),
     )
     .unwrap();
-    app.drag("role:button[Files, Git, and terminal]", travel(-130.0))
+    app.drag("role:button[Files, Git, and terminal]", travel(-130.0), DragOptions::default())
         .unwrap();
     app.wait_for("role:button[Changes]").unwrap();
-    app.drag("role:button[Changes]", travel(130.0)).unwrap();
+    app.drag("role:button[Changes]", travel(130.0), DragOptions::default()).unwrap();
     app.wait_for_gone("role:button[Changes]", std::time::Duration::from_secs(3))
         .unwrap();
 }
@@ -2396,6 +2398,7 @@ fn vertical_drag_keeps_the_conversation_open() {
     app.drag(
         "role:button[Sessions]",
         nsh_core::geometry::Point::new(px(20.0), px(130.0)),
+        DragOptions::default(),
     )
     .unwrap();
     assert!(
@@ -2608,6 +2611,7 @@ fn dragging_an_open_folder_row_collapses_it_and_carries_the_row_with_the_finger(
     app.drag_and_hold(
         "role:button[Work]",
         nsh_core::geometry::Point::new(px(0.0), px(80.0)),
+        DragOptions::default(),
     )
     .unwrap();
     // The row is carried with the finger: the page draws it where the finger
