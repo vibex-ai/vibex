@@ -298,6 +298,30 @@ pub fn block_surface() -> Hsla {
     background_card()
 }
 
+/// [`block_page`] as an adaptive color.
+pub fn block_page_adaptive() -> AdaptiveColor {
+    let page = block_page();
+    AdaptiveColor {
+        light: page,
+        dark: page,
+    }
+}
+
+/// [`block_page`] as the veil the top band keeps over the conversation.
+///
+/// Nearly the page's own tone, but not quite: a message still shows through it,
+/// which is what tells the reader the transcript goes on under the bar rather
+/// than ending there. The band's blur carries the rest of the separation, so
+/// this stays lighter than the page would be on its own.
+pub fn block_page_veil_adaptive() -> AdaptiveColor {
+    let page = block_page_adaptive();
+    const VEIL: f32 = 0.82;
+    AdaptiveColor {
+        light: page.light.alpha(VEIL),
+        dark: page.dark.alpha(VEIL),
+    }
+}
+
 /// A well inside a block: a value preview, an icon tile, a switch track.
 pub fn block_inset() -> Hsla {
     color_token("muted")

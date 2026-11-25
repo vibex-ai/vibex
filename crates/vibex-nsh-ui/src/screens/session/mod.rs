@@ -1203,11 +1203,17 @@ fn shell(
                 .flex_1()
                 .min_h(px(0.0))
                 .flex_col()
-                // The bar floats over the page, so the conversation starts
-                // under it: the tabs and the first row clear the bar and the
-                // status bar both, and a message scrolled up runs beneath the
-                // panes instead of stopping at a hard edge.
-                .pt_safe_area_plus(px(theme::HEADER_HEIGHT))
+                .relative()
+                // The glass the transcript passes under. It lives in here
+                // rather than on the page so that it and the group tabs are
+                // siblings: the tabs clear it by `z_index`, which only orders
+                // siblings, and the band must not blur the controls on it.
+                .child(top_glass())
+                // The bar floats over the page and the transcript runs beneath
+                // it: the list starts at the page's top edge, and the space the
+                // bar takes is the list's own content padding (see
+                // `timeline_view`), so a message scrolled up keeps showing
+                // through the glass instead of stopping at a hard edge.
                 .style_when(move || creating.get(), |style| style.hidden())
                 .child(group_tabs(&host))
                 .child(
@@ -1559,12 +1565,12 @@ fn active_session(host: &SessionHost) -> Memo<Option<SessionSummary>> {
     })
 }
 
-fn group_tabs(host: &SessionHost) -> impl IntoElement {
+/// The sessions of the open session's group, when it is in one with others:
+/// the tabs above the transcript.
+fn group_members(host: &SessionHost) -> Memo<Vec<String>> {
     let active = host.active;
     let sections = host.sidebar_sections;
-    let sessions = host.sessions;
-    let on_select = host.on_select.clone();
-    let members = computed(move || {
+    computed(move || {
         let Some(id) = active.get() else {
             return Vec::new();
         };
@@ -1577,7 +1583,21 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                 .map(|section| section.session_ids.clone())
                 .unwrap_or_default()
         })
-    });
+    })
+}
+
+/// Whether the group tabs stand above the transcript: they do when the open
+/// session shares its group with another, the only time the strip is drawn.
+fn group_tabs_visible(host: &SessionHost) -> Memo<bool> {
+    let members = group_members(host);
+    computed(move || members.with(|members| members.len() > 1))
+}
+
+fn group_tabs(host: &SessionHost) -> impl IntoElement {
+    let active = host.active;
+    let sessions = host.sessions;
+    let on_select = host.on_select.clone();
+    let members = group_members(host);
     when(
         move || members.with(|members| members.len() > 1),
         move || {
@@ -1587,6 +1607,12 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                 .scrollbar(false)
                 .flex_shrink_0()
                 .w_full()
+                // The bar floats over the page, so the tabs clear it here: the
+                // transcript below runs under the bar, the tabs do not.
+                .pt(move || px(top_bar_inset()))
+                // Above the glass: the band blurs what passes under it, and
+                // the tabs are controls that sit on it.
+                .z_index(2)
                 .child(
                     view()
                         .h(px(theme::ROUND_CONTROL))
@@ -1746,6 +1772,9 @@ fn timeline_view(
         tab.set(WorkbenchTab::Terminal);
         pager.open(ShellPage::Workbench);
     };
+    // The tabs above take the bar's room when they are shown; the list takes
+    // it only when they are not (see its `content_padding_top`).
+    let tabs_above = group_tabs_visible(&host);
     let source = host.timeline;
     let visible = computed(move || source.with(|entries| visible_timeline(entries)));
     let position_for = move |predicate: &dyn Fn(&TimelineEntry) -> bool| {
@@ -2058,6 +2087,20 @@ fn timeline_view(
                                 .test_id("transcript")
                                 .alignment(ListAlignment::Bottom)
                                 .follow_end(px(120.0))
+                                // The bar floats over the list rather than
+                                // sitting above it, so its height is the
+                                // list's own leading space: the first row
+                                // still clears the bar, while a message
+                                // scrolled up travels on under it. When the
+                                // group tabs are shown they have taken that
+                                // room already, and the list starts under them.
+                                .content_padding_top(move || {
+                                    if tabs_above.get() {
+                                        px(0.0)
+                                    } else {
+                                        px(top_bar_inset())
+                                    }
+                                })
                                 .on_scroll({
                                     let on_load_older = on_load_older.clone();
                                     move |event: &ScrollEvent| {
@@ -2082,10 +2125,11 @@ fn timeline_view(
                                 })
                                 .flex_1(),
                             )
-                            // The transcript runs out under the header and
-                            // the prompt card rather than being cut by them.
-                            .child(edge_fade(true))
-                            .child(edge_fade(false))
+                            // The transcript runs out under the prompt card
+                            // rather than being cut by it. The top needs no
+                            // strip of its own: the glass over the page does
+                            // that, and a second band would only darken it.
+                            .child(edge_fade())
                             .child(when(
                                 move || away_from_end.get() && !find_open.get(),
                                 move || {
@@ -2321,17 +2365,63 @@ fn starts_prose(entry: &TimelineEntry) -> bool {
     matches!(entry.kind, EntryKind::Agent | EntryKind::Reasoning)
 }
 
-/// The strip the transcript fades out in at one of its edges.
-fn edge_fade(top: bool) -> impl IntoElement {
+/// The strip the transcript fades out in at its foot.
+fn edge_fade() -> impl IntoElement {
     // The strip fades the page's own tone, which is the tone the conversation
-    // is drawn on: a fade from the flat background left a paler band at each
+    // is drawn on: a fade from the flat background left a paler band at the
     // end of the list wherever the page took its stepped tone.
     edge_fade_between(
-        top,
+        false,
         theme::SPACING_MD,
         theme::page_adaptive,
         theme::page_clear_adaptive,
     )
+}
+
+/// The glass the conversation passes under at the top of the page.
+///
+/// The bar above is three floating panes, not a strip, so what a message meets
+/// on its way up is this band: the page's tone over a blur of whatever lies
+/// behind it, both thinning out downwards. A message runs into the blur, keeps
+/// showing through it, and is gone only at the very top — where the page's own
+/// tone alone would cut the transcript off on a hard line at the bar's edge.
+///
+/// The tone and the blur are one view, so the mask that fades the band fades
+/// both together and there is no seam where one stops and the other goes on.
+fn top_glass() -> impl IntoElement {
+    // From the top of the page (the status bar included) to the bar's lower
+    // edge, with a little room past it for the fade to run out.
+    let height = move || px(safe_area().top.0 + theme::HEADER_HEIGHT + theme::SPACING_LG);
+    view()
+        .absolute()
+        .top(px(0.0))
+        .left(px(0.0))
+        .right(px(0.0))
+        .h(height)
+        // Over the transcript, under the bar's controls.
+        .z_index(1)
+        .bg(theme::block_page_veil_adaptive())
+        .backdrop_blur(px(TOP_GLASS_BLUR))
+        // Opaque at the top, clear at the bottom: the band's own tone and its
+        // blur both leave the page the further down the reader looks.
+        .mask_linear(
+            deg(180.0),
+            [
+                (black(), percentage(0.0)),
+                (black(), percentage(0.55)),
+                (transparent_black(), percentage(1.0)),
+            ],
+        )
+        .pointer_events(PointerEvents::None)
+}
+
+/// How much the top band blurs what passes under it.
+const TOP_GLASS_BLUR: f32 = 18.0;
+
+/// The space the bar takes at the top of the conversation: the status bar and
+/// the floating controls over it.
+fn top_bar_inset() -> f32 {
+    safe_area().top.0 + theme::HEADER_HEIGHT
 }
 
 /// A strip that fades `opaque` into `clear` at one edge of the surface it
@@ -3108,7 +3198,9 @@ fn copy_message(body: Memo<String>) -> ButtonElement {
         copy::text("Copy", "复制", "複製"),
         move || {
             crate::motion::tick();
-            set_clipboard(body.get_untracked())
+            // 0.7 answers whether the clipboard took it; this row has no use
+            // for the answer, so it is dropped.
+            let _ = set_clipboard(body.get_untracked());
         },
     )
     .disabled(move || body.with(String::is_empty))
@@ -3440,7 +3532,7 @@ fn activity_details_view(
                                     copy::text("Copy detail", "复制详情", "複製詳細資料"),
                                     move || {
                                         crate::motion::tick();
-                                        set_clipboard(detail.copy.clone())
+                                        let _ = set_clipboard(detail.copy.clone());
                                     },
                                 )
                                 .accessibility_label(label),
