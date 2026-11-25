@@ -2285,6 +2285,16 @@ impl SessionService {
                     detail: option.auth_source_label.clone(),
                     selected: matches_model(option),
                     available: option.availability == RuntimeOptionAvailability::Available,
+                    // The provider, account or route this option draws from:
+                    // what the picker groups by, so a reader sees which models
+                    // come from where instead of one flat list.
+                    source_key: runtime_source_key(&option.selection.auth_source),
+                    model_id: option
+                        .selection
+                        .model
+                        .model_id()
+                        .unwrap_or_default()
+                        .to_owned(),
                 })
                 .collect(),
         );
@@ -8940,6 +8950,25 @@ fn patch_line_counts(payload: Option<&TimelinePayload>) -> Option<(u32, u32)> {
 ///
 /// The bubble wears this as a glyph on its lower edge; a prompt needs no mark,
 /// so it answers `None`.
+/// The provider, account or route a runtime selection draws from.
+///
+/// The picker groups by this: a flat list of every model says nothing about
+/// where each one comes from, and a reader choosing a model is choosing a
+/// source as much as a name.
+fn runtime_source_key(source: &vibex_core::RuntimeAuthSource) -> String {
+    match source {
+        vibex_core::RuntimeAuthSource::ProviderProfile {
+            provider_profile_id,
+        } => format!("provider:{}", provider_profile_id.as_str()),
+        vibex_core::RuntimeAuthSource::AgentAccount { auth_context_id } => {
+            format!("account:{}", auth_context_id.as_str())
+        }
+        vibex_core::RuntimeAuthSource::ModelRoute { model_route_id } => {
+            format!("route:{}", model_route_id.as_str())
+        }
+    }
+}
+
 fn delivery_of(payload: Option<&TimelinePayload>) -> Option<MessageDelivery> {
     let Some(TimelinePayload::UserMessage(message)) = payload else {
         return None;

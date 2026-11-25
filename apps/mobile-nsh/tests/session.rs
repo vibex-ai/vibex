@@ -398,6 +398,8 @@ fn RuntimeShell() -> impl IntoElement {
             detail: "Pro".to_owned(),
             selected: true,
             available: true,
+            source_key: "provider:claude".to_owned(),
+            model_id: "claude-4".to_owned(),
         },
         RuntimeOptionView {
             id: "1".to_owned(),
@@ -407,6 +409,8 @@ fn RuntimeShell() -> impl IntoElement {
             detail: "Team".to_owned(),
             selected: false,
             available: true,
+            source_key: "provider:codex".to_owned(),
+            model_id: "gpt-5".to_owned(),
         },
     ]);
     host.runtime_reasoning = signal(vec![RuntimeChoiceView {
@@ -1412,7 +1416,13 @@ fn the_composer_opens_the_runtime_choices() {
     app.press("Claude 4").unwrap();
     app.wait_for("Agent settings").unwrap();
     assert!(!app.screen().shows("GPT-5"));
-    app.press("role:button[Codex]").unwrap();
+    app.press("role:button[Codex] >> nth=0").unwrap();
+    // The picker groups models under their source, and a source holding no
+    // current choice starts folded — so the Codex models are one press away
+    // rather than listed outright. The fold's header carries the source's
+    // name, which is also the Agent tab's label.
+    app.wait_for("role:button[Codex] >> nth=1").unwrap();
+    app.press("role:button[Codex] >> nth=1").unwrap();
     app.wait_for("GPT-5").unwrap();
     app.press("role:button[Close]").unwrap();
     app.wait_for_gone("GPT-5", std::time::Duration::from_secs(3))

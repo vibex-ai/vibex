@@ -249,6 +249,11 @@ pub struct RuntimeOptionView {
     pub detail: String,
     pub selected: bool,
     pub available: bool,
+    /// The provider profile, account or route the option draws from, as a
+    /// stable key to group by.
+    pub source_key: String,
+    /// The model's own id, for its brand mark.
+    pub model_id: String,
 }
 
 /// One value of a reasoning, mode or session option row.
@@ -5616,6 +5621,45 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                 .collect::<Vec<_>>()
         })
     });
+
+    // One fold per source, in the order the sources first appear: a reader
+    // choosing a model is choosing where it comes from too, and a flat list of
+    // every model says nothing about that.
+    let grouped = computed(move || {
+        let mut groups: Vec<(String, String, Vec<RuntimeOptionView>)> = Vec::new();
+        for option in filtered.get() {
+            match groups
+                .iter_mut()
+                .find(|(key, _, _)| *key == option.source_key)
+            {
+                Some((_, _, options)) => options.push(option),
+                None => groups.push((
+                    option.source_key.clone(),
+                    // The source's name, not the model's subtitle: a fold is
+                    // titled by where its models come from.
+                    option.agent.clone(),
+                    vec![option],
+                )),
+            }
+        }
+        groups
+    });
+    // A fold starts closed unless it holds the current choice: a reader who
+    // opens the picker to see what they are on should not have to open a fold
+    // to find it, and every other source starts out of the way.
+    let collapsed = signal(Vec::<String>::new());
+    effect(move || {
+        // Recomputed whenever the visible set changes — a new Agent, a new
+        // search — because the folds that are worth opening change with it.
+        let groups = grouped.get();
+        collapsed.set(
+            groups
+                .iter()
+                .filter(|(_, _, options)| !options.iter().any(|option| option.selected))
+                .map(|(key, _, _)| key.clone())
+                .collect(),
+        );
+    });
     let finish_reasoning = close.clone();
     let finish_mode = close.clone();
     let finish_options = close.clone();
@@ -5769,78 +5813,175 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                         move || !filtered.with(Vec::is_empty),
                                         move || {
                                             let choose = choose.clone();
-                                            sheet_card().child(each(
-                                                move || filtered.get(),
-                                                |row| row.id.clone(),
-                                                move |option: ReadSignal<RuntimeOptionView>, _| {
-                                                    let choose = choose.clone();
-                                                    button()
-                                                        .w_full()
-                                                        .min_h(px(theme::ROW_HEIGHT))
-                                                        .px(px(surface::ROW_INSET))
-                                                        .py(px(theme::SPACING_SM))
-                                                        .flex_row()
-                                                        .items_center()
-                                                        .gap(px(theme::SPACING_MD))
-                                                        .border_b_1()
-                                                        .border_b_color(theme::hairline)
-                                                        .active(|style| {
-                                                            style.bg(theme::row_pressed_bg())
-                                                        })
-                                                        .on_press(move || {
-                                                            dismiss_keyboard();
-                                                            option.with(|option| choose(&option.id));
-                                                        })
-                                                        .disabled(move || {
-                                                            busy.get()
-                                                                || !option
-                                                                    .with(|option| option.available)
-                                                        })
-                                                        .disabled_style(|style| style.opacity(0.45))
-                                                        .child(
-                                                            view()
-                                                                .flex_1()
-                                                                .min_w(px(0.0))
-                                                                .flex_col()
-                                                                .gap(px(1.0))
-                                                                .child(
-                                                                    text(move || {
-                                                                        option.with(|option| {
-                                                                            option.model.clone()
-                                                                        })
-                                                                    })
-                                                                    .truncate()
-                                                                    .text_size(px(
-                                                                        theme::font_detail(),
-                                                                    ))
-                                                                    .text_color(theme::foreground),
-                                                                )
-                                                                .child(
-                                                                    text(move || {
-                                                                        option.with(|option| {
-                                                                            option.detail.clone()
-                                                                        })
-                                                                    })
-                                                                    .truncate()
-                                                                    .text_size(px(
-                                                                        theme::font_micro(),
-                                                                    ))
-                                                                    .text_color(theme::text_muted),
-                                                                ),
-                                                        )
-                                                        .child(when(
+                                            let collapsed = collapsed;
+                                            dynamic(move || {
+                                            view().w_full().flex_col().gap(px(theme::SPACING_MD)).children(
+                                                grouped.get().into_iter().map(
+                                                    |(key, label, options)| {
+                                                        let choose = choose.clone();
+                                                        let fold_key = key.clone();
+                                                        let open = move || {
+                                                            !collapsed.with(|folded| {
+                                                                folded.iter().any(|folded| *folded == fold_key)
+                                                            })
+                                                        };
+                                                        let toggle = {
+                                                            let key = key.clone();
                                                             move || {
-                                                                option.with(|option| option.selected)
-                                                            },
-                                                            || {
-                                                                svg(icon!("check"))
-                                                                    .size(px(theme::ICON_MD))
-                                                                    .flex_shrink_0()
-                                                                    .text_color(theme::foreground)
-                                                            },
-                                                        ))
-                                                },
-                                            ))
+                                                                let key = key.clone();
+                                                                collapsed.update(|folded| {
+                                                                    if let Some(at) = folded
+                                                                        .iter()
+                                                                        .position(|folded| *folded == key)
+                                                                    {
+                                                                        folded.remove(at);
+                                                                    } else {
+                                                                        folded.push(key);
+                                                                    }
+                                                                });
+                                                            }
+                                                        };
+                                                        // The source's own mark, so a fold says
+                                                        // whose models are under it before the
+                                                        // name is read.
+                                                        let source_mark = agent_icon(&options[0].agent_id);
+                                                        let selected_here = options.iter().any(|o| o.selected);
+                                                        sheet_card()
+                                                            .child(
+                                                                button()
+                                                                    .w_full()
+                                                                    .min_h(px(theme::ROW_HEIGHT))
+                                                                    .px(px(surface::ROW_INSET))
+                                                                    .flex_row()
+                                                                    .items_center()
+                                                                    .gap(px(theme::SPACING_MD))
+                                                                    .active(|style| {
+                                                                        style.bg(theme::row_pressed_bg())
+                                                                    })
+                                                                    .on_press(move || toggle())
+                                                                    .child(
+                                                                        view()
+                                                                            .flex_shrink_0()
+                                                                            .child(svg(ImageSrc::svg_markup(
+                                                                                source_mark,
+                                                                            ))
+                                                                            .size(px(theme::ICON_MD))
+                                                                            .text_color(theme::foreground)),
+                                                                    )
+                                                                    .child(
+                                                                        text(label)
+                                                                            .flex_1()
+                                                                            .min_w(px(0.0))
+                                                                            .truncate()
+                                                                            .text_size(px(theme::font_caption()))
+                                                                            .font_weight(FontWeight::MEDIUM)
+                                                                            .text_color(theme::text_secondary),
+                                                                    )
+                                                                    .child(when(
+                                                                        move || selected_here,
+                                                                        || {
+                                                                            svg(icon!("check"))
+                                                                                .size(px(theme::ICON_SM))
+                                                                                .flex_shrink_0()
+                                                                                .text_color(theme::text_muted)
+                                                                        },
+                                                                    ))
+                                                                    .child({
+                                                                        // `icon!` takes a
+                                                                        // literal, so the two
+                                                                        // faces are two calls.
+                                                                        if open() {
+                                                                            svg(icon!("chevron-up"))
+                                                                                .size(px(theme::ICON_SM))
+                                                                                .flex_shrink_0()
+                                                                                .text_color(theme::text_muted)
+                                                                                .into_element()
+                                                                        } else {
+                                                                            svg(icon!("chevron-down"))
+                                                                                .size(px(theme::ICON_SM))
+                                                                                .flex_shrink_0()
+                                                                                .text_color(theme::text_muted)
+                                                                                .into_element()
+                                                                        }
+                                                                    }),
+                                                            )
+                                                            .child(when(open, {
+                                                                let choose = choose.clone();
+                                                                let options = options.clone();
+                                                                move || {
+                                                                    let choose = choose.clone();
+                                                                    view().w_full().flex_col().children(
+                                                                        options.iter().map(|row| {
+                                                                            let choose = choose.clone();
+                                                                            let id = row.id.clone();
+                                                                            let selected = row.selected;
+                                                                            let available = row.available;
+                                                                            let model = row.model.clone();
+                                                                            let detail = row.detail.clone();
+                                                                            let model_mark =
+                                                                                model_mark_svg(&row.model_id);
+                                                                            button()
+                                                                                .w_full()
+                                                                                .min_h(px(theme::ROW_HEIGHT))
+                                                                                .pl(px(theme::SPACING_XL + theme::SPACING_MD))
+                                                                                .pr(px(surface::ROW_INSET))
+                                                                                .py(px(theme::SPACING_SM))
+                                                                                .flex_row()
+                                                                                .items_center()
+                                                                                .gap(px(theme::SPACING_MD))
+                                                                                .active(|style| {
+                                                                                    style.bg(theme::row_pressed_bg())
+                                                                                })
+                                                                                .on_press(move || {
+                                                                                    dismiss_keyboard();
+                                                                                    choose(&id);
+                                                                                })
+                                                                                .disabled(move || busy.get() || !available)
+                                                                                .disabled_style(|style| {
+                                                                                    style.opacity(0.45)
+                                                                                })
+                                                                                .child(
+                                                                                    svg(model_mark)
+                                                                                        .size(px(theme::ICON_SM))
+                                                                                        .flex_shrink_0()
+                                                                                        .text_color(theme::text_secondary),
+                                                                                )
+                                                                                .child(
+                                                                                    view()
+                                                                                        .flex_1()
+                                                                                        .min_w(px(0.0))
+                                                                                        .flex_col()
+                                                                                        .gap(px(1.0))
+                                                                                        .child(
+                                                                                            text(model)
+                                                                                                .truncate()
+                                                                                                .text_size(px(theme::font_detail()))
+                                                                                                .text_color(theme::foreground),
+                                                                                        )
+                                                                                        .child(
+                                                                                            text(detail)
+                                                                                                .truncate()
+                                                                                                .text_size(px(theme::font_micro()))
+                                                                                                .text_color(theme::text_muted),
+                                                                                        ),
+                                                                                )
+                                                                                .child(when(
+                                                                                    move || selected,
+                                                                                    || {
+                                                                                        svg(icon!("check"))
+                                                                                            .size(px(theme::ICON_MD))
+                                                                                            .flex_shrink_0()
+                                                                                            .text_color(theme::foreground)
+                                                                                    },
+                                                                                ))
+                                                                        }),
+                                                                    )
+                                                                }
+                                                            }))
+                                                    },
+                                                ),
+                                            )
+                                            })
                                         },
                                     ))
                                     .child(when(
@@ -6793,26 +6934,29 @@ fn attachment_preview_sheet(
     )
 }
 
+/// The mark a model wears in the picker.
+///
+/// The model's own brand, from the same table the desktop reads; a model no
+/// brand owns falls back to the generic sparkle the desktop uses for one.
+fn model_mark_svg(model_id: &str) -> ImageSrc {
+    vibex_brands::model_mark(model_id)
+        .and_then(|mark| vibex_brands::mark_bytes(mark.path))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(ImageSrc::svg_markup)
+        .unwrap_or_else(|| icon!("sparkles"))
+}
+
 /// The mark a session's Agent wears in the drawer.
+///
+/// The same catalogue the desktop and the terminal read, so an Agent has one
+/// logo across every client rather than a default glyph wherever a client
+/// forgot to add it. The marks are themed: those drawn in the reader's own
+/// colour follow the appearance, and the ones with brand colours keep them.
 fn agent_icon(agent: &str) -> &'static str {
-    let agent = agent.to_ascii_lowercase();
-    if agent.contains("claude") {
-        include_str!("../../../assets/icons/claude.svg")
-    } else if agent.contains("codex") || agent.contains("openai") || agent.contains("gpt") {
-        include_str!("../../../assets/icons/openai.svg")
-    } else if agent.contains("gemini") {
-        include_str!("../../../assets/icons/gemini.svg")
-    } else if agent.contains("deepseek") {
-        include_str!("../../../assets/icons/deepseek.svg")
-    } else if agent.contains("opencode") {
-        include_str!("../../../assets/icons/opencode.svg")
-    } else if agent.contains("qwen") {
-        include_str!("../../../assets/icons/qwen.svg")
-    } else if agent.contains("copilot") {
-        include_str!("../../../assets/icons/copilot.svg")
-    } else {
-        include_str!("../../../assets/icons/bot.svg")
-    }
+    vibex_brands::agent_mark(agent)
+        .and_then(|mark| vibex_brands::mark_bytes(mark.path))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .unwrap_or_else(|| include_str!("../../../assets/icons/bot.svg"))
 }
 
 /// A quiet action written out in words, with an optional glyph before them.

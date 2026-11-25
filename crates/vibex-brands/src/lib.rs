@@ -230,6 +230,7 @@ pub fn themed_svg(svg: &str, current_color: Option<u32>) -> Option<String> {
 }
 
 include!("mark_table.rs");
+include!("model_table.rs");
 
 #[cfg(test)]
 mod tests;
