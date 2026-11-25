@@ -178,3 +178,41 @@ fn every_model_and_provider_mark_is_bundled() {
         );
     }
 }
+
+/// The Antigravity mark must avoid `<mask>` and `<filter>` because mobile's
+/// `nsh` SVG renderer skips both, which turns a masked blur stack into a solid
+/// colourful rectangle.
+#[test]
+fn antigravity_mark_uses_no_masks_or_filters() {
+    let source = mark_svg(mark!("agents/antigravity.svg", false), None)
+        .expect("antigravity mark should be bundled");
+    assert!(
+        !source.contains("<mask"),
+        "antigravity.svg must not rely on <mask> elements"
+    );
+    assert!(
+        !source.contains("<filter"),
+        "antigravity.svg must not rely on <filter> elements"
+    );
+}
+
+#[cfg(feature = "raster")]
+#[test]
+fn antigravity_mark_rasters_as_an_arch_with_transparent_corners() {
+    let png = mark_png(mark!("agents/antigravity.svg", false), 64, None)
+        .expect("antigravity mark should rasterize");
+    let image = image::load_from_memory(&png)
+        .expect("the bytes are a PNG")
+        .to_rgba8();
+    assert_eq!(image.get_pixel(0, 0).0[3], 0, "top-left corner stays transparent");
+    assert_eq!(image.get_pixel(63, 0).0[3], 0, "top-right corner stays transparent");
+    assert_eq!(
+        image.get_pixel(32, 60).0[3],
+        0,
+        "inner arch cutout stays transparent"
+    );
+    assert!(
+        image.get_pixel(31, 16).0[3] > 200,
+        "arch body near the apex is opaque"
+    );
+}

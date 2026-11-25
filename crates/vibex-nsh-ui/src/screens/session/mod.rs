@@ -5729,6 +5729,12 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
             .child(when(
                 move || panel.get() == RuntimePanel::Model,
                 move || {
+                    let strip_initialized = stored(false);
+                    effect(move || {
+                        if !open.get() {
+                            strip_initialized.replace(false);
+                        }
+                    });
                     view()
                         .w_full()
                         .flex_shrink_0()
@@ -5744,57 +5750,89 @@ fn runtime_sheet(host: SessionHost, panel: Signal<RuntimePanel>) -> impl IntoEle
                                         move || agents.get(),
                                         |row| row.0.clone(),
                                         move |row, _| {
+                                            let agent_id =
+                                                row.with_untracked(|row| row.0.clone());
+                                            let chip = element_ref();
+                                            let laid_out = signal(false);
                                             let chosen = move || {
                                                 active_agent.with(|id| {
                                                     row.with(|row| id.as_ref() == Some(&row.0))
                                                 })
                                             };
-                                            button()
-                                                .h(px(theme::SEGMENT_HEIGHT))
-                                                .px(px(theme::SPACING_MD))
+                                            effect(move || {
+                                                if laid_out.get()
+                                                    && open.get()
+                                                    && active_agent.with(|id| {
+                                                        id.as_deref() == Some(agent_id.as_str())
+                                                    })
+                                                {
+                                                    let animated =
+                                                        strip_initialized.replace(true);
+                                                    chip.reveal(
+                                                        RevealOptions::default()
+                                                            .horizontal(ScrollAlignment::Center)
+                                                            .animated(animated),
+                                                    );
+                                                }
+                                            });
+                                            view()
                                                 .flex_shrink_0()
-                                                .flex_row()
-                                                .items_center()
-                                                .gap(px(6.0))
-                                                .rounded_full()
-                                                .bg(move || {
-                                                    if chosen() {
-                                                        theme::action_primary()
-                                                    } else {
-                                                        theme::fill()
+                                                .element_ref(&chip)
+                                                .on_layout(move |_: &Bounds<Points>| {
+                                                    if !laid_out.get_untracked() {
+                                                        laid_out.set(true);
                                                     }
                                                 })
-                                                .active(|style| style.opacity(0.7))
-                                                .on_press(move || {
-                                                    agent.set(Some(
-                                                        row.with_untracked(|row| row.0.clone()),
-                                                    ))
-                                                })
-                                                .child(dynamic(move || {
-                                                    svg(icon(agent_icon(
-                                                        &row.with(|row| row.0.clone()),
-                                                    )))
-                                                    .size(px(14.0))
-                                                    .flex_shrink_0()
-                                                    .text_color(move || {
-                                                        if chosen() {
-                                                            theme::action_primary_label()
-                                                        } else {
-                                                            theme::text_secondary()
-                                                        }
-                                                    })
-                                                }))
                                                 .child(
-                                                    text(move || row.with(|row| row.1.clone()))
-                                                        .text_size(px(theme::font_caption()))
-                                                        .font_weight(FontWeight::MEDIUM)
-                                                        .text_color(move || {
+                                                    button()
+                                                        .h(px(theme::SEGMENT_HEIGHT))
+                                                        .px(px(theme::SPACING_MD))
+                                                        .flex_shrink_0()
+                                                        .flex_row()
+                                                        .items_center()
+                                                        .gap(px(6.0))
+                                                        .rounded_full()
+                                                        .bg(move || {
                                                             if chosen() {
-                                                                theme::action_primary_label()
+                                                                theme::action_primary()
                                                             } else {
-                                                                theme::text_secondary()
+                                                                theme::fill()
                                                             }
-                                                        }),
+                                                        })
+                                                        .active(|style| style.opacity(0.7))
+                                                        .on_press(move || {
+                                                            agent.set(Some(row.with_untracked(
+                                                                |row| row.0.clone(),
+                                                            )))
+                                                        })
+                                                        .child(dynamic(move || {
+                                                            svg(icon(agent_icon(
+                                                                &row.with(|row| row.0.clone()),
+                                                            )))
+                                                            .size(px(14.0))
+                                                            .flex_shrink_0()
+                                                            .text_color(move || {
+                                                                if chosen() {
+                                                                    theme::action_primary_label()
+                                                                } else {
+                                                                    theme::text_secondary()
+                                                                }
+                                                            })
+                                                        }))
+                                                        .child(
+                                                            text(move || {
+                                                                row.with(|row| row.1.clone())
+                                                            })
+                                                            .text_size(px(theme::font_caption()))
+                                                            .font_weight(FontWeight::MEDIUM)
+                                                            .text_color(move || {
+                                                                if chosen() {
+                                                                    theme::action_primary_label()
+                                                                } else {
+                                                                    theme::text_secondary()
+                                                                }
+                                                            }),
+                                                        ),
                                                 )
                                         },
                                     )),

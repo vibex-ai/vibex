@@ -2883,3 +2883,83 @@ fn a_process_row_is_its_prose_without_a_name_or_actions() {
         .count();
     assert_eq!(named, 0, "no paragraph repeats the Agent's name");
 }
+
+#[component]
+fn ManyAgentsRuntimeShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let runtime_open = signal(false);
+    host.runtime_open = runtime_open;
+    host.on_open_runtime = Rc::new(move || runtime_open.set(true));
+    host.on_close_runtime = Rc::new(move || runtime_open.set(false));
+    let agents = [
+        ("deepseek-harness", "DeepSeek Harness", "DeepSeek", "deepseek-chat", false),
+        ("claude-code", "Claude Code", "Anthropic", "Claude 4", false),
+        ("codex", "OpenAI Codex", "OpenAI", "GPT-5", false),
+        ("gemini", "Gemini CLI", "Google", "Gemini 2.5 Pro", false),
+        ("opencode", "OpenCode", "OpenRouter", "Sonnet 4", false),
+        ("antigravity", "Google Antigravity", "Antigravity", "Gemini 3 Pro", true),
+    ];
+    host.runtime_options.set(
+        agents
+            .into_iter()
+            .map(|(agent_id, agent, provider, model, selected)| RuntimeOptionView {
+                id: format!("{agent_id}:{model}"),
+                agent_id: agent_id.to_owned(),
+                agent: agent.to_owned(),
+                model_id: model.to_lowercase().replace(' ', "-"),
+                model: model.to_owned(),
+                source_key: format!("provider:{agent_id}"),
+                source_label: provider.to_owned(),
+                detail: String::new(),
+                available: true,
+                selected,
+            })
+            .collect(),
+    );
+    session::session(host)
+}
+
+#[test]
+fn opening_agent_settings_reveals_an_offscreen_selected_agent_chip() {
+    let mut config = EngineConfig::new(Root::of::<ManyAgentsRuntimeShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(844.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Model").unwrap();
+    app.press("Model").unwrap();
+    app.wait_for("Agent settings").unwrap();
+
+    let chip_bounds = |app: &Headless, label: &str| {
+        app.screen()
+            .layout_nodes()
+            .into_iter()
+            .find(|node| {
+                node.text
+                    .as_ref()
+                    .is_some_and(|text| text.text.text == label)
+            })
+            .map(|node| node.bounds)
+            .unwrap_or_else(|| panic!("expected chip label `{label}` in layout tree"))
+    };
+
+    let selected = chip_bounds(&app, "Google Antigravity");
+    let first = chip_bounds(&app, "DeepSeek Harness");
+    assert!(
+        selected.origin.x.0 >= 0.0 && selected.origin.x.0 + selected.size.width.0 <= 390.0,
+        "selected Agent chip must scroll into the 390px viewport on open, got {selected:?}"
+    );
+    assert!(
+        first.origin.x.0 < 0.0,
+        "leading Agent chip should have scrolled left out of the viewport, got {first:?}"
+    );
+    assert!(
+        app.screen().commands().iter().any(|(_, command)| matches!(
+            command,
+            nsh_core::Command::ScrollTo {
+                x,
+                animated: false,
+                ..
+            } if x.0 > 0.0
+        )),
+        "opening the sheet should jump the horizontal Agent strip without animation"
+    );
+}
