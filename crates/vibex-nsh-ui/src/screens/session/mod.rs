@@ -7107,8 +7107,8 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 .child(edge_fade_between(
                     false,
                     theme::SPACING_LG,
-                    theme::background_adaptive,
-                    theme::background_clear_adaptive,
+                    theme::page_adaptive,
+                    theme::page_clear_adaptive,
                 )),
         )
         // The foot: what the page is bound to, or what to do with the sessions
