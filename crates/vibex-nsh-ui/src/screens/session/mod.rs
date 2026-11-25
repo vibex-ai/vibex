@@ -2312,6 +2312,15 @@ struct Rail {
     below: Memo<bool>,
 }
 
+/// Whether a row opens prose rather than continuing a run of calls.
+///
+/// A fold's rows are its calls and the paragraphs between them; the rail is the
+/// line that ties the calls together, so it ends where a paragraph starts and
+/// picks up again after it.
+fn starts_prose(entry: &TimelineEntry) -> bool {
+    matches!(entry.kind, EntryKind::Agent | EntryKind::Reasoning)
+}
+
 /// The strip the transcript fades out in at one of its edges.
 fn edge_fade(top: bool) -> impl IntoElement {
     // The strip fades the page's own tone, which is the tone the conversation
@@ -2503,9 +2512,16 @@ fn entry_row(
                 .and_then(|&index| entries.with(|entries| entries.get(index).cloned()))
         })
     });
+    // The rail runs between the rows of one fold and stops where prose begins:
+    // a line into a paragraph says the paragraph is part of the call's run,
+    // which it is not.
     let rail = Rail {
         above: computed(move || {
-            entry.with(|entry| entry.as_ref().is_some_and(|entry| entry.parent_id.is_some()))
+            entry.with(|entry| {
+                entry.as_ref().is_some_and(|entry| {
+                    entry.parent_id.is_some() && !starts_prose(entry)
+                })
+            })
         }),
         below: computed(move || {
             visible.with(|indices| {
@@ -2513,7 +2529,7 @@ fn entry_row(
                     entries.with(|entries| {
                         entries
                             .get(index)
-                            .is_some_and(|entry| entry.parent_id.is_some())
+                            .is_some_and(|entry| entry.parent_id.is_some() && !starts_prose(entry))
                     })
                 })
             })
@@ -2904,9 +2920,14 @@ fn process_header_row(
     // with it: the fold is a summary of that Agent's work, so it says whose.
     view().w_full().pt(px(theme::SPACING_XS)).child(step(
         rail,
-        svg(agent_icon(&agent.get()))
-            .size(px(15.0))
-            .text_color(theme::text_muted),
+        // The mark reads the Agent when the row is built and again when the
+        // row's Agent changes, so a turn that settles onto a named Agent draws
+        // its logo rather than the default one it started with.
+        dynamic(move || {
+            svg(agent_icon(&agent.get()))
+                .size(px(15.0))
+                .text_color(theme::text_muted)
+        }),
         step_line(title, running, expanded, expandable, clock, move || {
             on_toggle(&row_id.get_untracked())
         }),
@@ -2960,33 +2981,20 @@ fn agent_prose(
         .w_full()
         .flex_col()
         .gap(px(6.0))
-        .pt(px(theme::SPACING_SM))
-        .pb(px(theme::SPACING_XS))
-        // A process row is the Agent thinking aloud between tool calls, so it
-        // is the prose alone: a name and a mark above every paragraph would
-        // bury what it is actually saying. The turn's answer keeps both.
-        .child(when(move || conclusion.get(), move || {
+        // Prose and the tool rows around it read as one run otherwise. The
+        // step rows keep their own compact rhythm, so the room that separates
+        // a paragraph from them belongs here.
+        .pt(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_SM))
+        // The prose stands on its own. The Agent that wrote it is named by the
+        // turn's fold above, so a mark and a name over every paragraph only
+        // pushed the text the reader came for further down the page.
+        .child(when(move || streaming.get() && !conclusion.get(), move || {
             view()
                 .flex_row()
                 .items_center()
-                .gap(px(6.0))
                 .min_h(px(crate::ui::activity::ACTIVITY_SLOT))
-                .child(dynamic(move || {
-                    svg(icon(agent_icon(&title.get())))
-                        .size(px(14.0))
-                        .flex_shrink_0()
-                        .text_color(theme::text_secondary)
-                }))
-                .child(
-                    text(move || title.get())
-                        .text_size(px(theme::font_micro()))
-                        .font_weight(FontWeight::SEMIBOLD)
-                        .text_color(theme::text_secondary),
-                )
-                .child(when(
-                    move || streaming.get(),
-                    move || crate::ui::activity::activity_ring(clock, theme::primary),
-                ))
+                .child(crate::ui::activity::activity_ring(clock, theme::primary))
         }))
         .child(
             text_view()
@@ -3250,6 +3258,11 @@ fn activity_row(
             .items_center()
             .gap(px(theme::SPACING_SM))
             .rounded(px(theme::RADIUS_CONTROL))
+            // A tool row is a block of its own, not another line of prose: the
+            // wash gives it an edge to end at, so a run of calls reads as one
+            // thing between two paragraphs rather than as more text.
+            .bg(theme::fill)
+            .my(px(2.0))
             .style_when(
                 move || grouped.get(),
                 |style| style.pl(px(theme::SPACING_SM)),
@@ -3343,7 +3356,7 @@ fn activity_glyph_icon(glyph: ActivityGlyph) -> ImageSrc {
         // edit reads the same on both clients: a closed folder for a listing,
         // a pencil for an edit, a person for a hand-off, a signal for a retry,
         // and a spark for anything the others do not name.
-        ActivityGlyph::Command => icon!("terminal"),
+        ActivityGlyph::Command => icon!("square-terminal"),
         ActivityGlyph::Search => icon!("search"),
         ActivityGlyph::Directory => icon!("folder"),
         ActivityGlyph::Read => icon!("file-text"),

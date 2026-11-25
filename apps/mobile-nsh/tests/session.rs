@@ -2730,8 +2730,8 @@ fn a_process_row_is_its_prose_without_a_name_or_actions() {
         app.screen().matches("role:button[Fork]").unwrap(),
         "the answer keeps the row actions"
     );
-    // The answer is named once, by the Agent that wrote it; a process row is
-    // its prose alone.
+    // The prose is the prose: the Agent is named by the turn's fold above, so
+    // no paragraph — the answer's included — repeats its name.
     let named = app
         .screen()
         .layout_nodes()
@@ -2742,5 +2742,5 @@ fn a_process_row_is_its_prose_without_a_name_or_actions() {
                 .is_some_and(|text| text.text.text == "Claude")
         })
         .count();
-    assert_eq!(named, 1, "only the answer carries the Agent's name");
+    assert_eq!(named, 0, "no paragraph repeats the Agent's name");
 }
