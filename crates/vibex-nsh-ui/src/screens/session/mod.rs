@@ -1702,6 +1702,7 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                     .h(px(theme::CHIP_HEIGHT))
                                     .max_w(px(170.0))
                                     .flex_shrink_0()
+                                    .overflow_hidden()
                                     .flex_row()
                                     .items_center()
                                     .px(px(theme::SPACING_MD))
@@ -1738,6 +1739,8 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                         })
                                         .truncate()
                                         .min_w(px(0.0))
+                                        .flex_shrink(1.0)
+                                        .overflow_hidden()
                                         .text_size(px(theme::font_micro()))
                                         .font_weight(FontWeight::MEDIUM)
                                         .text_color(move || {

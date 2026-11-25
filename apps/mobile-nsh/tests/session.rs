@@ -292,6 +292,40 @@ fn GroupShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A second title far wider than a group tab, so two adjacent tabs can be
+/// checked for overflow into each other.
+const GROUP_TAB_SECOND_LONG_TITLE: &str =
+    "Another long session title that must stay inside its group switcher tab";
+
+/// A shell with a session group whose member titles are wider than a tab.
+#[component]
+fn GroupLongTitleShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.update(|sessions| {
+        if let Some(first) = sessions.get_mut(0) {
+            first.title = DRAWER_LONG_TITLE.to_owned();
+        }
+        if let Some(second) = sessions.get_mut(1) {
+            second.title = GROUP_TAB_SECOND_LONG_TITLE.to_owned();
+        }
+    });
+    host.sidebar_sections.set(vec![SidebarSectionView {
+        kind: SidebarSectionKind::Group,
+        pinned: false,
+        project_id: Some("p1".to_owned()),
+        workspace_id: None,
+        parent_id: None,
+        depth: 0,
+        collapsed: false,
+        id: "group-1".to_owned(),
+        name: "Pair".to_owned(),
+        session_ids: vec!["s1".to_owned(), "s2".to_owned()],
+        auto_archive_after_days: None,
+        auto_continue: false,
+    }]);
+    session::session(host)
+}
+
 /// A shell with a collapsed authority folder.
 #[component]
 fn CollapsedFolderShell() -> impl IntoElement {
@@ -1799,6 +1833,73 @@ fn a_group_opens_its_actions() {
     assert!(app.screen().shows("Dissolve group"));
     app.press("Edit members").unwrap();
     app.wait_for("Group members").unwrap();
+}
+
+#[test]
+fn a_long_group_tab_title_stays_inside_its_tab() {
+    let mut config = EngineConfig::new(Root::of::<GroupLongTitleShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for(GROUP_TAB_SECOND_LONG_TITLE).unwrap();
+    let nodes = app.screen().layout_nodes();
+    let by_id: std::collections::HashMap<_, _> = nodes.iter().map(|node| (node.id, node)).collect();
+    let tab_pair = |title: &str| {
+        nodes
+            .iter()
+            .filter(|node| {
+                !node.hidden
+                    && node
+                        .text
+                        .as_ref()
+                        .is_some_and(|text| text.text.text == title)
+            })
+            .filter_map(|text_node| {
+                let button = by_id.get(&text_node.parent).copied()?;
+                // A group tab is capped at 170pt wide; the conversation header
+                // pill sits above it and spans wider than a tab.
+                (button.bounds.size.width.0 <= 170.5 && button.bounds.origin.x.0 >= 0.0)
+                    .then_some((text_node, button))
+            })
+            .next()
+            .unwrap_or_else(|| panic!("group tab for {title:?} is on screen"))
+    };
+
+    let (first_text, first_tab) = tab_pair(DRAWER_LONG_TITLE);
+    let (second_text, second_tab) = tab_pair(GROUP_TAB_SECOND_LONG_TITLE);
+
+    for (label, text_node, tab_button) in [
+        ("first", first_text, first_tab),
+        ("second", second_text, second_tab),
+    ] {
+        let text = text_node.text.as_ref().expect("tab title carries text");
+        assert_eq!(text.text.max_lines, 1, "{label} tab title is one line");
+        assert_eq!(
+            text.text.ellipsize,
+            nsh_core::EllipsizeMode::Tail,
+            "{label} tab title truncates at the tail"
+        );
+        let text_right = text_node.bounds.origin.x.0 + text_node.bounds.size.width.0;
+        let tab_right = tab_button.bounds.origin.x.0 + tab_button.bounds.size.width.0;
+        assert!(
+            text_right <= tab_right - 11.0,
+            "{label} tab title right edge ({text_right}pt, width {}pt) overflows tab right edge ({tab_right}pt, width {}pt)",
+            text_node.bounds.size.width.0,
+            tab_button.bounds.size.width.0
+        );
+        assert!(
+            text.content.size.width.0 <= text_node.bounds.size.width.0 + 0.5,
+            "{label} tab text content width ({}pt) exceeds its box ({}pt)",
+            text.content.size.width.0,
+            text_node.bounds.size.width.0
+        );
+    }
+
+    let first_text_right = first_text.bounds.origin.x.0 + first_text.bounds.size.width.0;
+    assert!(
+        first_text_right < second_tab.bounds.origin.x.0,
+        "first tab title ({first_text_right}pt) must not overlap second tab ({}pt)",
+        second_tab.bounds.origin.x.0
+    );
 }
 
 #[test]
