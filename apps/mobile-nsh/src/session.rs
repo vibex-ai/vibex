@@ -3103,7 +3103,10 @@ impl SessionService {
             .collect::<Vec<_>>();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        // A prompt is sent from the composer, and from the new-session sheet
+        // that closes the moment it hands its draft over: the message must
+        // outlive both.
+        detach(async move {
             let sends = attachments
                 .iter()
                 .map(|item| MessageAttachment {
@@ -4395,7 +4398,7 @@ impl SessionService {
         self.session_busy.set(true);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     backend
@@ -5395,7 +5398,7 @@ impl SessionService {
         self.session_busy.set(true);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     backend
@@ -5428,7 +5431,7 @@ impl SessionService {
         };
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let answer = nsh_base::alert_dialog()
                 .title(copy::text(
                     "Delete this session?",
@@ -5656,7 +5659,10 @@ impl SessionService {
         let draft = self.new_session_draft();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        // The sheet closes as soon as the session exists, so this task must
+        // not be owned by it: it would be cancelled before it ever ran, and
+        // the session would never be made at all.
+        detach(async move {
             let request = CreateAgentSessionRequest {
                 runtime: option.selection,
                 workspace_root: workspace.workspace.root_path.clone(),
@@ -5743,7 +5749,7 @@ impl SessionService {
         self.project_error.set(None);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
-        spawn(async move {
+        detach(async move {
             // A browse on a link that stopped answering never comes back, and
             // `project_busy` stays set: every folder in the picker then does
             // nothing, and the sheet sits on "Loading…" forever. The wait is
@@ -5805,7 +5811,7 @@ impl SessionService {
         let path = path.to_owned();
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
-        spawn(async move {
+        detach(async move {
             // Same bound as the browse, and on the same clock: awaiting
             // `timeout` in the engine thread's executor never fires, so it
             // wraps the work inside the tokio task instead.
@@ -5881,7 +5887,7 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         let workspaces = self.workspace_backend.clone();
-        spawn(async move {
+        detach(async move {
             let root = crate::runtime::handle()
                 .spawn(async move { workspaces.ensure_temporary_session_root().await })
                 .await;
@@ -7855,47 +7861,45 @@ impl SessionService {
         // opening a session tears that drawer down. A task owned by it would be
         // cancelled before its first poll — the state would already be
         // `Loading`, and the page would wait on a fetch that never started.
-        Owner::detached().run(move || {
-            spawn(async move {
-                // A fetch on a link that stops answering never comes back, and
-                // the page would wait on it for as long as the session stays
-                // open: a transcript filled from the cache with "Loading
-                // conversation…" over it. The wait is bounded so the reader is
-                // told, and can try again. The bound runs on the runtime's own
-                // clock: `timeout` awaited in the engine thread's executor
-                // never fires, because that executor has no timer.
-                let fetch_id = session_id.clone();
-                let fetched = crate::runtime::handle()
-                    .spawn(async move {
-                        tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
-                    })
-                    .await;
-                if !service.alive.get() {
-                    return;
-                }
-                // The reader may have moved to another session while this page
-                // was on its way: its rows are not theirs to see.
-                if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
-                    return;
-                }
-                match fetched {
-                    Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
-                    Ok(Ok(Err(error))) => service
-                        .conversation
-                        .set(ConversationState::Failed(error_text(&error))),
-                    Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
-                        copy::text(
-                            "The conversation did not arrive in time.",
-                            "会话加载超时。",
-                            "工作階段載入逾時。",
-                        )
-                        .into(),
-                    )),
-                    Err(error) => service.conversation.set(ConversationState::Failed(
-                        format!("opening the session did not finish: {error}").into(),
-                    )),
-                }
-            });
+        detach(async move {
+            // A fetch on a link that stops answering never comes back, and
+            // the page would wait on it for as long as the session stays
+            // open: a transcript filled from the cache with "Loading
+            // conversation…" over it. The wait is bounded so the reader is
+            // told, and can try again. The bound runs on the runtime's own
+            // clock: `timeout` awaited in the engine thread's executor
+            // never fires, because that executor has no timer.
+            let fetch_id = session_id.clone();
+            let fetched = crate::runtime::handle()
+                .spawn(async move {
+                    tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
+                })
+                .await;
+            if !service.alive.get() {
+                return;
+            }
+            // The reader may have moved to another session while this page
+            // was on its way: its rows are not theirs to see.
+            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+                return;
+            }
+            match fetched {
+                Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
+                Ok(Ok(Err(error))) => service
+                    .conversation
+                    .set(ConversationState::Failed(error_text(&error))),
+                Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
+                    copy::text(
+                        "The conversation did not arrive in time.",
+                        "会话加载超时。",
+                        "工作階段載入逾時。",
+                    )
+                    .into(),
+                )),
+                Err(error) => service.conversation.set(ConversationState::Failed(
+                    format!("opening the session did not finish: {error}").into(),
+                )),
+            }
         });
     }
 
@@ -8181,6 +8185,23 @@ struct NewSessionDraft {
 enum TerminalCommand {
     Input(String),
     Resize(u16, u16),
+}
+
+/// Runs `task` under an owner of its own, not the caller's.
+///
+/// Almost every write this service makes is started from a surface that is
+/// about to disappear: a drawer row that opens a session, a sheet that closes
+/// once the thing it made exists, a menu that dismisses on press. A task
+/// spawned under that surface's owner is cancelled with it — often before its
+/// first poll — while the state it was going to fill has already been set.
+/// The result is a page that waits forever for work that never started.
+///
+/// What these tasks do belongs to the session, not to the surface that asked
+/// for it, so they outlive it.
+fn detach(task: impl std::future::Future<Output = ()> + 'static) {
+    Owner::detached().run(move || {
+        spawn(task);
+    });
 }
 
 fn spawn_terminal_stream(

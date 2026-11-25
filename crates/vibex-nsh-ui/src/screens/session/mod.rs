@@ -7296,8 +7296,12 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 )
                 .child({
                     let on_new_session = on_new_session.clone();
+                    // A speech bubble taking a plus, not a bare plus: the
+                    // button makes a conversation, and the drawer's other plus
+                    // makes a project — two marks that said the same thing sat
+                    // three rows apart.
                     surface::round_button(
-                        icon!("plus"),
+                        icon!("chat-alt-add"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         move || on_new_session(),
                     )
