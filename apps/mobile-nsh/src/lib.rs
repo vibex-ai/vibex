@@ -427,6 +427,11 @@ fn start_host_poller(services: Signal<Option<Rc<SessionService>>>) {
             {
                 service.attach_camera_photo(path);
             }
+            if let Some(reason) = host::take_camera_failure()
+                && let Some(service) = services.get_untracked()
+            {
+                service.camera_failed(reason);
+            }
             if host::take_new_session_request()
                 && let Some(service) = services.get_untracked()
             {

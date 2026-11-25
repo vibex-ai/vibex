@@ -94,6 +94,20 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeCameraPhoto(
     .resolve::<jni::errors::LogErrorAndDefault>()
 }
 
+/// Reports that the host could not take a photo, and why.
+#[unsafe(no_mangle)]
+pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeCameraFailed(
+    mut env: EnvUnowned<'_>,
+    _class: JClass<'_>,
+    value: JString<'_>,
+) {
+    env.with_env(|_| -> jni::errors::Result<()> {
+        crate::host::set_camera_failure(&value.to_string());
+        Ok(())
+    })
+    .resolve::<jni::errors::LogErrorAndDefault>()
+}
+
 /// The pending update APK URL, or null.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeUpdateUrl(
@@ -150,7 +164,8 @@ pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeDiscoveryEvent(
 }
 
 /// The next thing the app asks the host to do: 0 none, 1 scan, 2 start
-/// discovery, 3 stop discovery. Poll it from the host's UI loop.
+/// discovery, 3 stop discovery, 4 camera, 5 app settings. Poll it from the
+/// host's UI loop.
 #[unsafe(no_mangle)]
 pub extern "system" fn Java_ai_vibex_mobile_nsh_NshHost_nativeTakeHostRequest(
     _env: *mut c_void,

@@ -2,7 +2,7 @@ use std::{collections::HashMap, rc::Rc};
 
 use nsh_base::button;
 use nsh_core::{
-    AccessibilityRole,
+    AccessibilityRole, TouchEvent, TouchPhase,
     element::{ImageSrc, Position},
     prelude::*,
 };
@@ -140,6 +140,11 @@ pub(super) struct TreeActions {
     pub move_row: MoveRow,
     pub new_session: RowAction,
     pub batch_scope: BatchScope,
+    /// Ends a carry the touch system can no longer report. The list's own
+    /// edge scrolling recycles the row that holds the gesture, and a
+    /// recycled row's release never arrives; the page watches the list
+    /// itself for the lifted finger and finishes the drag from there.
+    pub end_drag: Rc<dyn Fn()>,
 }
 
 #[derive(Clone, Copy)]
@@ -178,6 +183,7 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     let rows = state.rows;
     let clock = ActivityClock::start();
     let list_ref = state.list_ref;
+    let end_drag = actions.end_drag.clone();
     // The rows the list shows: when a drag has collapsed a nested row, its
     // children are gone from the list while the row itself stays, so the
     // row that holds the touch is not rebuilt under the finger.
@@ -294,6 +300,16 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             .estimated_item_size(px(theme::sidebar_row_height()))
             .element_ref(&list_ref)
             .on_scroll(move |event: &ScrollEvent| state.list_offset.set(event.offset.y.0))
+            // The list hears every touch its rows see, and it outlives them:
+            // edge scrolling recycles the row that holds the gesture, and a
+            // recycled row never reports the finger lifting, which left the
+            // carried row frozen over the page. A lift seen here finishes the
+            // carry whichever row started it.
+            .on_touch(move |event: &TouchEvent| {
+                if matches!(event.phase, TouchPhase::End | TouchPhase::Cancel) {
+                    end_drag();
+                }
+            })
             .flex_1(),
         )
 }

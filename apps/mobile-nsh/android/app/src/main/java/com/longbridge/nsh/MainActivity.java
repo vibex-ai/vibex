@@ -31,6 +31,7 @@ import java.io.File;
 public final class MainActivity extends Activity {
     private static final int SCAN_REQUEST = 42;
     private static final int CAMERA_REQUEST = 43;
+    private static final int CAMERA_PERMISSION_REQUEST = 44;
 
     private NshView view;
     private LanDiscovery lanDiscovery;
@@ -175,9 +176,24 @@ public final class MainActivity extends Activity {
     }
 
     private void openCamera() {
+        // The app declares CAMERA, and Android refuses the capture intent to
+        // an app that declares it without holding it. Ask first; the capture
+        // is started from the answer.
+        if (checkSelfPermission(android.Manifest.permission.CAMERA)
+                != android.content.pm.PackageManager.PERMISSION_GRANTED) {
+            requestPermissions(
+                    new String[] {android.Manifest.permission.CAMERA},
+                    CAMERA_PERMISSION_REQUEST);
+            return;
+        }
+        startCapture();
+    }
+
+    private void startCapture() {
         try {
             File directory = new File(getCacheDir(), "camera");
             if (!directory.exists() && !directory.mkdirs()) {
+                NshHost.nativeCameraFailed("the camera directory could not be made");
                 return;
             }
             File photo = new File(directory, "shot-" + System.currentTimeMillis() + ".jpg");
@@ -186,9 +202,19 @@ public final class MainActivity extends Activity {
             Intent intent = new Intent(MediaStore.ACTION_IMAGE_CAPTURE);
             intent.putExtra(MediaStore.EXTRA_OUTPUT, uri);
             intent.addFlags(Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            // A phone with no camera app is a phone with nothing to resolve
+            // this intent; without the check startActivityForResult throws and
+            // the app looked as if the button did nothing.
+            if (intent.resolveActivity(getPackageManager()) == null) {
+                cameraPath = null;
+                NshHost.nativeCameraFailed("no camera app is installed");
+                return;
+            }
             startActivityForResult(intent, CAMERA_REQUEST);
         } catch (Exception error) {
             cameraPath = null;
+            NshHost.nativeCameraFailed(
+                    error.getMessage() == null ? error.toString() : error.getMessage());
         }
     }
 
@@ -198,6 +224,10 @@ public final class MainActivity extends Activity {
         if (requestCode == CAMERA_REQUEST) {
             if (resultCode == RESULT_OK && cameraPath != null) {
                 NshHost.nativeCameraPhoto(cameraPath);
+            } else if (resultCode != RESULT_CANCELED) {
+                // A cancelled capture is the reader changing their mind and
+                // says nothing; a failed one would otherwise be silent.
+                NshHost.nativeCameraFailed("the camera returned no photo");
             }
             cameraPath = null;
             return;
@@ -217,6 +247,15 @@ public final class MainActivity extends Activity {
     @Override
     public void onRequestPermissionsResult(int requestCode, String[] permissions, int[] results) {
         super.onRequestPermissionsResult(requestCode, permissions, results);
+        if (requestCode == CAMERA_PERMISSION_REQUEST) {
+            if (results.length > 0
+                    && results[0] == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                startCapture();
+            } else {
+                NshHost.nativeCameraFailed("camera access was refused");
+            }
+            return;
+        }
         lanDiscovery.onRequestPermissionsResult(requestCode, results);
     }
 

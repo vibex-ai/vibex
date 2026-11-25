@@ -1482,7 +1482,12 @@ impl SidebarOrganizationView {
                 if !self.organization.set_group_pinned(group_id, *pinned) {
                     return Ok(SidebarMutationOutcome::AlreadyApplied);
                 }
-                SidebarMutationEffect::NAVIGATION.into()
+                // The pin is a field of the group, so it is persisted with the
+                // organization tree rather than with the navigation flags. A
+                // navigation effect alone left the toggle in the view and out
+                // of the saved state, and the next snapshot read the old value
+                // back — the row never moved, and the pin looked ignored.
+                SidebarMutationEffect::ORGANIZATION.into()
             }
             RemoteSidebarOrganizationMutation::SetGroupAutoContinue { group_id, enabled } => {
                 let Some(group) = self.organization.groups.get(group_id) else {
@@ -3377,6 +3382,49 @@ mod tests {
         };
         assert!(effect.navigation && !effect.organization);
         assert!(view.collapsed_project_ids.contains("project-1"));
+    }
+
+    #[test]
+    fn pinning_a_group_persists_with_the_organization_tree() {
+        let mut view = view_with_folder();
+        assert!(view.organization.create_group(
+            "group-1",
+            "Team",
+            "project-1",
+            "workspace-a",
+            &["session-a".to_string()],
+            &session_workspaces(),
+            None,
+        ));
+        let outcome = view
+            .apply_remote(
+                &RemoteSidebarOrganizationMutation::SetGroupPinned {
+                    group_id: "group-1".to_string(),
+                    pinned: true,
+                },
+                &session_projects(),
+                &session_workspaces(),
+                "unused",
+                "unused",
+            )
+            .expect("pinning a group is legal");
+        let SidebarMutationOutcome::Applied(effect) = outcome else {
+            panic!("a pin that changed the group should report an applied effect");
+        };
+        // The pin is a field of the group, so the shell has to save the
+        // organization: a navigation-only effect dropped it, and the group
+        // came back unpinned on the next snapshot.
+        assert!(
+            effect.organization,
+            "the group's own field is persisted with the organization tree"
+        );
+        assert!(view.organization.group_is_pinned("group-1"));
+        assert!(
+            SidebarOrganizationView::from_remote(&view.to_remote())
+                .organization
+                .group_is_pinned("group-1"),
+            "the pin survives the wire"
+        );
     }
 
     #[test]

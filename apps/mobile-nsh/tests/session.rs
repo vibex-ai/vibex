@@ -207,7 +207,12 @@ fn TurnShell() -> impl IntoElement {
     // actions; the process rows above it are the Agent's working notes.
     // A process row: the Agent thinking aloud between tool calls. It is prose
     // alone — no name above it, no actions under it.
-    let mut process = entry("pr1", EntryKind::Agent, "Claude", "Checking the build first.");
+    let mut process = entry(
+        "pr1",
+        EntryKind::Agent,
+        "Claude",
+        "Checking the build first.",
+    );
     process.turn_id = "t1".to_owned();
     let mut answer = entry(
         "a1",
@@ -216,7 +221,9 @@ fn TurnShell() -> impl IntoElement {
         "![shot](https://example.com/shot.png)\nDone",
     );
     answer.conclusion = true;
-    host.timeline = signal(vec![user, header, process, tool, permission, changes, answer]);
+    host.timeline = signal(vec![
+        user, header, process, tool, permission, changes, answer,
+    ]);
     session::session(host)
 }
 
@@ -518,7 +525,9 @@ fn OlderShell() -> impl IntoElement {
             &format!("s1:pad:{index}"),
             EntryKind::Agent,
             "Claude",
-            &format!("A paragraph of history, number {index}, long enough to take a row or two of the transcript."),
+            &format!(
+                "A paragraph of history, number {index}, long enough to take a row or two of the transcript."
+            ),
         );
         answer.conclusion = true;
         entries.push(answer);
@@ -2671,6 +2680,17 @@ fn a_session_can_be_deleted_from_the_drawer() {
     let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
+    // Deleting is confirmed before it happens: the drawer's own button is one
+    // press away from losing a conversation, so the alert's Delete is what
+    // actually runs the command.
+    app.on_dialog(|dialog| {
+        let delete = dialog
+            .buttons
+            .iter()
+            .find(|button| button.text == "Delete")
+            .expect("the alert offers Delete");
+        nsh_testing::DialogAnswer::Press(delete.text.clone())
+    });
     app.wait_for("Sessions").unwrap();
     app.press("role:button[Sessions]").unwrap();
     app.long_press("role:button[Fix the tests]").unwrap();
@@ -2707,19 +2727,37 @@ fn a_draft_can_be_submitted_while_a_turn_is_running() {
 fn both_side_pages_open_and_close_with_horizontal_drags() {
     let mut app = start();
     let travel = |distance| nsh_core::geometry::Point::new(px(distance), px(0.0));
-    app.drag("role:button[Sessions]", travel(130.0), DragOptions::default()).unwrap();
+    app.drag(
+        "role:button[Sessions]",
+        travel(130.0),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("role:button[Back to session]").unwrap();
-    app.drag("role:button[Back to session]", travel(-130.0), DragOptions::default())
-        .unwrap();
+    app.drag(
+        "role:button[Back to session]",
+        travel(-130.0),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for_gone(
         "role:button[Back to session]",
         std::time::Duration::from_secs(3),
     )
     .unwrap();
-    app.drag("role:button[Files, Git, and terminal]", travel(-130.0), DragOptions::default())
-        .unwrap();
+    app.drag(
+        "role:button[Files, Git, and terminal]",
+        travel(-130.0),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for("role:button[Changes]").unwrap();
-    app.drag("role:button[Changes]", travel(130.0), DragOptions::default()).unwrap();
+    app.drag(
+        "role:button[Changes]",
+        travel(130.0),
+        DragOptions::default(),
+    )
+    .unwrap();
     app.wait_for_gone("role:button[Changes]", std::time::Duration::from_secs(3))
         .unwrap();
 }
@@ -3089,28 +3127,42 @@ fn ManyAgentsRuntimeShell() -> impl IntoElement {
     host.on_open_runtime = Rc::new(move || runtime_open.set(true));
     host.on_close_runtime = Rc::new(move || runtime_open.set(false));
     let agents = [
-        ("deepseek-harness", "DeepSeek Harness", "DeepSeek", "deepseek-chat", false),
+        (
+            "deepseek-harness",
+            "DeepSeek Harness",
+            "DeepSeek",
+            "deepseek-chat",
+            false,
+        ),
         ("claude-code", "Claude Code", "Anthropic", "Claude 4", false),
         ("codex", "OpenAI Codex", "OpenAI", "GPT-5", false),
         ("gemini", "Gemini CLI", "Google", "Gemini 2.5 Pro", false),
         ("opencode", "OpenCode", "OpenRouter", "Sonnet 4", false),
-        ("antigravity", "Google Antigravity", "Antigravity", "Gemini 3 Pro", true),
+        (
+            "antigravity",
+            "Google Antigravity",
+            "Antigravity",
+            "Gemini 3 Pro",
+            true,
+        ),
     ];
     host.runtime_options.set(
         agents
             .into_iter()
-            .map(|(agent_id, agent, provider, model, selected)| RuntimeOptionView {
-                id: format!("{agent_id}:{model}"),
-                agent_id: agent_id.to_owned(),
-                agent: agent.to_owned(),
-                model_id: model.to_lowercase().replace(' ', "-"),
-                model: model.to_owned(),
-                source_key: format!("provider:{agent_id}"),
-                source_label: provider.to_owned(),
-                detail: String::new(),
-                available: true,
-                selected,
-            })
+            .map(
+                |(agent_id, agent, provider, model, selected)| RuntimeOptionView {
+                    id: format!("{agent_id}:{model}"),
+                    agent_id: agent_id.to_owned(),
+                    agent: agent.to_owned(),
+                    model_id: model.to_lowercase().replace(' ', "-"),
+                    model: model.to_owned(),
+                    source_key: format!("provider:{agent_id}"),
+                    source_label: provider.to_owned(),
+                    detail: String::new(),
+                    available: true,
+                    selected,
+                },
+            )
             .collect(),
     );
     session::session(host)
@@ -3160,7 +3212,6 @@ fn opening_agent_settings_reveals_an_offscreen_selected_agent_chip() {
         "opening the sheet should jump the horizontal Agent strip without animation"
     );
 }
-
 
 #[test]
 fn composer_input_defaults_to_a_single_line_and_grows_for_multiline_text() {
@@ -3248,4 +3299,130 @@ fn new_session_places_workspace_above_composer_and_uses_unified_agent_settings()
     // The composer pill reflects both the new model and the reasoning depth on its right.
     assert!(app.screen().shows("GPT-5"));
     assert!(app.screen().shows("High"));
+}
+
+#[test]
+fn deleting_a_session_asks_before_it_happens() {
+    let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.answer_dialogs_myself();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.long_press("role:button[Fix the tests]").unwrap();
+    app.press("role:button[Delete]").unwrap();
+    // The row is still there, and the alert is what asks: a long press
+    // followed by a tap is one slip away from losing a conversation.
+    let dialog = app
+        .pending_dialog()
+        .expect("deleting a session asks first")
+        .clone();
+    assert_eq!(dialog.title.as_deref(), Some("Delete this session?"));
+    assert!(
+        dialog
+            .buttons
+            .iter()
+            .any(|button| button.style == nsh_core::DialogButtonStyle::Destructive),
+        "the alert's own button is the one that deletes"
+    );
+    assert!(app.screen().shows("Fix the tests"));
+    app.answer_dialog(nsh_testing::DialogAnswer::Press("Delete".into()))
+        .unwrap();
+    app.wait_for_gone("text:Fix the tests", std::time::Duration::from_secs(5))
+        .unwrap();
+}
+
+#[test]
+fn dissolving_a_group_and_deleting_a_folder_ask_first() {
+    for (shell, row, entry, title) in [
+        ("group", "Pair", "Dissolve group", "Dissolve this group?"),
+        ("folder", "Work", "Delete", "Delete this folder?"),
+    ] {
+        let mut config = match shell {
+            "group" => EngineConfig::new(Root::of::<GroupShell>()),
+            _ => EngineConfig::new(Root::of::<FolderShell>()),
+        };
+        config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+        let mut app = Headless::start(config).unwrap();
+        app.answer_dialogs_myself();
+        app.wait_for("Sessions").unwrap();
+        app.press("role:button[Sessions]").unwrap();
+        app.long_press(&format!("role:button[{row}]")).unwrap();
+        app.press(&format!("role:button[{entry}]")).unwrap();
+        let dialog = app
+            .pending_dialog()
+            .expect("a destructive command asks first")
+            .clone();
+        assert_eq!(dialog.title.as_deref(), Some(title), "{shell}");
+        app.answer_dialog(nsh_testing::DialogAnswer::Press("Cancel".into()))
+            .unwrap();
+        assert!(
+            app.pending_dialog().is_none(),
+            "{shell}: cancelling runs nothing"
+        );
+        assert!(app.screen().shows(row), "{shell}: the row is still there");
+    }
+}
+
+/// A drawer long enough to scroll, so a carried row can be pushed past what is
+/// on screen and the list has to move under it.
+#[component]
+fn LongListShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.sessions.set(
+        (1..=12)
+            .map(|n| SessionSummary {
+                id: format!("s{n}"),
+                title: format!("Session {n}"),
+                agent: "Claude".to_owned(),
+                meta: "2m".to_owned(),
+                state: SessionState::Idle,
+                terminal: false,
+                project_id: "p1".to_owned(),
+                project_name: "vibex".to_owned(),
+                workspace_id: "w1".to_owned(),
+                workspace_label: "main".to_owned(),
+            })
+            .collect(),
+    );
+    session::session(host)
+}
+
+#[test]
+fn a_carried_row_lands_and_the_next_drag_is_accepted() {
+    // Carrying a row and putting it down has to end the carry: the page's card
+    // leaves with the finger, and the next gesture is taken by its own row. A
+    // carry that never ended kept the card over the page and refused every
+    // later drag as "already carrying".
+    let mut config = EngineConfig::new(Root::of::<LongListShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(700.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Sessions").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("Session 1").unwrap();
+    // Carry a row far enough that the list scrolls under it.
+    app.drag(
+        "role:button[Session 12]",
+        nsh_core::geometry::Point::new(px(0.0), px(-620.0)),
+        DragOptions::default().hold(std::time::Duration::from_millis(900)),
+    )
+    .unwrap();
+    // The carried card is gone with the finger: the row reads once.
+    assert_eq!(
+        app.screen()
+            .texts()
+            .iter()
+            .filter(|text| **text == "Session 12")
+            .count(),
+        1,
+        "the carried card is not left over the page"
+    );
+    // And the next drag is taken by its own row rather than refused.
+    app.drag(
+        "role:button[Session 2]",
+        nsh_core::geometry::Point::new(px(0.0), px(-90.0)),
+        DragOptions::default().hold(std::time::Duration::from_millis(700)),
+    )
+    .unwrap();
+    assert!(app.screen().shows("Session 2"), "the drawer is drawn again");
 }

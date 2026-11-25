@@ -100,6 +100,14 @@ static CAMERA_AVAILABLE: std::sync::atomic::AtomicBool = std::sync::atomic::Atom
 /// The photo the camera host wrote, waiting for the engine to read it.
 static CAMERA_PHOTO: OnceLock<Mutex<Option<String>>> = OnceLock::new();
 
+/// Why the host could not take a photo, waiting for the engine to say so.
+///
+/// A camera that opens and closes without a picture is indistinguishable from
+/// one that never opened, so the host reports its own failure: a missing
+/// camera app, a permission the user refused, a capture it could not start.
+/// Without this the button did nothing and said nothing.
+static CAMERA_FAILURE: OnceLock<Mutex<Option<String>>> = OnceLock::new();
+
 /// A launcher shortcut asked for a new session.
 static NEW_SESSION_REQUESTED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
@@ -230,6 +238,25 @@ pub fn set_camera_photo(path: &str) {
 /// Takes the camera photo path, if one is waiting.
 pub fn take_camera_photo() -> Option<String> {
     CAMERA_PHOTO
+        .get()
+        .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
+}
+
+/// Records that the host could not take a photo, and why.
+#[cfg_attr(
+    not(target_os = "android"),
+    allow(dead_code, reason = "the Android host sets this")
+)]
+pub fn set_camera_failure(reason: &str) {
+    *CAMERA_FAILURE
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|error| error.into_inner()) = Some(reason.to_owned());
+}
+
+/// Takes the reason the camera host failed, if it did.
+pub fn take_camera_failure() -> Option<String> {
+    CAMERA_FAILURE
         .get()
         .and_then(|slot| slot.lock().ok().and_then(|mut slot| slot.take()))
 }

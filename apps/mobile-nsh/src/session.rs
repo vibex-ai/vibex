@@ -79,13 +79,11 @@ use vibex_nsh_ui::{
         ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
         ComposerHistoryEntry, ConversationState, EntryKind, GoalControl, GoalPhaseView, GoalView,
         MessageDelivery, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
-        PlanStepState,
-        PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
-        QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
+        PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
+        QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimePickerHost, RuntimeSummaryView, ScheduledSendView, SessionHost,
-        SessionState,
-        SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView,
-        SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
+        SessionState, SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind,
+        SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -113,6 +111,13 @@ const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 /// flag gates every press, so a browse that never returns leaves every folder
 /// dead and the sheet saying "Loading…".
 const BROWSE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// How long one directory in the file tree may take to list.
+///
+/// A directory whose listing never returns keeps its row on a spinner for
+/// good, and the row cannot be pressed again while it is loading. Bounding it
+/// turns the wait into a failure the row reports and can retry.
+const FILE_TREE_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// Where the per-session composer drafts are kept.
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
@@ -2913,13 +2918,22 @@ impl SessionService {
         );
     }
 
+    /// Removes a project from the workbench, after the caller confirmed it.
+    ///
+    /// The row leaves the drawer at once and the authority is asked
+    /// afterwards: the request crosses the network, and a list that only
+    /// changed once it answered looked like the command had done nothing. A
+    /// failure puts the project back, so the drawer never claims a removal the
+    /// runtime did not make.
     fn remove_project(&self, id: &str) {
         let Ok(project_id) = ProjectId::parse(id) else {
             return;
         };
         let service = self.clone();
         let backend = self.workspace_backend.clone();
-        spawn(async move {
+        let removed = id.to_owned();
+        self.forget_project(&removed);
+        detach(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     backend
@@ -2931,13 +2945,45 @@ impl SessionService {
                 Ok(Ok(())) => {
                     service.reload_sessions().await;
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "project_remove_task_failed",
-                    format!("removing the project did not finish: {error}"),
-                )),
+                Ok(Err(error)) => {
+                    service.fail(&error);
+                    service.reload_sessions().await;
+                }
+                Err(error) => {
+                    service.fail(&BackendError::failed(
+                        "project_remove_task_failed",
+                        format!("removing the project did not finish: {error}"),
+                    ));
+                    service.reload_sessions().await;
+                }
             }
         });
+    }
+
+    /// Drops a project's rows from the drawer before the authority answers.
+    fn forget_project(&self, project_id: &str) {
+        self.session_records.update(|sessions| {
+            sessions.retain(|session| session.project_id.as_str() != project_id)
+        });
+        self.sessions.update(|sessions| {
+            sessions.retain(|session| session.project_id != project_id);
+        });
+        self.workspace_records
+            .update(|spaces| spaces.retain(|space| space.project.id.as_str() != project_id));
+        self.sidebar_view.update(|view| {
+            view.organization
+                .placements
+                .retain(|placement| placement.item.id() != project_id);
+        });
+        if self.active.get_untracked().is_some_and(|active| {
+            !self
+                .sessions
+                .with(|sessions| sessions.iter().any(|session| session.id == active))
+        }) {
+            self.active.set(None);
+            self.timeline.set(Vec::new());
+            *self.model.borrow_mut() = TimelineModel::default();
+        }
     }
 
     fn enqueue(
@@ -4043,6 +4089,17 @@ impl SessionService {
                 "目前宿主無法使用相機。",
             ));
         }
+    }
+
+    /// Says why the host could not take a photo.
+    ///
+    /// The camera opens in another app, so a refusal there has no other way
+    /// back: without this the button looked broken rather than declined.
+    pub fn camera_failed(&self, reason: String) {
+        self.fail_text(&format!(
+            "{}: {reason}",
+            copy::text("taking a photo failed", "拍照失败", "拍照失敗")
+        ));
     }
 
     /// Reads the photo the host wrote and turns it into an attachment.
@@ -5884,9 +5941,9 @@ impl SessionService {
         // Only once the transcript has something of its own to show. The
         // placeholder's own rows are not it: they are what is being replaced.
         let real = self.timeline.with(|entries| {
-            entries
-                .iter()
-                .any(|entry| !entry.id.starts_with("pending-turn:") && !entry.id.starts_with("pending-live:"))
+            entries.iter().any(|entry| {
+                !entry.id.starts_with("pending-turn:") && !entry.id.starts_with("pending-live:")
+            })
         });
         if !real {
             return;
@@ -6591,21 +6648,47 @@ impl SessionService {
         });
     }
 
+    /// Opens or closes the directory a row of the file tree stands for.
+    ///
+    /// A row can stand for several directories at once: the tree compacts a
+    /// chain of single-child directories into one row (`src/main/java`), and
+    /// toggling only the last of them left the outer ones closed, so the
+    /// second folder of a nested pair never opened and its spinner never
+    /// cleared. The chain is read from the tree and every directory in it is
+    /// opened or closed together, exactly as the desktop does.
     fn toggle_directory(&self, path: &str) {
-        let load = {
+        let loads = {
             let mut tree = self.file_tree.borrow_mut();
-            if !tree.toggle_expanded(path) {
+            let chain = tree
+                .all_visible_rows()
+                .iter()
+                .find(|row| row.path == path)
+                .map(|row| row.path_chain.clone())
+                .unwrap_or_else(|| vec![path.to_owned()]);
+            let expanding = !tree.chain_is_expanded(&chain);
+            if !tree.set_chain_expanded(&chain, expanding) {
                 return;
             }
-            tree.is_expanded(path)
-                && matches!(
-                    tree.load_state(path),
-                    FileTreeLoadState::Unloaded | FileTreeLoadState::Error { .. }
-                )
+            if !expanding {
+                Vec::new()
+            } else {
+                // Every directory the row just opened may hold children that
+                // were never read, not only the deepest one.
+                chain
+                    .into_iter()
+                    .filter(|path| {
+                        !path.is_empty()
+                            && !matches!(
+                                tree.load_state(path),
+                                FileTreeLoadState::Loaded | FileTreeLoadState::Loading
+                            )
+                    })
+                    .collect::<Vec<_>>()
+            }
         };
         self.publish_file_tree();
-        if load {
-            self.load_tree(path.to_owned());
+        for path in loads {
+            self.load_tree(path);
         }
     }
 
@@ -6687,6 +6770,13 @@ impl SessionService {
                         tree.set_root_name(name);
                     }
                 }
+                // A directory already being read is not asked for again: the
+                // second begin_load would replace the generation the first
+                // request answers to, so the answer would be dropped and the
+                // row would spin for good.
+                if tree.load_state(&path) == FileTreeLoadState::Loading {
+                    return;
+                }
                 tree.begin_load(&path)
             };
             service.publish_file_tree();
@@ -6694,14 +6784,26 @@ impl SessionService {
             let requested_workspace = workspace.clone();
             let result = crate::runtime::handle()
                 .spawn(async move {
-                    file_backend
-                        .file_tree(FileTreeRequest {
+                    // A directory that never answers would leave its row
+                    // spinning with no way back: the load is bounded, and a
+                    // timeout is reported as a failure the row can retry.
+                    match tokio::time::timeout(
+                        FILE_TREE_LOAD_TIMEOUT,
+                        file_backend.file_tree(FileTreeRequest {
                             workspace_id: requested_workspace,
                             path: tree_path,
                             max_depth: Some(1),
                             include_hidden: false,
-                        })
-                        .await
+                        }),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(BackendError::failed(
+                            "file_tree_load_timeout",
+                            "listing the files took too long",
+                        )),
+                    }
                 })
                 .await;
             if !service.workbench_is_current(generation) {
@@ -9023,13 +9125,15 @@ fn build_runtime_views(
                 label: copy::text("Default", "默认", "預設").to_owned(),
                 selected: selection.mode_id.is_none(),
             }];
-            choices.extend(option.modes.iter().map(|candidate| RuntimeChoiceView {
-                value: candidate.value.clone(),
-                label: candidate
-                    .label
-                    .clone()
-                    .unwrap_or_else(|| candidate.value.clone()),
-                selected: selection.mode_id.as_deref() == Some(candidate.value.as_str()),
+            choices.extend(option.modes.iter().map(|candidate| {
+                RuntimeChoiceView {
+                    value: candidate.value.clone(),
+                    label: candidate
+                        .label
+                        .clone()
+                        .unwrap_or_else(|| candidate.value.clone()),
+                    selected: selection.mode_id.as_deref() == Some(candidate.value.as_str()),
+                }
             }));
             choices
         }
@@ -9068,10 +9172,7 @@ fn build_runtime_views(
                         .iter()
                         .map(|value| RuntimeChoiceView {
                             value: value.value.clone(),
-                            label: value
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| value.value.clone()),
+                            label: value.label.clone().unwrap_or_else(|| value.value.clone()),
                             selected: current.as_deref() == Some(value.value.as_str()),
                         })
                         .collect(),
@@ -9141,9 +9242,7 @@ fn runtime_source_label(source: &vibex_core::RuntimeAuthSource, raw_label: &str)
 /// projected from. A client that reads only the request keeps drawing a card
 /// the runtime has already taken, and every press on it comes back as "no
 /// longer pending".
-fn answered_requests(
-    items: &[vibex_core::TimelineItem],
-) -> std::collections::HashSet<String> {
+fn answered_requests(items: &[vibex_core::TimelineItem]) -> std::collections::HashSet<String> {
     items
         .iter()
         .filter_map(|item| match &item.payload {
@@ -9320,9 +9419,7 @@ fn live_turn_phase(turn: &TimelineConversationTurn) -> &'static str {
         .chain(turn.process_rows.iter().rev())
         .find(|row| row.streaming);
     match latest.map(|row| row.kind) {
-        Some(TimelineRowKind::AgentMessage) => {
-            copy::text("Generating", "生成中", "生成中")
-        }
+        Some(TimelineRowKind::AgentMessage) => copy::text("Generating", "生成中", "生成中"),
         Some(
             TimelineRowKind::ToolCall
             | TimelineRowKind::Command
@@ -9332,9 +9429,7 @@ fn live_turn_phase(turn: &TimelineConversationTurn) -> &'static str {
             | TimelineRowKind::ImageGeneration,
         ) => copy::text("Calling tool", "调用工具", "呼叫工具"),
         Some(TimelineRowKind::Reasoning) => copy::text("Thinking", "思考中", "思考中"),
-        Some(_) | None if turn.live_status.is_some() => {
-            copy::text("Thinking", "思考中", "思考中")
-        }
+        Some(_) | None if turn.live_status.is_some() => copy::text("Thinking", "思考中", "思考中"),
         Some(_) | None => copy::text("Preparing", "准备中", "準備中"),
     }
 }
@@ -9511,8 +9606,8 @@ mod tests {
     #[test]
     fn a_resolution_retires_the_request_it_answers() {
         use vibex_core::{
-            DeviceId, ElicitationResolution, ElicitationResolutionAction, RequestId,
-            TimelineItem, TimelineItemId, TimelineItemKind, TimelinePayload, TimelineRedactionState,
+            DeviceId, ElicitationResolution, ElicitationResolutionAction, RequestId, TimelineItem,
+            TimelineItemId, TimelineItemKind, TimelinePayload, TimelineRedactionState,
             TimelineSource, VibexSessionId,
         };
         let session_id = VibexSessionId::new();

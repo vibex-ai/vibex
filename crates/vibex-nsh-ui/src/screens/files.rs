@@ -474,6 +474,8 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
     } else {
         (row.icon.icon(), row.icon.color())
     };
+    // The row's own path: a compacted `a/b/c` row toggles the whole chain,
+    // which the service resolves from its own tree.
     let path = row.path;
     let status = row.git.unwrap_or_default();
     let status_color = match status.as_str() {
@@ -798,12 +800,15 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                 FilePreviewKindView::Markdown if !force_source => scroll()
                     .flex_1()
                     .child(
-                        view().px(px(theme::SPACING_LG)).py(px(theme::SPACING_SM)).child(
-                            text_view()
-                                .markdown(Some(SharedString::from(preview.body)))
-                                .options(MarkdownOptions::default)
-                                .selectable(true),
-                        ),
+                        view()
+                            .px(px(theme::SPACING_LG))
+                            .py(px(theme::SPACING_SM))
+                            .child(
+                                text_view()
+                                    .markdown(Some(SharedString::from(preview.body)))
+                                    .options(MarkdownOptions::default)
+                                    .selectable(true),
+                            ),
                     )
                     .into_element(),
                 FilePreviewKindView::Image => view()
@@ -820,7 +825,11 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                     .into_element(),
                 FilePreviewKindView::Binary => surface::empty_state(
                     icon!("file-text"),
-                    copy::text("No preview for this file", "无法预览此文件", "無法預覽此檔案"),
+                    copy::text(
+                        "No preview for this file",
+                        "无法预览此文件",
+                        "無法預覽此檔案",
+                    ),
                     copy::text(
                         "It is not text, Markdown or an image.",
                         "它不是文本、Markdown 或图片。",

@@ -19,6 +19,18 @@
     <uses-permission android:name="android.permission.CHANGE_WIFI_MULTICAST_STATE" />
     <uses-feature android:name="android.hardware.camera" android:required="false" />
 
+    <!--
+      Android 11 hides other packages unless they are declared. The photo
+      attachment opens whichever camera app the phone has, and without this
+      the intent resolves to nothing and the button does nothing at all.
+    -->
+    <queries>
+        <intent>
+            <action android:name="android.media.action.IMAGE_CAPTURE" />
+        </intent>
+    </queries>
+
+
     <application
         android:allowBackup="false"
         android:hardwareAccelerated="true"

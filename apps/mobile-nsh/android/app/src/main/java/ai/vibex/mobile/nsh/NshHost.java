@@ -22,6 +22,9 @@ public final class NshHost {
     /** The path of a photo the camera host wrote. */
     public static native void nativeCameraPhoto(String path);
 
+    /** Why the camera host could not take a photo. */
+    public static native void nativeCameraFailed(String reason);
+
     /** A launcher shortcut asked for a new session. */
     public static native void nativeNewSession();
 
@@ -40,7 +43,10 @@ public final class NshHost {
     /** The pending screen-awake change: -1 none, 0 off, 1 on. */
     public static native int nativeTakeKeepScreenOn();
 
-    /** The next thing the app asks the host to do: 0 none, 1 scan, 2 find, 3 stop. */
+    /**
+     * The next thing the app asks the host to do: 0 none, 1 scan, 2 find
+     * start, 3 find stop, 4 camera, 5 app settings.
+     */
     public static native int nativeTakeHostRequest();
 
     /** Names the phone in the runtime's paired-device list. */

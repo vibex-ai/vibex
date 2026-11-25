@@ -18,10 +18,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::{
-    ButtonElement, button,
-    text_view::{MarkdownOptions, text_view},
-};
+use nsh_base::{ButtonElement, button};
 use nsh_core::{
     element::{ImageSrc, Painter, Position, canvas},
     prelude::*,
@@ -38,6 +35,7 @@ use crate::{
     },
 };
 
+mod find;
 mod pager;
 mod tree;
 mod workbench;
@@ -548,8 +546,8 @@ type OpenDiff = CollapseAction;
 type SessionMenu = FolderNameAction;
 
 use crate::screens::new_session::{
-    NewSessionHost, ProjectBrowserHost, WorkspaceChoice,
-    new_session as new_session_page, project_browser_sheet as project_browser,
+    NewSessionHost, ProjectBrowserHost, WorkspaceChoice, new_session as new_session_page,
+    project_browser_sheet as project_browser,
 };
 
 /// A callback with no arguments.
@@ -1273,28 +1271,25 @@ fn shell(
                 // there, and a strip in that band drew over them. In flow here,
                 // it is pushed below the bar by the same inset the tabs use,
                 // and it sits above the glass so the blur never touches it.
-                .child(when(
-                    move || connection.get() != ConnectionState::Online,
-                    {
-                        let tabs_above = tabs_above_for_banner;
-                        move || {
-                            view()
-                                .z_index(2)
-                                .pt(move || {
-                                    if tabs_above.get() {
-                                        px(0.0)
-                                    } else {
-                                        px(top_bar_inset())
-                                    }
-                                })
-                                .child(connection_banner(
-                                    connection,
-                                    connection_error,
-                                    on_retry.clone(),
-                                ))
-                        }
-                    },
-                ))
+                .child(when(move || connection.get() != ConnectionState::Online, {
+                    let tabs_above = tabs_above_for_banner;
+                    move || {
+                        view()
+                            .z_index(2)
+                            .pt(move || {
+                                if tabs_above.get() {
+                                    px(0.0)
+                                } else {
+                                    px(top_bar_inset())
+                                }
+                            })
+                            .child(connection_banner(
+                                connection,
+                                connection_error,
+                                on_retry.clone(),
+                            ))
+                    }
+                }))
                 .child(
                     view()
                         .relative()
@@ -1499,155 +1494,161 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         .z_index(2)
         .pt_safe_area()
         .child(
-        view()
-            .w_full()
-            .h(px(theme::HEADER_HEIGHT))
-            .flex_shrink_0()
-            .flex_row()
-            .items_center()
-            .gap(px(theme::SPACING_SM))
-            .px(px(theme::SPACING_MD))
-            .child(
-                surface::round_button(
-                    icon!("menu"),
-                    copy::text("Sessions", "会话", "工作階段"),
-                    move || pager.open(ShellPage::Sessions),
+            view()
+                .w_full()
+                .h(px(theme::HEADER_HEIGHT))
+                .flex_shrink_0()
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .px(px(theme::SPACING_MD))
+                .child(
+                    surface::round_button(
+                        icon!("menu"),
+                        copy::text("Sessions", "会话", "工作階段"),
+                        move || pager.open(ShellPage::Sessions),
+                    )
+                    .bg(theme::floating_pane_solid)
+                    .shadow(theme::floating_pane_shadow()),
                 )
-                .bg(theme::floating_pane_solid)
-                .shadow(theme::floating_pane_shadow()),
-            )
-            .child(
-                view().flex_1().min_w(px(0.0)).items_center().child(
-                    button()
-                        .max_w(relative(1.0))
-                        .h(px(theme::COMPACT_CONTROL + 2.0))
-                        .pl(px(theme::SPACING_MD))
-                        .pr(px(theme::SPACING_MD))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(6.0))
-                        .rounded_full()
-                        .bg(theme::floating_pane_solid)
-                        .shadow(theme::floating_pane_shadow())
-                        .active(|style| style.opacity(0.6))
-                        .accessibility_label(move || {
-                            SharedString::from(if has_menu() {
-                                format!(
-                                    "{}: {}",
-                                    copy::text("Conversation menu", "会话菜单", "工作階段選單"),
-                                    title.get()
-                                )
-                            } else {
-                                title.get()
-                            })
-                        })
-                        .disabled(move || !has_menu())
-                        .on_press(open_menu)
-                        .child(dynamic(move || {
-                            let state = if creating.get() {
-                                None
-                            } else {
-                                session
-                                    .with(|session| session.as_ref().map(|session| session.state))
-                            };
-                            match state {
-                                Some(SessionState::Running) => {
-                                    let continues = session.with(|session| {
-                                        session.as_ref().is_some_and(|session| {
-                                            auto_continue.with(|continuing| {
-                                                continuing.iter().any(|id| id == &session.id)
-                                            })
-                                        })
-                                    });
-                                    crate::ui::activity::activity_ring(
-                                        activity,
-                                        if continues {
-                                            theme::accent_green
-                                        } else {
-                                            theme::primary
-                                        },
-                                    )
-                                    .into_element()
-                                }
-                                // The desktop answers this state with its
-                                // question-mark icon everywhere it reports it,
-                                // so the header draws the same mark as the row
-                                // instead of a dot that reads as one more
-                                // status.
-                                Some(SessionState::Waiting) => svg(icon!("circle-question-mark"))
-                                    .size(px(theme::SIDEBAR_META_ICON))
-                                    .text_color(theme::accent_yellow)
-                                    .into_element(),
-                                Some(SessionState::Failed) => {
-                                    surface::status_dot(theme::accent_red).into_element()
-                                }
-                                _ => view().into_element(),
-                            }
-                        }))
-                        .child(
-                            text(move || title.get())
-                                .truncate()
-                                .min_w(px(0.0))
-                                .flex_shrink(1.0)
-                                .text_size(px(theme::font_detail()))
-                                .font_weight(FontWeight::SEMIBOLD)
-                                .text_color(theme::foreground),
-                        )
-                        .child(
-                            svg(icon!("chevron-down"))
-                                .size(px(12.0))
-                                .flex_shrink_0()
-                                .text_color(theme::text_muted)
-                                .style_when(move || !has_menu(), |style| style.hidden()),
-                        ),
-                ),
-            )
-            .child(
-                when(
-                    move || creating.get(),
-                    move || {
-                        let stop = on_stop_creating.clone();
-                        surface::round_button(
-                            icon!("x"),
-                            copy::text("Cancel", "取消", "取消"),
-                            move || {
-                                dismiss_keyboard();
-                                stop();
-                            },
-                        )
-                    },
-                )
-                .otherwise(move || {
-                    view()
-                        .flex_row()
-                        .items_center()
-                        .gap(px(theme::SPACING_SM))
-                        // The drawer owns "new session": its own control is the
-                        // one place to start one, so the header does not offer a
-                        // second way to the same page.
-                        .child(
-                            surface::round_button(
-                                icon!("panel-right"),
-                                copy::text(
-                                    "Files, Git, and terminal",
-                                    "文件、Git 与终端",
-                                    "檔案、Git 與終端機",
-                                ),
-                                move || pager.open(ShellPage::Workbench),
-                            )
+                .child(
+                    view().flex_1().min_w(px(0.0)).items_center().child(
+                        button()
+                            .max_w(relative(1.0))
+                            .h(px(theme::COMPACT_CONTROL + 2.0))
+                            .pl(px(theme::SPACING_MD))
+                            .pr(px(theme::SPACING_MD))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(6.0))
+                            .rounded_full()
                             .bg(theme::floating_pane_solid)
                             .shadow(theme::floating_pane_shadow())
-                            .relative()
-                            .child(when(terminal_running, || {
-                                surface::status_dot(theme::accent_success)
-                                    .absolute()
-                                    .top(px(3.0))
-                                    .right(px(3.0))
-                            })),
-                        )
-                }),
-            ),
-    )
+                            .active(|style| style.opacity(0.6))
+                            .accessibility_label(move || {
+                                SharedString::from(if has_menu() {
+                                    format!(
+                                        "{}: {}",
+                                        copy::text("Conversation menu", "会话菜单", "工作階段選單"),
+                                        title.get()
+                                    )
+                                } else {
+                                    title.get()
+                                })
+                            })
+                            .disabled(move || !has_menu())
+                            .on_press(open_menu)
+                            .child(dynamic(move || {
+                                let state = if creating.get() {
+                                    None
+                                } else {
+                                    session.with(|session| {
+                                        session.as_ref().map(|session| session.state)
+                                    })
+                                };
+                                match state {
+                                    Some(SessionState::Running) => {
+                                        let continues = session.with(|session| {
+                                            session.as_ref().is_some_and(|session| {
+                                                auto_continue.with(|continuing| {
+                                                    continuing.iter().any(|id| id == &session.id)
+                                                })
+                                            })
+                                        });
+                                        crate::ui::activity::activity_ring(
+                                            activity,
+                                            if continues {
+                                                theme::accent_green
+                                            } else {
+                                                theme::primary
+                                            },
+                                        )
+                                        .into_element()
+                                    }
+                                    // The desktop answers this state with its
+                                    // question-mark icon everywhere it reports it,
+                                    // so the header draws the same mark as the row
+                                    // instead of a dot that reads as one more
+                                    // status.
+                                    Some(SessionState::Waiting) => {
+                                        svg(icon!("circle-question-mark"))
+                                            .size(px(theme::SIDEBAR_META_ICON))
+                                            .text_color(theme::accent_yellow)
+                                            .into_element()
+                                    }
+                                    Some(SessionState::Failed) => {
+                                        surface::status_dot(theme::accent_red).into_element()
+                                    }
+                                    _ => view().into_element(),
+                                }
+                            }))
+                            .child(
+                                text(move || title.get())
+                                    .truncate()
+                                    .min_w(px(0.0))
+                                    .flex_shrink(1.0)
+                                    .text_size(px(theme::font_detail()))
+                                    .font_weight(FontWeight::SEMIBOLD)
+                                    .text_color(theme::foreground),
+                            )
+                            .child(
+                                svg(icon!("chevron-down"))
+                                    .size(px(12.0))
+                                    .flex_shrink_0()
+                                    .text_color(theme::text_muted)
+                                    .style_when(move || !has_menu(), |style| style.hidden()),
+                            ),
+                    ),
+                )
+                .child(
+                    when(
+                        move || creating.get(),
+                        move || {
+                            let stop = on_stop_creating.clone();
+                            surface::round_button(
+                                icon!("x"),
+                                copy::text("Cancel", "取消", "取消"),
+                                move || {
+                                    dismiss_keyboard();
+                                    stop();
+                                },
+                            )
+                        },
+                    )
+                    .otherwise(move || {
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            // The drawer owns "new session": its own control is the
+                            // one place to start one, so the header does not offer a
+                            // second way to the same page.
+                            .child(
+                                surface::round_button(
+                                    icon!("panel-right"),
+                                    copy::text(
+                                        "Files, Git, and terminal",
+                                        "文件、Git 与终端",
+                                        "檔案、Git 與終端機",
+                                    ),
+                                    move || pager.open(ShellPage::Workbench),
+                                )
+                                .bg(theme::floating_pane_solid)
+                                .shadow(theme::floating_pane_shadow())
+                                .relative()
+                                .child(when(
+                                    terminal_running,
+                                    || {
+                                        surface::status_dot(theme::accent_success)
+                                            .absolute()
+                                            .top(px(3.0))
+                                            .right(px(3.0))
+                                    },
+                                )),
+                            )
+                    }),
+                ),
+        )
 }
 
 fn active_session(host: &SessionHost) -> Memo<Option<SessionSummary>> {
@@ -1783,13 +1784,15 @@ fn group_tabs(host: &SessionHost) -> impl IntoElement {
                                         .overflow_hidden()
                                         .text_size(px(theme::font_micro()))
                                         .font_weight(FontWeight::MEDIUM)
-                                        .text_color(move || {
-                                            if selected() {
-                                                theme::foreground()
-                                            } else {
-                                                theme::text_secondary()
-                                            }
-                                        }),
+                                        .text_color(
+                                            move || {
+                                                if selected() {
+                                                    theme::foreground()
+                                                } else {
+                                                    theme::text_secondary()
+                                                }
+                                            },
+                                        ),
                                     )
                             },
                         )),
@@ -1833,11 +1836,9 @@ fn connection_banner(
                     text(move || {
                         error.get().unwrap_or_else(|| {
                             match connection.get() {
-                                ConnectionState::Connecting => copy::text(
-                                    "Reconnecting...",
-                                    "正在重新连接…",
-                                    "正在重新連線…",
-                                ),
+                                ConnectionState::Connecting => {
+                                    copy::text("Reconnecting...", "正在重新连接…", "正在重新連線…")
+                                }
                                 ConnectionState::Online => {
                                     copy::text("Connected", "已连接", "已連線")
                                 }
@@ -1910,7 +1911,35 @@ fn timeline_view(
     let on_refresh = host.on_refresh.clone();
     let on_new = host.on_new_session.clone();
     let terminal = active_session(&host);
+    let find_query = signal(String::new());
+    let find_cursor = signal(0usize);
+    let find_matches = computed(move || {
+        let query = find_query.with(|query| query.trim().to_lowercase());
+        if query.is_empty() {
+            return Vec::new();
+        }
+        source.with(|entries| {
+            entries
+                .iter()
+                .filter(|entry| searchable_match(entry, &query))
+                .map(|entry| entry.id.clone())
+                .collect::<Vec<_>>()
+        })
+    });
+    // The row the bar is on: its own hits are painted stronger than the rest,
+    // so the row it scrolled to is still identifiable among many.
+    let find_active_row = computed(move || {
+        find_matches.with(|matches| {
+            matches
+                .get(find_cursor.get().min(matches.len().saturating_sub(1)))
+                .cloned()
+        })
+    });
     let row_actions = TranscriptActions {
+        find: FindMarking {
+            query: find_query,
+            active_row: find_active_row,
+        },
         toggle_turn: host.on_toggle_turn.clone(),
         toggle_detail: host.on_toggle_detail.clone(),
         fork: host.on_fork.clone(),
@@ -1933,8 +1962,6 @@ fn timeline_view(
             })
         },
     };
-    let find_query = signal(String::new());
-    let find_cursor = signal(0usize);
     let list_ref = element_ref();
     effect(move || {
         if let Some(id) = reveal.get()
@@ -1945,7 +1972,30 @@ fn timeline_view(
                     && let Some(index) = position_for(&|entry| entry.id == id)
                 {
                     reveal.set(None);
-                    list_ref.scroll_to_index(index as u32, Percentage(0.5), px(0.0), false);
+                    // A find's match is aimed at, not centred: a row taller
+                    // than the viewport cannot be shown whole, and the word
+                    // the reader typed may sit anywhere inside it. Placing the
+                    // match a quarter down the page puts it in view even in a
+                    // long answer, which is the case the bar exists for.
+                    let aim = find_query.with_untracked(|query| {
+                        source.with_untracked(|entries| {
+                            entries
+                                .iter()
+                                .find(|entry| entry.id == id)
+                                .map_or(0.0, |entry| {
+                                    find::match_aim(&searchable_text(entry), query)
+                                })
+                        })
+                    });
+                    let row_height = 72.0;
+                    let view = window().height.0;
+                    let offset = -(aim * row_height - view * 0.25).max(0.0);
+                    list_ref.scroll_to_index(
+                        index as u32,
+                        Percentage(0.5),
+                        px(offset),
+                        !crate::motion::reduce_motion(),
+                    );
                 }
             });
         }
@@ -1978,19 +2028,6 @@ fn timeline_view(
         reveal.set(None);
     });
     let away_from_end = signal(false);
-    let find_matches = computed(move || {
-        let query = find_query.with(|query| query.trim().to_lowercase());
-        if query.is_empty() {
-            return Vec::new();
-        }
-        source.with(|entries| {
-            entries
-                .iter()
-                .filter(|entry| searchable_match(entry, &query))
-                .map(|entry| entry.id.clone())
-                .collect::<Vec<_>>()
-        })
-    });
     let find_reveal: Rc<dyn Fn(&str)> = Rc::new(move |id| {
         let query = find_query.with_untracked(|query| query.trim().to_lowercase());
         let open_detail = source.with_untracked(|entries| {
@@ -2136,9 +2173,10 @@ fn timeline_view(
                         move || {
                             view()
                                 .z_index(2)
-                                .style_when(move || clear_bar, |style| {
-                                    style.pt(px(top_bar_inset()))
-                                })
+                                .style_when(
+                                    move || clear_bar,
+                                    |style| style.pt(px(top_bar_inset())),
+                                )
                                 .child(find_bar(
                                     find_query,
                                     find_matches,
@@ -2153,31 +2191,34 @@ fn timeline_view(
                     // strip above the transcript says it is on its way. A
                     // button would have made the reader stop and press it at
                     // the one moment they were already reading backwards.
-                    .child(when(move || loading_older.get(), move || {
-                        view()
-                            .w_full()
-                            .items_center()
-                            .py(px(theme::SPACING_XS))
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .items_center()
-                                    .gap(px(theme::SPACING_SM))
-                                    .child(crate::ui::activity::activity_ring(
-                                        older_clock,
-                                        theme::primary,
-                                    ))
-                                    .child(
-                                        text(copy::text(
-                                            "Loading earlier...",
-                                            "正在加载更早的消息…",
-                                            "正在載入更早的訊息…",
+                    .child(when(
+                        move || loading_older.get(),
+                        move || {
+                            view()
+                                .w_full()
+                                .items_center()
+                                .py(px(theme::SPACING_XS))
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .items_center()
+                                        .gap(px(theme::SPACING_SM))
+                                        .child(crate::ui::activity::activity_ring(
+                                            older_clock,
+                                            theme::primary,
                                         ))
-                                        .text_size(px(theme::font_micro()))
-                                        .text_color(theme::text_muted),
-                                    ),
-                            )
-                    }))
+                                        .child(
+                                            text(copy::text(
+                                                "Loading earlier...",
+                                                "正在加载更早的消息…",
+                                                "正在載入更早的訊息…",
+                                            ))
+                                            .text_size(px(theme::font_micro()))
+                                            .text_color(theme::text_muted),
+                                        ),
+                                )
+                        },
+                    ))
                     .child({
                         let actions = row_actions.clone();
                         view()
@@ -2187,9 +2228,7 @@ fn timeline_view(
                             .child(
                                 virtual_list(
                                     move || visible.with(Vec::len),
-                                    move |at: Position| {
-                                        entry_row(at, actions.clone(), find_matches, find_cursor)
-                                    },
+                                    move |at: Position| entry_row(at, actions.clone()),
                                 )
                                 .keys(move || {
                                     visible.with(|indices| {
@@ -2226,31 +2265,30 @@ fn timeline_view(
                                 .on_scroll({
                                     let on_load_older = on_load_older.clone();
                                     move |event: &ScrollEvent| {
-                                    // Only a transcript with somewhere to go
-                                    // offers the way back to its end. A page
-                                    // holding one short message has no scroll
-                                    // range at all, and the top padding alone
-                                    // can make the arithmetic below come out
-                                    // positive — which put a "jump to latest"
-                                    // button on a page that was already at it.
-                                    let overflow = event.content_size.height.0
-                                        - event.size.height.0;
-                                    away_from_end.set(
-                                        overflow > 120.0
-                                            && overflow - event.offset.y.0 > 120.0,
-                                    );
-                                    // Reading near the top is the ask: fetch the
-                                    // next page then, not when a button is
-                                    // pressed. `loading_older` is the guard, so
-                                    // a scroll that keeps firing while the page
-                                    // is in flight asks once.
-                                    if event.offset.y.0 <= OLDER_TRIGGER
-                                        && has_older.get_untracked()
-                                        && !loading_older.get_untracked()
-                                    {
-                                        on_load_older();
+                                        // Only a transcript with somewhere to go
+                                        // offers the way back to its end. A page
+                                        // holding one short message has no scroll
+                                        // range at all, and the top padding alone
+                                        // can make the arithmetic below come out
+                                        // positive — which put a "jump to latest"
+                                        // button on a page that was already at it.
+                                        let overflow =
+                                            event.content_size.height.0 - event.size.height.0;
+                                        away_from_end.set(
+                                            overflow > 120.0 && overflow - event.offset.y.0 > 120.0,
+                                        );
+                                        // Reading near the top is the ask: fetch the
+                                        // next page then, not when a button is
+                                        // pressed. `loading_older` is the guard, so
+                                        // a scroll that keeps firing while the page
+                                        // is in flight asks once.
+                                        if event.offset.y.0 <= OLDER_TRIGGER
+                                            && has_older.get_untracked()
+                                            && !loading_older.get_untracked()
+                                        {
+                                            on_load_older();
+                                        }
                                     }
-                                }
                                 })
                                 .flex_1(),
                             )
@@ -2307,6 +2345,30 @@ fn visible_timeline(entries: &[TimelineEntry]) -> Vec<usize> {
         }
     }
     visible
+}
+
+/// The text a find searches in one row: what the row actually shows, so a hit
+/// is a word the reader can see.
+fn searchable_text(entry: &TimelineEntry) -> String {
+    let mut text = entry.title.clone();
+    if !entry.body.is_empty() {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&entry.body);
+    }
+    if let Some(activity) = entry.activity.as_ref() {
+        for part in std::iter::once(&activity.target)
+            .chain(activity.path.as_ref())
+            .chain(activity.details.iter().map(|detail| &detail.text))
+        {
+            if !part.is_empty() {
+                text.push('\n');
+                text.push_str(part);
+            }
+        }
+    }
+    text
 }
 
 fn searchable_match(entry: &TimelineEntry, query: &str) -> bool {
@@ -2458,6 +2520,18 @@ struct TranscriptActions {
     open_file: Rc<dyn Fn(&str)>,
     /// The clock every working mark in the transcript turns by.
     clock: crate::ui::activity::ActivityClock,
+    /// What the find bar is looking for, and which hit it is on. Every row
+    /// reads it: the matched words are marked where they sit, and the row
+    /// holding the current hit paints it stronger than the rest.
+    find: FindMarking,
+}
+
+/// The find bar's query, as the rows read it.
+#[derive(Clone, Copy)]
+struct FindMarking {
+    query: Signal<String>,
+    /// The row the bar is on, so its own hits are painted stronger.
+    active_row: Memo<Option<String>>,
 }
 
 /// The line a working row is named on.
@@ -2646,12 +2720,15 @@ fn step_node(glyph: ImageSrc, ink: impl Fn() -> Hsla + 'static) -> impl IntoElem
 
 /// The line a fold or a group is named on: its name, the working mark while
 /// it runs, and the disclosure when it opens.
+#[allow(clippy::too_many_arguments)]
 fn step_line(
     title: Memo<String>,
     running: Memo<bool>,
     expanded: Memo<bool>,
     expandable: Memo<bool>,
     clock: crate::ui::activity::ActivityClock,
+    query: Signal<String>,
+    active: Memo<bool>,
     on_toggle: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
@@ -2665,14 +2742,16 @@ fn step_line(
         .active(|style| style.bg(theme::row_pressed_bg()))
         .disabled(move || !expandable.get())
         .on_press(on_toggle)
-        .child(
-            text(move || title.get())
-                .flex_1()
-                .min_w(px(0.0))
-                .truncate()
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::text_secondary),
-        )
+        .child(view().flex_1().min_w(px(0.0)).child(find::marked_line(
+            title,
+            query,
+            active,
+            |line| {
+                line.truncate()
+                    .text_size(px(theme::font_detail()))
+                    .text_color(theme::text_secondary)
+            },
+        )))
         .child(when(
             move || running.get(),
             move || crate::ui::activity::activity_ring(clock, theme::primary),
@@ -2688,7 +2767,12 @@ fn step_line(
 /// A V of dots leads it, one highlight walking the stroke: the mark the
 /// desktop's timeline draws while a turn runs, so both clients say "still
 /// working" with the same thing.
-fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -> impl IntoElement {
+fn working_row(
+    body: Memo<String>,
+    _clock: crate::ui::activity::ActivityClock,
+    query: Signal<String>,
+    active: Memo<bool>,
+) -> impl IntoElement {
     // The V walks its own, slower lap: the row's shared clock is timed for the
     // ring, and at that speed the highlight jumps along the stroke.
     let clock = crate::ui::activity::ActivityClock::with_lap(crate::ui::activity::V_LAP_MS);
@@ -2703,17 +2787,19 @@ fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -
         .pt(px(theme::SPACING_MD))
         .pb(px(theme::SPACING_XL * 2.0))
         .child(crate::ui::activity::activity_v(clock, theme::text_muted))
-        .child(
-            text(move || body.get())
-                .flex_1()
-                .min_w(px(0.0))
-                .text_size(px(theme::font_detail()))
-                .text_color(theme::text_muted),
-        )
+        .child(view().flex_1().min_w(px(0.0)).child(find::marked_line(
+            body,
+            query,
+            active,
+            |line| {
+                line.text_size(px(theme::font_detail()))
+                    .text_color(theme::text_muted)
+            },
+        )))
 }
 
 /// A note from the system: said beside the conversation, not in it.
-fn notice_row(body: Memo<String>) -> impl IntoElement {
+fn notice_row(body: Memo<String>, query: Signal<String>, active: Memo<bool>) -> impl IntoElement {
     view().w_full().py(px(theme::SPACING_XS)).child(
         view()
             .w_full()
@@ -2721,21 +2807,15 @@ fn notice_row(body: Memo<String>) -> impl IntoElement {
             .bg(theme::fill)
             .px(px(theme::SPACING_MD))
             .py(px(theme::SPACING_SM))
-            .child(
-                text(move || body.get())
-                    .text_size(px(theme::font_caption()))
+            .child(find::marked_line(body, query, active, |line| {
+                line.text_size(px(theme::font_caption()))
                     .line_height(theme::line_height_for(theme::font_caption()))
-                    .text_color(theme::text_secondary),
-            ),
+                    .text_color(theme::text_secondary)
+            })),
     )
 }
 
-fn entry_row(
-    at: Position,
-    actions: TranscriptActions,
-    matches: Memo<Vec<String>>,
-    cursor: Signal<usize>,
-) -> impl IntoElement {
+fn entry_row(at: Position, actions: TranscriptActions) -> impl IntoElement {
     let entries = actions.entries;
     let visible = actions.visible;
     let entry = computed(move || {
@@ -2767,19 +2847,10 @@ fn entry_row(
     view()
         .w_full()
         .px(px(theme::SPACING_LG))
-        .style_when(
-            move || {
-                entry.with(|entry| {
-                    entry.as_ref().is_some_and(|entry| {
-                        matches.with(|matches| {
-                            matches.get(cursor.get().min(matches.len().saturating_sub(1)))
-                                == Some(&entry.id)
-                        })
-                    })
-                })
-            },
-            |style| style.bg(theme::sidebar_selected_bg()),
-        )
+        // No row-level tint: what a find marks is the word, not the message
+        // around it. A whole row painted made the reader hunt for their own
+        // query inside a highlighted paragraph, which is the opposite of what
+        // a find is for. `entry_element` marks the matched text instead.
         .child(entry_element(entry, rail, actions))
 }
 
@@ -2800,8 +2871,10 @@ fn entry_element(
         reveal,
         open_file,
         clock,
+        find,
         ..
     } = actions;
+
     let kind = computed(move || entry.with(|e| e.as_ref().map(|e| e.kind)));
     let body =
         computed(move || entry.with(|e| e.as_ref().map(|e| e.body.clone()).unwrap_or_default()));
@@ -2847,6 +2920,13 @@ fn entry_element(
                 .unwrap_or_default()
         })
     });
+    // The row the bar is on paints its own hits stronger; a row with no match
+    // is drawn exactly as it was, so a find costs the reader nothing they were
+    // not looking for.
+    let find_active = computed(move || {
+        find.active_row
+            .with(|active| active.as_deref() == Some(row_id.get().as_str()))
+    });
     let toggle_detail: Rc<dyn Fn()> =
         Rc::new(move || on_toggle_detail(&row_id.get_untracked(), sequence.get_untracked()));
     view()
@@ -2865,6 +2945,8 @@ fn entry_element(
                     editable_sequence,
                     on_edit_message.clone(),
                     on_open_attachment.clone(),
+                    find.query,
+                    find_active,
                 )
             },
         ))
@@ -2884,6 +2966,8 @@ fn entry_element(
                         rail,
                         clock,
                         on_toggle_turn.clone(),
+                        find.query,
+                        find_active,
                     )
                 }
             },
@@ -2903,9 +2987,16 @@ fn entry_element(
                                 theme::text_muted()
                             }
                         }),
-                        step_line(title, streaming, expanded, expandable, clock, move || {
-                            toggle(&row_id.get_untracked())
-                        }),
+                        step_line(
+                            title,
+                            streaming,
+                            expanded,
+                            expandable,
+                            clock,
+                            find.query,
+                            find_active,
+                            move || toggle(&row_id.get_untracked()),
+                        ),
                         view(),
                     )
                 }
@@ -2925,6 +3016,8 @@ fn entry_element(
                         jump,
                         conclusion,
                         on_fork.clone(),
+                        find.query,
+                        find_active,
                     )
                 }
             },
@@ -2942,6 +3035,8 @@ fn entry_element(
                         rail,
                         clock,
                         toggle.clone(),
+                        find.query,
+                        find_active,
                     )
                 }
             },
@@ -2958,30 +3053,41 @@ fn entry_element(
                     expandable,
                     rail,
                     toggle_detail.clone(),
+                    find.query,
+                    find_active,
                 )
             },
         ))
         .child(when(
             move || kind.get() == Some(EntryKind::Generating),
-            move || working_row(body, clock),
+            move || working_row(body, clock, find.query, find_active),
         ))
         .child(when(
             move || kind.get() == Some(EntryKind::Notice),
-            move || notice_row(body),
+            move || notice_row(body, find.query, find_active),
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Error)),
-            move || error_card(body),
+            move || error_card(body, find.query, find_active),
         ))
         .child(when(
             move || kind.with(|kind| *kind == Some(EntryKind::Changes)),
-            move || changes_card(title, entry, reveal.clone(), open_file.clone()),
+            move || {
+                changes_card(
+                    title,
+                    entry,
+                    reveal.clone(),
+                    open_file.clone(),
+                    find.query,
+                    find_active,
+                )
+            },
         ))
         .child(when(
             move || {
                 kind.with(|kind| matches!(kind, Some(EntryKind::Permission | EntryKind::Question)))
             },
-            move || decision_card(title, body, meta),
+            move || decision_card(title, body, meta, find.query, find_active),
         ))
 }
 
@@ -2996,6 +3102,7 @@ const REACTION_HANG: f32 = 6.0;
 
 /// What the reader wrote: a bubble on their side of the page, its one sharp
 /// corner pointing at it.
+#[allow(clippy::too_many_arguments)]
 fn user_bubble(
     body: Memo<String>,
     meta: Memo<String>,
@@ -3006,14 +3113,15 @@ fn user_bubble(
     editable_sequence: Signal<i64>,
     on_edit: EditMessage,
     on_open_attachment: OpenAttachment,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     // The pill the bubble's lower edge carries: the Agent's reaction and, when
     // the message was not an ordinary prompt, the glyph for what it did. They
     // share one surface so the row does not grow a second one, as the desktop's
     // edge region does.
-    let has_edge_marks = computed(move || {
-        reaction.with(Option::is_some) || delivery.with(Option::is_some)
-    });
+    let has_edge_marks =
+        computed(move || reaction.with(Option::is_some) || delivery.with(Option::is_some));
     view()
         .w_full()
         .flex_col()
@@ -3044,61 +3152,63 @@ fn user_bubble(
                         .bg(theme::bubble)
                         .px(px(surface::ROW_INSET))
                         .py(px(10.0))
-                        .child(
-                            text(move || body.get())
-                                .selectable(true)
+                        .child(find::marked_line(body, query, active, |line| {
+                            line.selectable(true)
                                 .text_size(px(theme::font_body()))
                                 .line_height(theme::line_height_for(theme::font_body()))
-                                .text_color(theme::foreground),
-                        ),
+                                .text_color(theme::foreground)
+                        })),
                 )
-                .child(when(move || has_edge_marks.get(), move || {
-                    view()
-                        .absolute()
-                        .bottom(px(-REACTION_HANG))
-                        .right(px(theme::SPACING_XS))
-                        .h(px(REACTION_SIZE))
-                        .flex_row()
-                        .items_center()
-                        .gap(px(2.0))
-                        .px(px(theme::SPACING_SM))
-                        .rounded_full()
-                        .bg(theme::block_surface)
-                        .border_1()
-                        .border_color(theme::hairline)
-                        .child(when(
-                            move || reaction.with(Option::is_some),
-                            move || {
-                                text(move || {
-                                    reaction
-                                        .with(|reaction| reaction.clone())
-                                        .unwrap_or_default()
-                                })
-                                .text_size(px(theme::font_caption()))
-                            },
-                        ))
-                        .child(when(
-                            move || delivery.with(Option::is_some),
-                            move || {
-                                // The glyph the desktop uses for the same
-                                // fact: a message that went into a turn that
-                                // was already running, or one that cut it off
-                                // and took over. `icon!` takes a literal, so
-                                // each case names its own file.
-                                if delivery.get() == Some(MessageDelivery::Resend) {
-                                    svg(icon!("rotate-ccw"))
-                                        .size(px(13.0))
-                                        .flex_shrink_0()
-                                        .text_color(theme::accent_yellow())
-                                } else {
-                                    svg(icon!("corner-down-right"))
-                                        .size(px(13.0))
-                                        .flex_shrink_0()
-                                        .text_color(theme::accent_success())
-                                }
-                            },
-                        ))
-                })),
+                .child(when(
+                    move || has_edge_marks.get(),
+                    move || {
+                        view()
+                            .absolute()
+                            .bottom(px(-REACTION_HANG))
+                            .right(px(theme::SPACING_XS))
+                            .h(px(REACTION_SIZE))
+                            .flex_row()
+                            .items_center()
+                            .gap(px(2.0))
+                            .px(px(theme::SPACING_SM))
+                            .rounded_full()
+                            .bg(theme::block_surface)
+                            .border_1()
+                            .border_color(theme::hairline)
+                            .child(when(
+                                move || reaction.with(Option::is_some),
+                                move || {
+                                    text(move || {
+                                        reaction
+                                            .with(|reaction| reaction.clone())
+                                            .unwrap_or_default()
+                                    })
+                                    .text_size(px(theme::font_caption()))
+                                },
+                            ))
+                            .child(when(
+                                move || delivery.with(Option::is_some),
+                                move || {
+                                    // The glyph the desktop uses for the same
+                                    // fact: a message that went into a turn that
+                                    // was already running, or one that cut it off
+                                    // and took over. `icon!` takes a literal, so
+                                    // each case names its own file.
+                                    if delivery.get() == Some(MessageDelivery::Resend) {
+                                        svg(icon!("rotate-ccw"))
+                                            .size(px(13.0))
+                                            .flex_shrink_0()
+                                            .text_color(theme::accent_yellow())
+                                    } else {
+                                        svg(icon!("corner-down-right"))
+                                            .size(px(13.0))
+                                            .flex_shrink_0()
+                                            .text_color(theme::accent_success())
+                                    }
+                                },
+                            ))
+                    },
+                )),
         )
         .child(when(
             move || !attachments.with(|items| items.is_empty()),
@@ -3186,6 +3296,8 @@ fn process_header_row(
     rail: Rail,
     clock: crate::ui::activity::ActivityClock,
     on_toggle: Rc<dyn Fn(&str)>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     let title = computed(move || {
         let label = if complete.get() {
@@ -3216,9 +3328,16 @@ fn process_header_row(
                 .size(px(15.0))
                 .text_color(theme::text_muted)
         }),
-        step_line(title, running, expanded, expandable, clock, move || {
-            on_toggle(&row_id.get_untracked())
-        }),
+        step_line(
+            title,
+            running,
+            expanded,
+            expandable,
+            clock,
+            query,
+            active,
+            move || on_toggle(&row_id.get_untracked()),
+        ),
         view(),
     ))
 }
@@ -3254,7 +3373,7 @@ fn work_duration(started_at_ms: i64, ended_at_ms: i64, complete: bool) -> String
 /// reader can do with the answer.
 #[allow(clippy::too_many_arguments)]
 fn agent_prose(
-    title: Memo<String>,
+    _title: Memo<String>,
     body: Memo<String>,
     streaming: Memo<bool>,
     sequence: Memo<i64>,
@@ -3262,6 +3381,8 @@ fn agent_prose(
     jump: Signal<Option<i64>>,
     conclusion: Memo<bool>,
     on_fork: Rc<dyn Fn(i64)>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     let images = computed(move || markdown_images(&body.get()));
     view()
@@ -3278,15 +3399,13 @@ fn agent_prose(
         // pushed the text the reader came for further down the page — and a
         // ring there, over a paragraph that is already arriving, only pushed
         // it further. The fold's header says the turn is still working.
-        .child(
-            text_view()
-                .markdown(move || Some(body.get().into()))
-                .options(move || MarkdownOptions {
-                    streaming: streaming.get(),
-                    ..MarkdownOptions::default()
-                })
-                .selectable(true),
-        )
+        .child(find::marked_markdown_view(
+            body,
+            query,
+            active,
+            streaming,
+            |view| view.selectable(true),
+        ))
         .child(when(
             move || images.with(|images| !images.is_empty()),
             move || {
@@ -3411,6 +3530,7 @@ fn share_message(body: Memo<String>) -> ButtonElement {
     .disabled(move || body.with(String::is_empty))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn reasoning_row(
     body: Memo<String>,
     streaming: Memo<bool>,
@@ -3419,6 +3539,8 @@ fn reasoning_row(
     rail: Rail,
     clock: crate::ui::activity::ActivityClock,
     toggle: Rc<dyn Fn()>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     let title = computed(move || copy::text("Thought", "思考", "思考").to_owned());
     step(
@@ -3430,9 +3552,16 @@ fn reasoning_row(
                 theme::text_muted()
             }
         }),
-        step_line(title, streaming, expanded, expandable, clock, move || {
-            toggle()
-        }),
+        step_line(
+            title,
+            streaming,
+            expanded,
+            expandable,
+            clock,
+            query,
+            active,
+            move || toggle(),
+        ),
         when(
             move || expanded.get(),
             move || {
@@ -3449,18 +3578,18 @@ fn reasoning_row(
                                 .justify_end()
                         },
                     )
-                    .child(
-                        text_view()
-                            .markdown(move || Some(body.get().into()))
-                            .options(move || MarkdownOptions {
-                                streaming: streaming.get(),
-                                ..MarkdownOptions::default()
-                            })
-                            .flex_shrink_0()
-                            .selectable(true)
-                            .text_size(px(theme::font_detail()))
-                            .text_color(theme::text_muted),
-                    )
+                    .child(find::marked_markdown_view(
+                        body,
+                        query,
+                        active,
+                        streaming,
+                        |view| {
+                            view.flex_shrink_0()
+                                .selectable(true)
+                                .text_size(px(theme::font_detail()))
+                                .text_color(theme::text_muted)
+                        },
+                    ))
             },
         ),
     )
@@ -3476,6 +3605,8 @@ fn activity_row(
     expandable: Memo<bool>,
     rail: Rail,
     on_toggle: Rc<dyn Fn()>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     // A row filed under a group steps in from the rows of the fold itself.
     let grouped = computed(move || {
@@ -3557,22 +3688,25 @@ fn activity_row(
                     .flex_row()
                     .items_center()
                     .gap(px(6.0))
-                    .child(
-                        text(move || title.get())
-                            .min_w(px(0.0))
+                    .child(find::marked_line(title, query, active, |line| {
+                        line.min_w(px(0.0))
                             .truncate()
                             .text_size(px(theme::font_detail()))
-                            .text_color(theme::text_secondary),
-                    )
+                            .text_color(theme::text_secondary)
+                    }))
                     .child(when(
                         move || !target.with(String::is_empty),
                         move || {
-                            text(move || target.get())
-                                .flex_1()
-                                .min_w(px(0.0))
-                                .truncate()
-                                .text_size(px(theme::font_detail()))
-                                .text_color(theme::text_muted)
+                            view().flex_1().min_w(px(0.0)).child(find::marked_line(
+                                target,
+                                query,
+                                active,
+                                |line| {
+                                    line.truncate()
+                                        .text_size(px(theme::font_detail()))
+                                        .text_color(theme::text_muted)
+                                },
+                            ))
                         },
                     )),
             )
@@ -3671,7 +3805,7 @@ fn activity_row(
             ))
             .child(when(
                 move || expanded.get(),
-                move || activity_details_view(activity, body),
+                move || activity_details_view(activity, body, query, active),
             )),
     )
 }
@@ -3702,6 +3836,8 @@ fn activity_glyph_icon(glyph: ActivityGlyph) -> ImageSrc {
 fn activity_details_view(
     activity: Memo<Option<ActivityView>>,
     body: Memo<String>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     dynamic(move || {
         let (details_loading, details_pending) = activity.with(|activity| {
@@ -3740,6 +3876,10 @@ fn activity_details_view(
             .children(details.into_iter().map(|detail| {
                 let label = copy::text("Copy {label}", "复制{label}", "複製{label}")
                     .replace("{label}", &detail.label);
+                let text_of_detail = computed({
+                    let text = detail.text.clone();
+                    move || text.clone()
+                });
                 // One block of a step's detail: what it is, the way to take
                 // it away, and the text itself in a well.
                 view()
@@ -3777,14 +3917,17 @@ fn activity_details_view(
                     )
                     .child(
                         scroll().max_h(px(192.0)).w_full().child(
-                            text(detail.text)
+                            view()
                                 .w_full()
                                 .pr(px(theme::SPACING_SM))
-                                .font_family("monospace")
-                                .selectable(true)
-                                .text_size(px(theme::font_micro()))
-                                .line_height(theme::line_height_for(theme::font_micro()))
-                                .text_color(theme::text_secondary),
+                                .child(find::marked_line(text_of_detail, query, active, |line| {
+                                    line.w_full()
+                                        .font_family("monospace")
+                                        .selectable(true)
+                                        .text_size(px(theme::font_micro()))
+                                        .line_height(theme::line_height_for(theme::font_micro()))
+                                        .text_color(theme::text_secondary)
+                                })),
                         ),
                     )
             }))
@@ -3797,6 +3940,8 @@ fn changes_card(
     entry: Memo<Option<TimelineEntry>>,
     reveal: RevealRow,
     open_file: Rc<dyn Fn(&str)>,
+    query: Signal<String>,
+    active: Memo<bool>,
 ) -> impl IntoElement {
     const PREVIEW_FILES: usize = 3;
     let files = computed(move || {
@@ -3824,15 +3969,17 @@ fn changes_card(
                     .disabled(move || !expandable.get())
                     .on_press(move || expanded.update(|expanded| *expanded = !*expanded))
                     .child(surface::tile(icon!("file-code")))
-                    .child(
-                        text(move || title.get())
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .truncate()
-                            .text_size(px(theme::font_detail()))
-                            .font_weight(FontWeight::MEDIUM)
-                            .text_color(theme::foreground),
-                    )
+                    .child(view().flex_1().min_w(px(0.0)).child(find::marked_line(
+                        title,
+                        query,
+                        active,
+                        |line| {
+                            line.truncate()
+                                .text_size(px(theme::font_detail()))
+                                .font_weight(FontWeight::MEDIUM)
+                                .text_color(theme::foreground)
+                        },
+                    )))
                     .child(when(
                         move || expandable.get(),
                         move || disclosure_chevron(computed(move || expanded.get())),
@@ -3932,7 +4079,13 @@ fn changes_card(
 }
 
 /// A question the Agent asked and how it was answered, kept in the record.
-fn decision_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) -> impl IntoElement {
+fn decision_card(
+    title: Memo<String>,
+    body: Memo<String>,
+    meta: Memo<String>,
+    query: Signal<String>,
+    active: Memo<bool>,
+) -> impl IntoElement {
     view().w_full().py(px(6.0)).child(
         surface::card()
             .px(px(surface::ROW_INSET))
@@ -3965,17 +4118,18 @@ fn decision_card(title: Memo<String>, body: Memo<String>, meta: Memo<String>) ->
             .child(when(
                 move || !body.with(String::is_empty),
                 move || {
-                    text(move || body.get())
-                        .text_size(px(theme::font_caption()))
-                        .line_height(theme::line_height_for(theme::font_caption()))
-                        .text_color(theme::text_secondary)
+                    find::marked_line(body, query, active, |line| {
+                        line.text_size(px(theme::font_caption()))
+                            .line_height(theme::line_height_for(theme::font_caption()))
+                            .text_color(theme::text_secondary)
+                    })
                 },
             )),
     )
 }
 
 /// A failure: what went wrong, on the tint failures are told by.
-fn error_card(body: Memo<String>) -> impl IntoElement {
+fn error_card(body: Memo<String>, query: Signal<String>, active: Memo<bool>) -> impl IntoElement {
     view().w_full().py(px(6.0)).child(
         view()
             .w_full()
@@ -3987,15 +4141,17 @@ fn error_card(body: Memo<String>) -> impl IntoElement {
             .px(px(surface::ROW_INSET))
             .py(px(theme::SPACING_MD))
             .child(surface::status_dot(theme::accent_red).mt(px(6.0)))
-            .child(
-                text(move || body.get())
-                    .flex_1()
-                    .min_w(px(0.0))
-                    .selectable(true)
-                    .text_size(px(theme::font_detail()))
-                    .line_height(theme::line_height_for(theme::font_detail()))
-                    .text_color(theme::accent_red),
-            ),
+            .child(view().flex_1().min_w(px(0.0)).child(find::marked_line(
+                body,
+                query,
+                active,
+                |line| {
+                    line.selectable(true)
+                        .text_size(px(theme::font_detail()))
+                        .line_height(theme::line_height_for(theme::font_detail()))
+                        .text_color(theme::accent_red)
+                },
+            ))),
     )
 }
 
@@ -4015,37 +4171,40 @@ fn command_palette(
         .px(px(theme::SPACING_MD))
         .pb(px(theme::SPACING_XS))
         .child(
-            surface::card().max_h(px(240.0)).shadow_md().child(
-                scroll()
-                    .max_h(px(240.0))
-                    .child(view().flex_col().child(each(
-                        move || {
-                            let query = draft.with(|draft| {
-                                draft
-                                    .strip_prefix('/')
-                                    .unwrap_or_default()
-                                    .trim()
-                                    .to_lowercase()
-                            });
-                            commands.with(|commands| {
-                                commands
-                                    .iter()
-                                    .filter(|command| {
-                                        query.is_empty()
-                                            || command.label.to_lowercase().contains(&query)
-                                            || command.insertion.to_lowercase().contains(&query)
-                                    })
-                                    .cloned()
-                                    .collect::<Vec<_>>()
-                            })
-                        },
-                        |command| command.id.clone(),
-                        {
-                            let on_arm = on_arm.clone();
-                            move |command, _| command_row(command, draft, kind, on_arm.clone())
-                        },
-                    ))),
-            ),
+            surface::card()
+                .max_h(px(240.0))
+                .shadow_md()
+                .child(
+                    scroll()
+                        .max_h(px(240.0))
+                        .child(view().flex_col().child(each(
+                            move || {
+                                let query = draft.with(|draft| {
+                                    draft
+                                        .strip_prefix('/')
+                                        .unwrap_or_default()
+                                        .trim()
+                                        .to_lowercase()
+                                });
+                                commands.with(|commands| {
+                                    commands
+                                        .iter()
+                                        .filter(|command| {
+                                            query.is_empty()
+                                                || command.label.to_lowercase().contains(&query)
+                                                || command.insertion.to_lowercase().contains(&query)
+                                        })
+                                        .cloned()
+                                        .collect::<Vec<_>>()
+                                })
+                            },
+                            |command| command.id.clone(),
+                            {
+                                let on_arm = on_arm.clone();
+                                move |command, _| command_row(command, draft, kind, on_arm.clone())
+                            },
+                        ))),
+                ),
         )
 }
 
@@ -4510,16 +4669,14 @@ fn composer_add_sheet(
     on_schedule: Action,
 ) -> impl IntoElement {
     use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
-    let attach = move |icon: ImageSrc,
-                       label: &'static str,
-                       detail: &'static str,
-                       action: Action| {
-        surface::row_captioned(icon, label, detail, move || {
-            open.set(false);
-            action();
-        })
-        .accessibility_label(label)
-    };
+    let attach =
+        move |icon: ImageSrc, label: &'static str, detail: &'static str, action: Action| {
+            surface::row_captioned(icon, label, detail, move || {
+                open.set(false);
+                action();
+            })
+            .accessibility_label(label)
+        };
     bottom_sheet(
         move || open.get(),
         move || open.set(false),
@@ -4775,7 +4932,9 @@ fn composer(
                             move |item, _| {
                                 let on_remove = on_remove.clone();
                                 compose::chip(
-                                    move || SharedString::from(item.with(|item| item.label.clone())),
+                                    move || {
+                                        SharedString::from(item.with(|item| item.label.clone()))
+                                    },
                                     move || on_remove(&item.with_untracked(|item| item.id.clone())),
                                 )
                             },
@@ -4783,24 +4942,20 @@ fn composer(
                     },
                 ))
                 .child(
-                    compose::field(
-                        draft,
-                        compose::placeholder(),
-                        move |text: &str| {
-                            match text.strip_prefix('/') {
-                                Some(query) => on_query(query),
-                                None => commands.set(Vec::new()),
-                            }
-                            match mention_query(text) {
-                                Some(query) => on_mention(&query),
-                                None => mentions.set(Vec::new()),
-                            }
-                            match skill_query(text) {
-                                Some(query) => on_skill(&query),
-                                None => skills.set(Vec::new()),
-                            }
-                        },
-                    )
+                    compose::field(draft, compose::placeholder(), move |text: &str| {
+                        match text.strip_prefix('/') {
+                            Some(query) => on_query(query),
+                            None => commands.set(Vec::new()),
+                        }
+                        match mention_query(text) {
+                            Some(query) => on_mention(&query),
+                            None => mentions.set(Vec::new()),
+                        }
+                        match skill_query(text) {
+                            Some(query) => on_skill(&query),
+                            None => skills.set(Vec::new()),
+                        }
+                    })
                     .element_ref(&composer_input),
                 )
                 .child(
@@ -5531,7 +5686,10 @@ fn history_sheet(
 
 /// The runtime sheet: what runs the session, and how. One sheet with a panel
 /// a kind of choice: the model, and the Agent's own option groups.
-pub(crate) fn runtime_sheet(host: RuntimePickerHost, panel: Signal<RuntimePanel>) -> impl IntoElement {
+pub(crate) fn runtime_sheet(
+    host: RuntimePickerHost,
+    panel: Signal<RuntimePanel>,
+) -> impl IntoElement {
     use crate::ui::sheet::{bottom_sheet, sheet_card, sheet_header};
     let open = host.open;
     let close = host.on_close;
@@ -6237,6 +6395,39 @@ struct SectionSheets {
     members_selected: Signal<Vec<String>>,
 }
 
+/// Asks before a command that cannot be taken back, then runs it.
+///
+/// The drawer's destructive commands all leave the same way: a native alert
+/// that names what goes away, and the command only when its own button was
+/// pressed. A long press followed by a tap is one slip away from losing a
+/// session, so nothing here runs on a single tap.
+fn confirm_destructive(
+    title: &'static str,
+    description: impl Into<SharedString> + 'static,
+    action_id: &'static str,
+    action_label: &'static str,
+    run: impl FnOnce() + 'static,
+) {
+    // Under an owner of its own. The menu closes the instant its entry is
+    // pressed, and a task spawned under that entry's owner is cancelled with
+    // it — before its first poll, so the alert never appeared and the command
+    // never ran. This is the same reason the drawer's service calls detach.
+    Owner::detached().run(move || {
+        spawn(async move {
+            let answer = nsh_base::alert_dialog()
+                .title(title)
+                .description(description)
+                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
+                .destructive(action_id, action_label)
+                .show()
+                .await;
+            if matches!(answer, Ok(answer) if answer.action.as_deref() == Some(action_id)) {
+                run();
+            }
+        });
+    });
+}
+
 /// The commands of one session, as its row and its own header both raise
 /// them. `lead` goes first: what only the place that raised the menu offers.
 fn session_menu(
@@ -6258,12 +6449,9 @@ fn session_menu(
     let send = host
         .scheduled_sends
         .with_untracked(|sends| sends.iter().find(|send| send.session_id == id).cloned());
-    let summary = host.sessions.with_untracked(|sessions| {
-        sessions
-            .iter()
-            .find(|session| session.id == id)
-            .cloned()
-    });
+    let summary = host
+        .sessions
+        .with_untracked(|sessions| sessions.iter().find(|session| session.id == id).cloned());
     let sections = host.sidebar_sections.get_untracked();
     // A session belongs to at most one group, so leaving it and joining one
     // are the two halves of one question.
@@ -6455,7 +6643,25 @@ fn session_menu(
             copy::text("Delete", "删除", "刪除"),
             {
                 let delete = host.on_delete_session.clone();
-                move || delete()
+                let title = title.to_owned();
+                move || {
+                    let delete = delete.clone();
+                    let title = title.clone();
+                    confirm_destructive(
+                        copy::text("Delete this session?", "删除该会话？", "刪除該工作階段？"),
+                        format!(
+                            "“{title}” {}",
+                            copy::text(
+                                "and its timeline leave the workbench. The files it changed stay on disk.",
+                                "及其时间线会一并移出工作台，它改动的文件会保留在磁盘上。",
+                                "及其時間軸會一併移出工作台，它改動的檔案會保留在磁碟上。",
+                            )
+                        ),
+                        "delete",
+                        copy::text("Delete", "删除", "刪除"),
+                        move || delete(),
+                    );
+                }
             },
         )
         .danger(),
@@ -6624,7 +6830,26 @@ fn folder_menu(
             copy::text("Delete", "删除", "刪除"),
             {
                 let delete = host.on_delete_folder.clone();
-                move || delete(&id)
+                let title = row.title.clone();
+                move || {
+                    let delete = delete.clone();
+                    let title = title.clone();
+                    let id = id.clone();
+                    confirm_destructive(
+                        copy::text("Delete this folder?", "删除该文件夹？", "刪除該資料夾？"),
+                        format!(
+                            "“{title}” {}",
+                            copy::text(
+                                "and the folders inside it leave the drawer. Its sessions move up one level; nothing on disk is deleted.",
+                                "及其中的文件夹会移出侧边栏，其中的会话会上移一级；磁盘上的文件不会被删除。",
+                                "及其中的資料夾會移出側邊欄，其中的工作階段會上移一級；磁碟上的檔案不會被刪除。",
+                            )
+                        ),
+                        "delete",
+                        copy::text("Delete", "删除", "刪除"),
+                        move || delete(&id),
+                    );
+                }
             },
         )
         .danger(),
@@ -6646,8 +6871,12 @@ fn group_menu(
             .cloned()
     });
     let pinned = section.as_ref().is_some_and(|section| section.pinned);
-    let auto_continue = section.as_ref().is_some_and(|section| section.auto_continue);
-    let members = section.map(|section| section.session_ids).unwrap_or_default();
+    let auto_continue = section
+        .as_ref()
+        .is_some_and(|section| section.auto_continue);
+    let members = section
+        .map(|section| section.session_ids)
+        .unwrap_or_default();
     Menu::at(anchor)
         .entry(MenuEntry::new(
             icon!("pencil"),
@@ -6704,7 +6933,26 @@ fn group_menu(
                 copy::text("Dissolve group", "解散分组", "解散群組"),
                 {
                     let dissolve = host.on_delete_group.clone();
-                    move || dissolve(&id)
+                    let title = row.title.clone();
+                    move || {
+                        let dissolve = dissolve.clone();
+                        let title = title.clone();
+                        let id = id.clone();
+                        confirm_destructive(
+                            copy::text("Dissolve this group?", "解散该分组？", "解散該群組？"),
+                            format!(
+                                "“{title}” {}",
+                                copy::text(
+                                    "goes away and its sessions return to the drawer on their own.",
+                                    "会被移除，其中的会话会各自回到侧边栏。",
+                                    "會被移除，其中的工作階段會各自回到側邊欄。",
+                                )
+                            ),
+                            "dissolve",
+                            copy::text("Dissolve", "解散", "解散"),
+                            move || dissolve(&id),
+                        );
+                    }
                 },
             )
             .danger(),
@@ -6803,7 +7051,9 @@ fn delay_sheet(
         if index > 0 {
             card = card.child(surface::row_divider());
         }
-        card = card.child(surface::row(icon!("clock"), label, move || on_pick(seconds)));
+        card = card.child(surface::row(icon!("clock"), label, move || {
+            on_pick(seconds)
+        }));
     }
     bottom_sheet(
         open,
@@ -7037,11 +7287,7 @@ pub(crate) fn runtime_trigger(
             })
         },
         move || {
-            if summary.with(|summary| {
-                summary
-                    .as_ref()
-                    .is_some_and(|summary| !summary.available)
-            }) {
+            if summary.with(|summary| summary.as_ref().is_some_and(|summary| !summary.available)) {
                 theme::accent_yellow()
             } else {
                 theme::foreground()
@@ -7470,6 +7716,37 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         move_row: host.sidebar.on_move_row.clone(),
         new_session: on_new_session_in,
         batch_scope: host.sidebar.batch_scope.clone(),
+        // A carry whose row was recycled still has to land: the list reports
+        // the lifted finger, and the row the drag started on is read from the
+        // carry itself rather than from the element that began it.
+        end_drag: {
+            let rows = host.sidebar.rows.clone();
+            let query = query;
+            let move_row = host.sidebar.on_move_row.clone();
+            let toggle = host.sidebar.on_toggle_row.clone();
+            Rc::new(move || {
+                let Some(dragged) = drag.get_untracked() else {
+                    return;
+                };
+                let delta = dragged.delta + scroll_travel.get_untracked();
+                let row = rows(&query.get_untracked())
+                    .into_iter()
+                    .find(|row| row.key() == dragged.key);
+                drag.set(None);
+                drag_collapse.set(None);
+                auto_scroll.set(0.0);
+                scroll_travel.set(0.0);
+                let Some(row) = row else {
+                    return;
+                };
+                if matches!(row.kind, SidebarRowKind::Folder | SidebarRowKind::Group)
+                    && !row.collapsed
+                {
+                    toggle(&row);
+                }
+                move_row(&row, delta);
+            })
+        },
     };
     view()
         .w_full()
