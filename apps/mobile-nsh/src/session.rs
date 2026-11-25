@@ -3835,19 +3835,27 @@ impl SessionService {
         let mut question_request = None;
         {
             let model = self.model.borrow();
+            // A resolution is its own row: answering a request appends one
+            // rather than rewriting the request's row, so a card whose answer
+            // was sent from another device stays `pending` in the transcript
+            // it was projected from. Read the resolutions first, or this phone
+            // keeps drawing a form the runtime has already taken.
+            let answered = answered_requests(&model.items);
             for item in model.items.iter().rev() {
                 match &item.payload {
                     TimelinePayload::PermissionRequest(request)
                         if pending.is_none()
                             && request.status == PermissionRequestStatus::Pending
-                            && request.session_id.as_str() == active =>
+                            && request.session_id.as_str() == active
+                            && !answered.contains(request.id.as_str()) =>
                     {
                         pending = Some(permission_pending(request));
                     }
                     TimelinePayload::ElicitationRequest(request)
                         if question.is_none()
                             && request.status == ElicitationRequestStatus::Pending
-                            && request.session_id.as_str() == active =>
+                            && request.session_id.as_str() == active
+                            && !answered.contains(request.id.as_str()) =>
                     {
                         question = Some(pending_question(request));
                         question_request = Some(request.clone());
@@ -8969,6 +8977,30 @@ fn runtime_source_key(source: &vibex_core::RuntimeAuthSource) -> String {
     }
 }
 
+/// The requests the transcript already carries an answer for.
+///
+/// Answering appends a resolution row rather than rewriting the request's own,
+/// so a request answered on another device stays `pending` in the row it was
+/// projected from. A client that reads only the request keeps drawing a card
+/// the runtime has already taken, and every press on it comes back as "no
+/// longer pending".
+fn answered_requests(
+    items: &[vibex_core::TimelineItem],
+) -> std::collections::HashSet<String> {
+    items
+        .iter()
+        .filter_map(|item| match &item.payload {
+            TimelinePayload::PermissionResolution(resolution) => {
+                Some(resolution.request_id.as_str().to_owned())
+            }
+            TimelinePayload::ElicitationResolution(resolution) => {
+                Some(resolution.request_id.as_str().to_owned())
+            }
+            _ => None,
+        })
+        .collect()
+}
+
 fn delivery_of(payload: Option<&TimelinePayload>) -> Option<MessageDelivery> {
     let Some(TimelinePayload::UserMessage(message)) = payload else {
         return None;
@@ -9310,9 +9342,49 @@ fn age(timestamp_ms: i64) -> String {
 mod tests {
     use super::{
         AttachmentItem, BTreeMap, Duration, TerminalFrameBatch, TerminalFrameSubscription,
-        TerminalId, decode_terminal_bytes, mpsc, spawn_terminal_stream, swap_attachment_draft,
-        workspace_file_path,
+        TerminalId, answered_requests, decode_terminal_bytes, mpsc, spawn_terminal_stream,
+        swap_attachment_draft, workspace_file_path,
     };
+
+    /// An answer sent from another device must retire the card here too.
+    ///
+    /// Answering appends a resolution row and leaves the request's own row
+    /// `pending`, so a client that reads only the request keeps offering a form
+    /// the runtime has taken — and every press comes back "no longer pending".
+    #[test]
+    fn a_resolution_retires_the_request_it_answers() {
+        use vibex_core::{
+            DeviceId, ElicitationResolution, ElicitationResolutionAction, RequestId,
+            TimelineItem, TimelineItemId, TimelineItemKind, TimelinePayload, TimelineRedactionState,
+            TimelineSource, VibexSessionId,
+        };
+        let session_id = VibexSessionId::new();
+        let request_id = RequestId::new();
+        let item = TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence: 1,
+            timestamp_ms: 0,
+            source: TimelineSource::User,
+            kind: TimelineItemKind::ElicitationResolution,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: Default::default(),
+            payload: TimelinePayload::ElicitationResolution(ElicitationResolution {
+                request_id: request_id.clone(),
+                session_id,
+                action: ElicitationResolutionAction::Accept,
+                answers: BTreeMap::new(),
+                responder_device_id: Some(DeviceId::new()),
+                resolved_at_ms: 0,
+            }),
+        };
+        let answered = answered_requests(&[item]);
+        assert!(answered.contains(request_id.as_str()));
+        assert!(!answered.contains("some-other-request"));
+    }
 
     #[test]
     fn timeline_paths_are_relativized_only_against_their_workspace() {

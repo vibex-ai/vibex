@@ -47,30 +47,6 @@ pub fn round_button_sized(
         .child(svg(icon).size(px(glyph)).text_color(theme::foreground))
 }
 
-/// A glyph alone, at the size of the round controls beside it.
-///
-/// The same touch target as [`round_button`] without the disc behind it, for a
-/// mark that already reads as a shape of its own — a duotone bubble is a
-/// drawing, and a filled circle under it only framed the frame.
-pub fn bare_icon_button(
-    icon: ImageSrc,
-    label: &'static str,
-    on_press: impl Fn() + 'static,
-    glyph: f32,
-) -> ButtonElement {
-    button()
-        .accessibility_label(label)
-        .on_press(on_press)
-        .size(px(theme::ROUND_CONTROL))
-        .flex_shrink_0()
-        .rounded_full()
-        .items_center()
-        .justify_center()
-        .active(|style| style.opacity(0.6))
-        .disabled_style(|style| style.opacity(0.4))
-        .child(svg(icon).size(px(glyph)).text_color(theme::foreground))
-}
-
 /// A quiet icon control: a glyph with a touch target and no fill of its own.
 pub fn ghost_button(
     icon: ImageSrc,
