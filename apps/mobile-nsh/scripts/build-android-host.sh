@@ -46,20 +46,60 @@ build_abi x86_64-linux-android x86_64 x86_64-linux-android26-clang llvm-ar
 
 # The nsh AAR without its own libnsh.so: the app's Rust library replaces it
 # so NshView and Native.runRust are this app.
+#
+# Its `classes.jar` is compiled from the nsh sources this workspace pins, not
+# taken from the released embed archive. The released AAR carries 0.6.1's Java,
+# and the modal keyboard fix this app needs lives in our fork's Java on top of
+# that release — a Java-only change, so `cargo` fetches the crates and never
+# the AAR. Taking the archive would silently drop the fix again: a dialog holds
+# its own window and its own IME, and without `keyboardFromModal` the app reads
+# `env(keyboard-inset-height)` as zero inside every sheet and lays its fields
+# under the keys.
 mkdir -p "$android/app/libs"
-if [[ ! -f "$android/app/libs/nsh.aar" ]]; then
-    zip="${NSH_EMBED_ZIP:-$HOME/tmp/nsh-embed-android.zip}"
-    if [[ ! -f "$zip" ]]; then
-        echo "downloading the nsh embed AAR"
-        curl -fsSL -o "$zip" \
-            "https://github.com/longbridge/nsh/releases/download/v0.6.1/nsh-embed-android.zip"
-    fi
-    work="$(mktemp -d)"
-    trap 'rm -rf "$work"' EXIT
-    unzip -q "$zip" -d "$work"
-    mkdir "$work/aar"
-    (cd "$work/aar" && unzip -q "$work/nsh-embed-android/nsh.aar" && rm -rf jni && zip -qr "$android/app/libs/nsh.aar" .)
-fi
+nsh_src="$(cargo metadata --format-version 1 --locked 2>/dev/null \
+    | python3 -c 'import json,sys; print(next(p["manifest_path"] for p in json.load(sys.stdin)["packages"] if p["name"] == "nsh-platform-android"))' \
+    | xargs dirname)"
+[[ -d "$nsh_src/java" ]] || {
+    echo "error: nsh-platform-android's Java sources are not at $nsh_src/java" >&2
+    exit 1
+}
+work="$(mktemp -d)"
+trap 'rm -rf "$work"' EXIT
+echo "compiling the nsh Java runtime from $nsh_src/java"
+find "$nsh_src/java" -name '*.java' > "$work/sources.txt"
+"$JAVA_HOME/bin/javac" --release 17 -Xlint:-options -encoding UTF-8 \
+    -classpath "$ANDROID_HOME/platforms/android-35/android.jar" \
+    -d "$work/classes" @"$work/sources.txt"
+"$JAVA_HOME/bin/jar" cf "$work/classes.jar" -C "$work/classes" .
+# The AAR's own files: the manifest, the empty R, the R8 rules, and the Java.
+# `jni/` stays out — the Rust library above is what the APK ships.
+cat > "$work/AndroidManifest.xml" <<'MANIFEST'
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android" package="com.longbridge.nsh">
+    <uses-sdk android:minSdkVersion="26" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Text actions (Translate and the like) the selection menu offers,
+        as TextView's: Android 11+ hides other apps' activities otherwise. -->
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.PROCESS_TEXT" />
+            <data android:mimeType="text/plain" />
+        </intent>
+    </queries>
+</manifest>
+MANIFEST
+: > "$work/R.txt"
+cat > "$work/proguard.txt" <<'RULES'
+# Native Shell: libnsh.so finds these classes and members by name over JNI
+# and binds native methods by their Java names.
+-keep class com.longbridge.nsh.** { *; }
+# The WebSocket client's TLS verifier (rustls-platform-verifier) calls these
+# over JNI.
+-keep class org.rustls.platformverifier.** { *; }
+RULES
+rm -f "$android/app/libs/nsh.aar"
+(cd "$work" && zip -qr "$android/app/libs/nsh.aar" \
+    AndroidManifest.xml classes.jar proguard.txt R.txt)
 
 cd "$android"
 "$GRADLE" -q :app:assembleRelease
