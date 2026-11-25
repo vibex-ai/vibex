@@ -3318,7 +3318,12 @@ impl SessionService {
                 .any(|row| show_reasoning || row.kind != TimelineRowKind::Reasoning)
             {
                 let mut header = process_header(turn, &turn_agent);
-                header.expandable = answered && !turn.pending_permission;
+                // A finished turn's work folds, whether or not it ended on a
+                // written conclusion: the desktop's rule is the same one, and
+                // its header carries the chevron for a turn that simply
+                // stopped with rows to show. Keying on a conclusion alone left
+                // those turns with no way to collapse their rows.
+                header.expandable = !turn.pending_permission && (finished || answered);
                 header.expanded =
                     !header.expandable || disclosures.get(&header.id).copied().unwrap_or(!finished);
                 parent = Some(header.id.clone());
