@@ -7309,15 +7309,15 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     // A speech bubble taking a plus, not a bare plus: the
                     // button makes a conversation, and the drawer's other plus
                     // makes a project — two marks that said the same thing sat
-                    // three rows apart. It is drawn a size larger than the
-                    // other controls' glyphs: its bubble is a quarter-opacity
-                    // wash behind a thin outline, which reads smaller than a
-                    // solid stroke at the same box.
-                    surface::round_button_sized(
+                    // three rows apart. The mark is the button: it is drawn at
+                    // the size of the round controls beside it, with no disc
+                    // behind it, because a filled circle under a duotone bubble
+                    // only framed the frame.
+                    surface::bare_icon_button(
                         icon!("chat-alt-add"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         move || on_new_session(),
-                        theme::ICON_MD + 5.0,
+                        theme::ROUND_CONTROL,
                     )
                 }),
         )
