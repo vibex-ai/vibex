@@ -8806,12 +8806,55 @@ fn turn_file_change(
     )
 }
 
+/// What a running turn is doing, as the desktop's own phases name it.
+///
+/// The row at the foot of a live transcript says the turn's phase rather than
+/// one fixed word: a turn that is thinking, calling a tool and writing its
+/// answer are three different things to wait for, and a row that always said
+/// the same word said none of them.
+fn live_turn_phase(turn: &TimelineConversationTurn) -> &'static str {
+    if turn.pending_permission {
+        return copy::text("Waiting for approval", "等待确认", "等待確認");
+    }
+    // The newest row still streaming is what the turn is doing now; a turn with
+    // none has not started its first step yet.
+    let latest = turn
+        .conclusion_row
+        .iter()
+        .chain(turn.process_rows.iter().rev())
+        .find(|row| row.streaming);
+    match latest.map(|row| row.kind) {
+        Some(TimelineRowKind::AgentMessage) => {
+            copy::text("Generating", "生成中", "生成中")
+        }
+        Some(
+            TimelineRowKind::ToolCall
+            | TimelineRowKind::Command
+            | TimelineRowKind::FileOperation
+            | TimelineRowKind::WebSearch
+            | TimelineRowKind::Collaboration
+            | TimelineRowKind::ImageGeneration,
+        ) => copy::text("Calling tool", "调用工具", "呼叫工具"),
+        Some(TimelineRowKind::Reasoning) => copy::text("Thinking", "思考中", "思考中"),
+        Some(_) | None if turn.live_status.is_some() => {
+            copy::text("Thinking", "思考中", "思考中")
+        }
+        Some(_) | None => copy::text("Preparing", "准备中", "準備中"),
+    }
+}
+
 fn live_turn_entry(turn: &TimelineConversationTurn) -> TimelineEntry {
     TimelineEntry {
         id: format!("turn-live:{}", turn.id),
         kind: EntryKind::Generating,
         title: copy::text("Agent", "Agent", "Agent").to_owned(),
-        body: copy::text("Working…", "工作中…", "工作中…").to_owned(),
+        // The runtime's own line while it has one, the phase otherwise: the
+        // row is the surface that says work is still arriving, so it closes
+        // the wording with the one ellipsis its indicator wears.
+        body: match turn.live_status.as_deref().map(str::trim) {
+            Some(activity) if !activity.is_empty() => activity.to_owned(),
+            _ => format!("{}…", live_turn_phase(turn)),
+        },
         meta: String::new(),
         streaming: true,
         turn_id: turn.id.clone(),

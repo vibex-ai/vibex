@@ -2621,14 +2621,27 @@ fn step_line(
 }
 
 /// The line that says the Agent is at work before it has anything to show.
-fn working_row(body: Memo<String>, clock: crate::ui::activity::ActivityClock) -> impl IntoElement {
+///
+/// The product's own V leads it, pulsing, rather than a ring: that is the mark
+/// the desktop draws while a turn runs, and it says who is working where a
+/// spinner says only that something is.
+fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -> impl IntoElement {
     view()
         .w_full()
         .flex_row()
         .items_center()
         .gap(px(theme::SPACING_SM))
-        .py(px(theme::SPACING_SM))
-        .child(crate::ui::activity::activity_ring(clock, theme::primary))
+        // The row sits directly above the composer, and the prompt card is a
+        // surface of its own: the air under it keeps the two from reading as
+        // one block.
+        .pt(px(theme::SPACING_SM))
+        .pb(px(theme::SPACING_MD))
+        .child(
+            view()
+                .flex_shrink_0()
+                .animate_pulse()
+                .child(crate::ui::brand::mark(15.0)),
+        )
         .child(
             text(move || body.get())
                 .flex_1()
