@@ -1158,6 +1158,10 @@ fn shell(
     let jump_to_message = signal(None::<i64>);
     let runtime_panel = signal(RuntimePanel::Model);
     let creating = host.new_session_open;
+    // Whether the group tabs take the bar's room above the transcript: the
+    // connection strip below them uses the same answer, so the two never both
+    // inset for the bar.
+    let tabs_above_for_banner = group_tabs_visible(&host);
     let create_host = NewSessionHost {
         workspaces: host.new_workspaces,
         runtimes: host.new_runtimes,
@@ -1189,10 +1193,6 @@ fn shell(
         .test_id("conversation-page")
         .child(header(host.clone(), pager, overlays))
         .child(when(
-            move || connection.get() != ConnectionState::Online,
-            move || connection_banner(connection, connection_error, on_retry.clone()),
-        ))
-        .child(when(
             move || creating.get(),
             move || new_session_page(create_host.clone()),
         ))
@@ -1216,6 +1216,33 @@ fn shell(
                 // through the glass instead of stopping at a hard edge.
                 .style_when(move || creating.get(), |style| style.hidden())
                 .child(group_tabs(&host))
+                // The connection strip belongs under the bar, not on the page's
+                // top edge: the status bar and the system's own chrome live
+                // there, and a strip in that band drew over them. In flow here,
+                // it is pushed below the bar by the same inset the tabs use,
+                // and it sits above the glass so the blur never touches it.
+                .child(when(
+                    move || connection.get() != ConnectionState::Online,
+                    {
+                        let tabs_above = tabs_above_for_banner;
+                        move || {
+                            view()
+                                .z_index(2)
+                                .pt(move || {
+                                    if tabs_above.get() {
+                                        px(0.0)
+                                    } else {
+                                        px(top_bar_inset())
+                                    }
+                                })
+                                .child(connection_banner(
+                                    connection,
+                                    connection_error,
+                                    on_retry.clone(),
+                                ))
+                        }
+                    },
+                ))
                 .child(
                     view()
                         .flex_1()
@@ -1414,7 +1441,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     copy::text("Sessions", "会话", "工作階段"),
                     move || pager.open(ShellPage::Sessions),
                 )
-                .bg(theme::floating_pane)
+                .bg(theme::floating_pane_solid)
                 .shadow(theme::floating_pane_shadow()),
             )
             .child(
@@ -1428,7 +1455,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         .items_center()
                         .gap(px(6.0))
                         .rounded_full()
-                        .bg(theme::floating_pane)
+                        .bg(theme::floating_pane_solid)
                         .shadow(theme::floating_pane_shadow())
                         .active(|style| style.opacity(0.6))
                         .accessibility_label(move || {
@@ -1536,7 +1563,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 ),
                                 move || pager.open(ShellPage::Workbench),
                             )
-                            .bg(theme::floating_pane)
+                            .bg(theme::floating_pane_solid)
                             .shadow(theme::floating_pane_shadow())
                             .relative()
                             .child(when(terminal_running, || {
@@ -1772,9 +1799,13 @@ fn timeline_view(
         tab.set(WorkbenchTab::Terminal);
         pager.open(ShellPage::Workbench);
     };
-    // The tabs above take the bar's room when they are shown; the list takes
-    // it only when they are not (see its `content_padding_top`).
+    // The strips above take the bar's room when one of them is shown; the list
+    // takes it only when neither is (see its `content_padding_top`).
     let tabs_above = group_tabs_visible(&host);
+    let connection = host.connection;
+    let strip_above = computed(move || {
+        tabs_above.get() || connection.get() != ConnectionState::Online
+    });
     let source = host.timeline;
     let visible = computed(move || source.with(|entries| visible_timeline(entries)));
     let position_for = move |predicate: &dyn Fn(&TimelineEntry) -> bool| {
@@ -2092,10 +2123,11 @@ fn timeline_view(
                                 // list's own leading space: the first row
                                 // still clears the bar, while a message
                                 // scrolled up travels on under it. When the
-                                // group tabs are shown they have taken that
-                                // room already, and the list starts under them.
+                                // group tabs or the connection strip are
+                                // shown they have taken that room already,
+                                // and the list starts under them.
                                 .content_padding_top(move || {
-                                    if tabs_above.get() {
+                                    if strip_above.get() {
                                         px(0.0)
                                     } else {
                                         px(top_bar_inset())
@@ -2389,9 +2421,10 @@ fn edge_fade() -> impl IntoElement {
 /// The tone and the blur are one view, so the mask that fades the band fades
 /// both together and there is no seam where one stops and the other goes on.
 fn top_glass() -> impl IntoElement {
-    // From the top of the page (the status bar included) to the bar's lower
-    // edge, with a little room past it for the fade to run out.
-    let height = move || px(safe_area().top.0 + theme::HEADER_HEIGHT + theme::SPACING_LG);
+    // From the top of the page (the status bar included) past the bar's lower
+    // edge, with room under it for the fade to run out: the band is taller than
+    // the bar so the transition is a long one rather than a short edge.
+    let height = move || px(safe_area().top.0 + theme::HEADER_HEIGHT + theme::SPACING_LG * 3.0);
     view()
         .absolute()
         .top(px(0.0))
@@ -2402,14 +2435,16 @@ fn top_glass() -> impl IntoElement {
         .z_index(1)
         .bg(theme::block_page_veil_adaptive())
         .backdrop_blur(px(TOP_GLASS_BLUR))
-        // Opaque at the top, clear at the bottom: the band's own tone and its
-        // blur both leave the page the further down the reader looks.
+        // The tone and the blur hold only through the status bar's band and
+        // then let go slowly: the fade runs across most of the band's height,
+        // so a message surfaces out of the glass gradually instead of crossing
+        // a short edge, and is fully itself before the bar's lower rim.
         .mask_linear(
             deg(180.0),
             [
                 (black(), percentage(0.0)),
-                (black(), percentage(0.55)),
-                (transparent_black(), percentage(1.0)),
+                (black(), percentage(0.08)),
+                (transparent_black(), percentage(0.86)),
             ],
         )
         .pointer_events(PointerEvents::None)

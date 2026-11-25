@@ -502,6 +502,16 @@ pub fn floating_pane() -> Hsla {
     background_card().alpha(0.72)
 }
 
+/// The pane a control floats in, with nothing showing through it.
+///
+/// [`floating_pane`] is glass, and is meant to be read against whatever scrolls
+/// under it. A control that must stay legible over a busy transcript — the
+/// bar's own buttons, whose glyphs sit over running prose — takes this instead,
+/// so nothing is ever drawn behind the mark.
+pub fn floating_pane_solid() -> Hsla {
+    background_card()
+}
+
 /// The shadow a floating pane casts.
 ///
 /// Soft, wide, and low: the pane has no border to say where it ends, so the
