@@ -2512,28 +2512,24 @@ fn entry_row(
                 .and_then(|&index| entries.with(|entries| entries.get(index).cloned()))
         })
     });
-    // The rail runs between the rows of one fold and stops where prose begins:
-    // a line into a paragraph says the paragraph is part of the call's run,
+    // The rail ties a run of calls together, and only that: it is drawn
+    // between two rows of the same fold that are both calls. A line into a
+    // paragraph — or out of one — says the paragraph is part of the call's run,
     // which it is not.
+    let step_row = move |index: usize| {
+        visible.with(|indices| {
+            indices.get(index).is_some_and(|&index| {
+                entries.with(|entries| {
+                    entries
+                        .get(index)
+                        .is_some_and(|entry| entry.parent_id.is_some() && !starts_prose(entry))
+                })
+            })
+        })
+    };
     let rail = Rail {
-        above: computed(move || {
-            entry.with(|entry| {
-                entry.as_ref().is_some_and(|entry| {
-                    entry.parent_id.is_some() && !starts_prose(entry)
-                })
-            })
-        }),
-        below: computed(move || {
-            visible.with(|indices| {
-                indices.get(at.index() + 1).is_some_and(|&index| {
-                    entries.with(|entries| {
-                        entries
-                            .get(index)
-                            .is_some_and(|entry| entry.parent_id.is_some() && !starts_prose(entry))
-                    })
-                })
-            })
-        }),
+        above: computed(move || step_row(at.index().saturating_sub(1)) && step_row(at.index())),
+        below: computed(move || step_row(at.index()) && step_row(at.index() + 1)),
     };
     view()
         .w_full()
@@ -3258,10 +3254,6 @@ fn activity_row(
             .items_center()
             .gap(px(theme::SPACING_SM))
             .rounded(px(theme::RADIUS_CONTROL))
-            // A tool row is a block of its own, not another line of prose: the
-            // wash gives it an edge to end at, so a run of calls reads as one
-            // thing between two paragraphs rather than as more text.
-            .bg(theme::fill)
             .my(px(2.0))
             .style_when(
                 move || grouped.get(),

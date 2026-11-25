@@ -1555,6 +1555,11 @@ impl SessionService {
                     .map(|session| (session.id.as_str().to_owned(), session.state))
                     .collect();
                 self.session_records.set(sessions.clone());
+                // The transcript is projected from these records (the Agent
+                // that ran a turn is one of them), and it was projected before
+                // the first listing arrived: project it again so a turn's
+                // header draws its Agent's logo rather than the default one.
+                self.publish();
                 if !active_exists {
                     if let Some(first) = sessions.first() {
                         self.open(first.id.as_str());
@@ -3281,14 +3286,18 @@ impl SessionService {
         let show_reasoning = self.show_reasoning.get_untracked();
         let locale = copy::language().locale();
         // The Agent the open session runs on, for the working header's mark.
+        // Read from the session records, which are the runtime's own answer:
+        // the summary rows are built for the drawer and may not be there yet
+        // when the transcript is first projected, and an empty name draws the
+        // default glyph instead of the Agent's logo.
         let turn_agent = active
             .as_deref()
             .and_then(|active| {
-                self.sessions.with_untracked(|sessions| {
+                self.session_records.with_untracked(|sessions| {
                     sessions
                         .iter()
-                        .find(|session| session.id == active)
-                        .map(|session| session.agent.clone())
+                        .find(|session| session.id.as_str() == active)
+                        .map(|session| session.agent_id.as_str().to_owned())
                 })
             })
             .unwrap_or_default();
