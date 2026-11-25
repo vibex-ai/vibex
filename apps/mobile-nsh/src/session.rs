@@ -78,7 +78,8 @@ use vibex_nsh_ui::{
     screens::session::{
         ActivityDetail, ActivityGlyph, ActivityView, AttachmentItem, CommandEntry,
         ComposerHistoryEntry, ConversationState, EntryKind, GoalControl, GoalPhaseView, GoalView,
-        PendingPermission, PendingQuestion, PermissionChoice, PermissionOption, PlanStepState,
+        MessageDelivery, PendingPermission, PendingQuestion, PermissionChoice, PermissionOption,
+        PlanStepState,
         PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind, QuestionOption,
         QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimeSummaryView, ScheduledSendView, SessionHost, SessionState,
@@ -3503,6 +3504,7 @@ impl SessionService {
             reaction: (kind == EntryKind::User)
                 .then(|| user_message_reaction(&row.item_ids, items))
                 .flatten(),
+            delivery: delivery_of(payload),
             activity: shared.map(|shared| ActivityView {
                 glyph: activity_glyph(shared.icon()),
                 target: shared.target().to_owned(),
@@ -3511,6 +3513,10 @@ impl SessionService {
                 error: shared.error_line().map(str::to_owned),
                 duration: activity::row_duration_ms(row, &shared, items)
                     .map(activity::format_duration),
+                // An edit's patch is what says how much it touched: the row
+                // counts its own `+`/`-` lines from it, as the desktop's does.
+                added_lines: patch_line_counts(payload).map(|(added, _)| added),
+                removed_lines: patch_line_counts(payload).map(|(_, removed)| removed),
                 details_pending,
                 details_loading: self
                     .loading_row_details
@@ -8591,27 +8597,57 @@ fn token_usage_view(usage: AgentTokenUsage) -> TokenUsageView {
     }
 }
 
+/// The lines an edit added and removed, counted from its unified diff.
+///
+/// A file operation's patch is the only thing on the row that says how much it
+/// touched, so the count is read from it rather than from the file snapshots:
+/// those are not kept, and a row whose operation left no patch has no count to
+/// show. Header lines (`+++`, `---`) are the diff's own, not the file's.
+fn patch_line_counts(payload: Option<&TimelinePayload>) -> Option<(u32, u32)> {
+    let Some(TimelinePayload::FileOperation(operation)) = payload else {
+        return None;
+    };
+    let patch = operation.canonical_patch()?;
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for line in patch.text.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added = added.saturating_add(1);
+        } else if line.starts_with('-') {
+            removed = removed.saturating_add(1);
+        }
+    }
+    (added > 0 || removed > 0).then_some((added, removed))
+}
+
+/// How a user message reached its turn, when it was not an ordinary prompt.
+///
+/// The bubble wears this as a glyph on its lower edge; a prompt needs no mark,
+/// so it answers `None`.
+fn delivery_of(payload: Option<&TimelinePayload>) -> Option<MessageDelivery> {
+    let Some(TimelinePayload::UserMessage(message)) = payload else {
+        return None;
+    };
+    match message.delivery {
+        UserMessageDelivery::Prompt => None,
+        UserMessageDelivery::Steer => Some(MessageDelivery::Steer),
+        UserMessageDelivery::Resend => Some(MessageDelivery::Resend),
+    }
+}
+
 /// The one-line status a permission or question row carries.
 fn row_meta(payload: Option<&TimelinePayload>) -> String {
     let Some(payload) = payload else {
         return String::new();
     };
     match payload {
-        TimelinePayload::UserMessage(message) => match message.delivery {
-            UserMessageDelivery::Prompt => String::new(),
-            UserMessageDelivery::Steer => copy::text(
-                "Steered into the running turn",
-                "已插入正在运行的回合",
-                "已插入正在執行的回合",
-            )
-            .to_owned(),
-            UserMessageDelivery::Resend => copy::text(
-                "Interrupted and resent",
-                "已中断并重新发送",
-                "已中斷並重新傳送",
-            )
-            .to_owned(),
-        },
+        // A delivery is not a line of status text: the bubble wears a glyph
+        // for it on its lower edge, as the desktop draws it, so the row does
+        // not carry a sentence about itself above the message.
+        TimelinePayload::UserMessage(_) => String::new(),
         TimelinePayload::PermissionRequest(request) => match request.status {
             PermissionRequestStatus::Pending => {
                 copy::text("Pending", "待确认", "待確認").to_owned()

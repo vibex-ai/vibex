@@ -147,6 +147,10 @@ pub struct ActivityView {
     pub failed: bool,
     pub error: Option<String>,
     pub duration: Option<String>,
+    /// Lines an edit added, when the row carries a patch to count them from.
+    pub added_lines: Option<u32>,
+    /// Lines an edit removed, when the row carries a patch to count them from.
+    pub removed_lines: Option<u32>,
     pub details_pending: bool,
     pub details_loading: bool,
     pub details: Vec<ActivityDetail>,
@@ -204,6 +208,21 @@ pub struct TimelineEntry {
     /// message with a reaction through its own tool, and the reader sees it as
     /// the mark they would have left themselves.
     pub reaction: Option<SharedString>,
+    /// How the message reached the turn, when it was not an ordinary prompt.
+    ///
+    /// A steered or resent message wears a glyph on the bubble's lower edge,
+    /// as the desktop draws it: it says what the message did without a line of
+    /// status text above the bubble.
+    pub delivery: Option<MessageDelivery>,
+}
+
+/// How a message reached the turn it belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MessageDelivery {
+    /// Injected into a turn that was already running.
+    Steer,
+    /// Interrupted the running turn and claimed a new one.
+    Resend,
 }
 
 /// What the open session is running on, for the composer's chips.
@@ -2705,6 +2724,7 @@ fn entry_element(
         computed(move || entry.with(|e| e.as_ref().map(|e| e.agent.clone()).unwrap_or_default()));
     let conclusion = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.conclusion)));
     let reaction = computed(move || entry.with(|e| e.as_ref().and_then(|e| e.reaction.clone())));
+    let delivery = computed(move || entry.with(|e| e.as_ref().and_then(|e| e.delivery)));
     let streaming = computed(move || entry.with(|e| e.as_ref().is_some_and(|e| e.streaming)));
     let attachments = computed(move || {
         entry.with(|e| {
@@ -2751,6 +2771,7 @@ fn entry_element(
                     meta,
                     attachments,
                     reaction,
+                    delivery,
                     sequence,
                     editable_sequence,
                     on_edit_message.clone(),
@@ -2848,7 +2869,6 @@ fn entry_element(
                     expanded,
                     expandable,
                     rail,
-                    clock,
                     toggle_detail.clone(),
                 )
             },
@@ -2877,6 +2897,15 @@ fn entry_element(
         ))
 }
 
+/// The mark a reaction pill stands at.
+const REACTION_SIZE: f32 = 22.0;
+/// How far a reaction hangs past the bubble's lower edge.
+///
+/// It overlaps the bubble rather than floating clear of it: the desktop anchors
+/// its own reaction to the same corner, and a pill set apart reads as another
+/// row's.
+const REACTION_HANG: f32 = 6.0;
+
 /// What the reader wrote: a bubble on their side of the page, its one sharp
 /// corner pointing at it.
 fn user_bubble(
@@ -2884,11 +2913,19 @@ fn user_bubble(
     meta: Memo<String>,
     attachments: Memo<Vec<AttachmentItem>>,
     reaction: Memo<Option<SharedString>>,
+    delivery: Memo<Option<MessageDelivery>>,
     sequence: Memo<i64>,
     editable_sequence: Signal<i64>,
     on_edit: EditMessage,
     on_open_attachment: OpenAttachment,
 ) -> impl IntoElement {
+    // The pill the bubble's lower edge carries: the Agent's reaction and, when
+    // the message was not an ordinary prompt, the glyph for what it did. They
+    // share one surface so the row does not grow a second one, as the desktop's
+    // edge region does.
+    let has_edge_marks = computed(move || {
+        reaction.with(Option::is_some) || delivery.with(Option::is_some)
+    });
     view()
         .w_full()
         .flex_col()
@@ -2905,43 +2942,80 @@ fn user_bubble(
             },
         ))
         .child(
+            // The bubble and the marks it earned: both are anchored to the
+            // bubble's own lower corner rather than stacked under it, so they
+            // read as belonging to this message the way the desktop's do, and
+            // the row does not grow a second surface.
             view()
                 .max_w(relative(0.86))
-                .rounded(px(theme::RADIUS_BUBBLE))
-                .rounded_br(px(theme::RADIUS_BUBBLE_TAIL))
-                .bg(theme::bubble)
-                .px(px(surface::ROW_INSET))
-                .py(px(10.0))
+                .relative()
                 .child(
-                    text(move || body.get())
-                        .selectable(true)
-                        .text_size(px(theme::font_body()))
-                        .line_height(theme::line_height_for(theme::font_body()))
-                        .text_color(theme::foreground),
-                ),
+                    view()
+                        .rounded(px(theme::RADIUS_BUBBLE))
+                        .rounded_br(px(theme::RADIUS_BUBBLE_TAIL))
+                        .bg(theme::bubble)
+                        .px(px(surface::ROW_INSET))
+                        .py(px(10.0))
+                        .child(
+                            text(move || body.get())
+                                .selectable(true)
+                                .text_size(px(theme::font_body()))
+                                .line_height(theme::line_height_for(theme::font_body()))
+                                .text_color(theme::foreground),
+                        ),
+                )
+                .child(when(move || has_edge_marks.get(), move || {
+                    view()
+                        .absolute()
+                        .bottom(px(-REACTION_HANG))
+                        .right(px(theme::SPACING_XS))
+                        .h(px(REACTION_SIZE))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(2.0))
+                        .px(px(theme::SPACING_SM))
+                        .rounded_full()
+                        .bg(theme::block_surface)
+                        .border_1()
+                        .border_color(theme::hairline)
+                        .child(when(
+                            move || reaction.with(Option::is_some),
+                            move || {
+                                text(move || {
+                                    reaction
+                                        .with(|reaction| reaction.clone())
+                                        .unwrap_or_default()
+                                })
+                                .text_size(px(theme::font_caption()))
+                            },
+                        ))
+                        .child(when(
+                            move || delivery.with(Option::is_some),
+                            move || {
+                                // The glyph the desktop uses for the same
+                                // fact: a message that went into a turn that
+                                // was already running, or one that cut it off
+                                // and took over. `icon!` takes a literal, so
+                                // each case names its own file.
+                                if delivery.get() == Some(MessageDelivery::Resend) {
+                                    svg(icon!("rotate-ccw"))
+                                        .size(px(13.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::accent_yellow())
+                                } else {
+                                    svg(icon!("corner-down-right"))
+                                        .size(px(13.0))
+                                        .flex_shrink_0()
+                                        .text_color(theme::accent_success())
+                                }
+                            },
+                        ))
+                })),
         )
         .child(when(
             move || !attachments.with(|items| items.is_empty()),
             move || message_attachments(attachments, on_open_attachment.clone()),
         ))
-        // The Agent's reaction, on the bubble's own edge: the mark a reader
-        // would have left, set by the Agent that answered them.
-        .child(when(move || reaction.with(Option::is_some), move || {
-            view()
-                .h(px(22.0))
-                .px(px(theme::SPACING_SM))
-                .mr(px(theme::SPACING_XS))
-                .items_center()
-                .justify_center()
-                .rounded_full()
-                .bg(theme::block_surface)
-                .border_1()
-                .border_color(theme::hairline)
-                .child(
-                    text(move || reaction.with(|reaction| reaction.clone()).unwrap_or_default())
-                        .text_size(px(theme::font_caption())),
-                )
-        }))
         .child(
             view()
                 .flex_row()
@@ -3319,7 +3393,6 @@ fn activity_row(
     expanded: Memo<bool>,
     expandable: Memo<bool>,
     rail: Rail,
-    clock: crate::ui::activity::ActivityClock,
     on_toggle: Rc<dyn Fn()>,
 ) -> impl IntoElement {
     // A row filed under a group steps in from the rows of the fold itself.
@@ -3421,6 +3494,50 @@ fn activity_row(
                         },
                     )),
             )
+            // An edit's size, in the colours a diff uses: the reader can tell
+            // a one-line touch from a rewrite without opening the row.
+            .child(when(
+                move || {
+                    activity.with(|value| {
+                        value
+                            .as_ref()
+                            .is_some_and(|activity| activity.added_lines.is_some())
+                    })
+                },
+                move || {
+                    let added = computed(move || {
+                        activity.with(|value| {
+                            value
+                                .as_ref()
+                                .and_then(|activity| activity.added_lines)
+                                .unwrap_or(0)
+                        })
+                    });
+                    let removed = computed(move || {
+                        activity.with(|value| {
+                            value
+                                .as_ref()
+                                .and_then(|activity| activity.removed_lines)
+                                .unwrap_or(0)
+                        })
+                    });
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .flex_shrink_0()
+                        .gap(px(4.0))
+                        .child(
+                            text(move || format!("+{}", added.get()))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::accent_success()),
+                        )
+                        .child(
+                            text(move || format!("-{}", removed.get()))
+                                .text_size(px(theme::font_micro()))
+                                .text_color(theme::accent_red()),
+                        )
+                },
+            ))
             .child(dynamic(move || {
                 if failed.get() {
                     text(copy::text("Failed", "失败", "失敗"))
@@ -3428,9 +3545,12 @@ fn activity_row(
                         .text_size(px(theme::font_micro()))
                         .text_color(theme::accent_red)
                         .into_element()
-                } else if running.get() {
-                    crate::ui::activity::activity_ring(clock, theme::primary).into_element()
                 } else {
+                    // A running row keeps its last reported duration rather
+                    // than a spinner: a turn runs several calls at once, and a
+                    // ring on every one of them turned the transcript into a
+                    // column of blinking dots. The fold's own header already
+                    // says the turn is still working.
                     text(activity.with(|value| {
                         value
                             .as_ref()
