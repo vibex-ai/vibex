@@ -3,6 +3,7 @@
 use std::{cell::RefCell, rc::Rc};
 
 use nsh_base::{Terminal, TerminalApi, TerminalEvent, button, input, terminal as terminal_view};
+use nsh_core::element::StyleRefinement;
 use nsh_core::prelude::*;
 use nsh_core::{AutoCapitalize, AutoFill, SubmitBehavior, element::Composition};
 
@@ -19,6 +20,28 @@ pub struct TerminalChoice {
 }
 
 type TerminalAction = Rc<dyn Fn(&str)>;
+
+/// The air between the grid's cells and the panel's edge.
+const TERMINAL_INSET: f32 = 10.0;
+
+/// The terminal panel, for the tests that check it is drawn as one.
+const TERMINAL_PANEL_ID: &str = "terminal-panel";
+
+/// The height of the row of keys the software keyboard lacks.
+const TERMINAL_KEY_ROW_HEIGHT: f32 = 50.0;
+
+/// One key's height in that row.
+const TERMINAL_KEY_HEIGHT: f32 = 32.0;
+
+/// The caret a terminal draws at the cursor's cell.
+///
+/// A block, not a bar: that is what a terminal's cursor looks like, and on a
+/// phone it is the only mark that says where the next character lands. It takes
+/// the terminal's accent so it reads against both the ground and a program's
+/// own background colors.
+fn cursor_style(style: StyleRefinement) -> StyleRefinement {
+    style.bg(theme::accent_green().alpha(0.75)).rounded(px(1.0))
+}
 
 #[derive(Clone)]
 pub struct TerminalHost {
@@ -104,8 +127,10 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         .flex_1()
         .min_h(px(0.0))
         .pb_keyboard()
-        // The head: the terminals of the workspace as tabs, or the one a
-        // terminal session runs in, and the tools that act on the open one.
+        // The head: a terminal's own chrome rather than a page header. The tab
+        // strip is the one thing that says "several shells, one of them open",
+        // and it is drawn on the chrome tone so the grid below reads as the
+        // recessed thing it is.
         .child(
             view()
                 .h(px(theme::TOUCH_TARGET))
@@ -115,6 +140,9 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .gap(px(2.0))
                 .pl(px(theme::SPACING_MD))
                 .pr(px(theme::SPACING_SM))
+                .bg(theme::terminal_chrome())
+                .border_b_1()
+                .border_color(theme::terminal_hairline())
                 .child(
                     when(attached_session, move || {
                         view()
@@ -123,15 +151,21 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             .flex_row()
                             .items_center()
                             .gap(px(theme::SPACING_SM))
-                            .child(surface::field_glyph(icon!("square-terminal")))
+                            .child(
+                                svg(icon!("square-terminal"))
+                                    .size(px(theme::ICON_SM))
+                                    .flex_shrink_0()
+                                    .text_color(theme::terminal_key_label()),
+                            )
                             .child(
                                 text(move || host.title.get().unwrap_or_default())
                                     .flex_1()
                                     .min_w(px(0.0))
                                     .truncate()
-                                    .text_size(px(theme::font_detail()))
+                                    .font_family(theme::TERMINAL_FONT_FAMILY)
+                                    .text_size(px(theme::font_caption()))
                                     .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::foreground),
+                                    .text_color(theme::terminal_key_label()),
                             )
                     })
                     .otherwise({
@@ -184,7 +218,12 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                     .gap(px(2.0))
                     .pl(px(theme::SPACING_MD))
                     .pr(px(theme::SPACING_SM))
-                    .pt(px(theme::SPACING_XS))
+                    .py(px(theme::SPACING_SM))
+                    // The find bar belongs to the terminal's chrome: it opens
+                    // under the tab strip, not on the page.
+                    .bg(theme::terminal_chrome())
+                    .border_b_1()
+                    .border_color(theme::terminal_hairline())
                     .child(
                         surface::field_pill()
                             .flex_1()
@@ -314,13 +353,35 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .flex_1()
                 .min_h(px(0.0))
                 .w_full()
-                .mt(px(theme::SPACING_XS))
                 .relative()
+                // The grid's own ground and inset. A terminal is a recessed
+                // panel, not a page: it keeps a little air around the cells so
+                // the first column does not sit against the edge of the phone,
+                // and it fills the whole width so a long line has room before
+                // it wraps.
+                .bg(theme::terminal_surface())
+                .test_id(TERMINAL_PANEL_ID)
+                .px(px(TERMINAL_INSET))
+                .py(px(TERMINAL_INSET))
+                // A tap anywhere on the panel opens the keyboard. The emulator
+                // focuses its own hidden sink on a press; this runs after it (an
+                // ancestor's press is delivered last) and hands focus to the
+                // input this screen controls, which is the one wired to the
+                // editing and input-method path above.
+                .on_press(move || keyboard.focus())
                 .child({
                     let data = on_text.clone();
                     terminal_view()
                         .component_ref(&term_ref)
                         .accessibility_label(copy::text("Terminal grid", "终端网格", "終端機網格"))
+                        // The faces the phone carries, and a cell ladder that
+                        // fits a shell's 80 columns: the emulator draws its own
+                        // grid, so the size here is what the PTY is measured
+                        // against.
+                        .font_family(theme::TERMINAL_FONT_FAMILY)
+                        .font_size(px(theme::font_terminal()))
+                        .line_height(px(theme::terminal_line_height()))
+                        .cursor_style(cursor_style)
                         .on_data(move |text: &SharedString| data(text))
                         .on_resize(move |event: &TerminalEvent| {
                             if let TerminalEvent::Resize(cols, rows) = event {
@@ -339,7 +400,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         view()
                             .absolute()
                             .inset(px(0.0))
-                            .bg(theme::block_page_adaptive())
+                            .bg(theme::terminal_surface())
                             .child(surface::empty_state(
                                 icon!("square-terminal"),
                                 move || {
@@ -411,20 +472,22 @@ fn terminal_tabs(
                         let chosen =
                             move || active.with(|active| active.as_deref() == Some(id.as_str()));
                         // A tab: the terminal's name, and the way to close it
-                        // inside the same pill.
+                        // inside the same pill. The chosen one is filled and
+                        // carries a mark of the accent, so which shell is open
+                        // reads at a glance on the dark chrome.
                         view()
                             .h(px(theme::CHIP_HEIGHT))
                             .flex_shrink_0()
                             .flex_row()
                             .items_center()
-                            .rounded_full()
+                            .rounded(px(7.0))
                             .bg({
                                 let chosen = chosen.clone();
                                 move || {
                                     if chosen() {
-                                        theme::fill_strong()
+                                        theme::terminal_tab_active()
                                     } else {
-                                        theme::fill()
+                                        theme::terminal_chrome()
                                     }
                                 }
                             })
@@ -442,13 +505,14 @@ fn terminal_tabs(
                                     .child(
                                         text(move || choice.with(|choice| choice.title.clone()))
                                             .truncate()
+                                            .font_family(theme::TERMINAL_FONT_FAMILY)
                                             .text_size(px(theme::font_micro()))
                                             .font_weight(FontWeight::MEDIUM)
                                             .text_color(move || {
                                                 if chosen() {
-                                                    theme::foreground()
+                                                    theme::terminal_key_label()
                                                 } else {
-                                                    theme::text_secondary()
+                                                    theme::terminal_key_label().alpha(0.55)
                                                 }
                                             }),
                                     ),
@@ -485,7 +549,7 @@ fn terminal_tabs(
                                     .child(
                                         svg(icon!("x"))
                                             .size(px(12.0))
-                                            .text_color(theme::text_muted),
+                                            .text_color(theme::terminal_key_label().alpha(0.6)),
                                     ),
                             )
                     },
@@ -514,9 +578,15 @@ fn terminal_keys(
         .scrollbar(false)
         .flex_shrink_0()
         .w_full()
+        // The key row is part of the terminal, not of the page: it sits on the
+        // chrome tone under a hairline, so the grid above it stays the one
+        // recessed panel and the keys read as the shell's own accessory row.
+        .bg(theme::terminal_chrome())
+        .border_t_1()
+        .border_color(theme::terminal_hairline())
         .child(
             view()
-                .h(px(48.0))
+                .h(px(TERMINAL_KEY_ROW_HEIGHT))
                 .flex_row()
                 .items_center()
                 .px(px(theme::SPACING_MD))
@@ -592,10 +662,16 @@ fn terminal_keyboard(
     input()
         .element_ref(&keyboard)
         .absolute()
-        .top_0()
+        // At the foot of the grid, where a shell's prompt is, so an input
+        // method opens its candidates near the line being typed.
+        .bottom_0()
         .left_0()
         .size(px(theme::TOUCH_TARGET))
-        .opacity(0.02)
+        // Opaque, with transparent ink: the field draws nothing, and no
+        // platform can mistake it for a decorative layer and leave it out of
+        // focus. `pointer_events` keeps it out of the way of the grid's own
+        // tap, which is what focuses it.
+        .opacity(1.0)
         .text_color(theme::foreground().opacity(0.0))
         .caret(false)
         .pointer_events(PointerEvents::None)
@@ -662,32 +738,32 @@ fn key_chip(
     action: impl Fn() + 'static,
 ) -> impl IntoElement {
     button()
-        .h(px(theme::COMPACT_CONTROL))
-        .min_w(px(40.0))
+        .h(px(TERMINAL_KEY_HEIGHT))
+        .min_w(px(42.0))
         .px(px(10.0))
         .flex_shrink_0()
         .items_center()
         .justify_center()
-        .rounded(px(theme::RADIUS_TILE))
+        .rounded(px(6.0))
         .bg(move || {
             if selected() {
-                theme::action_primary()
+                theme::terminal_key_active()
             } else {
-                theme::fill()
+                theme::terminal_key()
             }
         })
         .active(|style| style.opacity(0.6))
         .on_press(action)
         .child(
             text(label)
-                .font_family("monospace")
+                .font_family(theme::TERMINAL_FONT_FAMILY)
                 .text_size(px(theme::font_micro()))
                 .font_weight(FontWeight::MEDIUM)
                 .text_color(move || {
                     if selected() {
-                        theme::action_primary_label()
+                        theme::primary_foreground()
                     } else {
-                        theme::text_secondary()
+                        theme::terminal_key_label()
                     }
                 }),
         )

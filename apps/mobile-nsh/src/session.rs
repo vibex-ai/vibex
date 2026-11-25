@@ -213,8 +213,6 @@ pub struct SessionService {
     terminal_tx: Rc<RefCell<Option<mpsc::Sender<TerminalCommand>>>>,
     terminal_stream: Rc<RefCell<Option<AbortHandle>>>,
     terminal_writer: Rc<RefCell<Option<AbortHandle>>>,
-    /// Bytes of a UTF-8 character split across two frames.
-    terminal_pending: Rc<RefCell<Vec<u8>>>,
     terminal_choices: Signal<Vec<TerminalChoice>>,
     /// Bumped when the terminal closes, so its stream stops writing.
     terminal_generation: Rc<Cell<u64>>,
@@ -454,7 +452,6 @@ impl SessionService {
             terminal_tx: Rc::new(RefCell::new(None)),
             terminal_stream: Rc::new(RefCell::new(None)),
             terminal_writer: Rc::new(RefCell::new(None)),
-            terminal_pending: Rc::new(RefCell::new(Vec::new())),
             terminal_choices: signal(Vec::new()),
             terminal_generation: Rc::new(Cell::new(0)),
             files_open: signal(false),
@@ -6223,11 +6220,28 @@ impl SessionService {
                 return;
             }
             service.set_terminal_choices(&terminals);
-            if let Some(terminal) = terminals
-                .iter()
-                .find(|terminal| terminal.status == TerminalStatus::Running)
-            {
-                service.attach_terminal(terminal.id.clone(), terminal.title.clone());
+            // Coming back to the terminal surface returns to the shell that is
+            // already open. Opening it must not start another one: that is
+            // what left a workspace with a tab strip of identical shells.
+            let reopen = service.terminal_id.get_untracked().and_then(|open| {
+                terminals
+                    .iter()
+                    .find(|terminal| {
+                        terminal.id.as_str() == open && terminal.status == TerminalStatus::Running
+                    })
+                    .cloned()
+            });
+            // Otherwise the newest live shell: the list is in creation order,
+            // so the last running one is the one used most recently.
+            let terminal = reopen.or_else(|| {
+                terminals
+                    .iter()
+                    .rev()
+                    .find(|terminal| terminal.status == TerminalStatus::Running)
+                    .cloned()
+            });
+            if let Some(terminal) = terminal {
+                service.attach_terminal(terminal.id, terminal.title);
                 return;
             }
             let workspace = session.workspace_id;
@@ -6342,8 +6356,7 @@ impl SessionService {
                     service.reset_terminal_output();
                 }
                 for frame in batch.frames {
-                    let text = service.decode_terminal_frame(&frame.bytes);
-                    service.write_terminal_output(text);
+                    service.write_terminal_output(&frame.bytes);
                 }
                 service
                     .terminal_output_revision
@@ -6541,25 +6554,25 @@ impl SessionService {
         }
     }
 
-    fn write_terminal_output(&self, text: String) {
+    /// Feeds a frame to the emulator as the bytes the program wrote.
+    ///
+    /// The emulator parses bytes itself (`vte`), so decoding to a `String`
+    /// first is both lossy and wrong: a character split across two frames, or
+    /// a sequence the terminal's encoding does not spell in UTF-8, becomes a
+    /// replacement mark. Handing over the bytes lets the parser see exactly
+    /// what the PTY produced.
+    fn write_terminal_output(&self, bytes: &[u8]) {
         if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
-            api.write(text);
+            api.write_bytes(bytes);
         }
     }
 
     fn reset_terminal_output(&self) {
-        self.terminal_pending.borrow_mut().clear();
         if let Some(api) = self.terminal_ref.api::<TerminalApi>() {
             api.reset();
         }
         self.terminal_output_revision
             .update(|revision| *revision = revision.wrapping_add(1));
-    }
-
-    /// Decodes a frame, keeping a character split across frames for the next
-    /// one instead of writing a replacement mark.
-    fn decode_terminal_frame(&self, bytes: &[u8]) -> String {
-        decode_terminal_bytes(&mut self.terminal_pending.borrow_mut(), bytes)
     }
 
     /// Tells the runtime the grid's new size.
@@ -8460,36 +8473,6 @@ fn spawn_terminal_stream(
     })
 }
 
-/// Decodes a terminal frame, keeping an incomplete UTF-8 tail for the next
-/// frame instead of showing a replacement mark for it.
-fn decode_terminal_bytes(pending: &mut Vec<u8>, bytes: &[u8]) -> String {
-    pending.extend_from_slice(bytes);
-    let mut decoded = String::new();
-    let mut consumed = 0;
-    while consumed < pending.len() {
-        match std::str::from_utf8(&pending[consumed..]) {
-            Ok(text) => {
-                decoded.push_str(text);
-                consumed = pending.len();
-            }
-            Err(error) => {
-                let valid_end = consumed + error.valid_up_to();
-                decoded.push_str(
-                    std::str::from_utf8(&pending[consumed..valid_end]).unwrap_or_default(),
-                );
-                consumed = valid_end;
-                let Some(invalid_len) = error.error_len() else {
-                    break;
-                };
-                decoded.push(char::REPLACEMENT_CHARACTER);
-                consumed += invalid_len;
-            }
-        }
-    }
-    pending.drain(..consumed);
-    decoded
-}
-
 /// The sheet's row for one terminal.
 fn terminal_choice(terminal: &TerminalSession) -> TerminalChoice {
     TerminalChoice {
@@ -9382,8 +9365,8 @@ fn age(timestamp_ms: i64) -> String {
 mod tests {
     use super::{
         AttachmentItem, BTreeMap, Duration, TerminalFrameBatch, TerminalFrameSubscription,
-        TerminalId, answered_requests, decode_terminal_bytes, mpsc, spawn_terminal_stream,
-        swap_attachment_draft, workspace_file_path,
+        TerminalId, answered_requests, mpsc, spawn_terminal_stream, swap_attachment_draft,
+        workspace_file_path,
     };
 
     /// An answer sent from another device must retire the card here too.
@@ -9504,32 +9487,6 @@ mod tests {
             vec![first]
         );
         assert!(drafts.is_empty());
-    }
-
-    #[test]
-    fn a_character_split_across_frames_keeps_its_bytes() {
-        let mut pending = Vec::new();
-        let bytes = "é".as_bytes();
-        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..1]), "");
-        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[1..]), "é");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn text_before_an_incomplete_tail_is_written_at_once() {
-        let mut pending = Vec::new();
-        let bytes = "a😀".as_bytes();
-        let split = bytes.len() - 2;
-        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[..split]), "a");
-        assert_eq!(decode_terminal_bytes(&mut pending, &bytes[split..]), "😀");
-        assert!(pending.is_empty());
-    }
-
-    #[test]
-    fn an_invalid_terminal_byte_does_not_hide_following_output() {
-        let mut pending = Vec::new();
-        assert_eq!(decode_terminal_bytes(&mut pending, b"\xffready"), "�ready");
-        assert!(pending.is_empty());
     }
 
     #[test]

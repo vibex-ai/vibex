@@ -739,6 +739,107 @@ pub fn backdrop(opacity: f32) -> Hsla {
     hsla(0.0, 0.0, 0.0, opacity)
 }
 
+/// The face a terminal draws with.
+///
+/// The theme file carries no `font-mono`, so the emulator would fall back to
+/// the generic `monospace` alias, which resolves to whatever the platform
+/// picks. These are the faces the phone actually ships (see
+/// `apps/mobile/src/theme.rs`): Android loads `DroidSansMono.ttf`, iOS carries
+/// Menlo, and both are metric-compatible with the 8-point cell the PTY is
+/// sized against.
+pub const TERMINAL_FONT_FAMILY: &str = if cfg!(target_os = "android") {
+    "Droid Sans Mono"
+} else if cfg!(target_os = "ios") {
+    "Menlo"
+} else {
+    "monospace"
+};
+
+/// The size a terminal cell is drawn at, in points.
+///
+/// Below the body ladder on purpose: a terminal is a grid of columns, and at
+/// 80 columns across a phone the glyphs have to stay small enough that a
+/// command line does not wrap on every word.
+pub fn font_terminal() -> f32 {
+    (FONT_MICRO + 1.0) * font_scale_percent() as f32 / 100.0
+}
+
+/// The height of a terminal row: a little over the glyphs, so the grid reads
+/// as lines rather than as prose.
+pub fn terminal_line_height() -> f32 {
+    (font_terminal() * 1.32).round()
+}
+
+/// The ground a terminal sits on.
+///
+/// A terminal is recessed: in the dark appearance it drops well below the page,
+/// which is what makes the grid read as a shell rather than as another page of
+/// the app. The light appearance cannot go dark — the emulator draws its text in
+/// the theme's `foreground`, so a dark ground there would be ink on ink — so it
+/// takes the muted well instead, and the grid's border and padding carry the
+/// separation.
+pub fn terminal_surface() -> Hsla {
+    if dark() {
+        background().darken(0.42)
+    } else {
+        block_inset()
+    }
+}
+
+/// The chrome around the grid: the tab strip and the key row.
+///
+/// One step above [`terminal_surface`] and one below the page, so the three
+/// bands (chrome, grid, page) read as a stack without a border between them.
+pub fn terminal_chrome() -> Hsla {
+    if dark() {
+        background().darken(0.24)
+    } else {
+        background_dim()
+    }
+}
+
+/// A hairline inside the terminal's chrome.
+pub fn terminal_hairline() -> Hsla {
+    if dark() {
+        hsla(0.0, 0.0, 1.0, 0.08)
+    } else {
+        border_subtle()
+    }
+}
+
+/// The wash a key of the terminal's key row sits on.
+pub fn terminal_key() -> Hsla {
+    if dark() {
+        hsla(0.0, 0.0, 1.0, 0.10)
+    } else {
+        foreground().alpha(0.06)
+    }
+}
+
+/// A latched modifier's fill: the terminal's own accent, readable on either
+/// chrome.
+pub fn terminal_key_active() -> Hsla {
+    accent_green()
+}
+
+/// The ink of a terminal key.
+pub fn terminal_key_label() -> Hsla {
+    if dark() {
+        hsla(0.0, 0.0, 1.0, 0.86)
+    } else {
+        foreground()
+    }
+}
+
+/// The fill of the terminal's chosen tab.
+pub fn terminal_tab_active() -> Hsla {
+    if dark() {
+        hsla(0.0, 0.0, 1.0, 0.13)
+    } else {
+        foreground().alpha(0.08)
+    }
+}
+
 /// `from` moved `amount` of the way to `to`, channel by channel, so a step
 /// down the ladder moves lightness without letting the page show through.
 fn blend(from: Hsla, to: Hsla, amount: f32) -> Hsla {

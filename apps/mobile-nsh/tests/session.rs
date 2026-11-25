@@ -2185,6 +2185,36 @@ fn TerminalShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A character the PTY splits across two reads is still one character on
+/// screen: the emulator parses bytes, so the frames go to it as bytes.
+///
+/// The old path decoded each frame to a `String` first, which turned a split
+/// character into a replacement mark — the mojibake a reader saw whenever a
+/// program wrote non-ASCII text.
+#[component]
+fn SplitCharacterShell() -> impl IntoElement {
+    let host = host_with(None, None);
+    host.terminal_open.set(true);
+    let terminal_ref = host.terminal_ref;
+    set_timeout(std::time::Duration::from_millis(50), move || {
+        if let Some(api) = terminal_ref.api::<TerminalApi>() {
+            let bytes = "中文终端".as_bytes();
+            for byte in bytes {
+                api.write_bytes(&[*byte]);
+            }
+        }
+    });
+    session::session(host)
+}
+
+#[test]
+fn a_character_split_across_frames_is_not_mangled() {
+    let mut config = EngineConfig::new(Root::of::<SplitCharacterShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("中文终端").unwrap();
+}
+
 #[test]
 fn the_terminal_opens_and_shows_the_programs_output() {
     let mut config = EngineConfig::new(Root::of::<TerminalShell>());
@@ -2200,6 +2230,50 @@ fn the_terminal_opens_and_shows_the_programs_output() {
     app.wait_for_gone("1 matches", std::time::Duration::from_secs(3))
         .unwrap();
     app.wait_for("role:button[Keyboard]").unwrap();
+}
+
+/// A terminal has to look like one: monospaced cells on a row ladder of their
+/// own, not prose set in the app's body face.
+///
+/// The grid is the emulator's, so these props are what it draws with — and
+/// what the PTY is measured against.
+#[test]
+fn the_terminal_is_drawn_as_a_terminal() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(900.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
+    let cell = app.screen().span_style("hello from the pty").unwrap();
+    let family = cell
+        .font_family
+        .map(|family| family.name().to_string())
+        .unwrap_or_default();
+    assert!(
+        family.contains("Mono") || family.contains("mono") || family.contains("Menlo"),
+        "the grid draws with a monospaced face, not {family:?}"
+    );
+    // The cells are set below the body ladder: a terminal is a grid of columns,
+    // and a shell's 80 columns have to fit across the phone before they wrap.
+    let body = vibex_nsh_ui::theme::font_body();
+    assert!(
+        cell.font_size.0 > 0.0 && cell.font_size.0 < body,
+        "the grid draws at a terminal's size ({}), not body copy's ({body})",
+        cell.font_size.0
+    );
+}
+
+/// A tap on the grid is what puts the caret in the terminal: it has to be
+/// enough on its own, without the Keyboard button, because that is the gesture
+/// a reader makes when the program is waiting for an answer.
+#[test]
+fn tapping_the_terminal_grid_takes_the_keyboard() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
+    app.press("Terminal grid").unwrap();
+    app.press_key("l").unwrap();
+    app.wait_for("text:input: l").unwrap();
 }
 
 #[test]

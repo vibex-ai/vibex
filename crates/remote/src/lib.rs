@@ -7802,6 +7802,25 @@ fn terminal_list_for_workspace(
     // kills a process the tab does not own.
     let session_terminals = vibex_db::SessionTerminalRepository::terminal_ids(&conn)?;
 
+    // A row that says `Running` with no PTY behind it is what an unclean
+    // shutdown leaves: the process is gone, the record still claims it lives.
+    // Only the newest is brought back; the rest are retired below so a client
+    // is not handed a tab strip of shells that respawn on every listing.
+    let ghosts = stored
+        .iter()
+        .filter(|session| {
+            !session_terminals.contains(&session.id) && !live_by_id.contains_key(&session.id)
+        })
+        .filter(|session| terminal_session_should_restore(session))
+        .map(|session| session.id.clone())
+        .collect::<Vec<_>>();
+    let revivable = ghosts
+        .iter()
+        .rev()
+        .take(TERMINAL_RESTORE_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>();
+
     for session in stored {
         if session_terminals.contains(&session.id) {
             continue;
@@ -7811,7 +7830,7 @@ fn terminal_list_for_workspace(
             if terminal_session_visible(live_session) {
                 visible.push(live_session.clone());
             }
-        } else if terminal_session_should_restore(&session) {
+        } else if revivable.contains(&session.id) {
             if root.is_none() {
                 root = Some(workspace_root(&conn, workspace_id)?);
             }
@@ -7821,6 +7840,9 @@ fn terminal_list_for_workspace(
             )?;
             TerminalSessionRepository::upsert(&conn, &restored)?;
             visible.push(restored);
+        } else if ghosts.contains(&session.id) {
+            let retired = retire_terminal_session(session);
+            TerminalSessionRepository::upsert(&conn, &retired)?;
         }
     }
     for session in live {
@@ -7835,11 +7857,20 @@ fn terminal_list_for_workspace(
     Ok(visible)
 }
 
+/// How many persisted terminals a remote workspace brings back on its own.
+const TERMINAL_RESTORE_LIMIT: usize = 1;
+
 fn terminal_session_should_restore(session: &TerminalSession) -> bool {
-    matches!(
-        session.status,
-        TerminalStatus::Running | TerminalStatus::Stale
-    )
+    session.status == TerminalStatus::Running
+}
+
+/// A persisted terminal with no PTY behind it, marked as what it is.
+fn retire_terminal_session(mut session: TerminalSession) -> TerminalSession {
+    let now = unix_timestamp_ms();
+    session.status = TerminalStatus::Killed;
+    session.updated_at_ms = now;
+    session.closed_at_ms.get_or_insert(now);
+    session
 }
 
 fn terminal_session_visible(session: &TerminalSession) -> bool {
@@ -8188,6 +8219,43 @@ fn invalid_envelope_response() -> RemoteResponseEnvelope {
 mod tests {
     use super::*;
     use axum::body::{Body, to_bytes};
+
+    /// A row left `Running` by a runtime that died has no process behind it.
+    /// Restoring every one of them is what handed a phone client dozens of
+    /// identical shells, each unusable, and each listing added to the pile.
+    #[test]
+    fn only_the_newest_ghost_terminal_is_restored() {
+        let ghost = |status: TerminalStatus| TerminalSession {
+            id: vibex_core::TerminalId::new(),
+            workspace_id: WorkspaceId::new(),
+            title: "终端".to_owned(),
+            shell: "/bin/sh".to_owned(),
+            cwd: "/tmp".to_owned(),
+            rows: 24,
+            cols: 80,
+            status,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            closed_at_ms: None,
+        };
+        assert!(terminal_session_should_restore(&ghost(
+            TerminalStatus::Running
+        )));
+        // A shell that already ended is not a candidate, whatever it says.
+        assert!(!terminal_session_should_restore(&ghost(
+            TerminalStatus::Exited
+        )));
+        assert!(!terminal_session_should_restore(&ghost(
+            TerminalStatus::Stale
+        )));
+        // Retiring says `Killed`, which is what stops it coming back.
+        let retired = retire_terminal_session(ghost(TerminalStatus::Running));
+        assert_eq!(retired.status, TerminalStatus::Killed);
+        assert!(retired.closed_at_ms.is_some());
+        assert!(!terminal_session_should_restore(&retired));
+        assert_eq!(TERMINAL_RESTORE_LIMIT, 1);
+    }
+
     use axum::http::{Request, StatusCode};
     use futures_util::SinkExt;
     use std::path::{Path, PathBuf};
@@ -11212,7 +11280,7 @@ mod tests {
     }
 
     #[test]
-    fn terminal_list_restores_missing_open_terminals() {
+    fn terminal_list_restores_one_missing_open_terminal_and_retires_the_rest() {
         let (db_path, _manager) = test_agent_manager("terminal-restore");
         let workspace_root = temp_workspace_root("terminal-restore");
         let nested_cwd = workspace_root.join("src");
@@ -11248,9 +11316,19 @@ mod tests {
             updated_at_ms: now,
             closed_at_ms: Some(now),
         };
+        // A second ghost: what a runtime killed twice leaves behind. Only the
+        // newest is brought back.
+        let older_ghost = TerminalSession {
+            id: TerminalId::new(),
+            title: "older ghost".to_string(),
+            created_at_ms: now - 1_000,
+            updated_at_ms: now - 1_000,
+            ..stored_running_terminal.clone()
+        };
         {
             let mut conn = open_database(&db_path).unwrap();
             apply_migrations(&mut conn).unwrap();
+            TerminalSessionRepository::upsert(&conn, &older_ghost).unwrap();
             TerminalSessionRepository::upsert(&conn, &stored_running_terminal).unwrap();
             TerminalSessionRepository::upsert(&conn, &stored_stale_terminal).unwrap();
         }
@@ -11258,10 +11336,12 @@ mod tests {
 
         let listed = terminal_list_for_workspace(&runtime, &workspace.id).unwrap();
 
+        // The row that still said `Running` is the one shell brought back, at
+        // the directory it recorded.
         let recovered_running = listed
             .iter()
             .find(|session| session.id == running_terminal_id)
-            .unwrap();
+            .expect("the running row is restored");
         assert_eq!(recovered_running.status, TerminalStatus::Running);
         assert_eq!(
             recovered_running.cwd,
@@ -11272,16 +11352,16 @@ mod tests {
                 .to_string()
         );
         assert!(recovered_running.closed_at_ms.is_none());
-        let recovered_stale = listed
-            .iter()
-            .find(|session| session.id == stale_terminal_id)
-            .unwrap();
-        assert_eq!(recovered_stale.status, TerminalStatus::Running);
-        assert!(recovered_stale.closed_at_ms.is_none());
         runtime
             .terminals
             .snapshot(&running_terminal_id)
-            .expect("restored terminal should have a live PTY");
+            .expect("the restored terminal has a live PTY");
+        // The stale row is not a second shell: its process is long gone, so it
+        // is retired rather than started again.
+        assert!(
+            !listed.iter().any(|session| session.id == stale_terminal_id),
+            "a stale row must not become another live tab"
+        );
         let conn = open_database(&db_path).unwrap();
         let persisted = TerminalSessionRepository::list(&conn, &workspace.id).unwrap();
         assert_eq!(
@@ -11289,8 +11369,23 @@ mod tests {
                 .iter()
                 .filter(|session| session.status == TerminalStatus::Running)
                 .count(),
-            2
+            1,
+            "one listing restores one shell, not one per row"
         );
+        // The older ghost is retired: two rows cannot become two shells.
+        let retired_ghost = persisted
+            .iter()
+            .find(|session| session.id == older_ghost.id)
+            .expect("the older ghost is kept as a record");
+        assert_eq!(retired_ghost.status, TerminalStatus::Killed);
+        assert!(retired_ghost.closed_at_ms.is_some());
+        // The stale row keeps its own status: it was never a candidate for
+        // restoring, so nothing about it changed.
+        let stale = persisted
+            .iter()
+            .find(|session| session.id == stale_terminal_id)
+            .expect("the stale row is kept as a record");
+        assert_eq!(stale.status, TerminalStatus::Stale);
 
         cleanup_db(db_path);
         cleanup_workspace(workspace_root);

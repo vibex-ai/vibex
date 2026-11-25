@@ -5070,6 +5070,25 @@ impl DesktopRuntime {
         let mut visible = Vec::new();
         let session_terminals = vibex_db::SessionTerminalRepository::terminal_ids(&connection)?;
 
+        // A row that says `Running` with no PTY behind it is the record of a
+        // shell a previous runtime never shut down. Only the newest of them is
+        // brought back; the rest are retired below, so a workspace cannot
+        // accumulate a tab strip of dead shells that respawn on every listing.
+        let ghosts = stored
+            .iter()
+            .filter(|session| {
+                !session_terminals.contains(&session.id) && !live_by_id.contains_key(&session.id)
+            })
+            .filter(|session| terminal_session_should_restore(session))
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let revivable = ghosts
+            .iter()
+            .rev()
+            .take(TERMINAL_RESTORE_LIMIT)
+            .cloned()
+            .collect::<Vec<_>>();
+
         for session in stored {
             // A session's terminal belongs to the session page, not to this
             // list: showing it as a tab would let the reader close the Agent's
@@ -5082,7 +5101,7 @@ impl DesktopRuntime {
                 if terminal_session_visible(live_session) {
                     visible.push(live_session.clone());
                 }
-            } else if terminal_session_should_restore(&session) {
+            } else if revivable.contains(&session.id) {
                 if workspace_root.is_none() {
                     let (_, workspace) = WorkspaceRepository::get(&connection, workspace_id)?
                         .ok_or_else(|| {
@@ -5098,6 +5117,11 @@ impl DesktopRuntime {
                 )?;
                 TerminalSessionRepository::upsert(&connection, &restored)?;
                 visible.push(restored);
+            } else if ghosts.contains(&session.id) {
+                // Nothing is running for this row and nothing will be: say so
+                // once, instead of restoring it again on the next listing.
+                let retired = retire_terminal_session(session);
+                TerminalSessionRepository::upsert(&connection, &retired)?;
             }
         }
         for session in live {
@@ -5413,15 +5437,33 @@ fn update_channel_for_mode(mode: DesktopRuntimeMode) -> UpdateChannel {
     }
 }
 
+/// How many persisted terminals one workspace brings back to life on its own.
+///
+/// A reader works in one terminal; every other row is the record of a shell
+/// that has already run. Restoring them all is what turned the phone's terminal
+/// surface into a wall of dead tabs: each listing started a PTY for every row a
+/// previous crash had left `Running`, and each of those PTYs then outlived the
+/// listing and was restored again on the next one.
+const TERMINAL_RESTORE_LIMIT: usize = 1;
+
 fn terminal_session_should_restore(session: &TerminalSession) -> bool {
-    matches!(
-        session.status,
-        vibex_core::TerminalStatus::Running | vibex_core::TerminalStatus::Stale
-    )
+    session.status == vibex_core::TerminalStatus::Running
 }
 
 fn terminal_session_visible(session: &TerminalSession) -> bool {
     session.status == vibex_core::TerminalStatus::Running
+}
+
+/// A persisted terminal with no PTY behind it, marked as what it is.
+///
+/// The status is the only thing a later listing reads, so the row has to say
+/// `Killed` for the ghost to stop coming back.
+fn retire_terminal_session(mut session: TerminalSession) -> TerminalSession {
+    let now = vibex_core::unix_timestamp_ms();
+    session.status = vibex_core::TerminalStatus::Killed;
+    session.updated_at_ms = now;
+    session.closed_at_ms.get_or_insert(now);
+    session
 }
 
 fn record_shutdown_error(first_error: &mut Option<VibexError>, error: VibexError) {
@@ -5521,6 +5563,46 @@ mod tests {
         AgentAuthContextRepository, AgentAuthModelCatalogRepository, AgentSessionRuntimeRepository,
         SessionRepository,
     };
+
+    /// A row left `Running` by a runtime that died is a ghost: its process is
+    /// gone. Restoring every ghost is what put dozens of identical, unusable
+    /// shells in one tab strip, and each listing made the pile bigger.
+    #[test]
+    fn only_the_newest_ghost_terminal_is_restored() {
+        let ghost = |title: &str, status: TerminalStatus| TerminalSession {
+            id: TerminalId::new(),
+            workspace_id: WorkspaceId::new(),
+            title: title.to_owned(),
+            shell: "/bin/sh".to_owned(),
+            cwd: "/tmp".to_owned(),
+            rows: 24,
+            cols: 80,
+            status,
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            closed_at_ms: None,
+        };
+        // A terminal that is genuinely alive is never a candidate.
+        assert!(!terminal_session_should_restore(&ghost(
+            "live",
+            TerminalStatus::Exited
+        )));
+        assert!(!terminal_session_should_restore(&ghost(
+            "stale",
+            TerminalStatus::Stale
+        )));
+        assert!(terminal_session_should_restore(&ghost(
+            "ghost",
+            TerminalStatus::Running
+        )));
+        // Retiring one says `Killed`, which is what stops it coming back.
+        let retired = retire_terminal_session(ghost("ghost", TerminalStatus::Running));
+        assert_eq!(retired.status, TerminalStatus::Killed);
+        assert!(retired.closed_at_ms.is_some());
+        assert!(!terminal_session_should_restore(&retired));
+        // One workspace brings back one shell, not one per row.
+        assert_eq!(TERMINAL_RESTORE_LIMIT, 1);
+    }
 
     #[test]
     fn live_token_usage_overlays_the_persisted_snapshot() {
