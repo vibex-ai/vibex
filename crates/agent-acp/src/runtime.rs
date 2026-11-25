@@ -22085,6 +22085,22 @@ fn extract_config_values(candidates: Vec<&Value>) -> Vec<ProviderSessionConfigVa
             continue;
         };
         for item in items {
+            // ACP 1.6 lets a select carry titled groups (`{ group, name,
+            // options }`) beside flat entries, which is how codex-acp 2.6.0+
+            // publishes configured permission profiles next to the sandbox
+            // modes. Flatten them in order: a client that only reads `options`
+            // would offer the profile rows as nothing at all, and the value the
+            // session reports back could then never be re-selected.
+            if let Some(group) = item.get("options").and_then(Value::as_array) {
+                for entry in group {
+                    if let Some(value) = config_value_from_json(entry)
+                        && !values.iter().any(|existing| existing.value == value.value)
+                    {
+                        values.push(value);
+                    }
+                }
+                continue;
+            }
             if let Some(value) = config_value_from_json(item)
                 && !values.iter().any(|existing| existing.value == value.value)
             {
@@ -22338,6 +22354,44 @@ mod tests {
     }
 
     #[test]
+    fn grouped_select_options_are_flattened_without_losing_the_flat_entries() {
+        // codex-acp 2.6.0+ publishes configured permission profiles as titled
+        // groups beside the flat sandbox modes. A reader that only looked at
+        // flat entries offered no profile row, so a session reporting a
+        // `permission-profile:<id>` current value could never re-select it.
+        let values = json!([
+            { "value": "read-only", "name": "Read-only" },
+            {
+                "group": "permission-profiles",
+                "name": "Permission Profiles",
+                "options": [
+                    { "value": "permission-profile:reviewed", "name": "reviewed" },
+                    { "value": "read-only", "name": "Read-only" }
+                ]
+            },
+            { "value": "workspace-write", "name": "Workspace access" }
+        ]);
+        assert_eq!(
+            extract_config_values(vec![&values])
+                .into_iter()
+                .map(|value| (value.value, value.label))
+                .collect::<Vec<_>>(),
+            vec![
+                ("read-only".to_string(), Some("Read-only".to_string())),
+                (
+                    "permission-profile:reviewed".to_string(),
+                    Some("reviewed".to_string())
+                ),
+                (
+                    "workspace-write".to_string(),
+                    Some("Workspace access".to_string())
+                ),
+            ],
+            "groups flatten in place and a duplicate value keeps its first row"
+        );
+    }
+
+    #[test]
     fn other_agents_preserve_reported_mode_changes() {
         let agent = AgentId::parse("mock-agent").unwrap();
         assert_eq!(
@@ -22490,14 +22544,14 @@ mod tests {
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Claude);
 
         let codex = test_acp_config("/managed/node", vec!["/managed/codex-acp.js".to_string()]);
-        persist_managed_runtime(&conn, "codex", "codex-acp", "2.5.0", &codex);
+        persist_managed_runtime(&conn, "codex", "codex-acp", "2.12.0", &codex);
         let identity = client
             .effective_adapter_identity(&AgentId::parse("codex").unwrap(), &codex)
             .unwrap();
-        assert_eq!(identity.adapter_version, "2.5.0");
+        assert_eq!(identity.adapter_version, "2.12.0");
         assert_eq!(
             identity.compatibility_identity,
-            "adapter=codex-acp@2.5.0;runtime=@openai/codex@0.165.0"
+            "adapter=codex-acp@2.12.0;runtime=@openai/codex@0.171.0"
         );
         assert!(identity.exact_descriptor);
         assert_eq!(identity.event_enricher, AgentEventEnricherKind::Codex);
@@ -22536,10 +22590,10 @@ mod tests {
         );
         let new = test_acp_config(
             "node",
-            vec!["/managed/opencode/2.2.6/opencode.js".to_string()],
+            vec!["/managed/opencode/2.4.1/opencode.js".to_string()],
         );
         let mut fingerprints = Vec::new();
-        for (config, version) in [(&old, "1.19.3"), (&new, "2.2.6")] {
+        for (config, version) in [(&old, "1.19.3"), (&new, "2.4.1")] {
             client
                 .config_service
                 .update_agent_config(vibex_core::AgentUpdateConfigRequest {
@@ -23756,6 +23810,7 @@ mod tests {
                         "writeTextFile": true
                     },
                     "terminal": false,
+                    "session": { "configOptions": { "boolean": {} } },
                     "elicitation": { "form": {} },
                     "auth": {
                         "terminal": false
@@ -40708,7 +40763,7 @@ for line in sys.stdin:
             .unwrap();
         config.models = vec!["mock/model-1".to_string(), "mock/model-2".to_string()];
         let conn = open_database(&fixture.db_path).unwrap();
-        persist_managed_runtime(&conn, PI_AGENT_ID, PI_AGENT_ID, "0.0.34", &config);
+        persist_managed_runtime(&conn, PI_AGENT_ID, PI_AGENT_ID, "0.0.35", &config);
         vibex_db::ProviderSecretReferenceRepository::replace_for_profile(
             &conn,
             &fixture.profile_id,

@@ -23,44 +23,45 @@ use crate::protocol::{
 pub const CLAUDE_AGENT_ID: &str = "claude";
 pub const CLAUDE_ADAPTER_ID: &str = "claude-agent-acp";
 pub const CLAUDE_ADAPTER_PACKAGE: &str = "@agentclientprotocol/claude-agent-acp";
-pub const CLAUDE_ADAPTER_VERSION: &str = "0.101.0";
-pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-c9YGBfdJrLcKiinRpXuDuibC+CRGqQpe9+ey/+TuuZ7ejHlVyEELbbvRkxHZN+Hf5XGecJD5i0kvP2opCseATA==";
-/// The alias contract did not move with the pin: 0.101.0 resolves the same
+pub const CLAUDE_ADAPTER_VERSION: &str = "0.112.0";
+pub const CLAUDE_ADAPTER_INTEGRITY: &str = "sha512-T9FrKGd9eDKHNmZE/EfEf01v49UHKeKyGcu91O8sdVc7a9eMEDOGWT/0moWirGHJdBqJ9qPVfqu07IBegJuniA==";
+/// The alias contract did not move with the pin: 0.112.0 resolves the same
 /// `model` values to the same `ANTHROPIC_DEFAULT_*_MODEL`-derived picker rows
 /// that 0.71.0 did, and it still spells the config-option ids
-/// `model`/`mode`/`effort`, so the floor stays where the behaviour was first
-/// verified.
+/// `model`/`mode`/`effort` (`fast` and `ultracode` are additive Boolean
+/// toggles), so the floor stays where the behaviour was first verified.
 pub const CLAUDE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = ">=0.71.0";
 
 pub const CODEX_AGENT_ID: &str = "codex";
 pub const CODEX_ADAPTER_ID: &str = "codex-acp";
 pub const CODEX_ADAPTER_PACKAGE: &str = "@agentclientprotocol/codex-acp";
-pub const CODEX_ADAPTER_VERSION: &str = "2.5.0";
-pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-7e/4OhJwpvSTqsjiokoVYRV7O1XGem1CAsQgO1opmGYbRD5LvmydwDlJrldzQYO5TcPWueGzQ2Jdvyvp6l3qDw==";
+pub const CODEX_ADAPTER_VERSION: &str = "2.12.0";
+pub const CODEX_ADAPTER_INTEGRITY: &str = "sha512-UYZwEZoDUdzre4VG/ECGlAVVWlB4tSuy40WiGGiNcA/t3qx0i2Iz9i1BRgzrFHhq2QgEsxH8c7FFEdRwgLUBvg==";
 /// The alias table is registered against the exact adapter identity, so this
 /// requirement moves with `CODEX_ADAPTER_VERSION` rather than describing a
-/// range: 2.5.0 is the only release whose config-option spellings were read
+/// range: 2.12.0 is the only release whose config-option spellings were read
 /// back from the published bundle. The ids themselves did not move from
-/// 2.0.1 (`model`, `reasoning_effort`, `mode`), so only the gate moves.
-pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=2.5.0";
+/// 2.0.1 (`model`, `reasoning_effort`, `mode`); 2.6.0+ additionally advertise
+/// `fast-mode` (`category: "speed"`) and 2.11.0 exposes `session/options`.
+pub const CODEX_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=2.12.0";
 pub const CODEX_RUNTIME_PACKAGE: &str = "@openai/codex";
-/// What 2.5.0 declares it needs. It moved from `^0.160.1`, so the runtime pin
+/// What 2.12.0 declares it needs. It moved from `^0.165.0`, so the runtime pin
 /// below has to satisfy the new range rather than the old one.
 ///
-/// `^0.165.0` is a 0.x caret range, so it resolves below `0.166.0`: the newest
-/// `@openai/codex` release (`0.167.0`) is *outside* what the Adapter declares,
-/// and npm would install a `0.165.x` build anyway. `0.165.0` is that line's
+/// `^0.171.0` is a 0.x caret range, so it resolves below `0.172.0`: the newest
+/// `@openai/codex` release (`0.172.0`) is *outside* what the Adapter declares,
+/// and npm would install a `0.171.x` build anyway. `0.171.0` is that line's
 /// newest release and is what the pin follows.
-pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.165.0";
-pub const CODEX_RUNTIME_PIN: &str = "0.165.0";
-pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-aiwtQVp2KBhJld966CuU5bVfQ46VNB4mNTl6giX3WGZdt4euI3tv2RUqJpnupPNA8DXHg2z+RoQ0Zfw87dy8Lw==";
+pub const CODEX_RUNTIME_DECLARED_REQUIREMENT: &str = "^0.171.0";
+pub const CODEX_RUNTIME_PIN: &str = "0.171.0";
+pub const CODEX_RUNTIME_INTEGRITY: &str = "sha512-1IOFzL2Xg86tLdw6kDo3GoKbkQENgQi7TI6rlEvN132R7ngSw7SNOIQoTcnKzSZZ8kf9N9GynCweSoaFbqk2Eg==";
 
 pub const ZCODE_AGENT_ID: &str = "zcode";
 pub const ZCODE_ADAPTER_ID: &str = "zcode-acp-server";
 pub const ZCODE_ADAPTER_PACKAGE: &str = "zcode-acp-server";
-pub const ZCODE_ADAPTER_VERSION: &str = "0.82.3";
-pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-t0RHvAPQ7oEic1w9CLxaE8gusfDaOgbOdLW+v2KxLEg551wA+vj3XBBHy0YMKnjkyw7U+PmCYd+7oQpXM2ZwGw==";
-pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.82.3";
+pub const ZCODE_ADAPTER_VERSION: &str = "0.94.0";
+pub const ZCODE_ADAPTER_INTEGRITY: &str = "sha512-+RuqiDK8jmbA+tt5HwytjKfNf7zowqmSKyU/R8gib4yx3tiH1btQhqfvKMq+KBoC6jFBrKqQXoOFVZOLrXzsuA==";
+pub const ZCODE_CONFIG_ALIAS_VERSION_REQUIREMENT: &str = "=0.94.0";
 pub const NPM_REGISTRY_ORIGIN: &str = "https://registry.npmjs.org";
 
 /// Three-state support value used before runtime negotiation is complete.
@@ -957,7 +958,7 @@ fn claude_descriptor() -> VibexResult<AcpAgentCompatibility> {
         }],
         required_launch_env: Vec::new(),
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: claude-agent-acp@0.101.0",
+            "real bridge contract schema v2: claude-agent-acp@0.112.0",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1064,7 +1065,7 @@ fn codex_descriptor() -> VibexResult<AcpAgentCompatibility> {
             "true".to_string(),
         )],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: codex-acp@2.5.0 + @openai/codex@0.165.0",
+            "real bridge contract schema v2: codex-acp@2.12.0 + @openai/codex@0.171.0",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "no exact-version multi-session contract evidence",
@@ -1179,7 +1180,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
             ("ZCODE_ACP_RUNTIME".to_string(), "node".to_string()),
         ],
         mcp_forwarding: CompatibilitySupport::supported(
-            "real bridge contract schema v2: zcode-acp-server@0.82.3 forwards stdio MCP descriptors",
+            "real bridge contract schema v2: zcode-acp-server@0.94.0 forwards stdio MCP descriptors",
         ),
         safe_multi_session: CompatibilitySupport::unsupported(
             "Vibex launches one managed bridge per logical session",
@@ -1236,7 +1237,7 @@ fn zcode_descriptor() -> VibexResult<AcpAgentCompatibility> {
 /// when a live probe is unavailable. Conditional values the adapter may
 /// refuse (root-gated `bypassPermissions`, model-gated `xhigh`) are only
 /// listed in the `known_*` acceptance sets, never in the fallbacks. `auto` is
-/// advertised by 0.101.0 unless the CLI settings disable it
+/// advertised by 0.112.0 unless the CLI settings disable it
 /// (`autoModeDisabled`), and the bridge still clamps it to `acceptEdits` when
 /// the selected model lacks support.
 /// `dontAsk` was removed from the 0.71.0 mode catalog and is no longer
@@ -1619,7 +1620,7 @@ mod tests {
             claude.event_enricher_for_identity(&pinned),
             Some(AgentEventEnricherKind::Claude)
         );
-        let newer = identity_for("0.102.0");
+        let newer = identity_for("0.113.0");
         assert!(claude.quirks_for_identity(&newer).is_empty());
         assert_eq!(claude.event_enricher_for_identity(&newer), None);
     }
@@ -1658,7 +1659,7 @@ mod tests {
 
         let adjacent = AdapterCompatibilityIdentity::new(
             &codex.adapter_id,
-            &Version::parse("1.1.1").unwrap(),
+            &Version::parse("2.11.1").unwrap(),
             &BTreeMap::from([(
                 CODEX_RUNTIME_PACKAGE.to_string(),
                 Version::parse(CODEX_RUNTIME_PIN).unwrap(),
@@ -1668,7 +1669,7 @@ mod tests {
         assert_eq!(codex.event_enricher_for_identity(&adjacent), None);
         assert!(
             codex
-                .config_option_aliases_for_runtime("1.1.1", adjacent.as_str())
+                .config_option_aliases_for_runtime("2.11.1", adjacent.as_str())
                 .is_none()
         );
     }

@@ -2584,7 +2584,7 @@ fn legacy_runtime_identity(
             {
                 (
                     "claude-agent-acp",
-                    Some("0.101.0".to_string()),
+                    Some("0.112.0".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,
@@ -2592,15 +2592,15 @@ fn legacy_runtime_identity(
             }
             ("codex", None) if looks_managed_adapter_command(command, args, "codex-acp") => (
                 "codex-acp",
-                Some("2.5.0".to_string()),
-                Some("0.165.0".to_string()),
-                BTreeMap::from([("@openai/codex".to_string(), "0.165.0".to_string())]),
+                Some("2.12.0".to_string()),
+                Some("0.171.0".to_string()),
+                BTreeMap::from([("@openai/codex".to_string(), "0.171.0".to_string())]),
                 AgentVersionSource::Managed,
             ),
             ("zcode", None) if looks_managed_adapter_command(command, args, "zcode-acp-server") => {
                 (
                     "zcode-acp-server",
-                    Some("0.82.3".to_string()),
+                    Some("0.94.0".to_string()),
                     None,
                     BTreeMap::new(),
                     AgentVersionSource::Managed,
@@ -3588,7 +3588,7 @@ mod tests {
         for (agent_id, expected_version) in [
             ("dirac", "0.4.1"),
             ("factory-droid", "0.153.1"),
-            ("pi", "0.0.34"),
+            ("pi", "0.0.35"),
             ("qwen-code", "0.18.4"),
         ] {
             let entry = acp_agent_catalog_entries()

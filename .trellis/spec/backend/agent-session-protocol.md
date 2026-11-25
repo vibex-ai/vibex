@@ -3725,6 +3725,7 @@ clientCapabilities.meta["terminal-auth"]: bool
 clientCapabilities._meta.terminal_output: bool
 clientCapabilities._meta["terminal-auth"]: bool
 clientCapabilities._meta["subagent-transcript"]: true
+clientCapabilities.session.configOptions.boolean: {}
 ```
 
 The plain `meta` extension and the spec's reserved `_meta` are both emitted on
@@ -3739,6 +3740,18 @@ and no side effect — which the UI would otherwise report as a completed
 Agent, and as an explicit `false` when the capability is off, so an Agent cannot
 mistake silence for a client that never looked. This is the same failure class
 the reserved `_meta.terminal_output` key was added for.
+
+`session.configOptions.boolean` is advertised unconditionally: ACP 1.6 says an
+Agent MUST only send `type: "boolean"` config options to a client that declared
+it, and both `claude-agent-acp` and `codex-acp` read exactly that key before
+choosing the shape of their Fast mode and ultracode toggles. Vibex renders a
+Boolean option as a native toggle and sends the tagged
+`{ sessionId, configId, type: "boolean", value }` request, so it can take the
+native form; leaving the capability undeclared silently downgraded those
+controls to a two-value `select`. Select options that carry titled groups
+(`{ group, name, options }`) — how `codex-acp` 2.6.0+ publishes configured
+permission profiles — are flattened in order when read, so a value the session
+reports back can be re-selected even though it is not a flat row.
 
 Runtime terminal host seam:
 

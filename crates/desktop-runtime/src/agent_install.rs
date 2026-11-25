@@ -35,7 +35,7 @@ use vibex_db::{
 };
 
 const ZCODE_ACP_PACKAGE: &str = "zcode-acp-server";
-const ZCODE_ACP_VERSION: &str = "0.82.3";
+const ZCODE_ACP_VERSION: &str = "0.94.0";
 const ZCODE_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 
 const ACP_REGISTRY_URL: &str =
@@ -56,9 +56,13 @@ const MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 0, 0);
 const MINIMUM_UV_VERSION: semver::Version = semver::Version::new(0, 5, 0);
 const DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 15, 0);
 const PI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
+/// The npm channel of Kimi Code CLI declares `engines.node >= 22.19.0`; a
+/// managed Node below that line installs successfully and then refuses to
+/// start. The default floor (22.0.0) is too low for this Agent.
+const KIMI_MINIMUM_NODE_VERSION: semver::Version = semver::Version::new(22, 19, 0);
 const PI_CODING_AGENT_PACKAGE: &str = "@earendil-works/pi-coding-agent";
 /// The managed pi runtime is a verified version, not "whatever npm calls
-/// latest". pi-acp 0.0.34 needs pi `>= 0.81.0`, and the 1.x line has already
+/// latest". pi-acp 0.0.35 needs pi `>= 0.81.0`, and the 1.x line has already
 /// changed provider wire defaults (`kimi-coding` moved to Chat Completions with
 /// a `/v1` base URL), so a floating install silently crosses major versions.
 const PI_CODING_AGENT_VERSION: &str = "1.3.0";
@@ -3139,6 +3143,7 @@ fn minimum_node_version(agent_id: &AgentId) -> semver::Version {
     match agent_id.as_str() {
         "deepseek-harness" => DEEPSEEK_HARNESS_MINIMUM_NODE_VERSION,
         "pi" => PI_MINIMUM_NODE_VERSION,
+        "kimi" => KIMI_MINIMUM_NODE_VERSION,
         "zcode" => ZCODE_MINIMUM_NODE_VERSION,
         _ => MINIMUM_NODE_VERSION,
     }
@@ -6230,6 +6235,11 @@ mod tests {
             minimum_node_version(&AgentId::parse("zcode").unwrap()),
             semver::Version::new(22, 0, 0)
         );
+        // Kimi Code CLI's own npm channel declares `engines.node >= 22.19.0`.
+        assert_eq!(
+            minimum_node_version(&AgentId::parse("kimi").unwrap()),
+            semver::Version::new(22, 19, 0)
+        );
         assert_eq!(ManagedCliAgent::Zcode.registry_id(), "zcode-acp-server");
     }
 
@@ -6518,7 +6528,7 @@ mod tests {
 
         let pinned = pin_entry_to_target(&agent, entry.clone(), ManagedInstallTarget::Verified)
             .expect("the catalog pins this Agent");
-        assert_eq!(pinned.version, "0.4.40");
+        assert_eq!(pinned.version, "0.4.43");
         assert_eq!(
             pinned
                 .distribution
@@ -6526,7 +6536,7 @@ mod tests {
                 .as_ref()
                 .expect("npm distribution survives")
                 .package,
-            "@openma/deepseek-harness-acp@0.4.40"
+            "@openma/deepseek-harness-acp@0.4.43"
         );
         assert_eq!(
             parse_exact_npm_spec(
@@ -6534,7 +6544,7 @@ mod tests {
                 &pinned.version
             )
             .unwrap(),
-            ("@openma/deepseek-harness-acp", "0.4.40")
+            ("@openma/deepseek-harness-acp", "0.4.43")
         );
 
         let unchanged = pin_entry_to_target(&agent, entry, ManagedInstallTarget::Latest).unwrap();

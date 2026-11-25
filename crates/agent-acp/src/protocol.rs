@@ -47,11 +47,12 @@ use std::path::{Path, PathBuf};
 use agent_client_protocol_schema::{
     ProtocolVersion,
     v1::{
-        AuthenticateRequest, CancelNotification, ClientCapabilities, ContentBlock,
-        ElicitationCapabilities, ElicitationFormCapabilities, FileSystemCapabilities,
-        Implementation, InitializeRequest, LoadSessionRequest, LogoutRequest, NewSessionRequest,
-        PromptRequest, ResumeSessionRequest, SessionId, SetSessionConfigOptionRequest,
-        SetSessionModeRequest,
+        AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
+        ClientCapabilities, ClientSessionCapabilities, ContentBlock, ElicitationCapabilities,
+        ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
+        LoadSessionRequest, LogoutRequest, NewSessionRequest, PromptRequest,
+        ResumeSessionRequest, SessionConfigOptionsCapabilities, SessionId,
+        SetSessionConfigOptionRequest, SetSessionModeRequest,
     },
 };
 use serde_json::{Value, json};
@@ -813,6 +814,28 @@ pub(crate) fn build_initialize_params(
         }
         capabilities.insert("_meta".to_string(), Value::Object(reserved_meta));
     }
+    // ACP 1.6 gates every `type: "boolean"` config option on the client
+    // declaring `session.configOptions.boolean`. Agents MUST fall back to a
+    // two-value `select` without it — current claude-agent-acp and codex-acp
+    // both read exactly this key before deciding the shape of their Fast mode
+    // / ultracode toggles. Vibex renders a Boolean option natively
+    // (`SessionRuntimeFeatureKind::Toggle`) and writes it with the tagged
+    // `{ configId, type: "boolean", value }` request, so it can advertise the
+    // capability; leaving it undeclared silently downgraded those controls to
+    // selects. The value is built through the typed v1 schema so its field name
+    // cannot drift from what the Agents read.
+    if let Some(capabilities) = params
+        .get_mut("clientCapabilities")
+        .and_then(Value::as_object_mut)
+    {
+        let mut session = ClientSessionCapabilities::new();
+        session.config_options = Some(
+            SessionConfigOptionsCapabilities::new()
+                .boolean(BooleanConfigOptionCapabilities::default()),
+        );
+        let session = serde_json::to_value(&session).unwrap_or_else(|_| json!({}));
+        capabilities.insert("session".to_string(), session);
+    }
     params
 }
 
@@ -1079,6 +1102,7 @@ mod tests {
                 "clientCapabilities": {
                     "fs": { "readTextFile": true, "writeTextFile": true },
                     "terminal": false,
+                    "session": { "configOptions": { "boolean": {} } },
                     "elicitation": { "form": {} },
                     "auth": { "terminal": true },
                     "mcpServers": true,
@@ -1099,6 +1123,23 @@ mod tests {
                 }
             })
         );
+    }
+
+    /// ACP 1.6 requires this key before an Agent may send a `type: "boolean"`
+    /// config option, and both current `claude-agent-acp` and `codex-acp` read
+    /// exactly `session.configOptions.boolean` to decide whether their Fast mode
+    /// and ultracode toggles are native switches or two-value selects.
+    #[test]
+    fn boolean_config_options_are_advertised_unconditionally() {
+        for parameterized in [false, true] {
+            let capabilities = &build_initialize_params(true, true, false, false, false, parameterized)
+                ["clientCapabilities"];
+            assert_eq!(
+                capabilities["session"],
+                json!({ "configOptions": { "boolean": {} } }),
+                "the capability is not gated on the Agent's dialect"
+            );
+        }
     }
 
     /// Cursor reads the spec's reserved `_meta`, so the capability must not be
