@@ -17,6 +17,7 @@
     "check:model-catalog": "node scripts/sync-model-catalog.mjs --check",
     "e2e:regression": "cargo run -p vibex-diagnostics --bin vibex-e2e-regression-harness",
     "dev:desktop": "node scripts/prepare-desktop-dev-icon.mjs && cargo run -p vibex-desktop --locked",
+    "dev:server-artifact": "node scripts/package-server-dev.mjs",
     "lint": "eslint apps --no-error-on-unmatched-pattern",
     "prepare:pdfium": "node scripts/prepare-pdfium-runtime.mjs",
     "sync:model-catalog": "node scripts/sync-model-catalog.mjs",

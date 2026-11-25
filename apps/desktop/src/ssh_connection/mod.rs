@@ -10,6 +10,7 @@ pub mod command;
 pub mod compat;
 pub mod config;
 pub mod console;
+pub mod dev_artifact;
 pub mod diagnostics;
 pub mod effects;
 pub mod environment;
@@ -44,6 +45,7 @@ pub use config::{
     SshDiscovery, SshEffectiveConfig, SshHostEntry, default_ssh_config_path,
     discover_default_hosts, discover_hosts, resolve_effective, resolve_effective_default,
 };
+pub use dev_artifact::DevArtifactError;
 pub use effects::SshProvisioningEffects;
 pub use environment::{
     EnvironmentError, EnvironmentWarning, GlibcVersion, MIN_FREE_KB, MIN_GLIBC, PortState,

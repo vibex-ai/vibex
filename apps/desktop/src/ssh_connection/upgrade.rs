@@ -99,11 +99,18 @@ pub struct UpgradeOutcome {
 /// terminal interruption before calling this. The database snapshot is taken
 /// after the old runtime stops, which is the only point where SQLite and its
 /// WAL are guaranteed to be at rest.
+///
+/// `reinstall` relaxes the "strictly newer" rule to "not older", which is what
+/// a development build needs: its artifact is rebuilt at the same version on
+/// every iteration, and refusing the equal version would make the second
+/// upgrade impossible. A release artifact always passes `false`, so a published
+/// build keeps the strict ordering.
 pub fn upgrade_runtime(
     command: &SshCommand,
     launch: &LaunchConfig,
     artifact: &LocalArtifact,
     channel: SshRuntimeChannel,
+    reinstall: bool,
     progress: impl FnMut(u64, u64) + Send + 'static,
 ) -> Result<UpgradeOutcome, UpgradeError> {
     let before = supervisor::status(command, launch).map_err(|error| {
@@ -127,7 +134,12 @@ pub fn upgrade_runtime(
             "the installed runtime version is not valid semver",
         )
     })?;
-    validate_upgrade(&current, &target, channel).map_err(|message| {
+    let ordering = if reinstall {
+        validate_reinstall
+    } else {
+        validate_upgrade
+    };
+    ordering(&current, &target, channel).map_err(|message| {
         UpgradeError::new("ssh_upgrade_incompatible", UpgradePhase::Preflight, message)
     })?;
 
@@ -454,6 +466,27 @@ pub fn validate_upgrade(
     Ok(())
 }
 
+/// [`validate_upgrade`] for a development artifact: the same channel rule, but
+/// an equal version replaces the installed one.
+///
+/// The loop a developer runs is "rebuild `vibex-server`, upgrade the
+/// connection", and the version stays `0.1.9` throughout. Refusing the equal
+/// version would make the second iteration impossible without editing the
+/// version by hand. A downgrade is still refused.
+pub fn validate_reinstall(
+    current: &Version,
+    target: &Version,
+    channel: SshRuntimeChannel,
+) -> Result<(), String> {
+    if target < current {
+        return Err("the target runtime is older than the installed runtime".to_string());
+    }
+    if channel_for_version(target) != channel {
+        return Err("the target runtime channel does not match the connection".to_string());
+    }
+    Ok(())
+}
+
 fn supervisor_message(error: SupervisorError) -> String {
     format!("{}: {}", error.code, error.message)
 }
@@ -628,6 +661,7 @@ esac
             &launch,
             &artifact,
             SshRuntimeChannel::Rc,
+            false,
             |_, _| {},
         )
         .unwrap();
@@ -640,8 +674,15 @@ esac
         fs::write(dir.path().join("fail-start"), b"1").unwrap();
         let mut next = artifact.clone();
         next.version = "0.1.0-rc.10".to_string();
-        let error = upgrade_runtime(&command, &launch, &next, SshRuntimeChannel::Rc, |_, _| {})
-            .expect_err("the new runtime start should fail");
+        let error = upgrade_runtime(
+            &command,
+            &launch,
+            &next,
+            SshRuntimeChannel::Rc,
+            false,
+            |_, _| {},
+        )
+        .expect_err("the new runtime start should fail");
         assert_eq!(error.code, "ssh_upgrade_start_failed");
         assert!(
             error
@@ -652,6 +693,25 @@ esac
             error.rollback
         );
         assert_eq!(fs::read_to_string(&state).unwrap().trim(), "1");
+    }
+
+    #[test]
+    fn a_development_reinstall_accepts_the_installed_version_but_not_an_older_one() {
+        let current = version("0.1.9");
+        assert!(
+            validate_reinstall(&current, &current, SshRuntimeChannel::Stable).is_ok(),
+            "rebuilding the server keeps the version, so an equal one has to install"
+        );
+        assert!(validate_reinstall(&current, &version("0.2.0"), SshRuntimeChannel::Stable).is_ok());
+        assert!(
+            validate_reinstall(&current, &version("0.1.8"), SshRuntimeChannel::Stable).is_err(),
+            "a development artifact must not downgrade the runtime"
+        );
+        assert!(
+            validate_reinstall(&current, &version("0.1.0-rc.9"), SshRuntimeChannel::Stable)
+                .is_err(),
+            "the channel boundary still applies to a development artifact"
+        );
     }
 
     #[test]

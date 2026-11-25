@@ -11948,33 +11948,87 @@ enum LocalClientsSettingsState {
     Unavailable,
 }
 
-/// Debug-only local artifact path for WSL UI verification on machines without
-/// an update signing key. Release builds always go through the signed manifest.
-#[cfg(debug_assertions)]
-fn debug_wsl_artifact(
+/// A server artifact this build may install, and where it came from.
+struct ResolvedServerArtifact {
+    local: crate::ssh_connection::LocalArtifact,
+    /// True when a development build took the artifact from the local
+    /// override rather than the signed release manifest.
+    ///
+    /// Only a development artifact may replace the version already installed:
+    /// the loop is "rebuild the server, upgrade the connection", and the
+    /// version does not change between iterations. A release artifact keeps
+    /// the strict newer-than rule, because downgrading or reinstalling a
+    /// published build is not something the About page asked for.
+    development: bool,
+}
+
+/// The headless runtime artifact a development build should install, if one was
+/// pointed at with `VIBEX_DEV_SERVER_ARTIFACT`.
+///
+/// Release builds never resolve an artifact this way: they carry no such
+/// override, and the signed release manifest is the only trust anchor a
+/// packaged desktop may use. A debug build has no update verification key at
+/// all, so without this it answers every provisioning attempt with
+/// `app_update_verification_key_unavailable`.
+fn development_server_artifact(
     arch: crate::ssh_connection::environment::RemoteArch,
-) -> Result<Option<crate::ssh_connection::LocalArtifact>, String> {
-    let Ok(path) = std::env::var("VIBEX_WSL_E2E_ARTIFACT") else {
-        return Ok(None);
-    };
-    let bytes = std::fs::read(&path)
-        .map_err(|error| format!("VIBEX_WSL_E2E_ARTIFACT could not be read: {error}"))?;
-    let version =
-        std::env::var("VIBEX_WSL_E2E_VERSION").unwrap_or_else(|_| "0.1.0-rc.8".to_string());
-    Ok(Some(crate::ssh_connection::LocalArtifact {
-        path: PathBuf::from(path),
-        version,
-        arch,
-        size: bytes.len() as u64,
-        sha256: format!("{:x}", Sha256::digest(&bytes)),
+) -> Result<Option<ResolvedServerArtifact>, String> {
+    let local =
+        crate::ssh_connection::dev_artifact::from_environment(arch, env!("CARGO_PKG_VERSION"))
+            .map_err(|error| error.to_string())?;
+    Ok(local.map(|local| ResolvedServerArtifact {
+        local,
+        development: true,
     }))
 }
 
-#[cfg(not(debug_assertions))]
-fn debug_wsl_artifact(
-    _arch: crate::ssh_connection::environment::RemoteArch,
-) -> Result<Option<crate::ssh_connection::LocalArtifact>, String> {
-    Ok(None)
+/// Where one stage of a release artifact resolution has reached.
+///
+/// The two halves are published separately because they take very different
+/// amounts of time: the manifest is a small document, while the tarball is tens
+/// of megabytes and reports its own byte progress.
+enum ReleaseArtifactStage {
+    FetchingManifest,
+    Downloading { done: u64, total: u64 },
+}
+
+/// Resolves the server artifact for `arch` from the signed release manifest.
+///
+/// This is the release path only; a debug build may take
+/// [`development_server_artifact`] instead. The caller keeps its own stage
+/// publishing so each surface — the SSH progress dialog and the WSL dialog —
+/// can word the same two steps for its own reader.
+async fn release_server_artifact(
+    runtime: &Arc<vibex_desktop_runtime::DesktopRuntime>,
+    artifact_os: &str,
+    arch: crate::ssh_connection::environment::RemoteArch,
+    cache_dir: &Path,
+    mut on_stage: impl FnMut(ReleaseArtifactStage),
+) -> Result<ResolvedServerArtifact, String> {
+    on_stage(ReleaseArtifactStage::FetchingManifest);
+    let verified = runtime
+        .app_update()
+        .latest_verified_manifest()
+        .await
+        .map_err(|error| format!("{}: {}", error.code, error.message))?
+        .ok_or_else(|| "the release manifest is unavailable".to_string())?;
+    let version = verified.manifest.version.to_string();
+    let artifact = select_server_artifact_for_os(&verified, artifact_os, arch)
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    let local = download_server_artifact_for_os(
+        artifact,
+        artifact_os,
+        &version,
+        arch,
+        cache_dir,
+        |done, total| on_stage(ReleaseArtifactStage::Downloading { done, total }),
+    )
+    .await
+    .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    Ok(ResolvedServerArtifact {
+        local,
+        development: false,
+    })
 }
 
 pub struct VibexWorkbench {
@@ -17766,76 +17820,57 @@ impl VibexWorkbench {
             let environment = provisioner
                 .probe()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let local = match debug_wsl_artifact(environment.arch)? {
-                Some(local) => local,
+            let resolved = match development_server_artifact(environment.arch)? {
+                Some(resolved) => resolved,
                 None => {
-                    publish_wsl_provisioning_stage(
-                        &runner_stage,
-                        WslProvisioningStage::new(
-                            WslProvisioningStep::FetchingManifest,
-                            locale::text(
-                                "Fetching the signed release manifest…",
-                                "正在获取签名发布清单…",
-                                "正在取得簽章發行清單…",
-                            ),
-                        ),
-                    );
-                    let verified = runtime
-                        .app_update()
-                        .latest_verified_manifest()
-                        .await
-                        .map_err(|error| format!("{}: {}", error.code, error.message))?
-                        .ok_or_else(|| "the release manifest is unavailable".to_string())?;
-                    let version = verified.manifest.version.to_string();
-                    let artifact =
-                        select_server_artifact_for_os(&verified, "linux", environment.arch)
-                            .map_err(|error| format!("{}: {}", error.code, error.message))?;
-                    publish_wsl_provisioning_stage(
-                        &runner_stage,
-                        WslProvisioningStage::new(
-                            WslProvisioningStep::DownloadingRuntime,
-                            locale::text(
-                                "Downloading the runtime…",
-                                "正在下载运行时…",
-                                "正在下載執行階段…",
-                            ),
-                        ),
-                    );
-                    download_server_artifact_for_os(
-                        artifact,
+                    release_server_artifact(
+                        &runtime,
                         "linux",
-                        &version,
                         environment.arch,
                         &desktop_home.join("ssh-artifacts"),
-                        |done, total| {
-                            let detail = if total > 0 {
-                                format!(
-                                    "{} {done}/{total}",
+                        |stage| match stage {
+                            ReleaseArtifactStage::FetchingManifest => {
+                                publish_wsl_provisioning_stage(
+                                    &runner_stage,
+                                    WslProvisioningStage::new(
+                                        WslProvisioningStep::FetchingManifest,
+                                        locale::text(
+                                            "Fetching the signed release manifest…",
+                                            "正在获取签名发布清单…",
+                                            "正在取得簽章發行清單…",
+                                        ),
+                                    ),
+                                );
+                            }
+                            ReleaseArtifactStage::Downloading { done, total } => {
+                                let detail = if total > 0 {
+                                    format!(
+                                        "{} {done}/{total}",
+                                        locale::text(
+                                            "Downloading the runtime…",
+                                            "正在下载运行时…",
+                                            "正在下載執行階段…",
+                                        )
+                                    )
+                                } else {
                                     locale::text(
                                         "Downloading the runtime…",
                                         "正在下载运行时…",
                                         "正在下載執行階段…",
                                     )
-                                )
-                            } else {
-                                locale::text(
-                                    "Downloading the runtime…",
-                                    "正在下载运行时…",
-                                    "正在下載執行階段…",
-                                )
-                                .to_string()
-                            };
-                            publish_wsl_provisioning_stage(
-                                &runner_stage,
-                                WslProvisioningStage::new(
-                                    WslProvisioningStep::DownloadingRuntime,
-                                    detail,
-                                ),
-                            );
+                                    .to_string()
+                                };
+                                publish_wsl_provisioning_stage(
+                                    &runner_stage,
+                                    WslProvisioningStage::new(
+                                        WslProvisioningStep::DownloadingRuntime,
+                                        detail,
+                                    ),
+                                );
+                            }
                         },
                     )
-                    .await
-                    .map_err(|error| format!("{}: {}", error.code, error.message))?
+                    .await?
                 }
             };
             publish_wsl_provisioning_stage(
@@ -17847,7 +17882,7 @@ impl VibexWorkbench {
             );
             let now_ms = unix_timestamp_ms();
             let outcome = provisioner
-                .provision_with_progress(&local, now_ms, |stage| {
+                .provision_with_progress(&resolved.local, now_ms, |stage| {
                     publish_wsl_provisioning_stage(
                         &runner_stage,
                         WslProvisioningStage::new(
@@ -18176,26 +18211,20 @@ impl VibexWorkbench {
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let environment = probe(&command, profile.remote_port, MIN_FREE_KB)
                 .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
-            let verified = runtime
-                .app_update()
-                .latest_verified_manifest()
-                .await
-                .map_err(|error| format!("{}: {}", error.code, error.message))?
-                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
-            let target = verified.manifest.version.clone();
             let artifact_os = normalized_server_os(&environment.os);
-            let artifact = select_server_artifact_for_os(&verified, artifact_os, environment.arch)
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let local = download_server_artifact_for_os(
-                artifact,
-                artifact_os,
-                &target.to_string(),
-                environment.arch,
-                &home.join("ssh-artifacts"),
-                |_, _| {},
-            )
-            .await
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let resolved = match development_server_artifact(environment.arch)? {
+                Some(resolved) => resolved,
+                None => {
+                    release_server_artifact(
+                        &runtime,
+                        artifact_os,
+                        environment.arch,
+                        &home.join("ssh-artifacts"),
+                        |_| {},
+                    )
+                    .await?
+                }
+            };
             let launch = LaunchConfig::new(
                 &profile.remote_home,
                 &profile.remote_install_root,
@@ -18209,15 +18238,20 @@ impl VibexWorkbench {
                 .as_deref()
                 .and_then(crate::ssh_connection::upgrade::channel_for_version_str)
                 .unwrap_or(profile.channel);
+            let target = resolved.local.version.clone();
+            // A development artifact is often the version already installed —
+            // the loop is "rebuild the server, upgrade the connection" — so an
+            // equal version replaces it instead of being refused as a no-op.
             crate::ssh_connection::upgrade::upgrade_runtime(
                 &command,
                 &launch,
-                &local,
+                &resolved.local,
                 channel,
+                resolved.development,
                 |_, _| {},
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            Ok::<(String, String), String>((profile.id, target.to_string()))
+            Ok::<(String, String), String>((profile.id, target))
         });
         self.ssh_upgrade_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -18572,48 +18606,57 @@ impl VibexWorkbench {
             );
             let environment = probe(&command, profile.remote_port, MIN_FREE_KB)
                 .map_err(|error| format!("{}: {}", error.code(), error.message()))?;
-            publish_preparing_stage(
-                &stage,
-                PreparingStage::new(
-                    ProvisioningStep::CheckingEnvironment,
-                    locale::text(
-                        "Fetching the signed release manifest…",
-                        "正在获取签名发布清单…",
-                        "正在取得簽章發行清單…",
-                    ),
-                ),
-            );
-            let verified = runtime
-                .app_update()
-                .latest_verified_manifest()
-                .await
-                .map_err(|error| format!("{}: {}", error.code, error.message))?
-                .ok_or_else(|| "the release manifest is unavailable".to_string())?;
-            let version = verified.manifest.version.to_string();
             let artifact_os = normalized_server_os(&environment.os);
-            let artifact = select_server_artifact_for_os(&verified, artifact_os, environment.arch)
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            publish_preparing_stage(
-                &stage,
-                PreparingStage::new(
-                    ProvisioningStep::UploadingRuntime,
-                    locale::text(
-                        "Downloading the runtime for this host…",
-                        "正在下载适用于该主机的运行时…",
-                        "正在下載適用於該主機的執行階段…",
-                    ),
-                ),
-            );
-            let local = download_server_artifact_for_os(
-                artifact,
-                artifact_os,
-                &version,
-                environment.arch,
-                &home.join("ssh-artifacts"),
-                |_, _| {},
-            )
-            .await
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let resolved = match development_server_artifact(environment.arch)? {
+                Some(resolved) => resolved,
+                None => {
+                    release_server_artifact(
+                        &runtime,
+                        artifact_os,
+                        environment.arch,
+                        &home.join("ssh-artifacts"),
+                        |progress| match progress {
+                            ReleaseArtifactStage::FetchingManifest => {
+                                publish_preparing_stage(
+                                    &stage,
+                                    PreparingStage::new(
+                                        ProvisioningStep::CheckingEnvironment,
+                                        locale::text(
+                                            "Fetching the signed release manifest…",
+                                            "正在获取签名发布清单…",
+                                            "正在取得簽章發行清單…",
+                                        ),
+                                    ),
+                                );
+                            }
+                            ReleaseArtifactStage::Downloading { done, total } => {
+                                let detail = if total > 0 {
+                                    format!(
+                                        "{} {done}/{total}",
+                                        locale::text(
+                                            "Downloading the runtime for this host…",
+                                            "正在下载适用于该主机的运行时…",
+                                            "正在下載適用於該主機的執行階段…",
+                                        )
+                                    )
+                                } else {
+                                    locale::text(
+                                        "Downloading the runtime for this host…",
+                                        "正在下载适用于该主机的运行时…",
+                                        "正在下載適用於該主機的執行階段…",
+                                    )
+                                    .to_string()
+                                };
+                                publish_preparing_stage(
+                                    &stage,
+                                    PreparingStage::new(ProvisioningStep::UploadingRuntime, detail),
+                                );
+                            }
+                        },
+                    )
+                    .await?
+                }
+            };
             let launch = LaunchConfig::new(
                 &profile.remote_home,
                 &profile.remote_install_root,
@@ -18634,7 +18677,7 @@ impl VibexWorkbench {
                 destination,
                 profile.ssh_config_path.clone(),
                 launch,
-                local,
+                resolved.local,
                 home,
                 profile.local_tunnel_port,
                 unix_timestamp_ms(),
@@ -133646,6 +133689,73 @@ mod tests {
         );
     }
 
+    /// A development build may install a locally built server tarball.
+    ///
+    /// Every provisioning path used to go straight to the signed release
+    /// manifest, which only a release build can verify: `dev:desktop` and the
+    /// preview package carry no `VIBEX_UPDATE_PUBLIC_KEY`, so adding an SSH
+    /// host or a WSL distro answered
+    /// `app_update_verification_key_unavailable` and the feature could not be
+    /// exercised while developing it. Each path now asks the development
+    /// override first and falls back to the manifest, and the override is
+    /// compiled out of release builds.
+    #[test]
+    fn a_development_build_resolves_the_server_artifact_before_the_manifest() {
+        let source = include_str!("app.rs");
+        for (start, end) in [
+            (
+                "    fn resolve_ssh_profile_provisioning(",
+                "\n    /// Makes the preparing window visible",
+            ),
+            (
+                "    fn start_ssh_runtime_upgrade(",
+                "\n    fn update_profile_runtime_version(",
+            ),
+            (
+                "    fn provision_wsl_distro(",
+                "\n    fn sync_wsl_provisioning_settings(",
+            ),
+        ] {
+            let body = source
+                .split_once(start)
+                .and_then(|(_, tail)| tail.split_once(end))
+                .map(|(body, _)| body)
+                .unwrap_or_else(|| panic!("{start} should remain inspectable"));
+            let development = body
+                .find("development_server_artifact(")
+                .unwrap_or_else(|| panic!("{start} must consult the development override"));
+            let release = body
+                .find("release_server_artifact(")
+                .unwrap_or_else(|| panic!("{start} must keep the signed release path"));
+            assert!(
+                development < release,
+                "{start} must try the local artifact before the signed manifest"
+            );
+        }
+
+        let helper = source
+            .split_once("fn development_server_artifact(")
+            .and_then(|(_, tail)| tail.split_once("\n/// Where one stage of a release artifact"))
+            .map(|(body, _)| body)
+            .expect("the development override should remain inspectable");
+        assert!(
+            helper.contains("dev_artifact::from_environment"),
+            "the override reads the one module that owns the environment names"
+        );
+
+        // Release builds must not be able to reach the override at all.
+        let module = include_str!("ssh_connection/dev_artifact.rs");
+        assert!(module.contains("#[cfg(debug_assertions)]"));
+        assert!(
+            module.contains("#[cfg(not(debug_assertions))]"),
+            "a packaged desktop has to answer None, never a local file"
+        );
+        assert!(
+            source.contains("release_server_artifact("),
+            "the signed manifest stays the release authority"
+        );
+    }
+
     /// The progress dialog appears on the click, not after the download.
     ///
     /// A deployment begins with the SSH probe, the signed manifest and a ~38 MB
@@ -133665,8 +133775,8 @@ mod tests {
             .find("begin_ssh_provisioning_preparing(")
             .expect("the start must publish a placeholder before it downloads");
         let download = resolve
-            .find("download_server_artifact_for_os(")
-            .expect("the start still downloads the artifact");
+            .find("release_server_artifact(")
+            .expect("the start still resolves the artifact through the signed release");
         assert!(
             placeholder < download,
             "the dialog has to be claimed before the download, not after it"

@@ -25,6 +25,7 @@ sshd at all.
 - [Upgrade and rollback](#upgrade-and-rollback)
 - [Edit, remove, uninstall](#edit-remove-uninstall)
 - [Security boundary](#security-boundary)
+- [Developing the feature](#developing-the-feature)
 - [Troubleshooting](#troubleshooting)
 - [Operations reference](#operations-reference)
 - [Enabling it](#enabling-it)
@@ -280,7 +281,10 @@ Trust chain: **SSH host key → your SSH authentication → pinned TLS certifica
   printed by `Debug`.
 - **Artifacts.** Only artifacts listed in a signed release manifest are
   downloaded; size and SHA-256 are checked on the desktop and again on the
-  host. There is no unsigned fallback.
+  host. There is no unsigned fallback in a release build. A debug build may
+  instead install a tarball you built yourself — see
+  [Developing the feature](#developing-the-feature) — and that path is compiled
+  out of every packaged desktop.
 - **Remote commands.** Scripts are sent on stdin to `sh -s`; every argument is
   shell-quoted, and host names, paths, user names, and keys are validated
   before anything runs.
@@ -290,6 +294,62 @@ Trust chain: **SSH host key → your SSH authentication → pinned TLS certifica
   directory.
 - **Phones.** An SSH or WSL runtime is reachable only through the desktop's
   tunnel. Phones cannot pair with it directly.
+
+## Developing the feature
+
+Provisioning normally reads the headless runtime out of the signed release
+manifest, and only a release build carries the verification key that makes the
+manifest trustworthy. `pnpm dev:desktop` and the preview package do not, so
+every add answered
+
+```text
+app_update_verification_key_unavailable: this Vibex build does not contain an update verification key
+```
+
+A **debug** build therefore also accepts a locally built tarball:
+
+```bash
+# 1. Build and package the server once, then again after each server change.
+pnpm dev:server-artifact                       # debug build, host platform
+pnpm dev:server-artifact --release             # release build, faster runtime
+pnpm dev:server-artifact --target aarch64-unknown-linux-gnu
+
+# 2. Start the desktop with the artifact it just printed.
+export VIBEX_DEV_SERVER_ARTIFACT="$PWD/target/dev-server-artifacts/vibex-server-0.1.9-linux-x86_64.tar.gz"
+pnpm dev:desktop
+```
+
+The tarball has the same shape the release ships — one top-level
+`vibex-server` — so the install script and the upgrade transaction run
+unmodified; size and SHA-256 are computed from the file and verified on the
+host exactly as a release artifact is.
+
+| Variable | Meaning |
+| --- | --- |
+| `VIBEX_DEV_SERVER_ARTIFACT` | Path to the tarball. Unset means "use the signed manifest", which is what a release build does. |
+| `VIBEX_DEV_SERVER_VERSION` | Version to install it as. Defaults to the version in the file name (`vibex-server-0.1.9-linux-x86_64.tar.gz` → `0.1.9`), then to this desktop's own version. |
+
+Notes:
+
+- The override is compiled out of release builds: `cargo build --release` and
+  every packaged desktop resolve artifacts only through the signed manifest.
+- The upgrade transaction accepts an **equal** version for a development
+  artifact, so the loop is "rebuild the server, Update runtime" without editing
+  a version by hand. A downgrade is still refused, and a release artifact keeps
+  the strict newer-than rule.
+- The connection's channel is derived from the installed version, and a
+  development build reports its own version, so a `0.1.9` server pairs with a
+  `0.1.9` desktop. Building the server from a different version than the
+  desktop puts the connection in `update_recommended` / `desktop_update_required`;
+  keep them equal while developing.
+- **The tarball must run on the host.** A debug `vibex-server` links the
+  developer machine's glibc, so a container or VM with an older libc refuses it
+  with `GLIBC_2.xx not found` at the start step. Either develop against a host
+  whose glibc is at least yours, build with
+  `cargo build -p vibex-server --target <triple>` inside the oldest image you
+  target, or package a release build (`pnpm dev:server-artifact --release`).
+- `VIBEX_WSL_E2E_ARTIFACT` still works as the older spelling of the same
+  override.
 
 ## Troubleshooting
 

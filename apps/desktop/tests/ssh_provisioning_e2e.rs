@@ -310,8 +310,15 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
         size: new_bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&new_bytes)),
     };
-    let outcome = upgrade_runtime(&command, &launch, &new, SshRuntimeChannel::Rc, |_, _| {})
-        .expect("upgrade to rc.9");
+    let outcome = upgrade_runtime(
+        &command,
+        &launch,
+        &new,
+        SshRuntimeChannel::Rc,
+        false,
+        |_, _| {},
+    )
+    .expect("upgrade to rc.9");
     assert!(outcome.cleaned_versions >= 1, "rc.7 should be cleaned");
     assert_eq!(
         remote_file_sha(&command, &identity_path),
@@ -351,8 +358,15 @@ async fn upgrade_preserves_the_home_and_rolls_back_a_bad_artifact() {
         size: bad_bytes.len() as u64,
         sha256: format!("{:x}", Sha256::digest(&bad_bytes)),
     };
-    let error = upgrade_runtime(&command, &launch, &bad, SshRuntimeChannel::Rc, |_, _| {})
-        .expect_err("bad runtime must fail and roll back");
+    let error = upgrade_runtime(
+        &command,
+        &launch,
+        &bad,
+        SshRuntimeChannel::Rc,
+        false,
+        |_, _| {},
+    )
+    .expect_err("bad runtime must fail and roll back");
     assert!(
         error
             .rollback

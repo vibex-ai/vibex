@@ -480,8 +480,8 @@ VibexWorkbench::discard_ssh_provisioning_preparing(cx)      // failure/cancel, r
 ### 5. Good / Base / Bad
 
 - Good: `begin_ssh_provisioning_preparing(...)` before
-  `download_server_artifact_for_os(...)`, with `PreparingStage::new(...)`
-  published at each slow step.
+  `release_server_artifact(...)`, with `PreparingStage::new(...)` published at
+  each slow step.
 - Base: the poller re-reads the shared stage every 120 ms and only calls
   `sync_ssh_provisioning_settings` when the step or detail actually changed.
 - Bad: rendering only coordinator snapshots. The dialog then has nothing to
@@ -496,6 +496,98 @@ VibexWorkbench::discard_ssh_provisioning_preparing(cx)      // failure/cancel, r
 - `app::tests::the_progress_dialog_appears_before_the_artifact_download_finishes`
   — the placeholder is published before the download; the handoff keeps it; a
   dismissed placeholder suppresses the run it became.
+
+## Scenario: A development build resolves the server artifact locally
+
+### 1. Scope / Trigger
+
+- Any change to how a provisioning or upgrade path resolves the headless
+  runtime artifact, or to the `VIBEX_DEV_SERVER_ARTIFACT` override.
+- A report that `pnpm dev:desktop` or a preview package cannot add a remote
+  instance at all, failing with
+  `app_update_verification_key_unavailable`.
+
+### 2. Signatures
+
+```rust
+// apps/desktop/src/ssh_connection/dev_artifact.rs
+pub const ARTIFACT_ENV: &str = "VIBEX_DEV_SERVER_ARTIFACT";
+pub const VERSION_ENV: &str = "VIBEX_DEV_SERVER_VERSION";
+from_environment(arch, fallback_version) -> Result<Option<LocalArtifact>, DevArtifactError>
+from_path(path, version, fallback_version, arch) -> Result<LocalArtifact, DevArtifactError>
+
+// apps/desktop/src/app.rs
+development_server_artifact(arch) -> Result<Option<ResolvedServerArtifact>, String>
+release_server_artifact(runtime, artifact_os, arch, cache_dir, on_stage) -> Result<ResolvedServerArtifact, String>
+
+// apps/desktop/src/ssh_connection/upgrade.rs
+upgrade_runtime(command, launch, artifact, channel, reinstall, progress)
+validate_reinstall(current, target, channel) -> Result<(), String>
+```
+
+### 3. Contracts
+
+- `AppUpdateConfig::public_key_base64` is `option_env!("VIBEX_UPDATE_PUBLIC_KEY")`,
+  which only the release workflow injects. A debug or preview build therefore
+  answers `latest_verified_manifest()` with
+  `app_update_verification_key_unavailable`, and **every** provisioning path
+  that starts there is unusable while developing.
+- All three paths — `resolve_ssh_profile_provisioning`,
+  `start_ssh_runtime_upgrade`, `provision_wsl_distro` — ask
+  `development_server_artifact(...)` first and fall back to
+  `release_server_artifact(...)`. A new path resolves through the same two
+  helpers instead of calling `latest_verified_manifest()` directly.
+- The override is compiled out of release builds: `from_environment` is
+  `#[cfg(not(debug_assertions))] -> Ok(None)`, so a packaged desktop can only
+  follow the signed manifest. This is the whole reason the override is
+  acceptable: the trust chain documented for releases is unchanged.
+- The artifact's size and SHA-256 are computed from the file, so the host
+  verifies the same digest a release artifact carries. Nothing is signed,
+  because the file never leaves the developer's machine.
+- Version precedence: `VIBEX_DEV_SERVER_VERSION`, then the file name
+  (`vibex-server-<version>-linux-<arch>.tar.gz`), then the desktop's own
+  version. The value must be a safe directory name (letters, digits, `.`, `-`,
+  `_`), because the installer turns it into `server/<version>/`.
+- The upgrade transaction accepts an **equal** version only for a development
+  artifact (`reinstall = true`), because the loop is "rebuild the server,
+  Update runtime" at an unchanged version. A downgrade stays refused, and a
+  release artifact keeps the strict newer-than rule.
+- `VIBEX_WSL_E2E_ARTIFACT` remains a working alias so an existing WSL workflow
+  does not break.
+
+### 4. Validation & Error Matrix
+
+| Condition | Behaviour |
+| --- | --- |
+| no variable set, debug build | signed manifest, as before |
+| no variable set, release build | signed manifest; the override is compiled out |
+| file missing or unreadable | `ssh_dev_artifact_unreadable`, naming the variable |
+| file empty | `ssh_dev_artifact_empty` |
+| version not a safe directory name | `ssh_dev_artifact_version_invalid`, before any upload |
+| development artifact equal to the installed version | replaced (reinstall) |
+| development artifact older than the installed version | `ssh_upgrade_incompatible` |
+| development artifact on another channel | `ssh_upgrade_incompatible` |
+
+### 5. Good / Base / Bad
+
+- Good: `development_server_artifact(...)` then `release_server_artifact(...)`,
+  both returning the same `ResolvedServerArtifact` so the caller's stage
+  publishing stays one shape.
+- Base: the tarball keeps the release layout — one top-level `vibex-server` —
+  so `INSTALL_SCRIPT` and the upgrade transaction need no development branch.
+- Bad: calling `latest_verified_manifest()` directly from a new provisioning
+  path. It re-introduces the dead end this scenario exists to remove, and the
+  override silently stops covering the new surface.
+
+### 6. Tests Required
+
+- `ssh_connection::dev_artifact::tests::*` — digest and size describe the bytes,
+  version precedence, a safe-name rejection, and the variable names.
+- `ssh_connection::upgrade::tests::a_development_reinstall_accepts_the_installed_version_but_not_an_older_one`
+  — equal installs, older does not, and the channel boundary still applies.
+- `app::tests::a_development_build_resolves_the_server_artifact_before_the_manifest`
+  — all three paths consult the override before the manifest, and the module
+  keeps both `cfg` arms.
 
 ## Scenario: A paired runtime must reach the instance list
 
