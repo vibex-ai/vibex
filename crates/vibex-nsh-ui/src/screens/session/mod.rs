@@ -2919,8 +2919,13 @@ fn process_header_row(
         // The mark reads the Agent when the row is built and again when the
         // row's Agent changes, so a turn that settles onto a named Agent draws
         // its logo rather than the default one it started with.
+        //
+        // `agent_icon` hands back the SVG's own markup, so it goes through
+        // `icon` (`ImageSrc::svg_markup`) the way every other Agent mark does.
+        // Handed to `svg` as a bare `&str` it was read as a URL, and the
+        // header drew the failed-image placeholder instead of a logo.
         dynamic(move || {
-            svg(agent_icon(&agent.get()))
+            svg(icon(agent_icon(&agent.get())))
                 .size(px(15.0))
                 .text_color(theme::text_muted)
         }),
