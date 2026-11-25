@@ -19,6 +19,20 @@ pub fn round_button(
     label: &'static str,
     on_press: impl Fn() + 'static,
 ) -> ButtonElement {
+    round_button_sized(icon, label, on_press, theme::ICON_MD)
+}
+
+/// [`round_button`] with a glyph of its own size.
+///
+/// A duotone mark — a quarter-opacity wash behind a thin outline — reads
+/// smaller than a solid stroke in the same box, so a control wearing one asks
+/// for a size the others do not.
+pub fn round_button_sized(
+    icon: ImageSrc,
+    label: &'static str,
+    on_press: impl Fn() + 'static,
+    glyph: f32,
+) -> ButtonElement {
     button()
         .accessibility_label(label)
         .on_press(on_press)
@@ -30,11 +44,7 @@ pub fn round_button(
         .justify_center()
         .active(|style| style.opacity(0.6))
         .disabled_style(|style| style.opacity(0.4))
-        .child(
-            svg(icon)
-                .size(px(theme::ICON_MD))
-                .text_color(theme::foreground),
-        )
+        .child(svg(icon).size(px(glyph)).text_color(theme::foreground))
 }
 
 /// A quiet icon control: a glyph with a touch target and no fill of its own.

@@ -2170,11 +2170,18 @@ fn timeline_view(
                                 .on_scroll({
                                     let on_load_older = on_load_older.clone();
                                     move |event: &ScrollEvent| {
+                                    // Only a transcript with somewhere to go
+                                    // offers the way back to its end. A page
+                                    // holding one short message has no scroll
+                                    // range at all, and the top padding alone
+                                    // can make the arithmetic below come out
+                                    // positive — which put a "jump to latest"
+                                    // button on a page that was already at it.
+                                    let overflow = event.content_size.height.0
+                                        - event.size.height.0;
                                     away_from_end.set(
-                                        event.content_size.height.0
-                                            - event.size.height.0
-                                            - event.offset.y.0
-                                            > 120.0,
+                                        overflow > 120.0
+                                            && overflow - event.offset.y.0 > 120.0,
                                     );
                                     // Reading near the top is the ask: fetch the
                                     // next page then, not when a button is
@@ -7299,11 +7306,15 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     // A speech bubble taking a plus, not a bare plus: the
                     // button makes a conversation, and the drawer's other plus
                     // makes a project — two marks that said the same thing sat
-                    // three rows apart.
-                    surface::round_button(
+                    // three rows apart. It is drawn a size larger than the
+                    // other controls' glyphs: its bubble is a quarter-opacity
+                    // wash behind a thin outline, which reads smaller than a
+                    // solid stroke at the same box.
+                    surface::round_button_sized(
                         icon!("chat-alt-add"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         move || on_new_session(),
+                        theme::ICON_MD + 5.0,
                     )
                 }),
         )

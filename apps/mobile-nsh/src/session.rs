@@ -257,6 +257,14 @@ pub struct SessionService {
     auto_continue_paused: Signal<Vec<String>>,
     scheduled_sends: Signal<Vec<ScheduledSendView>>,
     new_session_open: Signal<bool>,
+    /// The turn a just-created session is waiting on, drawn before the runtime
+    /// has answered.
+    ///
+    /// Creating a session goes to the paired computer, and over a link that is
+    /// still pairing that takes a while. The reader has already sent their
+    /// first message by then, so the page shows it at once with a working
+    /// header over it, and the runtime's own rows replace it when they arrive.
+    pending_turn: Signal<Option<PendingTurn>>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtimes: Signal<Vec<RuntimeChoice>>,
     new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
@@ -487,6 +495,7 @@ impl SessionService {
             auto_continue_paused: signal(Vec::new()),
             scheduled_sends: signal(Vec::new()),
             new_session_open: signal(false),
+            pending_turn: signal(None),
             new_workspaces: signal(Vec::new()),
             new_runtimes: signal(Vec::new()),
             new_runtime_options: Rc::new(RefCell::new(Vec::new())),
@@ -3435,6 +3444,32 @@ impl SessionService {
             }
         }
         drop(disclosures);
+        // The reader's own turn, when the session it belongs to is still being
+        // made: their message and a working header, so the page says work has
+        // begun before the runtime can say anything at all.
+        if let Some(pending) = self.pending_turn.get_untracked()
+            && active.as_deref() == Some(pending.session_id.as_str())
+            && entries.is_empty()
+        {
+            entries.push(TimelineEntry {
+                id: format!("pending-turn:{}", pending.session_id),
+                kind: EntryKind::User,
+                body: pending.text.clone(),
+                attachments: pending.attachments.clone(),
+                started_at_ms: pending.started_at_ms,
+                ..TimelineEntry::default()
+            });
+            entries.push(TimelineEntry {
+                id: format!("pending-live:{}", pending.session_id),
+                kind: EntryKind::Generating,
+                title: copy::text("Agent", "Agent", "Agent").to_owned(),
+                body: format!("{}…", copy::text("Preparing", "准备中", "準備中")),
+                streaming: true,
+                turn_id: format!("pending-turn:{}", pending.session_id),
+                started_at_ms: pending.started_at_ms,
+                ..TimelineEntry::default()
+            });
+        }
         let latest_ended_normally = turns
             .last()
             .is_some_and(|turn| turn.complete && !turn.failed && !turn.pending_permission);
@@ -3454,6 +3489,10 @@ impl SessionService {
             .unwrap_or(0);
         drop(model);
         self.timeline.set(entries);
+        // The runtime's rows have arrived, so the placeholder turn steps aside.
+        // It is dropped after the real ones are in place, never before: the
+        // page must not be empty in between.
+        self.settle_pending_turn();
         self.plan.set(plan);
         self.goal.set(goal);
         self.needs_continue.set(needs_continue);
@@ -4766,6 +4805,44 @@ impl SessionService {
         self.persist_pins();
     }
 
+    /// Gives a session being made its row in the drawer, before it exists.
+    ///
+    /// The drawer is built from the runtime's own list, which has nothing to
+    /// say about a session whose request is still in flight. Without a row the
+    /// reader who just created one would be looking at a drawer that does not
+    /// contain it.
+    fn record_pending_session(
+        &self,
+        session_id: &VibexSessionId,
+        workspace: &WorkspaceSummary,
+        title: &str,
+    ) {
+        let id = session_id.as_str().to_owned();
+        let row = SessionSummary {
+            id: id.clone(),
+            title: title.to_owned(),
+            agent: String::new(),
+            meta: age(unix_timestamp_ms()),
+            state: SessionState::Running,
+            terminal: false,
+            project_id: workspace.project.id.as_str().to_owned(),
+            project_name: workspace.project.name.clone(),
+            workspace_id: workspace.workspace.id.as_str().to_owned(),
+            workspace_label: workspace
+                .git_branch
+                .clone()
+                .filter(|branch| !branch.trim().is_empty())
+                .unwrap_or_default(),
+        };
+        self.sessions.update(|sessions| {
+            if let Some(existing) = sessions.iter_mut().find(|existing| existing.id == id) {
+                *existing = row;
+            } else {
+                sessions.insert(0, row);
+            }
+        });
+    }
+
     fn record_sidebar_session(&self, session: &AgentSession) {
         self.session_records.update(|sessions| {
             if let Some(existing) = sessions
@@ -5657,8 +5734,15 @@ impl SessionService {
         self.new_busy.set(true);
         self.new_error.set(None);
         let draft = self.new_session_draft();
+        // The id is made here rather than left to the runtime, because the page
+        // opens on it before the request goes out: the runtime takes the id it
+        // is given, so the page the reader is looking at is the session being
+        // made.
+        let session_id = VibexSessionId::new();
+        self.begin_pending_turn(&session_id, &workspace, &draft);
         let service = self.clone();
         let backend = self.backend.clone();
+        let request_id = session_id.clone();
         // The sheet closes as soon as the session exists, so this task must
         // not be owned by it: it would be cancelled before it ever ran, and
         // the session would never be made at all.
@@ -5669,7 +5753,7 @@ impl SessionService {
                 workspace_mode: workspace.workspace.mode,
                 title: draft.title.clone(),
                 safety: None,
-                session_id: Some(VibexSessionId::new()),
+                session_id: Some(request_id),
                 defer_runtime_materialization: false,
                 tools: Default::default(),
             };
@@ -5681,12 +5765,55 @@ impl SessionService {
                 Ok(Ok(session)) => {
                     service.finish_new_session(session, draft);
                 }
-                Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
-                Err(error) => service.new_error.set(Some(
-                    format!("creating the session did not finish: {error}").into(),
-                )),
+                Ok(Err(error)) => {
+                    // Nothing was made, so nothing may keep showing a turn the
+                    // runtime will never answer for.
+                    service.pending_turn.set(None);
+                    service.new_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.pending_turn.set(None);
+                    service.new_error.set(Some(
+                        format!("creating the session did not finish: {error}").into(),
+                    ));
+                }
             }
         });
+    }
+
+    /// Puts the reader's own turn on the page while the session is being made.
+    ///
+    /// The sheet closes the moment they press create, and the runtime may take
+    /// a while to answer over a link that is still pairing. Showing their
+    /// message with a working header over it is the difference between "this
+    /// has begun" and "this app is stuck".
+    fn begin_pending_turn(
+        &self,
+        session_id: &VibexSessionId,
+        workspace: &WorkspaceSummary,
+        draft: &NewSessionDraft,
+    ) {
+        let title = draft
+            .title
+            .clone()
+            .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.trim().to_owned()))
+            .unwrap_or_else(|| copy::text("New session", "新建会话", "新增工作階段").to_owned());
+        self.new_session_open.set(false);
+        self.new_session_folder.set(None);
+        // A row of its own in the drawer, so the session the reader is on is
+        // where they expect it, under the words they just wrote.
+        self.record_pending_session(session_id, workspace, &title);
+        self.pending_turn.set(Some(PendingTurn {
+            session_id: session_id.as_str().to_owned(),
+            text: draft.text.clone(),
+            attachments: draft.attachments.clone(),
+            title,
+            started_at_ms: unix_timestamp_ms(),
+        }));
+        self.open(session_id.as_str());
+        // `open` clears the transcript and reads nothing back yet, so the
+        // placeholder turn is what puts the reader's own message on the page.
+        self.publish();
     }
 
     fn new_session_draft(&self) -> NewSessionDraft {
@@ -5735,10 +5862,42 @@ impl SessionService {
         }
         self.new_session_folder.set(None);
         self.refresh();
+        // The placeholder turn stays up through the handover. `open` clears the
+        // transcript, and the message it carries is only on its way: dropping
+        // it here would leave the page blank at the exact moment the reader is
+        // watching for their words to appear.
+        self.pending_turn.update(|pending| {
+            if let Some(pending) = pending.as_mut() {
+                pending.session_id = session.id.as_str().to_owned();
+            }
+        });
         self.open(session.id.as_str());
+        self.publish();
         if !draft.text.is_empty() || !draft.attachments.is_empty() {
             self.deliver(draft.text, draft.attachments, Vec::new(), false);
         }
+    }
+
+    /// Takes the placeholder turn down once the runtime's own rows are here.
+    fn settle_pending_turn(&self) {
+        let Some(pending) = self.pending_turn.get_untracked() else {
+            return;
+        };
+        if self.active.get_untracked().as_deref() != Some(pending.session_id.as_str()) {
+            self.pending_turn.set(None);
+            return;
+        }
+        // Only once the transcript has something of its own to show. The
+        // placeholder's own rows are not it: they are what is being replaced.
+        let real = self.timeline.with(|entries| {
+            entries
+                .iter()
+                .any(|entry| !entry.id.starts_with("pending-turn:") && !entry.id.starts_with("pending-live:"))
+        });
+        if !real {
+            return;
+        }
+        self.pending_turn.set(None);
     }
 
     fn browse_project_dirs(&self, path: Option<String>) {
@@ -8180,6 +8339,27 @@ struct NewSessionDraft {
     title: Option<String>,
     text: String,
     attachments: Vec<AttachmentItem>,
+}
+
+/// A turn the page draws before the runtime has answered for it.
+///
+/// A session is made on the paired computer, and the reader's first message is
+/// already written when the request goes out. Waiting for the answer before
+/// showing anything reads as a broken app — the sheet is gone, the page is
+/// empty, and nothing says work has begun. This is what the transcript shows
+/// meanwhile: their message, and a working header over it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PendingTurn {
+    /// The session the sheet was for, so a turn is only drawn on its own page.
+    session_id: String,
+    /// What the reader wrote, as the bubble shows it.
+    text: String,
+    attachments: Vec<AttachmentItem>,
+    /// The title the drawer and the conversation's header use until the
+    /// runtime's own arrives. The reader's own words say more than
+    /// "New session" does.
+    title: String,
+    started_at_ms: i64,
 }
 
 enum TerminalCommand {
