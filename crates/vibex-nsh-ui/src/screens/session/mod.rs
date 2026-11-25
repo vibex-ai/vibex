@@ -2655,10 +2655,10 @@ fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -
         .items_center()
         .gap(px(theme::SPACING_SM))
         // The row sits directly above the composer, and the prompt card is a
-        // surface of its own: the air under it keeps the two from reading as
-        // one block.
+        // surface of its own: generous air under it keeps the status line clear
+        // of the bottom fade and the prompt card below.
         .pt(px(theme::SPACING_MD))
-        .pb(px(theme::SPACING_XL))
+        .pb(px(theme::SPACING_XL * 2.0))
         .child(crate::ui::activity::activity_v(clock, theme::text_muted))
         .child(
             text(move || body.get())

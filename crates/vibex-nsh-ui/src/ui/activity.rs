@@ -15,11 +15,17 @@ pub const ACTIVITY_SLOT: f32 = 20.0;
 /// One lap of the highlight, in milliseconds: eight spinner frames at 100 ms.
 const ACTIVITY_LAP_MS: f32 = 800.0;
 
-/// One lap of the V's highlight.
+/// One full back-and-forth cycle of the V's highlight, in milliseconds.
 ///
-/// The desktop's timeline indicator takes this long to walk the mark, and the
-/// two clients read as the same thing only at the same speed.
+/// The desktop's timeline indicator takes this long to sweep from left to right
+/// and back to the left, and the two clients read as the same thing only at
+/// the same speed.
 pub const V_LAP_MS: f32 = 2100.0;
+/// Interpolation breakpoints sampled across one back-and-forth V sweep.
+///
+/// Dense enough that every dot reaches its peak smoothly along the cosine
+/// bounce without clipping between linear segments.
+const V_STOPS: usize = 48;
 /// The dots, in ring order: down the left column, back up the right one.
 const RING: [(f32, f32); 6] = [
     (0.0, 0.0),
@@ -46,10 +52,9 @@ impl ActivityClock {
 
     /// The same clock, lapping in `lap_ms`.
     ///
-    /// The V walks a longer path than the ring does — seven dots from one tip
-    /// to the other, not six around a cell — and it reads as a sweep rather
-    /// than a turn: the desktop gives it 2100 ms, and at the ring's 800 ms the
-    /// highlight jumps between dots instead of travelling.
+    /// The V sweeps back and forth across seven dots from left to right and
+    /// back again: the desktop gives one full round-trip 2100 ms, and at the
+    /// ring's 800 ms the highlight jumps between dots instead of travelling.
     pub fn with_lap(lap_ms: f32) -> Self {
         let phase = animated_value(0.0);
         let moving = !crate::motion::reduce_motion();
@@ -68,6 +73,20 @@ fn brightness(index: usize, head: f32) -> f32 {
     let offset = (index as f32 - head).rem_euclid(lap);
     let distance = offset.min(lap - offset);
     let intensity = 0.5 + 0.5 * (distance / lap * std::f32::consts::TAU).cos();
+    0.28 + 0.72 * intensity
+}
+
+/// How bright dot `index` of the V is at normalized cycle `phase` (`0.0..=1.0`).
+///
+/// Matches the desktop's timeline indicator (`timeline_mark`): the highlight
+/// eases from the left tip (`head = 0.0`) to the right tip (`head = 1.0`) over
+/// the first half of the cycle, then back from right to left over the second
+/// half, forming a seamless back-and-forth loop.
+fn v_brightness(index: usize, phase: f32) -> f32 {
+    let head = 0.5 - 0.5 * (phase * std::f32::consts::TAU).cos();
+    let position = index as f32 / (V_DOTS.len() - 1) as f32;
+    let distance = ((position - head).abs() / 0.42).min(1.0);
+    let intensity = 0.5 + 0.5 * (distance * std::f32::consts::PI).cos();
     0.28 + 0.72 * intensity
 }
 
@@ -115,8 +134,8 @@ pub fn activity_ring(clock: ActivityClock, color: impl Fn() -> Hsla + Copy + 'st
 ///
 /// They follow the mark from its left tip down to the point and back up to the
 /// right one: the path the desktop's timeline indicator walks. One highlight
-/// travels that stroke, so the shape reads as the product's V rather than as a
-/// generic spinner.
+/// sweeps left-to-right and back right-to-left along that stroke, so the shape
+/// reads as the product's V rather than as a generic spinner.
 const V_DOTS: [(f32, f32); 7] = [
     (0.14, 0.20),
     (0.26, 0.40),
@@ -127,15 +146,17 @@ const V_DOTS: [(f32, f32); 7] = [
     (0.86, 0.20),
 ];
 
-/// The V of dots, with one highlight walking its stroke.
+/// The V of dots, with one highlight sweeping left-to-right and back again.
 ///
 /// The mark a running turn leads with on the desktop. The dots sit on the V's
-/// own path and the highlight is a brightness wave along it, so the glyph is
-/// the product's mark and the motion happens inside it.
+/// own path and the highlight is a back-and-forth brightness wave along it, so
+/// the glyph is the product's mark and the motion happens inside it.
 pub fn activity_v(clock: ActivityClock, color: impl Fn() -> Hsla + Copy + 'static) -> View {
     let size = ACTIVITY_SLOT;
     let diameter = size * 0.16;
-    let stops: Vec<f32> = (0..=12).map(|step| step as f32 / 12.0).collect();
+    let stops: Vec<f32> = (0..=V_STOPS)
+        .map(|step| step as f32 / V_STOPS as f32)
+        .collect();
     view()
         .w(px(size))
         .h(px(size))
@@ -159,11 +180,11 @@ pub fn activity_v(clock: ActivityClock, color: impl Fn() -> Hsla + Copy + 'stati
                     if clock.moving {
                         let levels: Vec<f32> = stops
                             .iter()
-                            .map(|stop| brightness(index, stop * V_DOTS.len() as f32))
+                            .map(|&stop| v_brightness(index, stop))
                             .collect();
                         dot.bind_opacity(&clock.phase.interpolate(&stops, &levels))
                     } else {
-                        dot.opacity(brightness(index, 0.0))
+                        dot.opacity(1.0)
                     }
                 }),
         )
@@ -196,5 +217,53 @@ mod tests {
         }
         assert!(V_DOTS[3].1 > V_DOTS[0].1);
         assert!(V_DOTS[3].1 > V_DOTS[6].1);
+    }
+
+    /// The V highlight sweeps left-to-right on the first half of the cycle,
+    /// reverses right-to-left on the second half, and closes seamlessly.
+    #[test]
+    fn the_v_highlight_sweeps_left_to_right_and_back() {
+        // Left tip peaks at phase 0.0, center at 0.25, right tip at 0.5, center
+        // again at 0.75, and back to left tip at 1.0.
+        assert!((v_brightness(0, 0.0) - 1.0).abs() < 1e-5);
+        assert!((v_brightness(6, 0.0) - 0.28).abs() < 1e-5);
+        assert!((v_brightness(3, 0.25) - 1.0).abs() < 1e-5);
+        assert!((v_brightness(6, 0.5) - 1.0).abs() < 1e-5);
+        assert!((v_brightness(0, 0.5) - 0.28).abs() < 1e-5);
+        assert!((v_brightness(3, 0.75) - 1.0).abs() < 1e-5);
+
+        // Seamless loop closure and mirror symmetry between outbound and return.
+        for index in 0..V_DOTS.len() {
+            assert!((v_brightness(index, 0.0) - v_brightness(index, 1.0)).abs() < 1e-5);
+            for step in 0..=V_STOPS {
+                let phase = step as f32 / V_STOPS as f32;
+                assert!(
+                    (v_brightness(index, phase) - v_brightness(index, 1.0 - phase)).abs() < 1e-5,
+                    "dot {index} is not symmetric between outbound and return at phase {phase}"
+                );
+            }
+        }
+
+        // Across the outbound half (0.0..=0.5), each dot peaks strictly later
+        // than the one to its left, and reaches full brightness under V_STOPS.
+        let half = V_STOPS / 2;
+        let mut previous_peak_step = None;
+        for index in 0..V_DOTS.len() {
+            let (peak_step, peak_value) = (0..=half)
+                .map(|step| (step, v_brightness(index, step as f32 / V_STOPS as f32)))
+                .max_by(|a, b| a.1.total_cmp(&b.1))
+                .unwrap();
+            assert!(
+                peak_value > 0.98,
+                "dot {index} only reached {peak_value} at V_STOPS={V_STOPS}"
+            );
+            if let Some(prev) = previous_peak_step {
+                assert!(
+                    peak_step > prev,
+                    "dot {index} peaked at step {peak_step}, not after previous dot at {prev}"
+                );
+            }
+            previous_peak_step = Some(peak_step);
+        }
     }
 }
