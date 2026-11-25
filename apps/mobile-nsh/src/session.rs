@@ -106,6 +106,13 @@ const TIMELINE_LIMIT: u32 = 200;
 /// reader has no way back but to leave the session.
 const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
 
+/// How long one folder in the project picker may take to list.
+///
+/// Same failure as [`OPEN_TIMEOUT`], with a worse symptom: the picker's busy
+/// flag gates every press, so a browse that never returns leaves every folder
+/// dead and the sheet saying "Loading…".
+const BROWSE_TIMEOUT: Duration = Duration::from_secs(15);
+
 /// Where the per-session composer drafts are kept.
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 /// Where the newest transcript window of the last few sessions is kept.
@@ -5737,15 +5744,28 @@ impl SessionService {
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
         spawn(async move {
-            let result = crate::runtime::handle()
-                .spawn(async move { workspaces.browse_authority_directories(path).await })
+            // A browse on a link that stopped answering never comes back, and
+            // `project_busy` stays set: every folder in the picker then does
+            // nothing, and the sheet sits on "Loading…" forever. The wait is
+            // bounded so the reader is told and the picker takes presses again.
+            // The bound is on the runtime's clock, around the fetch: awaiting
+            // `timeout` in the engine thread's executor never fires, since that
+            // executor has no timer.
+            let fetched = crate::runtime::handle()
+                .spawn(async move {
+                    tokio::time::timeout(
+                        BROWSE_TIMEOUT,
+                        workspaces.browse_authority_directories(path),
+                    )
+                    .await
+                })
                 .await;
             if !service.alive.get() {
                 return;
             }
             service.project_busy.set(false);
-            match result {
-                Ok(Ok(listing)) => {
+            match fetched {
+                Ok(Ok(Ok(listing))) => {
                     service.project_dirs.set(
                         listing
                             .entries
@@ -5760,7 +5780,15 @@ impl SessionService {
                     service.project_dir_parent.set(listing.parent);
                     service.project_roots.set(listing.roots);
                 }
-                Ok(Err(error)) => service.project_error.set(Some(error_text(&error))),
+                Ok(Ok(Err(error))) => service.project_error.set(Some(error_text(&error))),
+                Ok(Err(_elapsed)) => service.project_error.set(Some(
+                    copy::text(
+                        "The folder did not arrive in time.",
+                        "文件夹加载超时。",
+                        "資料夾載入逾時。",
+                    )
+                    .into(),
+                )),
                 Err(error) => service.project_error.set(Some(
                     format!("browsing the directories did not finish: {error}").into(),
                 )),
@@ -5778,14 +5806,19 @@ impl SessionService {
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
         spawn(async move {
+            // Same bound as the browse, and on the same clock: awaiting
+            // `timeout` in the engine thread's executor never fires, so it
+            // wraps the work inside the tokio task instead.
             let opened = crate::runtime::handle()
                 .spawn(async move {
-                    workspaces
-                        .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
+                    tokio::time::timeout(
+                        BROWSE_TIMEOUT,
+                        workspaces.open_workspace(MutationRequest::new(OpenWorkspaceRequest {
                             root_path: path,
                             mode: None,
-                        }))
-                        .await
+                        })),
+                    )
+                    .await
                 })
                 .await;
             if !service.alive.get() {
@@ -5793,7 +5826,7 @@ impl SessionService {
             }
             service.project_busy.set(false);
             match opened {
-                Ok(Ok(workspace)) => {
+                Ok(Ok(Ok(workspace))) => {
                     service.workspace_records.update(|spaces| {
                         if let Some(existing) = spaces
                             .iter_mut()
@@ -5806,8 +5839,18 @@ impl SessionService {
                     });
                     service.project_browser_open.set(false);
                 }
-                Ok(Err(error)) => {
+                Ok(Ok(Err(error))) => {
                     service.project_error.set(Some(error_text(&error)));
+                }
+                Ok(Err(_elapsed)) => {
+                    service.project_error.set(Some(
+                        copy::text(
+                            "Opening the project did not finish in time.",
+                            "打开项目超时。",
+                            "開啟專案逾時。",
+                        )
+                        .into(),
+                    ));
                 }
                 Err(error) => {
                     service.project_error.set(Some(
@@ -7813,29 +7856,15 @@ impl SessionService {
             // transcript filled from the cache with "Loading conversation…"
             // over it. The wait is bounded so the reader is told, and can try
             // again.
-            let result = match tokio::time::timeout(
-                OPEN_TIMEOUT,
-                crate::runtime::handle().spawn(fetch_page(backend, session_id.clone())),
-            )
-            .await
-            {
-                Ok(result) => result,
-                Err(_) => {
-                    if service.alive.get()
-                        && service.active.get_untracked().as_deref() == Some(session_id.as_str())
-                    {
-                        service.conversation.set(ConversationState::Failed(
-                            copy::text(
-                                "The conversation did not arrive in time.",
-                                "会话加载超时。",
-                                "工作階段載入逾時。",
-                            )
-                            .into(),
-                        ));
-                    }
-                    return;
-                }
-            };
+            // The bound runs on the runtime's own clock: `timeout` awaited in
+            // the engine thread's executor never fires, because that executor
+            // has no timer. It goes around the fetch, inside the tokio task.
+            let fetch_id = session_id.clone();
+            let fetched = crate::runtime::handle()
+                .spawn(async move {
+                    tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
+                })
+                .await;
             if !service.alive.get() {
                 return;
             }
@@ -7844,11 +7873,19 @@ impl SessionService {
             if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
                 return;
             }
-            match result {
-                Ok(Ok(page)) => service.apply_page(&session_id, page),
-                Ok(Err(error)) => service
+            match fetched {
+                Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
+                Ok(Ok(Err(error))) => service
                     .conversation
                     .set(ConversationState::Failed(error_text(&error))),
+                Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
+                    copy::text(
+                        "The conversation did not arrive in time.",
+                        "会话加载超时。",
+                        "工作階段載入逾時。",
+                    )
+                    .into(),
+                )),
                 Err(error) => service.conversation.set(ConversationState::Failed(
                     format!("opening the session did not finish: {error}").into(),
                 )),

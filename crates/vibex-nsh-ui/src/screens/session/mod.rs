@@ -896,7 +896,7 @@ pub fn session(host: SessionHost) -> impl IntoElement {
             established.set(true);
         }
     });
-    view().flex_1().bg(theme::block_page).child(
+    view().flex_1().bg(theme::block_page_adaptive()).child(
         when(
             move || {
                 !established.get()
@@ -1207,7 +1207,7 @@ fn shell(
         // The page tone the cards sit on: where a palette makes the card and
         // the page the same white, this is the step between them, and the
         // floating bar's glass has something to be glass over.
-        .bg(theme::block_page)
+        .bg(theme::block_page_adaptive())
         .flex_col()
         .test_id("conversation-page")
         .child(header(host.clone(), pager, overlays))
@@ -2622,10 +2622,13 @@ fn step_line(
 
 /// The line that says the Agent is at work before it has anything to show.
 ///
-/// The product's own V leads it, pulsing, rather than a ring: that is the mark
-/// the desktop draws while a turn runs, and it says who is working where a
-/// spinner says only that something is.
+/// A V of dots leads it, one highlight walking the stroke: the mark the
+/// desktop's timeline draws while a turn runs, so both clients say "still
+/// working" with the same thing.
 fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -> impl IntoElement {
+    // The V walks its own, slower lap: the row's shared clock is timed for the
+    // ring, and at that speed the highlight jumps along the stroke.
+    let clock = crate::ui::activity::ActivityClock::with_lap(crate::ui::activity::V_LAP_MS);
     view()
         .w_full()
         .flex_row()
@@ -2634,14 +2637,9 @@ fn working_row(body: Memo<String>, _clock: crate::ui::activity::ActivityClock) -
         // The row sits directly above the composer, and the prompt card is a
         // surface of its own: the air under it keeps the two from reading as
         // one block.
-        .pt(px(theme::SPACING_SM))
-        .pb(px(theme::SPACING_MD))
-        .child(
-            view()
-                .flex_shrink_0()
-                .animate_pulse()
-                .child(crate::ui::brand::mark(15.0)),
-        )
+        .pt(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_XL))
+        .child(crate::ui::activity::activity_v(clock, theme::text_muted))
         .child(
             text(move || body.get())
                 .flex_1()
@@ -7191,7 +7189,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         // The two side pages are one product surface with the conversation
         // between them, so this page takes the same tone as the pages it
         // slides over rather than the dimmed field grouped pages use.
-        .bg(theme::block_page)
+        .bg(theme::block_page_adaptive())
         .test_id("sessions-page")
         .pt_safe_area()
         // The page carries the drawer's search field: the keyboard takes its

@@ -298,12 +298,26 @@ pub fn block_surface() -> Hsla {
     background_card()
 }
 
-/// [`block_page`] as an adaptive color.
+/// [`block_page`] as an adaptive color, one value per appearance.
+///
+/// It cannot be built from [`block_page`]: that answers for the appearance in
+/// force, so filling both fields with it froze the light tone into the dark
+/// palette — the top band stayed white after a switch to dark.
 pub fn block_page_adaptive() -> AdaptiveColor {
-    let page = block_page();
+    let card = theme().card;
+    let page = theme().background;
+    let grey = adaptive_token("secondary");
     AdaptiveColor {
-        light: page,
-        dark: page,
+        light: if card.light == page.light {
+            grey.light
+        } else {
+            page.light
+        },
+        dark: if card.dark == page.dark {
+            grey.dark
+        } else {
+            page.dark
+        },
     }
 }
 

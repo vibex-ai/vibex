@@ -387,7 +387,7 @@ pub fn pager(
         .flex_1()
         .relative()
         .overflow_hidden()
-        .bg(theme::block_page)
+        .bg(theme::block_page_adaptive())
         .pan_values(Some(&pager.drag), None)
         .pan_enabled(true)
         .on_pan_start(move |event: &PanEvent| pager.pan_started(event))
@@ -410,13 +410,13 @@ pub fn pager(
         )
         .child(
             side_page(move || pager.sessions_shown.get())
-                .bg(theme::block_page)
+                .bg(theme::block_page_adaptive())
                 .bind_translate_x(&sessions_x)
                 .child(sessions),
         )
         .child(
             side_page(move || pager.workbench_shown.get())
-                .bg(theme::block_page)
+                .bg(theme::block_page_adaptive())
                 .bind_translate_x(&workbench_x)
                 .child(when(move || pager.workbench_made.get(), workbench)),
         )

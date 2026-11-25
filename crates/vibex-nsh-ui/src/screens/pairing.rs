@@ -385,7 +385,7 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
         .flex_1()
         .relative()
         .items_center()
-        .bg(theme::block_page)
+        .bg(theme::block_page_adaptive())
         .px(px(theme::SPACING_XL))
         .pt_safe_area()
         // The keyboard takes its room out of the page rather than pushing the
@@ -1605,7 +1605,7 @@ fn details_page(host: PairingHost) -> impl IntoElement {
         .absolute()
         .inset(px(0.0))
         .z_index(10)
-        .bg(theme::block_page)
+        .bg(theme::block_page_adaptive())
         .on_press(|| {})
         .child(when(move || details.get().is_some(), {
             let on_close = on_close.clone();
