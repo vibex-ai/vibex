@@ -99,6 +99,13 @@ use crate::{pairing::error_text, sidebar};
 /// How many timeline items one read asks for.
 const TIMELINE_LIMIT: u32 = 200;
 
+/// How long a session's first page may take before the page says so.
+///
+/// A remote runtime behind a link that stopped answering leaves the fetch
+/// pending forever; without a bound the page keeps its loading hint up and the
+/// reader has no way back but to leave the session.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+
 /// Where the per-session composer drafts are kept.
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
 /// Where the newest transcript window of the last few sessions is kept.
@@ -7801,12 +7808,40 @@ impl SessionService {
         let backend = self.backend.clone();
         let session_id = session_id.clone();
         spawn(async move {
-            let result = crate::runtime::handle()
-                .spawn(fetch_page(backend, session_id.clone()))
-                .await;
-            if !service.alive.get()
-                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            // A fetch on a link that stops answering never comes back, and the
+            // page would wait on it for as long as the session stays open: a
+            // transcript filled from the cache with "Loading conversation…"
+            // over it. The wait is bounded so the reader is told, and can try
+            // again.
+            let result = match tokio::time::timeout(
+                OPEN_TIMEOUT,
+                crate::runtime::handle().spawn(fetch_page(backend, session_id.clone())),
+            )
+            .await
             {
+                Ok(result) => result,
+                Err(_) => {
+                    if service.alive.get()
+                        && service.active.get_untracked().as_deref() == Some(session_id.as_str())
+                    {
+                        service.conversation.set(ConversationState::Failed(
+                            copy::text(
+                                "The conversation did not arrive in time.",
+                                "会话加载超时。",
+                                "工作階段載入逾時。",
+                            )
+                            .into(),
+                        ));
+                    }
+                    return;
+                }
+            };
+            if !service.alive.get() {
+                return;
+            }
+            // The reader may have moved to another session while this page was
+            // on its way: its rows are not theirs to see.
+            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
                 return;
             }
             match result {

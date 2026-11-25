@@ -1819,12 +1819,17 @@ fn timeline_view(
         pager.open(ShellPage::Workbench);
     };
     // The strips above take the bar's room when one of them is shown; the list
-    // takes it only when neither is (see its `content_padding_top`).
+    // takes it only when none is (see its `content_padding_top`).
     let tabs_above = group_tabs_visible(&host);
     let connection = host.connection;
-    let strip_above = computed(move || {
-        tabs_above.get() || connection.get() != ConnectionState::Online
-    });
+    let find_open = host.find_open;
+    let banner_above = computed(move || connection.get() != ConnectionState::Online);
+    // The tabs and the connection strip are siblings of the list, so when
+    // either is up it has already cleared the bar and the list starts under it.
+    let sibling_strip_above = computed(move || tabs_above.get() || banner_above.get());
+    // The find bar sits inside the list's own column, under those siblings:
+    // it clears the bar itself only when neither of them did.
+    let strip_above = computed(move || sibling_strip_above.get() || find_open.get());
     let source = host.timeline;
     let visible = computed(move || source.with(|entries| visible_timeline(entries)));
     let position_for = move |predicate: &dyn Fn(&TimelineEntry) -> bool| {
@@ -1872,7 +1877,6 @@ fn timeline_view(
             })
         },
     };
-    let find_open = host.find_open;
     let find_query = signal(String::new());
     let find_cursor = signal(0usize);
     let list_ref = element_ref();
@@ -2067,14 +2071,25 @@ fn timeline_view(
                     .child(when(move || find_open.get(), {
                         let close = find_open;
                         let find_reveal = find_reveal.clone();
+                        // The bar floats over the page, so the find bar clears
+                        // it here unless the tabs or the connection strip have
+                        // already taken that room. It also sits above the
+                        // glass: the band blurs what passes under it, and a
+                        // field being typed into must not be under it.
+                        let clear_bar = !sibling_strip_above.get_untracked();
                         move || {
-                            find_bar(
-                                find_query,
-                                find_matches,
-                                find_cursor,
-                                find_reveal.clone(),
-                                close,
-                            )
+                            view()
+                                .z_index(2)
+                                .style_when(move || clear_bar, |style| {
+                                    style.pt(px(top_bar_inset()))
+                                })
+                                .child(find_bar(
+                                    find_query,
+                                    find_matches,
+                                    find_cursor,
+                                    find_reveal.clone(),
+                                    close,
+                                ))
                         }
                     }))
                     // The older messages come by themselves: scrolling near the
@@ -2834,7 +2849,6 @@ fn entry_element(
                         sequence,
                         prompt,
                         jump,
-                        clock,
                         conclusion,
                         on_fork.clone(),
                     )
@@ -3172,7 +3186,6 @@ fn agent_prose(
     sequence: Memo<i64>,
     prompt: Memo<Option<i64>>,
     jump: Signal<Option<i64>>,
-    clock: crate::ui::activity::ActivityClock,
     conclusion: Memo<bool>,
     on_fork: Rc<dyn Fn(i64)>,
 ) -> impl IntoElement {
@@ -3188,14 +3201,9 @@ fn agent_prose(
         .pb(px(theme::SPACING_SM))
         // The prose stands on its own. The Agent that wrote it is named by the
         // turn's fold above, so a mark and a name over every paragraph only
-        // pushed the text the reader came for further down the page.
-        .child(when(move || streaming.get() && !conclusion.get(), move || {
-            view()
-                .flex_row()
-                .items_center()
-                .min_h(px(crate::ui::activity::ACTIVITY_SLOT))
-                .child(crate::ui::activity::activity_ring(clock, theme::primary))
-        }))
+        // pushed the text the reader came for further down the page — and a
+        // ring there, over a paragraph that is already arriving, only pushed
+        // it further. The fold's header says the turn is still working.
         .child(
             text_view()
                 .markdown(move || Some(body.get().into()))
