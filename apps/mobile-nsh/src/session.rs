@@ -7850,46 +7850,52 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         let session_id = session_id.clone();
-        spawn(async move {
-            // A fetch on a link that stops answering never comes back, and the
-            // page would wait on it for as long as the session stays open: a
-            // transcript filled from the cache with "Loading conversation…"
-            // over it. The wait is bounded so the reader is told, and can try
-            // again.
-            // The bound runs on the runtime's own clock: `timeout` awaited in
-            // the engine thread's executor never fires, because that executor
-            // has no timer. It goes around the fetch, inside the tokio task.
-            let fetch_id = session_id.clone();
-            let fetched = crate::runtime::handle()
-                .spawn(async move {
-                    tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
-                })
-                .await;
-            if !service.alive.get() {
-                return;
-            }
-            // The reader may have moved to another session while this page was
-            // on its way: its rows are not theirs to see.
-            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
-                return;
-            }
-            match fetched {
-                Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
-                Ok(Ok(Err(error))) => service
-                    .conversation
-                    .set(ConversationState::Failed(error_text(&error))),
-                Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
-                    copy::text(
-                        "The conversation did not arrive in time.",
-                        "会话加载超时。",
-                        "工作階段載入逾時。",
-                    )
-                    .into(),
-                )),
-                Err(error) => service.conversation.set(ConversationState::Failed(
-                    format!("opening the session did not finish: {error}").into(),
-                )),
-            }
+        // Detached, because the press that asked for this page outlives the
+        // surface that took it: `open` runs from a drawer row's callback, and
+        // opening a session tears that drawer down. A task owned by it would be
+        // cancelled before its first poll — the state would already be
+        // `Loading`, and the page would wait on a fetch that never started.
+        Owner::detached().run(move || {
+            spawn(async move {
+                // A fetch on a link that stops answering never comes back, and
+                // the page would wait on it for as long as the session stays
+                // open: a transcript filled from the cache with "Loading
+                // conversation…" over it. The wait is bounded so the reader is
+                // told, and can try again. The bound runs on the runtime's own
+                // clock: `timeout` awaited in the engine thread's executor
+                // never fires, because that executor has no timer.
+                let fetch_id = session_id.clone();
+                let fetched = crate::runtime::handle()
+                    .spawn(async move {
+                        tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
+                    })
+                    .await;
+                if !service.alive.get() {
+                    return;
+                }
+                // The reader may have moved to another session while this page
+                // was on its way: its rows are not theirs to see.
+                if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                match fetched {
+                    Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
+                    Ok(Ok(Err(error))) => service
+                        .conversation
+                        .set(ConversationState::Failed(error_text(&error))),
+                    Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
+                        copy::text(
+                            "The conversation did not arrive in time.",
+                            "会话加载超时。",
+                            "工作階段載入逾時。",
+                        )
+                        .into(),
+                    )),
+                    Err(error) => service.conversation.set(ConversationState::Failed(
+                        format!("opening the session did not finish: {error}").into(),
+                    )),
+                }
+            });
         });
     }
 
