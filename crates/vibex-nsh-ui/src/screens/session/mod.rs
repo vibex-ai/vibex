@@ -1264,19 +1264,22 @@ fn shell(
                 ))
                 .child(
                     view()
+                        .relative()
                         .flex_1()
                         .min_h(px(0.0))
                         .child(timeline_view(host.clone(), jump_to_message, pager, tab))
-                        .child(when(move || host.error.get().is_some(), {
+                        // A failure floats here and leaves on its own. Drawn
+                        // into the page it had no way out: it outlived the
+                        // condition it described, and the reader had to leave
+                        // the session to be rid of it.
+                        .child({
                             let error = host.error;
-                            move || {
-                                text(move || error.get().unwrap_or_default())
-                                    .text_size(px(theme::font_caption()))
-                                    .text_color(theme::accent_red)
-                                    .px(px(theme::SPACING_LG))
-                                    .pb(px(theme::SPACING_SM))
-                            }
-                        })),
+                            crate::ui::toast::toast(
+                                error,
+                                top_bar_inset() + theme::SPACING_SM,
+                                move || error.set(None),
+                            )
+                        }),
                 )
                 .child(when(
                     move || {

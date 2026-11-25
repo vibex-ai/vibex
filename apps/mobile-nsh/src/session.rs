@@ -135,6 +135,13 @@ struct CachedTimeline {
 const RECONNECT_MIN_MS: u64 = 500;
 const RECONNECT_MAX_MS: u64 = 15_000;
 
+/// How often an idle connection is pinged.
+///
+/// Well under the shortest idle timeout a carrier NAT or a home router is
+/// likely to use, and under the runtime's own thirty-second request timeout, so
+/// a dead link is found by a ping rather than by a request that mattered.
+const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+
 /// A user message the composer is replacing.
 #[derive(Clone, Debug)]
 struct EditState {
@@ -1509,8 +1516,35 @@ impl SessionService {
             }
             let mut got_event = false;
             let mut subscription = subscription;
+            // A socket that goes quiet is not a socket that is gone: a carrier
+            // NAT, a router, or a tunnel in between can drop the mapping while
+            // both ends still believe the connection is open. Nothing arrives
+            // to say so — the next request simply never gets an answer, and
+            // thirty seconds later the page reports a timeout on a link it
+            // never suspected. The ping is what keeps the mapping alive, and
+            // its failure is what tells us the link died while we were idle.
+            let mut heartbeat = timer(HEARTBEAT_INTERVAL);
             while self.alive.get() {
-                match subscription.next().await {
+                let next = tokio::select! {
+                    event = subscription.next() => Some(event),
+                    () = &mut heartbeat => None,
+                };
+                let Some(event) = next else {
+                    // Due a ping. A pong that does not come back is a link
+                    // that has gone; dropping the subscription makes the loop
+                    // reconnect rather than wait for a request to fail.
+                    let web = self.web.clone();
+                    let beat = crate::runtime::handle()
+                        .spawn(async move { web.transport().heartbeat().await })
+                        .await;
+                    if let Ok(Err(error)) = &beat {
+                        log::warn!("heartbeat failed: {} ({})", error.code, error.message);
+                        break;
+                    }
+                    heartbeat = timer(HEARTBEAT_INTERVAL);
+                    continue;
+                };
+                match event {
                     Ok(Some(event)) => {
                         got_event = true;
                         let lost = matches!(event, BackendEvent::Disconnected);
