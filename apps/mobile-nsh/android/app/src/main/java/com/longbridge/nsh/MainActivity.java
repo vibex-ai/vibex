@@ -86,16 +86,35 @@ public final class MainActivity extends Activity {
         NshHost.nativeSetCameraAvailable(true);
         NshHost.nativeSetDiscoveryAvailable(true);
         lanDiscovery = new LanDiscovery(this, NshHost::nativeDiscoveryEvent);
-        view = new NshView(this);
-        view.useStandaloneLimits();
-        setContentView(view);
-        if (state == null) {
-            view.handleUrlSchemeIntent(getIntent());
-            readSharedText(getIntent());
-            readShortcut(getIntent());
+        // Made again for a configuration change it does not take as it runs —
+        // an overlay changing its resources, such as the navigation mode or
+        // the wallpaper's colors — the activity takes over the app that was
+        // already running instead of starting a second one. Without this the
+        // new activity built a fresh NshView and the session, the draft and
+        // every open surface went with the old one.
+        Object last = getLastNonConfigurationInstance();
+        if (last instanceof Kept) {
+            Kept kept = (Kept) last;
+            view = kept.view;
+            // Its views and the windows it shows over the activity come back
+            // as they were, and it hears the new activity's environment.
+            view.enterActivity(this);
+            DevActivity.systemBars(this);
+        } else {
+            // A `MutableContextWrapper`, so the view can move to the activity
+            // the system makes next: `NshView.canMove` is false for a view
+            // built on the activity itself, and nothing would be kept.
+            view = new NshView(new android.content.MutableContextWrapper(this));
+            view.useStandaloneLimits();
+            setContentView(view);
+            if (state == null) {
+                view.handleUrlSchemeIntent(getIntent());
+                readSharedText(getIntent());
+                readShortcut(getIntent());
+            }
+            view.runRustApp("nsh");
+            DevActivity.systemBars(this);
         }
-        view.runRustApp("nsh");
-        DevActivity.systemBars(this);
         updateReceiver = new BroadcastReceiver() {
             @Override
             public void onReceive(Context context, Intent intent) {
@@ -205,6 +224,12 @@ public final class MainActivity extends Activity {
     public void onConfigurationChanged(android.content.res.Configuration config) {
         super.onConfigurationChanged(config);
         DevActivity.systemBars(this);
+        // A change the running activity does take (the window resized, the
+        // appearance switched): the bars are this activity's to redraw, and
+        // the view has to apply them again.
+        if (view != null) {
+            view.mounter().applySystemBars();
+        }
     }
 
     @Override
@@ -258,9 +283,36 @@ public final class MainActivity extends Activity {
         if (lanDiscovery != null) {
             lanDiscovery.stop();
         }
-        if (view != null) {
+        // The activity goes, the app does not: the system is making this one
+        // again for a configuration change, and `onCreate` will take the view
+        // over. Only a real exit destroys it.
+        if (isChangingConfigurations() && view != null && view.canMove()) {
+            view.leaveActivity();
+        } else if (view != null) {
             view.destroy();
         }
         super.onDestroy();
+    }
+
+    /**
+     * What the activity made again for a configuration change takes over: the
+     * running app, not a new one.
+     *
+     * The view is kept only when it can move ({@link NshView#canMove}), which
+     * needs the {@link android.content.MutableContextWrapper} `onCreate` gives
+     * it; otherwise the system gets `null` and starts the app over, as before.
+     */
+    @Override
+    public Object onRetainNonConfigurationInstance() {
+        return view != null && view.canMove() ? new Kept(view) : null;
+    }
+
+    /** The running app, handed to the activity the system makes next. */
+    private static final class Kept {
+        final NshView view;
+
+        Kept(NshView view) {
+            this.view = view;
+        }
     }
 }
