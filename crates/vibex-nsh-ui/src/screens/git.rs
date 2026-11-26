@@ -3,7 +3,7 @@
 use std::rc::Rc;
 
 use nsh_base::{ButtonElement, button};
-use nsh_core::prelude::*;
+use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::{
     copy, theme,
@@ -88,6 +88,8 @@ pub struct CommitRow {
     pub short_hash: String,
     pub subject: String,
     pub detail: String,
+    /// When it was authored, for the time shown beside it.
+    pub authored_at_ms: Option<i64>,
 }
 
 /// An opened diff.
@@ -106,8 +108,19 @@ pub struct GitDiffPreview {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CommitDetailPreview {
     pub title: String,
+    /// The raw message and patch, kept as the fallback for a runtime that
+    /// reports no per-file changes.
     pub body: String,
     pub truncated: bool,
+    /// The commit's first line.
+    pub subject: String,
+    /// The rest of its message, when it has one.
+    pub message_body: String,
+    pub author: String,
+    /// When it was authored, already written for the reader.
+    pub authored_at: String,
+    /// One entry per changed file, each with its own patch slice.
+    pub files: Vec<super::git_diff::CommitFileDiff>,
 }
 
 /// What the surface may do, and the state it shows.
@@ -158,6 +171,11 @@ pub struct GitHost {
     /// The commit history, on its own view.
     pub history: Signal<Vec<CommitRow>>,
     pub show_history: Signal<bool>,
+    /// Whether more pages of the history exist, and one is being read.
+    pub history_more: Signal<bool>,
+    pub history_loading: Signal<bool>,
+    /// The commit search, answered against the whole history.
+    pub history_query: Signal<String>,
     /// The commit being read, shown over the history.
     pub commit_detail: Signal<Option<CommitDetailPreview>>,
     pub on_open_commit: Rc<dyn Fn(&str)>,
@@ -165,6 +183,9 @@ pub struct GitHost {
     pub on_revert: Rc<dyn Fn(&str)>,
     pub on_commit: Rc<dyn Fn()>,
     pub on_toggle_history: Rc<dyn Fn()>,
+    /// Reads the next page of the history, and searches all of it.
+    pub on_load_more_history: Rc<dyn Fn()>,
+    pub on_search_history: Rc<dyn Fn(&str)>,
     /// Opens a path's diff; the second argument says whether it is the staged
     /// or the working-tree version.
     pub on_open_diff: OpenDiff,
@@ -274,6 +295,7 @@ fn git_overview(host: GitHost) -> impl IntoElement {
     let error = host.error;
     let history_host = host.clone();
     let change_host = host.clone();
+    let search_host = host.clone();
     let mode = |commits: bool, toggle: Rc<dyn Fn()>| {
         move || {
             if history.get_untracked() != commits {
@@ -300,13 +322,20 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                         when(
                             move || history.get(),
                             move || {
+                                let search = search_host.on_search_history.clone();
+                                let clear = search.clone();
                                 surface::field_pill()
                                     .w_full()
                                     .child(surface::field_glyph(icon!("search")))
                                     .child(
-                                        field::text_field_bare(
+                                        // The runtime filters the whole
+                                        // history, not the page already read,
+                                        // so a commit older than the first page
+                                        // is found too.
+                                        field::text_field_bare_with(
                                             query,
                                             copy::text("Search commits", "搜索提交", "搜尋提交"),
+                                            move |value| search(value),
                                         )
                                         .flex_1()
                                         .min_w(px(0.0))
@@ -315,13 +344,17 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                                     .child(when(
                                         move || !query.with(String::is_empty),
                                         move || {
+                                            let clear = clear.clone();
                                             surface::field_clear(
                                                 copy::text(
                                                     "Clear commit search",
                                                     "清除提交搜索",
                                                     "清除提交搜尋",
                                                 ),
-                                                move || query.set(String::new()),
+                                                move || {
+                                                    query.set(String::new());
+                                                    clear("");
+                                                },
                                             )
                                         },
                                     ))
@@ -387,30 +420,24 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                         }),
                     ),
                 )
-                .child(
-                    surface::ghost_button(
-                        icon!("refresh"),
-                        copy::text("Fetch", "获取", "擷取"),
-                        move || (host.on_fetch)(),
-                    )
-                    .disabled(move || busy.get()),
-                )
-                .child(
-                    surface::ghost_button(
-                        icon!("download"),
-                        copy::text("Pull", "拉取", "拉取"),
-                        move || (host.on_pull)(),
-                    )
-                    .disabled(move || busy.get()),
-                )
-                .child(
-                    surface::ghost_button(
-                        icon!("upload"),
-                        copy::text("Push", "推送", "推送"),
-                        move || (host.on_push)(),
-                    )
-                    .disabled(move || busy.get()),
-                ),
+                .child(remote_button(
+                    icon!("refresh"),
+                    copy::text("Fetch", "获取", "擷取"),
+                    busy,
+                    host.on_fetch.clone(),
+                ))
+                .child(remote_button(
+                    icon!("download"),
+                    copy::text("Pull", "拉取", "拉取"),
+                    busy,
+                    host.on_pull.clone(),
+                ))
+                .child(remote_button(
+                    icon!("upload"),
+                    copy::text("Push", "推送", "推送"),
+                    busy,
+                    host.on_push.clone(),
+                )),
         )
         // What is being read, the working tree or its history, and what can
         // be done to the changes as a whole.
@@ -550,10 +577,13 @@ fn git_overview(host: GitHost) -> impl IntoElement {
             when(
                 move || history.get(),
                 move || {
+                    let history_host = history_host.clone();
                     history_list(
                         history_host.history,
-                        query,
+                        history_host.history_more,
+                        history_host.history_loading,
                         history_host.on_open_commit.clone(),
+                        history_host.on_load_more_history.clone(),
                     )
                 },
             )
@@ -565,6 +595,37 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                     .child(commit_bar(change_host.clone()))
             }),
         )
+}
+
+/// One of the three ways the branch meets its remote, spinning while any of
+/// them runs so a slow fetch, pull or push is visibly working.
+fn remote_button(
+    glyph: ImageSrc,
+    label: &'static str,
+    busy: Signal<bool>,
+    on_press: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    view()
+        .relative()
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .child(surface::ghost_button(glyph, label, move || on_press()).disabled(move || busy.get()))
+        .child(when(
+            move || busy.get(),
+            || {
+                let clock = crate::ui::activity::ActivityClock::start();
+                view()
+                    .absolute()
+                    .inset(px(0.0))
+                    .items_center()
+                    .justify_center()
+                    .child(crate::ui::activity::activity_ring(
+                        clock,
+                        theme::text_secondary,
+                    ))
+            },
+        ))
 }
 
 /// A count of lines in the color of the side it counts.
@@ -1291,8 +1352,10 @@ fn branch_sheet(
                 move || on_close(),
             ))
             .child(
-                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
-                    sheet_body().child(sheet_card().child(each(
+                scroll()
+                    .flex_shrink(1.0)
+                    .min_h(px(0.0))
+                    .child(sheet_body().child(sheet_card().child(each(
                         move || branches.get(),
                         |branch| branch.name.clone(),
                         move |branch, _| {
@@ -1368,8 +1431,7 @@ fn branch_sheet(
                                     },
                                 ))
                         },
-                    ))),
-                ),
+                    )))),
             ),
     )
 }
@@ -1377,51 +1439,69 @@ fn branch_sheet(
 /// The history list.
 fn history_list(
     history: Signal<Vec<CommitRow>>,
-    query: Signal<String>,
+    has_more: Signal<bool>,
+    loading: Signal<bool>,
     on_open_commit: Rc<dyn Fn(&str)>,
+    on_load_more: Rc<dyn Fn()>,
 ) -> impl IntoElement {
-    let filtered = computed(move || {
-        query.with(|query| {
-            let query = query.trim().to_lowercase();
-            history.with(|history| {
-                history
-                    .iter()
-                    .filter(|commit| {
-                        query.is_empty()
-                            || commit.subject.to_lowercase().contains(&query)
-                            || commit.detail.to_lowercase().contains(&query)
-                            || commit.short_hash.to_lowercase().contains(&query)
-                            || commit.hash.to_lowercase().contains(&query)
-                    })
-                    .cloned()
-                    .collect::<Vec<_>>()
-            })
-        })
-    });
     view().flex_1().min_h(px(0.0)).flex_col().child(
         virtual_list(
-            move || filtered.with(|filtered| filtered.len()),
-            move |at: Position| history_row(at, filtered, on_open_commit.clone()),
+            move || history.with(Vec::len),
+            move |at: Position| history_row(at, history, on_open_commit.clone()),
         )
         .keys(move || {
-            filtered.with(|filtered| {
-                filtered
+            history.with(|history| {
+                history
                     .iter()
                     .map(|commit| commit.hash.clone())
                     .collect::<Vec<_>>()
             })
         })
         .estimated_item_size(px(HISTORY_ROW_HEIGHT))
+        // Reaching the end walks one more page back through the history.
+        .on_load_more(move || on_load_more())
+        .footer(history_footer(history, has_more, loading))
         .flex_1(),
     )
 }
 
+/// The strip under the history: the next page on its way, or the end of it.
+fn history_footer(
+    history: Signal<Vec<CommitRow>>,
+    has_more: Signal<bool>,
+    loading: Signal<bool>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_shrink_0()
+        .py(px(theme::SPACING_MD))
+        .items_center()
+        .justify_center()
+        .child(when(
+            move || loading.get(),
+            || {
+                let clock = crate::ui::activity::ActivityClock::start();
+                crate::ui::activity::activity_ring(clock, theme::text_muted)
+            },
+        ))
+        .child(when(
+            move || {
+                !loading.get() && !has_more.get() && history.with(|history| !history.is_empty())
+            },
+            || {
+                text(copy::text("End of history", "已到最早提交", "已到最早提交"))
+                    .text_size(px(theme::font_micro()))
+                    .text_color(theme::text_muted)
+            },
+        ))
+}
+
 /// A commit in the history list.
-const HISTORY_ROW_HEIGHT: f32 = 56.0;
+const HISTORY_ROW_HEIGHT: f32 = 60.0;
 
 fn history_row(
     at: Position,
-    history: Memo<Vec<CommitRow>>,
+    history: Signal<Vec<CommitRow>>,
     on_open_commit: Rc<dyn Fn(&str)>,
 ) -> impl IntoElement {
     let commit = computed(move || history.with(|history| history.get(at.index()).cloned()));
@@ -1474,7 +1554,14 @@ fn history_row(
                     text(move || {
                         commit.with(|commit| {
                             commit.as_ref().map_or(String::new(), |commit| {
-                                format!("{} · {}", commit.short_hash, commit.detail)
+                                let mut line = format!("{} · {}", commit.short_hash, commit.detail);
+                                if let Some(stamp) =
+                                    commit.authored_at_ms.and_then(format_commit_time)
+                                {
+                                    line.push_str(" · ");
+                                    line.push_str(&stamp);
+                                }
+                                line
                             })
                         })
                     })
@@ -1486,63 +1573,31 @@ fn history_row(
         .child(surface::chevron())
 }
 
-/// A long text, one virtualized row per line, so it scrolls. A line of a
-/// patch is read by its first character: what was added, what was taken
-/// away, and where the hunk stands.
-fn line_list(lines: Memo<Vec<String>>) -> impl IntoElement {
-    #[derive(Clone, Copy, PartialEq)]
-    enum Kind {
-        Added,
-        Removed,
-        Hunk,
-        Plain,
+/// When a commit was authored, written compactly for the history list: the
+/// clock time for today, and the date for anything older.
+fn format_commit_time(authored_at_ms: i64) -> Option<String> {
+    if authored_at_ms <= 0 {
+        return None;
     }
-    fn kind(line: &str) -> Kind {
-        if line.starts_with('+') && !line.starts_with("+++") {
-            Kind::Added
-        } else if line.starts_with('-') && !line.starts_with("---") {
-            Kind::Removed
-        } else if line.starts_with("@@") {
-            Kind::Hunk
-        } else {
-            Kind::Plain
+    let seconds = (now_ms() - authored_at_ms).max(0) / 1_000;
+    Some(match seconds {
+        0..=59 => copy::text("now", "刚刚", "剛剛").to_owned(),
+        60..=3_599 => format!("{}m", seconds / 60),
+        3_600..=86_399 => format!("{}h", seconds / 3_600),
+        86_400..=2_591_999 => format!("{}d", seconds / 86_400),
+        _ => {
+            let days = seconds / 86_400;
+            format!("{}d", days)
         }
-    }
-    view().flex_1().min_h(px(0.0)).child(
-        virtual_list(
-            move || lines.with(|lines| lines.len()),
-            move |at: Position| {
-                let line = computed(move || {
-                    lines.with(|lines| lines.get(at.index()).cloned().unwrap_or_default())
-                });
-                let of = move || line.with(|line| kind(line));
-                view()
-                    .w_full()
-                    .px(px(theme::SPACING_LG))
-                    .bg(move || match of() {
-                        Kind::Added => theme::tint(theme::accent_success()),
-                        Kind::Removed => theme::tint(theme::accent_red()),
-                        Kind::Hunk => theme::fill(),
-                        Kind::Plain => theme::background().opacity(0.0),
-                    })
-                    .child(
-                        text(move || line.get())
-                            .font_family("monospace")
-                            .text_size(px(theme::font_hint()))
-                            .line_height(theme::line_height_for(theme::font_hint()))
-                            .text_color(move || match of() {
-                                Kind::Added => theme::accent_success(),
-                                Kind::Removed => theme::accent_red(),
-                                Kind::Hunk => theme::accent_blue(),
-                                Kind::Plain => theme::text_secondary(),
-                            }),
-                    )
-            },
-        )
-        .keys(move || (0..lines.with(|lines| lines.len())).collect::<Vec<_>>())
-        .estimated_item_size(px(18.0))
-        .flex_1(),
-    )
+    })
+}
+
+/// The wall clock in milliseconds.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as i64)
+        .unwrap_or_default()
 }
 
 /// The diff with the action that discards it.
@@ -1557,7 +1612,6 @@ fn diff_view(
                 .unwrap_or_default()
         })
     });
-    let lines = computed(move || body.get().lines().map(str::to_owned).collect::<Vec<_>>());
     let truncated =
         computed(move || diff.with(|diff| diff.as_ref().is_some_and(|diff| diff.truncated)));
     let path = computed(move || {
@@ -1573,7 +1627,12 @@ fn diff_view(
         .min_h(px(0.0))
         .border_t_1()
         .border_color(theme::hairline)
-        .child(line_list(lines))
+        // The diff is drawn from its parsed hunks, with line numbers and the
+        // two change tints, rather than as one flat block of raw text.
+        .child(dynamic(move || {
+            let staged = staged.get();
+            super::git_diff::single_file_diff(body.get(), staged).into_element()
+        }))
         .child(when(move || truncated.get(), || {
             preview_limit(copy::text(
                 "The diff is larger than the preview limit.",
@@ -1633,41 +1692,26 @@ fn diff_view(
 
 /// One commit's message and patch.
 fn commit_detail_view(detail: Signal<Option<CommitDetailPreview>>) -> impl IntoElement {
-    let body = computed(move || {
-        detail.with(|detail| {
-            detail
-                .as_ref()
-                .map(|detail| detail.body.clone())
-                .unwrap_or_default()
-        })
-    });
-    let truncated = computed(move || {
-        detail.with(|detail| detail.as_ref().is_some_and(|detail| detail.truncated))
-    });
-    let lines = computed(move || body.get().lines().map(str::to_owned).collect::<Vec<_>>());
+    let preview = computed(move || detail.get());
     view()
         .flex_1()
         .min_h(px(0.0))
         .border_t_1()
         .border_color(theme::hairline)
-        .child(line_list(lines))
-        .child(when(
-            move || truncated.get(),
-            || {
-                preview_limit(copy::text(
-                    "The patch is larger than the preview limit.",
-                    "补丁超过预览上限。",
-                    "補丁超過預覽上限。",
-                ))
-            },
-        ))
+        .child(dynamic(move || match preview.get() {
+            Some(detail) => super::git_diff::commit_detail_content(detail).into_element(),
+            None => view().into_element(),
+        }))
 }
 
+/// The mark's color for a changed path, matching the file tree and desktop:
+/// added is green, untracked is red, modified is blue, deleted is red.
 fn status_color(status: &str) -> Hsla {
     match status {
-        "A" | "?" => theme::accent_success(),
-        "D" => theme::accent_red(),
-        "M" | "R" => theme::accent_yellow(),
+        "A" => theme::status_added(),
+        "?" => theme::status_untracked(),
+        "D" | "!" => theme::accent_red(),
+        "M" | "R" | "C" | "T" => theme::status_modified(),
         _ => theme::text_muted(),
     }
 }

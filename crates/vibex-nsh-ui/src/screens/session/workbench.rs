@@ -83,6 +83,10 @@ pub(super) fn workbench(
             terminal_visible.set(open && selected == WorkbenchTab::Terminal);
             if open {
                 untracked(|| selected.ensure_loaded(&host));
+                // The Changes tab carries the branch's pull/push counts, so
+                // they are read as the workbench opens rather than when the
+                // tab is finally pressed.
+                untracked(|| (host.on_prime_git)());
             }
         }
     });

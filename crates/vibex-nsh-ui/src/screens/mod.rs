@@ -3,6 +3,7 @@
 pub mod connecting;
 pub mod files;
 pub mod git;
+pub mod git_diff;
 pub mod new_session;
 pub mod pairing;
 pub mod session;

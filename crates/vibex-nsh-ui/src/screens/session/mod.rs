@@ -894,14 +894,25 @@ pub struct SessionHost {
     pub on_restore_worktree: Rc<dyn Fn(&str)>,
     pub on_toggle_git_amend: Action,
     pub on_toggle_git_push_after: Action,
+    /// Reads the branch sync counts and the change list as the workbench
+    /// opens, so the Changes tab shows them before it is pressed.
+    pub on_prime_git: Action,
     pub on_git_push: Action,
     pub on_git_pull: Action,
     pub on_git_fetch: Action,
     pub git_history: Signal<Vec<crate::screens::git::CommitRow>>,
     pub git_show_history: Signal<bool>,
+    /// Whether the history has more pages, and a page is being read.
+    pub git_history_more: Signal<bool>,
+    pub git_history_loading: Signal<bool>,
+    /// The commit search, run against the whole history rather than the page.
+    pub git_history_query: Signal<String>,
     pub git_commit_detail: Signal<Option<crate::screens::git::CommitDetailPreview>>,
     pub on_commit_git: Action,
     pub on_toggle_git_history: Action,
+    /// Reads the next page of the history, and searches all of it.
+    pub on_load_more_git_history: Action,
+    pub on_search_git_history: Rc<dyn Fn(&str)>,
     pub on_open_git_commit: OpenPath,
     pub on_revert_git: OpenPath,
     pub on_git_back: Action,
@@ -1158,11 +1169,16 @@ fn workbench_surfaces(
         on_fetch: host.on_git_fetch.clone(),
         history: host.git_history,
         show_history: host.git_show_history,
+        history_more: host.git_history_more,
+        history_loading: host.git_history_loading,
+        history_query: host.git_history_query,
         commit_detail: host.git_commit_detail,
         on_open_commit: host.on_open_git_commit.clone(),
         on_revert: host.on_revert_git.clone(),
         on_commit: host.on_commit_git.clone(),
         on_toggle_history: host.on_toggle_git_history.clone(),
+        on_load_more_history: host.on_load_more_git_history.clone(),
+        on_search_history: host.on_search_git_history.clone(),
         on_back: host.on_git_back.clone(),
         on_refresh: host.on_refresh_git.clone(),
     };

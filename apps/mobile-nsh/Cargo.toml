@@ -21,6 +21,8 @@ vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
 vibex-remote-client = { path = "../../crates/vibex-remote-client" }
 base64.workspace = true
 log.workspace = true
+# Commit times are shown in the reader's own zone and language.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
 mdns-sd.workspace = true
 image = { workspace = true, features = ["png", "jpeg"] }
 rqrr = "0.11"

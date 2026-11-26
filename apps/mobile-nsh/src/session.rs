@@ -15,7 +15,6 @@ use std::{
 };
 
 use base64::Engine as _;
-use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use nsh_core::element::ImageSrc;
 use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::platform::Lifecycle;
@@ -64,6 +63,7 @@ use vibex_desktop_model::{
     SidebarProjectLogoColor, TimelineConversationTurn, TimelineModel, TimelineRow, TimelineRowKind,
 };
 use vibex_mobile_pairing::MobileCredentialBundle;
+use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use vibex_nsh_ui::{
     copy,
     screens::connecting::ConnectionState,
@@ -130,6 +130,12 @@ const BROWSE_TIMEOUT: Duration = Duration::from_secs(15);
 /// good, and the row cannot be pressed again while it is loading. Bounding it
 /// turns the wait into a failure the row reports and can retry.
 const FILE_TREE_LOAD_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How many commits one page of the history asks for.
+///
+/// The surface appends the next page as the reader scrolls, so a smaller page
+/// opens faster and still walks the whole history.
+const GIT_HISTORY_PAGE: u32 = 40;
 
 /// Where the per-session composer drafts are kept.
 const DRAFTS_KEY: &str = "vibex.mobile.drafts.v1";
@@ -255,6 +261,9 @@ pub struct SessionService {
     file_search_run: Rc<Cell<u64>>,
     workbench_generation: Rc<Cell<u64>>,
     files_entries: Signal<Vec<FileEntry>>,
+    /// Whether the reader asked for the whole tree to be open, so folders a
+    /// read reveals keep opening as they arrive.
+    expanding_all: Rc<Cell<bool>>,
     files_search: Signal<Vec<FileSearchRow>>,
     files_searching: Signal<bool>,
     files_path: Signal<Option<String>>,
@@ -285,6 +294,11 @@ pub struct SessionService {
     worktree_records: Rc<RefCell<Vec<GitManagedWorktreeRecord>>>,
     git_history: Signal<Vec<CommitRow>>,
     git_show_history: Signal<bool>,
+    /// Whether the history has more pages, and a page is being read.
+    git_history_more: Signal<bool>,
+    git_history_loading: Signal<bool>,
+    /// The commit search, run against the whole history rather than the page.
+    git_history_query: Signal<String>,
     git_commit_detail: Signal<Option<CommitDetailPreview>>,
     attachments: Signal<Vec<AttachmentItem>>,
     /// Makes each picked attachment's id unique for the composer.
@@ -533,6 +547,7 @@ impl SessionService {
             file_search_run: Rc::new(Cell::new(0)),
             workbench_generation: Rc::new(Cell::new(0)),
             files_entries: signal(Vec::new()),
+            expanding_all: Rc::new(Cell::new(false)),
             files_search: signal(Vec::new()),
             files_searching: signal(false),
             files_path: signal(None),
@@ -563,6 +578,9 @@ impl SessionService {
             worktree_records: Rc::new(RefCell::new(Vec::new())),
             git_history: signal(Vec::new()),
             git_show_history: signal(false),
+            git_history_more: signal(false),
+            git_history_loading: signal(false),
+            git_history_query: signal(String::new()),
             git_commit_detail: signal(None),
             attachments: signal(Vec::new()),
             attachment_seq: Rc::new(Cell::new(0)),
@@ -899,6 +917,10 @@ impl SessionService {
             git_remote_busy: self.git_remote_busy,
             git_branches: self.git_branches,
             git_branch_menu: self.git_branch_menu,
+            on_prime_git: {
+                let service = self.clone();
+                Rc::new(move || service.prime_git())
+            },
             on_open_git_branches: {
                 let service = self.clone();
                 Rc::new(move || service.open_git_branches())
@@ -976,6 +998,17 @@ impl SessionService {
             },
             git_history: self.git_history,
             git_show_history: self.git_show_history,
+            git_history_more: self.git_history_more,
+            git_history_loading: self.git_history_loading,
+            git_history_query: self.git_history_query,
+            on_load_more_git_history: {
+                let service = self.clone();
+                Rc::new(move || service.load_git_history_more())
+            },
+            on_search_git_history: {
+                let service = self.clone();
+                Rc::new(move |query: &str| service.search_git_history(query))
+            },
             git_commit_detail: self.git_commit_detail,
             attachments: self.attachments,
             session_actions: self.session_actions,
@@ -1480,13 +1513,7 @@ impl SessionService {
             },
             on_collapse_files: {
                 let service = self.clone();
-                Rc::new(move || {
-                    service
-                        .file_tree
-                        .borrow_mut()
-                        .restore_navigation_state([], None);
-                    service.publish_file_tree();
-                })
+                Rc::new(move || service.toggle_all_folders())
             },
             on_open_dir: {
                 let service = self.clone();
@@ -4581,10 +4608,8 @@ impl SessionService {
     /// Loads the `$` skills the open session offers.
     fn query_skills(&self, _query: &str) {
         if self.skills_loaded.get() {
-            let refill = refill_palette(
-                &self.skills_catalog.borrow(),
-                &self.skills.get_untracked(),
-            );
+            let refill =
+                refill_palette(&self.skills_catalog.borrow(), &self.skills.get_untracked());
             if let Some(entries) = refill {
                 self.skills.set(entries);
             }
@@ -6993,6 +7018,88 @@ impl SessionService {
         }
     }
 
+    /// Opens every folder the tree shows, or closes them all.
+    ///
+    /// The button used to restore an empty navigation state, which only ever
+    /// collapsed: pressing it a second time did nothing, and there was no way
+    /// to open the whole tree at once. It now flips between the two, and every
+    /// folder it opens is read if it was never loaded; folders that only
+    /// appear once their parent is read are opened as each read lands.
+    fn toggle_all_folders(&self) {
+        let (expanding, loads) = {
+            let mut tree = self.file_tree.borrow_mut();
+            let directories = tree
+                .all_visible_rows()
+                .iter()
+                .filter(|row| row.kind == vibex_core::FileEntryKind::Directory)
+                .map(|row| row.path.clone())
+                .filter(|path| !path.is_empty())
+                .collect::<Vec<_>>();
+            if directories.is_empty() {
+                return;
+            }
+            let all_open = directories.iter().all(|path| tree.is_expanded(path));
+            if all_open {
+                tree.restore_navigation_state([], None);
+                (false, Vec::new())
+            } else {
+                tree.restore_navigation_state(directories.clone(), None);
+                let loads = directories
+                    .into_iter()
+                    .filter(|path| {
+                        !matches!(
+                            tree.load_state(path),
+                            FileTreeLoadState::Loaded | FileTreeLoadState::Loading
+                        )
+                    })
+                    .collect::<Vec<_>>();
+                (true, loads)
+            }
+        };
+        self.expanding_all.set(expanding);
+        self.publish_file_tree();
+        for path in loads {
+            self.load_tree(path);
+        }
+    }
+
+    /// Opens the folders that a finished read just revealed, when the reader
+    /// asked for the whole tree to be open.
+    fn continue_expand_all(&self) {
+        if !self.expanding_all.get() {
+            return;
+        }
+        let loads = {
+            let mut tree = self.file_tree.borrow_mut();
+            let directories = tree
+                .all_visible_rows()
+                .iter()
+                .filter(|row| row.kind == vibex_core::FileEntryKind::Directory)
+                .map(|row| row.path.clone())
+                .filter(|path| !path.is_empty() && !tree.is_expanded(path))
+                .collect::<Vec<_>>();
+            if directories.is_empty() {
+                return;
+            }
+            let mut expanded = tree.expanded_directory_paths();
+            expanded.extend(directories.iter().cloned());
+            tree.restore_navigation_state(expanded, None);
+            directories
+                .into_iter()
+                .filter(|path| {
+                    !matches!(
+                        tree.load_state(path),
+                        FileTreeLoadState::Loaded | FileTreeLoadState::Loading
+                    )
+                })
+                .collect::<Vec<_>>()
+        };
+        self.publish_file_tree();
+        for path in loads {
+            self.load_tree(path);
+        }
+    }
+
     fn publish_file_tree(&self) {
         self.files_entries.set(
             self.file_tree
@@ -7135,6 +7242,10 @@ impl SessionService {
             };
             service.publish_file_tree();
             if reload {
+                // A reader who asked for the whole tree open keeps it open as
+                // each folder's children arrive; the folders just revealed are
+                // then read in turn.
+                service.continue_expand_all();
                 let mut dirs = service.file_tree.borrow().expanded_directory_paths();
                 dirs.retain(|directory| {
                     directory.rsplit_once('/').map_or("", |(parent, _)| parent) == path
@@ -7309,6 +7420,21 @@ impl SessionService {
         self.git_push_after.set(false);
         self.load_git_branches();
         self.refresh_git();
+    }
+
+    /// Reads what the Changes tab shows without opening it.
+    ///
+    /// The tab carries the branch's pull/push counts, and the workbench draws
+    /// that tab whichever surface is open. Waiting for the tab to be pressed
+    /// left the arrows off until the reader was already looking at the
+    /// changes, so the counts and the list are read as the workbench opens.
+    fn prime_git(&self) {
+        if self.git_branches.get_untracked().is_empty() {
+            self.load_git_branches();
+        }
+        if self.git_model.borrow().status.is_none() {
+            self.refresh_git();
+        }
     }
 
     /// Reloads the status list.
@@ -8148,6 +8274,7 @@ impl SessionService {
                 return;
             };
             if !service.workbench_is_current(generation) {
+                service.git_remote_busy.set(false);
                 return;
             }
             let result = crate::runtime::handle()
@@ -8162,6 +8289,9 @@ impl SessionService {
                 })
                 .await;
             if !service.workbench_is_current(generation) {
+                // The page moved on while the action ran: the spinner must not
+                // stay on for a workbench that no longer exists.
+                service.git_remote_busy.set(false);
                 return;
             }
             service.git_remote_busy.set(false);
@@ -8171,6 +8301,9 @@ impl SessionService {
                         service.apply_git_status(status);
                     }
                     service.refresh_git();
+                    // A fetch, pull or push moves the branch's ahead/behind
+                    // counts, which the Changes tab draws.
+                    service.load_git_branches();
                 }
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
                 Err(error) => service.git_error.set(Some(
@@ -8246,10 +8379,55 @@ impl SessionService {
         }
         self.git_show_history.set(true);
         self.git_diff.set(None);
+        self.git_history_query.set(String::new());
         self.load_git_history();
     }
 
+    /// Reads the first page of the history, replacing what is shown.
     fn load_git_history(&self) {
+        self.git_history.set(Vec::new());
+        self.git_history_more.set(false);
+        self.load_git_history_page(None);
+    }
+
+    /// Reads one more page of the history, after the last commit shown.
+    ///
+    /// The page is asked for by the last commit's hash, so scrolling past the
+    /// first page keeps walking back through the whole history instead of
+    /// stopping at the forty rows the surface opened with.
+    fn load_git_history_more(&self) {
+        if self.git_history_loading.get_untracked() || !self.git_history_more.get_untracked() {
+            return;
+        }
+        let before = next_history_cursor(&self.git_history.get_untracked());
+        self.load_git_history_page(before);
+    }
+
+    /// Searches the whole history rather than the page already read.
+    ///
+    /// The runtime filters its own scan, so a commit older than the first page
+    /// is still found. An empty query goes back to the unfiltered first page.
+    fn search_git_history(&self, query: &str) {
+        self.git_history_query.set(query.to_owned());
+        let query = query.trim().to_owned();
+        self.git_history.set(Vec::new());
+        self.git_history_more.set(false);
+        if query.is_empty() {
+            self.load_git_history();
+            return;
+        }
+        self.load_git_history_page_with(None, Some(query));
+    }
+
+    fn load_git_history_page(&self, before_commit: Option<String>) {
+        self.load_git_history_page_with(before_commit, None);
+    }
+
+    fn load_git_history_page_with(&self, before_commit: Option<String>, query: Option<String>) {
+        if self.git_history_loading.get_untracked() {
+            return;
+        }
+        self.git_history_loading.set(true);
         self.git_error.set(None);
         let generation = self.workbench_generation.get();
         let service = self.clone();
@@ -8257,6 +8435,7 @@ impl SessionService {
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
+                service.git_history_loading.set(false);
                 return;
             };
             let ref_name = service.git_history_ref.borrow().clone();
@@ -8264,11 +8443,11 @@ impl SessionService {
                 .spawn(async move {
                     git.git_history(GitHistoryRequest {
                         workspace_id: workspace,
-                        limit: Some(40),
-                        before_commit: None,
+                        limit: Some(GIT_HISTORY_PAGE),
+                        before_commit,
                         ref_name,
                         author: None,
-                        query: None,
+                        query,
                         authored_after_ms: None,
                         authored_before_ms: None,
                     })
@@ -8276,11 +8455,14 @@ impl SessionService {
                 })
                 .await;
             if !service.workbench_is_current(generation) {
+                service.git_history_loading.set(false);
                 return;
             }
+            service.git_history_loading.set(false);
             match result {
-                Ok(Ok(history)) => service.git_history.set(
-                    history
+                Ok(Ok(history)) => {
+                    service.git_history_more.set(history.has_more);
+                    let rows = history
                         .commits
                         .into_iter()
                         .map(|commit| CommitRow {
@@ -8288,9 +8470,17 @@ impl SessionService {
                             short_hash: commit.short_hash,
                             subject: commit.subject,
                             detail: commit.author_name,
+                            authored_at_ms: commit.authored_at_ms,
                         })
-                        .collect(),
-                ),
+                        .collect::<Vec<_>>();
+                    // A page follows the rows already read; a first page or a
+                    // new search replaces them.
+                    if service.git_history.get_untracked().is_empty() {
+                        service.git_history.set(rows);
+                    } else {
+                        service.git_history.update(|history| history.extend(rows));
+                    }
+                }
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
                 Err(error) => service.git_error.set(Some(
                     format!("reading the history did not finish: {error}").into(),
@@ -8327,18 +8517,60 @@ impl SessionService {
             match result {
                 Ok(Ok(detail)) => {
                     let mut body = detail.summary.subject.clone();
-                    if let Some(message) = detail.body {
+                    let message_body = detail.body.clone().unwrap_or_default();
+                    if !message_body.is_empty() {
                         body.push_str("\n\n");
-                        body.push_str(&message);
+                        body.push_str(&message_body);
                     }
-                    if let Some(patch) = detail.patch {
+                    if let Some(patch) = detail.patch.as_deref() {
                         body.push_str("\n\n");
-                        body.push_str(&patch);
+                        body.push_str(patch);
                     }
+                    // The patch is split by the same headers the runtime uses,
+                    // so each changed file is drawn as its own collapsible
+                    // card with its own hunks instead of one wall of text.
+                    let patches = detail
+                        .patch
+                        .as_deref()
+                        .map(vibex_nsh_ui::screens::git_diff::split_raw_patch_by_file)
+                        .unwrap_or_default();
+                    let patches = patches
+                        .into_iter()
+                        .collect::<std::collections::BTreeMap<_, _>>();
+                    let files = detail
+                        .files
+                        .iter()
+                        .map(|file| {
+                            let path = file.path.clone();
+                            vibex_nsh_ui::screens::git_diff::CommitFileDiff {
+                                patch: patches
+                                    .get(&path)
+                                    .or_else(|| {
+                                        file.original_path.as_ref().and_then(|old| patches.get(old))
+                                    })
+                                    .cloned()
+                                    .unwrap_or_default(),
+                                old_path: file.original_path.clone(),
+                                status: git_change_kind_label(file.kind).to_owned(),
+                                additions: file.additions,
+                                deletions: file.deletions,
+                                binary: patches.get(&path).is_some_and(|patch| {
+                                    patch.contains("Binary files ")
+                                        || patch.contains("GIT binary patch")
+                                }),
+                                path,
+                            }
+                        })
+                        .collect();
                     service.git_commit_detail.set(Some(CommitDetailPreview {
-                        title: detail.summary.short_hash,
+                        title: detail.summary.short_hash.clone(),
                         body,
                         truncated: detail.patch_truncated,
+                        subject: detail.summary.subject.clone(),
+                        message_body,
+                        author: detail.summary.author_name.clone(),
+                        authored_at: format_authored_at(detail.summary.authored_at_ms),
+                        files,
                     }));
                 }
                 Ok(Err(error)) => service.git_error.set(Some(error_text(&error))),
@@ -8630,8 +8862,8 @@ async fn fetch_older(
     session_id: VibexSessionId,
     before_sequence: i64,
 ) -> BackendResult<TimelinePage> {
-    let page = fetch_timeline_before_raw(backend.clone(), session_id.clone(), before_sequence)
-        .await?;
+    let page =
+        fetch_timeline_before_raw(backend.clone(), session_id.clone(), before_sequence).await?;
     Ok(align_timeline_window_to_turn_start(page, 1, |cursor| {
         fetch_timeline_before_raw(backend.clone(), session_id.clone(), cursor)
     })
@@ -10038,6 +10270,58 @@ fn age(timestamp_ms: i64) -> String {
     }
 }
 
+/// The commit the next page of the history is read after.
+///
+/// Pages walk backwards from the newest commit, so the cursor is the last row
+/// already shown; with nothing shown, the first page is read.
+fn next_history_cursor(history: &[vibex_nsh_ui::screens::git::CommitRow]) -> Option<String> {
+    history.last().map(|commit| commit.hash.clone())
+}
+
+/// The one-letter mark a changed file's row carries.
+fn git_change_kind_label(kind: vibex_core::GitChangeKind) -> &'static str {
+    use vibex_core::GitChangeKind;
+    match kind {
+        GitChangeKind::Added => "A",
+        GitChangeKind::Modified => "M",
+        GitChangeKind::Deleted => "D",
+        GitChangeKind::Renamed => "R",
+        GitChangeKind::Copied => "C",
+        GitChangeKind::TypeChanged => "T",
+        GitChangeKind::Untracked => "?",
+        GitChangeKind::Unmerged => "!",
+        GitChangeKind::Unknown => "M",
+    }
+}
+
+/// When a commit was authored, written for the reader: the date and the time
+/// of day, in the local zone, in the language the app is in.
+fn format_authored_at(authored_at_ms: Option<i64>) -> String {
+    format_authored_at_in(authored_at_ms, copy::language())
+}
+
+/// The same, in `language`, so the formatting is testable without a UI.
+fn format_authored_at_in(
+    authored_at_ms: Option<i64>,
+    language: vibex_nsh_ui::copy::Language,
+) -> String {
+    let Some(millis) = authored_at_ms else {
+        return "Unknown".to_owned();
+    };
+    let Some(timestamp) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(millis)
+        .map(|timestamp| timestamp.with_timezone(&chrono::Local))
+    else {
+        return "Unknown".to_owned();
+    };
+    match language {
+        vibex_nsh_ui::copy::Language::SimplifiedChinese
+        | vibex_nsh_ui::copy::Language::TraditionalChinese => {
+            timestamp.format("%Y年%-m月%-d日 %H:%M").to_string()
+        }
+        _ => timestamp.format("%b %-d, %Y, %H:%M").to_string(),
+    }
+}
+
 fn is_transient_rpc_error(error: &BackendError) -> bool {
     matches!(
         error.code.as_str(),
@@ -10064,9 +10348,49 @@ mod tests {
     /// its prefix, while the service reads the catalogue once per session. A
     /// refill that only checked "already loaded" left the list empty for good:
     /// `/`, `@` or `$` deleted and retyped never opened the palette again.
+    /// The next page of the history is read after the last commit shown.
+    ///
+    /// The surface walks backwards one page at a time; with the cursor always
+    /// `None` every scroll re-read the first page and the older commits were
+    /// never reached.
+    #[test]
+    fn the_history_cursor_follows_the_last_commit_shown() {
+        use super::next_history_cursor;
+        use vibex_nsh_ui::screens::git::CommitRow;
+        let row = |hash: &str| CommitRow {
+            hash: hash.to_owned(),
+            short_hash: hash.to_owned(),
+            subject: String::new(),
+            detail: String::new(),
+            authored_at_ms: None,
+        };
+        assert_eq!(next_history_cursor(&[]), None);
+        assert_eq!(
+            next_history_cursor(&[row("newest"), row("older"), row("oldest")]),
+            Some("oldest".to_owned())
+        );
+    }
+
+    /// A commit is drawn with its authored time, in the reader's own zone.
+    #[test]
+    fn a_commit_time_is_written_for_the_reader() {
+        use super::format_authored_at_in;
+        use vibex_nsh_ui::copy::Language;
+        assert_eq!(format_authored_at_in(None, Language::English), "Unknown");
+        let english = format_authored_at_in(Some(1_700_000_000_000), Language::English);
+        assert!(english.contains("2023"), "the year is missing: {english}");
+        assert!(
+            english.contains(':'),
+            "the clock time is missing: {english}"
+        );
+        let chinese = format_authored_at_in(Some(1_700_000_000_000), Language::SimplifiedChinese);
+        assert!(chinese.contains("2023年"), "the year is missing: {chinese}");
+        assert_ne!(english, chinese);
+    }
+
     #[test]
     fn a_cleared_palette_refills_from_the_read_already_made() {
-        use super::{refill_palette, CommandEntry};
+        use super::{CommandEntry, refill_palette};
         let entry = |id: &str| CommandEntry {
             id: id.to_owned(),
             label: id.to_owned(),
@@ -10206,7 +10530,9 @@ mod tests {
 
     #[test]
     fn runtime_source_label_names_providers_routes_and_accounts() {
-        let _guard = COPY_PREFERENCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let previous = super::copy::preference();
         super::copy::set_preference(super::copy::LanguagePreference::SimplifiedChinese);
 
@@ -10295,7 +10621,6 @@ mod queue_view_tests {
         assert_eq!(views[1].text, "third");
     }
 }
-
 
 #[cfg(test)]
 mod terminal_lifecycle_tests {
@@ -10767,7 +11092,10 @@ mod terminal_lifecycle_tests {
             "remote RPC timed out without changing socket state",
         );
         service.handle_reload_sessions_error(&timeout);
-        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Online);
+        assert_eq!(
+            service.connection.get_untracked(),
+            super::ConnectionState::Online
+        );
         assert_eq!(service.connection_error.get_untracked(), None);
         assert!(service.refresh_retry_scheduled.get());
 
@@ -10776,12 +11104,19 @@ mod terminal_lifecycle_tests {
             "remote RPC concurrency limit was reached",
         );
         service.handle_reload_sessions_error(&limit);
-        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Online);
+        assert_eq!(
+            service.connection.get_untracked(),
+            super::ConnectionState::Online
+        );
         assert_eq!(service.connection_error.get_untracked(), None);
 
-        let offline = BackendError::offline("remote_socket_down", "remote WebSocket is not connected");
+        let offline =
+            BackendError::offline("remote_socket_down", "remote WebSocket is not connected");
         service.handle_reload_sessions_error(&offline);
-        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Offline);
+        assert_eq!(
+            service.connection.get_untracked(),
+            super::ConnectionState::Offline
+        );
         assert_eq!(
             service.connection_error.get_untracked().as_deref(),
             Some("The runtime could not be reached.")
@@ -11070,7 +11405,10 @@ mod terminal_lifecycle_tests {
                 omitted: None,
             },
         );
-        assert_eq!(service.model.borrow().leading_turn_start, Some(initial_lead));
+        assert_eq!(
+            service.model.borrow().leading_turn_start,
+            Some(initial_lead)
+        );
         assert!(service.has_older.get_untracked());
 
         // Overlapping older page (contains seq 50 and overlapping seq 100) must fall

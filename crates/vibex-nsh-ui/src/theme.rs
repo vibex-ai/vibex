@@ -779,6 +779,55 @@ pub fn accent_purple() -> Hsla {
     color_token("chart-category-8")
 }
 
+fn color_token_or(name: &str, fallback: fn() -> Hsla) -> Hsla {
+    theme().color(name).map(color).unwrap_or_else(fallback)
+}
+
+/// Added file/folder tone in the workbench file tree, matching desktop.
+pub fn status_added() -> Hsla {
+    color_token_or("right-rail-status-added", accent_success)
+}
+
+/// Modified file/folder tone in the workbench file tree, matching desktop.
+pub fn status_modified() -> Hsla {
+    color_token_or("right-rail-status-modified", accent_blue)
+}
+
+/// Untracked file/folder tone in the workbench file tree, matching desktop.
+pub fn status_untracked() -> Hsla {
+    color_token_or("right-rail-status-untracked", accent_red)
+}
+
+/// Soft background tint for added diff lines.
+pub fn diff_added_bg() -> Hsla {
+    let base = accent_success();
+    if dark() {
+        base.alpha(0.14)
+    } else {
+        base.alpha(0.12)
+    }
+}
+
+/// Soft background tint for removed diff lines.
+pub fn diff_removed_bg() -> Hsla {
+    let base = accent_red();
+    if dark() {
+        base.alpha(0.14)
+    } else {
+        base.alpha(0.12)
+    }
+}
+
+/// Soft background tint for unified diff hunk headers.
+pub fn diff_hunk_bg() -> Hsla {
+    let base = accent_blue();
+    if dark() {
+        base.alpha(0.11)
+    } else {
+        base.alpha(0.08)
+    }
+}
+
 /// The scrim behind a side page or a sheet.
 pub fn backdrop(opacity: f32) -> Hsla {
     hsla(0.0, 0.0, 0.0, opacity)

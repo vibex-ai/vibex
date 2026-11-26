@@ -1,10 +1,12 @@
 //! The remote workspace's file tree, search, and read-only viewer.
 
-use std::rc::Rc;
+use std::{rc::Rc, time::Duration};
 
 use nsh_base::{
     button, editor,
-    editor::{Editor, EditorApi, EditorCommand, EditorSearch, EditorSearchResult},
+    editor::{
+        Editor, EditorApi, EditorCommand, EditorSearch, EditorSearchResult, EditorTextPressEvent,
+    },
     text_view::{MarkdownOptions, text_view},
 };
 use nsh_core::{
@@ -109,6 +111,15 @@ pub struct SearchOptions {
     pub regex: bool,
 }
 
+/// Active content-search highlight carried from the browser into the viewer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FileSearchHighlight {
+    query: String,
+    case_sensitive: bool,
+    whole_word: bool,
+    regex: bool,
+}
+
 pub type FileSearch = Rc<dyn Fn(&str, SearchOptions)>;
 pub type OpenFile = Rc<dyn Fn(&str, Option<u32>)>;
 
@@ -131,6 +142,7 @@ pub struct FilesHost {
 pub fn files(host: FilesHost) -> impl IntoElement {
     let path = host.path;
     let preview = host.clone();
+    let highlight = signal(None::<FileSearchHighlight>);
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -140,15 +152,18 @@ pub fn files(host: FilesHost) -> impl IntoElement {
                 .flex_1()
                 .min_h(px(0.0))
                 .style_when(move || path.with(Option::is_some), |style| style.hidden())
-                .child(file_browser(host)),
+                .child(file_browser(host, highlight)),
         )
         .child(when(
             move || path.with(Option::is_some),
-            move || file_viewer(preview.clone()),
+            move || file_viewer(preview.clone(), highlight),
         ))
 }
 
-fn file_browser(host: FilesHost) -> impl IntoElement {
+fn file_browser(
+    host: FilesHost,
+    highlight: Signal<Option<FileSearchHighlight>>,
+) -> impl IntoElement {
     let query = signal(String::new());
     let options = signal(SearchOptions::default());
     let has_query = move || query.with(|query| !query.trim().is_empty());
@@ -222,7 +237,11 @@ fn file_browser(host: FilesHost) -> impl IntoElement {
                 ))
                 .child(surface::ghost_button(
                     icon!("chevrons-down-up"),
-                    copy::text("Collapse folders", "折叠文件夹", "摺疊資料夾"),
+                    copy::text(
+                        "Expand or collapse folders",
+                        "展开或折叠文件夹",
+                        "展開或摺疊資料夾",
+                    ),
                     move || (host.on_collapse)(),
                 )),
         )
@@ -308,9 +327,8 @@ fn file_browser(host: FilesHost) -> impl IntoElement {
                             let open = open.clone();
                             let dir = host.on_open_dir.clone();
                             dynamic(move || match entry.get() {
-                                Some(row) => {
-                                    file_row(row, open.clone(), dir.clone()).into_element()
-                                }
+                                Some(row) => file_row(row, open.clone(), dir.clone(), highlight)
+                                    .into_element(),
                                 None => view().into_element(),
                             })
                         },
@@ -349,7 +367,9 @@ fn file_browser(host: FilesHost) -> impl IntoElement {
                         )
                     },
                 )
-                .otherwise(move || file_search_list(results, open.clone()))
+                .otherwise(move || {
+                    file_search_list(results, open.clone(), query, options, highlight)
+                })
             })
         }))
 }
@@ -400,7 +420,13 @@ fn search_toggle(
         )
 }
 
-fn file_search_list(rows: Signal<Vec<FileSearchRow>>, open: OpenFile) -> impl IntoElement {
+fn file_search_list(
+    rows: Signal<Vec<FileSearchRow>>,
+    open: OpenFile,
+    query: Signal<String>,
+    options: Signal<SearchOptions>,
+    highlight: Signal<Option<FileSearchHighlight>>,
+) -> impl IntoElement {
     scroll()
         .flex_1()
         .min_h(px(0.0))
@@ -421,6 +447,18 @@ fn file_search_list(rows: Signal<Vec<FileSearchRow>>, open: OpenFile) -> impl In
                     .active(|style| style.bg(theme::row_pressed_bg()))
                     .on_press(move || {
                         let row = row.get_untracked();
+                        let opts = options.get_untracked();
+                        let needle = query.get_untracked().trim().to_owned();
+                        if opts.contents && !needle.is_empty() {
+                            highlight.set(Some(FileSearchHighlight {
+                                query: needle,
+                                case_sensitive: opts.case_sensitive,
+                                whole_word: opts.whole_word,
+                                regex: opts.regex,
+                            }));
+                        } else {
+                            highlight.set(None);
+                        }
                         dismiss_keyboard();
                         open(&row.path, row.line);
                     })
@@ -459,9 +497,15 @@ fn file_search_list(rows: Signal<Vec<FileSearchRow>>, open: OpenFile) -> impl In
         )))
 }
 
-fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl IntoElement {
+fn file_row(
+    row: FileEntry,
+    open: OpenFile,
+    toggle: Rc<dyn Fn(&str)>,
+    highlight: Signal<Option<FileSearchHighlight>>,
+) -> impl IntoElement {
     let directory = row.directory;
     let depth = row.depth.min(10);
+    let ignored = row.ignored;
     let (icon, color) = if directory {
         (
             if row.expanded {
@@ -478,12 +522,8 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
     // which the service resolves from its own tree.
     let path = row.path;
     let status = row.git.unwrap_or_default();
-    let status_color = match status.as_str() {
-        "A" | "?" => theme::accent_success(),
-        "D" => theme::accent_red(),
-        "M" | "R" => theme::accent_yellow(),
-        _ => theme::text_muted(),
-    };
+    let status_color = git_status_color(&status, ignored);
+    let name_color = file_name_color(&status, ignored);
     button()
         .min_h(px(TREE_ROW_HEIGHT))
         .relative()
@@ -498,6 +538,7 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
             if directory {
                 toggle(&path);
             } else {
+                highlight.set(None);
                 open(&path, None);
             }
         })
@@ -526,7 +567,11 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
                             icon!("chevron-right")
                         })
                         .size(px(12.0))
-                        .text_color(theme::text_muted)
+                        .text_color(if ignored {
+                            theme::text_muted().opacity(0.42)
+                        } else {
+                            theme::text_muted()
+                        })
                     },
                 )),
         )
@@ -535,7 +580,7 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
                 .size(px(theme::ICON_SM))
                 .flex_shrink_0()
                 .text_color(color)
-                .opacity(if row.ignored { 0.55 } else { 1.0 }),
+                .opacity(if ignored { 0.35 } else { 1.0 }),
         )
         .child(
             text(row.name)
@@ -543,11 +588,7 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
                 .min_w(px(0.0))
                 .truncate()
                 .text_size(px(theme::font_detail()))
-                .text_color(if row.ignored {
-                    theme::text_muted
-                } else {
-                    theme::foreground
-                }),
+                .text_color(name_color),
         )
         .children(row.loading.then(|| {
             svg(icon!("loader-circle"))
@@ -567,17 +608,79 @@ fn file_row(row: FileEntry, open: OpenFile, toggle: Rc<dyn Fn(&str)>) -> impl In
         }))
 }
 
-fn file_viewer(host: FilesHost) -> impl IntoElement {
+fn git_status_color(status: &str, ignored: bool) -> Hsla {
+    if ignored || status == "I" {
+        return theme::text_muted().opacity(0.42);
+    }
+    match status {
+        "A" => theme::status_added(),
+        "?" => theme::status_untracked(),
+        "D" | "U" => theme::accent_red(),
+        "M" | "R" | "C" => theme::status_modified(),
+        _ => theme::text_muted(),
+    }
+}
+
+fn file_name_color(status: &str, ignored: bool) -> Hsla {
+    if ignored || status == "I" {
+        return theme::foreground().opacity(0.38);
+    }
+    match status {
+        "A" => theme::status_added(),
+        "?" => theme::status_untracked(),
+        "D" | "U" => theme::accent_red(),
+        "M" | "R" | "C" => theme::status_modified(),
+        _ => theme::foreground(),
+    }
+}
+
+fn file_viewer(
+    host: FilesHost,
+    highlight: Signal<Option<FileSearchHighlight>>,
+) -> impl IntoElement {
     let path = host.path;
     let file = host.file;
     let error = host.error;
     let reader = component_ref::<Editor>();
-    let find = signal(false);
+    let initial_hl = highlight.get_untracked();
+    let find = signal(initial_hl.is_some());
+    let find_auto_focus = signal(false);
     let jump = signal(false);
-    let query = signal(String::new());
+    let query = signal(
+        initial_hl
+            .as_ref()
+            .map(|hl| hl.query.clone())
+            .unwrap_or_default(),
+    );
+    let find_options = signal(
+        initial_hl
+            .as_ref()
+            .map(|hl| SearchOptions {
+                contents: true,
+                case_sensitive: hl.case_sensitive,
+                whole_word: hl.whole_word,
+                regex: hl.regex,
+            })
+            .unwrap_or_default(),
+    );
     let line = signal(String::new());
     let matches = signal(EditorSearchResult::default());
     let initial = stored(None::<(String, u32)>);
+    effect(move || {
+        let _ = path.get();
+        if let Some(hl) = highlight.get() {
+            query.set(hl.query);
+            find_options.set(SearchOptions {
+                contents: true,
+                case_sensitive: hl.case_sensitive,
+                whole_word: hl.whole_word,
+                regex: hl.regex,
+            });
+            find_auto_focus.set(false);
+            find.set(true);
+            jump.set(false);
+        }
+    });
     let can_find = move || {
         file.with(|file| {
             file.as_ref().is_some_and(|file| {
@@ -618,6 +721,7 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                     icon!("chevron-left"),
                     copy::text("Back", "返回", "返回"),
                     move || {
+                        highlight.set(None);
                         dismiss_keyboard();
                         (host.on_back)();
                     },
@@ -667,6 +771,7 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                             copy::text("Find in file", "在文件中查找", "在檔案中尋找"),
                             move || {
                                 jump.set(false);
+                                find_auto_focus.set(true);
                                 find.update(|value| *value = !*value);
                             },
                         ))
@@ -683,6 +788,7 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
         .child(when(
             move || find.get(),
             move || {
+                let focus_find = find_auto_focus.get_untracked();
                 tool_bar()
                     .child(
                         surface::field_pill()
@@ -696,7 +802,7 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                                     query,
                                     copy::text("Find in file", "在文件中查找", "在檔案中尋找"),
                                 )
-                                .auto_focus(true)
+                                .auto_focus(focus_find)
                                 .flex_1()
                                 .min_w(px(0.0))
                                 .h_full(),
@@ -733,6 +839,7 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                         copy::text("Close search", "关闭搜索", "關閉搜尋"),
                         move || {
                             find.set(false);
+                            highlight.set(None);
                             query.set(String::new());
                             dismiss_keyboard();
                         },
@@ -844,17 +951,69 @@ fn file_viewer(host: FilesHost) -> impl IntoElement {
                         .value(Some(SharedString::from(preview.body)))
                         .language(Some(SharedString::from(preview.language)))
                         .read_only(true)
-                        .search(move || find.get().then(|| EditorSearch::new(query.get())))
+                        .search(move || {
+                            find.get().then(|| {
+                                let opts = find_options.get();
+                                let mut search = EditorSearch::new(query.get());
+                                search.case_sensitive = opts.case_sensitive;
+                                search.whole_word = opts.whole_word;
+                                search.regex = opts.regex;
+                                search
+                            })
+                        })
                         .on_search_change(move |result: &EditorSearchResult| {
                             matches.set(result.clone())
                         })
-                        .on_layout(move |_: &Bounds<Points>| {
+                        // The mobile viewer is strictly read-only: tapping text
+                        // must not raise the soft keyboard via the hidden sink.
+                        .on_text_press(move |_: &EditorTextPressEvent| {
+                            if let Some(api) = reader.api::<EditorApi>() {
+                                api.blur();
+                            }
+                            dismiss_keyboard();
+                        })
+                        .on_focus(move || {
+                            if let Some(api) = reader.api::<EditorApi>() {
+                                api.blur();
+                            }
+                            dismiss_keyboard();
+                        })
+                        .on_layout(move |bounds: &Bounds<Points>| {
+                            if bounds.size.height.0 <= 0.0 {
+                                return;
+                            }
                             if initial.get() != location
                                 && let Some((_, line)) = location.as_ref()
-                                && let Some(api) = reader.api::<EditorApi>()
                             {
                                 initial.replace(location.clone());
-                                api.go_to_line(line.saturating_sub(1));
+                                let target = (*line).saturating_sub(1);
+                                let scroll_to_match = move || {
+                                    let Some(api) = reader.api::<EditorApi>() else {
+                                        return;
+                                    };
+                                    api.go_to_line(target);
+                                    if find.get_untracked()
+                                        && !query.get_untracked().trim().is_empty()
+                                    {
+                                        api.run(EditorCommand::FindNext);
+                                        let landed_on_target = api
+                                            .selections()
+                                            .last()
+                                            .is_some_and(|sel| sel.head.line == target);
+                                        if !landed_on_target {
+                                            api.go_to_line(target);
+                                        }
+                                    }
+                                    api.blur();
+                                };
+                                // Run once immediately (for synchronous/headless
+                                // layouts) and once after the editor's internal
+                                // scroll viewport finishes measuring its height.
+                                scroll_to_match();
+                                spawn(async move {
+                                    timer(Duration::from_millis(48)).await;
+                                    scroll_to_match();
+                                });
                             }
                         })
                         .test_id("file-content")

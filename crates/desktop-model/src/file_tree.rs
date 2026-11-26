@@ -340,14 +340,29 @@ impl FileTreeProjection {
                 Some((entry.path.clone(), entry))
             })
             .collect::<BTreeMap<_, _>>();
+        // A directory listing answers for its own children only. Deeper nodes
+        // belong to a listing of a child that may still be in flight (or may
+        // already have landed), so they are kept: pruning them here emptied an
+        // expanded grandchild whenever the shallower parent's answer arrived
+        // last, which is exactly what a compacted chain (`aur/vibex-bin`) and
+        // a second-level folder do.
         self.nodes.retain(|path, _| {
             path == &base_path
                 || !path_is_equal_or_descendant(path, &base_path)
                 || incoming.contains_key(path)
+                || parent_path(path).as_deref() != Some(base_path.as_str())
         });
         for (path, entry) in incoming {
             let load_state = if entry.kind == FileEntryKind::Directory {
-                FileTreeLoadState::Unloaded
+                // A listing re-describes the directory but says nothing about
+                // whether its own children were read; keeping the state keeps
+                // an already loaded folder from going back to "unloaded" (and
+                // spinning) every time a parent is refreshed.
+                self.nodes
+                    .get(&path)
+                    .map(|node| node.load_state.clone())
+                    .filter(|state| !matches!(state, FileTreeLoadState::Loading))
+                    .unwrap_or(FileTreeLoadState::Unloaded)
             } else {
                 FileTreeLoadState::Loaded
             };
@@ -552,7 +567,12 @@ impl FileTreeProjection {
     }
 
     pub fn chain_is_expanded(&self, paths: &[String]) -> bool {
-        !paths.is_empty() && paths.iter().all(|path| self.is_expanded(path))
+        // A row can stand for a chain of single-child directories
+        // (`aur/vibex-bin`). Its head is what the reader opened, so the head's
+        // state is the chain's: requiring every link would report a chain that
+        // grew after its listing arrived as collapsed, and the row would then
+        // open nothing and never close.
+        paths.first().is_some_and(|path| self.is_expanded(path))
     }
 
     pub fn set_chain_expanded(&mut self, paths: &[String], expanded: bool) -> bool {
@@ -1009,7 +1029,9 @@ fn append_visible_children(
             depth,
             kind: visible_node.entry.kind,
             icon: file_icon_descriptor(&visible_node.entry.name, visible_node.entry.kind),
-            expanded: path_chain.iter().all(|path| expanded.contains(path)),
+            expanded: path_chain
+                .first()
+                .is_some_and(|path| expanded.contains(path)),
             selected: path_chain.iter().any(|path| selected.contains(path))
                 || selected_directory_path
                     .is_some_and(|selected| path_chain.iter().any(|path| path == selected)),
@@ -1034,12 +1056,15 @@ fn append_visible_children(
         let expansion_path_chain = selected_chain_index
             .map(|index| &path_chain[..=index])
             .unwrap_or(path_chain.as_slice());
+        // A chain that grew after its listing arrived (a folder that turned
+        // out to hold exactly one child directory) must still open: the head
+        // is what the reader toggled, so the head decides.
         if nodes
             .get(children_root_path)
             .is_some_and(|node| node.entry.kind == FileEntryKind::Directory)
             && (expansion_path_chain
-                .iter()
-                .all(|path| expanded.contains(path))
+                .first()
+                .is_some_and(|path| expanded.contains(path))
                 || !query.is_empty())
         {
             append_visible_children(
@@ -1463,6 +1488,132 @@ mod tests {
         assert!(tree.toggle_expanded("a"));
         assert!(tree.toggle_expanded("b"));
         assert_eq!(tree.visible_row_count(), 5);
+    }
+
+    /// A shallow listing must not erase what a deeper one already read.
+    ///
+    /// Opening `aur` and then a folder inside it starts two reads. When the
+    /// parent's answer lands last it only describes `aur`'s own children, so
+    /// pruning the whole subtree dropped `aur/vibex-bin`'s contents and the
+    /// folder showed empty even though it had been read.
+    #[test]
+    fn a_parent_listing_keeps_a_deeper_subtree_already_read() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+        let root = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            root,
+            "",
+            vec![entry(&workspace_id, "aur", FileEntryKind::Directory)],
+        ));
+        assert!(tree.toggle_expanded("aur"));
+        let aur = tree.begin_load("aur");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            aur,
+            "aur",
+            vec![entry(
+                &workspace_id,
+                "aur/vibex-bin",
+                FileEntryKind::Directory
+            )],
+        ));
+        assert!(tree.toggle_expanded("aur/vibex-bin"));
+        let inner = tree.begin_load("aur/vibex-bin");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            inner,
+            "aur/vibex-bin",
+            vec![entry(
+                &workspace_id,
+                "aur/vibex-bin/PKGBUILD",
+                FileEntryKind::File
+            )],
+        ));
+
+        // The parent's listing arrives again, describing only its own child.
+        assert!(tree.toggle_expanded("aur"));
+        assert!(tree.toggle_expanded("aur"));
+        let again = tree.begin_load("aur");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            again,
+            "aur",
+            vec![entry(
+                &workspace_id,
+                "aur/vibex-bin",
+                FileEntryKind::Directory
+            )],
+        ));
+
+        assert!(tree.is_expanded("aur/vibex-bin"));
+        assert_eq!(tree.load_state("aur/vibex-bin"), FileTreeLoadState::Loaded);
+        assert!(
+            tree.all_visible_rows()
+                .iter()
+                .any(|row| row.path == "aur/vibex-bin/PKGBUILD"),
+            "the deeper listing's file disappeared from the tree"
+        );
+    }
+
+    /// A chain that grows after its listing still opens from its head.
+    ///
+    /// A folder whose only child is another folder is drawn as one compacted
+    /// row (`system/aur`). The row's head is what the reader toggled, so the
+    /// second segment that the listing revealed must not count as closed and
+    /// leave the row unable to open.
+    #[test]
+    fn a_compacted_chain_opens_from_its_head() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+        let root = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            root,
+            "",
+            vec![entry(&workspace_id, "system", FileEntryKind::Directory)],
+        ));
+        assert!(tree.toggle_expanded("system"));
+        let system = tree.begin_load("system");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            system,
+            "system",
+            vec![entry(&workspace_id, "system/aur", FileEntryKind::Directory)],
+        ));
+        let row = tree
+            .all_visible_rows()
+            .iter()
+            .find(|row| row.path == "system/aur")
+            .expect("the compacted row is drawn");
+        assert_eq!(
+            row.path_chain,
+            vec!["system".to_string(), "system/aur".to_string()]
+        );
+        assert!(row.expanded, "the row reports itself closed after opening");
+
+        // The chain's own toggle opens it, and the file under it is drawn.
+        assert!(tree.toggle_expanded("system/aur"));
+        let inner = tree.begin_load("system/aur");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            inner,
+            "system/aur",
+            vec![entry(
+                &workspace_id,
+                "system/aur/PKGBUILD",
+                FileEntryKind::File
+            )],
+        ));
+        assert!(
+            tree.all_visible_rows()
+                .iter()
+                .any(|row| row.path == "system/aur/PKGBUILD"),
+            "the compacted folder showed no contents after opening"
+        );
     }
 
     #[test]
