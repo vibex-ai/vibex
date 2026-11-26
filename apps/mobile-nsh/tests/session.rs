@@ -2157,6 +2157,54 @@ fn a_folder_can_be_named_from_the_drawer() {
     assert!(app.screen().shows("Create"));
 }
 
+/// A sheet's field stays above the software keyboard.
+///
+/// A sheet is its own modal window on Android, so the activity's keyboard
+/// inset never sees the keyboard that window raises: the field inside it laid
+/// out under the keys until the platform reported the modal's own keyboard.
+/// The sheet lifts by that inset, so its field's bottom has to stay above the
+/// keyboard's top edge.
+#[test]
+fn a_sheets_field_stays_above_the_keyboard() {
+    const KEYBOARD: f32 = 320.0;
+    // Android, where a sheet is its own window: its root keeps the window's
+    // whole height and the keyboard arrives as `env(keyboard-inset-height)`,
+    // so the app is what has to keep its content clear of the keys.
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    config.environment.os = nsh_core::platform::Os::Android;
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.long_press("Projects").unwrap();
+    app.wait_for("New folder").unwrap();
+    app.press("New folder").unwrap();
+    app.wait_for("Folder name").unwrap();
+
+    let field = |app: &Headless| {
+        app.screen()
+            .layout("text:Folder name")
+            .unwrap()
+            .unwrap_or_else(|| panic!("the sheet's field is on screen"))
+            .bounds
+    };
+    let at_rest = field(&app);
+    app.set_environment("keyboard up", |env| env.keyboard_height = px(KEYBOARD))
+        .unwrap();
+    let lifted = field(&app);
+    // `start()` mounts a 390x1600 phone; the keyboard takes its height off the
+    // bottom edge.
+    let keyboard_top = 1600.0 - KEYBOARD;
+    assert!(
+        lifted.origin.y.0 + lifted.size.height.0 <= keyboard_top + 0.5,
+        "the field ends above the keyboard: {lifted:?}, keyboard top {keyboard_top}"
+    );
+    assert!(
+        lifted.origin.y.0 < at_rest.origin.y.0,
+        "the sheet rose with the keyboard: {at_rest:?} -> {lifted:?}"
+    );
+}
+
 #[test]
 fn add_project_opens_the_chosen_runtime_directory() {
     let mut app = start();

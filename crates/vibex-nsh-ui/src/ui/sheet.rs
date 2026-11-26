@@ -50,7 +50,20 @@ pub fn bottom_sheet(
                 on_close();
             }
         })
-        .child(content)
+        // A sheet is its own window on Android, and that window keeps the
+        // screen's whole height: the keyboard reaches the app as
+        // `env(keyboard-inset-height)` and nothing lifts the panel for it.
+        // Without this the field inside a sheet laid out under the keys — the
+        // content has to give them their room itself. Every other platform
+        // moves the panel, so the padding is Android's alone; there it would
+        // lift the content a second time.
+        .child(
+            view()
+                .w_full()
+                .flex_col()
+                .when(platform_name() == "android", |column| column.pb_keyboard())
+                .child(content),
+        )
 }
 
 /// The header of a sheet: what it is, and the one control that closes it.
@@ -88,7 +101,11 @@ pub fn sheet_header(
                 .active(|style| style.opacity(0.6))
                 .accessibility_label(copy::text("Close", "关闭", "關閉"))
                 .on_press(on_close)
-                .child(svg(icon!("x")).size(px(14.0)).text_color(theme::text_secondary)),
+                .child(
+                    svg(icon!("x"))
+                        .size(px(14.0))
+                        .text_color(theme::text_secondary),
+                ),
         )
 }
 
