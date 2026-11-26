@@ -2302,6 +2302,7 @@ impl SessionService {
         if text.is_empty() || self.sending.get_untracked() {
             return;
         }
+        let mentions = self.armed_mentions_for(&text);
         self.sending.set(true);
         self.error.set(None);
         let service = self.clone();
@@ -2333,23 +2334,14 @@ impl SessionService {
                 .spawn(async move {
                     backend
                         .replace_user_message(MutationRequest::new(
-                            vibex_core::ReplaceUserMessagePayload {
-                                user_sequence: edit.user_sequence,
-                                expected_end_sequence: edit.expected_end_sequence,
-                                message: SendAgentMessageRequest {
-                                    session_id: request_session.clone(),
-                                    message_idempotency_key: RequestId::new().into_string(),
-                                    desired_runtime: selection,
-                                    text,
-                                    attachments: Vec::new(),
-                                    mentions: Vec::new(),
-                                    reasoning_effort: None,
-                                    correlation_id: None,
-                                    delivery: UserMessageDelivery::Prompt,
-                                    prompt_context: None,
-                                    provenance: MessageProvenance::HumanInput,
-                                },
-                            },
+                            build_replace_user_message_payload(
+                                edit.user_sequence,
+                                edit.expected_end_sequence,
+                                request_session,
+                                selection,
+                                text,
+                                mentions,
+                            ),
                         ))
                         .await
                 })
@@ -2360,6 +2352,7 @@ impl SessionService {
                     service.edit_state.borrow_mut().take();
                     service.editing.set(false);
                     service.draft.set(String::new());
+                    service.armed_mentions.borrow_mut().clear();
                     service.reload(&session_id);
                 }
                 Ok(Err(error)) => service.fail(&error),
@@ -5163,7 +5156,7 @@ impl SessionService {
         let ids = ids.to_vec();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             for id in ids {
                 let Ok(session_id) = VibexSessionId::parse(id.as_str()) else {
                     continue;
@@ -6125,7 +6118,7 @@ impl SessionService {
         });
     }
 
-    /// Deletes the session the actions sheet is open on, after confirming it.
+    /// Deletes the session the actions menu targeted, after the caller confirmed it.
     fn delete_open_session(&self) {
         let Some(id) = self.session_actions.get_untracked() else {
             return;
@@ -6136,24 +6129,6 @@ impl SessionService {
         let service = self.clone();
         let backend = self.backend.clone();
         detach(async move {
-            let answer = nsh_base::alert_dialog()
-                .title(copy::text(
-                    "Delete this session?",
-                    "删除这个会话？",
-                    "刪除這個工作階段？",
-                ))
-                .description(copy::text(
-                    "Its transcript leaves this runtime. This cannot be undone.",
-                    "它的对话记录会从运行时删除，且无法撤销。",
-                    "它的對話記錄會從執行環境刪除，且無法復原。",
-                ))
-                .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                .destructive("delete", copy::text("Delete", "删除", "刪除"))
-                .show()
-                .await;
-            if !matches!(&answer, Ok(answer) if answer.action.as_deref() == Some("delete")) {
-                return;
-            }
             service.session_busy.set(true);
             let result = crate::runtime::handle()
                 .spawn(async move {
@@ -9276,6 +9251,29 @@ async fn send_and_refetch(
     fetch_page(backend, session_id).await
 }
 
+fn build_send_agent_message_request(
+    session_id: VibexSessionId,
+    selection: SessionRuntimeSelection,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+) -> SendAgentMessageRequest {
+    let reasoning_effort = selection.reasoning_effort.clone();
+    SendAgentMessageRequest {
+        session_id,
+        message_idempotency_key: vibex_core::RequestId::new().into_string(),
+        desired_runtime: selection,
+        text,
+        attachments,
+        mentions,
+        reasoning_effort,
+        correlation_id: None,
+        delivery: UserMessageDelivery::Prompt,
+        prompt_context: None,
+        provenance: MessageProvenance::HumanInput,
+    }
+}
+
 fn build_human_message_request(
     session_id: VibexSessionId,
     selection: SessionRuntimeSelection,
@@ -9283,22 +9281,36 @@ fn build_human_message_request(
     attachments: Vec<MessageAttachment>,
     mentions: Vec<VibexUseMention>,
 ) -> vibex_core::HumanAgentMessageRequest {
-    let reasoning_effort = selection.reasoning_effort.clone();
     vibex_core::HumanAgentMessageRequest {
         mentions,
-        message: SendAgentMessageRequest {
+        message: build_send_agent_message_request(
             session_id,
-            message_idempotency_key: vibex_core::RequestId::new().into_string(),
-            desired_runtime: selection,
+            selection,
             text,
             attachments,
-            mentions: Vec::new(),
-            reasoning_effort,
-            correlation_id: None,
-            delivery: UserMessageDelivery::Prompt,
-            prompt_context: None,
-            provenance: MessageProvenance::HumanInput,
-        },
+            Vec::new(),
+        ),
+    }
+}
+
+fn build_replace_user_message_payload(
+    user_sequence: i64,
+    expected_end_sequence: i64,
+    session_id: VibexSessionId,
+    selection: SessionRuntimeSelection,
+    text: String,
+    mentions: Vec<VibexUseMention>,
+) -> vibex_core::ReplaceUserMessagePayload {
+    vibex_core::ReplaceUserMessagePayload {
+        user_sequence,
+        expected_end_sequence,
+        message: build_send_agent_message_request(
+            session_id,
+            selection,
+            text,
+            Vec::new(),
+            mentions,
+        ),
     }
 }
 
@@ -12368,6 +12380,24 @@ mod terminal_lifecycle_tests {
         assert_eq!(request.message.reasoning_effort.as_deref(), Some("high"));
         assert_eq!(
             request.message.desired_runtime.reasoning_effort.as_deref(),
+            Some("high")
+        );
+
+        let replaced = super::build_replace_user_message_payload(
+            4,
+            5,
+            session_id.clone(),
+            request.message.desired_runtime,
+            "Edited prompt for @Claude".into(),
+            request.mentions.clone(),
+        );
+        assert_eq!(replaced.user_sequence, 4);
+        assert_eq!(replaced.expected_end_sequence, 5);
+        assert_eq!(replaced.message.session_id, session_id);
+        assert_eq!(replaced.message.mentions, request.mentions);
+        assert_eq!(replaced.message.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            replaced.message.desired_runtime.reasoning_effort.as_deref(),
             Some("high")
         );
     }
