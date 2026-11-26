@@ -369,12 +369,14 @@ pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
                 .first()
                 .map(|location| location.uri.clone())
         })?;
-    const PAIRS: [(&str, &str); 5] = [
+    const PAIRS: [(&str, &str); 7] = [
         ("old_string", "new_string"),
         ("oldText", "newText"),
         ("old_str", "new_str"),
         ("old_text", "new_text"),
         ("oldString", "newString"),
+        ("TargetContent", "ReplacementContent"),
+        ("target_content", "replacement_content"),
     ];
     let pair = |object: &serde_json::Map<String, Value>| {
         PAIRS.iter().find_map(|(old, new)| {
@@ -385,7 +387,12 @@ pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
     };
     let (operation, old_text, new_text) = if let Some((old, new)) = pair(object) {
         (FileOperationKind::Edit, Some(old), new)
-    } else if let Some(edits) = object.get("edits").and_then(Value::as_array) {
+    } else if let Some(edits) = object
+        .get("edits")
+        .or_else(|| object.get("ReplacementChunks"))
+        .or_else(|| object.get("replacement_chunks"))
+        .and_then(Value::as_array)
+    {
         let edits = edits
             .iter()
             .map(|edit| pair(edit.as_object()?))
@@ -398,9 +405,16 @@ pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
             new.join("\n"),
         )
     } else {
-        let content = ["content", "contents", "file_text", "text", "code_content"]
-            .iter()
-            .find_map(|key| object.get(*key)?.as_str())?;
+        let content = [
+            "content",
+            "contents",
+            "file_text",
+            "text",
+            "code_content",
+            "CodeContent",
+        ]
+        .iter()
+        .find_map(|key| object.get(*key)?.as_str())?;
         (FileOperationKind::Write, None, content.to_string())
     };
     Some(FileOperationPayload {
@@ -439,11 +453,18 @@ fn output_text(source: &str, known_exit_code: Option<i32>, locale: Locale) -> St
     };
     // Only unwrap recognized result envelopes. Application JSON with additional
     // fields remains intact instead of silently losing data named "output".
-    let output_keys = ["formatted_output", "stdout", "stderr"];
-    if object.keys().all(|key| {
-        output_keys.contains(&key.as_str()) || matches!(key.as_str(), "exit_code" | "exitCode")
-    }) && output_keys.iter().any(|key| object.contains_key(*key))
+    let output_keys = ["formatted_output", "combinedOutput", "stdout", "stderr"];
+    let command_meta_keys = ["exit_code", "exitCode", "commandLine", "workingDir"];
+    if object
+        .keys()
+        .all(|key| output_keys.contains(&key.as_str()) || command_meta_keys.contains(&key.as_str()))
+        && output_keys.iter().any(|key| object.contains_key(*key))
         && output_keys.iter().all(|key| {
+            object
+                .get(*key)
+                .is_none_or(|value| value.is_string() || value.is_null())
+        })
+        && ["commandLine", "workingDir"].iter().all(|key| {
             object
                 .get(*key)
                 .is_none_or(|value| value.is_string() || value.is_null())
@@ -456,8 +477,21 @@ fn output_text(source: &str, known_exit_code: Option<i32>, locale: Locale) -> St
             .is_some_and(|(left, right)| left != right);
         if !conflicting_codes && code.is_none_or(|code| code.is_null() || code.as_i64().is_some()) {
             let mut text = String::new();
+            // Antigravity's `_exec_tool_raw_output` duplicates the same output
+            // into both `combinedOutput` and `formatted_output`. Avoid printing
+            // it twice when both are present.
+            let skip_combined = object
+                .get("formatted_output")
+                .and_then(Value::as_str)
+                .is_some_and(|formatted| {
+                    object
+                        .get("combinedOutput")
+                        .and_then(Value::as_str)
+                        .is_some_and(|combined| combined == formatted)
+                });
             for part in output_keys
                 .iter()
+                .filter(|key| !(skip_combined && **key == "combinedOutput"))
                 .filter_map(|key| object.get(*key).and_then(Value::as_str))
                 .filter(|text| !text.is_empty())
             {
@@ -1379,5 +1413,103 @@ mod tests {
                 .error_line()
                 .is_some_and(|line| line.starts_with("Encountered retryable error"))
         );
+    }
+
+    #[test]
+    fn antigravity_exec_output_and_pascal_case_tools_render_cleanly() {
+        // Antigravity's exec envelope carries duplicated `combinedOutput` and
+        // `formatted_output` alongside `commandLine`/`workingDir`/`exitCode`.
+        let exec_raw = serde_json::json!({
+            "commandLine": "cargo check -p vibex-ui",
+            "workingDir": "/work/vibex",
+            "exitCode": 1,
+            "exit_code": 1,
+            "combinedOutput": "error: broken\n",
+            "formatted_output": "error: broken\n"
+        })
+        .to_string();
+        let rendered = output_text(&exec_raw, None);
+        assert_eq!(rendered.matches("error: broken").count(), 1, "{rendered}");
+        assert!(!rendered.contains("commandLine:"), "{rendered}");
+        assert!(rendered.ends_with("Exit code: 1"), "{rendered}");
+        assert_eq!(output_text(&exec_raw, Some(1)), "error: broken\n");
+
+        // Snake-case `Running <tool>` titles defer to PascalCase arguments.
+        let grep = tool(
+            "grep_search",
+            "Running grep_search",
+            serde_json::json!({"Query": "SessionPayloadState", "SearchPath": "crates/agent-acp"}),
+        );
+        let grep_payload = TimelinePayload::ToolCall(grep);
+        let grep_activity = timeline_activity::Activity::project(
+            &row_for(&grep_payload),
+            Some(&grep_payload),
+            Locale::En,
+        );
+        assert_eq!(grep_activity.icon(), ProcessActivityIcon::Search);
+        assert_eq!(
+            grep_activity.target(),
+            "SessionPayloadState in crates/agent-acp"
+        );
+
+        let list = tool(
+            "list_dir",
+            "Running list_dir",
+            serde_json::json!({"DirectoryPath": "/work/crates/agent-acp"}),
+        );
+        let list_payload = TimelinePayload::ToolCall(list);
+        let list_activity = timeline_activity::Activity::project(
+            &row_for(&list_payload),
+            Some(&list_payload),
+            Locale::En,
+        );
+        assert_eq!(list_activity.icon(), ProcessActivityIcon::Directory);
+        assert_eq!(list_activity.target(), "/work/crates/agent-acp");
+
+        // `replace_file_content` and `multi_replace_file_content` extract diffs.
+        let replace = file_operation(&tool(
+            "replace_file_content",
+            "Running replace_file_content",
+            serde_json::json!({
+                "TargetFile": "/work/src/main.rs",
+                "TargetContent": "old()",
+                "ReplacementContent": "new()"
+            }),
+        ))
+        .expect("replace_file_content should extract a file operation");
+        assert_eq!(replace.operation, FileOperationKind::Edit);
+        assert_eq!(replace.path, "/work/src/main.rs");
+        assert_eq!(replace.old_text.as_deref(), Some("old()"));
+        assert_eq!(replace.new_text.as_deref(), Some("new()"));
+
+        let multi = file_operation(&tool(
+            "multi_replace_file_content",
+            "Running multi_replace_file_content",
+            serde_json::json!({
+                "TargetFile": "/work/src/main.rs",
+                "ReplacementChunks": [
+                    {"TargetContent": "a", "ReplacementContent": "b"},
+                    {"TargetContent": "c", "ReplacementContent": "d"}
+                ]
+            }),
+        ))
+        .expect("multi_replace_file_content should extract a file operation");
+        assert_eq!(multi.old_text.as_deref(), Some("a\nc"));
+        assert_eq!(multi.new_text.as_deref(), Some("b\nd"));
+
+        // Normalized MCP tool calls keep `server · tool` even if arguments have a `name` key.
+        let mcp = tool(
+            "mcp__Agent-delegation__vibex_react",
+            "mcp__Agent-delegation__vibex_react",
+            serde_json::json!({"name": "thumbs_up"}),
+        );
+        let mcp_payload = TimelinePayload::ToolCall(mcp);
+        let mcp_activity = timeline_activity::Activity::project(
+            &row_for(&mcp_payload),
+            Some(&mcp_payload),
+            Locale::En,
+        );
+        assert_eq!(mcp_activity.icon(), ProcessActivityIcon::Integration);
+        assert_eq!(mcp_activity.target(), "Agent-delegation · vibex_react");
     }
 }

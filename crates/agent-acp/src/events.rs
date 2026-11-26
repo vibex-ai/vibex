@@ -457,6 +457,383 @@ fn codebuddy_marks_subagent(input: &AgentEventInput) -> bool {
         .is_some()
 }
 
+#[derive(Debug, Default)]
+pub struct AntigravityEventEnricher;
+
+impl AgentEventEnricher for AntigravityEventEnricher {
+    fn enrich(&self, input: &AgentEventInput) -> Vec<CanonicalAgentEvent> {
+        let mut normalized = input.clone();
+        // `agy_acp_server` replays non-MCP historical tool arguments as a JSON
+        // string (`tool_call.arguments_json`); decode object strings so live
+        // and replayed sessions produce identical canonical payloads.
+        if let Some(Value::String(raw_json)) = normalized.raw_input.as_ref()
+            && raw_json.trim_start().starts_with('{')
+            && let Ok(parsed) = serde_json::from_str::<Value>(raw_json)
+            && parsed.is_object()
+        {
+            normalized.raw_input = Some(parsed);
+        }
+
+        // Antigravity tags MCP calls with `_meta.mcp.{server,tool}` and puts a
+        // redundant `"arguments"` wrapper alongside the flattened tool args in
+        // `rawInput`. Normalize to `mcp__<server>__<tool>` and unwrap the
+        // duplicate envelope so the timeline classifies and displays it as MCP.
+        if let Some(mcp_name) = antigravity_mcp_tool_name(&normalized) {
+            normalized.tool_name = mcp_name;
+            if let Some(prompt) = normalized
+                .meta
+                .get("prompt")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                normalized.title = prompt.to_string();
+            } else {
+                normalized.title = normalized.tool_name.clone();
+            }
+            if let Some(unwrapped) = normalized
+                .raw_input
+                .as_ref()
+                .and_then(antigravity_unwrap_mcp_raw_input)
+            {
+                normalized.raw_input = Some(unwrapped);
+            }
+            return PassthroughEventEnricher.enrich(&normalized);
+        }
+
+        let original_kind = normalized_kind(&normalized.tool_name);
+        if let Some(recovered) = antigravity_recovered_tool_name(&normalized, &original_kind) {
+            normalized.tool_name = recovered;
+        }
+        let kind = normalized_kind(&normalized.tool_name);
+
+        if kind == "run_command"
+            || kind == "shell"
+            || (original_kind == "execute"
+                && (command_text(normalized.raw_input.as_ref()).is_some()
+                    || !normalized.title.trim().is_empty()))
+        {
+            if let Some(summary) = antigravity_exec_output_summary(&normalized) {
+                normalized.output_summary = Some(summary);
+            }
+            return vec![command_event(&normalized)];
+        }
+
+        if matches!(
+            kind.as_str(),
+            "client_create_file"
+                | "client_edit_file"
+                | "create_file"
+                | "edit_file"
+                | "write_file"
+                | "write_to_file"
+                | "replace_file_content"
+                | "multi_replace_file_content"
+                | "delete_file"
+        ) || (original_kind == "edit" && has_diff_content(normalized.content.as_ref()))
+        {
+            // `FileOperationPayload` carries no failed state; when a write or
+            // edit fails (permission denial, quota/step error), keep a named
+            // `ToolCall` so the timeline preserves the failed badge and error.
+            if normalized.status != ToolCallStatus::Failed
+                && let Some(files) = antigravity_file_events(&normalized)
+            {
+                return files;
+            }
+            return PassthroughEventEnricher.enrich(&normalized);
+        }
+
+        if matches!(kind.as_str(), "search_web" | "web_search") {
+            return vec![web_search_event(&normalized)];
+        }
+
+        if matches!(kind.as_str(), "generate_image" | "image_generation")
+            || contains_image_block(normalized.content.as_ref())
+        {
+            return vec![image_event(&normalized)];
+        }
+
+        if matches!(
+            kind.as_str(),
+            "invoke_subagent" | "start_subagent" | "run_workflow" | "browser_subagent"
+        ) {
+            return vec![antigravity_collaboration_event(&normalized)];
+        }
+
+        if matches!(
+            kind.as_str(),
+            "todo" | "todo_list" | "todo_update" | "todo_write" | "update_steps"
+        ) && todo_items(normalized.raw_input.as_ref()).is_some()
+        {
+            return vec![todo_event(&normalized)];
+        }
+
+        PassthroughEventEnricher.enrich(&normalized)
+    }
+}
+
+fn antigravity_mcp_tool_name(input: &AgentEventInput) -> Option<String> {
+    let tool = input
+        .meta
+        .get("mcp_tool")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let server = input
+        .meta
+        .get("mcp_server")
+        .map(String::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match (server, tool) {
+        (Some(server), Some(tool)) => Some(format!("mcp__{server}__{tool}")),
+        (None, Some(tool)) => Some(format!("mcp__mcp__{tool}")),
+        _ => None,
+    }
+}
+
+fn antigravity_unwrap_mcp_raw_input(raw_input: &Value) -> Option<Value> {
+    let object = raw_input.as_object()?;
+    let arguments = object.get("arguments")?.as_object()?;
+    // `agy_acp_server`'s `unwrap_mcp_tool_call` copies every key from
+    // `arguments` to the top level as well as keeping `"arguments"`. Strip the
+    // duplicate wrapper only when all other top-level keys already come from
+    // `arguments`.
+    let redundant_wrapper = object
+        .iter()
+        .all(|(key, value)| key == "arguments" || arguments.get(key) == Some(value));
+    redundant_wrapper.then(|| Value::Object(arguments.clone()))
+}
+
+fn antigravity_recovered_tool_name(input: &AgentEventInput, original_kind: &str) -> Option<String> {
+    if let Some(rest) = input.title.trim().strip_prefix("Running ") {
+        let candidate = rest.trim();
+        if is_antigravity_tool_identifier(candidate) {
+            return Some(candidate.to_string());
+        }
+    }
+    if input.native_event_id.starts_with("interaction_")
+        && matches!(original_kind, "" | "tool" | "other")
+    {
+        return Some("ask_question".to_string());
+    }
+    if original_kind == "execute" {
+        return Some("run_command".to_string());
+    }
+    if original_kind == "fetch" {
+        return Some("read_url_content".to_string());
+    }
+    if original_kind == "read"
+        && input
+            .raw_input
+            .as_ref()
+            .and_then(|value| {
+                string_value(
+                    value,
+                    &["absolute_path", "AbsolutePath", "file_path", "FilePath"],
+                )
+            })
+            .is_some()
+    {
+        return Some("view_file".to_string());
+    }
+    None
+}
+
+fn is_antigravity_tool_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value.contains('_')
+        && !value.contains(char::is_whitespace)
+        && value
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_')
+}
+
+fn antigravity_exec_output_summary(input: &AgentEventInput) -> Option<String> {
+    let raw = input.raw_output.as_ref()?.text.as_str();
+    let parsed = serde_json::from_str::<Value>(raw).ok()?;
+    let object = parsed.as_object()?;
+    let output = object
+        .get("formatted_output")
+        .or_else(|| object.get("combinedOutput"))
+        .or_else(|| object.get("combined_output"))
+        .and_then(Value::as_str)?;
+    let trimmed = output.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
+fn has_diff_content(content: Option<&Value>) -> bool {
+    let Some(content) = content else {
+        return false;
+    };
+    let items = content
+        .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| std::slice::from_ref(content));
+    items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("diff"))
+}
+
+fn antigravity_file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
+    // Prefer ACP diff blocks emitted by `agy_acp_server` (`extract_tool_content`),
+    // which carry both `oldText` (loaded from disk before the edit) and `newText`.
+    if has_diff_content(input.content.as_ref()) {
+        let mut diff_only = input.clone();
+        diff_only.tool_name = "diff".to_string();
+        if let Some(files) = file_events(&diff_only) {
+            return Some(files);
+        }
+    }
+    let raw_input = input.raw_input.as_ref()?;
+    let path = string_value(
+        raw_input,
+        &[
+            "target_file",
+            "TargetFile",
+            "file_path",
+            "FilePath",
+            "absolute_path",
+            "AbsolutePath",
+            "path",
+            "file",
+        ],
+    )?;
+    let kind = normalized_kind(&input.tool_name);
+    let hint = match kind.as_str() {
+        "client_create_file" | "create_file" | "write_file" | "write_to_file" => {
+            Some(FileOperationKind::Write)
+        }
+        "client_edit_file"
+        | "edit_file"
+        | "replace_file_content"
+        | "multi_replace_file_content" => Some(FileOperationKind::Edit),
+        "delete_file" => Some(FileOperationKind::Delete),
+        _ => None,
+    };
+    let (old_text, new_text) = if let Some(chunks) = raw_input
+        .get("ReplacementChunks")
+        .or_else(|| raw_input.get("replacement_chunks"))
+        .and_then(Value::as_array)
+        .filter(|chunks| !chunks.is_empty())
+    {
+        let old = chunks
+            .iter()
+            .filter_map(|chunk| text_value(chunk, &["TargetContent", "target_content"]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let new = chunks
+            .iter()
+            .filter_map(|chunk| text_value(chunk, &["ReplacementContent", "replacement_content"]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (Some(old), Some(new))
+    } else {
+        let old_text = text_value(
+            raw_input,
+            &[
+                "oldText",
+                "old_text",
+                "old_content",
+                "TargetContent",
+                "target_content",
+                "before",
+            ],
+        );
+        let new_text = text_value(
+            raw_input,
+            &[
+                "newText",
+                "new_text",
+                "code_content",
+                "CodeContent",
+                "ReplacementContent",
+                "replacement_content",
+                "content",
+                "text",
+                "after",
+            ],
+        );
+        (old_text, new_text)
+    };
+    let operation = file_operation(raw_input, hint, old_text.as_deref(), new_text.as_deref());
+    let extension = input.raw_extension();
+    let snapshots = FileOperationPayload {
+        operation,
+        summary: format!("{} {}", file_operation_label(operation), public_text(&path)),
+        path: public_text(&path),
+        old_text,
+        new_text,
+        patch: None,
+        raw_extension: extension.clone(),
+    };
+    let patch = snapshots.canonical_patch();
+    Some(vec![CanonicalAgentEvent::FileOperation(
+        FileOperationPayload {
+            old_text: None,
+            new_text: None,
+            patch,
+            raw_extension: extension,
+            ..snapshots
+        },
+    )])
+}
+
+fn antigravity_collaboration_event(input: &AgentEventInput) -> CanonicalAgentEvent {
+    let agent_label = input
+        .raw_input
+        .as_ref()
+        .and_then(|value| {
+            string_value(
+                value,
+                &[
+                    "role",
+                    "Role",
+                    "subagent_name",
+                    "type_name",
+                    "TypeName",
+                    "agent",
+                    "agentName",
+                ],
+            )
+        })
+        .map(|value| public_text(&value));
+    let summary = input
+        .raw_input
+        .as_ref()
+        .and_then(|value| {
+            string_value(
+                value,
+                &[
+                    "description",
+                    "Description",
+                    "task_description",
+                    "Task",
+                    "prompt",
+                    "Prompt",
+                ],
+            )
+        })
+        .or_else(|| agent_label.clone())
+        .unwrap_or_else(|| {
+            if input.title.trim().is_empty() {
+                input.tool_name.clone()
+            } else {
+                input.title.clone()
+            }
+        });
+    CanonicalAgentEvent::Collaboration(CollaborationPayload {
+        action: public_text(&input.tool_name),
+        status: input.status,
+        summary: public_text(&summary),
+        agent_label,
+        delegation_id: None,
+        child_session_id: None,
+        raw_extension: input.raw_extension(),
+    })
+}
+
 pub fn normalize_agent_event(
     enricher_kind: AgentEventEnricherKind,
     input: &AgentEventInput,
@@ -467,6 +844,7 @@ pub fn normalize_agent_event(
         AgentEventEnricherKind::Hermes => HermesEventEnricher.enrich(input),
         AgentEventEnricherKind::Grok => GrokEventEnricher.enrich(input),
         AgentEventEnricherKind::CodeBuddy => CodeBuddyEventEnricher.enrich(input),
+        AgentEventEnricherKind::Antigravity => AntigravityEventEnricher.enrich(input),
         AgentEventEnricherKind::Passthrough => PassthroughEventEnricher.enrich(input),
     };
     events
@@ -522,24 +900,42 @@ pub fn parse_event_locations(value: Option<&Value>) -> Vec<AgentEventLocation> {
 }
 
 pub fn parse_event_meta(value: Option<&Value>) -> BTreeMap<String, String> {
-    value
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(|meta| meta.iter())
-        .filter_map(|(key, value)| {
-            let key = normalized_kind(key);
-            if !allowed_meta_key(&key) {
-                return None;
+    let Some(meta) = value.and_then(Value::as_object) else {
+        return BTreeMap::new();
+    };
+    let mut parsed = BTreeMap::new();
+    for (key, value) in meta {
+        if parsed.len() >= EVENT_META_LIMIT {
+            break;
+        }
+        let normalized = normalized_kind(key);
+        // Antigravity carries MCP attribution under `_meta.mcp = {server, tool}`.
+        if normalized == "mcp"
+            && let Some(mcp) = value.as_object()
+        {
+            if let Some(server) = string_value(&Value::Object(mcp.clone()), &["server"])
+                && parsed.len() < EVENT_META_LIMIT
+            {
+                parsed.insert("mcp_server".to_string(), server);
             }
-            let value = match value {
-                Value::String(value) => value.clone(),
-                Value::Number(_) | Value::Bool(_) => value.to_string(),
-                _ => return None,
-            };
-            Some((key, value))
-        })
-        .take(EVENT_META_LIMIT)
-        .collect()
+            if let Some(tool) = string_value(&Value::Object(mcp.clone()), &["tool"])
+                && parsed.len() < EVENT_META_LIMIT
+            {
+                parsed.insert("mcp_tool".to_string(), tool);
+            }
+            continue;
+        }
+        if !allowed_meta_key(&normalized) {
+            continue;
+        }
+        let value = match value {
+            Value::String(value) => value.clone(),
+            Value::Number(_) | Value::Bool(_) => value.to_string(),
+            _ => continue,
+        };
+        parsed.insert(normalized, value);
+    }
+    parsed
 }
 
 fn allowed_meta_key(key: &str) -> bool {
@@ -554,6 +950,9 @@ fn allowed_meta_key(key: &str) -> bool {
             | "tool_name"
             | "agent"
             | "role"
+            | "mcp_server"
+            | "mcp_tool"
+            | "prompt"
     )
 }
 
@@ -596,13 +995,38 @@ fn command_event(input: &AgentEventInput) -> CanonicalAgentEvent {
     let cwd = input
         .raw_input
         .as_ref()
-        .and_then(|value| string_value(value, &["cwd", "workingDirectory"]));
+        .and_then(|value| {
+            string_value(
+                value,
+                &[
+                    "cwd",
+                    "Cwd",
+                    "workingDirectory",
+                    "working_dir",
+                    "workingDir",
+                ],
+            )
+        })
+        .or_else(|| {
+            input
+                .raw_output
+                .as_ref()
+                .and_then(|output| serde_json::from_str::<Value>(&output.text).ok())
+                .as_ref()
+                .and_then(|value| {
+                    string_value(
+                        value,
+                        &["workingDir", "working_dir", "workingDirectory", "cwd"],
+                    )
+                })
+        });
     let exit_code = input
         .meta
         .iter()
         .find(|(key, _)| normalized_kind(key) == "exit_code")
         .map(|(_, value)| value)
-        .and_then(|value| value.parse::<i32>().ok());
+        .and_then(|value| value.parse::<i32>().ok())
+        .or_else(|| command_exit_code_from_raw_output(input.raw_output.as_ref()));
     CanonicalAgentEvent::CommandExecution(CommandPayload {
         command: public_text(&command),
         cwd: cwd.map(|value| public_text(&value)),
@@ -618,6 +1042,17 @@ fn command_event(input: &AgentEventInput) -> CanonicalAgentEvent {
             .map(|value| public_text(value)),
         raw_extension: input.raw_extension(),
     })
+}
+
+fn command_exit_code_from_raw_output(raw_output: Option<&AgentEventRawOutput>) -> Option<i32> {
+    let text = raw_output?.text.as_str();
+    let parsed = serde_json::from_str::<Value>(text).ok()?;
+    let object = parsed.as_object()?;
+    object
+        .get("exitCode")
+        .or_else(|| object.get("exit_code"))
+        .and_then(Value::as_i64)
+        .and_then(|code| i32::try_from(code).ok())
 }
 
 fn file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgentEvent>> {
@@ -689,7 +1124,7 @@ fn web_search_event(input: &AgentEventInput) -> CanonicalAgentEvent {
     let query = input
         .raw_input
         .as_ref()
-        .and_then(|value| string_value(value, &["query", "searchQuery"]))
+        .and_then(|value| string_value(value, &["query", "Query", "searchQuery", "search_query"]))
         .or_else(|| {
             input
                 .raw_input
@@ -744,16 +1179,31 @@ fn collaboration_event(input: &AgentEventInput) -> CanonicalAgentEvent {
 
 fn image_event(input: &AgentEventInput) -> CanonicalAgentEvent {
     let mime_type = image_string(input, &["mimeType", "mime_type"]);
-    let image_reference = image_string(input, &["imageReference", "uri", "url"])
-        .filter(|value| !value.trim_start().starts_with("data:"))
-        .map(|value| public_text(&value));
+    let image_reference = image_string(
+        input,
+        &[
+            "imageReference",
+            "imagePath",
+            "output_path",
+            "generated_image_path",
+            "image_uri",
+            "uri",
+            "url",
+        ],
+    )
+    .filter(|value| !value.trim_start().starts_with("data:"))
+    .map(|value| public_text(&value));
+    let summary =
+        image_string(input, &["prompt", "imageName", "image_name"]).unwrap_or_else(|| {
+            if input.title.trim().is_empty() {
+                "Image generation".to_string()
+            } else {
+                input.title.clone()
+            }
+        });
     CanonicalAgentEvent::ImageGeneration(ImageGenerationPayload {
         status: input.status,
-        summary: public_text(if input.title.trim().is_empty() {
-            "Image generation"
-        } else {
-            &input.title
-        }),
+        summary: public_text(&summary),
         mime_type: mime_type.map(|value| public_text(&value)),
         image_reference,
         raw_extension: input.raw_extension(),
@@ -915,19 +1365,25 @@ fn file_operation_label(operation: FileOperationKind) -> &'static str {
 }
 
 fn todo_items(value: Option<&Value>) -> Option<Vec<PlanStepPayload>> {
-    let items = value?.get("items").and_then(Value::as_array)?;
+    let value = value?;
+    let items = ["items", "steps", "todos", "plan"]
+        .iter()
+        .find_map(|key| value.get(*key).and_then(Value::as_array))?;
     Some(
         items
             .iter()
             .take(32)
             .filter_map(|item| {
-                let title = string_value(item, &["text", "title", "description"])?;
+                let title =
+                    string_value(item, &["text", "title", "content", "step", "description"])?;
                 let status = string_value(item, &["status"])
                     .map(|status| normalized_kind(&status))
                     .map(|status| match status.as_str() {
-                        "completed" | "done" => PlanStepStatus::Completed,
-                        "running" | "in_progress" => PlanStepStatus::Running,
-                        "failed" => PlanStepStatus::Failed,
+                        "completed" | "complete" | "done" => PlanStepStatus::Completed,
+                        "running" | "in_progress" | "inprogress" | "active" => {
+                            PlanStepStatus::Running
+                        }
+                        "failed" | "error" | "cancelled" | "canceled" => PlanStepStatus::Failed,
                         _ => PlanStepStatus::Pending,
                     })
                     .unwrap_or_else(|| {
@@ -948,10 +1404,18 @@ fn todo_items(value: Option<&Value>) -> Option<Vec<PlanStepPayload>> {
 
 fn command_text(value: Option<&Value>) -> Option<String> {
     let value = value?;
-    value
-        .as_str()
-        .map(str::to_string)
-        .or_else(|| string_value(value, &["command", "cmd", "shellCommand"]))
+    value.as_str().map(str::to_string).or_else(|| {
+        string_value(
+            value,
+            &[
+                "command",
+                "command_line",
+                "CommandLine",
+                "cmd",
+                "shellCommand",
+            ],
+        )
+    })
 }
 
 fn is_command_kind(kind: &str) -> bool {
@@ -963,14 +1427,19 @@ fn is_command_kind(kind: &str) -> bool {
 
 fn contains_image_block(content: Option<&Value>) -> bool {
     content.is_some_and(|content| {
+        let is_image = |item: &Value| {
+            item.get("type").and_then(Value::as_str) == Some("image")
+                || (item.get("type").and_then(Value::as_str) == Some("content")
+                    && item
+                        .get("content")
+                        .and_then(|inner| inner.get("type"))
+                        .and_then(Value::as_str)
+                        == Some("image"))
+        };
         content
             .as_array()
-            .map(|items| {
-                items
-                    .iter()
-                    .any(|item| item.get("type").and_then(Value::as_str) == Some("image"))
-            })
-            .unwrap_or_else(|| content.get("type").and_then(Value::as_str) == Some("image"))
+            .map(|items| items.iter().any(is_image))
+            .unwrap_or_else(|| is_image(content))
     })
 }
 
@@ -999,7 +1468,11 @@ fn image_value(value: &Value, keys: &[&str]) -> Option<String> {
     if let Some(items) = value.as_array() {
         return items.iter().find_map(|item| image_value(item, keys));
     }
-    string_value(value, keys)
+    string_value(value, keys).or_else(|| {
+        value
+            .get("content")
+            .and_then(|inner| image_value(inner, keys))
+    })
 }
 
 fn image_string_value(value: &Value) -> Option<String> {
@@ -1654,5 +2127,186 @@ mod tests {
             stable_json_text(&Value::Object(root)),
             r#"{"kind":"update","nested":{"alpha":false,"zeta":true},"path":"src/lib.rs"}"#
         );
+    }
+
+    #[test]
+    fn antigravity_enricher_normalizes_commands_diffs_mcp_and_history_replay() {
+        // 1. `run_command` with structured Antigravity exec rawOutput.
+        let mut command = input(
+            "execute",
+            json!({
+                "command_line": "cargo test -p vibex-ui",
+                "working_dir": "/work/vibex"
+            }),
+        );
+        command.title = "Running run_command".to_string();
+        command.raw_output = Some(
+            vibex_core::AgentEventRawOutput::new(
+                vibex_core::AgentEventRawOutputMode::Snapshot,
+                json!({
+                    "commandLine": "cargo test -p vibex-ui",
+                    "workingDir": "/work/vibex",
+                    "exitCode": 2,
+                    "exit_code": 2,
+                    "combinedOutput": "test failed\n",
+                    "formatted_output": "test failed\n"
+                })
+                .to_string(),
+            )
+            .0,
+        );
+        let events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &command);
+        match &events[0].event {
+            CanonicalAgentEvent::CommandExecution(exec) => {
+                assert_eq!(exec.command, "cargo test -p vibex-ui");
+                assert_eq!(exec.cwd.as_deref(), Some("/work/vibex"));
+                assert_eq!(exec.exit_code, Some(2));
+                assert_eq!(exec.output_summary.as_deref(), Some("test failed"));
+            }
+            other => panic!("expected CommandExecution, got {other:?}"),
+        }
+
+        // 2. Historical `session/load` sends non-MCP `rawInput` as a JSON string.
+        let mut replay = command.clone();
+        replay.raw_input = Some(Value::String(
+            json!({"CommandLine": "git status", "Cwd": "/work/vibex"}).to_string(),
+        ));
+        let replay_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &replay);
+        match &replay_events[0].event {
+            CanonicalAgentEvent::CommandExecution(exec) => {
+                assert_eq!(exec.command, "git status");
+                assert_eq!(exec.cwd.as_deref(), Some("/work/vibex"));
+            }
+            other => {
+                panic!("expected CommandExecution from stringified history input, got {other:?}")
+            }
+        }
+
+        // 3. Successful edit with ACP diff block -> FileOperation with patch.
+        let mut edit = input(
+            "edit",
+            json!({
+                "TargetFile": "/work/src/lib.rs",
+                "TargetContent": "before",
+                "ReplacementContent": "after"
+            }),
+        );
+        edit.title = "Running replace_file_content".to_string();
+        edit.content = Some(json!([{
+            "type": "diff",
+            "path": "/work/src/lib.rs",
+            "oldText": "before\n",
+            "newText": "after\n"
+        }]));
+        let edit_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &edit);
+        match &edit_events[0].event {
+            CanonicalAgentEvent::FileOperation(file) => {
+                assert_eq!(file.operation, FileOperationKind::Edit);
+                assert_eq!(file.path, "/work/src/lib.rs");
+                let patch = file.patch.as_ref().expect("diff should render a patch");
+                assert!(patch.text.contains("-before"), "{}", patch.text);
+                assert!(patch.text.contains("+after"), "{}", patch.text);
+            }
+            other => panic!("expected FileOperation, got {other:?}"),
+        }
+
+        // 4. Failed edit stays a named ToolCall so failure status & error survive.
+        let mut failed_edit = edit.clone();
+        failed_edit.status = ToolCallStatus::Failed;
+        failed_edit.output_summary = Some("permission denied".to_string());
+        let failed_events =
+            normalize_agent_event(AgentEventEnricherKind::Antigravity, &failed_edit);
+        match &failed_events[0].event {
+            CanonicalAgentEvent::ToolCall(call) => {
+                assert_eq!(call.tool_name, "replace_file_content");
+                assert_eq!(call.status, ToolCallStatus::Failed);
+                assert_eq!(call.output_summary.as_deref(), Some("permission denied"));
+            }
+            other => panic!("expected failed edit to remain ToolCall, got {other:?}"),
+        }
+
+        // 5. MCP tool call with `_meta.mcp` and duplicated `"arguments"` envelope.
+        let mut mcp = input(
+            "other",
+            json!({
+                "emoji": "wave",
+                "arguments": {"emoji": "wave"}
+            }),
+        );
+        mcp.title = "Running vibex_react".to_string();
+        mcp.meta = parse_event_meta(Some(&json!({
+            "mcp": {
+                "server": "Agent-delegation",
+                "tool": "vibex_react"
+            },
+            "prompt": "React to the latest message"
+        })));
+        let mcp_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &mcp);
+        match &mcp_events[0].event {
+            CanonicalAgentEvent::ToolCall(call) => {
+                assert_eq!(call.tool_name, "mcp__Agent-delegation__vibex_react");
+                assert_eq!(call.summary, "React to the latest message");
+                assert_eq!(call.input_summary.as_deref(), Some(r#"{"emoji":"wave"}"#));
+            }
+            other => panic!("expected MCP ToolCall, got {other:?}"),
+        }
+
+        // 6. Web search, image generation (nested content block), subagent, todo, interaction.
+        let mut search = input("other", json!({"Query": "rust acp protocol"}));
+        search.title = "Running search_web".to_string();
+        assert!(matches!(
+            &normalize_agent_event(AgentEventEnricherKind::Antigravity, &search)[0].event,
+            CanonicalAgentEvent::WebSearch(search) if search.query == "rust acp protocol"
+        ));
+
+        let mut image = input("other", json!({"Prompt": "sunset over mountains"}));
+        image.title = "Running generate_image".to_string();
+        image.content = Some(json!([{
+            "type": "content",
+            "content": {
+                "type": "image",
+                "mimeType": "image/png",
+                "uri": "file:///work/out.png"
+            }
+        }]));
+        assert!(matches!(
+            &normalize_agent_event(AgentEventEnricherKind::Antigravity, &image)[0].event,
+            CanonicalAgentEvent::ImageGeneration(image)
+                if image.mime_type.as_deref() == Some("image/png")
+                    && image.image_reference.as_deref() == Some("file:///work/out.png")
+        ));
+
+        let mut subagent = input(
+            "other",
+            json!({"Role": "Codebase Researcher", "Prompt": "Audit ACP wiring"}),
+        );
+        subagent.title = "Running invoke_subagent".to_string();
+        assert!(matches!(
+            &normalize_agent_event(AgentEventEnricherKind::Antigravity, &subagent)[0].event,
+            CanonicalAgentEvent::Collaboration(collab)
+                if collab.agent_label.as_deref() == Some("Codebase Researcher")
+                    && collab.summary == "Audit ACP wiring"
+        ));
+
+        let mut steps = input(
+            "other",
+            json!({"steps": [{"title": "Inspect server", "status": "in_progress"}]}),
+        );
+        steps.title = "Running update_steps".to_string();
+        assert!(matches!(
+            &normalize_agent_event(AgentEventEnricherKind::Antigravity, &steps)[0].event,
+            CanonicalAgentEvent::TodoUpdate(todo)
+                if todo.items.len() == 1
+                    && todo.items[0].title == "Inspect server"
+                    && todo.items[0].status == PlanStepStatus::Running
+        ));
+
+        let mut interaction = input("other", json!({"questions": []}));
+        interaction.native_event_id = "interaction_42".to_string();
+        interaction.title = "Clarify scope".to_string();
+        assert!(matches!(
+            &normalize_agent_event(AgentEventEnricherKind::Antigravity, &interaction)[0].event,
+            CanonicalAgentEvent::ToolCall(call) if call.tool_name == "ask_question"
+        ));
     }
 }

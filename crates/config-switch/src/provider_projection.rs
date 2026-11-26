@@ -3624,7 +3624,8 @@ fn legacy_model_id_projection_entries(
         .collect()
 }
 
-const ANTIGRAVITY_THINKING_SUFFIXES: [&str; 4] = ["-extra_high", "-high", "-medium", "-low"];
+const ANTIGRAVITY_THINKING_SUFFIXES: [&str; 5] =
+    ["-extra_high", "-high", "-medium", "-low", "-minimal"];
 
 const ANTIGRAVITY_BUILTIN_THINKING_FAMILIES: [&str; 9] = [
     "gemini-4-carbon",
@@ -3638,9 +3639,20 @@ const ANTIGRAVITY_BUILTIN_THINKING_FAMILIES: [&str; 9] = [
     "gemini-3.1-pro",
 ];
 
-/// Strips a built-in Antigravity thinking-level suffix (`-low`, `-medium`,
-/// `-high`, `-extra_high`) only when the base name is one of Antigravity's own
-/// thinking-level model families.
+/// Thinking levels advertised by `agy_acp_server`'s built-in
+/// `DEFAULT_MODEL_METADATA_MAP` for `model_id`, in ascending effort order.
+pub fn antigravity_thinking_levels(model_id: &str) -> &'static [&'static str] {
+    match antigravity_thinking_family(model_id) {
+        Some("gemini-4-neon" | "gemini-4-hydrogen") => &["low", "medium", "high", "extra_high"],
+        Some("gemini-3.1-pro") => &["low", "high"],
+        Some(_) => &["low", "medium", "high"],
+        None => &[],
+    }
+}
+
+/// Strips a built-in Antigravity thinking-level suffix (`-minimal`, `-low`,
+/// `-medium`, `-high`, `-extra_high`) only when the base name is one of
+/// Antigravity's own thinking-level model families.
 ///
 /// `agy_acp_server` only translates suffixes for exact keys in its built-in
 /// `DEFAULT_MODEL_METADATA_MAP`. Any other id (including namespaced proxy ids
@@ -10195,7 +10207,28 @@ mod tests {
                 verbatim,
                 "custom model id must not receive a synthetic thinking suffix"
             );
+            assert!(
+                antigravity_thinking_levels(verbatim).is_empty(),
+                "custom model {verbatim} must not advertise synthetic thinking levels"
+            );
         }
+
+        assert_eq!(
+            antigravity_thinking_levels("gemini-4-neon"),
+            &["low", "medium", "high", "extra_high"]
+        );
+        assert_eq!(
+            antigravity_thinking_levels("gemini-4-hydrogen-high"),
+            &["low", "medium", "high", "extra_high"]
+        );
+        assert_eq!(
+            antigravity_thinking_levels("gemini-3.1-pro"),
+            &["low", "high"]
+        );
+        assert_eq!(
+            antigravity_thinking_levels("gemini-3.7-flash"),
+            &["low", "medium", "high"]
+        );
     }
 
     #[test]

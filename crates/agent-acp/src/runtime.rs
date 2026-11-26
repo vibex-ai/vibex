@@ -5438,84 +5438,7 @@ impl AcpSessionAttachment {
             return Vec::new();
         };
         let snapshot = state.tool_calls.entry(tool_call_id.clone()).or_default();
-        if let Some(title) = update.get("title").and_then(Value::as_str) {
-            snapshot.title = bounded_session_content(title);
-        }
-        if let Some(tool_kind) = update.get("kind").and_then(Value::as_str) {
-            snapshot.kind = tool_kind.to_string();
-        }
-        if let Some(raw_input) = update.get("rawInput") {
-            snapshot.raw_input = Some(raw_input.clone());
-            snapshot.input_summary = truncate_optional_summary(raw_input.to_string());
-        }
-        // An adapter that streams a terminal-backed command delivers each chunk
-        // once, under the spec's reserved `_meta`, and settles with the
-        // un-streamed tail plus `_meta.terminal_exit`. Accumulate the chunks so
-        // the delta below sees a growing text rather than a lone fragment.
-        let streamed_terminal = streamed_terminal_output(update);
-        if let Some(fragment) = streamed_terminal
-            && !fragment.is_empty()
-        {
-            snapshot.terminal_output.push_str(fragment);
-        }
-        let raw_output_text = update
-            .get("rawOutput")
-            .map(|value| match value {
-                Value::String(value) => value.clone(),
-                _ => value.to_string(),
-            })
-            .and_then(safe_tool_raw_output)
-            .or_else(|| {
-                (!snapshot.terminal_output.is_empty())
-                    .then(|| snapshot.terminal_output.clone())
-                    .and_then(safe_tool_raw_output)
-            });
-        let raw_output = raw_output_text
-            .as_deref()
-            .and_then(|next| raw_output_delta(&mut snapshot.raw_output_state, next));
-        if update.get("rawOutput").is_some() || streamed_terminal.is_some() {
-            snapshot.output_summary = raw_output_text
-                .as_deref()
-                .and_then(truncate_optional_summary);
-        }
-        if let Some(content) = update.get("content") {
-            snapshot.content = Some(content.clone());
-        }
-        if let Some(content_summary) = tool_call_content_summary(snapshot.content.as_ref()) {
-            snapshot.output_summary = truncate_optional_summary(content_summary);
-        }
-        if let Some(locations) = update.get("locations") {
-            snapshot.locations = crate::parse_event_locations(Some(locations));
-        }
-        // `meta` is the adapter-extension spelling the catalog reads; `_meta`
-        // is the spec's reserved one. Accept both so neither an extension nor a
-        // conforming adapter loses its bounded metadata.
-        if let Some(meta) = update.get("_meta").or_else(|| update.get("meta")) {
-            snapshot.meta = crate::parse_event_meta(Some(meta));
-        }
-        // The streaming settlement reports the exit status beside the tail.
-        if let Some(exit_code) = streamed_terminal_exit_code(update) {
-            snapshot
-                .meta
-                .insert("exit_code".to_string(), exit_code.to_string());
-        }
-        let status_raw =
-            update
-                .get("status")
-                .and_then(Value::as_str)
-                .unwrap_or(if kind == "tool_call" {
-                    "pending"
-                } else {
-                    "in_progress"
-                });
-        let status = match status_raw {
-            "pending" | "in_progress" if !snapshot.started => ToolCallStatus::Started,
-            "pending" | "in_progress" => ToolCallStatus::Progress,
-            "completed" => ToolCallStatus::Completed,
-            "failed" | "cancelled" | "canceled" => ToolCallStatus::Failed,
-            _ => ToolCallStatus::Progress,
-        };
-        snapshot.started = true;
+        let (status, raw_output) = merge_tool_call_snapshot(snapshot, kind, update);
         let completed = matches!(status, ToolCallStatus::Completed | ToolCallStatus::Failed);
         let snapshot = snapshot.clone();
         if completed {
@@ -5570,6 +5493,105 @@ impl AcpSessionAttachment {
         }
         events
     }
+}
+
+fn merge_tool_call_snapshot(
+    snapshot: &mut ToolCallSnapshot,
+    kind: &str,
+    update: &Value,
+) -> (ToolCallStatus, Option<AgentEventRawOutput>) {
+    if let Some(title) = update.get("title").and_then(Value::as_str) {
+        snapshot.title = bounded_session_content(title);
+    }
+    if let Some(tool_kind) = update.get("kind").and_then(Value::as_str) {
+        snapshot.kind = tool_kind.to_string();
+    }
+    if let Some(raw_input) = update.get("rawInput") {
+        snapshot.raw_input = Some(raw_input.clone());
+        snapshot.input_summary = truncate_optional_summary(raw_input.to_string());
+    }
+    // An adapter that streams a terminal-backed command delivers each chunk
+    // once, under the spec's reserved `_meta`, and settles with the
+    // un-streamed tail plus `_meta.terminal_exit`. Accumulate the chunks so
+    // the delta below sees a growing text rather than a lone fragment.
+    let streamed_terminal = streamed_terminal_output(update);
+    if let Some(fragment) = streamed_terminal
+        && !fragment.is_empty()
+    {
+        snapshot.terminal_output.push_str(fragment);
+    }
+    let raw_output_text = update
+        .get("rawOutput")
+        .map(|value| match value {
+            Value::String(value) => value.clone(),
+            _ => value.to_string(),
+        })
+        .and_then(safe_tool_raw_output)
+        .or_else(|| {
+            (!snapshot.terminal_output.is_empty())
+                .then(|| snapshot.terminal_output.clone())
+                .and_then(safe_tool_raw_output)
+        });
+    let raw_output = raw_output_text
+        .as_deref()
+        .and_then(|next| raw_output_delta(&mut snapshot.raw_output_state, next));
+    let raw_output_provided = update.get("rawOutput").is_some() || streamed_terminal.is_some();
+    if raw_output_provided {
+        snapshot.output_summary = raw_output_text
+            .as_deref()
+            .and_then(truncate_optional_summary);
+    }
+    if let Some(content) = update.get("content") {
+        snapshot.content = Some(content.clone());
+    }
+    // Only derive `output_summary` from `content` when this update either
+    // supplied fresh content (without explicit `rawOutput`) or when no
+    // `rawOutput` has been captured yet. Otherwise an earlier start-frame
+    // `diff` block would overwrite a terminal `rawOutput` (e.g. a failure
+    // error message) on `tool_call_update`.
+    if !raw_output_provided
+        && (update.get("content").is_some() || snapshot.output_summary.is_none())
+        && let Some(content_summary) = tool_call_content_summary(snapshot.content.as_ref())
+    {
+        snapshot.output_summary = truncate_optional_summary(content_summary);
+    }
+    if let Some(locations) = update.get("locations") {
+        snapshot.locations = crate::parse_event_locations(Some(locations));
+    }
+    // `meta` is the adapter-extension spelling the catalog reads; `_meta`
+    // is the spec's reserved one. Accept both so neither an extension nor a
+    // conforming adapter loses its bounded metadata. Merge into existing
+    // keys so a follow-up frame that omits `_meta` (or sends partial keys)
+    // preserves earlier attribution such as `_meta.mcp`.
+    if let Some(meta) = update.get("_meta").or_else(|| update.get("meta")) {
+        for (key, value) in crate::parse_event_meta(Some(meta)) {
+            snapshot.meta.insert(key, value);
+        }
+    }
+    // The streaming settlement reports the exit status beside the tail.
+    if let Some(exit_code) = streamed_terminal_exit_code(update) {
+        snapshot
+            .meta
+            .insert("exit_code".to_string(), exit_code.to_string());
+    }
+    let status_raw =
+        update
+            .get("status")
+            .and_then(Value::as_str)
+            .unwrap_or(if kind == "tool_call" {
+                "pending"
+            } else {
+                "in_progress"
+            });
+    let status = match status_raw {
+        "pending" | "in_progress" if !snapshot.started => ToolCallStatus::Started,
+        "pending" | "in_progress" => ToolCallStatus::Progress,
+        "completed" => ToolCallStatus::Completed,
+        "failed" | "cancelled" | "canceled" => ToolCallStatus::Failed,
+        _ => ToolCallStatus::Progress,
+    };
+    snapshot.started = true;
+    (status, raw_output)
 }
 
 impl AcpProcess {
@@ -17158,6 +17180,7 @@ fn antigravity_model_reasoning_effort(model: &str) -> Option<&'static str> {
         ("-high", "high"),
         ("-medium", "medium"),
         ("-low", "low"),
+        ("-minimal", "minimal"),
     ]
     .into_iter()
     .find_map(|(suffix, effort)| model.ends_with(suffix).then_some(effort))
@@ -17170,12 +17193,19 @@ fn antigravity_runtime_model_id(model: &str, effort: &str) -> String {
     format!("{family}-{effort}")
 }
 
-fn antigravity_reasoning_efforts() -> Vec<AgentReasoningEffort> {
-    ["low", "medium", "high"]
-        .into_iter()
+fn antigravity_reasoning_efforts(model: Option<&str>) -> Vec<AgentReasoningEffort> {
+    let levels = model
+        .map(vibex_config_switch::antigravity_thinking_levels)
+        .filter(|levels| !levels.is_empty())
+        .unwrap_or(&["low", "medium", "high"]);
+    levels
+        .iter()
         .map(|value| AgentReasoningEffort {
-            value: value.to_string(),
-            description: Some(value[..1].to_uppercase() + &value[1..]),
+            value: (*value).to_string(),
+            description: Some(match *value {
+                "extra_high" => "Extra High".to_string(),
+                other => other[..1].to_uppercase() + &other[1..],
+            }),
         })
         .collect()
 }
@@ -19621,11 +19651,11 @@ async fn runtime_session_probe_from_response(
     }
     if process.agent_id.as_str() == "antigravity"
         && reasoning_efforts.is_empty()
-        && target_model
+        && let Some(model) = target_model
             .or_else(|| process.startup_model())
-            .is_some_and(vibex_config_switch::antigravity_supports_thinking_suffix)
+            .filter(|model| vibex_config_switch::antigravity_supports_thinking_suffix(model))
     {
-        reasoning_efforts = antigravity_reasoning_efforts();
+        reasoning_efforts = antigravity_reasoning_efforts(Some(model));
     }
     // A probe for one explicit Model only confirms that target; the Model list
     // and the names beside it come from the stateless response.
@@ -23674,11 +23704,154 @@ mod tests {
             "gemini-2.5-pro"
         );
         assert_eq!(
-            antigravity_reasoning_efforts()
+            antigravity_reasoning_efforts(Some("gemini-4-neon"))
+                .into_iter()
+                .map(|effort| effort.value)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high", "extra_high"]
+        );
+        assert_eq!(
+            antigravity_reasoning_efforts(Some("gemini-3.1-pro"))
+                .into_iter()
+                .map(|effort| effort.value)
+                .collect::<Vec<_>>(),
+            ["low", "high"]
+        );
+        assert_eq!(
+            antigravity_reasoning_efforts(Some("gemini-3.7-flash"))
                 .into_iter()
                 .map(|effort| effort.value)
                 .collect::<Vec<_>>(),
             ["low", "medium", "high"]
+        );
+        assert_eq!(
+            antigravity_reasoning_efforts(None)
+                .into_iter()
+                .map(|effort| effort.value)
+                .collect::<Vec<_>>(),
+            ["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn antigravity_tool_call_update_preserves_terminal_raw_output_and_mcp_meta() {
+        // Start frame carries a diff block; follow-up failure carries `rawOutput`
+        // without a new `content` field. The stale diff must not overwrite the
+        // error message, and the failed edit stays a named ToolCall so the UI
+        // retains the failure badge and error output.
+        let mut edit_snapshot = ToolCallSnapshot::default();
+        let _ = merge_tool_call_snapshot(
+            &mut edit_snapshot,
+            "tool_call",
+            &json!({
+                "toolCallId": "edit-1",
+                "title": "Running client_edit_file",
+                "kind": "edit",
+                "status": "in_progress",
+                "rawInput": {
+                    "target_file": "/work/src/lib.rs",
+                    "old_text": "before",
+                    "new_text": "after"
+                },
+                "content": [{
+                    "type": "diff",
+                    "path": "/work/src/lib.rs",
+                    "oldText": "before",
+                    "newText": "after"
+                }]
+            }),
+        );
+        let (edit_status, edit_raw_output) = merge_tool_call_snapshot(
+            &mut edit_snapshot,
+            "tool_call_update",
+            &json!({
+                "toolCallId": "edit-1",
+                "status": "failed",
+                "rawOutput": "Access to path \"/work/src/lib.rs\" is denied."
+            }),
+        );
+        let edit_events = normalize_tool_call_snapshot(
+            AgentEventEnricherKind::Antigravity,
+            "antigravity-test",
+            "edit-1".to_string(),
+            edit_status,
+            edit_snapshot,
+            edit_raw_output,
+        );
+        let failed_edit = edit_events
+            .iter()
+            .find_map(|event| match event {
+                AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                    event: crate::CanonicalAgentEvent::ToolCall(call),
+                    ..
+                }) => Some(call),
+                _ => None,
+            })
+            .expect("failed edit should preserve ToolCall status and error output");
+        assert_eq!(failed_edit.tool_name, "client_edit_file");
+        assert_eq!(failed_edit.status, ToolCallStatus::Failed);
+        assert_eq!(
+            failed_edit.output_summary.as_deref(),
+            Some("Access to path \"/work/src/lib.rs\" is denied.")
+        );
+
+        // Start frame carries `_meta.mcp`; follow-up completion omits `_meta`.
+        // Merging metadata keeps the MCP attribution on the terminal event.
+        let mut mcp_snapshot = ToolCallSnapshot::default();
+        let _ = merge_tool_call_snapshot(
+            &mut mcp_snapshot,
+            "tool_call",
+            &json!({
+                "toolCallId": "mcp-1",
+                "title": "Running vibex_react",
+                "kind": "other",
+                "status": "in_progress",
+                "rawInput": {
+                    "emoji": "ok",
+                    "arguments": { "emoji": "ok" }
+                },
+                "_meta": {
+                    "mcp": {
+                        "server": "Agent-delegation",
+                        "tool": "vibex_react"
+                    }
+                }
+            }),
+        );
+        let (mcp_status, mcp_raw_output) = merge_tool_call_snapshot(
+            &mut mcp_snapshot,
+            "tool_call_update",
+            &json!({
+                "toolCallId": "mcp-1",
+                "status": "completed",
+                "rawOutput": "ok"
+            }),
+        );
+        let mcp_events = normalize_tool_call_snapshot(
+            AgentEventEnricherKind::Antigravity,
+            "antigravity-test",
+            "mcp-1".to_string(),
+            mcp_status,
+            mcp_snapshot,
+            mcp_raw_output,
+        );
+        let completed_mcp = mcp_events
+            .iter()
+            .find_map(|event| match event {
+                AcpEvent::Canonical(crate::NormalizedAgentEvent {
+                    event: crate::CanonicalAgentEvent::ToolCall(call),
+                    ..
+                }) => Some(call),
+                _ => None,
+            })
+            .expect("completed MCP call should retain _meta.mcp attribution");
+        assert_eq!(
+            completed_mcp.tool_name,
+            "mcp__Agent-delegation__vibex_react"
+        );
+        assert_eq!(
+            completed_mcp.input_summary.as_deref(),
+            Some(r#"{"emoji":"ok"}"#)
         );
     }
 

@@ -380,6 +380,24 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
         .profiled("interactive workspace-trust prompt blocks the ACP handshake")
         .with_credential_scrub(&["GEMINI_API_KEY", "GOOGLE_API_KEY"])
         .with_launch_args(GEMINI_LAUNCH_ARGS),
+    // Antigravity (`agy_acp_server`) emits generic ACP tool kinds alongside
+    // `Running <tool>` titles, structured exec/image rawOutput envelopes, diff
+    // content blocks, and `_meta.mcp` envelopes. Inherited Gemini/Vertex/gateway
+    // environment variables override its OAuth account flow unless cleared on
+    // the agent-account path.
+    AgentDialectProfile::generic("antigravity")
+        .profiled("Antigravity ACP event normalization and OAuth credential scrubbing")
+        .with_credential_scrub(&[
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_GEMINI_BASE_URL",
+            "GOOGLE_VERTEX_BASE_URL",
+            "AGY_ACP_DEFAULT_MODEL",
+            "AGY_LLM_GATEWAY_URL",
+            "AGY_LLM_GATEWAY_MODELS",
+            "AGY_ACP_ENABLE_GATEWAY_AUTH",
+        ])
+        .with_enricher(AgentEventEnricherKind::Antigravity),
     // Factory Droid rejects forwarded MCP entries; the catalog already opts
     // out of the preset feature, and this keeps the wire empty on every path.
     AgentDialectProfile::generic("factory-droid")
@@ -657,5 +675,31 @@ mod tests {
                 placement: LaunchArgPlacement::Leading,
             }]
         );
+    }
+
+    #[test]
+    fn antigravity_uses_its_enricher_forwards_mcp_and_scrubs_gateway_and_gemini_env() {
+        let antigravity = agent_dialect_profile("antigravity");
+        assert_eq!(antigravity.support_tier, AgentSupportTier::DialectProfiled);
+        assert_eq!(
+            antigravity.event_enricher,
+            AgentEventEnricherKind::Antigravity
+        );
+        assert!(antigravity.mcp_wire_delivery.forwards_servers());
+        for key in [
+            "GEMINI_API_KEY",
+            "GOOGLE_API_KEY",
+            "GOOGLE_GEMINI_BASE_URL",
+            "GOOGLE_VERTEX_BASE_URL",
+            "AGY_ACP_DEFAULT_MODEL",
+            "AGY_LLM_GATEWAY_URL",
+            "AGY_LLM_GATEWAY_MODELS",
+            "AGY_ACP_ENABLE_GATEWAY_AUTH",
+        ] {
+            assert!(
+                antigravity.credential_env_keys_to_unset.contains(&key),
+                "{key} must be scrubbed on the Antigravity agent-account path"
+            );
+        }
     }
 }

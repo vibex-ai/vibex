@@ -225,6 +225,10 @@ pub enum AgentEventEnricherKind {
     Grok,
     /// CodeBuddy virtualizes MCP tool calls behind `DeferExecuteTool`.
     CodeBuddy,
+    /// Antigravity emits generic ACP kinds with `Running <tool>` titles,
+    /// structured exec/image payloads, diff content blocks, and `_meta.mcp`
+    /// envelopes.
+    Antigravity,
     Passthrough,
 }
 

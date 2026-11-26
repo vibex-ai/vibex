@@ -105,9 +105,10 @@ impl Activity {
                     .then(|| tool_input_string(tool, &["description"]))
                     .flatten();
                 let input_target = described.or_else(|| {
-                    summary_is_uninformative(&tool.summary, &tool.tool_name)
-                        .then(|| tool_input_target(tool, icon))
-                        .flatten()
+                    (summary_is_uninformative(&tool.summary, &tool.tool_name)
+                        && mcp_tool_name(&tool.tool_name).is_none())
+                    .then(|| tool_input_target(tool, icon))
+                    .flatten()
                 });
                 let summary = if summary_is_uninformative(summary, &tool.tool_name)
                     && input_target.is_none()
@@ -319,26 +320,54 @@ impl Activity {
 /// agent meant it.
 pub(crate) const FILE_PATH_KEYS: &[&str] = &[
     "file_path",
+    "FilePath",
     "path",
     "filePath",
     "absolute_path",
+    "AbsolutePath",
     "target_file",
+    "TargetFile",
     "targetFile",
     "file",
 ];
 
 pub(crate) fn input_keys(kind: ActivityKind) -> &'static [&'static str] {
     match kind {
-        ActivityKind::Command => &["command", "cmd", "commands", "script"],
+        ActivityKind::Command => &[
+            "command",
+            "command_line",
+            "CommandLine",
+            "cmd",
+            "commands",
+            "script",
+        ],
         ActivityKind::FileRead
         | ActivityKind::FileEdit
         | ActivityKind::FileCreate
         | ActivityKind::FileDelete => FILE_PATH_KEYS,
-        ActivityKind::Search => &["pattern", "query", "regex", "q"],
-        ActivityKind::Collaboration => &["description", "subagent_type", "agent", "prompt"],
+        ActivityKind::Search => &["pattern", "Pattern", "query", "Query", "regex", "q"],
+        ActivityKind::Collaboration => &[
+            "description",
+            "Description",
+            "role",
+            "Role",
+            "subagent_type",
+            "agent",
+            "prompt",
+            "Prompt",
+        ],
         ActivityKind::Integration => &["name", "skill", "server", "tool"],
-        ActivityKind::Web => &["url", "query", "queries"],
-        ActivityKind::Directory => &["pattern", "glob", "path"],
+        ActivityKind::Web => &["url", "Url", "query", "Query", "queries"],
+        ActivityKind::Directory => &[
+            "directory_path",
+            "DirectoryPath",
+            "search_directory",
+            "SearchDirectory",
+            "pattern",
+            "Pattern",
+            "glob",
+            "path",
+        ],
         _ => &[],
     }
 }
@@ -364,16 +393,26 @@ fn tool_input_target(tool: &ToolCallPayload, kind: ActivityKind) -> Option<Strin
                     .as_str()
                     .filter(|text| !text.trim().is_empty())
             })?;
-            Some(
-                match object
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
+            let scope = [
+                "path",
+                "search_path",
+                "SearchPath",
+                "search_directory",
+                "SearchDirectory",
+                "directory_path",
+                "DirectoryPath",
+            ]
+            .iter()
+            .find_map(|key| {
+                object
+                    .get(*key)?
+                    .as_str()
                     .filter(|path| !path.trim().is_empty() && *path != ".")
-                {
-                    Some(path) => format!("{pattern} in {path}"),
-                    None => pattern.to_string(),
-                },
-            )
+            });
+            Some(match scope {
+                Some(path) => format!("{pattern} in {path}"),
+                None => pattern.to_string(),
+            })
         }
         Ok(serde_json::Value::Object(object)) => keys.iter().find_map(|key| {
             match object.get(*key)? {
@@ -453,7 +492,13 @@ fn names_only_the_tool_being_run(summary: &str, tool_name: &str) -> bool {
     let forwarded = ["client_", "acp_"]
         .iter()
         .any(|prefix| rest.to_ascii_lowercase().starts_with(prefix));
-    forwarded || bare(rest) == bare(tool_name)
+    let snake_tool_identifier = rest.contains('_')
+        && !rest.contains(char::is_whitespace)
+        && rest.len() <= 64
+        && rest
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric() || character == '_');
+    forwarded || snake_tool_identifier || bare(rest) == bare(tool_name)
 }
 
 /// A tool's name as the header shows it when nothing better is known.

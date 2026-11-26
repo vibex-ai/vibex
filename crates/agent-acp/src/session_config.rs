@@ -390,7 +390,9 @@ impl SessionConfigPlanner {
     /// than as one selectable `reasoning_effort` option. Those values still
     /// use ACP's typed `session/set_mode` request on the wire.
     pub fn reasoning_effort_value_is_advertised(&self, value: &str) -> bool {
-        if self.antigravity_reasoning_model_bridge && matches!(value, "low" | "medium" | "high") {
+        if self.antigravity_reasoning_model_bridge
+            && matches!(value, "minimal" | "low" | "medium" | "high" | "extra_high")
+        {
             return true;
         }
         if self.reasoning_effort_mode_bridge
@@ -550,7 +552,10 @@ impl SessionConfigPlanner {
             SessionConfigFieldKind::Mode => self.plan_mode(&field.key),
             SessionConfigFieldKind::ReasoningEffort
                 if self.antigravity_reasoning_model_bridge
-                    && matches!(field.value.as_str(), "low" | "medium" | "high") =>
+                    && matches!(
+                        field.value.as_str(),
+                        "minimal" | "low" | "medium" | "high" | "extra_high"
+                    ) =>
             {
                 config_evidence
                     .map(|evidence| SessionConfigPlan::Live {
@@ -4726,5 +4731,45 @@ mod direct_route_option_tests {
         assert_eq!(effort_values(&option.reasoning_efforts), ["off", "high"]);
         assert!(option.modes.is_empty());
         assert!(option.features.is_empty());
+    }
+
+    #[test]
+    fn antigravity_reasoning_model_bridge_accepts_extra_high_and_minimal() {
+        let mut operations = BTreeMap::new();
+        operations.insert(
+            AcpOperation::SessionSetConfigOption,
+            SessionConfigOperationEvidence {
+                support: CapabilitySupport::Supported,
+                source: CapabilitySource::NegotiatedRuntime,
+                encoding: AcpWireEncoding::Typed,
+                stability: AcpOperationStability::CapabilityGated,
+                compatibility_identity: "antigravity".to_string(),
+                activation_generation: 1,
+            },
+        );
+        let planner =
+            SessionConfigPlanner::new("antigravity", 1, BTreeMap::new(), operations, Vec::new())
+                .with_antigravity_reasoning_model_bridge();
+
+        for level in ["minimal", "low", "medium", "high", "extra_high"] {
+            assert!(
+                planner.reasoning_effort_value_is_advertised(level),
+                "{level} must be advertised by the Antigravity reasoning bridge"
+            );
+            let field = SessionConfigFieldRequest {
+                key: CanonicalSessionConfigKey::parse(CANONICAL_REASONING_EFFORT).unwrap(),
+                kind: SessionConfigFieldKind::ReasoningEffort,
+                value: level.to_string(),
+            };
+            assert!(matches!(
+                planner.plan(&field).unwrap(),
+                SessionConfigPlan::Live {
+                    operation: AcpOperation::SessionSetConfigOption,
+                    option_id: Some(ref option_id),
+                    ..
+                } if option_id == "model"
+            ));
+        }
+        assert!(!planner.reasoning_effort_value_is_advertised("unsupported"));
     }
 }
