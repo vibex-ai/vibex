@@ -31,6 +31,7 @@ pub fn card() -> View {
         .bg(theme::composer_surface)
         .shadow_sm()
         .p(px(theme::SPACING_SM))
+        .test_id("composer-card")
 }
 
 /// The field: starts as a single breathing line and grows with what is written.

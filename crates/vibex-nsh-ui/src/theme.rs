@@ -519,11 +519,23 @@ pub fn floating_pane() -> Hsla {
 /// The pane a control floats in, with nothing showing through it.
 ///
 /// [`floating_pane`] is glass, and is meant to be read against whatever scrolls
-/// under it. A control that must stay legible over a busy transcript — the
-/// bar's own buttons, whose glyphs sit over running prose — takes this instead,
-/// so nothing is ever drawn behind the mark.
+/// under it. A control that must stay legible over a busy transcript — a
+/// notice raised over running prose — takes this instead, so nothing is ever
+/// drawn behind the mark.
 pub fn floating_pane_solid() -> Hsla {
     background_card()
+}
+
+/// The fill of the conversation bar's own controls.
+///
+/// The menu, the title and the workbench sit on the same page as the prompt
+/// card and answer to the same hand, so they wear that card's fill rather than
+/// the card tone the rest of the page's panes take. In the light appearance the
+/// two are the same white and nothing moves; in the dark one the composer
+/// surface is a step above `card`, and without this the bar read as three
+/// dimmer blocks pinned over the field they belong to.
+pub fn header_pane() -> Hsla {
+    composer_surface()
 }
 
 /// The shadow a floating pane casts.

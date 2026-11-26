@@ -1482,9 +1482,12 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         }
     };
     // The bar floats over the conversation rather than sitting on top of it:
-    // its controls are translucent panes with a shadow, so a message scrolls
-    // underneath and reads through the gaps instead of being cut off at a
-    // hard edge. `pt_safe_area` keeps the panes below the status bar.
+    // its controls are filled panes with a shadow, so a message scrolls
+    // underneath and is read in the gaps between them instead of being cut off
+    // at a hard edge. They take `header_pane` — the prompt card's own fill —
+    // because the bar and the field are the same instrument at the two ends of
+    // the page, and the card tone left the bar a dimmer block in the dark
+    // appearance. `pt_safe_area` keeps the panes below the status bar.
     view()
         .w_full()
         .absolute()
@@ -1508,7 +1511,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         copy::text("Sessions", "会话", "工作階段"),
                         move || pager.open(ShellPage::Sessions),
                     )
-                    .bg(theme::floating_pane_solid)
+                    .bg(theme::header_pane)
                     .shadow(theme::floating_pane_shadow()),
                 )
                 .child(
@@ -1522,7 +1525,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                             .items_center()
                             .gap(px(6.0))
                             .rounded_full()
-                            .bg(theme::floating_pane_solid)
+                            .bg(theme::header_pane)
                             .shadow(theme::floating_pane_shadow())
                             .active(|style| style.opacity(0.6))
                             .accessibility_label(move || {
@@ -1633,7 +1636,7 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                     ),
                                     move || pager.open(ShellPage::Workbench),
                                 )
-                                .bg(theme::floating_pane_solid)
+                                .bg(theme::header_pane)
                                 .shadow(theme::floating_pane_shadow())
                                 .relative()
                                 .child(when(
