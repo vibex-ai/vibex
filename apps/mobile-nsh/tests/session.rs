@@ -2487,6 +2487,43 @@ fn terminal_keyboard_handles_repeated_backspaces_across_reseed() {
     );
 }
 
+/// Running one command (`pwd` + Enter) and immediately typing a second (`ls`)
+/// must never replay the previous command's text (`pwdls`), whether submitted
+/// with the keyboard Return key or the terminal key-bar Enter chip.
+#[test]
+fn terminal_sequential_commands_do_not_replay_previous_input() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Keyboard]").unwrap();
+    app.press("role:button[Keyboard]").unwrap();
+
+    for key in ["p", "w", "d", "enter"] {
+        app.press_key(key).unwrap();
+    }
+    app.wait_for("text:input: [return]").unwrap();
+
+    for key in ["l", "s"] {
+        app.press_key(key).unwrap();
+    }
+    app.wait_for("text:input: s").unwrap();
+    assert!(
+        !app.screen().shows("pwdl") && !app.screen().shows("pwdls"),
+        "second command must not replay the first command"
+    );
+
+    // Also verify submitting via the shortcut bar's Enter chip clears cleanly.
+    app.press("Enter").unwrap();
+    for key in ["i", "d"] {
+        app.press_key(key).unwrap();
+    }
+    app.wait_for("text:input: d").unwrap();
+    assert!(
+        !app.screen().shows("lsi") && !app.screen().shows("pwd"),
+        "subsequent command after Enter chip must not replay prior text"
+    );
+}
+
 #[test]
 fn the_at_palette_inserts_a_workspace_reference() {
     let mut app = start();

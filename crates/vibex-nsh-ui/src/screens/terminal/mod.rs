@@ -29,6 +29,7 @@ pub struct TerminalChoice {
 }
 
 type TerminalAction = Rc<dyn Fn(&str)>;
+type SubmitHandle = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 
 /// The air between the grid's cells and the panel's edge.
 const TERMINAL_INSET: f32 = 10.0;
@@ -42,13 +43,19 @@ const TERMINAL_KEY_ROW_HEIGHT: f32 = 50.0;
 /// One key's height in that row.
 const TERMINAL_KEY_HEIGHT: f32 = 32.0;
 
-/// Alternating space runways kept inside the invisible IME field so rapid
+/// Three space runways kept inside the invisible IME field so rapid
 /// soft-keyboard Backspace presses always have characters to delete even before
-/// a round-trip value sync arrives from Rust, and every re-seed produces a
-/// distinct `Prop::Value` string so `nsh-core` always flushes the new text back
-/// to the native `EditText` / `UITextField`.
-const INPUT_SEED_A: &str = "        ";
-const INPUT_SEED_B: &str = "         ";
+/// a round-trip value sync arrives from Rust.
+///
+/// Using three distinct lengths guarantees every re-seed can pick a seed that:
+/// 1. differs from the last `Prop::Value` flushed by `nsh-core` (so same-tick
+///    `on_change` + `on_submit` never elides the reset),
+/// 2. differs from the text currently in the native field (so `Core` always
+///    emits `MountItem::InputValue`), and
+/// 3. has a different leading-space prefix length than the pre-reseed text (so
+///    we can unambiguously distinguish a dropped async `setValue` from fresh
+///    input typed after the reset succeeded).
+const INPUT_SEEDS: [&str; 3] = ["        ", "         ", "          "];
 
 /// Minimum buffer length before the hidden IME field is re-seeded.
 const INPUT_RESEED_LOW: usize = 4;
@@ -98,6 +105,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let control = signal(false);
     let alt = signal(false);
     let keyboard = element_ref();
+    let submit_keyboard: SubmitHandle = Rc::new(RefCell::new(None));
     let confirm = signal(None::<String>);
     let error = host.error;
     let output = host.output_revision;
@@ -455,14 +463,18 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 // fresh native geometry and edit count.
                 .child(when(
                     move || visible.get() && selected(),
-                    move || {
-                        terminal_keyboard(
-                            keyboard,
-                            active,
-                            composing_text,
-                            input_modes.clone(),
-                            on_text.clone(),
-                        )
+                    {
+                        let submit_keyboard = submit_keyboard.clone();
+                        move || {
+                            terminal_keyboard(
+                                keyboard,
+                                active,
+                                composing_text,
+                                submit_keyboard.clone(),
+                                input_modes.clone(),
+                                on_text.clone(),
+                            )
+                        }
                     },
                 ))
                 .child(when(
@@ -499,7 +511,13 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 ))
         })
         .child(when(selected, move || {
-            terminal_keys(control, alt, terminal_modes.clone(), on_data.clone())
+            terminal_keys(
+                control,
+                alt,
+                terminal_modes.clone(),
+                submit_keyboard.clone(),
+                on_data.clone(),
+            )
         }))
         .child(when(
             move || keyboard_height().0 == 0.0,
@@ -629,6 +647,7 @@ fn terminal_keys(
     control: Signal<bool>,
     alt: Signal<bool>,
     modes: Rc<dyn Fn() -> EmulatorModes>,
+    submit_keyboard: SubmitHandle,
     data: TerminalAction,
 ) -> impl IntoElement {
     let escape = data.clone();
@@ -675,7 +694,14 @@ fn terminal_keys(
                         data(&seq);
                     })
                 }))
-                .child(key_chip("Enter", || false, move || enter("\r")))
+                .child(key_chip("Enter", || false, move || {
+                    let submit = submit_keyboard.borrow().clone();
+                    if let Some(submit) = submit {
+                        submit();
+                    } else {
+                        enter("\r");
+                    }
+                }))
                 .child(key_chip("⌫", || false, move || backspace("\u{7f}")))
                 .child(key_chip(
                     "Alt",
@@ -701,47 +727,165 @@ fn terminal_keys(
         )
 }
 
+/// Pure state machine bridging native `EditText` / `UITextField` text changes,
+/// IME compositions, and async seed resets into exact PTY byte streams.
+struct InputBridge {
+    committed: String,
+    flushed_prop: String,
+    pending: Option<String>,
+    reseeded_from: Option<String>,
+    composing: bool,
+}
+
+impl InputBridge {
+    fn new() -> Self {
+        let initial = INPUT_SEEDS[0].to_owned();
+        Self {
+            committed: initial.clone(),
+            flushed_prop: initial,
+            pending: None,
+            reseeded_from: None,
+            composing: false,
+        }
+    }
+
+    fn note_flushed_prop(&mut self, value: &str) {
+        self.flushed_prop.clear();
+        self.flushed_prop.push_str(value);
+    }
+
+    /// Buffers `next` during IME composition, returning `true` when deferred.
+    fn buffer_if_composing(&mut self, next: &str) -> bool {
+        if self.composing {
+            self.pending = Some(next.to_owned());
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Updates composition state and returns any buffered edit to commit now
+    /// that the composition has finished.
+    fn set_composing(&mut self, composing: bool) -> Option<String> {
+        self.composing = composing;
+        if composing { None } else { self.pending.take() }
+    }
+
+    fn take_pending(&mut self) -> Option<String> {
+        self.pending.take()
+    }
+
+    /// Diffs a committed native input value into PTY bytes and returns an
+    /// optional replacement seed if the buffer needs to be re-seeded.
+    fn commit(&mut self, next: &str) -> (String, Option<String>) {
+        let base = match self.reseeded_from.take() {
+            Some(old) if is_dropped_reseed_edit(&old, next) => old,
+            _ => self.committed.clone(),
+        };
+        let data = terminal_edit(&base, next);
+        self.committed = next.to_owned();
+        if next.len() < INPUT_RESEED_LOW || next.len() > INPUT_RESEED_HIGH {
+            (data, Some(self.reseed()))
+        } else {
+            (data, None)
+        }
+    }
+
+    /// Clears any active composition and requests a fresh seed runway.
+    fn reset(&mut self) -> String {
+        self.composing = false;
+        self.pending = None;
+        self.reseed()
+    }
+
+    /// Picks a seed guaranteed to differ from `flushed_prop`, the current
+    /// committed value, and the pre-reseed leading-space count so:
+    /// - `nsh-core`'s prop differ always flushes `MountItem::InputValue`, and
+    /// - if the platform still drops the async `setValue` (e.g. a faster edit
+    ///   incremented `InputBox.count`), `reseeded_from` catches the stale text
+    ///   without ever duplicating the previous command.
+    fn reseed(&mut self) -> String {
+        if self.reseeded_from.is_some()
+            && self.committed != self.flushed_prop
+            && INPUT_SEEDS.contains(&self.committed.as_str())
+        {
+            return self.committed.clone();
+        }
+        let previous = self.committed.clone();
+        if self.reseeded_from.is_none() {
+            self.reseeded_from = Some(previous.clone());
+        }
+        let anchor_spaces = leading_spaces(self.reseeded_from.as_deref().unwrap_or(&previous));
+        let next_seed = INPUT_SEEDS
+            .iter()
+            .copied()
+            .find(|&seed| {
+                seed != self.flushed_prop && seed != previous && seed.len() != anchor_spaces
+            })
+            .or_else(|| {
+                INPUT_SEEDS
+                    .iter()
+                    .copied()
+                    .find(|&seed| seed != self.flushed_prop && seed != previous)
+            })
+            .unwrap_or(INPUT_SEEDS[0]);
+        self.committed = next_seed.to_owned();
+        next_seed.to_owned()
+    }
+}
+
+fn leading_spaces(text: &str) -> usize {
+    text.bytes().take_while(|&byte| byte == b' ').count()
+}
+
+/// Returns `true` when `next` is clearly an edit against the pre-reseed text
+/// `old` (meaning the platform dropped or raced past our async `setValue`
+/// reset) rather than fresh typing on top of the new seed runway.
+fn is_dropped_reseed_edit(old: &str, next: &str) -> bool {
+    let old_spaces = leading_spaces(old);
+    if old_spaces == old.len() {
+        return false;
+    }
+    // Same text re-reported, or new characters appended onto stale command text.
+    if next.starts_with(old) {
+        return true;
+    }
+    // Backspace deleting from stale command text while non-space text remains.
+    if old.starts_with(next) && next.len() > old_spaces {
+        return true;
+    }
+    false
+}
+
 fn terminal_keyboard(
     keyboard: ElementRef,
     active: Signal<Option<String>>,
     composing_text: Signal<Option<SharedString>>,
+    submit_keyboard: SubmitHandle,
     modes: Rc<dyn Fn() -> EmulatorModes>,
     send: TerminalAction,
 ) -> impl IntoElement {
     // `input_value` mirrors `on_change` during normal typing and composition so
     // `nsh-core`'s prop differ stays in sync while `core::Prop::Value` sees
     // `input.value == value` and emits nothing to the native `EditText` (zero
-    // mid-word `setText`/`setSelection` disruption). On re-seed/reset we flip
-    // between `INPUT_SEED_A` and `INPUT_SEED_B` and move the caret to the end.
-    let input_value = signal(INPUT_SEED_A.to_owned());
-    let committed = Rc::new(RefCell::new(INPUT_SEED_A.to_owned()));
-    let pending = Rc::new(RefCell::new(None::<String>));
-    let composing = signal(false);
+    // mid-word `setText`/`setSelection` disruption). On re-seed/reset
+    // `InputBridge` picks a distinct seed and moves the caret to the end.
+    let input_value = signal(INPUT_SEEDS[0].to_owned());
+    let bridge = Rc::new(RefCell::new(InputBridge::new()));
     let focused = signal(false);
 
-    let reseed = {
-        let committed = committed.clone();
-        move || {
-            let next_seed = if input_value.with_untracked(|value| value == INPUT_SEED_A) {
-                INPUT_SEED_B
-            } else {
-                INPUT_SEED_A
-            };
-            *committed.borrow_mut() = next_seed.to_owned();
-            input_value.set(next_seed.to_owned());
-            let end = next_seed.encode_utf16().count() as u32;
-            keyboard.set_selection(end, end);
-        }
+    let apply_seed = move |next_seed: String| {
+        let end = next_seed.encode_utf16().count() as u32;
+        input_value.set(next_seed);
+        keyboard.set_selection(end, end);
     };
 
     let reset = {
-        let reseed = reseed.clone();
-        let pending = pending.clone();
+        let bridge = bridge.clone();
         move || {
-            composing.set(false);
             composing_text.set(None);
-            pending.borrow_mut().take();
-            reseed();
+            let next_seed = bridge.borrow_mut().reset();
+            apply_seed(next_seed);
         }
     };
 
@@ -806,18 +950,13 @@ fn terminal_keyboard(
     }
 
     let commit = {
-        let committed = committed.clone();
-        let reseed = reseed.clone();
+        let bridge = bridge.clone();
         let send = send.clone();
         move |next: &str| {
-            let data = {
-                let previous = committed.borrow();
-                terminal_edit(&previous, next)
-            };
-            if next.len() < INPUT_RESEED_LOW || next.len() > INPUT_RESEED_HIGH {
-                reseed();
+            let (data, reseed_target) = bridge.borrow_mut().commit(next);
+            if let Some(next_seed) = reseed_target {
+                apply_seed(next_seed);
             } else {
-                *committed.borrow_mut() = next.to_owned();
                 input_value.set(next.to_owned());
             }
             if !data.is_empty() {
@@ -826,8 +965,31 @@ fn terminal_keyboard(
         }
     };
 
+    let submit_action: Rc<dyn Fn()> = Rc::new({
+        let bridge = bridge.clone();
+        let commit = commit.clone();
+        let reset = reset.clone();
+        let send = send.clone();
+        move || {
+            let unflushed = bridge.borrow_mut().take_pending();
+            if let Some(unflushed) = unflushed {
+                commit(&unflushed);
+            }
+            send("\r");
+            reset();
+        }
+    });
+    *submit_keyboard.borrow_mut() = Some(submit_action.clone());
+    {
+        let submit_keyboard = submit_keyboard.clone();
+        cleanup(move || {
+            submit_keyboard.borrow_mut().take();
+        });
+    }
+
     let on_paste_send = send.clone();
     let on_paste_modes = modes.clone();
+    let value_bridge = bridge.clone();
 
     input()
         .element_ref(&keyboard)
@@ -850,18 +1012,21 @@ fn terminal_keyboard(
         .auto_fill(AutoFill::Off)
         .paste_behavior(PasteBehavior::Report)
         .submit_behavior(SubmitBehavior::Submit)
-        .value(move || input_value.get())
+        .value(move || {
+            let value = input_value.get();
+            value_bridge.borrow_mut().note_flushed_prop(&value);
+            value
+        })
         .selected_range((
-            INPUT_SEED_A.encode_utf16().count() as u32,
-            INPUT_SEED_A.encode_utf16().count() as u32,
+            INPUT_SEEDS[0].encode_utf16().count() as u32,
+            INPUT_SEEDS[0].encode_utf16().count() as u32,
         ))
         .on_focus(move || focused.set(true))
         .on_change({
-            let pending = pending.clone();
+            let bridge = bridge.clone();
             let commit = commit.clone();
             move |next: &str| {
-                if composing.get_untracked() {
-                    pending.replace(Some(next.to_owned()));
+                if bridge.borrow_mut().buffer_if_composing(next) {
                     input_value.set(next.to_owned());
                 } else {
                     commit(next);
@@ -869,18 +1034,16 @@ fn terminal_keyboard(
             }
         })
         .on_composition_change({
-            let pending = pending.clone();
+            let bridge = bridge.clone();
             let commit = commit.clone();
             move |composition: &Composition| {
-                composing.set(composition.composing);
+                let flushed = bridge.borrow_mut().set_composing(composition.composing);
                 composing_text.set(if composition.composing && !composition.text.is_empty() {
                     Some(SharedString::from(composition.text.clone()))
                 } else {
                     None
                 });
-                if !composition.composing
-                    && let Some(next) = pending.take()
-                {
+                if let Some(next) = flushed {
                     commit(&next);
                 }
             }
@@ -891,18 +1054,7 @@ fn terminal_keyboard(
                 on_paste_send(&payload);
             }
         })
-        .on_submit({
-            let pending = pending.clone();
-            let commit = commit.clone();
-            let reset = reset.clone();
-            move |_: &str| {
-                if let Some(unflushed) = pending.take() {
-                    commit(&unflushed);
-                }
-                send("\r");
-                reset();
-            }
-        })
+        .on_submit(move |_: &str| submit_action())
         .on_blur(move || {
             focused.set(false);
             reset();
@@ -1042,7 +1194,7 @@ fn modified_input(text: &str, control: bool, alt: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{encode_paste, modified_input, terminal_edit};
+    use super::{INPUT_SEEDS, InputBridge, encode_paste, modified_input, terminal_edit};
 
     #[test]
     fn native_input_edits_produce_pty_bytes() {
@@ -1069,5 +1221,94 @@ mod tests {
             encode_paste("echo hi\n", true),
             "\x1b[200~echo hi\r\x1b[201~"
         );
+    }
+
+    #[test]
+    fn same_tick_command_and_submit_always_picks_a_new_seed_prop() {
+        let mut bridge = InputBridge::new();
+        // Initial prop flushed by nsh-core is INPUT_SEEDS[0].
+        bridge.note_flushed_prop(INPUT_SEEDS[0]);
+
+        // Typing "pwd" and submitting in the same tick (before prop flush):
+        let (typed, reseed) = bridge.commit(&format!("{}pwd", INPUT_SEEDS[0]));
+        assert_eq!(typed, "pwd");
+        assert!(reseed.is_none());
+
+        let next_seed = bridge.reset();
+        assert_ne!(
+            next_seed, INPUT_SEEDS[0],
+            "reseed must differ from the last flushed prop so nsh-core emits InputValue"
+        );
+        bridge.note_flushed_prop(&next_seed);
+
+        // Next command "ls" after the native field applied `next_seed`:
+        let (l, _) = bridge.commit(&format!("{next_seed}l"));
+        let (s, _) = bridge.commit(&format!("{next_seed}ls"));
+        assert_eq!(format!("{l}{s}"), "ls");
+    }
+
+    #[test]
+    fn dropped_native_reset_never_replays_previous_command() {
+        let mut bridge = InputBridge::new();
+        bridge.note_flushed_prop(INPUT_SEEDS[0]);
+
+        let prev_text = format!("{}pwd", INPUT_SEEDS[0]);
+        assert_eq!(bridge.commit(&prev_text).0, "pwd");
+        bridge.note_flushed_prop(&prev_text);
+
+        // Submit resets the bridge, requesting a new seed from Android...
+        let _next_seed = bridge.reset();
+
+        // ...but Android drops the async `setValue` (e.g. count raced ahead)
+        // so the native EditText still contains `        pwd` when user types `ls`:
+        let (l, _) = bridge.commit(&format!("{prev_text}l"));
+        let (s, _) = bridge.commit(&format!("{prev_text}ls"));
+        assert_eq!(
+            format!("{l}{s}"),
+            "ls",
+            "must send only `ls`, never replay `pwdls`"
+        );
+    }
+
+    #[test]
+    fn dropped_native_reset_handles_composing_and_backspace_cleanly() {
+        let mut bridge = InputBridge::new();
+        bridge.note_flushed_prop(INPUT_SEEDS[0]);
+
+        let prev_text = format!("{}pwd", INPUT_SEEDS[0]);
+        assert_eq!(bridge.commit(&prev_text).0, "pwd");
+        bridge.note_flushed_prop(&prev_text);
+        let _next_seed = bridge.reset();
+
+        // Composing "ls" on top of stale EditText text:
+        assert!(bridge.set_composing(true).is_none());
+        assert!(bridge.buffer_if_composing(&format!("{prev_text}l")));
+        assert!(bridge.buffer_if_composing(&format!("{prev_text}ls")));
+        let flushed = bridge.set_composing(false).unwrap();
+        assert_eq!(bridge.commit(&flushed).0, "ls");
+
+        // Another dropped reset followed by Backspace:
+        let stale = format!("{prev_text}ls");
+        let _next_seed = bridge.reset();
+        assert_eq!(bridge.commit(&format!("{prev_text}l")).0, "\u{7f}");
+        assert_eq!(bridge.commit(&stale).0, "s");
+    }
+
+    #[test]
+    fn repeating_identical_command_after_applied_reset_still_sends_it() {
+        let mut bridge = InputBridge::new();
+        bridge.note_flushed_prop(INPUT_SEEDS[0]);
+
+        let first = format!("{}pwd", INPUT_SEEDS[0]);
+        assert_eq!(bridge.commit(&first).0, "pwd");
+        bridge.note_flushed_prop(&first);
+
+        let next_seed = bridge.reset();
+        bridge.note_flushed_prop(&next_seed);
+
+        // Native field applied `next_seed` (different leading-space length),
+        // then user inserts "pwd" again in a single candidate commit:
+        let second = format!("{next_seed}pwd");
+        assert_eq!(bridge.commit(&second).0, "pwd");
     }
 }
