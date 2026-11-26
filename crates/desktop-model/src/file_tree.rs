@@ -350,19 +350,26 @@ impl FileTreeProjection {
             path == &base_path
                 || !path_is_equal_or_descendant(path, &base_path)
                 || incoming.contains_key(path)
-                || parent_path(path).as_deref() != Some(base_path.as_str())
+                || parent_path(path).as_deref().unwrap_or("") != base_path.as_str()
         });
         for (path, entry) in incoming {
             let load_state = if entry.kind == FileEntryKind::Directory {
-                // A listing re-describes the directory but says nothing about
-                // whether its own children were read; keeping the state keeps
-                // an already loaded folder from going back to "unloaded" (and
-                // spinning) every time a parent is refreshed.
-                self.nodes
-                    .get(&path)
-                    .map(|node| node.load_state.clone())
-                    .filter(|state| !matches!(state, FileTreeLoadState::Loading))
-                    .unwrap_or(FileTreeLoadState::Unloaded)
+                if self.load_generations.contains_key(&path) {
+                    // Keep an in-flight child load intact when its parent's
+                    // listing lands first so callers do not re-issue the load
+                    // and invalidate the earlier generation.
+                    FileTreeLoadState::Loading
+                } else {
+                    // A listing re-describes the directory but says nothing about
+                    // whether its own children were read; keeping the state keeps
+                    // an already loaded folder from going back to "unloaded" (and
+                    // spinning) every time a parent is refreshed.
+                    self.nodes
+                        .get(&path)
+                        .map(|node| node.load_state.clone())
+                        .filter(|state| !matches!(state, FileTreeLoadState::Loading))
+                        .unwrap_or(FileTreeLoadState::Unloaded)
+                }
             } else {
                 FileTreeLoadState::Loaded
             };
@@ -531,6 +538,13 @@ impl FileTreeProjection {
             .get(&path)
             .map(|node| node.load_state.clone())
             .unwrap_or(FileTreeLoadState::Unloaded)
+    }
+
+    pub fn has_children(&self, path: &str) -> bool {
+        let path = normalize_relative_path(path);
+        self.children_by_parent
+            .get(&path)
+            .is_some_and(|children| !children.is_empty())
     }
 
     pub fn is_expanded(&self, path: &str) -> bool {
@@ -1037,7 +1051,15 @@ fn append_visible_children(
                     .is_some_and(|selected| path_chain.iter().any(|path| path == selected)),
             hidden,
             ignored,
-            load_state: visible_node.load_state.clone(),
+            load_state: if path_chain.iter().any(|path| {
+                nodes
+                    .get(path)
+                    .is_some_and(|node| node.load_state == FileTreeLoadState::Loading)
+            }) {
+                FileTreeLoadState::Loading
+            } else {
+                visible_node.load_state.clone()
+            },
             git,
             pending: path_chain
                 .iter()
@@ -1958,5 +1980,119 @@ mod tests {
                 .map(|git| git.signal),
             Some(FileGitSignal::Untracked)
         );
+    }
+
+    #[test]
+    fn parent_listing_preserves_in_flight_child_load_state_and_compacted_chain_loading() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+
+        let root_gen = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            root_gen,
+            "",
+            vec![
+                entry(&workspace_id, "packaging", FileEntryKind::Directory),
+                entry(&workspace_id, "packaging/aur", FileEntryKind::Directory),
+            ],
+        ));
+
+        let chain = tree.visible_row(1).unwrap().path_chain.clone();
+        assert_eq!(chain, ["packaging", "packaging/aur"]);
+        assert!(tree.set_chain_expanded(&chain, true));
+
+        let parent_gen = tree.begin_load("packaging");
+        let child_gen = tree.begin_load("packaging/aur");
+        assert_eq!(tree.load_state("packaging"), FileTreeLoadState::Loading);
+        assert_eq!(tree.load_state("packaging/aur"), FileTreeLoadState::Loading);
+
+        // Parent listing arrives first while child load is still in flight.
+        assert!(tree.apply_entries(
+            &workspace_id,
+            parent_gen,
+            "packaging",
+            vec![
+                entry(&workspace_id, "packaging/aur", FileEntryKind::Directory),
+                entry(
+                    &workspace_id,
+                    "packaging/aur/vibex-bin",
+                    FileEntryKind::Directory,
+                ),
+            ],
+        ));
+        assert_eq!(tree.load_state("packaging"), FileTreeLoadState::Loaded);
+        assert_eq!(tree.load_state("packaging/aur"), FileTreeLoadState::Loading);
+        assert_eq!(
+            tree.visible_row(1).unwrap().load_state,
+            FileTreeLoadState::Loading
+        );
+        assert!(!tree.has_children("packaging/aur/vibex-bin"));
+
+        // Child listing still matches its original generation and populates files.
+        assert!(tree.apply_entries(
+            &workspace_id,
+            child_gen,
+            "packaging/aur",
+            vec![
+                entry(
+                    &workspace_id,
+                    "packaging/aur/vibex-bin",
+                    FileEntryKind::Directory,
+                ),
+                entry(
+                    &workspace_id,
+                    "packaging/aur/vibex-bin/PKGBUILD",
+                    FileEntryKind::File,
+                ),
+                entry(
+                    &workspace_id,
+                    "packaging/aur/vibex-bin/.SRCINFO",
+                    FileEntryKind::File,
+                ),
+            ],
+        ));
+        assert_eq!(tree.load_state("packaging/aur"), FileTreeLoadState::Loaded);
+        assert!(tree.has_children("packaging/aur/vibex-bin"));
+        assert_eq!(
+            tree.all_visible_rows()
+                .iter()
+                .map(|row| row.path.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "",
+                "packaging/aur/vibex-bin",
+                "packaging/aur/vibex-bin/.SRCINFO",
+                "packaging/aur/vibex-bin/PKGBUILD",
+            ]
+        );
+    }
+
+    #[test]
+    fn root_listing_prunes_deleted_top_level_entries() {
+        let workspace_id = WorkspaceId::new();
+        let mut tree = FileTreeProjection::default();
+        tree.reset_workspace(workspace_id.clone());
+
+        let gen1 = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            gen1,
+            "",
+            vec![
+                entry(&workspace_id, "keep.rs", FileEntryKind::File),
+                entry(&workspace_id, "removed.rs", FileEntryKind::File),
+            ],
+        ));
+        let gen2 = tree.begin_load("");
+        assert!(tree.apply_entries(
+            &workspace_id,
+            gen2,
+            "",
+            vec![entry(&workspace_id, "keep.rs", FileEntryKind::File)],
+        ));
+        assert!(tree.contains_path("keep.rs"));
+        assert!(!tree.contains_path("removed.rs"));
     }
 }

@@ -14,8 +14,8 @@ use nsh_testing::{DragOptions, Headless};
 use vibex_nsh_ui::screens::connecting::ConnectionState;
 use vibex_nsh_ui::screens::files::{FileEntry, FilePreview, FilePreviewKindView, FileSearchRow};
 use vibex_nsh_ui::screens::git::{
-    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, WorktreeConflictRow,
-    WorktreeOperationRow, WorktreeRow,
+    BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, GitRemoteActivity,
+    WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
 };
 use vibex_nsh_ui::screens::new_session::{DirectoryEntry, ProjectBrowserHost, WorkspaceChoice};
 use vibex_nsh_ui::screens::session::{
@@ -778,7 +778,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let runtime_features = signal(Vec::new());
     let git_amend = signal(false);
     let git_push_after = signal(false);
-    let git_remote_busy = signal(false);
+    let git_remote_busy = signal(None::<GitRemoteActivity>);
     let git_branches = signal(vec![BranchRow {
         name: "main".to_owned(),
         current: true,
@@ -1005,19 +1005,48 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let git_selected = signal(vec!["src/main.rs".to_owned()]);
     let git_message = signal(String::new());
     let git_committing = signal(false);
-    let git_history = signal(vec![CommitRow {
+    let initial_commits = vec![CommitRow {
         hash: "abc123".to_owned(),
         short_hash: "abc123".to_owned(),
         subject: "Initial commit".to_owned(),
         detail: "Ada".to_owned(),
-    }]);
+        authored_at_ms: Some(1_700_000_000_000),
+    }];
+    let git_history = signal(initial_commits.clone());
     let git_show_history = signal(false);
+    let git_history_more = signal(false);
+    let git_history_loading = signal(false);
+    let git_history_query = signal(String::new());
+    let on_search_git_history = Rc::new(move |query: &str| {
+        git_history_query.set(query.to_owned());
+        let needle = query.trim().to_lowercase();
+        if needle.is_empty() {
+            git_history.set(initial_commits.clone());
+        } else {
+            git_history.set(
+                initial_commits
+                    .iter()
+                    .filter(|row| {
+                        row.subject.to_lowercase().contains(&needle)
+                            || row.short_hash.to_lowercase().contains(&needle)
+                            || row.detail.to_lowercase().contains(&needle)
+                    })
+                    .cloned()
+                    .collect(),
+            );
+        }
+    });
     let git_commit_detail = signal(None::<CommitDetailPreview>);
     let on_open_git_commit = Rc::new(move |hash: &str| {
         git_commit_detail.set(Some(CommitDetailPreview {
             title: hash.to_owned(),
             body: "commit detail body".to_owned(),
             truncated: false,
+            subject: "Initial commit".to_owned(),
+            message_body: "Detailed explanation of the commit\nwith a second line.".to_owned(),
+            author: "Ada".to_owned(),
+            authored_at: "2026-11-26 20:00".to_owned(),
+            files: Vec::new(),
         }));
     });
     let on_revert_git = Rc::new(move |_path: &str| git_diff.set(None));
@@ -1525,14 +1554,20 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_restore_worktree: Rc::new(|_| {}),
         on_toggle_git_amend: Rc::new(|| {}),
         on_toggle_git_push_after: Rc::new(|| {}),
-        on_git_push: Rc::new(|| {}),
-        on_git_pull: Rc::new(|| {}),
-        on_git_fetch: Rc::new(|| {}),
+        on_prime_git: Rc::new(|| {}),
+        on_git_push: Rc::new(move || git_remote_busy.set(Some(GitRemoteActivity::Push))),
+        on_git_pull: Rc::new(move || git_remote_busy.set(Some(GitRemoteActivity::Pull))),
+        on_git_fetch: Rc::new(move || git_remote_busy.set(Some(GitRemoteActivity::Fetch))),
         git_history,
         git_show_history,
+        git_history_more,
+        git_history_loading,
+        git_history_query,
         git_commit_detail,
         on_commit_git,
         on_toggle_git_history,
+        on_load_more_git_history: Rc::new(|| {}),
+        on_search_git_history,
         on_open_git_commit,
         on_revert_git,
         on_git_back,
@@ -3846,3 +3881,103 @@ fn a_carried_row_lands_and_the_next_drag_is_accepted() {
     .unwrap();
     assert!(app.screen().shows("Session 2"), "the drawer is drawn again");
 }
+
+#[test]
+fn git_remote_buttons_spin_only_the_pressed_action_and_disable_siblings() {
+    let mut app = start();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("role:button[Fetch]").unwrap();
+
+    // Initially none of the remote buttons is spinning.
+    assert!(!app.screen().matches("id:git-remote-spinner-fetch").unwrap());
+    assert!(!app.screen().matches("id:git-remote-spinner-pull").unwrap());
+    assert!(!app.screen().matches("id:git-remote-spinner-push").unwrap());
+
+    // Pressing Pull spins only Pull and disables Fetch and Push.
+    app.press("role:button[Pull]").unwrap();
+    app.wait_for("id:git-remote-spinner-pull").unwrap();
+    assert!(
+        !app.screen().matches("id:git-remote-spinner-fetch").unwrap(),
+        "Fetch must not spin while Pull is running"
+    );
+    assert!(
+        !app.screen().matches("id:git-remote-spinner-push").unwrap(),
+        "Push must not spin while Pull is running"
+    );
+    // Pressing a sibling while Pull is busy must not switch the spinner to Fetch.
+    let _ = app.press("role:button[Fetch]");
+    assert!(app.screen().matches("id:git-remote-spinner-pull").unwrap());
+    assert!(!app.screen().matches("id:git-remote-spinner-fetch").unwrap());
+}
+
+#[test]
+fn commit_detail_collapses_message_body_by_default_and_toggles_on_press() {
+    let mut app = start();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("role:button[Commits]").unwrap();
+    app.press("role:button[Commits]").unwrap();
+    app.wait_for("Initial commit").unwrap();
+    app.press("Initial commit").unwrap();
+
+    // Subject and expand toggle appear, while the multi-line body starts collapsed.
+    app.wait_for("id:commit-message-toggle").unwrap();
+    assert!(app.screen().shows("Initial commit"));
+    assert!(
+        !app.screen().matches("id:commit-message-body").unwrap(),
+        "commit message body must start collapsed"
+    );
+
+    // Tapping the commit header expands the full commit message body.
+    app.press("id:commit-message-toggle").unwrap();
+    app.wait_for("id:commit-message-body").unwrap();
+    assert!(
+        app.screen()
+            .shows("Detailed explanation of the commit\nwith a second line.")
+    );
+
+    // Tapping again collapses the body back to subject-only.
+    app.press("id:commit-message-toggle").unwrap();
+    app.wait_for_gone(
+        "id:commit-message-body",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+}
+
+#[test]
+fn readonly_file_viewer_supports_selection_and_copy_without_editing() {
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    config.environment.os = nsh_core::platform::Os::Ios;
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Files, Git, and terminal]").unwrap();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("src").unwrap();
+    app.wait_for("main.rs").unwrap();
+    app.press("main.rs").unwrap();
+    app.wait_for("fn main() {").unwrap();
+
+    // Long-pressing text on touch selects a word and opens the floating
+    // selection action bar with Copy and Select All.
+    app.long_press("fn main() {").unwrap();
+    app.wait_for("id:file-selection-actions").unwrap();
+    app.wait_for("id:file-selection-copy").unwrap();
+    app.press("id:file-selection-select-all").unwrap();
+    app.press("id:file-selection-copy").unwrap();
+    app.wait_for_gone(
+        "id:file-selection-actions",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
+    assert_eq!(
+        app.screen().clipboard(),
+        Some("fn main() {\n    let greeting = \"hello\";\n    println!(\"{greeting}\");\n}")
+    );
+    // The file stays strictly read-only.
+    assert!(app.screen().shows("fn main() {"));
+}
+

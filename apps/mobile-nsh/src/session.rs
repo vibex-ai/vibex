@@ -72,7 +72,7 @@ use vibex_nsh_ui::{
     },
     screens::git::{
         BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
-        WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
+        GitRemoteActivity, WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
     },
     screens::new_session::{DirectoryEntry, ProjectBrowserHost, WorkspaceChoice},
     screens::session::{
@@ -282,7 +282,7 @@ pub struct SessionService {
     git_committing: Signal<bool>,
     git_amend: Signal<bool>,
     git_push_after: Signal<bool>,
-    git_remote_busy: Signal<bool>,
+    git_remote_busy: Signal<Option<GitRemoteActivity>>,
     git_branches: Signal<Vec<BranchRow>>,
     git_branch_menu: Signal<bool>,
     git_history_ref: Rc<RefCell<Option<String>>>,
@@ -575,7 +575,7 @@ impl SessionService {
             git_committing: signal(false),
             git_amend: signal(false),
             git_push_after: signal(false),
-            git_remote_busy: signal(false),
+            git_remote_busy: signal(None),
             git_branches: signal(Vec::new()),
             git_branch_menu: signal(false),
             git_history_ref: Rc::new(RefCell::new(None)),
@@ -2210,7 +2210,7 @@ impl SessionService {
         self.git_diff.set(None);
         self.git_error.set(None);
         self.git_selected.set(Vec::new());
-        self.git_remote_busy.set(false);
+        self.git_remote_busy.set(None);
         self.git_totals.set((0, 0));
         self.git_branch_menu.set(false);
         self.git_history.set(Vec::new());
@@ -7203,21 +7203,33 @@ impl SessionService {
     fn toggle_all_folders(&self) {
         let (expanding, loads) = {
             let mut tree = self.file_tree.borrow_mut();
-            let directories = tree
+            let chains = tree
                 .all_visible_rows()
                 .iter()
-                .filter(|row| row.kind == vibex_core::FileEntryKind::Directory)
-                .map(|row| row.path.clone())
-                .filter(|path| !path.is_empty())
+                .filter(|row| {
+                    row.kind == vibex_core::FileEntryKind::Directory && !row.path.is_empty()
+                })
+                .map(|row| {
+                    if row.path_chain.is_empty() {
+                        vec![row.path.clone()]
+                    } else {
+                        row.path_chain.clone()
+                    }
+                })
                 .collect::<Vec<_>>();
-            if directories.is_empty() {
+            if chains.is_empty() {
                 return;
             }
-            let all_open = directories.iter().all(|path| tree.is_expanded(path));
+            let all_open = chains.iter().all(|chain| tree.chain_is_expanded(chain));
             if all_open {
                 tree.restore_navigation_state([], None);
                 (false, Vec::new())
             } else {
+                let directories = chains
+                    .into_iter()
+                    .flatten()
+                    .filter(|path| !path.is_empty())
+                    .collect::<Vec<_>>();
                 tree.restore_navigation_state(directories.clone(), None);
                 let loads = directories
                     .into_iter()
@@ -7249,9 +7261,19 @@ impl SessionService {
             let directories = tree
                 .all_visible_rows()
                 .iter()
-                .filter(|row| row.kind == vibex_core::FileEntryKind::Directory)
-                .map(|row| row.path.clone())
-                .filter(|path| !path.is_empty() && !tree.is_expanded(path))
+                .filter(|row| {
+                    row.kind == vibex_core::FileEntryKind::Directory
+                        && !row.path.is_empty()
+                        && !tree.chain_is_expanded(&row.path_chain)
+                })
+                .flat_map(|row| {
+                    if row.path_chain.is_empty() {
+                        vec![row.path.clone()]
+                    } else {
+                        row.path_chain.clone()
+                    }
+                })
+                .filter(|path| !path.is_empty())
                 .collect::<Vec<_>>();
             if directories.is_empty() {
                 return;
@@ -7284,7 +7306,15 @@ impl SessionService {
                 .filter(|row| !row.path.is_empty())
                 .map(|row| FileEntry {
                     path: row.path.clone(),
-                    name: row.name.clone(),
+                    name: if row.segments.len() > 1 {
+                        row.segments
+                            .iter()
+                            .map(|segment| segment.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(" / ")
+                    } else {
+                        row.name.clone()
+                    },
                     directory: row.kind == vibex_core::FileEntryKind::Directory,
                     depth: row.depth.saturating_sub(1),
                     expanded: row.expanded,
@@ -7363,6 +7393,7 @@ impl SessionService {
                 tree.begin_load(&path)
             };
             service.publish_file_tree();
+            let max_depth = if path.is_empty() { 1 } else { 4 };
             let tree_path = (!path.is_empty()).then(|| path.clone());
             let requested_workspace = workspace.clone();
             let result = crate::runtime::handle()
@@ -7375,8 +7406,8 @@ impl SessionService {
                         file_backend.file_tree(FileTreeRequest {
                             workspace_id: requested_workspace,
                             path: tree_path,
-                            max_depth: Some(1),
-                            include_hidden: false,
+                            max_depth: Some(max_depth),
+                            include_hidden: true,
                         }),
                     )
                     .await
@@ -7421,12 +7452,35 @@ impl SessionService {
                 // each folder's children arrive; the folders just revealed are
                 // then read in turn.
                 service.continue_expand_all();
-                let mut dirs = service.file_tree.borrow().expanded_directory_paths();
-                dirs.retain(|directory| {
-                    directory.rsplit_once('/').map_or("", |(parent, _)| parent) == path
-                        && service.file_tree.borrow().load_state(directory)
-                            == FileTreeLoadState::Unloaded
-                });
+                let mut dirs = std::collections::BTreeSet::new();
+                {
+                    let tree = service.file_tree.borrow();
+                    let prefix = (!path.is_empty()).then(|| format!("{path}/"));
+                    for row in tree.all_visible_rows() {
+                        if row.kind != vibex_core::FileEntryKind::Directory
+                            || row.path.is_empty()
+                            || !row.expanded
+                            || row.load_state != FileTreeLoadState::Unloaded
+                            || tree.has_children(&row.path)
+                        {
+                            continue;
+                        }
+                        let under_loaded = match prefix.as_deref() {
+                            None => true,
+                            Some(prefix) => row.path == path || row.path.starts_with(prefix),
+                        };
+                        if under_loaded {
+                            dirs.insert(row.path.clone());
+                        }
+                    }
+                    for directory in tree.expanded_directory_paths() {
+                        if directory.rsplit_once('/').map_or("", |(parent, _)| parent) == path
+                            && tree.load_state(&directory) == FileTreeLoadState::Unloaded
+                        {
+                            dirs.insert(directory);
+                        }
+                    }
+                }
                 for dir in dirs {
                     service.load_tree(dir);
                 }
@@ -8432,10 +8486,15 @@ impl SessionService {
 
     /// Fetches, pulls or pushes the open workspace's branch.
     fn git_remote(&self, kind: GitRemoteActionKind) {
-        if self.git_remote_busy.get_untracked() {
+        if self.git_remote_busy.get_untracked().is_some() {
             return;
         }
-        self.git_remote_busy.set(true);
+        let activity = match kind {
+            GitRemoteActionKind::Fetch => GitRemoteActivity::Fetch,
+            GitRemoteActionKind::Pull => GitRemoteActivity::Pull,
+            GitRemoteActionKind::Push => GitRemoteActivity::Push,
+        };
+        self.git_remote_busy.set(Some(activity));
         self.git_error.set(None);
         let generation = self.workbench_generation.get();
         let service = self.clone();
@@ -8444,12 +8503,12 @@ impl SessionService {
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.workbench_is_current(generation) {
-                    service.git_remote_busy.set(false);
+                    service.git_remote_busy.set(None);
                 }
                 return;
             };
             if !service.workbench_is_current(generation) {
-                service.git_remote_busy.set(false);
+                service.git_remote_busy.set(None);
                 return;
             }
             let result = crate::runtime::handle()
@@ -8466,10 +8525,10 @@ impl SessionService {
             if !service.workbench_is_current(generation) {
                 // The page moved on while the action ran: the spinner must not
                 // stay on for a workbench that no longer exists.
-                service.git_remote_busy.set(false);
+                service.git_remote_busy.set(None);
                 return;
             }
-            service.git_remote_busy.set(false);
+            service.git_remote_busy.set(None);
             match result {
                 Ok(Ok(result)) => {
                     if let Some(status) = result.status_after {
@@ -8757,18 +8816,18 @@ impl SessionService {
     }
 
     fn revert_paths(&self, paths: Vec<String>) {
-        if paths.is_empty() || self.git_remote_busy.get_untracked() {
+        if paths.is_empty() || self.git_remote_busy.get_untracked().is_some() {
             return;
         }
         let generation = self.workbench_generation.get();
-        self.git_remote_busy.set(true);
+        self.git_remote_busy.set(Some(GitRemoteActivity::Revert));
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
         spawn(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.workbench_is_current(generation) {
-                    service.git_remote_busy.set(false);
+                    service.git_remote_busy.set(None);
                 }
                 return;
             };
@@ -8787,7 +8846,7 @@ impl SessionService {
             if !service.workbench_is_current(generation) {
                 return;
             }
-            service.git_remote_busy.set(false);
+            service.git_remote_busy.set(None);
             match result {
                 Ok(Ok(status)) => {
                     service.git_diff.set(None);
@@ -11926,5 +11985,284 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<RuntimeSelectionFlowCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("runtime-flow-ok").unwrap();
+    }
+
+    struct FakeFileTreeBackend {
+        workspace_id: vibex_core::WorkspaceId,
+        entries: Vec<(String, vibex_core::FileEntryKind)>,
+    }
+
+    impl FakeFileTreeBackend {
+        fn list(&self, request: &vibex_core::FileTreeRequest) -> Vec<vibex_core::FileTreeEntry> {
+            let base = request
+                .path
+                .as_deref()
+                .unwrap_or("")
+                .trim_matches('/')
+                .to_owned();
+            let max_depth = request.max_depth.unwrap_or(2) as usize;
+            let prefix = if base.is_empty() {
+                String::new()
+            } else {
+                format!("{base}/")
+            };
+            self.entries
+                .iter()
+                .filter_map(|(path, kind)| {
+                    let rel = if prefix.is_empty() {
+                        path.as_str()
+                    } else {
+                        path.strip_prefix(&prefix)?
+                    };
+                    if rel.is_empty() {
+                        return None;
+                    }
+                    let depth = rel.matches('/').count();
+                    if depth > max_depth {
+                        return None;
+                    }
+                    if !request.include_hidden
+                        && rel.split('/').any(|seg| seg.starts_with('.'))
+                    {
+                        return None;
+                    }
+                    let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+                    let parent_path = path.rsplit_once('/').map(|(parent, _)| parent.to_owned());
+                    Some(vibex_core::FileTreeEntry {
+                        workspace_id: self.workspace_id.clone(),
+                        path: path.clone(),
+                        name: name.clone(),
+                        kind: *kind,
+                        parent_path,
+                        size_bytes: None,
+                        modified_at_ms: None,
+                        ignored: false,
+                        hidden: name.starts_with('.'),
+                    })
+                })
+                .collect()
+        }
+    }
+
+    impl vibex_backend::FileBackend for FakeFileTreeBackend {
+        fn file_tree(
+            &self,
+            request: vibex_core::FileTreeRequest,
+        ) -> vibex_backend::BackendFuture<'_, Vec<vibex_core::FileTreeEntry>> {
+            let entries = self.list(&request);
+            Box::pin(async move { Ok(entries) })
+        }
+
+        fn search_files(
+            &self,
+            _request: vibex_core::FileSearchRequest,
+        ) -> vibex_backend::BackendFuture<'_, Vec<vibex_core::FileSearchResult>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn read_file(
+            &self,
+            _request: vibex_core::FileReadRequest,
+        ) -> vibex_backend::BackendFuture<'_, vibex_core::FileReadResponse> {
+            Box::pin(async {
+                Err(vibex_backend::BackendError::failed(
+                    "unsupported",
+                    "not used in tree test",
+                ))
+            })
+        }
+
+        fn read_file_bytes(
+            &self,
+            _workspace_id: vibex_core::WorkspaceId,
+            _path: String,
+            _max_bytes: usize,
+        ) -> vibex_backend::BackendFuture<'_, Vec<u8>> {
+            Box::pin(async { Ok(Vec::new()) })
+        }
+
+        fn write_file(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::FileWriteRequest>,
+        ) -> vibex_backend::BackendFuture<'_, vibex_core::FileReadResponse> {
+            Box::pin(async {
+                Err(vibex_backend::BackendError::failed(
+                    "unsupported",
+                    "not used in tree test",
+                ))
+            })
+        }
+
+        fn create_directory(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> vibex_backend::BackendFuture<'_, vibex_core::FileTreeEntry> {
+            Box::pin(async {
+                Err(vibex_backend::BackendError::failed(
+                    "unsupported",
+                    "not used in tree test",
+                ))
+            })
+        }
+
+        fn copy_path(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> vibex_backend::BackendFuture<'_, vibex_core::FileTreeEntry> {
+            Box::pin(async {
+                Err(vibex_backend::BackendError::failed(
+                    "unsupported",
+                    "not used in tree test",
+                ))
+            })
+        }
+
+        fn rename_path(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> vibex_backend::BackendFuture<'_, vibex_core::FileTreeEntry> {
+            Box::pin(async {
+                Err(vibex_backend::BackendError::failed(
+                    "unsupported",
+                    "not used in tree test",
+                ))
+            })
+        }
+
+        fn delete_path(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> vibex_backend::BackendFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+
+    #[component]
+    fn FileTreeExpansionFlowView() -> impl IntoElement {
+        use vibex_core::FileEntryKind::{Directory, File};
+
+        let workspace_id = vibex_core::WorkspaceId::new();
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.file_backend = Arc::new(FakeFileTreeBackend {
+            workspace_id: workspace_id.clone(),
+            entries: vec![
+                ("packaging".into(), Directory),
+                ("packaging/aur".into(), Directory),
+                ("packaging/aur/vibex-bin".into(), Directory),
+                ("packaging/aur/vibex-bin/PKGBUILD".into(), File),
+                ("packaging/aur/vibex-bin/.SRCINFO".into(), File),
+                ("skills".into(), Directory),
+                ("skills/system".into(), Directory),
+                ("skills/system/run-workflow".into(), Directory),
+                ("skills/system/run-workflow/SKILL.md".into(), File),
+                ("apps".into(), Directory),
+                ("apps/desktop".into(), Directory),
+                ("apps/desktop/src".into(), Directory),
+                ("apps/desktop/src/main.rs".into(), File),
+                ("apps/mobile-nsh".into(), Directory),
+                ("apps/mobile-nsh/Cargo.toml".into(), File),
+                ("deep".into(), Directory),
+                ("deep/l1".into(), Directory),
+                ("deep/l1/l2".into(), Directory),
+                ("deep/l1/l2/l3".into(), Directory),
+                ("deep/l1/l2/l3/l4".into(), Directory),
+                ("deep/l1/l2/l3/l4/l5".into(), Directory),
+                ("deep/l1/l2/l3/l4/l5/leaf.rs".into(), File),
+            ],
+        });
+        service.active.set(Some(vibex_core::VibexSessionId::new().as_str().to_owned()));
+        *service.files_workspace.borrow_mut() = Some(workspace_id);
+        let status = signal("loading".to_owned());
+        let flow = service.clone();
+        spawn(async move {
+            flow.load_tree(String::new());
+            for _ in 0..40 {
+                timer(Duration::from_millis(20)).await;
+                if flow
+                    .files_entries
+                    .with_untracked(|rows| rows.iter().any(|r| r.path == "packaging/aur"))
+                {
+                    break;
+                }
+            }
+            // Compacted root chains show their full joined segment names instead of only the leaf.
+            let initial_rows = flow.files_entries.get_untracked();
+            assert_eq!(
+                initial_rows
+                    .iter()
+                    .find(|r| r.path == "packaging/aur")
+                    .map(|r| r.name.as_str()),
+                Some("packaging / aur")
+            );
+            assert_eq!(
+                initial_rows
+                    .iter()
+                    .find(|r| r.path == "skills/system")
+                    .map(|r| r.name.as_str()),
+                Some("skills / system")
+            );
+
+            // Expand compacted chains + nested 2nd-level folder + deep 6-level chain.
+            flow.toggle_directory("packaging/aur");
+            flow.toggle_directory("skills/system");
+            flow.toggle_directory("apps");
+            flow.toggle_directory("deep/l1");
+            for _ in 0..60 {
+                timer(Duration::from_millis(20)).await;
+                let ready = flow.files_entries.with_untracked(|rows| {
+                    rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD")
+                        && rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO")
+                        && rows.iter().any(|r| r.path == "skills/system/run-workflow/SKILL.md")
+                        && rows.iter().any(|r| r.path == "apps/desktop/src")
+                        && rows.iter().any(|r| r.path == "deep/l1/l2/l3/l4/l5/leaf.rs")
+                });
+                if ready {
+                    break;
+                }
+            }
+
+            // Now expand the 2nd-level nested folder `apps/desktop/src`.
+            flow.toggle_directory("apps/desktop/src");
+            for _ in 0..40 {
+                timer(Duration::from_millis(20)).await;
+                if flow
+                    .files_entries
+                    .with_untracked(|rows| rows.iter().any(|r| r.path == "apps/desktop/src/main.rs"))
+                {
+                    break;
+                }
+            }
+
+            let rows = flow.files_entries.get_untracked();
+            assert!(rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD"));
+            assert!(rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO"));
+            assert!(rows.iter().any(|r| r.path == "skills/system/run-workflow/SKILL.md"));
+            assert!(rows.iter().any(|r| r.path == "apps/desktop/src/main.rs"));
+            assert!(rows.iter().any(|r| r.path == "deep/l1/l2/l3/l4/l5/leaf.rs"));
+            assert!(
+                rows.iter().all(|r| !r.loading),
+                "no folder row stays stuck in loading state"
+            );
+            flow.shutdown();
+            status.set("file-tree-flow-ok".to_owned());
+        });
+
+        view().child(text(move || status.get()))
+    }
+
+    #[test]
+    fn file_tree_expands_compacted_nested_and_deep_folders_with_hidden_files() {
+        let config = EngineConfig::new(Root::of::<FileTreeExpansionFlowView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("file-tree-flow-ok").unwrap();
     }
 }

@@ -14,6 +14,8 @@ use nsh_core::{
 pub const ACTIVITY_SLOT: f32 = 20.0;
 /// One lap of the highlight, in milliseconds: eight spinner frames at 100 ms.
 const ACTIVITY_LAP_MS: f32 = 800.0;
+/// One full turn of the standard circular loading spinner, in milliseconds.
+const SPINNER_LAP_MS: f32 = 850.0;
 
 /// One full back-and-forth cycle of the V's highlight, in milliseconds.
 ///
@@ -188,6 +190,26 @@ pub fn activity_v(clock: ActivityClock, color: impl Fn() -> Hsla + Copy + 'stati
                     }
                 }),
         )
+}
+
+/// A standard rotating circular loading spinner (`loader-circle`), driven on
+/// the platform's own animation clock. With Reduce Motion it stands still.
+pub fn spinner(size: f32, color: impl Fn() -> Hsla + Copy + 'static) -> View {
+    let box_view = view()
+        .size(px(size))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .child(svg(icon!("loader-circle")).size(px(size)).text_color(color));
+    if crate::motion::reduce_motion() {
+        box_view
+    } else {
+        let angle = animated_value(0.0);
+        Animation::timing(&angle, 360.0, Timing::new(SPINNER_LAP_MS, Easing::Linear))
+            .looped(None)
+            .start();
+        box_view.bind_rotate(&angle)
+    }
 }
 
 #[cfg(test)]

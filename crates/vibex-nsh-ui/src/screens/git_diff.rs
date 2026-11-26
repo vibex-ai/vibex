@@ -385,6 +385,7 @@ pub fn commit_detail_content(detail: super::git::CommitDetailPreview) -> impl In
         (1..file_count).collect()
     };
     let collapsed = signal(initial_collapsed);
+    let message_expanded = signal(false);
     let subject = if detail.subject.is_empty() {
         detail.title.clone()
     } else {
@@ -392,6 +393,75 @@ pub fn commit_detail_content(detail: super::git::CommitDetailPreview) -> impl In
     };
     let message_body = detail.message_body.trim().to_owned();
     let show_message_body = !message_body.is_empty() && message_body != subject.trim();
+
+    let subject_header: AnyElement = if show_message_body {
+        button()
+            .test_id("commit-message-toggle")
+            .accessibility_label(move || {
+                Some(SharedString::from(if message_expanded.get() {
+                    copy::text("Collapse commit message", "收起提交说明", "收起提交說明")
+                } else {
+                    copy::text("Expand commit message", "展开提交说明", "展開提交說明")
+                }))
+            })
+            .on_press(move || message_expanded.update(|expanded| *expanded = !*expanded))
+            .w_full()
+            .flex_row()
+            .items_start()
+            .gap(px(theme::SPACING_SM))
+            .active(|style| style.opacity(0.7))
+            .child(
+                text(subject)
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .text_size(px(theme::font_body()))
+                    .font_weight(FontWeight::SEMIBOLD)
+                    .line_height(theme::line_height_for(theme::font_body()))
+                    .text_color(theme::foreground),
+            )
+            .child(
+                view()
+                    .flex_shrink_0()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(2.0))
+                    .pt(px(2.0))
+                    .child(
+                        text(move || {
+                            if message_expanded.get() {
+                                copy::text("Collapse", "收起", "收起")
+                            } else {
+                                copy::text("Expand", "展开", "展開")
+                            }
+                        })
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                    )
+                    .child(
+                        when(
+                            move || message_expanded.get(),
+                            || {
+                                svg(icon!("chevron-up"))
+                                    .size(px(14.0))
+                                    .text_color(theme::text_muted)
+                            },
+                        )
+                        .otherwise(|| {
+                            svg(icon!("chevron-down"))
+                                .size(px(14.0))
+                                .text_color(theme::text_muted)
+                        }),
+                    ),
+            )
+            .into_element()
+    } else {
+        text(subject)
+            .text_size(px(theme::font_body()))
+            .font_weight(FontWeight::SEMIBOLD)
+            .line_height(theme::line_height_for(theme::font_body()))
+            .text_color(theme::foreground)
+            .into_element()
+    };
 
     scroll().flex_1().min_h(px(0.0)).child(
         view()
@@ -411,18 +481,20 @@ pub fn commit_detail_content(detail: super::git::CommitDetailPreview) -> impl In
                     .bg(theme::fill)
                     .border_1()
                     .border_color(theme::hairline)
-                    .child(
-                        text(subject)
-                            .text_size(px(theme::font_body()))
-                            .font_weight(FontWeight::SEMIBOLD)
-                            .line_height(theme::line_height_for(theme::font_body()))
-                            .text_color(theme::foreground),
-                    )
+                    .child(subject_header)
                     .children(show_message_body.then(|| {
-                        text(message_body)
-                            .text_size(px(theme::font_caption()))
-                            .line_height(theme::line_height_for(theme::font_caption()))
-                            .text_color(theme::text_secondary)
+                        let body = message_body.clone();
+                        when(
+                            move || message_expanded.get(),
+                            move || {
+                                text(body.clone())
+                                    .test_id("commit-message-body")
+                                    .selectable(true)
+                                    .text_size(px(theme::font_caption()))
+                                    .line_height(theme::line_height_for(theme::font_caption()))
+                                    .text_color(theme::text_secondary)
+                            },
+                        )
                     }))
                     .child(
                         view()

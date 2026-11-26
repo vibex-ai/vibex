@@ -5,7 +5,8 @@ use std::{rc::Rc, time::Duration};
 use nsh_base::{
     button, editor,
     editor::{
-        Editor, EditorApi, EditorCommand, EditorSearch, EditorSearchResult, EditorTextPressEvent,
+        Editor, EditorApi, EditorCommand, EditorContextMenuEvent, EditorSearch, EditorSearchResult,
+        EditorSelection, EditorTextPressEvent,
     },
     text_view::{MarkdownOptions, text_view},
 };
@@ -590,12 +591,10 @@ fn file_row(
                 .text_size(px(theme::font_detail()))
                 .text_color(name_color),
         )
-        .children(row.loading.then(|| {
-            svg(icon!("loader-circle"))
-                .size(px(14.0))
-                .flex_shrink_0()
-                .text_color(theme::text_muted)
-        }))
+        .children(
+            row.loading
+                .then(|| crate::ui::activity::spinner(14.0, theme::text_muted)),
+        )
         .children((!status.is_empty()).then(|| {
             text(status)
                 .w(px(16.0))
@@ -665,9 +664,14 @@ fn file_viewer(
     );
     let line = signal(String::new());
     let matches = signal(EditorSearchResult::default());
+    let selection_menu = signal(false);
+    let has_selection = signal(false);
+    let selection_bar_bottom = signal(false);
     let initial = stored(None::<(String, u32)>);
     effect(move || {
         let _ = path.get();
+        selection_menu.set(false);
+        has_selection.set(false);
         if let Some(hl) = highlight.get() {
             query.set(hl.query);
             find_options.set(SearchOptions {
@@ -721,6 +725,8 @@ fn file_viewer(
                     icon!("chevron-left"),
                     copy::text("Back", "返回", "返回"),
                     move || {
+                        selection_menu.set(false);
+                        has_selection.set(false);
                         highlight.set(None);
                         dismiss_keyboard();
                         (host.on_back)();
@@ -946,79 +952,134 @@ fn file_viewer(
                 .into_element(),
                 _ => {
                     let location = path.get_untracked().zip(preview.line);
-                    editor()
-                        .component_ref(&reader)
-                        .value(Some(SharedString::from(preview.body)))
-                        .language(Some(SharedString::from(preview.language)))
-                        .read_only(true)
-                        .search(move || {
-                            find.get().then(|| {
-                                let opts = find_options.get();
-                                let mut search = EditorSearch::new(query.get());
-                                search.case_sensitive = opts.case_sensitive;
-                                search.whole_word = opts.whole_word;
-                                search.regex = opts.regex;
-                                search
-                            })
-                        })
-                        .on_search_change(move |result: &EditorSearchResult| {
-                            matches.set(result.clone())
-                        })
-                        // The mobile viewer is strictly read-only: tapping text
-                        // must not raise the soft keyboard via the hidden sink.
-                        .on_text_press(move |_: &EditorTextPressEvent| {
-                            if let Some(api) = reader.api::<EditorApi>() {
-                                api.blur();
-                            }
-                            dismiss_keyboard();
-                        })
-                        .on_focus(move || {
-                            if let Some(api) = reader.api::<EditorApi>() {
-                                api.blur();
-                            }
-                            dismiss_keyboard();
-                        })
-                        .on_layout(move |bounds: &Bounds<Points>| {
-                            if bounds.size.height.0 <= 0.0 {
-                                return;
-                            }
-                            if initial.get() != location
-                                && let Some((_, line)) = location.as_ref()
-                            {
-                                initial.replace(location.clone());
-                                let target = (*line).saturating_sub(1);
-                                let scroll_to_match = move || {
-                                    let Some(api) = reader.api::<EditorApi>() else {
-                                        return;
-                                    };
-                                    api.go_to_line(target);
-                                    if find.get_untracked()
-                                        && !query.get_untracked().trim().is_empty()
-                                    {
-                                        api.run(EditorCommand::FindNext);
-                                        let landed_on_target = api
-                                            .selections()
-                                            .last()
-                                            .is_some_and(|sel| sel.head.line == target);
-                                        if !landed_on_target {
-                                            api.go_to_line(target);
-                                        }
-                                    }
-                                    api.blur();
-                                };
-                                // Run once immediately (for synchronous/headless
-                                // layouts) and once after the editor's internal
-                                // scroll viewport finishes measuring its height.
-                                scroll_to_match();
-                                spawn(async move {
-                                    timer(Duration::from_millis(48)).await;
-                                    scroll_to_match();
-                                });
-                            }
-                        })
-                        .test_id("file-content")
+                    view()
+                        .relative()
                         .flex_1()
                         .min_h(px(0.0))
+                        .child(
+                            editor()
+                                .component_ref(&reader)
+                                .value(Some(SharedString::from(preview.body)))
+                                .language(Some(SharedString::from(preview.language)))
+                                .read_only(true)
+                                .search(move || {
+                                    find.get().then(|| {
+                                        let opts = find_options.get();
+                                        let mut search = EditorSearch::new(query.get());
+                                        search.case_sensitive = opts.case_sensitive;
+                                        search.whole_word = opts.whole_word;
+                                        search.regex = opts.regex;
+                                        search
+                                    })
+                                })
+                                .on_search_change(move |result: &EditorSearchResult| {
+                                    matches.set(result.clone())
+                                })
+                                .on_selection_change(move |selections: &Vec<EditorSelection>| {
+                                    let selected = selections
+                                        .iter()
+                                        .any(|selection| selection.anchor != selection.head);
+                                    has_selection.set(selected);
+                                    if !selected {
+                                        selection_menu.set(false);
+                                    }
+                                })
+                                .on_context_menu(move |event: &EditorContextMenuEvent| {
+                                    let selected = reader
+                                        .api::<EditorApi>()
+                                        .is_some_and(|api| !api.selected_text().is_empty());
+                                    has_selection.set(selected);
+                                    selection_bar_bottom.set(event.y.0 < 200.0);
+                                    selection_menu.set(true);
+                                })
+                                .on_find_with_selection(move |selected: &String| {
+                                    let needle = selected.trim();
+                                    if !needle.is_empty() {
+                                        query.set(needle.to_owned());
+                                        find_auto_focus.set(false);
+                                        find.set(true);
+                                        jump.set(false);
+                                        selection_menu.set(false);
+                                    }
+                                })
+                                // The mobile viewer is strictly read-only: a plain tap
+                                // with no selection blurs immediately so it never raises
+                                // the soft keyboard, while a double-tap or long-press
+                                // selection keeps focus so touch selection handles and
+                                // Copy / Select All stay usable.
+                                .on_text_press(move |_: &EditorTextPressEvent| {
+                                    let selected = reader
+                                        .api::<EditorApi>()
+                                        .is_some_and(|api| !api.selected_text().is_empty());
+                                    if !selected {
+                                        selection_menu.set(false);
+                                        has_selection.set(false);
+                                        if let Some(api) = reader.api::<EditorApi>() {
+                                            api.blur();
+                                        }
+                                        dismiss_keyboard();
+                                    }
+                                })
+                                .on_blur(move || {
+                                    selection_menu.set(false);
+                                })
+                                .on_layout(move |bounds: &Bounds<Points>| {
+                                    if bounds.size.height.0 <= 0.0 {
+                                        return;
+                                    }
+                                    if initial.get() != location
+                                        && let Some((_, line)) = location.as_ref()
+                                    {
+                                        initial.replace(location.clone());
+                                        let target = (*line).saturating_sub(1);
+                                        let scroll_to_match = move || {
+                                            let Some(api) = reader.api::<EditorApi>() else {
+                                                return;
+                                            };
+                                            api.go_to_line(target);
+                                            if find.get_untracked()
+                                                && !query.get_untracked().trim().is_empty()
+                                            {
+                                                api.run(EditorCommand::FindNext);
+                                                let landed_on_target = api
+                                                    .selections()
+                                                    .last()
+                                                    .is_some_and(|sel| sel.head.line == target);
+                                                if !landed_on_target {
+                                                    api.go_to_line(target);
+                                                }
+                                            }
+                                            api.blur();
+                                        };
+                                        // Run once immediately (for synchronous/headless
+                                        // layouts) and once after the editor's internal
+                                        // scroll viewport finishes measuring its height.
+                                        scroll_to_match();
+                                        spawn(async move {
+                                            timer(Duration::from_millis(48)).await;
+                                            scroll_to_match();
+                                        });
+                                    }
+                                })
+                                .test_id("file-content")
+                                .flex_1()
+                                .min_h(px(0.0)),
+                        )
+                        .child(when(
+                            move || selection_menu.get() || has_selection.get(),
+                            move || {
+                                selection_action_bar(
+                                    reader,
+                                    has_selection,
+                                    selection_menu,
+                                    selection_bar_bottom,
+                                    query,
+                                    find,
+                                    find_auto_focus,
+                                    jump,
+                                )
+                            },
+                        ))
                         .into_element()
                 }
             };
@@ -1066,4 +1127,139 @@ fn find_button(
             api.run(command);
         }
     })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn selection_action_bar(
+    reader: ComponentRef<Editor>,
+    has_selection: Signal<bool>,
+    selection_menu: Signal<bool>,
+    at_bottom: Signal<bool>,
+    query: Signal<String>,
+    find: Signal<bool>,
+    find_auto_focus: Signal<bool>,
+    jump: Signal<bool>,
+) -> impl IntoElement {
+    view()
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .style_when(
+            move || !at_bottom.get(),
+            |style| style.top(px(theme::SPACING_SM)),
+        )
+        .style_when(
+            move || at_bottom.get(),
+            |style| style.bottom(px(theme::SPACING_SM)),
+        )
+        .items_center()
+        .pointer_events(PointerEvents::BoxNone)
+        .child(
+            view()
+                .test_id("file-selection-actions")
+                .pointer_events(PointerEvents::Auto)
+                .flex_row()
+                .items_center()
+                .gap(px(2.0))
+                .px(px(6.0))
+                .py(px(4.0))
+                .rounded_full()
+                .bg(theme::background_card)
+                .border_1()
+                .border_color(theme::hairline)
+                .child(when(
+                    move || has_selection.get(),
+                    move || {
+                        selection_action_button(
+                            Some(icon!("copy")),
+                            copy::text("Copy", "复制", "複製"),
+                            "file-selection-copy",
+                            move || {
+                                if let Some(api) = reader.api::<EditorApi>() {
+                                    let selected = api.selected_text();
+                                    if !selected.is_empty() {
+                                        drop(set_clipboard(selected));
+                                    }
+                                    api.blur();
+                                }
+                                selection_menu.set(false);
+                                has_selection.set(false);
+                                dismiss_keyboard();
+                            },
+                        )
+                    },
+                ))
+                .child(selection_action_button(
+                    None,
+                    copy::text("Select All", "全选", "全選"),
+                    "file-selection-select-all",
+                    move || {
+                        if let Some(api) = reader.api::<EditorApi>() {
+                            api.run(EditorCommand::SelectAll);
+                            let selected = !api.selected_text().is_empty();
+                            has_selection.set(selected);
+                            selection_menu.set(selected);
+                        }
+                    },
+                ))
+                .child(when(
+                    move || has_selection.get(),
+                    move || {
+                        selection_action_button(
+                            Some(icon!("search")),
+                            copy::text("Find", "查找", "尋找"),
+                            "file-selection-find",
+                            move || {
+                                if let Some(api) = reader.api::<EditorApi>() {
+                                    let selected = api.selected_text();
+                                    let first_line = selected
+                                        .lines()
+                                        .find(|line| !line.trim().is_empty())
+                                        .map(str::trim)
+                                        .unwrap_or_default();
+                                    let needle: String = first_line.chars().take(120).collect();
+                                    if !needle.is_empty() {
+                                        query.set(needle);
+                                        find_auto_focus.set(false);
+                                        find.set(true);
+                                        jump.set(false);
+                                    }
+                                    api.blur();
+                                }
+                                selection_menu.set(false);
+                                has_selection.set(false);
+                                dismiss_keyboard();
+                            },
+                        )
+                    },
+                )),
+        )
+}
+
+fn selection_action_button(
+    glyph: Option<ImageSrc>,
+    label: &'static str,
+    id: &'static str,
+    on_press: impl Fn() + 'static,
+) -> impl IntoElement {
+    view()
+        .test_id(id)
+        .role(nsh_core::AccessibilityRole::Button)
+        .label(label)
+        .focusable(false)
+        .on_press(move |_: &()| on_press())
+        .h(px(30.0))
+        .px(px(10.0))
+        .rounded_full()
+        .flex_row()
+        .items_center()
+        .gap(px(4.0))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .children(glyph.map(|glyph| svg(glyph).size(px(14.0)).text_color(theme::foreground)))
+        .child(
+            text(label)
+                .text_size(px(theme::font_caption()))
+                .font_weight(FontWeight::MEDIUM)
+                .text_color(theme::foreground),
+        )
 }

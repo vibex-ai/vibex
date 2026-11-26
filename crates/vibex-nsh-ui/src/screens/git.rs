@@ -123,6 +123,26 @@ pub struct CommitDetailPreview {
     pub files: Vec<super::git_diff::CommitFileDiff>,
 }
 
+/// A Git remote or revert operation running in the background.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum GitRemoteActivity {
+    Fetch,
+    Pull,
+    Push,
+    Revert,
+}
+
+impl GitRemoteActivity {
+    fn spinner_test_id(self) -> &'static str {
+        match self {
+            Self::Fetch => "git-remote-spinner-fetch",
+            Self::Pull => "git-remote-spinner-pull",
+            Self::Push => "git-remote-spinner-push",
+            Self::Revert => "git-remote-spinner-revert",
+        }
+    }
+}
+
 /// What the surface may do, and the state it shows.
 #[derive(Clone)]
 pub struct GitHost {
@@ -143,7 +163,8 @@ pub struct GitHost {
     /// Whether the next commit amends the last one, and whether it pushes after.
     pub amend: Signal<bool>,
     pub push_after: Signal<bool>,
-    pub remote_busy: Signal<bool>,
+    /// Which remote/revert action is currently running, if any.
+    pub remote_busy: Signal<Option<GitRemoteActivity>>,
     pub branches: Signal<Vec<BranchRow>>,
     pub branch_menu: Signal<bool>,
     pub on_open_branches: Rc<dyn Fn()>,
@@ -421,18 +442,21 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                     ),
                 )
                 .child(remote_button(
+                    GitRemoteActivity::Fetch,
                     icon!("refresh"),
                     copy::text("Fetch", "获取", "擷取"),
                     busy,
                     host.on_fetch.clone(),
                 ))
                 .child(remote_button(
+                    GitRemoteActivity::Pull,
                     icon!("download"),
                     copy::text("Pull", "拉取", "拉取"),
                     busy,
                     host.on_pull.clone(),
                 ))
                 .child(remote_button(
+                    GitRemoteActivity::Push,
                     icon!("upload"),
                     copy::text("Push", "推送", "推送"),
                     busy,
@@ -523,7 +547,9 @@ fn git_overview(host: GitHost) -> impl IntoElement {
                                         });
                                     },
                                 )
-                                .disabled(move || selected.with(Vec::is_empty) || busy.get()),
+                                .disabled(move || {
+                                    selected.with(Vec::is_empty) || busy.with(Option::is_some)
+                                }),
                             )
                             .child(surface::ghost_button(
                                 icon!("chevrons-down-up"),
@@ -597,35 +623,43 @@ fn git_overview(host: GitHost) -> impl IntoElement {
         )
 }
 
-/// One of the three ways the branch meets its remote, spinning while any of
-/// them runs so a slow fetch, pull or push is visibly working.
+/// One of the three ways the branch meets its remote: only the pressed button
+/// swaps its glyph for a rotating spinner while running; the sibling buttons
+/// show a normal disabled state without spinning.
 fn remote_button(
+    kind: GitRemoteActivity,
     glyph: ImageSrc,
     label: &'static str,
-    busy: Signal<bool>,
+    busy: Signal<Option<GitRemoteActivity>>,
     on_press: Rc<dyn Fn()>,
 ) -> impl IntoElement {
-    view()
-        .relative()
+    let active = move || busy.get() == Some(kind);
+    let any_busy = move || busy.with(Option::is_some);
+    let spinner_id = kind.spinner_test_id();
+    button()
+        .accessibility_label(label)
+        .on_press(move || on_press())
+        .busy(active)
+        .disabled(any_busy)
+        .size(px(theme::COMPACT_CONTROL))
         .flex_shrink_0()
+        .rounded_full()
         .items_center()
         .justify_center()
-        .child(surface::ghost_button(glyph, label, move || on_press()).disabled(move || busy.get()))
-        .child(when(
-            move || busy.get(),
-            || {
-                let clock = crate::ui::activity::ActivityClock::start();
-                view()
-                    .absolute()
-                    .inset(px(0.0))
-                    .items_center()
-                    .justify_center()
-                    .child(crate::ui::activity::activity_ring(
-                        clock,
-                        theme::text_secondary,
-                    ))
-            },
-        ))
+        .hit_slop(px(5.0))
+        .active(|style| style.bg(theme::row_pressed_bg()))
+        .style_when(move || any_busy() && !active(), |style| style.opacity(0.4))
+        .child(
+            when(active, move || {
+                crate::ui::activity::spinner(theme::ICON_MD, theme::text_secondary)
+                    .test_id(spinner_id)
+            })
+            .otherwise(move || {
+                svg(glyph.clone())
+                    .size(px(theme::ICON_MD))
+                    .text_color(theme::text_secondary)
+            }),
+        )
 }
 
 /// A count of lines in the color of the side it counts.

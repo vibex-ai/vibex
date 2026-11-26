@@ -882,7 +882,7 @@ pub struct SessionHost {
     pub git_committing: Signal<bool>,
     pub git_amend: Signal<bool>,
     pub git_push_after: Signal<bool>,
-    pub git_remote_busy: Signal<bool>,
+    pub git_remote_busy: Signal<Option<crate::screens::git::GitRemoteActivity>>,
     pub git_branches: Signal<Vec<crate::screens::git::BranchRow>>,
     pub git_branch_menu: Signal<bool>,
     pub on_open_git_branches: Action,
