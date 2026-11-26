@@ -158,6 +158,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         if !visible.get() {
             control.set(false);
             alt.set(false);
+            confirm.set(None);
             composing_text.set(None);
         }
     });

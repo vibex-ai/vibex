@@ -398,6 +398,31 @@ impl SessionService {
         on_device_renamed: Rc<dyn Fn(&str)>,
         on_server_kind: Rc<dyn Fn(RemoteServerKind)>,
     ) -> BackendResult<Self> {
+        let service = Self::build_unstarted(
+            bundle,
+            on_disconnect,
+            on_switch_runtime,
+            on_open_settings,
+            on_runtime_renamed,
+            on_device_renamed,
+            on_server_kind,
+        )?;
+        service.start_connection();
+        service.start_draft_saver();
+        service.start_screen_policy();
+        service.start_notification_presses();
+        Ok(service)
+    }
+
+    fn build_unstarted(
+        bundle: &MobileCredentialBundle,
+        on_disconnect: Rc<dyn Fn()>,
+        on_switch_runtime: Rc<dyn Fn()>,
+        on_open_settings: Rc<dyn Fn()>,
+        on_runtime_renamed: Rc<dyn Fn(&str)>,
+        on_device_renamed: Rc<dyn Fn(&str)>,
+        on_server_kind: Rc<dyn Fn(RemoteServerKind)>,
+    ) -> BackendResult<Self> {
         let web = bundle.backend()?;
         let terminal_backend: Arc<dyn TerminalBackend> = web.clone();
         let file_backend: Arc<dyn FileBackend> = web.clone();
@@ -599,10 +624,6 @@ impl SessionService {
             on_device_renamed,
             on_server_kind,
         };
-        service.start_connection();
-        service.start_draft_saver();
-        service.start_screen_policy();
-        service.start_notification_presses();
         Ok(service)
     }
 
@@ -6161,7 +6182,7 @@ impl SessionService {
         let terminal_backend = self.terminal_backend.clone();
         let opening = terminal_backend.clone();
         let generation = self.terminal_generation.get();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     let session = backend.open_session(active_id).await?;
@@ -6316,25 +6337,25 @@ impl SessionService {
         self.terminal_tx.replace(Some(sender));
         let (cols, rows) = self.terminal_size.get();
         self.queue_terminal_command(TerminalCommand::Resize(cols, rows));
-        spawn({
+        detach({
             let service = self.clone();
             async move {
                 while let Some(error) = command_errors.recv().await {
-                    if service.terminal_generation.get() != generation {
+                    if !service.alive.get() || service.terminal_generation.get() != generation {
                         break;
                     }
                     service.terminal_error.set(Some(error_text(&error)));
                 }
             }
         });
-        spawn(async move {
+        detach(async move {
             while let Some(batch) = receive.recv().await {
-                if service.terminal_generation.get() != generation {
+                if !service.alive.get() || service.terminal_generation.get() != generation {
                     return;
                 }
                 while service.terminal_ref.api::<TerminalApi>().is_none() {
                     timer(Duration::from_millis(16)).await;
-                    if service.terminal_generation.get() != generation {
+                    if !service.alive.get() || service.terminal_generation.get() != generation {
                         return;
                     }
                 }
@@ -6349,7 +6370,7 @@ impl SessionService {
                     .update(|revision| *revision = revision.wrapping_add(1));
             }
             let result = stream.await;
-            if service.terminal_generation.get() == generation {
+            if service.alive.get() && service.terminal_generation.get() == generation {
                 service.terminal_error.set(Some(match result {
                     Ok(Err(error)) => error_text(&error),
                     Err(error) => format!("reading the terminal did not finish: {error}").into(),
@@ -6375,9 +6396,9 @@ impl SessionService {
         let service = self.clone();
         let terminal_backend = self.terminal_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
-                if service.terminal_generation.get() == generation {
+                if service.alive.get() && service.terminal_generation.get() == generation {
                     service.terminal_busy.set(false);
                 }
                 return;
@@ -6396,7 +6417,7 @@ impl SessionService {
                         .await
                 })
                 .await;
-            if service.terminal_generation.get() != generation {
+            if !service.alive.get() || service.terminal_generation.get() != generation {
                 return;
             }
             service.terminal_busy.set(false);
@@ -6461,34 +6482,25 @@ impl SessionService {
         let generation = self.terminal_generation.get();
         let service = self.clone();
         let backend = self.terminal_backend.clone();
-        spawn(async move {
+        // Run detached from the confirmation card's reactive owner: confirming
+        // closes the card immediately (`confirm.set(None)`), which disposes its
+        // owner on the next flush and would cancel an owner-scoped `spawn`
+        // before `close_terminal` finishes — leaving `terminal_busy` stuck true.
+        detach(async move {
             let target = id.clone();
             let result = crate::runtime::handle()
                 .spawn(async move { backend.close_terminal(MutationRequest::new(target)).await })
                 .await;
-            if service.terminal_generation.get() != generation {
+            if !service.alive.get() || service.terminal_generation.get() != generation {
                 return;
             }
             service.terminal_busy.set(false);
             match result {
-                Ok(Ok(_)) => {
-                    service
-                        .terminal_choices
-                        .update(|choices| choices.retain(|choice| choice.id != id.as_str()));
-                    if service.terminal_id.get_untracked().as_deref() == Some(id.as_str()) {
-                        service.stop_terminal_tasks();
-                        service.terminal_id.set(None);
-                        service.terminal_error.set(None);
-                        service.reset_terminal_output();
-                        if let Some(next) = service.terminal_choices.with(|choices| {
-                            choices
-                                .iter()
-                                .find(|choice| choice.status == "running")
-                                .map(|choice| choice.id.clone())
-                        }) {
-                            service.select_terminal(&next);
-                        }
-                    }
+                Ok(Ok(_)) => service.retire_terminal(&id),
+                Ok(Err(error)) if error.code == "terminal_not_found" => {
+                    // The PTY is already gone on the runtime; drop the stale tab
+                    // instead of stranding it in the strip.
+                    service.retire_terminal(&id);
                 }
                 Ok(Err(error)) => service.terminal_error.set(Some(error_text(&error))),
                 Err(error) => service.terminal_error.set(Some(
@@ -6496,6 +6508,27 @@ impl SessionService {
                 )),
             }
         });
+    }
+
+    fn retire_terminal(&self, id: &TerminalId) {
+        self.terminal_choices
+            .update(|choices| choices.retain(|choice| choice.id != id.as_str()));
+        if self.terminal_id.get_untracked().as_deref() == Some(id.as_str()) {
+            self.stop_terminal_tasks();
+            self.terminal_id.set(None);
+            self.terminal_title.set(None);
+            self.terminal_error.set(None);
+            self.reset_terminal_output();
+            if let Some(next) = self.terminal_choices.with(|choices| {
+                choices
+                    .iter()
+                    .rev()
+                    .find(|choice| choice.status == "running")
+                    .map(|choice| choice.id.clone())
+            }) {
+                self.select_terminal(&next);
+            }
+        }
     }
 
     /// Replaces the terminal list from a backend listing.
@@ -9724,8 +9757,11 @@ mod tests {
         assert!(drafts.is_empty());
     }
 
+    pub(super) static COPY_PREFERENCE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn runtime_source_label_names_providers_routes_and_accounts() {
+        let _guard = COPY_PREFERENCE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let previous = super::copy::preference();
         super::copy::set_preference(super::copy::LanguagePreference::SimplifiedChinese);
 
@@ -9812,5 +9848,457 @@ mod queue_view_tests {
         assert_eq!(views[0].id, 1);
         assert_eq!(views[1].id, 3);
         assert_eq!(views[1].text, "third");
+    }
+}
+
+
+#[cfg(test)]
+mod terminal_lifecycle_tests {
+    use std::collections::BTreeMap;
+    use std::rc::Rc;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use nsh_core::prelude::*;
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+    use tokio::sync::mpsc;
+    use vibex_backend::{
+        BackendError, BackendFuture, BackendResult, MutationRequest, TerminalBackend,
+        TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
+    };
+    use vibex_core::{
+        DeviceId, RemoteAuthProof, RemoteClientType, TerminalCreateRequest, TerminalId,
+        TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
+        TerminalWriteRequest, WorkspaceId,
+    };
+    use vibex_mobile_pairing::{
+        MOBILE_CREDENTIAL_SCHEMA_VERSION, MobileCredentialBundle, MobileRemoteRouteBundle,
+    };
+    use vibex_nsh_ui::screens::terminal::{TerminalHost, terminal};
+    use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
+
+    use super::{SessionService, copy, terminal_choice};
+
+    struct FakeTerminalState {
+        sessions: Vec<TerminalSession>,
+        /// Output channels for active subscriptions, keyed by terminal id.
+        subscribers: BTreeMap<String, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
+        /// Initial banner delivered when subscribing to each terminal.
+        banners: BTreeMap<String, Vec<u8>>,
+        next_index: usize,
+    }
+
+    #[derive(Clone)]
+    struct FakeTerminalBackend {
+        state: Arc<Mutex<FakeTerminalState>>,
+    }
+
+    impl FakeTerminalBackend {
+        fn new(initial_count: usize) -> (Self, WorkspaceId, Vec<TerminalSession>) {
+            let workspace_id = WorkspaceId::new();
+            let mut sessions = Vec::new();
+            let mut banners = BTreeMap::new();
+            for index in 1..=initial_count {
+                let id = TerminalId::new();
+                let title = format!("Shell {index}");
+                banners.insert(
+                    id.as_str().to_owned(),
+                    format!("hello from shell {index}\r\n").into_bytes(),
+                );
+                sessions.push(TerminalSession {
+                    id,
+                    workspace_id: workspace_id.clone(),
+                    title,
+                    shell: "/bin/sh".to_owned(),
+                    cwd: "/work".to_owned(),
+                    rows: 24,
+                    cols: 80,
+                    status: TerminalStatus::Running,
+                    created_at_ms: index as i64,
+                    updated_at_ms: index as i64,
+                    closed_at_ms: None,
+                });
+            }
+            let backend = Self {
+                state: Arc::new(Mutex::new(FakeTerminalState {
+                    sessions: sessions.clone(),
+                    subscribers: BTreeMap::new(),
+                    banners,
+                    next_index: initial_count + 1,
+                })),
+            };
+            (backend, workspace_id, sessions)
+        }
+    }
+
+    struct FakeSubscription {
+        terminal_id: TerminalId,
+        rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        seq: i64,
+    }
+
+    impl TerminalFrameSubscription for FakeSubscription {
+        fn next(&mut self) -> BackendFuture<'_, Option<TerminalFrameBatch>> {
+            Box::pin(async move {
+                let Some(bytes) = self.rx.recv().await else {
+                    return Ok(None);
+                };
+                let seq = self.seq;
+                self.seq += 1;
+                Ok(Some(TerminalFrameBatch {
+                    terminal_id: self.terminal_id.clone(),
+                    frames: vec![TerminalFrame {
+                        sequence: seq,
+                        bytes,
+                    }],
+                    next_sequence: self.seq,
+                    dropped_frames: 0,
+                    reset_required: false,
+                }))
+            })
+        }
+    }
+
+    impl TerminalBackend for FakeTerminalBackend {
+        fn list_terminals(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> BackendFuture<'_, Vec<TerminalSession>> {
+            let state = self.state.clone();
+            Box::pin(async move { Ok(state.lock().unwrap().sessions.clone()) })
+        }
+
+        fn create_terminal(
+            &self,
+            request: MutationRequest<TerminalCreateRequest>,
+        ) -> BackendFuture<'_, TerminalSession> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                let mut guard = state.lock().unwrap();
+                let index = guard.next_index;
+                guard.next_index += 1;
+                let id = TerminalId::new();
+                let session = TerminalSession {
+                    id: id.clone(),
+                    workspace_id: request.payload.workspace_id,
+                    title: format!("Shell {index}"),
+                    shell: "/bin/sh".to_owned(),
+                    cwd: "/work".to_owned(),
+                    rows: request.payload.rows,
+                    cols: request.payload.cols,
+                    status: TerminalStatus::Running,
+                    created_at_ms: index as i64,
+                    updated_at_ms: index as i64,
+                    closed_at_ms: None,
+                };
+                guard.banners.insert(
+                    id.as_str().to_owned(),
+                    format!("hello from shell {index}\r\n").into_bytes(),
+                );
+                guard.sessions.push(session.clone());
+                Ok(session)
+            })
+        }
+
+        fn terminal_snapshot(
+            &self,
+            _terminal_id: TerminalId,
+        ) -> BackendFuture<'_, TerminalSnapshot> {
+            Box::pin(async move {
+                Err(BackendError::unsupported(
+                    "snapshot_unsupported",
+                    "not used in fake terminal backend",
+                ))
+            })
+        }
+
+        fn subscribe_terminal(
+            &self,
+            terminal_id: TerminalId,
+            _next_sequence: i64,
+        ) -> BackendResult<Box<dyn TerminalFrameSubscription>> {
+            let (tx, rx) = mpsc::unbounded_channel();
+            let mut guard = self.state.lock().unwrap();
+            if let Some(banner) = guard.banners.get(terminal_id.as_str()).cloned() {
+                let _ = tx.send(banner);
+            }
+            guard
+                .subscribers
+                .entry(terminal_id.as_str().to_owned())
+                .or_default()
+                .push(tx);
+            Ok(Box::new(FakeSubscription {
+                terminal_id,
+                rx,
+                seq: 1,
+            }))
+        }
+
+        fn write_terminal(
+            &self,
+            request: MutationRequest<TerminalWriteRequest>,
+        ) -> BackendFuture<'_, ()> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let id = request.payload.terminal_id.as_str().to_owned();
+                let echo = format!("echo:{}\r\n", request.payload.data).into_bytes();
+                let guard = state.lock().unwrap();
+                if let Some(senders) = guard.subscribers.get(&id) {
+                    for tx in senders {
+                        let _ = tx.send(echo.clone());
+                    }
+                }
+                Ok(())
+            })
+        }
+
+        fn resize_terminal(
+            &self,
+            request: MutationRequest<TerminalResizeRequest>,
+        ) -> BackendFuture<'_, TerminalSession> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let guard = state.lock().unwrap();
+                guard
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == request.payload.terminal_id)
+                    .cloned()
+                    .ok_or_else(|| {
+                        BackendError::failed("terminal_not_found", "terminal was not found")
+                    })
+            })
+        }
+
+        fn close_terminal(
+            &self,
+            request: MutationRequest<TerminalId>,
+        ) -> BackendFuture<'_, TerminalSession> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                // Async delay ensures the confirmation card's `when(...)` branch
+                // has already unmounted and disposed its reactive `Owner` before
+                // the RPC resolves — reproducing the real network timing.
+                tokio::time::sleep(Duration::from_millis(25)).await;
+                let mut guard = state.lock().unwrap();
+                let Some(pos) = guard
+                    .sessions
+                    .iter()
+                    .position(|session| session.id == request.payload)
+                else {
+                    return Err(BackendError::failed(
+                        "terminal_not_found",
+                        "terminal was not found",
+                    ));
+                };
+                let mut session = guard.sessions.remove(pos);
+                session.status = TerminalStatus::Killed;
+                guard.subscribers.remove(request.payload.as_str());
+                Ok(session)
+            })
+        }
+    }
+
+    fn test_bundle() -> MobileCredentialBundle {
+        let device_id = DeviceId::new();
+        let identity = ClientDeviceIdentity::generate(device_id.clone()).unwrap();
+        let server = ClientDeviceIdentity::generate(DeviceId::new()).unwrap();
+        MobileCredentialBundle {
+            schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_owned(),
+            record: RemoteCredentialRecord {
+                server_url: "https://desktop.example".to_owned(),
+                auth: RemoteAuthProof {
+                    device_id,
+                    auth_token: "grant".to_owned(),
+                },
+                device_identity_public_key: identity.public_key_base64(),
+                server_identity_public_key: Some(server.public_key_base64()),
+            },
+            identity_private_key: identity.private_key_base64(),
+            expected_server_id: "server-test".to_owned(),
+            client_type: RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            display_name: Some("Test Studio".to_owned()),
+            route: Some(MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://desktop.example".to_owned()],
+                relay: None,
+            }),
+        }
+    }
+
+    fn build_terminal_service(
+        initial_count: usize,
+        initial_error: Option<&'static str>,
+    ) -> SessionService {
+        let (fake, workspace_id, sessions) = FakeTerminalBackend::new(initial_count);
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.terminal_backend = Arc::new(fake);
+        *service.files_workspace.borrow_mut() = Some(workspace_id);
+        service.terminal_open.set(true);
+        service.terminal_visible.set(true);
+        service
+            .terminal_choices
+            .set(sessions.iter().map(terminal_choice).collect());
+        if let Some(last) = sessions.last() {
+            if let Some(err) = initial_error {
+                service.terminal_id.set(Some(last.id.as_str().to_owned()));
+                service.terminal_title.set(Some(last.title.clone().into()));
+                service.terminal_error.set(Some(err.into()));
+            } else {
+                service.attach_terminal(last.id.clone(), last.title.clone());
+            }
+        }
+        service
+    }
+
+    fn terminal_view(service: SessionService) -> impl IntoElement {
+        let find_open = signal(false);
+        let host = TerminalHost {
+            session_terminal: computed(|| None),
+            title: service.terminal_title,
+            error: service.terminal_error,
+            term_ref: service.terminal_ref,
+            visible: service.terminal_visible,
+            on_data: {
+                let service = service.clone();
+                Rc::new(move |data: &str| service.terminal_input(data))
+            },
+            on_resize: {
+                let service = service.clone();
+                Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
+            },
+            on_title: Rc::new(|_| {}),
+            terminals: service.terminal_choices,
+            active: service.terminal_id,
+            busy: service.terminal_busy,
+            output_revision: service.terminal_output_revision,
+            find_open,
+            on_retry: {
+                let service = service.clone();
+                Rc::new(move || service.retry_terminal())
+            },
+            on_kill: {
+                let service = service.clone();
+                Rc::new(move |id: &str| service.kill_terminal(id))
+            },
+            on_select_terminal: {
+                let service = service.clone();
+                Rc::new(move |id: &str| service.select_terminal(id))
+            },
+            on_new_terminal: {
+                let service = service.clone();
+                Rc::new(move || service.new_terminal())
+            },
+        };
+        view().size_full().child(terminal(host))
+    }
+
+    #[component]
+    fn TwoTerminalsView() -> impl IntoElement {
+        terminal_view(build_terminal_service(2, None))
+    }
+
+    #[component]
+    fn SingleTerminalView() -> impl IntoElement {
+        terminal_view(build_terminal_service(1, None))
+    }
+
+    #[component]
+    fn ErrorTerminalView() -> impl IntoElement {
+        terminal_view(build_terminal_service(1, Some("Terminal disconnected")))
+    }
+
+    #[test]
+    fn closing_active_terminal_from_confirm_card_switches_and_keeps_controls_enabled() {
+        let _guard = super::tests::COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = copy::preference();
+        copy::set_preference(copy::LanguagePreference::English);
+        let mut config = EngineConfig::new(Root::of::<TwoTerminalsView>());
+        config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+        let mut app = Headless::start(config).unwrap();
+
+        app.wait_for("hello from shell 2").unwrap();
+        app.press("role:button[Close terminal: Shell 2]").unwrap();
+        app.wait_for("Close this terminal and stop its running process?")
+            .unwrap();
+        app.press("Close terminal").unwrap();
+
+        app.wait_for_gone(
+            "role:button[Close terminal: Shell 2]",
+            Duration::from_secs(3),
+        )
+        .unwrap();
+        app.wait_for("hello from shell 1").unwrap();
+
+        // Controls must NOT be stuck disabled after closing a terminal: tapping
+        // the terminal panel / Keyboard must focus the IME and send input.
+        app.press("role:button[Keyboard]").unwrap();
+        app.press_key("x").unwrap();
+        app.wait_for("text:echo:x").unwrap();
+        copy::set_preference(previous);
+    }
+
+    #[test]
+    fn closing_last_terminal_clears_screen_and_allows_creating_new_terminal() {
+        let _guard = super::tests::COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = copy::preference();
+        copy::set_preference(copy::LanguagePreference::English);
+        let mut config = EngineConfig::new(Root::of::<SingleTerminalView>());
+        config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+        let mut app = Headless::start(config).unwrap();
+
+        app.wait_for("hello from shell 1").unwrap();
+        app.press("role:button[Close terminal: Shell 1]").unwrap();
+        app.wait_for("Close this terminal and stop its running process?")
+            .unwrap();
+        app.press("Close terminal").unwrap();
+
+        app.wait_for_gone("hello from shell 1", Duration::from_secs(3))
+            .unwrap();
+        app.wait_for("Select or create a terminal").unwrap();
+
+        // New terminal button must be enabled and able to spawn a fresh shell.
+        app.press("role:button[New terminal]").unwrap();
+        app.wait_for("hello from shell 2").unwrap();
+        app.press("role:button[Keyboard]").unwrap();
+        app.press_key("y").unwrap();
+        app.wait_for("text:echo:y").unwrap();
+        copy::set_preference(previous);
+    }
+
+    #[test]
+    fn reconnecting_terminal_from_error_banner_keeps_stream_alive() {
+        let _guard = super::tests::COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = copy::preference();
+        copy::set_preference(copy::LanguagePreference::English);
+        let mut config = EngineConfig::new(Root::of::<ErrorTerminalView>());
+        config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+        let mut app = Headless::start(config).unwrap();
+
+        app.wait_for("Terminal disconnected").unwrap();
+        app.press("role:button[Reconnect terminal]").unwrap();
+
+        app.wait_for_gone("Terminal disconnected", Duration::from_secs(3))
+            .unwrap();
+        app.wait_for("hello from shell 1").unwrap();
+        copy::set_preference(previous);
     }
 }
