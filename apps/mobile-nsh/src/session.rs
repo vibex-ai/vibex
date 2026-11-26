@@ -148,6 +148,14 @@ const RECONNECT_MAX_MS: u64 = 15_000;
 /// a dead link is found by a ping rather than by a request that mattered.
 const HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
 
+/// Coalescing window for bursty session-list refreshes triggered by projection
+/// invalidation or lag events.
+const REFRESH_COALESCE_DELAY: Duration = Duration::from_millis(200);
+
+/// Backoff before retrying a session-list refresh after a transient RPC timeout
+/// or concurrency limit on an otherwise open WebSocket.
+const REFRESH_TRANSIENT_RETRY_DELAY: Duration = Duration::from_secs(2);
+
 /// A user message the composer is replacing.
 #[derive(Clone, Debug)]
 struct EditState {
@@ -321,6 +329,13 @@ pub struct SessionService {
     alive: Rc<Cell<bool>>,
     /// A retry asked for by the page, consumed by the connection loop.
     retry_now: Rc<Cell<bool>>,
+    /// Single-flight + dirty flags coalescing bursty `refresh()` calls.
+    refresh_in_flight: Rc<Cell<bool>>,
+    refresh_dirty: Rc<Cell<bool>>,
+    refresh_retry_scheduled: Rc<Cell<bool>>,
+    /// Single-flight + dirty flags coalescing duplicate `reload(session_id)` calls.
+    reload_in_flight: Rc<RefCell<Option<String>>>,
+    reload_dirty: Rc<Cell<bool>>,
     /// The composer draft of each session this phone has seen.
     drafts: Rc<RefCell<BTreeMap<String, String>>>,
     attachment_drafts: Rc<RefCell<BTreeMap<String, Vec<AttachmentItem>>>>,
@@ -570,6 +585,11 @@ impl SessionService {
             loading_older: signal(false),
             alive: Rc::new(Cell::new(true)),
             retry_now: Rc::new(Cell::new(false)),
+            refresh_in_flight: Rc::new(Cell::new(false)),
+            refresh_dirty: Rc::new(Cell::new(false)),
+            refresh_retry_scheduled: Rc::new(Cell::new(false)),
+            reload_in_flight: Rc::new(RefCell::new(None)),
+            reload_dirty: Rc::new(Cell::new(false)),
             drafts: Rc::new(RefCell::new(load_drafts())),
             attachment_drafts: Rc::new(RefCell::new(BTreeMap::new())),
             drafts_snapshot: Rc::new(RefCell::new(String::new())),
@@ -1502,11 +1522,72 @@ impl SessionService {
     }
 
     /// Reloads the session list without disturbing the live stream.
+    ///
+    /// Bursts of projection invalidations or lag notices collapse into a single
+    /// in-flight reload plus at most one trailing pass so the mobile client
+    /// never saturates the gateway's per-connection RPC slot limit.
     fn refresh(&self) {
+        self.refresh_dirty.set(true);
+        if self.refresh_in_flight.get() {
+            return;
+        }
+        self.refresh_in_flight.set(true);
         let service = self.clone();
-        spawn(async move {
-            service.reload_sessions().await;
+        detach(async move {
+            struct ClearInFlight(Rc<Cell<bool>>);
+            impl Drop for ClearInFlight {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _guard = ClearInFlight(service.refresh_in_flight.clone());
+            while service.alive.get() && service.refresh_dirty.get() {
+                timer(REFRESH_COALESCE_DELAY).await;
+                if !service.alive.get() {
+                    break;
+                }
+                service.refresh_dirty.set(false);
+                service.reload_sessions().await;
+            }
         });
+    }
+
+    fn schedule_transient_refresh_retry(&self) {
+        if !self.alive.get() || self.refresh_retry_scheduled.replace(true) {
+            return;
+        }
+        let service = self.clone();
+        detach(async move {
+            struct ClearRetry(Rc<Cell<bool>>);
+            impl Drop for ClearRetry {
+                fn drop(&mut self) {
+                    self.0.set(false);
+                }
+            }
+            let _guard = ClearRetry(service.refresh_retry_scheduled.clone());
+            timer(REFRESH_TRANSIENT_RETRY_DELAY).await;
+            if service.alive.get() {
+                service.refresh();
+            }
+        });
+    }
+
+    fn handle_reload_sessions_error(&self, error: &BackendError) {
+        if is_transient_rpc_error(error) {
+            // Transient RPC timeouts ("without changing socket state") and
+            // concurrency limits leave the WebSocket open: keep the live
+            // connection status intact and retry once after a short backoff.
+            log::warn!(
+                "session refresh deferred: {} ({})",
+                error.code,
+                error.message
+            );
+            self.schedule_transient_refresh_retry();
+        } else {
+            log::warn!("session connect failed: {} ({})", error.code, error.message);
+            self.connection.set(ConnectionState::Offline);
+            self.connection_error.set(Some(error_text(error)));
+        }
     }
 
     /// Opens the runtime's event stream and keeps it open.
@@ -1702,9 +1783,7 @@ impl SessionService {
                 true
             }
             Ok(Err(error)) => {
-                log::warn!("session connect failed: {} ({})", error.code, error.message);
-                self.connection.set(ConnectionState::Offline);
-                self.connection_error.set(Some(error_text(&error)));
+                self.handle_reload_sessions_error(&error);
                 false
             }
             Err(error) => {
@@ -8155,9 +8234,17 @@ impl SessionService {
         if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
             return;
         }
+        // Coalesce duplicate reloads for the same session (e.g. a burst of
+        // `BackendEvent::Lagged` frames) into a single in-flight fetch plus at
+        // most one trailing pass.
+        if self.reload_in_flight.borrow().as_deref() == Some(session_id.as_str()) {
+            self.reload_dirty.set(true);
+            return;
+        }
+        *self.reload_in_flight.borrow_mut() = Some(session_id.as_str().to_owned());
+        self.reload_dirty.set(false);
         self.conversation.set(ConversationState::Loading);
         let service = self.clone();
-        let backend = self.backend.clone();
         let session_id = session_id.clone();
         // Detached, because the press that asked for this page outlives the
         // surface that took it: `open` runs from a drawer row's callback, and
@@ -8165,43 +8252,65 @@ impl SessionService {
         // cancelled before its first poll — the state would already be
         // `Loading`, and the page would wait on a fetch that never started.
         detach(async move {
-            // A fetch on a link that stops answering never comes back, and
-            // the page would wait on it for as long as the session stays
-            // open: a transcript filled from the cache with "Loading
-            // conversation…" over it. The wait is bounded so the reader is
-            // told, and can try again. The bound runs on the runtime's own
-            // clock: `timeout` awaited in the engine thread's executor
-            // never fires, because that executor has no timer.
-            let fetch_id = session_id.clone();
-            let fetched = crate::runtime::handle()
-                .spawn(async move {
-                    tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
-                })
-                .await;
-            if !service.alive.get() {
-                return;
+            struct ClearReloadInFlight {
+                slot: Rc<RefCell<Option<String>>>,
+                id: String,
             }
-            // The reader may have moved to another session while this page
-            // was on its way: its rows are not theirs to see.
-            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
-                return;
+            impl Drop for ClearReloadInFlight {
+                fn drop(&mut self) {
+                    let mut slot = self.slot.borrow_mut();
+                    if slot.as_deref() == Some(self.id.as_str()) {
+                        *slot = None;
+                    }
+                }
             }
-            match fetched {
-                Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
-                Ok(Ok(Err(error))) => service
-                    .conversation
-                    .set(ConversationState::Failed(error_text(&error))),
-                Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
-                    copy::text(
-                        "The conversation did not arrive in time.",
-                        "会话加载超时。",
-                        "工作階段載入逾時。",
-                    )
-                    .into(),
-                )),
-                Err(error) => service.conversation.set(ConversationState::Failed(
-                    format!("opening the session did not finish: {error}").into(),
-                )),
+            let _guard = ClearReloadInFlight {
+                slot: service.reload_in_flight.clone(),
+                id: session_id.as_str().to_owned(),
+            };
+            loop {
+                // A fetch on a link that stops answering never comes back, and
+                // the page would wait on it for as long as the session stays
+                // open: a transcript filled from the cache with "Loading
+                // conversation…" over it. The wait is bounded so the reader is
+                // told, and can try again. The bound runs on the runtime's own
+                // clock: `timeout` awaited in the engine thread's executor
+                // never fires, because that executor has no timer.
+                let backend = service.backend.clone();
+                let fetch_id = session_id.clone();
+                let fetched = crate::runtime::handle()
+                    .spawn(async move {
+                        tokio::time::timeout(OPEN_TIMEOUT, fetch_page(backend, fetch_id)).await
+                    })
+                    .await;
+                if !service.alive.get() {
+                    return;
+                }
+                // The reader may have moved to another session while this page
+                // was on its way: its rows are not theirs to see.
+                if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+                    return;
+                }
+                match fetched {
+                    Ok(Ok(Ok(page))) => service.apply_page(&session_id, page),
+                    Ok(Ok(Err(error))) => service
+                        .conversation
+                        .set(ConversationState::Failed(error_text(&error))),
+                    Ok(Err(_elapsed)) => service.conversation.set(ConversationState::Failed(
+                        copy::text(
+                            "The conversation did not arrive in time.",
+                            "会话加载超时。",
+                            "工作階段載入逾時。",
+                        )
+                        .into(),
+                    )),
+                    Err(error) => service.conversation.set(ConversationState::Failed(
+                        format!("opening the session did not finish: {error}").into(),
+                    )),
+                }
+                if !service.reload_dirty.replace(false) {
+                    break;
+                }
             }
         });
     }
@@ -9629,6 +9738,13 @@ fn age(timestamp_ms: i64) -> String {
     }
 }
 
+fn is_transient_rpc_error(error: &BackendError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "remote_rpc_timeout" | "remote_rpc_concurrency_limit"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -10300,5 +10416,104 @@ mod terminal_lifecycle_tests {
             .unwrap();
         app.wait_for("hello from shell 1").unwrap();
         copy::set_preference(previous);
+    }
+
+    #[component]
+    fn TransientRpcErrorCheckView() -> impl IntoElement {
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.connection.set(super::ConnectionState::Online);
+        service.connection_error.set(None);
+
+        let timeout = BackendError::failed(
+            "remote_rpc_timeout",
+            "remote RPC timed out without changing socket state",
+        );
+        service.handle_reload_sessions_error(&timeout);
+        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Online);
+        assert_eq!(service.connection_error.get_untracked(), None);
+        assert!(service.refresh_retry_scheduled.get());
+
+        let limit = BackendError::failed(
+            "remote_rpc_concurrency_limit",
+            "remote RPC concurrency limit was reached",
+        );
+        service.handle_reload_sessions_error(&limit);
+        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Online);
+        assert_eq!(service.connection_error.get_untracked(), None);
+
+        let offline = BackendError::offline("remote_socket_down", "remote WebSocket is not connected");
+        service.handle_reload_sessions_error(&offline);
+        assert_eq!(service.connection.get_untracked(), super::ConnectionState::Offline);
+        assert_eq!(
+            service.connection_error.get_untracked().as_deref(),
+            Some("The runtime could not be reached.")
+        );
+        service.shutdown();
+        view().child(text("transient-rpc-ok"))
+    }
+
+    #[component]
+    fn RefreshCoalesceCheckView() -> impl IntoElement {
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        // Simulate an in-flight refresh worker; a burst of 25 invalidations
+        // must only flip `refresh_dirty` without launching new tasks.
+        service.refresh_in_flight.set(true);
+        for _ in 0..25 {
+            service.apply_event(vibex_backend::BackendEvent::ProjectionInvalidated(
+                vibex_backend::BackendProjection::Sidebar,
+            ));
+        }
+        assert!(service.refresh_in_flight.get());
+        assert!(service.refresh_dirty.get());
+
+        // Similarly, duplicate reloads for the active session coalesce via `reload_dirty`.
+        let session_id = vibex_core::VibexSessionId::new();
+        service.active.set(Some(session_id.as_str().to_owned()));
+        *service.reload_in_flight.borrow_mut() = Some(session_id.as_str().to_owned());
+        service.reload_dirty.set(false);
+        for _ in 0..10 {
+            service.reload(&session_id);
+        }
+        assert!(service.reload_dirty.get());
+        service.shutdown();
+        view().child(text("refresh-coalesce-ok"))
+    }
+
+    #[test]
+    fn transient_rpc_errors_do_not_mark_live_session_offline() {
+        let _guard = super::tests::COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = copy::preference();
+        copy::set_preference(copy::LanguagePreference::English);
+        let config = EngineConfig::new(Root::of::<TransientRpcErrorCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("transient-rpc-ok").unwrap();
+        copy::set_preference(previous);
+    }
+
+    #[test]
+    fn refresh_burst_marks_dirty_and_coalesces_single_flight() {
+        let config = EngineConfig::new(Root::of::<RefreshCoalesceCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("refresh-coalesce-ok").unwrap();
     }
 }

@@ -7602,9 +7602,57 @@ fn agent_install_source(
     })
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct VerifiedSchemaKey {
+    path: PathBuf,
+    #[cfg(unix)]
+    file_id: Option<(u64, u64)>,
+}
+
+impl VerifiedSchemaKey {
+    fn for_path(path: &Path) -> Self {
+        #[cfg(unix)]
+        let file_id = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(path)
+                .ok()
+                .map(|meta| (meta.dev(), meta.ino()))
+        };
+        Self {
+            path: path.to_path_buf(),
+            #[cfg(unix)]
+            file_id,
+        }
+    }
+}
+
+fn verified_schema_keys() -> &'static std::sync::Mutex<std::collections::HashSet<VerifiedSchemaKey>>
+{
+    static VERIFIED: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::HashSet<VerifiedSchemaKey>>,
+    > = std::sync::OnceLock::new();
+    VERIFIED.get_or_init(|| std::sync::Mutex::new(std::collections::HashSet::new()))
+}
+
 fn open_migrated_database(path: &Path) -> VibexResult<DbConnection> {
     let mut conn = open_database(path)?;
-    apply_migrations(&mut conn)?;
+    let key = VerifiedSchemaKey::for_path(path);
+    #[cfg(unix)]
+    let cacheable = key.file_id.is_some();
+    #[cfg(not(unix))]
+    let cacheable = true;
+
+    let already_verified = cacheable
+        && verified_schema_keys()
+            .lock()
+            .map(|keys| keys.contains(&key))
+            .unwrap_or(false);
+    if !already_verified {
+        apply_migrations(&mut conn)?;
+        if cacheable && let Ok(mut keys) = verified_schema_keys().lock() {
+            keys.insert(key);
+        }
+    }
     Ok(conn)
 }
 
@@ -7968,8 +8016,7 @@ fn authorize_agent_action(
     request_id: Option<RequestId>,
     correlation_id: Option<vibex_core::CorrelationId>,
 ) -> VibexResult<RemoteAuthContext> {
-    let mut conn = open_database(manager.database_path())?;
-    apply_migrations(&mut conn)?;
+    let conn = open_migrated_database(manager.database_path())?;
     let auth = RemoteTrustService::authenticate(&conn, proof)?;
     RemoteTrustService::authorize_action(&conn, &auth, action, request_id, correlation_id)?;
     Ok(auth)
@@ -7986,8 +8033,7 @@ fn audit_agent_mutation(
     request_id: Option<RequestId>,
     correlation_id: Option<vibex_core::CorrelationId>,
 ) -> VibexResult<()> {
-    let mut conn = open_database(manager.database_path())?;
-    apply_migrations(&mut conn)?;
+    let conn = open_migrated_database(manager.database_path())?;
     RemoteTrustService::insert_audit(
         &conn,
         device_id,
@@ -12656,5 +12702,50 @@ mod tests {
         )
         .await;
         assert!(unavailable.payload.is_none());
+    }
+
+    #[test]
+    fn open_migrated_database_caches_verified_file_and_remigrates_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("remote-cache-test.db");
+
+        let conn = open_migrated_database(&db_path).unwrap();
+        let count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert!(count > 0);
+        drop(conn);
+
+        // Subsequent open on the same file hits the verified cache.
+        let key = VerifiedSchemaKey::for_path(&db_path);
+        assert!(verified_schema_keys().lock().unwrap().contains(&key));
+        let conn = open_migrated_database(&db_path).unwrap();
+        let second_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(second_count, count);
+        drop(conn);
+
+        // Replacing the file at the same path creates a fresh database that
+        // must still be migrated instead of assuming the previous inode's state.
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&db_path).unwrap();
+            let _ = std::fs::remove_file(db_path.with_extension("db-wal"));
+            let _ = std::fs::remove_file(db_path.with_extension("db-shm"));
+            // Keep a dummy file to avoid immediate inode reuse on tmpfs/ext4.
+            let _hold = std::fs::File::create(dir.path().join("inode-spacer")).unwrap();
+            let conn = open_migrated_database(&db_path).unwrap();
+            let fresh_count: i64 = conn
+                .query_row("SELECT COUNT(*) FROM schema_migrations", [], |row| {
+                    row.get(0)
+                })
+                .unwrap();
+            assert_eq!(fresh_count, count);
+        }
     }
 }

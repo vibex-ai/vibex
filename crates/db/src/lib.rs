@@ -12763,11 +12763,22 @@ pub fn open_database(path: &Path) -> VibexResult<Connection> {
         "db_pragma_failed",
         "failed to configure SQLite busy timeout",
     ))?;
-    conn.pragma_update(None, "journal_mode", "WAL")
+    // Inspect the current journal mode before requesting a transition:
+    // `PRAGMA journal_mode = WAL` acquires a write lock even when the database
+    // is already in WAL mode, amplifying SQLITE_BUSY contention under load.
+    let current_journal_mode: String = conn
+        .pragma_query_value(None, "journal_mode", |row| row.get(0))
         .map_err(storage_err(
             "db_pragma_failed",
-            "failed to enable SQLite WAL mode",
+            "failed to inspect SQLite journal mode",
         ))?;
+    if !current_journal_mode.eq_ignore_ascii_case("wal") {
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .map_err(storage_err(
+                "db_pragma_failed",
+                "failed to enable SQLite WAL mode",
+            ))?;
+    }
     conn.pragma_update(None, "foreign_keys", "ON")
         .map_err(storage_err(
             "db_pragma_failed",

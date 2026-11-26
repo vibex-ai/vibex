@@ -3,7 +3,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::Body;
 use axum::extract::ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade};
@@ -79,6 +79,7 @@ const DEFAULT_MAX_IN_FLIGHT_RPCS_PER_CONNECTION: usize = 32;
 const MAX_IDEMPOTENCY_CACHE_ENTRIES: usize = 1024;
 const MAX_RELAY_ATTACHMENT_TASKS: usize = 32;
 const DOMAIN_EVENT_QUEUE_CAPACITY: usize = 256;
+const SIDEBAR_INVALIDATION_COALESCE_WINDOW: Duration = Duration::from_millis(250);
 const IDEMPOTENCY_CACHE_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 const REMOTE_V2_SUBPROTOCOL: &str = "vibex-v2";
 const REMOTE_V2_TICKET_PREFIX: &str = "vibex-ticket.";
@@ -589,6 +590,7 @@ struct RemoteGatewayInner {
     registry: ConnectionRegistry,
     idempotency: Arc<Mutex<HashMap<IdempotencyCacheKey, CachedRpcResponse>>>,
     domain_events: GatewayDomainEvents,
+    sidebar_invalidation: Mutex<SidebarInvalidationState>,
     pairing_routes: Arc<Mutex<RemoteGatewayPairingRoutes>>,
     lan_pairing: Arc<LanPairingCoordinator>,
     zero_config_lan_pairing: Arc<LanPairingCoordinator>,
@@ -596,6 +598,12 @@ struct RemoteGatewayInner {
     lan_pairing_requests: Arc<Semaphore>,
     peer_limiter: Arc<PeerRateLimiter>,
     session_epoch: AtomicU64,
+}
+
+#[derive(Default)]
+struct SidebarInvalidationState {
+    last_emitted: Option<Instant>,
+    trailing_scheduled: bool,
 }
 
 #[derive(Clone)]
@@ -698,6 +706,7 @@ impl RemoteGateway {
                 registry: ConnectionRegistry::default(),
                 idempotency: Arc::new(Mutex::new(HashMap::new())),
                 domain_events: GatewayDomainEvents::default(),
+                sidebar_invalidation: Mutex::new(SidebarInvalidationState::default()),
                 pairing_routes: Arc::new(Mutex::new(pairing_routes)),
                 lan_pairing: Arc::new(LanPairingCoordinator::default()),
                 zero_config_lan_pairing: Arc::new(LanPairingCoordinator::default()),
@@ -736,6 +745,46 @@ impl RemoteGateway {
     /// refetch that projection after this notification rather than treating the
     /// event itself as a second source of sidebar state.
     pub fn publish_sidebar_invalidation(&self) -> VibexResult<()> {
+        let now = Instant::now();
+        {
+            let mut state = self
+                .inner
+                .sidebar_invalidation
+                .lock()
+                .map_err(|_| gateway_state_error())?;
+            if let Some(last) = state.last_emitted {
+                let elapsed = now.saturating_duration_since(last);
+                if elapsed < SIDEBAR_INVALIDATION_COALESCE_WINDOW {
+                    if state.trailing_scheduled {
+                        return Ok(());
+                    }
+                    if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                        state.trailing_scheduled = true;
+                        let delay = SIDEBAR_INVALIDATION_COALESCE_WINDOW.saturating_sub(elapsed);
+                        let inner = Arc::downgrade(&self.inner);
+                        drop(state);
+                        handle.spawn(async move {
+                            tokio::time::sleep(delay).await;
+                            let Some(inner) = inner.upgrade() else {
+                                return;
+                            };
+                            if let Ok(mut state) = inner.sidebar_invalidation.lock() {
+                                state.trailing_scheduled = false;
+                                state.last_emitted = Some(Instant::now());
+                            }
+                            let _ = inner.domain_events.publish(
+                                "sidebar",
+                                inner.session_epoch.load(Ordering::Acquire),
+                                None,
+                            );
+                        });
+                        return Ok(());
+                    }
+                }
+            }
+            // Leading edge (or no Tokio runtime active): emit immediately.
+            state.last_emitted = Some(now);
+        }
         self.inner.domain_events.publish(
             "sidebar",
             self.inner.session_epoch.load(Ordering::Acquire),
@@ -1610,7 +1659,7 @@ impl RemoteGateway {
             RemoteJsonMessageV2::RpcRequest(request) => {
                 let proof = self.relay_authenticated_proof(context, authenticated_proof)?;
                 Ok(vec![RemoteJsonMessageV2::RpcResponse(
-                    process_rpc(&state, proof, request).await,
+                    run_rpc_isolated(state.clone(), proof.clone(), request).await,
                 )])
             }
             RemoteJsonMessageV2::Control(RemoteControlMessageV2::Ping(ping)) => {
@@ -3629,7 +3678,7 @@ async fn handle_active_text(
             let outbound = outbound.clone();
             tokio::spawn(async move {
                 let _permit = permit;
-                let response = process_rpc(&state, &proof, request).await;
+                let response = run_rpc_isolated(state, proof, request).await;
                 let _ = send_json(&outbound, RemoteJsonMessageV2::RpcResponse(response)).await;
             });
             true
@@ -4503,6 +4552,41 @@ fn audit_terminal_binary_input(
         request_id,
         None,
     )
+}
+
+/// Runs an RPC on a Tokio blocking worker when running on a multi-threaded
+/// runtime so synchronous SQLite/filesystem/git work inside RPC handlers never
+/// starves the async worker threads servicing WebSocket reads, heartbeats, and
+/// live event streams.
+async fn run_rpc_isolated(
+    state: GatewayState,
+    proof: RemoteAuthProof,
+    request: RemoteRpcRequestV2,
+) -> RemoteRpcResponseV2 {
+    let request_id = request.request_id.clone();
+    let correlation_id = request.correlation_id.clone();
+    let handle = tokio::runtime::Handle::current();
+    if handle.runtime_flavor() == tokio::runtime::RuntimeFlavor::MultiThread {
+        let blocking_handle = handle.clone();
+        match tokio::task::spawn_blocking(move || {
+            blocking_handle.block_on(process_rpc(&state, &proof, request))
+        })
+        .await
+        {
+            Ok(response) => response,
+            Err(error) => rpc_error_response(
+                request_id,
+                correlation_id,
+                VibexError::new(
+                    ErrorCategory::Remote,
+                    "remote_rpc_worker_failed",
+                    format!("remote RPC worker did not finish: {error}"),
+                ),
+            ),
+        }
+    } else {
+        process_rpc(&state, &proof, request).await
+    }
 }
 
 async fn process_rpc(
@@ -8500,5 +8584,77 @@ mod tests {
             *source.calls.lock().unwrap(),
             vec!["backup_inspect", "diagnostics"]
         );
+    }
+
+    #[tokio::test]
+    async fn publish_sidebar_invalidation_coalesces_bursts_to_leading_and_trailing() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("sidebar-coalesce.db");
+        let identity_path = dir.path().join("identity.json");
+        let gateway = RemoteGateway::new(
+            RemoteGatewayConfig::default(),
+            RemoteDispatcher::new(RemoteServiceConfig::loopback_disabled()),
+            &db_path,
+            &identity_path,
+        );
+        let mut events = gateway.inner.domain_events.subscribe();
+
+        // A rapid burst of invalidations emits immediately once (leading edge)
+        // and schedules at most one trailing invalidation for the window.
+        for _ in 0..20 {
+            gateway.publish_sidebar_invalidation().unwrap();
+        }
+        let first = events.try_recv().unwrap();
+        assert_eq!(first.channel, "sidebar");
+        assert_eq!(first.sequence, 1);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+
+        let trailing = tokio::time::timeout(
+            SIDEBAR_INVALIDATION_COALESCE_WINDOW + Duration::from_millis(250),
+            events.recv(),
+        )
+        .await
+        .expect("trailing sidebar invalidation arrives after coalesce window")
+        .unwrap();
+        assert_eq!(trailing.channel, "sidebar");
+        assert_eq!(trailing.sequence, 2);
+        assert!(matches!(
+            events.try_recv(),
+            Err(broadcast::error::TryRecvError::Empty)
+        ));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn run_rpc_isolated_completes_on_multithread_runtime() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("isolated-rpc.db");
+        let identity_path = dir.path().join("identity.json");
+        let gateway = RemoteGateway::new(
+            RemoteGatewayConfig::default(),
+            RemoteDispatcher::new(RemoteServiceConfig::loopback_disabled()),
+            &db_path,
+            &identity_path,
+        );
+        let admin = pair_test_device(&db_path, RemoteDevicePermissionLevel::FullControl, None);
+        let state = gateway_state_for_test(&gateway);
+        let request = RemoteRpcRequestV2::new(
+            RemoteOperationKind::DeviceManagement,
+            Some(
+                serde_json::to_value(RemoteDeviceRequest::ListDevices(
+                    RemoteDeviceListRequest {
+                        auth: admin.clone(),
+                    },
+                ))
+                .unwrap(),
+            ),
+        );
+        let response = run_rpc_isolated(state, admin, request).await;
+        assert!(response.error.is_none(), "unexpected RPC error: {:?}", response.error);
+        let listed: RemoteDeviceListResponse =
+            serde_json::from_value(response.payload.unwrap()).unwrap();
+        assert!(!listed.devices.is_empty());
     }
 }
