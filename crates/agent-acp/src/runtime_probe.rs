@@ -454,6 +454,12 @@ impl AcpRuntimeClient {
         {
             crate::codex::upsert_codex_model_override(&mut env, model);
         }
+        if projection_context.projection.is_some()
+            && let Some(model) =
+                crate::runtime::antigravity_launch_model(&profile.agent_id, &config)
+        {
+            crate::runtime::upsert_antigravity_default_model_override(&mut env, model);
+        }
         add_isolation_environment(
             &mut env,
             &home,

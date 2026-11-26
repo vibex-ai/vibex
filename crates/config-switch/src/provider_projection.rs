@@ -355,6 +355,7 @@ impl AgentProviderProjectionEngine {
         apply_agent_projection_defaults(
             descriptor,
             model_provider,
+            binding,
             selected_model,
             endpoint,
             &mut non_secret_env,
@@ -1728,12 +1729,15 @@ fn selected_endpoint<'a>(
 ///
 /// Returns `None` for anything that is not a gateway binding, so an ordinary
 /// Provider with an unset Key still fails loudly.
-fn gateway_placeholder_secret(binding: &AgentModelProviderBinding) -> Option<String> {
-    let is_gateway = binding.provider_options.entries.iter().any(|entry| {
+fn is_gateway_binding(binding: &AgentModelProviderBinding) -> bool {
+    binding.provider_options.entries.iter().any(|entry| {
         entry.key.trim() == crate::GATEWAY_PROFILE_ROLE_OPTION_KEY
             && entry.value.trim() == crate::GATEWAY_PROFILE_ROLE
-    });
-    is_gateway.then(|| vibex_core::gateway_agent_token(binding.agent_id.as_str()))
+    })
+}
+
+fn gateway_placeholder_secret(binding: &AgentModelProviderBinding) -> Option<String> {
+    is_gateway_binding(binding).then(|| vibex_core::gateway_agent_token(binding.agent_id.as_str()))
 }
 
 fn selected_credential<'a>(
@@ -2290,6 +2294,7 @@ fn projection_process_arg_templates(agent_id: &str) -> Vec<String> {
 fn apply_agent_projection_defaults(
     descriptor: &AgentProviderProjectionDescriptor,
     provider: &ModelProviderProfile,
+    binding: &AgentModelProviderBinding,
     model: Option<&AgentConfiguredModelBinding>,
     endpoint: Option<&ModelProviderEndpoint>,
     env: &mut BTreeMap<String, String>,
@@ -2308,11 +2313,25 @@ fn apply_agent_projection_defaults(
                     .to_string(),
             );
         }
-        // See `antigravity_gateway_env`: without these the projected route id
-        // is not a model Antigravity will accept.
+        // Vibex's own local model-gateway bindings use Antigravity's gateway
+        // mode (allowlisting route-group model ids while authenticating against
+        // loopback). Direct Provider Profiles stay in `gemini-api-key` mode so
+        // `agy_acp_server` forwards the real `GEMINI_API_KEY` instead of its
+        // hardcoded `dummy_api_key`, and receive the selected model via
+        // `AGY_ACP_DEFAULT_MODEL` so custom/third-party ids are admitted into
+        // the session catalogue.
         "antigravity" => {
-            for (key, value) in antigravity_gateway_env(endpoint, model, descriptor, provider) {
-                env.insert(key, value);
+            if is_gateway_binding(binding) {
+                for (key, value) in
+                    antigravity_gateway_env(endpoint, binding, model, descriptor, provider)
+                {
+                    env.insert(key, value);
+                }
+            } else if let Some(model) = model {
+                let model_id = projected_runtime_model_id(provider, descriptor, model);
+                if !model_id.trim().is_empty() {
+                    env.insert("AGY_ACP_DEFAULT_MODEL".to_string(), model_id);
+                }
             }
         }
         "poolside" => {
@@ -2374,18 +2393,27 @@ fn agent_specific_overlays(
     secret_env_key: Option<&str>,
 ) -> VibexResult<Vec<ManagedProjectionOverlay>> {
     match descriptor.route.agent_id.as_str() {
-        "antigravity" => Ok(vec![ManagedProjectionOverlay {
-            relative_path: "antigravity-acp/settings.json".to_string(),
-            format: "json".to_string(),
-            // Gateway mode: Antigravity's own model catalogue holds only its
-            // Gemini ids, so a route-group model id is refused as "not
-            // available for the current authentication method". Its `gateway`
-            // auth type replaces that catalogue with the
-            // `AGY_LLM_GATEWAY_MODELS` allowlist, which is what
-            // `antigravity_gateway_env` fills in.
-            content: serde_json::json!({ "auth": { "type": "gateway" } }).to_string(),
-            contains_secret_reference: false,
-        }]),
+        "antigravity" => {
+            let auth_type = if is_gateway_binding(binding) {
+                // Gateway mode is reserved for Vibex's internal model-gateway
+                // bindings: `agy_acp_server` hardcodes `api_key="dummy_api_key"`
+                // in gateway mode, which only the loopback gateway ignores.
+                // There, `AGY_LLM_GATEWAY_MODELS` replaces the built-in
+                // catalogue with the projected route-group allowlist.
+                "gateway"
+            } else {
+                // Direct Provider Profiles must use `gemini-api-key` so
+                // `agy_acp_server` sends `GEMINI_API_KEY` as `X-Goog-Api-Key`.
+                // Custom model ids are admitted via `AGY_ACP_DEFAULT_MODEL`.
+                "gemini-api-key"
+            };
+            Ok(vec![ManagedProjectionOverlay {
+                relative_path: "antigravity-acp/settings.json".to_string(),
+                format: "json".to_string(),
+                content: serde_json::json!({ "auth": { "type": auth_type } }).to_string(),
+                contains_secret_reference: false,
+            }])
+        }
         // ZCode's ACP bridge lists user-added providers from the legacy
         // `config.json` provider map, but the backend registry that actually
         // resolves a Model id is built from the personal provider table
@@ -2424,17 +2452,31 @@ fn agent_specific_overlays(
 /// the ACP surface use the gateway credential instead of demanding a login.
 fn antigravity_gateway_env(
     endpoint: Option<&ModelProviderEndpoint>,
+    binding: &AgentModelProviderBinding,
     model: Option<&AgentConfiguredModelBinding>,
     descriptor: &AgentProviderProjectionDescriptor,
     provider: &ModelProviderProfile,
 ) -> Vec<(String, String)> {
-    let (Some(endpoint), Some(model)) = (endpoint, model) else {
+    let Some(endpoint) = endpoint else {
         return Vec::new();
     };
-    // The allowlist entry has to be the *runtime* id Antigravity will be asked
-    // for, which carries the thinking-level suffix its picker uses.
-    let model_id = projected_runtime_model_id(provider, descriptor, model);
-    if model_id.trim().is_empty() {
+    let mut allowlist = Vec::new();
+    if let Some(model) = model {
+        let model_id = projected_runtime_model_id(provider, descriptor, model);
+        if !model_id.trim().is_empty() {
+            allowlist.push(model_id);
+        }
+    }
+    for configured in &binding.configured_models {
+        if !configured.enabled {
+            continue;
+        }
+        let model_id = projected_runtime_model_id(provider, descriptor, configured);
+        if !model_id.trim().is_empty() && !allowlist.contains(&model_id) {
+            allowlist.push(model_id);
+        }
+    }
+    if allowlist.is_empty() {
         return Vec::new();
     }
     vec![
@@ -2444,7 +2486,7 @@ fn antigravity_gateway_env(
             "AGY_LLM_GATEWAY_URL".to_string(),
             strip_google_api_path_suffix(&endpoint.url),
         ),
-        ("AGY_LLM_GATEWAY_MODELS".to_string(), model_id),
+        ("AGY_LLM_GATEWAY_MODELS".to_string(), allowlist.join(",")),
         (
             "AGY_ACP_ENABLE_GATEWAY_AUTH".to_string(),
             "true".to_string(),
@@ -3582,21 +3624,75 @@ fn legacy_model_id_projection_entries(
         .collect()
 }
 
+const ANTIGRAVITY_THINKING_SUFFIXES: [&str; 4] = ["-extra_high", "-high", "-medium", "-low"];
+
+const ANTIGRAVITY_BUILTIN_THINKING_FAMILIES: [&str; 9] = [
+    "gemini-4-carbon",
+    "gemini-4-neon",
+    "gemini-4-hydrogen",
+    "gemini-4-argon",
+    "gemini-3.8-flash",
+    "gemini-3.7-flash",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash",
+    "gemini-3.1-pro",
+];
+
+/// Strips a built-in Antigravity thinking-level suffix (`-low`, `-medium`,
+/// `-high`, `-extra_high`) only when the base name is one of Antigravity's own
+/// thinking-level model families.
+///
+/// `agy_acp_server` only translates suffixes for exact keys in its built-in
+/// `DEFAULT_MODEL_METADATA_MAP`. Any other id (including namespaced proxy ids
+/// like `models/any/gemini-4-neon`, route-group ids like `group/...`, or
+/// unmapped Gemini ids) is forwarded verbatim on the wire, so synthesizing a
+/// `-high` suffix for it corrupts the upstream model name.
+pub fn antigravity_thinking_family(model_id: &str) -> Option<&str> {
+    let trimmed = model_id.trim();
+    if trimmed.is_empty() || trimmed.contains('/') {
+        return None;
+    }
+    let family = ANTIGRAVITY_THINKING_SUFFIXES
+        .iter()
+        .find_map(|suffix| trimmed.strip_suffix(suffix))
+        .unwrap_or(trimmed);
+    ANTIGRAVITY_BUILTIN_THINKING_FAMILIES
+        .contains(&family)
+        .then_some(family)
+}
+
+/// Whether `model_id` is a built-in Antigravity thinking-level family (bare or
+/// already suffixed) whose `-low`/`-medium`/`-high`/`-extra_high` suffix
+/// `agy_acp_server` strips into `thinkingConfig.thinkingLevel`.
+pub fn antigravity_supports_thinking_suffix(model_id: &str) -> bool {
+    antigravity_thinking_family(model_id).is_some()
+}
+
+/// Projects an Antigravity model id into the runtime spelling `agy_acp_server`
+/// expects: built-in bare thinking families default to `-high` (already-suffixed
+/// ids stay unchanged), while custom, namespaced, and route-group model ids
+/// remain verbatim.
+pub fn antigravity_projected_model_id(model_id: &str) -> String {
+    let trimmed = model_id.trim();
+    if !antigravity_supports_thinking_suffix(trimmed) {
+        return trimmed.to_string();
+    }
+    if ANTIGRAVITY_THINKING_SUFFIXES
+        .iter()
+        .any(|suffix| trimmed.ends_with(suffix))
+    {
+        return trimmed.to_string();
+    }
+    format!("{trimmed}-high")
+}
+
 fn projected_runtime_model_id(
     provider: &ModelProviderProfile,
     descriptor: &AgentProviderProjectionDescriptor,
     model: &AgentConfiguredModelBinding,
 ) -> String {
     if descriptor.route.agent_id.as_str() == "antigravity" {
-        // Antigravity requires a concrete thinking-level model id. Use its
-        // default high variant until an explicit reasoning effort is applied
-        // by the runtime bridge; already-qualified ids remain unchanged.
-        if !["-high", "-medium", "-low"]
-            .iter()
-            .any(|suffix| model.agent_model_id.ends_with(suffix))
-        {
-            return format!("{}-high", model.agent_model_id);
-        }
+        return antigravity_projected_model_id(&model.agent_model_id);
     }
     if matches!(
         descriptor.provider_control,
@@ -9122,7 +9218,6 @@ mod tests {
             let expected_model = match expected.agent_id {
                 "pi" => "matrix-provider/agent-model",
                 "hermes" => "custom:agent-model",
-                "antigravity" => "agent-model-high",
                 _ => "agent-model",
             };
             assert_eq!(plan.effective_model.as_deref(), Some(expected_model));
@@ -9859,11 +9954,11 @@ mod tests {
 
     /// Antigravity reads its credential mode from `settings.json`.
     ///
-    /// The Projection sets `GEMINI_API_KEY`, but Antigravity does not infer the
-    /// credential kind from an environment variable the way Gemini CLI infers it
-    /// from a user-level `security.auth.selectedType`. Without `auth.type` its
-    /// ACP `session/new` is refused with `Authentication required`, so the
-    /// session never reaches a prompt.
+    /// Direct Provider Profiles must stay in `gemini-api-key` mode so
+    /// `agy_acp_server` forwards `GEMINI_API_KEY` as `X-Goog-Api-Key` (its
+    /// `gateway` mode hardcodes `dummy_api_key`), admitting custom model ids
+    /// via `AGY_ACP_DEFAULT_MODEL`. Only Vibex's internal model-gateway
+    /// bindings switch into `gateway` mode with `AGY_LLM_GATEWAY_MODELS`.
     #[test]
     fn antigravity_projects_its_auth_mode_into_the_state_home() {
         let descriptor = vibex_core::catalog_projection_descriptors()
@@ -9872,53 +9967,122 @@ mod tests {
             .find(|descriptor| descriptor.route.agent_id.as_str() == "antigravity")
             .unwrap();
         let (provider, runtime, binding) = typed_projection_fixture(&descriptor);
-        let mut model = binding.configured_models[0].clone();
-        model.agent_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
-        model.provider_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
-        let mut binding = binding.clone();
-        binding.configured_models = vec![model.clone()];
 
-        let plan = AgentProviderProjectionEngine::plan(
+        // 1. Direct Provider Profile (custom namespaced model id): uses
+        // `gemini-api-key`, preserves the model id verbatim (no bogus `-high`),
+        // and sets `AGY_ACP_DEFAULT_MODEL` without enabling gateway mode.
+        let mut direct_model = binding.configured_models[0].clone();
+        direct_model.agent_model_id = "models/any/gemini-4-neon".to_string();
+        direct_model.provider_model_id = "models/any/gemini-4-neon".to_string();
+        let mut direct_binding = binding.clone();
+        direct_binding.configured_models = vec![direct_model];
+
+        let direct_plan = AgentProviderProjectionEngine::plan(
             &provider,
             &runtime,
-            &binding,
+            &direct_binding,
             &descriptor,
-            "antigravity-gateway",
+            "antigravity-direct",
         )
         .unwrap();
-        // Antigravity's own catalogue refuses a route-group id, so the
-        // projection switches it into gateway mode with an allowlist that names
-        // exactly the projected Model.
         assert_eq!(
-            plan.non_secret_env
-                .get("AGY_LLM_GATEWAY_URL")
+            direct_plan
+                .non_secret_env
+                .get("AGY_ACP_DEFAULT_MODEL")
                 .map(String::as_str),
-            Some("https://provider.example.invalid"),
-            "the gateway origin carries no /v1 suffix: {:?}",
-            plan.non_secret_env
+            Some("models/any/gemini-4-neon")
         );
-        assert_eq!(
-            plan.non_secret_env
-                .get("AGY_LLM_GATEWAY_MODELS")
-                .map(String::as_str),
-            Some("group/model_route_x/deepseek-v4.1-flash-high")
+        assert!(
+            !direct_plan
+                .non_secret_env
+                .contains_key("AGY_LLM_GATEWAY_URL"),
+            "direct Provider Profiles must not enable gateway mode: {:?}",
+            direct_plan.non_secret_env
         );
-        assert_eq!(
-            plan.non_secret_env
-                .get("AGY_ACP_ENABLE_GATEWAY_AUTH")
-                .map(String::as_str),
-            Some("true")
+        assert!(
+            !direct_plan
+                .non_secret_env
+                .contains_key("AGY_LLM_GATEWAY_MODELS")
         );
-
-        let settings = plan
+        assert!(
+            !direct_plan
+                .non_secret_env
+                .contains_key("AGY_ACP_ENABLE_GATEWAY_AUTH")
+        );
+        let direct_settings = direct_plan
             .overlay_files
             .iter()
             .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
             .expect("Antigravity needs an auth overlay");
-        let value: serde_json::Value = serde_json::from_str(&settings.content).unwrap();
+        let direct_value: serde_json::Value =
+            serde_json::from_str(&direct_settings.content).unwrap();
         assert_eq!(
-            value["auth"]["type"], "gateway",
-            "gemini-api-key refuses a route-group model id"
+            direct_value["auth"]["type"], "gemini-api-key",
+            "direct Provider Profiles must authenticate with GEMINI_API_KEY"
+        );
+
+        // 2. Internal Vibex model-gateway binding: switches into gateway mode
+        // with the allowlist containing route-group ids verbatim (no `-high`).
+        let mut gateway_model = binding.configured_models[0].clone();
+        gateway_model.agent_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
+        gateway_model.provider_model_id = "group/model_route_x/deepseek-v4.1-flash".to_string();
+        let mut gateway_binding = binding.clone();
+        gateway_binding.configured_models = vec![gateway_model];
+        gateway_binding
+            .provider_options
+            .entries
+            .push(ProviderBindingMetadata {
+                key: crate::GATEWAY_PROFILE_ROLE_OPTION_KEY.to_string(),
+                value: crate::GATEWAY_PROFILE_ROLE.to_string(),
+            });
+
+        let gateway_plan = AgentProviderProjectionEngine::plan(
+            &provider,
+            &runtime,
+            &gateway_binding,
+            &descriptor,
+            "antigravity-gateway",
+        )
+        .unwrap();
+        assert_eq!(
+            gateway_plan
+                .non_secret_env
+                .get("AGY_LLM_GATEWAY_URL")
+                .map(String::as_str),
+            Some("https://provider.example.invalid"),
+            "the gateway origin carries no /v1 suffix: {:?}",
+            gateway_plan.non_secret_env
+        );
+        assert_eq!(
+            gateway_plan
+                .non_secret_env
+                .get("AGY_LLM_GATEWAY_MODELS")
+                .map(String::as_str),
+            Some("group/model_route_x/deepseek-v4.1-flash")
+        );
+        assert_eq!(
+            gateway_plan
+                .non_secret_env
+                .get("AGY_ACP_ENABLE_GATEWAY_AUTH")
+                .map(String::as_str),
+            Some("true")
+        );
+        assert!(
+            !gateway_plan
+                .non_secret_env
+                .contains_key("AGY_ACP_DEFAULT_MODEL")
+        );
+
+        let gateway_settings = gateway_plan
+            .overlay_files
+            .iter()
+            .find(|overlay| overlay.relative_path == "antigravity-acp/settings.json")
+            .expect("Antigravity needs an auth overlay");
+        let gateway_value: serde_json::Value =
+            serde_json::from_str(&gateway_settings.content).unwrap();
+        assert_eq!(
+            gateway_value["auth"]["type"], "gateway",
+            "internal model-gateway bindings use gateway mode"
         );
     }
 
@@ -9947,16 +10111,16 @@ mod tests {
             .expect("Antigravity needs an auth overlay");
         let value: serde_json::Value = serde_json::from_str(&overlay.content).unwrap();
         assert_eq!(
-            value["auth"]["type"], "gateway",
-            "gemini-api-key refuses a route-group model id; gateway mode accepts the allowlist"
+            value["auth"]["type"], "gemini-api-key",
+            "direct Provider Profiles authenticate with GEMINI_API_KEY"
         );
         assert!(
             !overlay.contains_secret_reference,
             "the credential itself stays in the environment, not in this file"
         );
-        // With no endpoint or Model there is nothing to allowlist, so no
-        // gateway environment is projected.
-        assert!(antigravity_gateway_env(None, None, &descriptor, &provider).is_empty());
+        // With no endpoint there is nothing to allowlist, so no gateway
+        // environment is projected.
+        assert!(antigravity_gateway_env(None, &binding, None, &descriptor, &provider).is_empty());
 
         // Every other Agent keeps exactly the overlays its provider control
         // described.
@@ -9990,10 +10154,18 @@ mod tests {
         let (provider, _, binding) = typed_projection_fixture(&descriptor);
         let mut model = binding.configured_models[0].clone();
 
+        // Built-in Antigravity thinking families default to `-high` unless
+        // already suffixed.
         model.agent_model_id = "gemini-3.7-flash".to_string();
         assert_eq!(
             projected_runtime_model_id(&provider, &descriptor, &model),
             "gemini-3.7-flash-high"
+        );
+
+        model.agent_model_id = "gemini-4-neon".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &model),
+            "gemini-4-neon-high"
         );
 
         model.agent_model_id = "gemini-3.7-flash-medium".to_string();
@@ -10001,6 +10173,29 @@ mod tests {
             projected_runtime_model_id(&provider, &descriptor, &model),
             "gemini-3.7-flash-medium"
         );
+
+        model.agent_model_id = "gemini-4-neon-extra_high".to_string();
+        assert_eq!(
+            projected_runtime_model_id(&provider, &descriptor, &model),
+            "gemini-4-neon-extra_high"
+        );
+
+        // Custom, namespaced, and route-group model ids are NOT in
+        // `agy_acp_server`'s metadata map and must stay verbatim.
+        for verbatim in [
+            "models/any/gemini-4-neon",
+            "any/gemini-4-neon",
+            "group/model_route_x/deepseek-v4.1-flash",
+            "gemini-2.5-pro",
+            "agent-model",
+        ] {
+            model.agent_model_id = verbatim.to_string();
+            assert_eq!(
+                projected_runtime_model_id(&provider, &descriptor, &model),
+                verbatim,
+                "custom model id must not receive a synthetic thinking suffix"
+            );
+        }
     }
 
     #[test]
@@ -10797,7 +10992,14 @@ mod tests {
             let mut model = base.clone();
             model.wire_protocol_id = protocol.to_string();
             let mut env = BTreeMap::new();
-            apply_agent_projection_defaults(&descriptor, &provider, Some(&model), None, &mut env);
+            apply_agent_projection_defaults(
+                &descriptor,
+                &provider,
+                &binding,
+                Some(&model),
+                None,
+                &mut env,
+            );
             assert_eq!(
                 env.get("COPILOT_PROVIDER_TYPE").map(String::as_str),
                 Some(expected_type),
@@ -10866,7 +11068,14 @@ mod tests {
             );
 
             let mut env = BTreeMap::new();
-            apply_agent_projection_defaults(&descriptor, &provider, Some(&model), None, &mut env);
+            apply_agent_projection_defaults(
+                &descriptor,
+                &provider,
+                &binding,
+                Some(&model),
+                None,
+                &mut env,
+            );
             assert_eq!(
                 env.get("CLINE_PROVIDER").map(String::as_str),
                 Some(expected_provider)

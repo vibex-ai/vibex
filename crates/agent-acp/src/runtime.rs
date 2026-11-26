@@ -395,7 +395,7 @@ pub(crate) fn apply_startup_model_to_config(
     let Some(model) = model.map(str::trim).filter(|model| !model.is_empty()) else {
         return;
     };
-    if agent_id == "codex" {
+    if matches!(agent_id, "codex" | "antigravity") {
         config.models = vec![model.to_string()];
         return;
     }
@@ -483,6 +483,39 @@ pub(crate) fn codex_launch_model<'a>(
     match config.models.as_slice() {
         [model] => Some(model.trim()).filter(|model| !model.is_empty()),
         _ => None,
+    }
+}
+
+/// The single model an Antigravity launch selected, if the launch carries one.
+///
+/// Direct Antigravity Provider Profiles run in `gemini-api-key` mode so the
+/// real `GEMINI_API_KEY` is sent in `X-Goog-Api-Key`. In that mode
+/// `agy_acp_server` admits a custom/third-party model id into its session
+/// catalogue via `AGY_ACP_DEFAULT_MODEL`, so a narrowed launch config applies
+/// that model at process startup and pins it in the process identity.
+pub(crate) fn antigravity_launch_model<'a>(
+    agent_id: &AgentId,
+    config: &'a AcpProviderConfig,
+) -> Option<&'a str> {
+    if agent_id.as_str() != "antigravity" {
+        return None;
+    }
+    match config.models.as_slice() {
+        [model] => Some(model.trim()).filter(|model| !model.is_empty()),
+        _ => None,
+    }
+}
+
+pub(crate) fn upsert_antigravity_default_model_override(
+    overlays: &mut Vec<(String, String)>,
+    model: &str,
+) {
+    if antigravity_gateway_mode_requested(overlays) {
+        return;
+    }
+    let projected = vibex_config_switch::antigravity_projected_model_id(model);
+    if !projected.is_empty() {
+        upsert_env_overlay(overlays, "AGY_ACP_DEFAULT_MODEL".to_string(), projected);
     }
 }
 
@@ -12668,6 +12701,16 @@ impl AcpRuntimeClient {
         {
             codex::upsert_codex_model_override(&mut overlays, model);
         }
+        // Direct Antigravity Provider Profiles run in `gemini-api-key` mode,
+        // where `AGY_ACP_DEFAULT_MODEL` admits the selected model (including
+        // custom/namespaced proxy ids) into `agy_acp_server`'s session
+        // catalogue. Override it per process so switching between configured
+        // models on one Profile launches with the requested model.
+        if projection.is_some()
+            && let Some(model) = antigravity_launch_model(&profile.agent_id, config)
+        {
+            upsert_antigravity_default_model_override(&mut overlays, model);
+        }
         Ok(ProcessEnvironmentMaterialization {
             env_overlays: overlays,
             projection,
@@ -13246,6 +13289,20 @@ impl AcpRuntimeClient {
                 codex::CODEX_LAUNCH_MODEL_SNAPSHOT_KEY.to_string(),
                 model.to_string(),
             );
+        }
+        // On direct Antigravity Provider Profiles (non-gateway mode), the
+        // selected model enters `agy_acp_server` via `AGY_ACP_DEFAULT_MODEL`.
+        // Include it in the process identity so switching between custom
+        // models on one Profile restarts cleanly onto the new model.
+        if !non_secret_env
+            .get("AGY_ACP_ENABLE_GATEWAY_AUTH")
+            .is_some_and(|value| value.trim().eq_ignore_ascii_case("true"))
+            && let Some(model) = antigravity_launch_model(&profile.agent_id, config)
+        {
+            let projected = vibex_config_switch::antigravity_projected_model_id(model);
+            if !projected.is_empty() {
+                non_secret_env.insert("AGY_ACP_DEFAULT_MODEL".to_string(), projected);
+            }
         }
         if let Some(projection) = &legacy_projection
             && !non_secret_env.contains_key(PROVIDER_PROJECTION_FINGERPRINT_ENV)
@@ -15534,6 +15591,13 @@ impl AcpRuntimeClient {
             Some(projected)
         } else if field.kind == SessionConfigFieldKind::ReasoningEffort
             && process.agent_id.as_str() == "antigravity"
+            && matches!(
+                plan,
+                SessionConfigPlan::Live {
+                    option_id: Some(id),
+                    ..
+                } if id == "model"
+            )
         {
             let mut projected = field.clone();
             projected.kind = SessionConfigFieldKind::Model;
@@ -16614,7 +16678,15 @@ impl AcpRuntimeClient {
         if process.agent_id.as_str() == GROK_AGENT_ID {
             planner = planner.with_reasoning_effort_mode_bridge();
         }
-        if process.agent_id.as_str() == "antigravity" {
+        if process.agent_id.as_str() == "antigravity"
+            && !planner.advertises_reasoning_effort()
+            && discovery
+                .current_model
+                .as_ref()
+                .map(|model| model.value.as_str())
+                .or_else(|| process.startup_model())
+                .is_some_and(vibex_config_switch::antigravity_supports_thinking_suffix)
+        {
             planner = planner.with_antigravity_reasoning_model_bridge();
         }
         if config_option_needs_raw_fallback {
@@ -16832,17 +16904,24 @@ struct RuntimeConfigSubstitutions<'a> {
 }
 
 fn antigravity_model_reasoning_effort(model: &str) -> Option<&'static str> {
-    [("-high", "high"), ("-medium", "medium"), ("-low", "low")]
-        .into_iter()
-        .find_map(|(suffix, effort)| model.ends_with(suffix).then_some(effort))
+    if !vibex_config_switch::antigravity_supports_thinking_suffix(model) {
+        return None;
+    }
+    [
+        ("-extra_high", "extra_high"),
+        ("-high", "high"),
+        ("-medium", "medium"),
+        ("-low", "low"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, effort)| model.ends_with(suffix).then_some(effort))
 }
 
 fn antigravity_runtime_model_id(model: &str, effort: &str) -> String {
-    let model = ["-high", "-medium", "-low"]
-        .iter()
-        .find_map(|suffix| model.strip_suffix(suffix))
-        .unwrap_or(model);
-    format!("{model}-{effort}")
+    let Some(family) = vibex_config_switch::antigravity_thinking_family(model) else {
+        return model.to_string();
+    };
+    format!("{family}-{effort}")
 }
 
 fn antigravity_reasoning_efforts() -> Vec<AgentReasoningEffort> {
@@ -17382,7 +17461,16 @@ fn runtime_config_response_conflict(
     let explicit = match field.kind {
         SessionConfigFieldKind::Model => extract_current_model_id(response),
         SessionConfigFieldKind::Mode => extract_current_mode_id(response),
-        SessionConfigFieldKind::ReasoningEffort if process.agent_id.as_str() == "antigravity" => {
+        SessionConfigFieldKind::ReasoningEffort
+            if process.agent_id.as_str() == "antigravity"
+                && matches!(
+                    plan,
+                    SessionConfigPlan::Live {
+                        option_id: Some(id),
+                        ..
+                    } if id == "model"
+                ) =>
+        {
             extract_current_model_id(response)
                 .and_then(|model| antigravity_model_reasoning_effort(&model).map(str::to_string))
         }
@@ -19285,7 +19373,12 @@ async fn runtime_session_probe_from_response(
         reasoning_efforts =
             extract_initialize_reasoning_efforts(initialize, runtime_target_model.as_deref());
     }
-    if process.agent_id.as_str() == "antigravity" {
+    if process.agent_id.as_str() == "antigravity"
+        && reasoning_efforts.is_empty()
+        && target_model
+            .or_else(|| process.startup_model())
+            .is_some_and(vibex_config_switch::antigravity_supports_thinking_suffix)
+    {
         reasoning_efforts = antigravity_reasoning_efforts();
     }
     // A probe for one explicit Model only confirms that target; the Model list
@@ -23263,8 +23356,34 @@ mod tests {
             "gemini-3.7-flash-low"
         );
         assert_eq!(
+            antigravity_runtime_model_id("gemini-4-neon", "extra_high"),
+            "gemini-4-neon-extra_high"
+        );
+        assert_eq!(
+            antigravity_runtime_model_id("gemini-4-neon-extra_high", "medium"),
+            "gemini-4-neon-medium"
+        );
+        assert_eq!(
             antigravity_model_reasoning_effort("gemini-3.7-flash-medium"),
             Some("medium")
+        );
+        assert_eq!(
+            antigravity_model_reasoning_effort("gemini-4-neon-extra_high"),
+            Some("extra_high")
+        );
+        // Custom/namespaced models do not belong to Antigravity's built-in
+        // thinking families and must stay untouched.
+        assert_eq!(
+            antigravity_runtime_model_id("models/any/gemini-4-neon", "high"),
+            "models/any/gemini-4-neon"
+        );
+        assert_eq!(
+            antigravity_model_reasoning_effort("models/any/gemini-4-neon-high"),
+            None
+        );
+        assert_eq!(
+            antigravity_runtime_model_id("gemini-2.5-pro", "high"),
+            "gemini-2.5-pro"
         );
         assert_eq!(
             antigravity_reasoning_efforts()
@@ -23272,6 +23391,61 @@ mod tests {
                 .map(|effort| effort.value)
                 .collect::<Vec<_>>(),
             ["low", "medium", "high"]
+        );
+    }
+
+    #[test]
+    fn antigravity_launch_model_overrides_default_model_only_outside_gateway_mode() {
+        let antigravity = AgentId::parse("antigravity").unwrap();
+        let mut config = test_acp_config("agy_acp_server", Vec::new());
+        apply_startup_model_to_config(
+            &mut config,
+            antigravity.as_str(),
+            Some("models/any/gemini-4-neon"),
+        );
+        assert_eq!(
+            antigravity_launch_model(&antigravity, &config),
+            Some("models/any/gemini-4-neon")
+        );
+
+        let mut direct_overlays = vec![(
+            "AGY_ACP_DEFAULT_MODEL".to_string(),
+            "gemini-4-neon-high".to_string(),
+        )];
+        upsert_antigravity_default_model_override(&mut direct_overlays, "models/any/gemini-4-neon");
+        assert_eq!(
+            direct_overlays,
+            vec![(
+                "AGY_ACP_DEFAULT_MODEL".to_string(),
+                "models/any/gemini-4-neon".to_string(),
+            )]
+        );
+
+        let mut builtin_overlays = Vec::new();
+        upsert_antigravity_default_model_override(&mut builtin_overlays, "gemini-4-neon");
+        assert_eq!(
+            builtin_overlays,
+            vec![(
+                "AGY_ACP_DEFAULT_MODEL".to_string(),
+                "gemini-4-neon-high".to_string(),
+            )]
+        );
+
+        let mut gateway_overlays = vec![
+            (
+                "AGY_ACP_ENABLE_GATEWAY_AUTH".to_string(),
+                "true".to_string(),
+            ),
+            (
+                "AGY_LLM_GATEWAY_MODELS".to_string(),
+                "group/route/model".to_string(),
+            ),
+        ];
+        upsert_antigravity_default_model_override(&mut gateway_overlays, "group/route/model");
+        assert!(
+            !gateway_overlays
+                .iter()
+                .any(|(key, _)| key == "AGY_ACP_DEFAULT_MODEL")
         );
     }
 

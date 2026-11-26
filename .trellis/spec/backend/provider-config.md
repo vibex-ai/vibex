@@ -579,15 +579,23 @@ runtime switch or a turn on an Agent that was otherwise healthy.
   durable selection still naming it, so the binding converged on `thinking: on`
   while the submission asked for `off` and every dispatch was refused with
   `message_submission_runtime_binding_mismatch`.
-- **Antigravity needs gateway mode to accept a route-group Model.** Its built-in
-  catalogue holds only its own Gemini ids and refuses anything else through the
-  `model` config option ("not available for the current authentication method").
-  The projection therefore writes `auth.type = "gateway"` and injects
-  `AGY_LLM_GATEWAY_URL` (origin only — Antigravity appends the Google API path),
-  `AGY_LLM_GATEWAY_MODELS` (the projected *runtime* id, including the
-  thinking-level suffix its picker uses), and `AGY_ACP_ENABLE_GATEWAY_AUTH`.
-  This is the one Agent whose projection deliberately leaves its documented
-  credential mode, because that is the only mode that can serve a route group.
+- **Antigravity gateway mode is strictly for Vibex's internal model-gateway bindings; direct Provider Profiles stay on `gemini-api-key`.**
+  In `gateway` mode, `agy_acp_server` constructs its Gemini client with a
+  hardcoded `dummy_api_key` and sends `X-Goog-Api-Key: dummy_api_key` on the
+  wire, which third-party Gemini-compatible gateways reject with 401. Therefore:
+  - Internal `model-gateway` bindings (`vibex.internal.profileRole = model_gateway`)
+    write `auth.type = "gateway"` and inject `AGY_LLM_GATEWAY_URL` (origin
+    only), `AGY_LLM_GATEWAY_MODELS` (the enabled projected runtime model ids),
+    and `AGY_ACP_ENABLE_GATEWAY_AUTH = "true"`.
+  - Direct Provider Profiles write `auth.type = "gemini-api-key"` and inject
+    `AGY_ACP_DEFAULT_MODEL` (overridden per launch when a single model is
+    selected and included in process identity) so Antigravity sends the real
+    `GEMINI_API_KEY` in `X-Goog-Api-Key` while admitting custom or namespaced
+    model ids into its API-key session catalogue.
+  - Thinking-level suffixes (`-low`, `-medium`, `-high`, `-extra_high`) are
+    synthesized and bridged only for Antigravity's built-in thinking families;
+    custom, namespaced, and route-group ids stay verbatim because
+    `agy_acp_server` forwards unmapped ids literally on the wire.
 - **A JSON Schema type name is lowercase outside Gemini.** Gemini's wire says
   `"OBJECT"`/`"STRING"`; OpenAI, Anthropic, and the JSON Schema spec say
   `object`/`string`. Forwarding the upper-case form made the upstream reject the
@@ -3327,22 +3335,26 @@ agent_discovery_records(
   runtime profile remains available through `list_by_agent`.
 - Good: Google Antigravity 1.0.0 accepts a Profile-scoped `GEMINI_API_KEY` and
   `GOOGLE_GEMINI_BASE_URL`; it appends `/v1beta/models/...` to the configured
-  origin and selects the Profile model through its advertised ACP `model`
-  config option. Vibex therefore gives each Antigravity Profile a private
-  `GEMINI_HOME`, strips a trailing `/v1` or `/v1beta` from the endpoint before
-  launch, explicitly selects the advertised `gemini-api-key` authentication
-  method after `initialize`, enables ACP terminal callbacks for shell tools,
-  and initially maps a Provider-facing model such as `gemini-3.7-flash` to
-  Antigravity's concrete default `gemini-3.7-flash-high` ACP variant. Vibex
-  exposes `low`, `medium`, and `high` as a synthetic reasoning-effort option;
-  choosing one replaces an existing thinking suffix or appends it to the
-  Provider model before sending Antigravity's `model` config option. Provider
-  model runtime-option probing uses the same authenticated launch and records
-  this synthetic option alongside the Agent's advertised modes. It uses
-  restart-and-resume switching rather than relying on the ignored
-  `GEMINI_MODEL` process variable. Antigravity advertises session listing at
-  `sessionCapabilities.list`; the runtime accepts that standard shape as well
-  as the legacy top-level `listSessions` boolean.
+  origin and selects the Profile model through `AGY_ACP_DEFAULT_MODEL` (for
+  direct Provider Profiles in `gemini-api-key` mode) or `AGY_LLM_GATEWAY_MODELS`
+  (for internal `model-gateway` bindings in `gateway` mode). Vibex gives each
+  Antigravity Profile a private `GEMINI_HOME`, strips a trailing `/v1` or
+  `/v1beta` from the endpoint before launch, explicitly selects the advertised
+  `gemini-api-key` authentication method after `initialize` outside gateway
+  mode, enables ACP terminal callbacks for shell tools, and maps built-in
+  thinking-level families such as `gemini-3.7-flash` or `gemini-4-neon` to
+  their default `-high` ACP variant while keeping custom/namespaced ids such as
+  `models/any/gemini-4-neon` verbatim. For built-in thinking families that do
+  not already expose a native `thinking_level` option, Vibex exposes `low`,
+  `medium`, and `high` as a synthetic reasoning-effort option; choosing one
+  replaces an existing thinking suffix or appends it before sending
+  Antigravity's `model` config option. Provider model runtime-option probing
+  uses the same authenticated launch and records this option only when
+  applicable alongside the Agent's advertised modes. It uses restart-and-resume
+  switching with `AGY_ACP_DEFAULT_MODEL` in process identity rather than
+  relying on the ignored `GEMINI_MODEL` process variable. Antigravity
+  advertises session listing at `sessionCapabilities.list`; the runtime accepts
+  that standard shape as well as the legacy top-level `listSessions` boolean.
 - Bad: a newly supported typed projector persists successfully but disappears
   after refresh because `ProviderProfileRepository::list` still contains only
   `claude`, `codex`, and `opencode`.
