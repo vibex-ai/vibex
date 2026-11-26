@@ -7,7 +7,6 @@
 
 use std::rc::Rc;
 
-use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DragOptions, Headless};
@@ -29,6 +28,7 @@ use vibex_nsh_ui::screens::session::{
 };
 use vibex_nsh_ui::screens::team::TeamTaskView;
 use vibex_nsh_ui::screens::terminal::TerminalChoice;
+use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use vibex_nsh_ui::theme;
 
 const COMPOSER: &str = "text:/ commands @files & refs $skills";
@@ -2578,8 +2578,11 @@ fn a_session_is_written_under_the_conversations_own_header() {
     app.type_text(r"text:/main\.rs /", "$").unwrap();
     app.wait_for("$audit").unwrap();
     app.press("$audit").unwrap();
-    app.wait_for_gone("Run repository audit skill", std::time::Duration::from_secs(3))
-        .unwrap();
+    app.wait_for_gone(
+        "Run repository audit skill",
+        std::time::Duration::from_secs(3),
+    )
+    .unwrap();
     assert_eq!(
         app.screen().input_text(r"text:/\$audit /").unwrap(),
         Some("/review @src/main.rs $audit ")
@@ -4050,19 +4053,17 @@ fn commit_detail_collapses_message_body_by_default_and_toggles_on_press() {
 
     // Tapping again collapses the body back to subject-only.
     app.press("id:commit-message-toggle").unwrap();
-    app.wait_for_gone(
-        "id:commit-message-body",
-        std::time::Duration::from_secs(3),
-    )
-    .unwrap();
+    app.wait_for_gone("id:commit-message-body", std::time::Duration::from_secs(3))
+        .unwrap();
 }
 
 #[test]
 fn readonly_file_viewer_supports_selection_and_copy_without_editing() {
     let mut config = EngineConfig::new(Root::of::<Shell>());
-    config.environment.os = nsh_core::platform::Os::Ios;
+    config.environment.os = nsh_core::platform::Os::Android;
     let mut app = Headless::start(config).unwrap();
-    app.wait_for("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Files, Git, and terminal]")
+        .unwrap();
     app.press("role:button[Files, Git, and terminal]").unwrap();
     app.wait_for("README.md").unwrap();
     app.press("src").unwrap();
@@ -4070,23 +4071,23 @@ fn readonly_file_viewer_supports_selection_and_copy_without_editing() {
     app.press("main.rs").unwrap();
     app.wait_for("fn main() {").unwrap();
 
-    // Long-pressing text on touch selects a word and opens the floating
-    // selection action bar with Copy and Select All.
-    app.long_press("fn main() {").unwrap();
-    app.wait_for("id:file-selection-actions").unwrap();
-    app.wait_for("id:file-selection-copy").unwrap();
-    app.press("id:file-selection-select-all").unwrap();
-    app.press("id:file-selection-copy").unwrap();
-    app.wait_for_gone(
-        "id:file-selection-actions",
-        std::time::Duration::from_secs(3),
-    )
-    .unwrap();
+    // The read-only source viewer mounts no `<input>` inside the document so
+    // tapping file content never raises the soft keyboard on mobile.
     assert_eq!(
-        app.screen().clipboard(),
-        Some("fn main() {\n    let greeting = \"hello\";\n    println!(\"{greeting}\");\n}")
+        app.screen()
+            .count("id:file-content >> role:textbox")
+            .unwrap(),
+        0
     );
-    // The file stays strictly read-only.
+    assert_eq!(app.screen().count("role:textbox").unwrap(), 0);
+
+    // Code lines live inside a native `SelectableView` (supporting OS selection
+    // handles, Copy, and Select All), while the line-number gutter stays outside.
+    assert!(app.screen().in_selectable_view("fn main() {").unwrap());
+    assert!(!app.screen().in_selectable_view("id:file-gutter").unwrap());
+
+    // Tapping file content keeps zero textboxes mounted and leaves the file untouched.
+    app.press("fn main() {").unwrap();
+    assert_eq!(app.screen().count("role:textbox").unwrap(), 0);
     assert!(app.screen().shows("fn main() {"));
 }
-

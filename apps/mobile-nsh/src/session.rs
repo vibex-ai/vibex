@@ -71,8 +71,8 @@ use vibex_nsh_ui::{
         FileEntry, FileGlyph, FilePreview, FilePreviewKindView, FileSearchRow, SearchOptions,
     },
     screens::git::{
-        BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview,
-        GitRemoteActivity, WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
+        BranchRow, CommitDetailPreview, CommitRow, GitChangeRow, GitDiffPreview, GitRemoteActivity,
+        WorktreeConflictRow, WorktreeOperationRow, WorktreeRow,
     },
     screens::new_session::{DirectoryEntry, ProjectBrowserHost, WorkspaceChoice},
     screens::session::{
@@ -3036,9 +3036,7 @@ impl SessionService {
         if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
             return;
         }
-        if let Some(command) =
-            matching_armed_command(self.armed_command.borrow().as_ref(), &text)
-        {
+        if let Some(command) = matching_armed_command(self.armed_command.borrow().as_ref(), &text) {
             self.execute_command(command, text, attachments, true);
             return;
         }
@@ -4481,7 +4479,9 @@ impl SessionService {
     fn active_palette_scope(&self) -> Option<PaletteScope> {
         if self.new_session_open.get_untracked() {
             let selection = self.new_runtime_selection.borrow().clone();
-            let agent_id = selection.as_ref().map(|selection| selection.agent_id.clone());
+            let agent_id = selection
+                .as_ref()
+                .map(|selection| selection.agent_id.clone());
             // Without an open session, the authority requires an Agent id to
             // route command and skill discovery.
             agent_id.as_ref()?;
@@ -4506,7 +4506,12 @@ impl SessionService {
             sessions
                 .iter()
                 .find(|session| session.id.as_str() == active)
-                .map(|session| (Some(session.workspace_id.clone()), Some(session.agent_id.clone())))
+                .map(|session| {
+                    (
+                        Some(session.workspace_id.clone()),
+                        Some(session.agent_id.clone()),
+                    )
+                })
                 .unwrap_or((None, None))
         });
         let (runtime_agent_id, provider_profile_id) = self
@@ -6444,8 +6449,7 @@ impl SessionService {
     fn new_session_draft(&self) -> NewSessionDraft {
         let title = self.new_title.get_untracked().trim().to_owned();
         let text = self.new_prompt.get_untracked().trim().to_owned();
-        let command =
-            matching_armed_command(self.new_armed_command.borrow().as_ref(), &text);
+        let command = matching_armed_command(self.new_armed_command.borrow().as_ref(), &text);
         let mentions = armed_mentions_matching(&self.new_armed_mentions.borrow(), &text);
         NewSessionDraft {
             title: (!title.is_empty()).then_some(title),
@@ -7205,7 +7209,7 @@ impl SessionService {
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             timer(Duration::from_millis(180)).await;
             if service.file_search_run.get() != run {
                 return;
@@ -7454,7 +7458,11 @@ impl SessionService {
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        // Tree rows live inside `virtual_list`'s `dynamic` branches: tapping a
+        // folder updates `files_entries` immediately, disposing the pressed
+        // row's reactive owner before the listing returns. Detach so row
+        // rebuilds never cancel in-flight directory reads.
+        detach(async move {
             if !service.workbench_is_current(generation) {
                 return;
             }
@@ -7604,7 +7612,7 @@ impl SessionService {
         let service = self.clone();
         let file_backend = self.file_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.file_read_run.get() == run {
                     service.files_error.set(Some(
@@ -12436,9 +12444,7 @@ mod terminal_lifecycle_tests {
                     if depth > max_depth {
                         return None;
                     }
-                    if !request.include_hidden
-                        && rel.split('/').any(|seg| seg.starts_with('.'))
-                    {
+                    if !request.include_hidden && rel.split('/').any(|seg| seg.starts_with('.')) {
                         return None;
                     }
                     let name = path.rsplit('/').next().unwrap_or(path).to_owned();
@@ -12465,7 +12471,10 @@ mod terminal_lifecycle_tests {
             request: vibex_core::FileTreeRequest,
         ) -> vibex_backend::BackendFuture<'_, Vec<vibex_core::FileTreeEntry>> {
             let entries = self.list(&request);
-            Box::pin(async move { Ok(entries) })
+            Box::pin(async move {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                Ok(entries)
+            })
         }
 
         fn search_files(
@@ -12594,7 +12603,9 @@ mod terminal_lifecycle_tests {
                 ("deep/l1/l2/l3/l4/l5/leaf.rs".into(), File),
             ],
         });
-        service.active.set(Some(vibex_core::VibexSessionId::new().as_str().to_owned()));
+        service
+            .active
+            .set(Some(vibex_core::VibexSessionId::new().as_str().to_owned()));
         *service.files_workspace.borrow_mut() = Some(workspace_id);
         let status = signal("loading".to_owned());
         let flow = service.clone();
@@ -12634,9 +12645,14 @@ mod terminal_lifecycle_tests {
             for _ in 0..60 {
                 timer(Duration::from_millis(20)).await;
                 let ready = flow.files_entries.with_untracked(|rows| {
-                    rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD")
-                        && rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO")
-                        && rows.iter().any(|r| r.path == "skills/system/run-workflow/SKILL.md")
+                    rows.iter()
+                        .any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD")
+                        && rows
+                            .iter()
+                            .any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO")
+                        && rows
+                            .iter()
+                            .any(|r| r.path == "skills/system/run-workflow/SKILL.md")
                         && rows.iter().any(|r| r.path == "apps/desktop/src")
                         && rows.iter().any(|r| r.path == "deep/l1/l2/l3/l4/l5/leaf.rs")
                 });
@@ -12649,18 +12665,26 @@ mod terminal_lifecycle_tests {
             flow.toggle_directory("apps/desktop/src");
             for _ in 0..40 {
                 timer(Duration::from_millis(20)).await;
-                if flow
-                    .files_entries
-                    .with_untracked(|rows| rows.iter().any(|r| r.path == "apps/desktop/src/main.rs"))
-                {
+                if flow.files_entries.with_untracked(|rows| {
+                    rows.iter().any(|r| r.path == "apps/desktop/src/main.rs")
+                }) {
                     break;
                 }
             }
 
             let rows = flow.files_entries.get_untracked();
-            assert!(rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD"));
-            assert!(rows.iter().any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO"));
-            assert!(rows.iter().any(|r| r.path == "skills/system/run-workflow/SKILL.md"));
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "packaging/aur/vibex-bin/PKGBUILD")
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "packaging/aur/vibex-bin/.SRCINFO")
+            );
+            assert!(
+                rows.iter()
+                    .any(|r| r.path == "skills/system/run-workflow/SKILL.md")
+            );
             assert!(rows.iter().any(|r| r.path == "apps/desktop/src/main.rs"));
             assert!(rows.iter().any(|r| r.path == "deep/l1/l2/l3/l4/l5/leaf.rs"));
             assert!(
@@ -12679,5 +12703,111 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<FileTreeExpansionFlowView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("file-tree-flow-ok").unwrap();
+    }
+
+    #[component]
+    fn FileTreeRealUiView() -> impl IntoElement {
+        use vibex_core::FileEntryKind::{Directory, File};
+
+        let workspace_id = vibex_core::WorkspaceId::new();
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.file_backend = Arc::new(FakeFileTreeBackend {
+            workspace_id: workspace_id.clone(),
+            entries: vec![
+                ("packaging".into(), Directory),
+                ("packaging/aur".into(), Directory),
+                ("packaging/aur/vibex-bin".into(), Directory),
+                ("packaging/aur/vibex-bin/PKGBUILD".into(), File),
+                ("packaging/aur/vibex-bin/.SRCINFO".into(), File),
+                ("skills".into(), Directory),
+                ("skills/system".into(), Directory),
+                ("skills/system/run-workflow".into(), Directory),
+                ("skills/system/run-workflow/SKILL.md".into(), File),
+                ("apps".into(), Directory),
+                ("apps/desktop".into(), Directory),
+                ("apps/desktop/Cargo.toml".into(), File),
+                ("apps/desktop/src".into(), Directory),
+                ("apps/desktop/src/main.rs".into(), File),
+                ("apps/mobile-nsh".into(), Directory),
+                ("apps/mobile-nsh/Cargo.toml".into(), File),
+            ],
+        });
+        service
+            .active
+            .set(Some(vibex_core::VibexSessionId::new().as_str().to_owned()));
+        *service.files_workspace.borrow_mut() = Some(workspace_id);
+        service.load_tree(String::new());
+
+        let host = vibex_nsh_ui::screens::files::FilesHost {
+            entries: service.files_entries,
+            search: service.files_search,
+            searching: service.files_searching,
+            path: service.files_path,
+            file: service.files_preview,
+            error: service.files_error,
+            on_search: {
+                let service = service.clone();
+                Rc::new(move |query: &str, options| service.search_files(query, options))
+            },
+            on_refresh: {
+                let service = service.clone();
+                Rc::new(move || service.load_tree(String::new()))
+            },
+            on_collapse: {
+                let service = service.clone();
+                Rc::new(move || service.toggle_all_folders())
+            },
+            on_open_dir: {
+                let service = service.clone();
+                Rc::new(move |path: &str| service.toggle_directory(path))
+            },
+            on_open_file: {
+                let service = service.clone();
+                Rc::new(move |path: &str, line| service.open_file(path.to_owned(), line))
+            },
+            on_back: {
+                let service = service.clone();
+                Rc::new(move || service.files_back())
+            },
+        };
+        vibex_nsh_ui::screens::files::files(host)
+    }
+
+    #[test]
+    fn file_tree_ui_row_press_expands_compacted_and_second_level_folders() {
+        let mut config = EngineConfig::new(Root::of::<FileTreeRealUiView>());
+        config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1200.0));
+        let mut app = Headless::start(config).unwrap();
+
+        app.wait_for("packaging / aur").unwrap();
+        app.wait_for("skills / system").unwrap();
+        app.wait_for("apps").unwrap();
+
+        // Tapping compacted single-child folder rows inside virtual_list's dynamic rows
+        // must survive the row rebuild and reveal their deeper children.
+        app.press("packaging / aur").unwrap();
+        app.wait_for("PKGBUILD").unwrap();
+        app.wait_for(".SRCINFO").unwrap();
+
+        app.press("skills / system").unwrap();
+        app.wait_for("SKILL.md").unwrap();
+
+        // Expanding a 1st-level folder and then its 2nd-level and 3rd-level children
+        // must reveal nested folder contents instead of opening empty.
+        app.press("apps").unwrap();
+        app.wait_for("desktop").unwrap();
+        app.press("desktop").unwrap();
+        app.wait_for("src").unwrap();
+        app.press("src").unwrap();
+        app.wait_for("main.rs").unwrap();
     }
 }

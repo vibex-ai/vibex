@@ -3,17 +3,14 @@
 use std::{rc::Rc, time::Duration};
 
 use nsh_base::{
-    button, editor,
-    editor::{
-        Editor, EditorApi, EditorCommand, EditorContextMenuEvent, EditorSearch, EditorSearchResult,
-        EditorSelection, EditorTextPressEvent,
-    },
+    button,
     text_view::{MarkdownOptions, text_view},
 };
 use nsh_core::{
     element::{ImageSrc, Position},
     prelude::*,
 };
+use unicode_width::UnicodeWidthChar as _;
 
 use crate::{
     copy, theme,
@@ -24,6 +21,18 @@ use crate::{
 const TREE_ROW_HEIGHT: f32 = 40.0;
 /// How far a level of the tree steps in.
 const TREE_INDENT: f32 = 18.0;
+/// Typography and geometry for the read-only source code viewer.
+const CODE_FONT_SIZE: f32 = 13.0;
+const CODE_LINE_HEIGHT: f32 = 20.0;
+const CODE_PAD_X: f32 = 12.0;
+const CODE_PAD_Y: f32 = 8.0;
+/// Files up to this many lines mount every line directly so native Select All
+/// covers the full file without virtualization boundaries.
+const DIRECT_RENDER_LIMIT: usize = 400;
+/// Extra lines mounted above and below the viewport for large files.
+const VISIBLE_OVERSCAN_LINES: usize = 60;
+/// Scroll quantization step so micro-scrolls do not churn visible row memos.
+const SCROLL_BUCKET_LINES: usize = 12;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct FileEntry {
@@ -633,6 +642,128 @@ fn file_name_color(status: &str, ignored: bool) -> Hsla {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct CodeMatch {
+    line: usize,
+    start: usize,
+    end: usize,
+}
+
+fn split_source_lines(body: &str) -> Vec<String> {
+    if body.is_empty() {
+        vec![String::new()]
+    } else {
+        body.lines().map(ToOwned::to_owned).collect()
+    }
+}
+
+fn is_word_char(ch: char) -> bool {
+    ch.is_alphanumeric() || ch == '_'
+}
+
+fn is_word_boundary(line: &str, start: usize, end: usize) -> bool {
+    let before = line[..start].chars().next_back();
+    let after = line[end..].chars().next();
+    !before.is_some_and(is_word_char) && !after.is_some_and(is_word_char)
+}
+
+fn find_code_matches(lines: &[String], query: &str, options: SearchOptions) -> Vec<CodeMatch> {
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut matches = Vec::new();
+    if options.case_sensitive {
+        for (line_idx, line) in lines.iter().enumerate() {
+            for (start, matched) in line.match_indices(query) {
+                let end = start + matched.len();
+                if options.whole_word && !is_word_boundary(line, start, end) {
+                    continue;
+                }
+                matches.push(CodeMatch {
+                    line: line_idx,
+                    start,
+                    end,
+                });
+            }
+        }
+        return matches;
+    }
+
+    let needle = query.to_lowercase();
+    if needle.is_empty() {
+        return matches;
+    }
+    for (line_idx, line) in lines.iter().enumerate() {
+        if line.is_ascii() && needle.is_ascii() {
+            let lowered = line.to_ascii_lowercase();
+            for (start, matched) in lowered.match_indices(&needle) {
+                let end = start + matched.len();
+                if options.whole_word && !is_word_boundary(line, start, end) {
+                    continue;
+                }
+                matches.push(CodeMatch {
+                    line: line_idx,
+                    start,
+                    end,
+                });
+            }
+            continue;
+        }
+        let mut folded = String::with_capacity(line.len());
+        let mut byte_map: Vec<(usize, usize)> = Vec::with_capacity(line.len());
+        for (byte_idx, ch) in line.char_indices() {
+            let char_end = byte_idx + ch.len_utf8();
+            for lower in ch.to_lowercase() {
+                let start_len = folded.len();
+                folded.push(lower);
+                for _ in start_len..folded.len() {
+                    byte_map.push((byte_idx, char_end));
+                }
+            }
+        }
+        for (folded_start, matched) in folded.match_indices(&needle) {
+            let folded_end = folded_start + matched.len();
+            if folded_end == 0 || folded_end > byte_map.len() {
+                continue;
+            }
+            let start = byte_map[folded_start].0;
+            let end = byte_map[folded_end - 1].1;
+            if !line.is_char_boundary(start) || !line.is_char_boundary(end) || start >= end {
+                continue;
+            }
+            if options.whole_word && !is_word_boundary(line, start, end) {
+                continue;
+            }
+            matches.push(CodeMatch {
+                line: line_idx,
+                start,
+                end,
+            });
+        }
+    }
+    matches
+}
+
+fn display_line_width(line: &str) -> usize {
+    line.chars()
+        .map(|ch| {
+            if ch == '\t' {
+                4
+            } else {
+                ch.width().unwrap_or(1)
+            }
+        })
+        .sum()
+}
+
+fn scroll_target_y(line_index: usize, total_lines: usize, viewport_height: f32) -> f32 {
+    let total_height = total_lines as f32 * CODE_LINE_HEIGHT + CODE_PAD_Y * 2.0;
+    let max_y = (total_height - viewport_height).max(0.0);
+    let line_y = CODE_PAD_Y + line_index as f32 * CODE_LINE_HEIGHT;
+    let centered = line_y - (viewport_height - CODE_LINE_HEIGHT).max(0.0) * 0.35;
+    centered.clamp(0.0, max_y)
+}
+
 fn file_viewer(
     host: FilesHost,
     highlight: Signal<Option<FileSearchHighlight>>,
@@ -640,7 +771,7 @@ fn file_viewer(
     let path = host.path;
     let file = host.file;
     let error = host.error;
-    let reader = component_ref::<Editor>();
+    let vscroll = element_ref();
     let initial_hl = highlight.get_untracked();
     let find = signal(initial_hl.is_some());
     let find_auto_focus = signal(false);
@@ -663,15 +794,34 @@ fn file_viewer(
             .unwrap_or_default(),
     );
     let line = signal(String::new());
-    let matches = signal(EditorSearchResult::default());
-    let selection_menu = signal(false);
-    let has_selection = signal(false);
-    let selection_bar_bottom = signal(false);
+    let current_match = signal(None::<usize>);
+    let active_line = signal(None::<usize>);
+    let viewport_height = signal(0.0_f32);
     let initial = stored(None::<(String, u32)>);
+
+    let source_lines = computed(move || {
+        Rc::new(file.with(|preview| {
+            preview
+                .as_ref()
+                .map(|preview| split_source_lines(&preview.body))
+                .unwrap_or_default()
+        }))
+    });
+
+    let search_matches = computed(move || {
+        if !find.get() {
+            return Rc::new(Vec::<CodeMatch>::new());
+        }
+        let lines = source_lines.get();
+        let needle = query.get();
+        let opts = find_options.get();
+        Rc::new(find_code_matches(&lines, &needle, opts))
+    });
+
     effect(move || {
         let _ = path.get();
-        selection_menu.set(false);
-        has_selection.set(false);
+        active_line.set(None);
+        current_match.set(None);
         if let Some(hl) = highlight.get() {
             query.set(hl.query);
             find_options.set(SearchOptions {
@@ -685,6 +835,43 @@ fn file_viewer(
             jump.set(false);
         }
     });
+
+    effect(move || {
+        let _ = query.get();
+        let _ = find.get();
+        let _ = find_options.get();
+        current_match.set(None);
+    });
+
+    let scroll_to_line = move |target: usize| {
+        let total = source_lines.get_untracked().len();
+        if total == 0 {
+            return;
+        }
+        let clamped = target.min(total.saturating_sub(1));
+        active_line.set(Some(clamped));
+        let vh = viewport_height.get_untracked().max(CODE_LINE_HEIGHT * 8.0);
+        let y = scroll_target_y(clamped, total, vh);
+        vscroll.scroll_to(Point::new(px(0.0), px(y)), false);
+    };
+
+    let step_match = move |forward: bool| {
+        let matches = search_matches.get_untracked();
+        if matches.is_empty() {
+            current_match.set(None);
+            return;
+        }
+        let next = match current_match.get_untracked() {
+            None if forward => 0,
+            None => matches.len().saturating_sub(1),
+            Some(index) if forward => (index + 1) % matches.len(),
+            Some(0) => matches.len().saturating_sub(1),
+            Some(index) => index - 1,
+        };
+        current_match.set(Some(next));
+        scroll_to_line(matches[next].line);
+    };
+
     let can_find = move || {
         file.with(|file| {
             file.as_ref().is_some_and(|file| {
@@ -695,16 +882,19 @@ fn file_viewer(
             })
         })
     };
+
     let on_jump = move || {
-        let Some(api) = reader.api::<EditorApi>() else {
-            return;
-        };
-        if let Ok(line) = line.get_untracked().trim().parse::<u32>() {
-            let last = api.value().lines().count().saturating_sub(1) as u32;
-            api.go_to_line(line.saturating_sub(1).min(last));
+        if let Ok(parsed) = line.get_untracked().trim().parse::<u32>() {
+            let total = source_lines.get_untracked().len();
+            if total > 0 {
+                let target = (parsed.saturating_sub(1) as usize).min(total.saturating_sub(1));
+                scroll_to_line(target);
+            }
+            jump.set(false);
             dismiss_keyboard();
         }
     };
+
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -725,9 +915,11 @@ fn file_viewer(
                     icon!("chevron-left"),
                     copy::text("Back", "返回", "返回"),
                     move || {
-                        selection_menu.set(false);
-                        has_selection.set(false);
+                        find.set(false);
+                        jump.set(false);
                         highlight.set(None);
+                        current_match.set(None);
+                        active_line.set(None);
                         dismiss_keyboard();
                         (host.on_back)();
                     },
@@ -815,30 +1007,24 @@ fn file_viewer(
                             )
                             .child(
                                 text(move || {
-                                    matches.with(|result| {
-                                        format!(
-                                            "{}/{}",
-                                            result.current.map_or(0, |i| i + 1),
-                                            result.count
-                                        )
-                                    })
+                                    let count = search_matches.get().len();
+                                    let current = current_match.get().map_or(0, |i| i + 1);
+                                    format!("{current}/{count}")
                                 })
                                 .flex_shrink_0()
                                 .text_size(px(theme::font_micro()))
                                 .text_color(theme::text_muted),
                             ),
                     )
-                    .child(find_button(
-                        reader,
-                        EditorCommand::FindPrevious,
+                    .child(surface::ghost_button(
                         icon!("chevron-up"),
                         copy::text("Previous match", "上一个匹配", "上一個符合"),
+                        move || step_match(false),
                     ))
-                    .child(find_button(
-                        reader,
-                        EditorCommand::FindNext,
+                    .child(surface::ghost_button(
                         icon!("chevron-down"),
                         copy::text("Next match", "下一个匹配", "下一個符合"),
+                        move || step_match(true),
                     ))
                     .child(surface::ghost_button(
                         icon!("x"),
@@ -847,6 +1033,8 @@ fn file_viewer(
                             find.set(false);
                             highlight.set(None);
                             query.set(String::new());
+                            current_match.set(None);
+                            active_line.set(None);
                             dismiss_keyboard();
                         },
                     ))
@@ -952,135 +1140,18 @@ fn file_viewer(
                 .into_element(),
                 _ => {
                     let location = path.get_untracked().zip(preview.line);
-                    view()
-                        .relative()
-                        .flex_1()
-                        .min_h(px(0.0))
-                        .child(
-                            editor()
-                                .component_ref(&reader)
-                                .value(Some(SharedString::from(preview.body)))
-                                .language(Some(SharedString::from(preview.language)))
-                                .read_only(true)
-                                .search(move || {
-                                    find.get().then(|| {
-                                        let opts = find_options.get();
-                                        let mut search = EditorSearch::new(query.get());
-                                        search.case_sensitive = opts.case_sensitive;
-                                        search.whole_word = opts.whole_word;
-                                        search.regex = opts.regex;
-                                        search
-                                    })
-                                })
-                                .on_search_change(move |result: &EditorSearchResult| {
-                                    matches.set(result.clone())
-                                })
-                                .on_selection_change(move |selections: &Vec<EditorSelection>| {
-                                    let selected = selections
-                                        .iter()
-                                        .any(|selection| selection.anchor != selection.head);
-                                    has_selection.set(selected);
-                                    if !selected {
-                                        selection_menu.set(false);
-                                    }
-                                })
-                                .on_context_menu(move |event: &EditorContextMenuEvent| {
-                                    let selected = reader
-                                        .api::<EditorApi>()
-                                        .is_some_and(|api| !api.selected_text().is_empty());
-                                    has_selection.set(selected);
-                                    selection_bar_bottom.set(event.y.0 < 200.0);
-                                    selection_menu.set(true);
-                                })
-                                .on_find_with_selection(move |selected: &String| {
-                                    let needle = selected.trim();
-                                    if !needle.is_empty() {
-                                        query.set(needle.to_owned());
-                                        find_auto_focus.set(false);
-                                        find.set(true);
-                                        jump.set(false);
-                                        selection_menu.set(false);
-                                    }
-                                })
-                                // The mobile viewer is strictly read-only: a plain tap
-                                // with no selection blurs immediately so it never raises
-                                // the soft keyboard, while a double-tap or long-press
-                                // selection keeps focus so touch selection handles and
-                                // Copy / Select All stay usable.
-                                .on_text_press(move |_: &EditorTextPressEvent| {
-                                    let selected = reader
-                                        .api::<EditorApi>()
-                                        .is_some_and(|api| !api.selected_text().is_empty());
-                                    if !selected {
-                                        selection_menu.set(false);
-                                        has_selection.set(false);
-                                        if let Some(api) = reader.api::<EditorApi>() {
-                                            api.blur();
-                                        }
-                                        dismiss_keyboard();
-                                    }
-                                })
-                                .on_blur(move || {
-                                    selection_menu.set(false);
-                                })
-                                .on_layout(move |bounds: &Bounds<Points>| {
-                                    if bounds.size.height.0 <= 0.0 {
-                                        return;
-                                    }
-                                    if initial.get() != location
-                                        && let Some((_, line)) = location.as_ref()
-                                    {
-                                        initial.replace(location.clone());
-                                        let target = (*line).saturating_sub(1);
-                                        let scroll_to_match = move || {
-                                            let Some(api) = reader.api::<EditorApi>() else {
-                                                return;
-                                            };
-                                            api.go_to_line(target);
-                                            if find.get_untracked()
-                                                && !query.get_untracked().trim().is_empty()
-                                            {
-                                                api.run(EditorCommand::FindNext);
-                                                let landed_on_target = api
-                                                    .selections()
-                                                    .last()
-                                                    .is_some_and(|sel| sel.head.line == target);
-                                                if !landed_on_target {
-                                                    api.go_to_line(target);
-                                                }
-                                            }
-                                            api.blur();
-                                        };
-                                        // Run once immediately (for synchronous/headless
-                                        // layouts) and once after the editor's internal
-                                        // scroll viewport finishes measuring its height.
-                                        scroll_to_match();
-                                        spawn(async move {
-                                            timer(Duration::from_millis(48)).await;
-                                            scroll_to_match();
-                                        });
-                                    }
-                                })
-                                .test_id("file-content")
-                                .flex_1()
-                                .min_h(px(0.0)),
-                        )
-                        .child(when(
-                            move || selection_menu.get() || has_selection.get(),
-                            move || {
-                                selection_action_bar(
-                                    reader,
-                                    has_selection,
-                                    selection_menu,
-                                    selection_bar_bottom,
-                                    query,
-                                    find,
-                                    find_auto_focus,
-                                    jump,
-                                )
-                            },
-                        ))
-                        .into_element()
+                    read_only_code_viewer(
+                        source_lines.get_untracked(),
+                        vscroll,
+                        viewport_height,
+                        active_line,
+                        search_matches,
+                        current_match,
+                        location,
+                        initial,
+                        scroll_to_line,
+                    )
+                    .into_element()
                 }
             };
             view()
@@ -1104,6 +1175,259 @@ fn file_viewer(
         }))
 }
 
+/// Strictly read-only source code viewer built on native `SelectableView`.
+///
+/// Unlike `nsh_base::editor::Editor`, this mounts no `<input>` element inside
+/// the document, so tapping, scrolling, or selecting file content never raises
+/// the soft keyboard on Android or iOS while keeping native selection handles,
+/// Copy, and Select All fully usable across lines.
+#[allow(clippy::too_many_arguments)]
+fn read_only_code_viewer(
+    lines: Rc<Vec<String>>,
+    vscroll: ElementRef,
+    viewport_height: Signal<f32>,
+    active_line: Signal<Option<usize>>,
+    search_matches: Memo<Rc<Vec<CodeMatch>>>,
+    current_match: Signal<Option<usize>>,
+    location: Option<(String, u32)>,
+    initial: Stored<Option<(String, u32)>>,
+    scroll_to_line: impl Fn(usize) + Copy + 'static,
+) -> impl IntoElement {
+    let total_lines = lines.len().max(1);
+    let total_height = total_lines as f32 * CODE_LINE_HEIGHT + CODE_PAD_Y * 2.0;
+    let gutter_digits = total_lines.to_string().len().max(2);
+    let gutter_width = (gutter_digits as f32 * 7.8 + 16.0).max(36.0);
+    let max_cols = lines
+        .iter()
+        .map(|line| display_line_width(line))
+        .max()
+        .unwrap_or(0);
+    let content_width = max_cols as f32 * 8.2 + CODE_PAD_X * 2.0 + 24.0;
+
+    let scroll_bucket = signal(0usize);
+    let visible_lines = computed(move || {
+        if total_lines <= DIRECT_RENDER_LIMIT {
+            return (0..total_lines).collect::<Vec<_>>();
+        }
+        let bucket = scroll_bucket.get();
+        let vh = viewport_height.get().max(800.0);
+        let first_visible = bucket.saturating_mul(SCROLL_BUCKET_LINES);
+        let visible_count = (vh / CODE_LINE_HEIGHT).ceil() as usize + 2;
+        let start = first_visible.saturating_sub(VISIBLE_OVERSCAN_LINES);
+        let end = (first_visible + visible_count + VISIBLE_OVERSCAN_LINES).min(total_lines);
+        (start..end).collect::<Vec<_>>()
+    });
+
+    scroll()
+        .element_ref(&vscroll)
+        .flex_1()
+        .min_h(px(0.0))
+        .on_scroll(move |event: &ScrollEvent| {
+            if total_lines > DIRECT_RENDER_LIMIT {
+                let first = ((event.offset.y.0 - CODE_PAD_Y).max(0.0) / CODE_LINE_HEIGHT) as usize;
+                let bucket = first / SCROLL_BUCKET_LINES;
+                if scroll_bucket.get_untracked() != bucket {
+                    scroll_bucket.set(bucket);
+                }
+            }
+        })
+        .on_layout(move |bounds: &Bounds<Points>| {
+            if bounds.size.height.0 <= 0.0 {
+                return;
+            }
+            if (viewport_height.get_untracked() - bounds.size.height.0).abs() > 0.5 {
+                viewport_height.set(bounds.size.height.0);
+            }
+            if initial.get() != location
+                && let Some((_, line)) = location.as_ref()
+            {
+                initial.replace(location.clone());
+                let target = (*line).saturating_sub(1) as usize;
+                let matches = search_matches.get_untracked();
+                if let Some(index) = matches.iter().position(|m| m.line == target) {
+                    current_match.set(Some(index));
+                }
+                scroll_to_line(target);
+                spawn(async move {
+                    timer(Duration::from_millis(48)).await;
+                    scroll_to_line(target);
+                });
+            }
+        })
+        .child(
+            view()
+                .w_full()
+                .h(px(total_height))
+                .flex_row()
+                // Gutter lives outside `selectable(true)` with `select_none()` so
+                // cross-line copies never include line numbers.
+                .child(
+                    view()
+                        .test_id("file-gutter")
+                        .relative()
+                        .flex_shrink_0()
+                        .w(px(gutter_width))
+                        .h(px(total_height))
+                        .border_r_1()
+                        .border_color(theme::hairline)
+                        .select_none()
+                        .child(each(
+                            visible_lines,
+                            |index: &usize| *index,
+                            move |index, _| {
+                                let line_index = index.get_untracked();
+                                let top = CODE_PAD_Y + line_index as f32 * CODE_LINE_HEIGHT;
+                                view()
+                                    .absolute()
+                                    .left_0()
+                                    .right_0()
+                                    .top(px(top))
+                                    .h(px(CODE_LINE_HEIGHT))
+                                    .px(px(theme::SPACING_SM))
+                                    .justify_center()
+                                    .bg(move || {
+                                        if active_line.get() == Some(line_index) {
+                                            theme::accent_blue().alpha(0.10)
+                                        } else {
+                                            transparent_black()
+                                        }
+                                    })
+                                    .child(
+                                        text((line_index + 1).to_string())
+                                            .select_none()
+                                            .text_right()
+                                            .font_family("monospace")
+                                            .text_size(px(11.5))
+                                            .line_height(px(CODE_LINE_HEIGHT))
+                                            .text_color(move || {
+                                                if active_line.get() == Some(line_index) {
+                                                    theme::foreground()
+                                                } else {
+                                                    theme::text_muted()
+                                                }
+                                            }),
+                                    )
+                            },
+                        )),
+                )
+                .child(
+                    scroll().horizontal().flex_1().min_w(px(0.0)).child(
+                        view()
+                            .test_id("file-content")
+                            .selectable(true)
+                            .relative()
+                            .min_w(relative(1.0))
+                            .w(px(content_width))
+                            .h(px(total_height))
+                            .child(each(
+                                visible_lines,
+                                |index: &usize| *index,
+                                move |index, _| {
+                                    let line_index = index.get_untracked();
+                                    let content =
+                                        lines.get(line_index).cloned().unwrap_or_default();
+                                    let top = CODE_PAD_Y + line_index as f32 * CODE_LINE_HEIGHT;
+                                    code_content_row(
+                                        line_index,
+                                        top,
+                                        content,
+                                        active_line,
+                                        search_matches,
+                                        current_match,
+                                    )
+                                },
+                            )),
+                    ),
+                ),
+        )
+}
+
+fn code_content_row(
+    line_index: usize,
+    top: f32,
+    content: String,
+    active_line: Signal<Option<usize>>,
+    search_matches: Memo<Rc<Vec<CodeMatch>>>,
+    current_match: Signal<Option<usize>>,
+) -> impl IntoElement {
+    let line_matches = computed(move || {
+        let all = search_matches.get();
+        let active = current_match.get();
+        all.iter()
+            .enumerate()
+            .filter(|(_, m)| m.line == line_index)
+            .map(|(idx, m)| (m.start, m.end, active == Some(idx)))
+            .collect::<Vec<_>>()
+    });
+    view()
+        .absolute()
+        .left_0()
+        .right_0()
+        .top(px(top))
+        .h(px(CODE_LINE_HEIGHT))
+        .px(px(CODE_PAD_X))
+        .justify_center()
+        .bg(move || {
+            if active_line.get() == Some(line_index) {
+                theme::accent_blue().alpha(0.10)
+            } else {
+                transparent_black()
+            }
+        })
+        .child(dynamic(move || {
+            let matches = line_matches.get();
+            if matches.is_empty() {
+                text(content.clone())
+                    .select_text()
+                    .font_family("monospace")
+                    .text_size(px(CODE_FONT_SIZE))
+                    .line_height(px(CODE_LINE_HEIGHT))
+                    .text_color(theme::foreground)
+                    .number_of_lines(1u32)
+                    .text_overflow(nsh_core::EllipsizeMode::Clip)
+                    .into_element()
+            } else {
+                let mut spans: Vec<AnyElement> = Vec::new();
+                let mut cursor = 0usize;
+                for (start, end, is_current) in matches {
+                    if start > cursor && content.is_char_boundary(start) {
+                        spans.push(text(content[cursor..start].to_owned()).into_element());
+                    }
+                    if end > start
+                        && content.is_char_boundary(start)
+                        && content.is_char_boundary(end)
+                    {
+                        let bg = if is_current {
+                            theme::accent_yellow().alpha(0.55)
+                        } else {
+                            theme::accent_yellow().alpha(0.25)
+                        };
+                        spans.push(
+                            text(content[start..end].to_owned())
+                                .bg(bg)
+                                .text_color(theme::foreground)
+                                .into_element(),
+                        );
+                        cursor = end;
+                    }
+                }
+                if cursor < content.len() && content.is_char_boundary(cursor) {
+                    spans.push(text(content[cursor..].to_owned()).into_element());
+                }
+                text("")
+                    .select_text()
+                    .font_family("monospace")
+                    .text_size(px(CODE_FONT_SIZE))
+                    .line_height(px(CODE_LINE_HEIGHT))
+                    .text_color(theme::foreground)
+                    .number_of_lines(1u32)
+                    .text_overflow(nsh_core::EllipsizeMode::Clip)
+                    .children(spans)
+                    .into_element()
+            }
+        }))
+}
+
 /// The strip a viewer's tool is used in: a field, and the controls beside it.
 fn tool_bar() -> View {
     view()
@@ -1116,150 +1440,48 @@ fn tool_bar() -> View {
         .pb(px(theme::SPACING_SM))
 }
 
-fn find_button(
-    reader: ComponentRef<Editor>,
-    command: EditorCommand,
-    icon: ImageSrc,
-    label: &'static str,
-) -> impl IntoElement {
-    surface::ghost_button(icon, label, move || {
-        if let Some(api) = reader.api::<EditorApi>() {
-            api.run(command);
-        }
-    })
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-#[allow(clippy::too_many_arguments)]
-fn selection_action_bar(
-    reader: ComponentRef<Editor>,
-    has_selection: Signal<bool>,
-    selection_menu: Signal<bool>,
-    at_bottom: Signal<bool>,
-    query: Signal<String>,
-    find: Signal<bool>,
-    find_auto_focus: Signal<bool>,
-    jump: Signal<bool>,
-) -> impl IntoElement {
-    view()
-        .absolute()
-        .left(px(0.0))
-        .right(px(0.0))
-        .style_when(
-            move || !at_bottom.get(),
-            |style| style.top(px(theme::SPACING_SM)),
-        )
-        .style_when(
-            move || at_bottom.get(),
-            |style| style.bottom(px(theme::SPACING_SM)),
-        )
-        .items_center()
-        .pointer_events(PointerEvents::BoxNone)
-        .child(
-            view()
-                .test_id("file-selection-actions")
-                .pointer_events(PointerEvents::Auto)
-                .flex_row()
-                .items_center()
-                .gap(px(2.0))
-                .px(px(6.0))
-                .py(px(4.0))
-                .rounded_full()
-                .bg(theme::background_card)
-                .border_1()
-                .border_color(theme::hairline)
-                .child(when(
-                    move || has_selection.get(),
-                    move || {
-                        selection_action_button(
-                            Some(icon!("copy")),
-                            copy::text("Copy", "复制", "複製"),
-                            "file-selection-copy",
-                            move || {
-                                if let Some(api) = reader.api::<EditorApi>() {
-                                    let selected = api.selected_text();
-                                    if !selected.is_empty() {
-                                        drop(set_clipboard(selected));
-                                    }
-                                    api.blur();
-                                }
-                                selection_menu.set(false);
-                                has_selection.set(false);
-                                dismiss_keyboard();
-                            },
-                        )
-                    },
-                ))
-                .child(selection_action_button(
-                    None,
-                    copy::text("Select All", "全选", "全選"),
-                    "file-selection-select-all",
-                    move || {
-                        if let Some(api) = reader.api::<EditorApi>() {
-                            api.run(EditorCommand::SelectAll);
-                            let selected = !api.selected_text().is_empty();
-                            has_selection.set(selected);
-                            selection_menu.set(selected);
-                        }
-                    },
-                ))
-                .child(when(
-                    move || has_selection.get(),
-                    move || {
-                        selection_action_button(
-                            Some(icon!("search")),
-                            copy::text("Find", "查找", "尋找"),
-                            "file-selection-find",
-                            move || {
-                                if let Some(api) = reader.api::<EditorApi>() {
-                                    let selected = api.selected_text();
-                                    let first_line = selected
-                                        .lines()
-                                        .find(|line| !line.trim().is_empty())
-                                        .map(str::trim)
-                                        .unwrap_or_default();
-                                    let needle: String = first_line.chars().take(120).collect();
-                                    if !needle.is_empty() {
-                                        query.set(needle);
-                                        find_auto_focus.set(false);
-                                        find.set(true);
-                                        jump.set(false);
-                                    }
-                                    api.blur();
-                                }
-                                selection_menu.set(false);
-                                has_selection.set(false);
-                                dismiss_keyboard();
-                            },
-                        )
-                    },
-                )),
-        )
-}
+    #[test]
+    fn find_code_matches_handles_case_whole_word_and_unicode() {
+        let lines = split_source_lines(
+            "fn greeting() {\n    let greeting_id = \"Greeting\";\n    println!(\"你好 greeting\");\n}",
+        );
+        let ci = find_code_matches(&lines, "greeting", SearchOptions::default());
+        assert_eq!(ci.len(), 4);
+        assert_eq!(ci[0].line, 0);
+        assert_eq!(ci[1].line, 1);
+        assert_eq!(ci[2].line, 1);
+        assert_eq!(ci[3].line, 2);
 
-fn selection_action_button(
-    glyph: Option<ImageSrc>,
-    label: &'static str,
-    id: &'static str,
-    on_press: impl Fn() + 'static,
-) -> impl IntoElement {
-    view()
-        .test_id(id)
-        .role(nsh_core::AccessibilityRole::Button)
-        .label(label)
-        .focusable(false)
-        .on_press(move |_: &()| on_press())
-        .h(px(30.0))
-        .px(px(10.0))
-        .rounded_full()
-        .flex_row()
-        .items_center()
-        .gap(px(4.0))
-        .active(|style| style.bg(theme::row_pressed_bg()))
-        .children(glyph.map(|glyph| svg(glyph).size(px(14.0)).text_color(theme::foreground)))
-        .child(
-            text(label)
-                .text_size(px(theme::font_caption()))
-                .font_weight(FontWeight::MEDIUM)
-                .text_color(theme::foreground),
-        )
+        let whole = find_code_matches(
+            &lines,
+            "greeting",
+            SearchOptions {
+                whole_word: true,
+                ..Default::default()
+            },
+        );
+        // Skips `greeting_id`, matches `greeting`, `Greeting`, and `greeting` after CJK.
+        assert_eq!(whole.len(), 3);
+
+        let cs = find_code_matches(
+            &lines,
+            "Greeting",
+            SearchOptions {
+                case_sensitive: true,
+                ..Default::default()
+            },
+        );
+        assert_eq!(cs.len(), 1);
+        assert_eq!(cs[0].line, 1);
+    }
+
+    #[test]
+    fn split_source_lines_preserves_empty_lines_and_handles_empty_file() {
+        assert_eq!(split_source_lines(""), vec![String::new()]);
+        assert_eq!(split_source_lines("a\n\nb"), vec!["a", "", "b"]);
+    }
 }
