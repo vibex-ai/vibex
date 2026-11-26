@@ -3931,11 +3931,21 @@ async fn run_trusted_npm_setup(
     npm_config: &IsolatedNpmConfigs,
 ) -> VibexResult<()> {
     let setup = match agent_id.as_str() {
-        "amp-acp" => Some((AMP_CLI_PACKAGE, "install.cjs")),
-        "codewhale" => Some((CODEWHALE_CLI_PACKAGE, "scripts/install.js")),
+        "amp-acp" => Some((AMP_CLI_PACKAGE, "install.cjs", Vec::new())),
+        "codewhale" => Some((CODEWHALE_CLI_PACKAGE, "scripts/install.js", Vec::new())),
+        // `@openma/deepseek-harness-acp` 0.4.43+ downloads its standalone
+        // `@deepseek-ai/dsh` runtime on first run instead of bundling the
+        // tarball inside the npm package. Prefetch it during managed
+        // installation so the first ACP probe or session creation never hits
+        // the 20s probe timeout mid-download and leaves a stale runtime lock.
+        "deepseek-harness" => Some((
+            DEEPSEEK_HARNESS_ACP_PACKAGE,
+            "dist/bin.js",
+            vec!["--prefetch-runtime"],
+        )),
         _ => None,
     };
-    let Some((package, script)) = setup else {
+    let Some((package, script, args)) = setup else {
         return Ok(());
     };
     let package_root = package_directory(staging, package)?;
@@ -3944,6 +3954,7 @@ async fn run_trusted_npm_setup(
     let mut command = Command::new(&node.node);
     command
         .arg(&script)
+        .args(&args)
         .current_dir(package_root)
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -4331,6 +4342,35 @@ function ensureVendoredRuntime() {{
   }}
 }}
 
+function reapStaleRuntimeLocks() {{
+  try {{
+    const root = cacheRoot();
+    if (!fs.existsSync(root)) return;
+    for (const name of fs.readdirSync(root)) {{
+      if (!name.startsWith(".") || !name.endsWith(".lock")) continue;
+      const lockPath = path.join(root, name);
+      let raw;
+      try {{
+        raw = fs.readFileSync(lockPath, "utf8").trim();
+      }} catch {{
+        continue;
+      }}
+      const pid = Number.parseInt(raw, 10);
+      if (!Number.isInteger(pid) || pid <= 0) continue;
+      let dead = false;
+      try {{
+        process.kill(pid, 0);
+      }} catch (error) {{
+        if (error && error.code === "ESRCH") dead = true;
+      }}
+      if (dead) {{
+        fs.rmSync(lockPath, {{ force: true }});
+      }}
+    }}
+  }} catch {{}}
+}}
+
+reapStaleRuntimeLocks();
 ensureVendoredRuntime();
 const child = spawn(process.execPath, [adapter, ...process.argv.slice(2)], {{ stdio: "inherit", env: process.env }});
 child.on("error", (error) => {{
@@ -6388,6 +6428,7 @@ mod tests {
         .unwrap();
 
         assert!(launcher.contains("DSH_ACP_CACHE_DIR"));
+        assert!(launcher.contains("reapStaleRuntimeLocks"));
         assert!(launcher.contains(".dsh-acp-runtime"));
         assert!(launcher.contains("entry.type !== \"SymbolicLink\""));
         assert!(launcher.contains("createRequire(adapter)(\"tar\")"));

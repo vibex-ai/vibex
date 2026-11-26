@@ -1412,6 +1412,18 @@ impl<A> SessionAttachmentRegistry<A> {
         })
     }
 
+    /// Whether an active prompt currently holds the prompt admission slot on
+    /// `expected`.
+    pub fn is_prompt_active(&self, expected: &SessionAttachmentEventFence) -> bool {
+        let Ok(state) = self.inner.state.lock() else {
+            return false;
+        };
+        state
+            .attachments
+            .get(&expected.binding_id)
+            .is_some_and(|record| record.fence == *expected && record.prompt_active)
+    }
+
     fn release_prompt(&self, binding_id: &RuntimeBindingId, fence: &SessionAttachmentEventFence) {
         let Ok(mut state) = self.inner.state.lock() else {
             return;

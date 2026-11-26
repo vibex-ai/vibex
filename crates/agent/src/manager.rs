@@ -260,6 +260,9 @@ pub struct AgentManager {
     /// need the live answer, so each turn registers here for its whole lifetime
     /// and an RAII guard releases the entry on every exit path.
     active_turn_sessions: Arc<StdMutex<HashSet<String>>>,
+    /// Wakes waiters (such as a turn arriving right after `interrupt`) as soon
+    /// as the in-flight turn's [`ActiveTurnGuard`] drops and releases its slot.
+    active_turn_notify: Arc<tokio::sync::Notify>,
     /// The PTY host a terminal-mode session starts its Agent in.
     ///
     /// Installed by the composition root that owns the terminal manager. A
@@ -284,6 +287,7 @@ pub struct AgentManager {
 /// error, or a cancelled future all clear the slot.
 struct ActiveTurnGuard {
     sessions: Arc<StdMutex<HashSet<String>>>,
+    notify: Arc<tokio::sync::Notify>,
     session_id: String,
 }
 
@@ -292,6 +296,7 @@ impl Drop for ActiveTurnGuard {
         if let Ok(mut sessions) = self.sessions.lock() {
             sessions.remove(&self.session_id);
         }
+        self.notify.notify_waiters();
     }
 }
 
@@ -708,6 +713,7 @@ impl AgentManager {
             context_bridge,
             session_event_pumps: Arc::new(StdMutex::new(HashSet::new())),
             active_turn_sessions: Arc::new(StdMutex::new(HashSet::new())),
+            active_turn_notify: Arc::new(tokio::sync::Notify::new()),
             session_terminal_launcher: OnceLock::new(),
             user_input_expiry_task: StdMutex::new(None),
         };
@@ -3860,6 +3866,15 @@ impl AgentManager {
         &self,
         request: ContinueAgentTurnRequest,
     ) -> VibexResult<Vec<TimelineItem>> {
+        // An immediately preceding `interrupt` may still be unwinding its
+        // in-flight turn in the background; wait briefly for it to finish
+        // persisting its final state and releasing its slot before inspecting
+        // the session and timeline.
+        if self.session_turn_in_flight(&request.session_id) {
+            let _ = self
+                .wait_for_active_turn_to_settle(&request.session_id, Duration::from_secs(5))
+                .await;
+        }
         let conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
@@ -4119,6 +4134,7 @@ impl AgentManager {
         }
         ActiveTurnGuard {
             sessions: Arc::clone(&self.active_turn_sessions),
+            notify: Arc::clone(&self.active_turn_notify),
             session_id: session_id.as_str().to_string(),
         }
     }
@@ -4132,6 +4148,38 @@ impl AgentManager {
             .lock()
             .map(|sessions| sessions.contains(session_id.as_str()))
             .unwrap_or(true)
+    }
+
+    /// Waits up to `max_wait` for an unwinding provider turn on `session_id`
+    /// to drop its [`ActiveTurnGuard`].
+    ///
+    /// Returns `true` once no turn is in flight, or `false` if the previous
+    /// turn is still active when the wait expires.
+    async fn wait_for_active_turn_to_settle(
+        &self,
+        session_id: &VibexSessionId,
+        max_wait: Duration,
+    ) -> bool {
+        if !self.session_turn_in_flight(session_id) {
+            return true;
+        }
+        let deadline = tokio::time::Instant::now() + max_wait;
+        loop {
+            let notified = self.active_turn_notify.notified();
+            if !self.session_turn_in_flight(session_id) {
+                return true;
+            }
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                return false;
+            }
+            if tokio::time::timeout(deadline - now, notified)
+                .await
+                .is_err()
+            {
+                return !self.session_turn_in_flight(session_id);
+            }
+        }
     }
 
     /// Settles a session after one of its user-input requests is resolved.
@@ -4635,11 +4683,27 @@ impl AgentManager {
             ));
         }
 
+        // If an interrupted turn is still unwinding its provider RPC, wait
+        // briefly for it to release its active-turn slot instead of appending
+        // a user message only to collide with `acp_turn_already_running`.
+        if self.session_turn_in_flight(&request.session_id)
+            && !self
+                .wait_for_active_turn_to_settle(&request.session_id, Duration::from_secs(5))
+                .await
+        {
+            return Err(VibexError::conflict(
+                "agent_turn_already_running",
+                "Agent session already has a running turn",
+            ));
+        }
+
         let mut conn = self.open_migrated()?;
         let session = SessionRepository::get(&conn, &request.session_id)?.ok_or_else(|| {
             VibexError::validation("session_not_found", "Agent session was not found")
         })?;
-        if session.state == AgentSessionState::Running {
+        if session.state == AgentSessionState::Running
+            || self.session_turn_in_flight(&request.session_id)
+        {
             return Err(VibexError::conflict(
                 "agent_turn_already_running",
                 "Agent session already has a running turn",
@@ -11419,7 +11483,247 @@ mod tests {
         let _ = fs::remove_dir_all(workspace_root);
     }
 
-    /// MCP credentials never live in the database: plain entries are stored,
+    #[tokio::test]
+    async fn followup_turn_waits_for_unwinding_interrupted_turn_instead_of_colliding() {
+        let db_path = temp_db_path("interrupt-unwind-followup");
+        let workspace_root = temp_workspace_path("interrupt-unwind-followup");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let mut manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        ProviderProfileRepository::ensure_local_defaults(&conn).unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let agent_id = AgentId::parse("interrupt-unwind-agent").unwrap();
+        let adapter_id = AcpAdapterId::parse("interrupt-unwind-acp").unwrap();
+        let provider_profile_id =
+            ProviderProfileId::parse(ProviderKind::Acp.local_default_profile_id().to_string())
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "interrupt unwind followup",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            agent_id.clone(),
+            AgentSessionState::Idle,
+        );
+        let selection = SessionRuntimeSelection::provider(
+            agent_id.clone(),
+            provider_profile_id,
+            "interrupt-unwind-model",
+        );
+        let mut runtime_config = SessionRuntimeConfigState {
+            preferred_model: selection.model_id().map(str::to_string),
+            effective_model: selection.model_id().map(str::to_string),
+            ..SessionRuntimeConfigState::default()
+        };
+        runtime_config.mark_generation_if_converged(0);
+        let now = unix_timestamp_ms();
+        let binding = RuntimeBinding {
+            binding_id: RuntimeBindingId::new(),
+            session_id: session.id.clone(),
+            agent_id: agent_id.clone(),
+            transport_kind: TransportKind::Acp,
+            auth_source: selection.auth_source.clone(),
+            auth_source_revision: 1,
+            adapter_id: adapter_id.clone(),
+            adapter_version: "1.0.0".to_string(),
+            adapter_compatibility_identity: "interrupt-unwind-acp@1".to_string(),
+            native_session_id: Some("native-interrupt-unwind".to_string()),
+            native_state_home_id: NativeStateHomeId::new(),
+            provider_resume_identity: None,
+            process_spawn_fingerprint: "interrupt-unwind".to_string(),
+            session_runtime_config_state: runtime_config,
+            capability_snapshot: None,
+            restore_compatibility_key: None,
+            last_context_sequence: 0,
+            last_summary_sequence: 0,
+            context_bridge_version: 0,
+            activation_generation: 0,
+            binding_state: BindingState::Current,
+            created_by_switch_id: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        };
+        AgentSessionRuntimeRepository::initialize_runtime_selection(
+            &mut conn, &binding, &selection,
+        )
+        .unwrap();
+        drop(conn);
+
+        struct InterruptUnwindProvider {
+            identity: ProviderTurnExecutionIdentity,
+            armed: tokio::sync::Notify,
+            release: tokio::sync::Notify,
+        }
+
+        #[async_trait]
+        impl AgentProvider for InterruptUnwindProvider {
+            fn kind(&self) -> ProviderKind {
+                ProviderKind::Acp
+            }
+
+            fn capabilities(&self) -> ProviderCapabilities {
+                let mut capabilities =
+                    ProviderCapabilities::conservative(ProviderKind::Acp, "interrupt-unwind-test");
+                capabilities.interrupt = true;
+                capabilities
+            }
+
+            async fn create_session(
+                &self,
+                _request: ProviderCreateRequest,
+            ) -> VibexResult<ProviderSessionHandle> {
+                unreachable!("interrupt unwind test uses a seeded binding")
+            }
+
+            async fn resume_session(
+                &self,
+                binding: ProviderBinding,
+            ) -> VibexResult<ProviderSessionHandle> {
+                Ok(ProviderSessionHandle {
+                    binding,
+                    capabilities: self.capabilities(),
+                })
+            }
+
+            async fn prepare_turn_execution(
+                &self,
+                _handle: &ProviderSessionHandle,
+                _request: &ProviderTurnRequest,
+            ) -> VibexResult<Option<ProviderTurnExecutionIdentity>> {
+                Ok(Some(self.identity.clone()))
+            }
+
+            async fn send_turn(
+                &self,
+                _handle: ProviderSessionHandle,
+                _request: ProviderTurnRequest,
+            ) -> VibexResult<ProviderTurnResult> {
+                Ok(ProviderTurnResult {
+                    stop_reason: Some("end_turn".to_string()),
+                    events: vec![ProviderEvent::agent(TimelinePayload::AgentMessage(
+                        vibex_core::AgentMessagePayload {
+                            text: "resumed".to_string(),
+                            is_final: true,
+                        },
+                    ))],
+                    binding_update: None,
+                    completed: true,
+                })
+            }
+
+            async fn resolve_permission(
+                &self,
+                _request: ProviderPermissionResolution,
+            ) -> VibexResult<()> {
+                Ok(())
+            }
+
+            async fn interrupt(&self, _handle: ProviderSessionHandle) -> VibexResult<()> {
+                Ok(())
+            }
+        }
+
+        let provider = Arc::new(InterruptUnwindProvider {
+            identity: ProviderTurnExecutionIdentity {
+                binding_id: binding.binding_id.clone(),
+                activation_generation: binding.activation_generation,
+                model_id: Some(selection.model_id().unwrap().to_string()),
+            },
+            armed: tokio::sync::Notify::new(),
+            release: tokio::sync::Notify::new(),
+        });
+        manager
+            .register_runtime(
+                AgentRuntimeRouteKey {
+                    agent_id,
+                    transport_kind: TransportKind::Acp,
+                    adapter_id,
+                },
+                provider.clone(),
+            )
+            .unwrap();
+
+        let manager = Arc::new(manager);
+        let first_manager = Arc::clone(&manager);
+        let first_session_id = session.id.clone();
+        let first_selection = selection.clone();
+        let first_provider = Arc::clone(&provider);
+        let first_turn = tokio::spawn(async move {
+            first_manager
+                .run_agent_turn(
+                    AgentTurnRequest {
+                        mentions: Vec::new(),
+                        session_id: first_session_id,
+                        required_runtime: Some(first_selection),
+                        text: "first turn".to_string(),
+                        attachments: Vec::new(),
+                        reasoning_effort: None,
+                        correlation_id: None,
+                        delivery: UserMessageDelivery::Prompt,
+                        prompt_context: None,
+                        provenance: vibex_core::MessageProvenance::HumanInput,
+                        provider_command: false,
+                    },
+                    AgentTurnDisplayPolicy::USER_AUTHORED,
+                    ContextBridgeTurnBehavior::ConsumePending,
+                    None,
+                    move |_provider, _handle, _request| {
+                        let provider = Arc::clone(&first_provider);
+                        async move {
+                            provider.armed.notify_one();
+                            provider.release.notified().await;
+                            // Emulate a cancelled ACP turn: no synthetic final AgentMessage.
+                            Ok(ProviderTurnResult {
+                                stop_reason: Some("cancelled".to_string()),
+                                events: vec![ProviderEvent::provider(
+                                    TimelinePayload::SystemNotice(
+                                        vibex_core::SystemNoticePayload {
+                                            level: vibex_core::SystemNoticeLevel::Info,
+                                            message: "ACP turn stopped: cancelled".to_string(),
+                                        },
+                                    ),
+                                )],
+                                binding_update: None,
+                                completed: true,
+                            })
+                        }
+                    },
+                )
+                .await
+        });
+        provider.armed.notified().await;
+
+        // Interrupt settles DB state to Idle while the first turn is still
+        // unwinding its provider future.
+        manager.interrupt(&session.id).await.unwrap();
+        assert!(manager.session_turn_in_flight(&session.id));
+
+        // Release the unwinding first turn shortly after a follow-up continue_turn
+        // starts. `continue_turn` must wait for the first turn to finish unwinding
+        // and then succeed without hitting `agent_continue_requires_incomplete_turn`
+        // or colliding with the previous turn.
+        let release_provider = Arc::clone(&provider);
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(80)).await;
+            release_provider.release.notify_one();
+        });
+
+        let continued = manager
+            .continue_turn(ContinueAgentTurnRequest {
+                session_id: session.id.clone(),
+                correlation_id: None,
+            })
+            .await
+            .expect("continue_turn after cancelled turn must wait for unwind and succeed");
+        assert!(!continued.is_empty());
+        first_turn.await.unwrap().unwrap();
+
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
     /// secrets stay with the configured backend and are resolved only when the
     /// server is actually forwarded.
     ///

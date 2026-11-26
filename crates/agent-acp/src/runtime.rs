@@ -105,7 +105,9 @@ use vibex_core::{TimelineRedactionState, WorkspaceMode};
 use vibex_db::{
     AgentAuthContextRepository, AgentAuthModelCatalogRepository,
     AgentAuthenticationOperationRepository, AgentModelProviderBindingRepository,
-    AgentRuntimeProbeRepository, AgentRuntimeProfileRepository, AgentSessionRuntimeRepository,
+    AgentRuntimeOptionSnapshotRepository, AgentRuntimeProbeRepository,
+    AgentRuntimeProfileRepository, AgentSessionRuntimeRepository,
+    ProviderModelRuntimeOptionSnapshotRepository, ProviderRuntimeOptionSnapshotRepository,
     RuntimeBindingRepository, SessionRepository, SwitchOperationRecord, apply_migrations,
     open_database,
 };
@@ -199,6 +201,15 @@ const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(2);
 // during concurrent workspace checks.
 #[cfg(test)]
 const ACP_GRACEFUL_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(1);
+/// How long `interrupt` waits for an adapter to answer `session/prompt` after
+/// receiving `session/cancel` before forcibly aborting the stalled prompt and
+/// recycling the attachment so the next turn does not wedge on
+/// `acp_turn_already_running`.
+#[cfg(not(test))]
+const ACP_INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_secs(3);
+#[cfg(test)]
+const ACP_INTERRUPT_SETTLE_TIMEOUT: Duration = Duration::from_millis(400);
+const ACP_INTERRUPT_SETTLE_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const ACP_DEBUG_LOG_LIMIT: usize = 256;
 const ACP_FS_READ_BYTE_LIMIT: u64 = 10 * 1024 * 1024;
 /// Concurrency and deadline for host filesystem work. Both exist to protect
@@ -6200,6 +6211,37 @@ impl AcpProcess {
         self.clear_pending_prompt_request_id(request_id);
     }
 
+    /// Resolves any in-flight `session/prompt` request for `native_session_id`
+    /// with a synthetic `cancelled` response when the adapter ignores
+    /// `session/cancel` past the interrupt grace window.
+    ///
+    /// Returning `cancelled` unwinds `send_turn` cleanly through its normal
+    /// guard-release path instead of leaving `prompt_active` and `active_turn`
+    /// wedged forever.
+    fn force_cancel_pending_prompt_for_session(&self, native_session_id: &str) -> bool {
+        let request_id = self
+            .pending_prompt_requests
+            .lock()
+            .ok()
+            .and_then(|mut pending| pending.remove(native_session_id));
+        let Some(request_id) = request_id else {
+            return false;
+        };
+        let pending = self
+            .pending_requests
+            .lock()
+            .ok()
+            .and_then(|mut requests| requests.remove(&request_id));
+        if let Some(pending) = pending {
+            let _ = pending
+                .response
+                .send(Ok(json!({ "stopReason": "cancelled" })));
+            true
+        } else {
+            false
+        }
+    }
+
     pub(crate) async fn request(
         &self,
         method: &str,
@@ -9422,6 +9464,71 @@ impl AcpRuntimeSwitchBridge {
                 )
             })
     }
+
+    /// Loads previously persisted or in-memory session-config evidence for a
+    /// provider-backed selection so `resolve()` can validate modes and
+    /// reasoning efforts without failing when a transient live probe times out.
+    ///
+    /// Precedence mirrors the UI catalog:
+    /// 1. Persisted model-scoped snapshot (`provider_model_runtime_option_snapshots`).
+    /// 2. Live in-memory evidence observed from real sessions on this Profile
+    ///    (for non-Claude Agents where mode/effort is profile-wide).
+    /// 3. Persisted profile-scoped snapshot (`provider_runtime_option_snapshots`).
+    /// 4. Persisted Agent-scoped snapshot (`agent_runtime_option_snapshots`).
+    fn cached_session_config_evidence(
+        &self,
+        agent_id: &AgentId,
+        provider_profile_id: &ProviderProfileId,
+        model_id: Option<&str>,
+    ) -> Option<AgentSessionConfigProbe> {
+        let model_scoped_required = agent_id.as_str() == CLAUDE_AGENT_ID && model_id.is_some();
+        if let Ok(conn) = open_database(&self.db_path) {
+            if let Some(model_id) = model_id
+                && let Ok(records) = ProviderModelRuntimeOptionSnapshotRepository::list(&conn)
+                && let Some(probe) = records.into_iter().find_map(|record| {
+                    (record.provider_profile_id == *provider_profile_id
+                        && record.model_id == model_id
+                        && record.agent_id == *agent_id)
+                        .then_some(record.session_config)
+                        .flatten()
+                })
+            {
+                return Some(probe);
+            }
+            if !model_scoped_required {
+                if let Ok(evidence) = self.client.profile_session_config_evidence()
+                    && let Some(probe) = evidence.get(provider_profile_id)
+                {
+                    return Some(probe.clone());
+                }
+                if let Ok(records) = ProviderRuntimeOptionSnapshotRepository::list(&conn)
+                    && let Some(probe) = records.into_iter().find_map(|record| {
+                        (record.provider_profile_id == *provider_profile_id
+                            && record.agent_id == *agent_id)
+                            .then_some(record.session_config)
+                            .flatten()
+                    })
+                {
+                    return Some(probe);
+                }
+                if let Ok(records) = AgentRuntimeOptionSnapshotRepository::list(&conn)
+                    && let Some(probe) = records.into_iter().find_map(|record| {
+                        (record.agent_id == *agent_id)
+                            .then_some(record.session_config)
+                            .flatten()
+                    })
+                {
+                    return Some(probe);
+                }
+            }
+        } else if !model_scoped_required
+            && let Ok(evidence) = self.client.profile_session_config_evidence()
+            && let Some(probe) = evidence.get(provider_profile_id)
+        {
+            return Some(probe.clone());
+        }
+        None
+    }
 }
 
 #[async_trait]
@@ -9591,22 +9698,52 @@ impl RuntimeSelectionResolver for AcpRuntimeSwitchBridge {
             || effective_selection.mode_id.is_some())
             && let Some(provider_profile_id) = context.launch_profile_id.as_ref()
         {
-            let probe = if context.agent_id.as_str() == CLAUDE_AGENT_ID
-                && let Some(model_id) = model_id.as_deref()
-            {
-                self.manager
-                    .probe_session_config_for_model(
-                        selection.agent_id.clone(),
-                        provider_profile_id.clone(),
-                        model_id,
-                    )
-                    .await
+            let cached = self.cached_session_config_evidence(
+                &context.agent_id,
+                provider_profile_id,
+                model_id.as_deref(),
+            );
+            let cached_answers_selection =
+                cached.as_ref().is_some_and(|probe| {
+                    let effort_covered = effective_selection
+                        .reasoning_effort
+                        .as_deref()
+                        .is_none_or(|effort| {
+                            probe
+                                .reasoning_efforts
+                                .iter()
+                                .any(|candidate| candidate.value == effort)
+                                || (probe.reasoning_efforts.is_empty()
+                                    && probe.options_advertise_no_reasoning_effort())
+                        });
+                    let mode_covered = effective_selection.mode_id.as_deref().is_none_or(|mode| {
+                        probe.modes.iter().any(|candidate| candidate.value == mode)
+                    });
+                    effort_covered && mode_covered
+                });
+            if cached_answers_selection {
+                cached
             } else {
-                self.manager
-                    .probe_session_config(selection.agent_id.clone(), provider_profile_id.clone())
-                    .await
-            };
-            probe.ok()
+                let live = if context.agent_id.as_str() == CLAUDE_AGENT_ID
+                    && let Some(model_id) = model_id.as_deref()
+                {
+                    self.manager
+                        .probe_session_config_for_model(
+                            selection.agent_id.clone(),
+                            provider_profile_id.clone(),
+                            model_id,
+                        )
+                        .await
+                } else {
+                    self.manager
+                        .probe_session_config(
+                            selection.agent_id.clone(),
+                            provider_profile_id.clone(),
+                        )
+                        .await
+                };
+                live.ok().or(cached)
+            }
         } else {
             None
         };
@@ -10688,6 +10825,112 @@ fn normalize_claude_model_mode(
         return None;
     }
     Some("default".to_string())
+}
+
+/// Resolves the cache directory where `@openma/deepseek-harness-acp` stores its
+/// standalone runtime and `.lock` files, matching `cacheRoot()` in its `bin.js`.
+fn deepseek_harness_cache_root(env_overlays: &[(String, String)]) -> Option<PathBuf> {
+    let overlay = |key: &str| {
+        env_overlays
+            .iter()
+            .rev()
+            .find(|(existing, _)| existing == key)
+            .map(|(_, value)| value.as_str())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    let env_path = |key: &str| {
+        overlay(key).or_else(|| {
+            std::env::var_os(key)
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+    };
+    if let Some(explicit) = env_path("DSH_ACP_CACHE_DIR") {
+        return Some(explicit);
+    }
+    #[cfg(windows)]
+    if let Some(local_app_data) = env_path("LOCALAPPDATA") {
+        return Some(local_app_data.join("dsh-acp"));
+    }
+    if let Some(xdg) = env_path("XDG_CACHE_HOME") {
+        return Some(xdg.join("dsh-acp"));
+    }
+    let home = env_path("HOME").or_else(|| env_path("USERPROFILE"))?;
+    Some(home.join(".cache").join("dsh-acp"))
+}
+
+/// Returns whether a numeric PID recorded in a lock file belongs to a process
+/// that is known to have exited. Returns `false` when the OS cannot confirm the
+/// process is dead so a live owner's lock is never broken.
+fn pid_is_known_dead(pid: u32) -> bool {
+    if pid == 0 {
+        return true;
+    }
+    #[cfg(unix)]
+    {
+        let Ok(raw_pid) = libc::pid_t::try_from(pid) else {
+            return true;
+        };
+        // SAFETY: `kill(pid, 0)` only checks process existence without delivering a signal.
+        let rc = unsafe { libc::kill(raw_pid, 0) };
+        if rc == 0 {
+            return false;
+        }
+        std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        false
+    }
+}
+
+/// Removes stale `.lock` files left behind in `dsh-acp`'s cache directory when
+/// a previous DeepSeek Harness process was killed mid-download/extraction.
+///
+/// `@openma/deepseek-harness-acp` writes the owner's PID into
+/// `.<dsh>-<hash>.lock` and waits up to 60 minutes before considering a lock
+/// stale by mtime alone. If Vibex kills a probe after `ACP_PROBE_TIMEOUT` while
+/// the standalone runtime is downloading, every subsequent launch would block
+/// silently on that dead PID's lock for an hour. Checking PID liveness before
+/// spawning recovers immediately without disturbing any live download.
+fn reap_stale_deepseek_harness_runtime_locks_in_dir(cache_dir: &Path) -> usize {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return 0;
+    };
+    let mut removed = 0;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        if !name.starts_with('.') || !name.ends_with(".lock") {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(&path) else {
+            continue;
+        };
+        let Ok(pid) = contents.trim().parse::<u32>() else {
+            continue;
+        };
+        if pid_is_known_dead(pid) && std::fs::remove_file(&path).is_ok() {
+            tracing::warn!(
+                target: "vibex_agent_acp",
+                lock_path = %path.display(),
+                dead_pid = pid,
+                "Removed stale DeepSeek Harness runtime lock owned by dead process"
+            );
+            removed += 1;
+        }
+    }
+    removed
+}
+
+fn reap_stale_deepseek_harness_runtime_locks(env_overlays: &[(String, String)]) {
+    if let Some(cache_dir) = deepseek_harness_cache_root(env_overlays) {
+        reap_stale_deepseek_harness_runtime_locks_in_dir(&cache_dir);
+    }
 }
 
 fn safe_runtime_configuration_cause_code(cause_code: &str) -> String {
@@ -13989,6 +14232,9 @@ impl AcpRuntimeClient {
         }
         for (key, value) in &env_overlays {
             command.env(key, value.clone());
+        }
+        if agent_id.as_str() == crate::DEEPSEEK_HARNESS_AGENT_ID {
+            reap_stale_deepseek_harness_runtime_locks(&env_overlays);
         }
         // The subprocess environment loses to the user's `~/.claude/settings.json`
         // for the endpoint, so state the connection on the session settings tier
@@ -19971,6 +20217,7 @@ impl AcpClient for AcpRuntimeClient {
             .to_string();
         let usage_status = match stop_reason.as_str() {
             "cancelled" | "canceled" | "interrupted" => AgentUsageExecutionStatus::Interrupted,
+            _ if payload.turn_cancel_requested() => AgentUsageExecutionStatus::Interrupted,
             _ => AgentUsageExecutionStatus::Completed,
         };
         let user_initiated_stop = usage_status == AgentUsageExecutionStatus::Interrupted;
@@ -20039,7 +20286,13 @@ impl AcpClient for AcpRuntimeClient {
             .with_recovery_hint("Continue the session to retry from the stopped turn")
             .with_diagnostic("stopReason", stop_reason));
         }
-        let buffered_events = turn_guard.complete(!has_pending_permissions, usage_status)?;
+        // A user-interrupted turn did not finish its reply normally. Suppressing
+        // the synthetic final Agent message leaves the timeline incomplete so
+        // explicit continuation ("Stop and continue" / Continue) can resume from
+        // where it stopped, while manual Stop keeps auto-continue paused on the
+        // client side.
+        let emit_final_message = !has_pending_permissions && !user_initiated_stop;
+        let buffered_events = turn_guard.complete(emit_final_message, usage_status)?;
         let mut events = buffered_events;
         if stop_reason != "end_turn" {
             events.push(AcpEvent::SystemNotice {
@@ -20162,16 +20415,51 @@ impl AcpClient for AcpRuntimeClient {
         let Some(attachment) = self.current_attachment(&binding.session_id) else {
             return Ok(());
         };
-        self.attachment_router
-            .registry
-            .apply_current(attachment.fence(), |current| {
+        let fence = attachment.fence().clone();
+        let (process, native_session_id) = self.attachment_router.registry.apply_current(
+            &fence,
+            |current| -> VibexResult<(Arc<AcpProcess>, String)> {
                 current.mark_turn_cancel_requested();
                 current.cancel_pending_host_requests();
                 current.process().notify(
                     AcpOperation::SessionCancel.method(),
                     protocol::build_session_cancel_params(&current.native_session_id),
-                )
-            })?
+                )?;
+                Ok((current.process(), current.native_session_id.clone()))
+            },
+        )??;
+
+        // Wait briefly for the adapter to finish answering `session/prompt`
+        // after `session/cancel` so the old turn releases `prompt_active`
+        // before the caller treats the session as idle or sends the next turn.
+        let deadline = Instant::now() + ACP_INTERRUPT_SETTLE_TIMEOUT;
+        while self.attachment_router.registry.is_prompt_active(&fence) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            sleep(ACP_INTERRUPT_SETTLE_POLL_INTERVAL).await;
+        }
+
+        // If the adapter ignored `session/cancel` (e.g. a wedged HTTP request
+        // or stalled tool call), forcibly resolve the pending prompt waiter as
+        // `cancelled` and detach the wedged attachment so the next turn
+        // materializes a clean process instead of hanging or failing with
+        // `acp_turn_already_running`.
+        if self.attachment_router.registry.is_prompt_active(&fence) {
+            let forced = process.force_cancel_pending_prompt_for_session(&native_session_id);
+            if forced {
+                let release_deadline = Instant::now() + Duration::from_millis(250);
+                while self.attachment_router.registry.is_prompt_active(&fence) {
+                    if Instant::now() >= release_deadline {
+                        break;
+                    }
+                    sleep(Duration::from_millis(10)).await;
+                }
+            }
+            self.detach_attachment(&fence).await;
+        }
+
+        Ok(())
     }
 
     async fn steer_turn(&self, request: AcpSteerTurnRequest) -> VibexResult<AcpSteerOutcome> {
@@ -28203,6 +28491,10 @@ for line in sys.stdin:
             # Hold the prompt open so the client's `session/cancel` is the only
             # thing that can complete it, then answer `end_turn` with no output.
             pending_empty_prompt_id = mid
+            continue
+        if prompt_mode == "ignore_cancel_forever":
+            # Never answer `session/prompt`, even after `session/cancel`, to
+            # exercise wedged-turn recovery on interrupt.
             continue
         if prompt_mode == "activity_only_end_turn":
             # Command-style acknowledgement: a session update with no model
@@ -37754,13 +38046,218 @@ for line in sys.stdin:
         .expect("a cancelled empty turn must complete");
         let turn = turn.expect("a user-cancelled empty turn is not a failure");
         assert!(turn.completed);
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
         assert!(
-            std::iter::from_fn(|| event_rx.try_recv().ok())
+            events
+                .iter()
                 .all(|event| !matches!(event, AcpEvent::Error { .. }))
+        );
+        assert!(
+            !events
+                .iter()
+                .chain(turn.events.iter())
+                .any(|event| matches!(event, AcpEvent::AssistantMessage { is_final: true, .. })),
+            "a user-cancelled turn must not manufacture a synthetic final Agent message"
         );
 
         client.close_session(&binding).await.unwrap();
         fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn interrupt_recovers_a_wedged_turn_so_the_next_turn_does_not_hit_already_running() {
+        let Some(fixture) = MockAcpFixture::create("interrupt-wedged-turn") else {
+            return;
+        };
+        fixture.set_prompt_mode("ignore_cancel_forever");
+        let client = Arc::new(fixture.client());
+        let session_id = VibexSessionId::new();
+        let session = client
+            .create_session(AcpCreateSessionRequest {
+                session_id: session_id.clone(),
+                provider_profile_id: fixture.profile_id.clone(),
+                model: None,
+                workspace_root: fixture.workspace.display().to_string(),
+                runtime_resources: ProviderRuntimeResources::default(),
+            })
+            .await
+            .unwrap();
+        let binding = test_binding_for(&session_id, &fixture.profile_id, &session);
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let turn_request = AcpSendTurnRequest {
+            session_id: session_id.clone(),
+            message_submission_id: None,
+            required_runtime: None,
+            text: "stall forever".to_string(),
+            attachments: Vec::new(),
+            workspace_root: fixture.workspace.display().to_string(),
+            binding: binding.clone(),
+            runtime_resources: ProviderRuntimeResources::default(),
+            execution_identity: None,
+            event_sender: Some(event_tx),
+            usage_execution_context: None,
+            usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+            usage_event_sender: None,
+        };
+        let (stalled_turn, ()) = tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::join!(prepare_and_send_turn(&client, turn_request), async {
+                for _ in 0..200 {
+                    if logged_request_count(&fixture.request_log(), "session/prompt") >= 1 {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                client.interrupt(&binding).await.unwrap();
+            })
+        })
+        .await
+        .expect("interrupt must unwind a turn that ignores session/cancel");
+        let stalled_turn = stalled_turn.expect("forced cancellation unwinds as a cancelled turn");
+        assert_eq!(stalled_turn.stop_reason.as_deref(), Some("cancelled"));
+        let events = std::iter::from_fn(|| event_rx.try_recv().ok()).collect::<Vec<_>>();
+        assert!(
+            !events
+                .iter()
+                .chain(stalled_turn.events.iter())
+                .any(|event| matches!(event, AcpEvent::AssistantMessage { is_final: true, .. })),
+            "a forcibly interrupted turn must remain incomplete for continuation"
+        );
+
+        // Once the wedged turn is interrupted, sending a follow-up turn must
+        // succeed instead of failing with `acp_turn_already_running`.
+        fixture.set_prompt_mode("normal");
+        let followup = prepare_and_send_turn(
+            &client,
+            AcpSendTurnRequest {
+                session_id: session_id.clone(),
+                message_submission_id: None,
+                required_runtime: None,
+                text: "continue from here".to_string(),
+                attachments: Vec::new(),
+                workspace_root: fixture.workspace.display().to_string(),
+                binding: binding.clone(),
+                runtime_resources: ProviderRuntimeResources::default(),
+                execution_identity: None,
+                event_sender: None,
+                usage_execution_context: None,
+                usage_counter_origin: AgentUsageCounterOrigin::Unknown,
+                usage_event_sender: None,
+            },
+        )
+        .await
+        .expect("follow-up turn after wedged interrupt must not collide with active turn");
+        assert!(followup.completed);
+
+        client.close_session(&binding).await.unwrap();
+        fixture.cleanup();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn runtime_selection_resolver_uses_cached_option_snapshot_when_live_probe_is_unavailable()
+    {
+        let Some(fixture) = runtime_switch_fixture("resolve-cached-options").await else {
+            return;
+        };
+        let agent_id = fixture.selection.agent_id.clone();
+        let profile_id = fixture
+            .selection
+            .provider_profile_id()
+            .cloned()
+            .expect("fixture uses a provider profile");
+        let model_id = fixture
+            .selection
+            .model_id()
+            .expect("fixture has an explicit model")
+            .to_string();
+
+        // Persist a model-scoped runtime option snapshot for a mode and effort
+        // that the profile config itself does not list.
+        let conn = open_database(&fixture.fixture.db_path).unwrap();
+        ProviderModelRuntimeOptionSnapshotRepository::upsert_success(
+            &conn,
+            &vibex_db::ProviderModelRuntimeOptionSnapshotRecord {
+                provider_profile_id: profile_id.clone(),
+                model_id: model_id.clone(),
+                agent_id: agent_id.clone(),
+                session_config: Some(AgentSessionConfigProbe {
+                    models: vec![model_id.clone()],
+                    modes: vec![ProviderSessionConfigValue {
+                        value: "danger-full-access".to_string(),
+                        label: Some("Danger".to_string()),
+                    }],
+                    reasoning_efforts: vec![AgentReasoningEffort {
+                        value: "max".to_string(),
+                        description: Some("Max".to_string()),
+                    }],
+                    options: Vec::new(),
+                }),
+                last_success_at_ms: Some(unix_timestamp_ms()),
+                last_attempt_at_ms: unix_timestamp_ms(),
+                last_error_code: None,
+            },
+        )
+        .unwrap();
+        drop(conn);
+
+        // Break the configured binary path so any live probe subprocess would fail.
+        let broken_path = fixture.fixture.root.join("missing-probe-binary");
+        let service = fixture.fixture.service();
+        let mut config = service
+            .get_acp_profile_config_for_launch(profile_id.clone())
+            .unwrap();
+        config.command = broken_path.display().to_string();
+        service
+            .update_acp_profile_config(vibex_core::AcpProviderProfileUpdateRequest {
+                provider_profile_id: profile_id.clone(),
+                config,
+            })
+            .unwrap();
+
+        let mut selection = fixture.selection.clone();
+        selection.mode_id = Some("danger-full-access".to_string());
+        selection.reasoning_effort = Some("max".to_string());
+
+        let resolved = fixture
+            .bridge
+            .resolve(&fixture.session.id, &selection, None)
+            .await
+            .expect("cached runtime option snapshot must validate selection without a live probe");
+        assert_eq!(
+            resolved.selection.mode_id.as_deref(),
+            Some("danger-full-access")
+        );
+        assert_eq!(resolved.selection.reasoning_effort.as_deref(), Some("max"));
+
+        drop(fixture.message_submission);
+        drop(fixture.runtime_selection);
+        drop(fixture.manager);
+        drop(fixture.bridge);
+        drop(fixture.client);
+        fixture.fixture.cleanup();
+    }
+
+    #[test]
+    fn deepseek_harness_lock_reaper_removes_dead_pid_locks_and_keeps_live_ones() {
+        let dir = std::env::temp_dir().join(format!(
+            "vibex-dsh-lock-reaper-{}",
+            vibex_core::RequestId::new().as_str()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let dead_lock = dir.join(".0.2.2-rc.5-deadbeef1234.lock");
+        let live_lock = dir.join(".0.2.2-rc.5-live12345678.lock");
+        let unrelated = dir.join("not-a-lock.txt");
+        // PID 0 is never a valid live process, and current PID is guaranteed alive.
+        std::fs::write(&dead_lock, "0\n").unwrap();
+        std::fs::write(&live_lock, format!("{}\n", std::process::id())).unwrap();
+        std::fs::write(&unrelated, "0\n").unwrap();
+
+        let removed = reap_stale_deepseek_harness_runtime_locks_in_dir(&dir);
+        assert_eq!(removed, 1);
+        assert!(!dead_lock.exists(), "dead PID lock must be removed");
+        assert!(live_lock.exists(), "live PID lock must be preserved");
+        assert!(unrelated.exists(), "non-lock files must not be touched");
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
