@@ -95,8 +95,20 @@ use vibex_ui::{
 
 use crate::{pairing::error_text, sidebar};
 
-/// How many timeline items one read asks for.
+/// Fallback item count when a timeline read is not bounded by a turn window.
 const TIMELINE_LIMIT: u32 = 200;
+
+/// How many whole turns one mobile timeline page asks for.
+///
+/// Matches desktop's turn-windowed reads so a running or tool-heavy turn does
+/// not crowd out earlier turns behind a fixed 200-item tail slice.
+const MOBILE_TIMELINE_TURN_WINDOW: u32 = 8;
+
+/// Maximum extra backward pages walked to align a mid-turn cut onto a turn start.
+const MOBILE_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 4;
+
+/// Hard cap on items accumulated while aligning a window onto a turn boundary.
+const MOBILE_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS: usize = 4_000;
 
 /// How long a session's first page may take before the page says so.
 ///
@@ -134,6 +146,8 @@ const TIMELINE_CACHE_SESSIONS: usize = 4;
 struct CachedTimeline {
     saved_at_ms: i64,
     has_older: bool,
+    #[serde(default)]
+    leading_turn_start: Option<vibex_core::TimelineTurnStart>,
     items: Vec<vibex_core::TimelineItem>,
 }
 
@@ -3307,11 +3321,18 @@ impl SessionService {
         self.conversation.set(ConversationState::Ready);
         self.has_older.set(page.has_older);
         let has_older = page.has_older;
+        let cacheable = page.omitted.is_none();
         self.model
             .borrow_mut()
-            .replace_authoritative(session_id.clone(), page.items);
+            .replace_authoritative_with_leading_turn_start(
+                session_id.clone(),
+                page.items,
+                page.leading_turn_start,
+            );
         self.publish();
-        self.save_cached_timeline(session_id, has_older);
+        if cacheable {
+            self.save_cached_timeline(session_id, has_older);
+        }
         self.refresh_token_usage(session_id);
     }
 
@@ -3326,7 +3347,11 @@ impl SessionService {
         self.has_older.set(cached.has_older);
         self.model
             .borrow_mut()
-            .replace_authoritative(session_id.clone(), cached.items);
+            .replace_authoritative_with_leading_turn_start(
+                session_id.clone(),
+                cached.items,
+                cached.leading_turn_start,
+            );
         self.publish();
     }
 
@@ -3334,7 +3359,10 @@ impl SessionService {
         if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
             return;
         }
-        let items = self.model.borrow().items.clone();
+        let (items, leading_turn_start) = {
+            let model = self.model.borrow();
+            (model.items.clone(), model.leading_turn_start.clone())
+        };
         if items.is_empty() {
             return;
         }
@@ -3344,6 +3372,7 @@ impl SessionService {
             CachedTimeline {
                 saved_at_ms: unix_timestamp_ms(),
                 has_older,
+                leading_turn_start,
                 items,
             },
         );
@@ -3407,30 +3436,92 @@ impl SessionService {
         self.loading_older.set(true);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
+            let fetch_id = session_id.clone();
             let result = crate::runtime::handle()
-                .spawn(fetch_older(backend, session_id.clone(), before))
+                .spawn(async move {
+                    tokio::time::timeout(OPEN_TIMEOUT, fetch_older(backend, fetch_id, before)).await
+                })
                 .await;
+            if !service.alive.get()
+                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            {
+                return;
+            }
             service.loading_older.set(false);
             match result {
-                Ok(Ok(page)) => {
-                    service.has_older.set(page.has_older);
-                    let has_older = page.has_older;
-                    service.model.borrow_mut().prepend_authoritative_page(
-                        &session_id,
-                        &page.items,
-                        page.leading_turn_start,
-                    );
-                    service.publish();
-                    service.save_cached_timeline(&session_id, has_older);
+                Ok(Ok(Ok(page))) => {
+                    service.apply_older_page(&session_id, before, page);
                 }
-                Ok(Err(error)) => service.fail(&error),
+                Ok(Ok(Err(error))) => service.fail(&error),
+                Ok(Err(_elapsed)) => service.fail_text(copy::text(
+                    "Older messages did not arrive in time.",
+                    "更早的消息加载超时。",
+                    "更早的訊息載入逾時。",
+                )),
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
                     format!("reading older history did not finish: {error}"),
                 )),
             }
         });
+    }
+
+    /// Splices an older page in front of the active timeline, falling back to a
+    /// full normalized merge if a concurrent reload overlapped the cursor.
+    fn apply_older_page(
+        &self,
+        session_id: &VibexSessionId,
+        requested_before: i64,
+        page: TimelinePage,
+    ) {
+        if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
+        let cacheable = page.omitted.is_none();
+        let added = {
+            let mut model = self.model.borrow_mut();
+            let current_oldest = model.items.first().map(|item| item.sequence);
+            let strictly_below_held = current_oldest.is_none_or(|oldest| {
+                page.items
+                    .iter()
+                    .all(|item| item.session_id != *session_id || item.sequence < oldest)
+            });
+            if strictly_below_held
+                && model.prepend_authoritative_page(
+                    session_id,
+                    &page.items,
+                    page.leading_turn_start.clone(),
+                )
+            {
+                true
+            } else {
+                let cutoff = current_oldest.unwrap_or(requested_before);
+                let has_strictly_older = page.items.iter().any(|item| {
+                    item.session_id == *session_id && item.sequence >= 0 && item.sequence < cutoff
+                });
+                if has_strictly_older {
+                    let mut merged = page.items;
+                    merged.extend(model.items.iter().cloned());
+                    model.replace_authoritative_with_leading_turn_start(
+                        session_id.clone(),
+                        merged,
+                        page.leading_turn_start,
+                    );
+                    true
+                } else {
+                    false
+                }
+            }
+        };
+        let has_older = page.has_older && added;
+        self.has_older.set(has_older);
+        if added {
+            self.publish();
+            if cacheable {
+                self.save_cached_timeline(session_id, has_older);
+            }
+        }
     }
 
     /// Re-projects the kept model into the shell's rows.
@@ -8334,38 +8425,139 @@ impl SessionService {
     }
 }
 
-/// Lists the sessions and fetches one page of a session's timeline.
-async fn fetch_older(
+fn initial_timeline_request(session_id: VibexSessionId) -> FetchTimelineRequest {
+    FetchTimelineRequest {
+        session_id,
+        after_sequence: None,
+        before_sequence: None,
+        limit: TIMELINE_LIMIT,
+        max_turns: Some(MOBILE_TIMELINE_TURN_WINDOW),
+        max_bytes: Some(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES),
+    }
+}
+
+fn older_timeline_request(
+    session_id: VibexSessionId,
+    before_sequence: i64,
+) -> FetchTimelineRequest {
+    FetchTimelineRequest {
+        session_id,
+        after_sequence: None,
+        before_sequence: Some(before_sequence),
+        limit: TIMELINE_LIMIT,
+        max_turns: Some(MOBILE_TIMELINE_TURN_WINDOW),
+        max_bytes: Some(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES),
+    }
+}
+
+/// Fetches one backward turn-windowed page strictly before `before_sequence`.
+async fn fetch_timeline_before_raw(
     backend: Arc<dyn AgentBackend>,
     session_id: VibexSessionId,
     before_sequence: i64,
 ) -> BackendResult<TimelinePage> {
     backend
-        .fetch_timeline(FetchTimelineRequest {
-            session_id,
-            after_sequence: None,
-            before_sequence: Some(before_sequence),
-            limit: TIMELINE_LIMIT,
-            max_turns: None,
-            max_bytes: None,
-        })
+        .fetch_timeline(older_timeline_request(session_id, before_sequence))
         .await
 }
 
+fn prepend_older_timeline_page(page: &mut TimelinePage, older: TimelinePage) -> bool {
+    let Some(newer_start) = page
+        .start_sequence
+        .or_else(|| page.items.first().map(|item| item.sequence))
+    else {
+        return false;
+    };
+    if older.session_id != page.session_id
+        || older.items.is_empty()
+        || older.items.iter().any(|item| item.sequence >= newer_start)
+    {
+        return false;
+    }
+    let mut items = older.items;
+    items.append(&mut page.items);
+    page.start_sequence = items.first().map(|item| item.sequence);
+    page.items = items;
+    page.has_older = older.has_older;
+    page.starts_at_turn_start = older.starts_at_turn_start;
+    page.leading_turn_start = older.leading_turn_start;
+    true
+}
+
+fn count_turn_boundaries(page: &TimelinePage) -> usize {
+    let user_messages = page
+        .items
+        .iter()
+        .filter(|item| item.kind == vibex_core::TimelineItemKind::UserMessage)
+        .count();
+    if page.starts_at_turn_start {
+        user_messages.max(1)
+    } else {
+        user_messages
+    }
+}
+
+/// Walks a page backward (bounded) so it starts on a turn boundary and, when
+/// `min_turns > 1`, carries at least `min_turns` whole turns if older history
+/// exists.
+async fn align_timeline_window_to_turn_start<F, Fut>(
+    mut page: TimelinePage,
+    min_turns: usize,
+    mut fetch_before: F,
+) -> TimelinePage
+where
+    F: FnMut(i64) -> Fut,
+    Fut: std::future::Future<Output = BackendResult<TimelinePage>>,
+{
+    let mut pages = 0;
+    while page.has_older
+        && (!page.starts_at_turn_start || count_turn_boundaries(&page) < min_turns)
+        && pages < MOBILE_TIMELINE_WINDOW_TURN_ALIGN_PAGES
+        && page.items.len() < MOBILE_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS
+    {
+        let Some(start_sequence) = page
+            .start_sequence
+            .or_else(|| page.items.first().map(|item| item.sequence))
+        else {
+            break;
+        };
+        let Ok(older) = fetch_before(start_sequence).await else {
+            break;
+        };
+        if !prepend_older_timeline_page(&mut page, older) {
+            break;
+        }
+        pages += 1;
+    }
+    page
+}
+
+/// Fetches older turns before `before_sequence`, aligned to a turn boundary.
+async fn fetch_older(
+    backend: Arc<dyn AgentBackend>,
+    session_id: VibexSessionId,
+    before_sequence: i64,
+) -> BackendResult<TimelinePage> {
+    let page = fetch_timeline_before_raw(backend.clone(), session_id.clone(), before_sequence)
+        .await?;
+    Ok(align_timeline_window_to_turn_start(page, 1, |cursor| {
+        fetch_timeline_before_raw(backend.clone(), session_id.clone(), cursor)
+    })
+    .await)
+}
+
+/// Fetches the newest turn-windowed page of a session's timeline.
 async fn fetch_page(
     backend: Arc<dyn AgentBackend>,
     session_id: VibexSessionId,
 ) -> BackendResult<TimelinePage> {
-    backend
-        .fetch_timeline(FetchTimelineRequest {
-            session_id,
-            after_sequence: None,
-            before_sequence: None,
-            limit: TIMELINE_LIMIT,
-            max_turns: None,
-            max_bytes: None,
-        })
-        .await
+    let page = backend
+        .fetch_timeline(initial_timeline_request(session_id.clone()))
+        .await?;
+    Ok(align_timeline_window_to_turn_start(page, 2, |cursor| {
+        fetch_timeline_before_raw(backend.clone(), session_id.clone(), cursor)
+    })
+    .await)
 }
 
 /// Sends `text` (and any attachments) and reads the transcript back.
@@ -10515,5 +10707,304 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<RefreshCoalesceCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("refresh-coalesce-ok").unwrap();
+    }
+
+    fn synthetic_timeline_item(
+        session_id: &vibex_core::VibexSessionId,
+        sequence: i64,
+        kind: vibex_core::TimelineItemKind,
+        text: &str,
+    ) -> vibex_core::TimelineItem {
+        let (source, payload) = match kind {
+            vibex_core::TimelineItemKind::UserMessage => (
+                vibex_core::TimelineSource::User,
+                vibex_core::TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                    text: text.to_owned(),
+                    attachments: Vec::new(),
+                    mentions: Vec::new(),
+                    delivery: Default::default(),
+                    provenance: Default::default(),
+                }),
+            ),
+            _ => (
+                vibex_core::TimelineSource::Agent,
+                vibex_core::TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: text.to_owned(),
+                    is_final: true,
+                }),
+            ),
+        };
+        vibex_core::TimelineItem {
+            id: vibex_core::TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms: sequence * 1000,
+            source,
+            kind,
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: Default::default(),
+            payload,
+        }
+    }
+
+    #[test]
+    fn timeline_requests_specify_turn_window_and_byte_budget() {
+        let session_id = vibex_core::VibexSessionId::new();
+        let initial = super::initial_timeline_request(session_id.clone());
+        assert_eq!(initial.max_turns, Some(super::MOBILE_TIMELINE_TURN_WINDOW));
+        assert_eq!(
+            initial.max_bytes,
+            Some(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES)
+        );
+        assert_eq!(initial.before_sequence, None);
+        assert_eq!(initial.after_sequence, None);
+
+        let older = super::older_timeline_request(session_id, 42);
+        assert_eq!(older.before_sequence, Some(42));
+        assert_eq!(older.max_turns, Some(super::MOBILE_TIMELINE_TURN_WINDOW));
+        assert_eq!(
+            older.max_bytes,
+            Some(vibex_core::REMOTE_TIMELINE_PAGE_MAX_BYTES)
+        );
+    }
+
+    #[test]
+    fn align_timeline_window_walks_back_from_mid_turn_and_stops_when_two_turns_present() {
+        let session_id = vibex_core::VibexSessionId::new();
+        let turn1_user = synthetic_timeline_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::UserMessage,
+            "Turn 1 prompt",
+        );
+        let turn1_reply = synthetic_timeline_item(
+            &session_id,
+            2,
+            vibex_core::TimelineItemKind::AgentMessage,
+            "Turn 1 reply",
+        );
+        let turn2_user = synthetic_timeline_item(
+            &session_id,
+            10,
+            vibex_core::TimelineItemKind::UserMessage,
+            "Turn 2 prompt",
+        );
+        let turn2_tail = synthetic_timeline_item(
+            &session_id,
+            200,
+            vibex_core::TimelineItemKind::AgentMessage,
+            "Turn 2 tail",
+        );
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+
+        // Case 1: initial page cut mid-turn (`starts_at_turn_start: false`).
+        // Walking back fetches Turn 2's start, then Turn 1 so 2 whole turns are loaded.
+        let mid_turn_page = vibex_core::TimelinePage {
+            session_id: session_id.clone(),
+            items: vec![turn2_tail.clone()],
+            start_sequence: Some(200),
+            end_sequence: Some(200),
+            has_older: true,
+            has_newer: false,
+            starts_at_turn_start: false,
+            leading_turn_start: Some(vibex_core::TimelineTurnStart {
+                sequence: 10,
+                timestamp_ms: 10_000,
+            }),
+            omitted: None,
+        };
+        let mut cursors = Vec::new();
+        let aligned = rt.block_on(super::align_timeline_window_to_turn_start(
+            mid_turn_page,
+            2,
+            |before| {
+                cursors.push(before);
+                let session_id = session_id.clone();
+                let turn1_user = turn1_user.clone();
+                let turn1_reply = turn1_reply.clone();
+                let turn2_user = turn2_user.clone();
+                async move {
+                    if before == 200 {
+                        Ok(vibex_core::TimelinePage {
+                            session_id,
+                            items: vec![turn2_user],
+                            start_sequence: Some(10),
+                            end_sequence: Some(10),
+                            has_older: true,
+                            has_newer: true,
+                            starts_at_turn_start: true,
+                            leading_turn_start: None,
+                            omitted: None,
+                        })
+                    } else {
+                        Ok(vibex_core::TimelinePage {
+                            session_id,
+                            items: vec![turn1_user, turn1_reply],
+                            start_sequence: Some(1),
+                            end_sequence: Some(2),
+                            has_older: false,
+                            has_newer: true,
+                            starts_at_turn_start: true,
+                            leading_turn_start: None,
+                            omitted: None,
+                        })
+                    }
+                }
+            },
+        ));
+        assert_eq!(cursors, vec![200, 10]);
+        assert!(aligned.starts_at_turn_start);
+        assert!(!aligned.has_older);
+        assert_eq!(
+            aligned
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 10, 200]
+        );
+
+        // Case 2: initial page ALREADY contains 2 complete turns (`has_older: true`).
+        // Must not spend an extra RPC.
+        let two_turn_page = vibex_core::TimelinePage {
+            session_id: session_id.clone(),
+            items: vec![turn1_user, turn1_reply, turn2_user, turn2_tail],
+            start_sequence: Some(1),
+            end_sequence: Some(200),
+            has_older: true,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: None,
+        };
+        let mut extra_calls = 0usize;
+        let unchanged = rt.block_on(super::align_timeline_window_to_turn_start(
+            two_turn_page,
+            2,
+            |_before| {
+                extra_calls += 1;
+                async { unreachable!("page with 2 whole turns must not walk back") }
+            },
+        ));
+        assert_eq!(extra_calls, 0);
+        assert!(unchanged.has_older);
+        assert_eq!(unchanged.items.len(), 4);
+    }
+
+    #[component]
+    fn ApplyPageAndOlderCheckView() -> impl IntoElement {
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        let session_id = vibex_core::VibexSessionId::new();
+        service.active.set(Some(session_id.as_str().to_owned()));
+
+        let initial_lead = vibex_core::TimelineTurnStart {
+            sequence: 50,
+            timestamp_ms: 50_000,
+        };
+        service.apply_page(
+            &session_id,
+            vibex_core::TimelinePage {
+                session_id: session_id.clone(),
+                items: vec![synthetic_timeline_item(
+                    &session_id,
+                    100,
+                    vibex_core::TimelineItemKind::AgentMessage,
+                    "Latest reply",
+                )],
+                start_sequence: Some(100),
+                end_sequence: Some(100),
+                has_older: true,
+                has_newer: false,
+                starts_at_turn_start: false,
+                leading_turn_start: Some(initial_lead.clone()),
+                omitted: None,
+            },
+        );
+        assert_eq!(service.model.borrow().leading_turn_start, Some(initial_lead));
+        assert!(service.has_older.get_untracked());
+
+        // Overlapping older page (contains seq 50 and overlapping seq 100) must fall
+        // back to normalized merge instead of being silently dropped.
+        service.apply_older_page(
+            &session_id,
+            100,
+            vibex_core::TimelinePage {
+                session_id: session_id.clone(),
+                items: vec![
+                    synthetic_timeline_item(
+                        &session_id,
+                        50,
+                        vibex_core::TimelineItemKind::UserMessage,
+                        "Earlier prompt",
+                    ),
+                    synthetic_timeline_item(
+                        &session_id,
+                        100,
+                        vibex_core::TimelineItemKind::AgentMessage,
+                        "Latest reply",
+                    ),
+                ],
+                start_sequence: Some(50),
+                end_sequence: Some(100),
+                has_older: true,
+                has_newer: true,
+                starts_at_turn_start: true,
+                leading_turn_start: None,
+                omitted: None,
+            },
+        );
+        assert_eq!(
+            service
+                .model
+                .borrow()
+                .items
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![50, 100]
+        );
+        assert_eq!(service.model.borrow().leading_turn_start, None);
+        assert!(service.has_older.get_untracked());
+
+        // An empty older page must clear `has_older` to prevent auto-load loops.
+        service.apply_older_page(
+            &session_id,
+            50,
+            vibex_core::TimelinePage {
+                session_id: session_id.clone(),
+                items: Vec::new(),
+                start_sequence: None,
+                end_sequence: None,
+                has_older: true,
+                has_newer: true,
+                starts_at_turn_start: false,
+                leading_turn_start: None,
+                omitted: None,
+            },
+        );
+        assert!(!service.has_older.get_untracked());
+
+        service.shutdown();
+        view().child(text("apply-older-ok"))
+    }
+
+    #[test]
+    fn apply_page_preserves_leading_turn_start_and_handles_older_edge_cases() {
+        let config = EngineConfig::new(Root::of::<ApplyPageAndOlderCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("apply-older-ok").unwrap();
     }
 }

@@ -542,6 +542,90 @@ fn OlderShell() -> impl IntoElement {
     session::session(host)
 }
 
+/// A short transcript that fits inside the viewport and therefore cannot scroll,
+/// yet still has older pages on the server.
+#[component]
+fn ShortOlderShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let has_older = signal(true);
+    let loading = signal(false);
+    let mut latest = entry(
+        "s1:latest",
+        EntryKind::Agent,
+        "Claude",
+        "Latest collapsed tail.",
+    );
+    latest.conclusion = true;
+    let timeline = signal(vec![latest]);
+    let page = std::rc::Rc::new(std::cell::Cell::new(0u32));
+    host.has_older = has_older;
+    host.loading_older = loading;
+    host.timeline = timeline;
+    host.on_load_older = Rc::new(move || {
+        loading.set(true);
+        let step = page.get() + 1;
+        page.set(step);
+        spawn(async move {
+            match step {
+                1 => {
+                    let mut middle = entry(
+                        "s1:middle",
+                        EntryKind::Agent,
+                        "Claude",
+                        "Middle turn that still fits.",
+                    );
+                    middle.conclusion = true;
+                    timeline.update(|rows| rows.insert(0, middle));
+                    loading.set(false);
+                }
+                _ => {
+                    let earliest = entry(
+                        "s1:earliest",
+                        EntryKind::User,
+                        "You",
+                        "Earliest user prompt",
+                    );
+                    timeline.update(|rows| rows.insert(0, earliest));
+                    has_older.set(false);
+                    loading.set(false);
+                }
+            }
+        });
+    });
+    session::session(host)
+}
+
+/// A short non-scrollable transcript whose older-page fetch fails transiently:
+/// it must ask once and stop rather than spinning in a loop.
+#[component]
+fn ShortOlderFailingShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let has_older = signal(true);
+    let loading = signal(false);
+    let attempts = signal(0u32);
+    let mut latest = entry(
+        "s1:fail-latest",
+        EntryKind::Agent,
+        "Claude",
+        "Only visible row",
+    );
+    latest.conclusion = true;
+    host.has_older = has_older;
+    host.loading_older = loading;
+    host.timeline = signal(vec![latest]);
+    host.on_load_older = Rc::new(move || {
+        loading.set(true);
+        attempts.update(|count| *count += 1);
+        spawn(async move {
+            loading.set(false);
+        });
+    });
+    view()
+        .flex_1()
+        .child(session::session(host))
+        .child(text(move || format!("older-attempts={}", attempts.get())))
+}
+
 /// The same shell while its runtime is unreachable and its transcript is on
 /// screen: the conversation stays, with a reconnecting strip.
 #[component]
@@ -1691,6 +1775,32 @@ fn older_history_loads_itself_as_the_reader_scrolls_to_the_top() {
     // Scrolling up is what asks for them.
     app.scroll("id:transcript", px(-2000.0)).unwrap();
     app.wait_for("Loading earlier...").unwrap();
+}
+
+#[test]
+fn short_non_scrollable_transcript_auto_loads_older_history() {
+    let mut config = EngineConfig::new(Root::of::<ShortOlderShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(900.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Latest collapsed tail.").unwrap();
+    // Without any scroll gesture (the list fits inside the viewport and cannot
+    // scroll), older pages load automatically across multiple pages until
+    // history is exhausted or the list overflows.
+    app.wait_for("Middle turn that still fits.").unwrap();
+    app.wait_for("Earliest user prompt").unwrap();
+}
+
+#[test]
+fn short_non_scrollable_transcript_does_not_loop_when_load_older_fails() {
+    let mut config = EngineConfig::new(Root::of::<ShortOlderFailingShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(900.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("Only visible row").unwrap();
+    app.wait_for("older-attempts=1").unwrap();
+    // Pump extra frames to confirm the failed load does not re-trigger in a loop.
+    std::thread::sleep(std::time::Duration::from_millis(120));
+    assert!(app.screen().shows("older-attempts=1"));
+    assert!(!app.screen().shows("older-attempts=2"));
 }
 
 #[test]

@@ -16,7 +16,10 @@
 //! finger ([`crate::ui::menu`]); what a command still has to ask is asked in
 //! a sheet of cards ([`crate::ui::sheet`]).
 
-use std::rc::Rc;
+use std::{
+    cell::{Cell, RefCell},
+    rc::Rc,
+};
 
 use nsh_base::{ButtonElement, button};
 use nsh_core::{
@@ -2053,6 +2056,111 @@ fn timeline_view(
     let has_older = host.has_older;
     let loading_older = host.loading_older;
     let on_load_older = host.on_load_older.clone();
+    // A bottom-aligned transcript whose rendered rows fit inside the viewport
+    // has zero scroll range (`content_size.height <= size.height`), so swiping
+    // never fires `on_scroll` and `has_older` would be unreachable. Watch the
+    // list's post-layout geometry and, once layout confirms the transcript
+    // cannot scroll, fetch older pages automatically until either the list
+    // overflows the viewport or history is exhausted.
+    let last_scroll_unscrollable: Rc<Cell<Option<(nsh_core::NodeId, bool)>>> =
+        Rc::new(Cell::new(None));
+    let scroll_watch_rev = signal(0u64);
+    {
+        let last_scroll_unscrollable = last_scroll_unscrollable.clone();
+        watch_scroll(
+            move || list_ref.node(),
+            move |event: &ScrollEvent| {
+                let Some(node) = list_ref.node() else {
+                    return;
+                };
+                let unscrollable = event.size.height.0 > 0.0
+                    && event.content_size.height.0 - event.size.height.0 <= 1.0;
+                if last_scroll_unscrollable.get() != Some((node, unscrollable)) {
+                    last_scroll_unscrollable.set(Some((node, unscrollable)));
+                    scroll_watch_rev.update(|rev| *rev = rev.wrapping_add(1));
+                }
+            },
+        );
+    }
+    let last_auto_older_snapshot: Rc<RefCell<Option<(Option<String>, usize, Option<String>)>>> =
+        Rc::new(RefCell::new(None));
+    let auto_older_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
+    {
+        let on_load_older = on_load_older.clone();
+        let last_scroll_unscrollable = last_scroll_unscrollable.clone();
+        let last_auto_older_snapshot = last_auto_older_snapshot.clone();
+        let auto_older_gen = auto_older_gen.clone();
+        effect(move || {
+            let _active_id = active.get();
+            let more = has_older.get();
+            let loading = loading_older.get();
+            let _watch_rev = scroll_watch_rev.get();
+            let visible_len = visible.with(|indices| {
+                let _first_id = indices.first().and_then(|&index| {
+                    source.with(|entries| entries.get(index).map(|entry| entry.id.clone()))
+                });
+                indices.len()
+            });
+            if !more || visible_len == 0 {
+                *last_auto_older_snapshot.borrow_mut() = None;
+                auto_older_gen.set(auto_older_gen.get().wrapping_add(1));
+                return;
+            }
+            if loading {
+                return;
+            }
+            let Some(node_at_schedule) = list_ref.node() else {
+                return;
+            };
+            let generation = auto_older_gen.get().wrapping_add(1);
+            auto_older_gen.set(generation);
+            let on_load_older = on_load_older.clone();
+            let last_scroll_unscrollable = last_scroll_unscrollable.clone();
+            let last_auto_older_snapshot = last_auto_older_snapshot.clone();
+            let auto_older_gen = auto_older_gen.clone();
+            spawn(async move {
+                // Wait for the current commit's layout and `sync_watches` to
+                // settle so `last_scroll_unscrollable` reflects the rows now on
+                // screen rather than a shorter previous render.
+                if list_ref.measure().await.is_none() {
+                    return;
+                }
+                if auto_older_gen.get() != generation {
+                    return;
+                }
+                if !has_older.get_untracked() || loading_older.get_untracked() {
+                    return;
+                }
+                let Some(current_node) = list_ref.node() else {
+                    return;
+                };
+                if current_node != node_at_schedule {
+                    return;
+                }
+                if last_scroll_unscrollable.get() != Some((current_node, true)) {
+                    *last_auto_older_snapshot.borrow_mut() = None;
+                    return;
+                }
+                let (cur_len, cur_first_id) = visible.with_untracked(|indices| {
+                    let first_id = indices.first().and_then(|&index| {
+                        source.with_untracked(|entries| {
+                            entries.get(index).map(|entry| entry.id.clone())
+                        })
+                    });
+                    (indices.len(), first_id)
+                });
+                if cur_len == 0 {
+                    return;
+                }
+                let snapshot = (active.get_untracked(), cur_len, cur_first_id);
+                if *last_auto_older_snapshot.borrow() == Some(snapshot.clone()) {
+                    return;
+                }
+                *last_auto_older_snapshot.borrow_mut() = Some(snapshot);
+                on_load_older();
+            });
+        });
+    }
     // The ring the "earlier messages" strip turns while a page is on its way.
     let older_clock = crate::ui::activity::ActivityClock::start();
     view()
@@ -2287,6 +2395,17 @@ fn timeline_view(
                                         // a scroll that keeps firing while the page
                                         // is in flight asks once.
                                         if event.offset.y.0 <= OLDER_TRIGGER
+                                            && has_older.get_untracked()
+                                            && !loading_older.get_untracked()
+                                        {
+                                            on_load_older();
+                                        }
+                                    }
+                                })
+                                .on_scroll_drag_start({
+                                    let on_load_older = on_load_older.clone();
+                                    move |offset: &Point<Points>| {
+                                        if offset.y.0 <= OLDER_TRIGGER
                                             && has_older.get_untracked()
                                             && !loading_older.get_untracked()
                                         {
