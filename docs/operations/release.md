@@ -477,9 +477,11 @@ node scripts/publish-nix.mjs --version 0.2.0 --dry-run
 ```
 
 The workflow uses the repository-scoped `GITHUB_TOKEN`; no extra secret is
-required. The bump is a bot-authored commit on the default branch, so branch
-protection must allow `github-actions[bot]` to push (or the workflow will have
-to open a pull request instead).
+required. The bump is one bot-authored commit pushed fast-forward onto the
+default branch. The repository's `main-protection` ruleset only forbids deleting
+the branch and force-pushing it, so that push is allowed as written. If a rule
+requiring pull requests or status checks is ever added to the ruleset, the push
+step fails and the bump has to go through a pull request instead.
 
 NixOS supplies the graphics driver through `/run/opengl-driver`; `libglvnd` and
 `vulkan-loader` are on the package RUNPATH and pick the host Mesa/NVIDIA driver
