@@ -286,6 +286,7 @@ impl VibexWorkbench {
             self.timeline.leading_turn_start = prepared.leading_turn_start;
         }
         self.timeline_has_older = prepared.timeline_has_older;
+        self.timeline_has_live_gap = self.timeline.needs_authoritative_refetch;
         self.reconcile_optimistic_user_message();
         TimelineInstall::Installed
     }

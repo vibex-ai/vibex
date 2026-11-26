@@ -5481,3 +5481,337 @@ fn a_window_places_its_units_from_the_edge_that_holds_still() {
         vec![px(0.0), px(190.0)],
     );
 }
+
+fn resume_test_timeline_item(
+    session_id: &VibexSessionId,
+    sequence: i64,
+    payload: TimelinePayload,
+) -> TimelineItem {
+    let source = match &payload {
+        TimelinePayload::UserMessage(_) => vibex_core::TimelineSource::User,
+        _ => vibex_core::TimelineSource::Agent,
+    };
+    TimelineItem {
+        id: vibex_core::TimelineItemId::new(),
+        session_id: session_id.clone(),
+        sequence,
+        timestamp_ms: sequence * 1000,
+        source,
+        kind: payload.kind(),
+        correlation_id: None,
+        provider_correlation_id: None,
+        redaction_state: vibex_core::TimelineRedactionState::None,
+        execution_attribution: None,
+        payload_depth: vibex_core::TimelinePayloadDepth::Detail,
+        payload,
+    }
+}
+
+#[gpui::test]
+fn parked_running_session_resumes_from_live_turn_boundary_preserving_settled_history(
+    cx: &mut TestAppContext,
+) {
+    cx.update(gpui_component::init);
+    let session_id = VibexSessionId::parse("session_parked_resume").unwrap();
+    let other_session_id = VibexSessionId::parse("session_other").unwrap();
+    let (workbench, cx) = live_tool_timeline(cx, true);
+
+    let make_user = |sequence: i64, text: &str| {
+        resume_test_timeline_item(
+            &session_id,
+            sequence,
+            TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: text.to_string(),
+                ..Default::default()
+            }),
+        )
+    };
+    let make_answer = |sequence: i64, text: &str| {
+        resume_test_timeline_item(
+            &session_id,
+            sequence,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: text.to_string(),
+                is_final: true,
+            }),
+        )
+    };
+    let make_tool = |sequence: i64, status: vibex_core::ToolCallStatus| {
+        resume_test_timeline_item(
+            &session_id,
+            sequence,
+            TimelinePayload::ToolCall(vibex_core::ToolCallPayload {
+                tool_call_id: format!("call-{sequence}"),
+                tool_name: "shell".to_string(),
+                status,
+                summary: "run".to_string(),
+                input_summary: None,
+                output_summary: None,
+                raw_extension: None,
+            }),
+        )
+    };
+
+    let turn1_user = make_user(10, "first question");
+    let turn1_answer = make_answer(11, "first answer");
+    let turn2_user = make_user(20, "second question");
+    let turn2_tool_done = make_tool(21, vibex_core::ToolCallStatus::Completed);
+    let turn2_answer = make_answer(22, "second answer");
+    let turn3_user = make_user(30, "third question");
+    let turn3_tool_running = make_tool(31, vibex_core::ToolCallStatus::Progress);
+
+    workbench.update(cx, |workbench, _| {
+        workbench.selected_session_id = Some(session_id.clone());
+        workbench.view_session_id = Some(session_id.clone());
+        workbench.timeline.replace_authoritative(
+            session_id.clone(),
+            vec![
+                turn1_user.clone(),
+                turn1_answer.clone(),
+                turn2_user.clone(),
+                turn2_tool_done.clone(),
+                turn2_answer.clone(),
+                turn3_user.clone(),
+                turn3_tool_running.clone(),
+            ],
+        );
+        workbench.timeline_has_older = true;
+        workbench.timeline_has_live_gap = false;
+        workbench.timeline_follow.set_following_bottom(true);
+        workbench.timeline.mark_lagged();
+
+        // Switching back to a parked running session resumes from the live
+        // turn's UserMessage so settled turns stay intact instead of collapsing
+        // to a cold window.
+        let resume = workbench
+            .timeline_resume_plan_for_session(&session_id, true)
+            .expect("parked running session without a live gap should resume from live turn start");
+        assert_eq!(
+            resume
+                .prefix
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 11, 20, 21, 22]
+        );
+        assert_eq!(resume.after_sequence, 29);
+        assert!(resume.timeline_has_older);
+        assert_eq!(resume.verify_first, Some((30, turn3_user.id.clone())));
+        assert!(resume.max_items >= AGENT_TIMELINE_RESUME_MAX_ITEMS + 2);
+
+        // Verification passes only when the first row returned above
+        // `after_sequence` is still the exact same boundary message.
+        assert!(timeline_tail_first_item_matches(
+            Some(&turn3_user),
+            resume.verify_first.as_ref()
+        ));
+        let mut rewritten_turn3 = turn3_user.clone();
+        rewritten_turn3.id = vibex_core::TimelineItemId::new();
+        assert!(!timeline_tail_first_item_matches(
+            Some(&rewritten_turn3),
+            resume.verify_first.as_ref()
+        ));
+        assert!(!timeline_tail_first_item_matches(
+            None,
+            resume.verify_first.as_ref()
+        ));
+
+        // Even while following the bottom (no reader anchor), replacement
+        // reads cover the oldest sequence already held in this view.
+        assert_eq!(
+            workbench.loaded_timeline_cover_sequence_for_session(Some(&session_id)),
+            Some(10)
+        );
+        assert_eq!(
+            workbench.loaded_timeline_cover_sequence_for_session(Some(&other_session_id)),
+            None
+        );
+
+        // If an earlier turn still holds an unfinished activity (e.g. a
+        // steering message landed before a tool completed), back the boundary
+        // up to that turn's user message so no in-progress item stays frozen.
+        let turn2_tool_running = make_tool(21, vibex_core::ToolCallStatus::Progress);
+        workbench.timeline.replace_authoritative(
+            session_id.clone(),
+            vec![
+                turn1_user.clone(),
+                turn1_answer.clone(),
+                turn2_user.clone(),
+                turn2_tool_running,
+                turn3_user.clone(),
+            ],
+        );
+        workbench.timeline.mark_lagged();
+        let earlier = workbench
+            .timeline_resume_plan_for_session(&session_id, true)
+            .expect("should back up to the turn owning the in-progress tool");
+        assert_eq!(
+            earlier
+                .prefix
+                .iter()
+                .map(|item| item.sequence)
+                .collect::<Vec<_>>(),
+            vec![10, 11]
+        );
+        assert_eq!(earlier.after_sequence, 19);
+        assert_eq!(earlier.verify_first, Some((20, turn2_user.id.clone())));
+
+        // A view with an internal live-stream gap must reload authoritatively.
+        workbench.timeline_has_live_gap = true;
+        assert!(
+            workbench
+                .timeline_resume_plan_for_session(&session_id, true)
+                .is_none()
+        );
+    });
+}
+
+#[tokio::test]
+async fn turn_aligned_window_with_multiple_user_turns_does_not_walk_backward() {
+    let session_id = VibexSessionId::parse("session_multi_turn_window").unwrap();
+    let user_item = |sequence: i64| {
+        resume_test_timeline_item(
+            &session_id,
+            sequence,
+            TimelinePayload::UserMessage(vibex_core::UserMessagePayload {
+                text: format!("q{sequence}"),
+                ..Default::default()
+            }),
+        )
+    };
+    let answer_item = |sequence: i64, text: &str| {
+        resume_test_timeline_item(
+            &session_id,
+            sequence,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: text.to_string(),
+                is_final: true,
+            }),
+        )
+    };
+    let mut page = TimelinePage {
+        session_id: session_id.clone(),
+        items: vec![
+            user_item(100),
+            answer_item(101, "a1"),
+            user_item(102),
+            answer_item(103, "a2"),
+        ],
+        start_sequence: Some(100),
+        end_sequence: Some(103),
+        has_older: true,
+        has_newer: false,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: None,
+    };
+
+    let reads = Rc::new(std::cell::Cell::new(0_usize));
+    let counter = reads.clone();
+    let aligned = align_timeline_window_to_turn_start(page.clone(), move |_| {
+        let counter = counter.clone();
+        async move {
+            counter.set(counter.get() + 1);
+            Err(vibex_core::VibexError::storage(
+                "unexpected_read",
+                "should not walk backward when two user turns are already covered",
+            ))
+        }
+    })
+    .await;
+    assert_eq!(reads.get(), 0);
+    assert_eq!(aligned.start_sequence, Some(100));
+    assert!(aligned.starts_at_turn_start);
+
+    // Prepending an older page that reports an omitted gap must be refused.
+    let omitted_older = TimelinePage {
+        session_id: session_id.clone(),
+        items: vec![user_item(50), answer_item(99, "a0")],
+        start_sequence: Some(50),
+        end_sequence: Some(99),
+        has_older: false,
+        has_newer: true,
+        starts_at_turn_start: true,
+        leading_turn_start: None,
+        omitted: Some(vibex_core::TimelineSequenceGap {
+            after: 50,
+            before: 99,
+        }),
+    };
+    assert!(!prepend_older_timeline_page(&mut page, omitted_older));
+    assert_eq!(page.start_sequence, Some(100));
+}
+
+#[test]
+fn spliced_older_page_heights_prevent_prefetch_cascade() {
+    let row_sizes = vec![size(px(600.0), px(180.0)); 10];
+    let viewport = 600.0;
+
+    // After `splice(0..0, 8)` shifts the reader's row from 0 to 8, the newly
+    // spliced rows are unmeasured (0px) in `ListState`, but the row-size table
+    // already knows 8 * 180px = 1440px sits above the viewport and 1800px total
+    // exceeds the 600px viewport. Neither the scrolled-up nor bottom-following
+    // branch may cascade another older-page fetch.
+    let table_distance = timeline_table_distance_to_top(
+        &row_sizes,
+        10,
+        gpui::ListOffset {
+            item_ix: 8,
+            offset_in_item: px(0.0),
+        },
+    );
+    assert_eq!(table_distance, 1440.0);
+    assert!(timeline_table_is_scrollable(&row_sizes, 10, viewport));
+    assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+        distance_to_top: 0.0_f32.max(table_distance),
+        viewport_height: viewport,
+        has_older: true,
+        in_flight: 0,
+        following_bottom: false,
+        scrollable: true,
+        loading: false,
+    }));
+    assert!(!timeline_should_prefetch_older(TimelineOlderPrefetch {
+        distance_to_top: 0.0_f32.max(table_distance),
+        viewport_height: viewport,
+        has_older: true,
+        in_flight: 0,
+        following_bottom: true,
+        scrollable: true,
+        loading: false,
+    }));
+
+    // Once the reader actually scrolls near the top (1 row = 180px above),
+    // prefetch resumes cleanly.
+    let near_top = timeline_table_distance_to_top(
+        &row_sizes,
+        10,
+        gpui::ListOffset {
+            item_ix: 1,
+            offset_in_item: px(0.0),
+        },
+    );
+    assert_eq!(near_top, 180.0);
+    assert!(timeline_should_prefetch_older(TimelineOlderPrefetch {
+        distance_to_top: near_top,
+        viewport_height: viewport,
+        has_older: true,
+        in_flight: 0,
+        following_bottom: false,
+        scrollable: true,
+        loading: false,
+    }));
+
+    // A transcript that genuinely does not fill one viewport still prefetches.
+    let short_sizes = vec![size(px(600.0), px(180.0)); 2];
+    assert!(!timeline_table_is_scrollable(&short_sizes, 2, viewport));
+    assert!(timeline_should_prefetch_older(TimelineOlderPrefetch {
+        distance_to_top: 0.0,
+        viewport_height: viewport,
+        has_older: true,
+        in_flight: 0,
+        following_bottom: true,
+        scrollable: false,
+        loading: false,
+    }));
+}
