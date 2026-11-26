@@ -8720,6 +8720,20 @@ impl AcpRuntimeSwitchBridge {
             && binding.transport_kind == TransportKind::Acp
     }
 
+    fn cloned_restore_probeable(&self, binding: &RuntimeBinding, intent: &SwitchIntent) -> bool {
+        binding.provider_resume_identity.as_deref()
+            == Some(vibex_core::CLONED_SESSION_RESUME_IDENTITY)
+            && binding.native_session_id.is_some()
+            && binding.agent_id == intent.target_selection.agent_id
+            && binding.transport_kind == TransportKind::Acp
+            && (binding.agent_id.as_str() != CODEX_AGENT_ID
+                || binding.auth_source == intent.target_selection.auth_source
+                || matches!(
+                    intent.target_selection.auth_source,
+                    vibex_core::RuntimeAuthSource::AgentAccount { .. }
+                ))
+    }
+
     fn historical_resume_binding(
         &self,
         intent: &SwitchIntent,
@@ -8732,7 +8746,8 @@ impl AcpRuntimeSwitchBridge {
         candidates.retain(|binding| {
             source_binding_id.as_ref() != Some(&binding.binding_id)
                 && binding.binding_state == BindingState::Inactive
-                && self.exact_restore_compatible(binding, intent, context)
+                && (self.exact_restore_compatible(binding, intent, context)
+                    || self.cloned_restore_probeable(binding, intent))
         });
         candidates.sort_by(|left, right| {
             left.last_context_sequence

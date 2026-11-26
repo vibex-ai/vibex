@@ -21,7 +21,8 @@ use vibex_core::{
     RemoteAgentCatchUpRequest, RemoteAgentCatchUpResponse, RemoteAgentContinueTurnResponse,
     RemoteAgentCreateSessionResponse, RemoteAgentDeepLinkResolveResponse,
     RemoteAgentDetachRuntimeResponse, RemoteAgentExecuteCommandResponse,
-    RemoteAgentForkSessionResponse, RemoteAgentInterruptResponse,
+    RemoteAgentExportSessionCloneBundleResponse, RemoteAgentForkSessionResponse,
+    RemoteAgentImportSessionCloneBundleResponse, RemoteAgentInterruptResponse,
     RemoteAgentMessageSubmissionResponse, RemoteAgentProjectionCapabilityResponse,
     RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse,
     RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
@@ -5267,6 +5268,43 @@ async fn dispatch_agent_request(
             )?;
             let session = result?;
             serde_json::to_value(RemoteAgentForkSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ExportSessionCloneBundle(request) => {
+            authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::ReadAgentSession,
+                Some(request_id),
+                correlation_id,
+            )?;
+            let bundle = manager.export_session_clone_bundle(request.request).await?;
+            serde_json::to_value(RemoteAgentExportSessionCloneBundleResponse { bundle })
+                .map_err(remote_payload_encode_error)
+        }
+        RemoteAgentRequest::ImportSessionCloneBundle(request) => {
+            let session_count = request.request.sessions.len();
+            let target_id = format!("clone-import:{session_count}");
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.import_session_clone_bundle(request.request).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent session clone import",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let result = result?;
+            serde_json::to_value(RemoteAgentImportSessionCloneBundleResponse { result })
                 .map_err(remote_payload_encode_error)
         }
         RemoteAgentRequest::RenameSession(request) => {
@@ -12407,7 +12445,8 @@ mod tests {
         assert_eq!(names, vec!["Alpha", "projects"]);
 
         let nested =
-            browse_authority_directories(&runtime, Some(&projects.to_string_lossy()), false).unwrap();
+            browse_authority_directories(&runtime, Some(&projects.to_string_lossy()), false)
+                .unwrap();
         assert_eq!(
             nested.path,
             projects.canonicalize().unwrap().to_string_lossy()
@@ -12451,9 +12490,12 @@ mod tests {
             "the rejection must not echo an out-of-root path"
         );
 
-        let missing =
-            browse_authority_directories(&runtime, Some("/vibex-browse-missing-root-sentinel"), false)
-                .unwrap_err();
+        let missing = browse_authority_directories(
+            &runtime,
+            Some("/vibex-browse-missing-root-sentinel"),
+            false,
+        )
+        .unwrap_err();
         assert_eq!(missing.code, "remote_directory_unavailable");
 
         let file = browse_authority_directories(
@@ -12484,12 +12526,9 @@ mod tests {
         // starting point rather than a refusal.
         let outside = tempfile::tempdir().unwrap();
         std::fs::create_dir_all(outside.path().join("elsewhere")).unwrap();
-        let listing = browse_authority_directories(
-            &runtime,
-            Some(&outside.path().to_string_lossy()),
-            true,
-        )
-        .unwrap();
+        let listing =
+            browse_authority_directories(&runtime, Some(&outside.path().to_string_lossy()), true)
+                .unwrap();
         assert_eq!(
             listing.path,
             outside.path().canonicalize().unwrap().to_string_lossy()
@@ -12537,8 +12576,8 @@ mod tests {
             "the listing keeps the in-root path so following it is re-checked"
         );
 
-        let escaped =
-            browse_authority_directories(&runtime, Some(&listing.entries[0].path), false).unwrap_err();
+        let escaped = browse_authority_directories(&runtime, Some(&listing.entries[0].path), false)
+            .unwrap_err();
         assert_eq!(escaped.code, "remote_directory_outside_roots");
     }
 

@@ -555,6 +555,39 @@ impl AgentBackend for NativeBackend {
         })
     }
 
+    fn export_session_clone_bundle(
+        &self,
+        request: vibex_core::SessionCloneExportRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneBundle> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .export_session_clone_bundle(request)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
+    fn import_session_clone_bundle(
+        &self,
+        request: MutationRequest<vibex_core::SessionCloneImportRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneImportResult> {
+        let runtime = self.runtime.clone();
+        Box::pin(async move {
+            request.validate()?;
+            runtime.ensure_accepting_actions()?;
+            runtime
+                .agent()
+                .manager()
+                .import_session_clone_bundle(request.payload)
+                .await
+                .map_err(Into::into)
+        })
+    }
+
     fn usage_statistics(
         &self,
         request: AgentUsageStatisticsRequest,

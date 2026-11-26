@@ -13,6 +13,7 @@ pub mod runtime_route;
 pub mod runtime_selection;
 pub mod runtime_switch;
 pub mod scheduler;
+pub mod session_clone;
 pub mod session_terminal;
 pub mod smoke_workspace;
 pub mod state_machine;

@@ -266,6 +266,20 @@ impl AgentBackend for DisconnectedBackend {
     ) -> BackendFuture<'_, AgentCommandExecuteResult> {
         disconnected_future!()
     }
+
+    fn export_session_clone_bundle(
+        &self,
+        _request: vibex_core::SessionCloneExportRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneBundle> {
+        disconnected_future!()
+    }
+
+    fn import_session_clone_bundle(
+        &self,
+        _request: MutationRequest<vibex_core::SessionCloneImportRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneImportResult> {
+        disconnected_future!()
+    }
 }
 
 impl WorkspaceBackend for DisconnectedBackend {

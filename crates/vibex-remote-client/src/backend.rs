@@ -72,8 +72,10 @@ use vibex_core::{
     RemoteAgentCancelRuntimeSwitchRequest, RemoteAgentCancelRuntimeSwitchResponse,
     RemoteAgentCreateSessionRequest, RemoteAgentCreateSessionResponse,
     RemoteAgentDeepLinkResolveRequest, RemoteAgentDeepLinkResolveResponse,
-    RemoteAgentForkSessionRequest, RemoteAgentForkSessionResponse, RemoteAgentInterruptRequest,
-    RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
+    RemoteAgentExportSessionCloneBundleRequest, RemoteAgentExportSessionCloneBundleResponse,
+    RemoteAgentForkSessionRequest, RemoteAgentForkSessionResponse,
+    RemoteAgentImportSessionCloneBundleRequest, RemoteAgentImportSessionCloneBundleResponse,
+    RemoteAgentInterruptRequest, RemoteAgentInterruptResponse, RemoteAgentLogoutAuthContextRequest,
     RemoteAgentMessageSubmissionRequest, RemoteAgentMessageSubmissionResponse,
     RemoteAgentRefreshAuthModelsRequest, RemoteAgentRenameSessionRequest,
     RemoteAgentRenameSessionResponse, RemoteAgentReplaceUserMessageRequest,
@@ -1343,6 +1345,58 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentForkSessionResponse>(value)?.session)
+        })
+    }
+
+    fn export_session_clone_bundle(
+        &self,
+        request: vibex_core::SessionCloneExportRequest,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneBundle> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload = RemoteAgentRequest::ExportSessionCloneBundle(
+                RemoteAgentExportSessionCloneBundleRequest {
+                    auth: this.auth(),
+                    request,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentExportSessionCloneBundleResponse>(value)?.bundle)
+        })
+    }
+
+    fn import_session_clone_bundle(
+        &self,
+        request: MutationRequest<vibex_core::SessionCloneImportRequest>,
+    ) -> BackendFuture<'_, vibex_core::SessionCloneImportResult> {
+        let this = self.clone();
+        Box::pin(async move {
+            request.validate()?;
+            let key = Self::mutation_key(&request);
+            let payload = RemoteAgentRequest::ImportSessionCloneBundle(
+                RemoteAgentImportSessionCloneBundleRequest {
+                    auth: this.auth(),
+                    request: request.payload,
+                },
+            );
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    Some(request.request_id),
+                    Some((&key, request.expected_revision.as_deref(), None)),
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentImportSessionCloneBundleResponse>(value)?.result)
         })
     }
 

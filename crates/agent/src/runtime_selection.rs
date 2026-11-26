@@ -254,7 +254,7 @@ impl RuntimeSelectionService {
         // transient write race must not fail session creation.
         let record = crate::storage_retry::retry_transient_storage(|| async {
             let mut conn = open_database(self.inner.coordinator.database_path())?;
-            AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
+            let record = AgentSessionRuntimeRepository::enqueue_initial_runtime_switch(
                 &mut conn,
                 RuntimeSwitchId::new(),
                 &DesiredRuntimeSwitchEnqueueRequest {
@@ -270,7 +270,9 @@ impl RuntimeSelectionService {
                     active_work_policy: self.seamless_active_work_policy(),
                     requested_session_config: requested_session_config.clone(),
                 },
-            )
+            )?;
+            let _ = vibex_db::SessionCloneRepository::delete_runtime_hint(&conn, session_id);
+            Ok(record)
         })
         .await?;
         Ok(record)
@@ -329,6 +331,17 @@ impl RuntimeSelectionService {
                 "runtime_selection_interaction_unsupported",
                 "runtime selection interaction is not supported",
             ));
+        }
+
+        if let Ok(durable) = self.required_runtime_state(&request.session_id)
+            && durable.current_binding_id.is_none()
+            && durable.desired_runtime_selection.is_none()
+            && durable.effective_runtime_selection.is_none()
+            && durable.runtime_selection_status.is_none()
+        {
+            return self
+                .initialize_new_session_deferred(&request.session_id, request.desired, None, None)
+                .await;
         }
 
         if let Some(existing) =
@@ -642,10 +655,20 @@ impl RuntimeSelectionService {
                     .expect("initial target projection requires a durable switch"),
             )?,
             None => {
-                return Err(VibexError::conflict(
+                let mut err = VibexError::conflict(
                     "session_runtime_selection_uninitialized",
                     "Agent session desired runtime selection is not initialized",
-                ));
+                );
+                if let Ok(Some(hint)) =
+                    vibex_db::SessionCloneRepository::get_runtime_hint(&conn, session_id)
+                    && let Ok(json) = serde_json::to_string(&hint)
+                {
+                    err = err.with_diagnostic(
+                        vibex_core::CLONED_PREFERRED_RUNTIME_SELECTION_DIAGNOSTIC,
+                        json,
+                    );
+                }
+                return Err(err);
             }
         };
         // The product API has a non-optional effective field. Before the first

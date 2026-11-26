@@ -1080,6 +1080,37 @@ impl SidebarUiState {
             .unwrap_or_default()
     }
 
+    /// Mutates the arrangement owned by `authority`, whether `authority` is the
+    /// active authority on screen or currently parked in `authority_arrangements`.
+    pub fn mutate_arrangement_for(
+        &mut self,
+        authority: &str,
+        mutate: impl FnOnce(&mut SidebarAuthorityArrangement),
+    ) {
+        let authority = authority.trim();
+        if authority.is_empty() {
+            return;
+        }
+        if self.active_authority() == authority {
+            let mut arrangement = self.arrangement();
+            mutate(&mut arrangement);
+            Self::normalize_arrangement(&mut arrangement);
+            self.set_arrangement(arrangement);
+            return;
+        }
+        let mut arrangement = self
+            .authority_arrangements
+            .remove(authority)
+            .unwrap_or_default();
+        mutate(&mut arrangement);
+        Self::normalize_arrangement(&mut arrangement);
+        if !arrangement.is_empty() {
+            self.authority_arrangements
+                .insert(authority.to_string(), arrangement);
+        }
+        self.normalize_authority_arrangements();
+    }
+
     /// Snapshot of the authority-scoped fields.
     pub fn arrangement(&self) -> SidebarAuthorityArrangement {
         SidebarAuthorityArrangement {
@@ -5159,6 +5190,45 @@ mod tests {
         assert_eq!(
             restored.composer.queue[0].text,
             "Ask @Reviewer and @TypedName"
+        );
+    }
+
+    #[test]
+    fn mutate_arrangement_for_updates_parked_and_active_authorities_cleanly() {
+        let mut sidebar = SidebarUiState::default();
+        sidebar.mutate_arrangement_for("server:target", |arrangement| {
+            arrangement.project_order.push("project_target".into());
+            arrangement
+                .pinned_session_ids
+                .insert("session_cloned".into());
+        });
+        assert!(sidebar.project_order.is_empty());
+        assert_eq!(
+            sidebar.arrangement_for("server:target").project_order,
+            vec!["project_target".to_string()]
+        );
+
+        sidebar.switch_authority("server:target");
+        assert_eq!(sidebar.project_order, vec!["project_target".to_string()]);
+        assert!(sidebar.pinned_session_ids.contains("session_cloned"));
+
+        let mut map = BTreeMap::new();
+        map.insert("src_a".to_string(), "dst_a".to_string());
+        map.insert("src_b".to_string(), "dst_b".to_string());
+        let group = crate::SessionGroupUiState::new(
+            "Backend Squad",
+            "project_source",
+            "workspace_source",
+            vec!["src_a".into(), "src_b".into()],
+        );
+        let remapped = group
+            .remap_sessions("project_target", "workspace_target", &map)
+            .expect("group should remap");
+        assert_eq!(remapped.project_id, "project_target");
+        assert_eq!(remapped.workspace_id, "workspace_target");
+        assert_eq!(
+            remapped.member_session_ids,
+            vec!["dst_a".to_string(), "dst_b".to_string()]
         );
     }
 }

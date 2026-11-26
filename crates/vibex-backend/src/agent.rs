@@ -15,7 +15,8 @@ use vibex_core::{
     FetchTurnIndexRequest, ForkAgentSessionRequest, GetMessageSubmissionRequest,
     MessageSubmissionState, ProviderConfiguredModel, ProviderProfile, RemoteDeepLinkResolution,
     RenameAgentSessionRequest, ReplaceUserMessagePayload, ResolveElicitationRequest,
-    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest,
+    ResolvePermissionRequest, RuntimeSessionEvent, SendAgentMessageRequest, SessionCloneBundle,
+    SessionCloneExportRequest, SessionCloneImportRequest, SessionCloneImportResult,
     SessionRuntimeOptionCatalog, SetDesiredAgentSessionRuntimeRequest, SteerAgentMessageRequest,
     SteerAgentMessageResult, TimelineItem, TimelineLiveEvent, TimelinePage, TimelineTurnIndex,
     VibexSessionId,
@@ -328,6 +329,30 @@ pub trait AgentBackend: BackendBound {
             Err(crate::BackendError::unsupported(
                 "agent_session_fork_unavailable",
                 "Agent session forking is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn export_session_clone_bundle(
+        &self,
+        _request: SessionCloneExportRequest,
+    ) -> BackendFuture<'_, SessionCloneBundle> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_session_clone_unavailable",
+                "Agent session clone export is unavailable on this backend",
+            ))
+        })
+    }
+
+    fn import_session_clone_bundle(
+        &self,
+        _request: MutationRequest<SessionCloneImportRequest>,
+    ) -> BackendFuture<'_, SessionCloneImportResult> {
+        Box::pin(async {
+            Err(crate::BackendError::unsupported(
+                "agent_session_clone_unavailable",
+                "Agent session clone import is unavailable on this backend",
             ))
         })
     }

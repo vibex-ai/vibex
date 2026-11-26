@@ -40,6 +40,7 @@ pub mod remote;
 pub mod remote_v2;
 pub mod runtime;
 pub mod scheduled_task;
+pub mod session_clone;
 pub mod terminal;
 pub mod terminal_agent;
 pub mod time;
@@ -371,8 +372,10 @@ pub use remote::{
     RemoteAgentDetachRuntimeResponse, RemoteAgentDiscoverCommandsRequest,
     RemoteAgentDiscoverCommandsResponse, RemoteAgentEnsureDefaultAuthContextRequest,
     RemoteAgentEnsureDefaultAuthContextResponse, RemoteAgentExecuteCommandRequest,
-    RemoteAgentExecuteCommandResponse, RemoteAgentForkSessionRequest,
-    RemoteAgentForkSessionResponse, RemoteAgentInstallManagedAgentRequest,
+    RemoteAgentExecuteCommandResponse, RemoteAgentExportSessionCloneBundleRequest,
+    RemoteAgentExportSessionCloneBundleResponse, RemoteAgentForkSessionRequest,
+    RemoteAgentForkSessionResponse, RemoteAgentImportSessionCloneBundleRequest,
+    RemoteAgentImportSessionCloneBundleResponse, RemoteAgentInstallManagedAgentRequest,
     RemoteAgentInstallManagedAgentResponse, RemoteAgentInterruptRequest,
     RemoteAgentInterruptResponse, RemoteAgentListRequest, RemoteAgentListResponse,
     RemoteAgentLogoutAuthContextRequest, RemoteAgentLogoutRequest, RemoteAgentLogoutResponse,
@@ -636,6 +639,7 @@ pub use terminal_agent::{
 };
 pub use time::unix_timestamp_ms;
 pub mod team;
+pub use session_clone::*;
 pub use team::*;
 pub use timeline::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,

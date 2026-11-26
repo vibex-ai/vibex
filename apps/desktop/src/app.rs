@@ -19,6 +19,8 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64_STANDARD};
 #[path = "message_schedule.rs"]
 mod message_schedule;
 use message_schedule::{MessageSchedule, MessageScheduleEditor, MessageScheduleTarget};
+#[path = "session_clone.rs"]
+mod session_clone;
 #[path = "session_images.rs"]
 mod session_images;
 #[path = "timeline_activity.rs"]
@@ -13024,6 +13026,9 @@ pub struct VibexWorkbench {
     runtime_selection_requests_in_flight: BTreeSet<String>,
     runtime_selection_initializations_in_flight: BTreeSet<String>,
     runtime_selection_uninitialized_sessions: BTreeSet<String>,
+    cloned_preferred_runtime_selections: BTreeMap<String, SessionRuntimeSelection>,
+    pending_clone_reveal_session: Option<(String, VibexSessionId)>,
+    enabling_cloned_agents: BTreeSet<String>,
     runtime_selection_cancellations_in_flight: BTreeSet<String>,
     runtime_preference_write_fence: RuntimePreferenceWriteFence,
     remote_token_usage_in_flight: Option<VibexSessionId>,
@@ -14788,6 +14793,9 @@ impl VibexWorkbench {
             runtime_selection_requests_in_flight: BTreeSet::new(),
             runtime_selection_initializations_in_flight: BTreeSet::new(),
             runtime_selection_uninitialized_sessions: BTreeSet::new(),
+            cloned_preferred_runtime_selections: BTreeMap::new(),
+            pending_clone_reveal_session: None,
+            enabling_cloned_agents: BTreeSet::new(),
             runtime_selection_cancellations_in_flight: BTreeSet::new(),
             runtime_preference_write_fence: RuntimePreferenceWriteFence::default(),
             remote_token_usage_in_flight: None,
@@ -22823,6 +22831,17 @@ impl VibexWorkbench {
                                 sessions.insert(0, pending_session);
                             }
                             let sessions_empty = sessions.is_empty();
+                            if let Some((target_rt, reveal_sid)) =
+                                this.pending_clone_reveal_session.as_ref()
+                                && this.runtime_registry.active_runtime_id() == target_rt.as_str()
+                            {
+                                let reveal_sid = reveal_sid.clone();
+                                this.pending_clone_reveal_session = None;
+                                if sessions.iter().any(|s| s.id == reveal_sid) {
+                                    this.selected_session_id = Some(reveal_sid);
+                                    this.new_session_open = false;
+                                }
+                            }
                             let preferred = this
                                 .selected_session_id
                                 .as_ref()
@@ -30911,11 +30930,7 @@ impl VibexWorkbench {
                         .compact()
                         .size(px(28.0))
                         .icon(IconName::Close)
-                        .tooltip(locale::text(
-                            "Dismiss this notice",
-                            "关闭提示",
-                            "關閉提示",
-                        ))
+                        .tooltip(locale::text("Dismiss this notice", "关闭提示", "關閉提示"))
                         .on_click(cx.listener(|this, _, _, cx| {
                             if let Some(session_id) = this.composer_notice_session_id() {
                                 this.dismiss_turn_stall_watch(session_id.as_str());
@@ -31508,6 +31523,13 @@ impl VibexWorkbench {
         &self,
         session_id: &VibexSessionId,
     ) -> Option<SessionRuntimeSelection> {
+        if let Some(cloned_hint) = self
+            .cloned_preferred_runtime_selections
+            .get(session_id.as_str())
+            .cloned()
+        {
+            return Some(cloned_hint);
+        }
         let session = self.registered_session(session_id.as_str())?;
         let agent_id = session.agent_id.clone();
         let catalog = self.runtime_catalog.as_ref()?;
@@ -32425,11 +32447,12 @@ impl VibexWorkbench {
             // backend RPC; terminals, the projection cache, and the heartbeat
             // are authority-local concerns.
             self.load_agent_session_timeline_remote(
-                session_id,
+                session_id.clone(),
                 generation,
                 TimelineWindowRead::resuming(resume).covering(cover_sequence),
                 cx,
             );
+            self.load_agent_session_projection_remote(session_id, generation, cx);
         }
     }
 
@@ -33213,14 +33236,24 @@ impl VibexWorkbench {
                         Ok(Ok(selection)) => {
                             this.runtime_selection_uninitialized_sessions
                                 .remove(session_id.as_str());
+                            this.cloned_preferred_runtime_selections
+                                .remove(session_id.as_str());
                             this.apply_runtime_selection_state(&session_id, selection, cx);
                         }
                         Ok(Err(error))
                             if error.code == "session_runtime_selection_uninitialized" =>
                         {
-                            // Imported sessions predate runtime selection
-                            // state; the composer offers initialization
+                            // Imported and cloned sessions predate live runtime
+                            // selection state; the composer offers initialization
                             // instead of surfacing this as an error.
+                            if let Some(hint) =
+                                session_clone::extract_cloned_preferred_runtime_selection_from_vibex_error(
+                                    &error,
+                                )
+                            {
+                                this.cloned_preferred_runtime_selections
+                                    .insert(session_id.as_str().to_string(), hint);
+                            }
                             this.runtime_selection_uninitialized_sessions
                                 .insert(session_id.as_str().to_string());
                             this.runtime_selection = None;
@@ -46782,9 +46815,91 @@ impl VibexWorkbench {
         // Importing a history is a local-only action, so this stays on the
         // embedded runtime: a parked one must not be asked about a session that
         // only the paired authority owns.
-        let (Some(runtime), Some(session_id)) =
-            (self.local_authority(), self.selected_session_id.clone())
-        else {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return;
+        };
+        let Some(runtime) = self.local_authority() else {
+            let Some(backend) = self.backend.clone() else {
+                return;
+            };
+            let session_key = session_id.as_str().to_string();
+            if !self
+                .runtime_selection_uninitialized_sessions
+                .contains(&session_key)
+                || self
+                    .runtime_selection_initializations_in_flight
+                    .contains(&session_key)
+            {
+                return;
+            }
+            self.optimistic_runtime_selections
+                .insert(session_key.clone(), selection.clone());
+            self.runtime_selection_initializations_in_flight
+                .insert(session_key.clone());
+            let generation = self.session_generation;
+            let requested_session_id = session_id.clone();
+            let idempotency_key = format!(
+                "init_cloned_runtime_{}_{}",
+                session_id.as_str(),
+                unix_timestamp_ms()
+            );
+            let runner = gpui_tokio::Tokio::spawn(cx, async move {
+                backend
+                    .agent()
+                    .set_desired_runtime(MutationRequest::new(
+                        SetDesiredAgentSessionRuntimeRequest {
+                            session_id,
+                            idempotency_key,
+                            expected_revision: 0,
+                            expected_selection_revision: 0,
+                            desired: selection,
+                            interaction: RuntimeSelectionInteraction::Seamless,
+                        },
+                    ))
+                    .await
+            });
+            cx.spawn(
+                async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                    let outcome = runner.await;
+                    let _ = entity.update(cx, |this, cx| {
+                        this.runtime_selection_initializations_in_flight
+                            .remove(&session_key);
+                        let active = this.session_generation == generation
+                            && this.selected_session_id.as_ref() == Some(&requested_session_id);
+                        match outcome {
+                            Ok(Ok(selection_state)) => {
+                                this.runtime_selection_uninitialized_sessions
+                                    .remove(&session_key);
+                                this.cloned_preferred_runtime_selections
+                                    .remove(&session_key);
+                                if active {
+                                    this.apply_runtime_selection_state(
+                                        &requested_session_id,
+                                        selection_state,
+                                        cx,
+                                    );
+                                }
+                            }
+                            Ok(Err(error)) => {
+                                this.optimistic_runtime_selections.remove(&session_key);
+                                if active {
+                                    this.agent_error =
+                                        Some(format!("{}: {}", error.code, error.message));
+                                }
+                            }
+                            Err(error) => {
+                                this.optimistic_runtime_selections.remove(&session_key);
+                                if active {
+                                    this.agent_error =
+                                        Some(format!("runtime initialization failed: {error}"));
+                                }
+                            }
+                        }
+                        cx.notify();
+                    });
+                },
+            )
+            .detach();
             return;
         };
         let session_key = session_id.as_str().to_string();
@@ -55731,6 +55846,39 @@ impl VibexWorkbench {
                                     this.create_session_group_from_selection(window, cx)
                                 })),
                         )
+                        .when(self.has_clone_target_instances(), |bar| {
+                            let selected_strings: Vec<String> =
+                                self.sidebar_state.selected_ids.iter().cloned().collect();
+                            let single_project =
+                                self.batch_selection_is_single_project(&selected_strings);
+                            let selected_vec: Vec<VibexSessionId> = selected_strings
+                                .iter()
+                                .filter_map(|id| VibexSessionId::parse(id.as_str()).ok())
+                                .collect();
+                            bar.child(
+                                Button::new("sidebar-clone-selected")
+                                    .small()
+                                    .secondary()
+                                    .w_full()
+                                    .justify_center()
+                                    .icon(sidebar_icon("icons/vibex/monitor.svg"))
+                                    .label(locale::text(
+                                        "Clone to Instance…",
+                                        "克隆到实例…",
+                                        "複製到執行個體…",
+                                    ))
+                                    .disabled(!single_project)
+                                    .on_click(cx.listener(move |this, _, window, cx| {
+                                        this.open_session_clone_dialog(
+                                            session_clone::CloneSourceRequest::Sessions(
+                                                selected_vec.clone(),
+                                            ),
+                                            window,
+                                            cx,
+                                        )
+                                    })),
+                            )
+                        })
                         .child(
                             h_flex()
                                 .gap(px(6.0))
@@ -56095,12 +56243,18 @@ impl VibexWorkbench {
         let auto_continue_entity = entity.clone();
         let new_folder_entity = entity.clone();
         let import_entity = entity.clone();
+        let clone_entity = entity.clone();
+        let has_clone_targets = entity
+            .upgrade()
+            .map(|this| this.read_with(cx, |this, _| this.has_clone_target_instances()))
+            .unwrap_or(false);
         let delete_entity = entity;
         let appearance_project_id = target.project_id.clone();
         let auto_continue_project_id = target.project_id.clone();
         let new_folder_project_id = target.project_id.clone();
         let import_workspace = target.import_workspace.clone();
         let import_project_name = target.project_search_name.clone();
+        let clone_project_id = target.project_id.clone();
         let delete_project_id = target.project_id;
         let delete_project_name = target.project_name.clone();
         let auto_continue_enabled = target.auto_continue_enabled;
@@ -56164,6 +56318,27 @@ impl VibexWorkbench {
                         });
                     }),
             )
+            .when(has_clone_targets, |menu| {
+                menu.item(
+                    PopupMenuItem::new(locale::text(
+                        "Clone Project to Instance…",
+                        "克隆项目到实例…",
+                        "複製專案到執行個體…",
+                    ))
+                    .icon(sidebar_icon("icons/vibex/monitor.svg"))
+                    .on_click(move |_, window, cx| {
+                        let _ = clone_entity.update(cx, |this, cx| {
+                            this.open_session_clone_dialog(
+                                session_clone::CloneSourceRequest::Project(
+                                    clone_project_id.clone(),
+                                ),
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
+                )
+            })
             .item(
                 PopupMenuItem::new(strings.sidebar_delete_project)
                     .icon(sidebar_icon("icons/vibex/trash-2.svg"))
@@ -56254,10 +56429,16 @@ impl VibexWorkbench {
         let new_folder_entity = entity.clone();
         let rename_entity = entity.clone();
         let archive_entity = entity.clone();
+        let clone_entity = entity.clone();
+        let has_clone_targets = entity
+            .upgrade()
+            .map(|this| this.read_with(cx, |this, _| this.has_clone_target_instances()))
+            .unwrap_or(false);
         let delete_entity = entity;
         let child_parent_id = folder_id.clone();
         let rename_folder_id = folder_id.clone();
         let archive_folder_id = folder_id.clone();
+        let clone_folder_id = folder_id.clone();
         let delete_folder_id = folder_id;
         let project_id_for_child = project_id.clone();
         let workspace_id_for_child = workspace_id.clone();
@@ -56350,6 +56531,26 @@ impl VibexWorkbench {
                     });
                 }),
         )
+        .when(has_clone_targets, |menu| {
+            menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Clone Folder to Instance…",
+                    "克隆文件夹到实例…",
+                    "複製資料夾到執行個體…",
+                ))
+                .icon(sidebar_icon("icons/vibex/monitor.svg"))
+                .disabled(!has_project_scope)
+                .on_click(move |_, window, cx| {
+                    let _ = clone_entity.update(cx, |this, cx| {
+                        this.open_session_clone_dialog(
+                            session_clone::CloneSourceRequest::Folder(clone_folder_id.clone()),
+                            window,
+                            cx,
+                        )
+                    });
+                }),
+            )
+        })
         .item(
             PopupMenuItem::new(locale::text("Delete Folder", "删除文件夹", "刪除資料夾"))
                 .icon(sidebar_icon("icons/vibex/trash-2.svg"))
@@ -59038,6 +59239,12 @@ impl VibexWorkbench {
         };
         let rename_entity = entity.clone();
         let rename_id = group_id.clone();
+        let clone_entity = entity.clone();
+        let clone_group_id = group_id.clone();
+        let has_clone_targets = entity
+            .upgrade()
+            .map(|this| this.read_with(cx, |this, _| this.has_clone_target_instances()))
+            .unwrap_or(false);
         let dissolve_entity = entity.clone();
         let dissolve_id = group_id.clone();
         let delete_entity = entity.clone();
@@ -59078,6 +59285,25 @@ impl VibexWorkbench {
                         });
                     }),
             )
+            .when(has_clone_targets, |menu| {
+                menu.item(
+                    PopupMenuItem::new(locale::text(
+                        "Clone Group to Instance…",
+                        "克隆会话组到实例…",
+                        "複製會話組到執行個體…",
+                    ))
+                    .icon(sidebar_icon("icons/vibex/monitor.svg"))
+                    .on_click(move |_, window, cx| {
+                        let _ = clone_entity.update(cx, |this, cx| {
+                            this.open_session_clone_dialog(
+                                session_clone::CloneSourceRequest::Group(clone_group_id.clone()),
+                                window,
+                                cx,
+                            )
+                        });
+                    }),
+                )
+            })
             .separator()
             .item(
                 PopupMenuItem::new(locale::text(
@@ -61553,6 +61779,11 @@ impl VibexWorkbench {
             "恢復自動繼續",
         ));
         let fork_label = batch_label(locale::text("Fork session", "分叉会话", "分支會話"));
+        let context_clone_label = batch_label(locale::text(
+            "Clone to Instance…",
+            "克隆到实例…",
+            "複製到執行個體…",
+        ));
         let archive_label = batch_label(locale::text("Archive", "归档", "封存"));
         let delete_label = batch_label(strings.sidebar_delete);
         let pin_label = {
@@ -61994,6 +62225,25 @@ impl VibexWorkbench {
                         let resume_auto_continue_entity = context_entity.clone();
                         let resume_auto_continue_id = context_auto_continue_id.clone();
                         let resume_auto_continue_targets = batch_ids.clone();
+                        let clone_entity = context_entity.clone();
+                        let clone_single_id = context_pin_id.clone();
+                        let clone_batch_targets = batch_ids.clone();
+                        let (has_clone_targets, clone_disabled) = context_entity
+                            .upgrade()
+                            .map(|this| {
+                                this.read_with(cx, |this, _| {
+                                    let has = this.has_clone_target_instances();
+                                    let valid = match clone_batch_targets.as_ref() {
+                                        Some(ids) => this.batch_selection_is_single_project(ids),
+                                        None => this
+                                            .registered_session(clone_single_id.as_str())
+                                            .is_some_and(|s| !s.is_terminal()),
+                                    };
+                                    (has, !valid)
+                                })
+                            })
+                            .unwrap_or((false, true));
+                        let clone_label = context_clone_label.clone();
                         let pin_entity = context_entity.clone();
                         let pin_id = context_pin_id.clone();
                         let pin_targets = batch_ids.clone();
@@ -62186,6 +62436,33 @@ impl VibexWorkbench {
                                     }
                                     submenu
                                 },
+                            );
+                        }
+                        if has_clone_targets {
+                            menu = menu.separator().item(
+                                PopupMenuItem::new(clone_label)
+                                    .icon(sidebar_icon("icons/vibex/monitor.svg"))
+                                    .disabled(clone_disabled)
+                                    .on_click(move |_, window, cx| {
+                                        let ids: Vec<VibexSessionId> = clone_batch_targets
+                                            .as_ref()
+                                            .map(|raw_ids| {
+                                                raw_ids
+                                                    .iter()
+                                                    .filter_map(|id| {
+                                                        VibexSessionId::parse(id.as_str()).ok()
+                                                    })
+                                                    .collect()
+                                            })
+                                            .unwrap_or_else(|| vec![clone_single_id.clone()]);
+                                        let _ = clone_entity.update(cx, |this, cx| {
+                                            this.open_session_clone_dialog(
+                                                session_clone::CloneSourceRequest::Sessions(ids),
+                                                window,
+                                                cx,
+                                            )
+                                        });
+                                    }),
                             );
                         }
                         menu = menu.separator().item(
@@ -81516,6 +81793,7 @@ impl VibexWorkbench {
         let generation_status = self.render_agent_generation_status(session_running, cx);
         let failover_prompt = self.render_failover_prompt(cx);
         let failover_notices = self.render_failover_notices(cx);
+        let agent_readiness_banner = self.render_session_agent_readiness_banner(cx);
         // The turn has no deadline, so the reader needs to hear about silence
         // instead: this is the only surface that can ask what to do about it.
         let turn_stall_notice = self.render_turn_stall_notice(cx);
@@ -82125,6 +82403,16 @@ impl VibexWorkbench {
                                 .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
                                 .pb_2()
                                 .child(prompt),
+                        )
+                    })
+                    .when_some(agent_readiness_banner, |this, banner| {
+                        this.child(
+                            div()
+                                .w_full()
+                                .min_w_0()
+                                .px(px(COMPOSER_QUEUE_HORIZONTAL_INSET))
+                                .pb_2()
+                                .child(banner),
                         )
                     })
                     .when_some(turn_stall_notice, |this, notice| {
@@ -125041,7 +125329,12 @@ mod tests {
         assert_eq!(AGENT_TURN_STALL_TIMEOUT, Duration::from_secs(10 * 60));
 
         // Output a minute ago is a turn that is working, whatever its age.
-        assert!(!turn_stall_notice_is_due(true, now_ms - 60_000, false, now_ms));
+        assert!(!turn_stall_notice_is_due(
+            true,
+            now_ms - 60_000,
+            false,
+            now_ms
+        ));
         assert!(!turn_stall_notice_is_due(
             true,
             now_ms - (timeout_ms - 1_000),
@@ -125049,7 +125342,12 @@ mod tests {
             now_ms
         ));
         // The threshold itself is the first frame that asks.
-        assert!(turn_stall_notice_is_due(true, now_ms - timeout_ms, false, now_ms));
+        assert!(turn_stall_notice_is_due(
+            true,
+            now_ms - timeout_ms,
+            false,
+            now_ms
+        ));
         // A turn that ended, or that the reader already answered, is quiet.
         assert!(!turn_stall_notice_is_due(
             false,
@@ -125064,7 +125362,12 @@ mod tests {
             now_ms
         ));
         // A clock that ran ahead of the wall clock is not a stall.
-        assert!(!turn_stall_notice_is_due(true, now_ms + 5_000, false, now_ms));
+        assert!(!turn_stall_notice_is_due(
+            true,
+            now_ms + 5_000,
+            false,
+            now_ms
+        ));
     }
 
     #[test]
@@ -125109,9 +125412,7 @@ mod tests {
         // The two answers the notice offers are the whole interaction.
         let notice = source
             .split_once("    fn render_turn_stall_notice(")
-            .and_then(|(_, tail)| {
-                tail.split_once("\n    fn terminate_stalled_turn_and_continue(")
-            })
+            .and_then(|(_, tail)| tail.split_once("\n    fn terminate_stalled_turn_and_continue("))
             .map(|(body, _)| body)
             .expect("stall notice renderer should remain inspectable");
         assert!(notice.contains("Button::new(\"turn-stall-terminate\")"));

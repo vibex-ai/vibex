@@ -86,6 +86,8 @@ mod model_route;
 pub use model_route::*;
 mod model_source;
 pub use model_source::*;
+mod session_clone;
+pub use session_clone::*;
 
 pub type DbConnection = Connection;
 
@@ -100,7 +102,7 @@ pub use runtime::{
     SwitchOperationJournalRepository, SwitchOperationRecord,
 };
 
-pub const CURRENT_SCHEMA_VERSION: i64 = 90;
+pub const CURRENT_SCHEMA_VERSION: i64 = 91;
 const SQLITE_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, Copy)]
@@ -12920,6 +12922,7 @@ pub fn apply_migrations(conn: &mut Connection) -> VibexResult<Vec<String>> {
     // the name; recorded last because it only repairs titles the earlier
     // migrations made possible.
     apply_session_title_instruction_echo(conn, &mut applied)?;
+    apply_cloned_session_runtime_hints(conn, &mut applied)?;
     Ok(applied)
 }
 
@@ -16162,7 +16165,7 @@ pub fn run_smoke(path: &Path) -> VibexResult<DatabaseSmokeResult> {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn append_timeline_in_transaction(
+pub(crate) fn append_timeline_in_transaction(
     tx: &Transaction<'_>,
     session_id: &VibexSessionId,
     source: TimelineSource,

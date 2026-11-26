@@ -590,6 +590,8 @@ pub enum RemoteAgentOperationKind {
     DetachRuntime,
     GetSidebarOrganization,
     MutateSidebarOrganization,
+    ExportSessionCloneBundle,
+    ImportSessionCloneBundle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1423,6 +1425,32 @@ pub struct RemoteAgentCatchUpResponse {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentExportSessionCloneBundleRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::SessionCloneExportRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentExportSessionCloneBundleResponse {
+    pub bundle: crate::SessionCloneBundle,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentImportSessionCloneBundleRequest {
+    pub auth: RemoteAuthProof,
+    pub request: crate::SessionCloneImportRequest,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentImportSessionCloneBundleResponse {
+    pub result: crate::SessionCloneImportResult,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", content = "data", rename_all = "snake_case")]
 pub enum RemoteAgentRequest {
     GetTeamSnapshot(crate::RemoteTeamReadRequest<crate::TeamSnapshotRequest>),
@@ -1491,6 +1519,8 @@ pub enum RemoteAgentRequest {
     DetachRuntime(RemoteAgentDetachRuntimeRequest),
     GetSidebarOrganization(RemoteSidebarOrganizationRequest),
     MutateSidebarOrganization(RemoteSidebarOrganizationMutateRequest),
+    ExportSessionCloneBundle(RemoteAgentExportSessionCloneBundleRequest),
+    ImportSessionCloneBundle(RemoteAgentImportSessionCloneBundleRequest),
 }
 
 impl RemoteAgentRequest {
@@ -1568,6 +1598,8 @@ impl RemoteAgentRequest {
             Self::MutateSidebarOrganization(_) => {
                 RemoteAgentOperationKind::MutateSidebarOrganization
             }
+            Self::ExportSessionCloneBundle(_) => RemoteAgentOperationKind::ExportSessionCloneBundle,
+            Self::ImportSessionCloneBundle(_) => RemoteAgentOperationKind::ImportSessionCloneBundle,
         }
     }
 }

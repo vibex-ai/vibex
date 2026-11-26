@@ -931,6 +931,52 @@ impl SessionGroupUiState {
         self.member_session_ids.iter().any(|id| id == session_id)
     }
 
+    /// Clones this session group into a target project/workspace by remapping
+    /// member session ids and pane stacks from `session_map`. Returns `None` if
+    /// none of the group's members are present in `session_map`.
+    pub fn remap_sessions(
+        &self,
+        target_project_id: impl Into<String>,
+        target_workspace_id: impl Into<String>,
+        session_map: &BTreeMap<String, String>,
+    ) -> Option<Self> {
+        let member_session_ids = self
+            .member_session_ids
+            .iter()
+            .filter_map(|id| session_map.get(id).cloned())
+            .collect::<Vec<_>>();
+        if member_session_ids.is_empty() {
+            return None;
+        }
+        let mut layout = self.layout.clone();
+        layout.for_each_pane_mut(&mut |pane| {
+            pane.session_ids = pane
+                .session_ids
+                .iter()
+                .filter_map(|id| session_map.get(id).cloned())
+                .collect();
+            pane.active_session_id = pane
+                .active_session_id
+                .as_ref()
+                .and_then(|id| session_map.get(id).cloned());
+        });
+        let mut cloned = Self {
+            name: self.name.clone(),
+            project_id: target_project_id.into(),
+            workspace_id: target_workspace_id.into(),
+            member_session_ids,
+            layout,
+            focused_pane_id: self.focused_pane_id.clone(),
+            maximized_pane_id: self.maximized_pane_id.clone(),
+            auto_continue: self.auto_continue,
+            pinned: self.pinned,
+            automatic_layout: self.automatic_layout.clone(),
+            applied_automatic_layout: self.applied_automatic_layout.clone(),
+        };
+        cloned.normalize();
+        Some(cloned)
+    }
+
     /// Bounds every field and re-derives the layout from the member list, so a
     /// hand-edited or stale document cannot describe a session twice.
     pub fn normalize(&mut self) {

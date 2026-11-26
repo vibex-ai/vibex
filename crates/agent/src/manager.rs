@@ -7333,7 +7333,7 @@ impl AgentManager {
         self.publish_timeline_item(item)
     }
 
-    fn publish_timeline_item(&self, item: TimelineItem) -> VibexResult<TimelineItem> {
+    pub(crate) fn publish_timeline_item(&self, item: TimelineItem) -> VibexResult<TimelineItem> {
         let _ = self.live_events.send(TimelineLiveEvent {
             session_id: item.session_id.clone(),
             sequence: item.sequence,
@@ -7352,7 +7352,7 @@ impl AgentManager {
         let _ = self.session_events.send(session.clone());
     }
 
-    fn publish_root_session_update(&self, conn: &DbConnection, session: AgentSession) {
+    pub(crate) fn publish_root_session_update(&self, conn: &DbConnection, session: AgentSession) {
         // Child updates refresh open worker views and tree metadata. Client
         // session-list queries keep their authoritative roots-only projection,
         // so a client that cannot place a snapshot answers it by re-reading

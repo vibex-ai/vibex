@@ -10590,6 +10590,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "uuid",
  "vibex-config-switch",
  "vibex-core",
  "vibex-db",
