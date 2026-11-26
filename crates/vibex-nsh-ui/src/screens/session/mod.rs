@@ -7872,13 +7872,16 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     // three rows apart. The mark is the button: drawn at the
                     // size of the round controls beside it, with no disc behind
                     // it and in a softer ink so the bubble and plus sit gently
-                    // next to the search pill.
+                    // next to the search pill. The ink is the duotone one: the
+                    // bubble carries its own quarter-opacity wash, which the
+                    // light page shows as a grey plate under a glyph that is
+                    // meant to be quiet.
                     surface::bare_icon_button(
                         icon!("chat-alt-add"),
                         copy::text("New session", "新建会话", "新增工作階段"),
                         move || on_new_session(),
                         theme::ROUND_CONTROL,
-                        theme::muted_foreground,
+                        theme::sidebar_duotone_ink,
                     )
                 }),
         )

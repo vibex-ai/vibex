@@ -695,6 +695,29 @@ pub fn sidebar_text_muted() -> Hsla {
     blend(muted_foreground(), color_token("sidebar-foreground"), 0.12)
 }
 
+/// The ink of a duotone mark on a side page.
+///
+/// A duotone drawing paints its own quarter-opacity wash of the ink under a
+/// thin stroke, so it reads heavier than a stroke-only glyph set in the same
+/// colour. The dark page swallows that wash — it lands within a shade of the
+/// ground — and the ink only has to carry the stroke, so it keeps
+/// [`muted_foreground`]. The light page does the opposite: the same wash shows
+/// as a grey block beside the search pill, which made the drawer's
+/// new-session bubble read as a filled control rather than the quiet mark it
+/// is. Lifting the ink toward the page in that appearance lightens the wash
+/// and the stroke together, and leaves the dark one exactly as it was.
+pub fn sidebar_duotone_ink() -> Hsla {
+    let ink = muted_foreground();
+    if dark() {
+        ink
+    } else {
+        // Far enough that the wash stops reading as a plate, not so far that
+        // the stroke drops under the 3:1 a graphical object needs against the
+        // page it sits on.
+        blend(ink, block_page(), 0.20)
+    }
+}
+
 /// The guide down a folder's child column.
 pub fn sidebar_tree_guide() -> Hsla {
     color_token("sidebar-border").opacity(0.70)
