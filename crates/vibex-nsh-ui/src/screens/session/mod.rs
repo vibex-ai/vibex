@@ -255,6 +255,12 @@ pub struct RuntimePickerHost {
     pub busy: Signal<bool>,
     pub on_open: Action,
     pub on_close: Action,
+    /// Called when the reader taps an Agent chip in the picker. New-session
+    /// mode uses this to immediately switch the draft selection to that Agent's
+    /// remembered provider, model and options; an existing session leaves it
+    /// `None` so browsing another Agent does not mutate the live session until
+    /// a model row is chosen.
+    pub on_choose_agent: Option<ChooseAgent>,
     pub on_choose_runtime: Rc<dyn Fn(&str)>,
     pub on_choose_reasoning: Rc<dyn Fn(&str)>,
     pub on_choose_mode: Rc<dyn Fn(&str)>,
@@ -272,6 +278,9 @@ pub struct RuntimeOptionView {
     /// fold header already names the provider.
     pub detail: String,
     pub selected: bool,
+    /// Whether this option is the Agent's last remembered choice, used to
+    /// expand its provider fold when browsing another Agent on a live session.
+    pub preferred: bool,
     pub available: bool,
     /// The provider profile, account or route the option draws from, as a
     /// stable key to group by.
@@ -556,6 +565,7 @@ use crate::screens::new_session::{
 /// A callback with no arguments.
 type Action = Rc<dyn Fn()>;
 /// Chooses a value for one of the Agent's session options.
+type ChooseAgent = Rc<dyn Fn(&str)>;
 type ChooseFeature = Rc<dyn Fn(&str, Option<&str>)>;
 /// Opens one user message for replacement.
 type EditMessage = Rc<dyn Fn(i64, &str)>;
@@ -1399,6 +1409,7 @@ fn shell(
                 busy: host.runtime_busy,
                 on_open: host.on_open_runtime.clone(),
                 on_close: host.on_close_runtime.clone(),
+                on_choose_agent: None,
                 on_choose_runtime: host.on_choose_runtime.clone(),
                 on_choose_reasoning: host.on_choose_reasoning.clone(),
                 on_choose_mode: host.on_choose_mode.clone(),
@@ -5832,6 +5843,7 @@ pub(crate) fn runtime_sheet(
     use crate::ui::sheet::{bottom_sheet, sheet_card, sheet_header};
     let open = host.open;
     let close = host.on_close;
+    let on_choose_agent = host.on_choose_agent;
     let query = signal(String::new());
     let agent = signal(None::<String>);
     let options = host.options;
@@ -5948,12 +5960,31 @@ pub(crate) fn runtime_sheet(
         // search — because the folds that are worth opening change with it.
         let searching = !query.get().trim().is_empty();
         let groups = grouped.get();
+        let has_selected = groups
+            .iter()
+            .any(|(_, _, options)| options.iter().any(|option| option.selected));
+        let has_preferred = !has_selected
+            && groups
+                .iter()
+                .any(|(_, _, options)| options.iter().any(|option| option.preferred));
         collapsed.set(if searching {
             Vec::new()
-        } else {
+        } else if has_selected {
             groups
                 .iter()
                 .filter(|(_, _, options)| !options.iter().any(|option| option.selected))
+                .map(|(key, _, _)| key.clone())
+                .collect()
+        } else if has_preferred {
+            groups
+                .iter()
+                .filter(|(_, _, options)| !options.iter().any(|option| option.preferred))
+                .map(|(key, _, _)| key.clone())
+                .collect()
+        } else {
+            groups
+                .iter()
+                .skip(1)
                 .map(|(key, _, _)| key.clone())
                 .collect()
         });
@@ -6004,8 +6035,11 @@ pub(crate) fn runtime_sheet(
             ))
             .child(when(
                 move || panel.get() == RuntimePanel::Model,
-                move || {
-                    let strip_initialized = stored(false);
+                {
+                    let on_choose_agent = on_choose_agent.clone();
+                    move || {
+                        let on_choose_agent_for_each = on_choose_agent.clone();
+                        let strip_initialized = stored(false);
                     effect(move || {
                         if !open.get() {
                             strip_initialized.replace(false);
@@ -6026,6 +6060,7 @@ pub(crate) fn runtime_sheet(
                                         move || agents.get(),
                                         |row| row.0.clone(),
                                         move |row, _| {
+                                            let on_choose_agent = on_choose_agent_for_each.clone();
                                             let agent_id =
                                                 row.with_untracked(|row| row.0.clone());
                                             let chip = element_ref();
@@ -6076,10 +6111,20 @@ pub(crate) fn runtime_sheet(
                                                             }
                                                         })
                                                         .active(|style| style.opacity(0.7))
-                                                        .on_press(move || {
-                                                            agent.set(Some(row.with_untracked(
-                                                                |row| row.0.clone(),
-                                                            )))
+                                                        .on_press({
+                                                            let on_choose_agent =
+                                                                on_choose_agent.clone();
+                                                            move || {
+                                                                let id = row.with_untracked(
+                                                                    |row| row.0.clone(),
+                                                                );
+                                                                agent.set(Some(id.clone()));
+                                                                if let Some(choose) =
+                                                                    &on_choose_agent
+                                                                {
+                                                                    choose(&id);
+                                                                }
+                                                            }
                                                         })
                                                         .child(dynamic(move || {
                                                             svg(icon(agent_icon(
@@ -6128,6 +6173,7 @@ pub(crate) fn runtime_sheet(
                                     .h_full(),
                                 ),
                         )
+                    }
                 },
             ))
             .child(

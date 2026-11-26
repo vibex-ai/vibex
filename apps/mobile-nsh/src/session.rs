@@ -93,7 +93,7 @@ use vibex_ui::{
     tool_detail,
 };
 
-use crate::{pairing::error_text, sidebar};
+use crate::{pairing::error_text, runtime_prefs::RuntimePreferences, sidebar};
 
 /// Fallback item count when a timeline read is not bounded by a turn window.
 const TIMELINE_LIMIT: u32 = 200;
@@ -320,6 +320,9 @@ pub struct SessionService {
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     new_runtime_selection: Rc<RefCell<Option<SessionRuntimeSelection>>>,
+    /// Bumped whenever the reader changes the new-session runtime so an
+    /// in-flight catalogue refresh cannot overwrite their choice.
+    new_runtime_edit_gen: Rc<Cell<u64>>,
     new_runtime_summary: Signal<Option<RuntimeSummaryView>>,
     new_runtime_option_views: Signal<Vec<RuntimeOptionView>>,
     new_runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
@@ -385,6 +388,10 @@ pub struct SessionService {
     /// The open session's runtime selection and the runtime's catalogue.
     runtime_state: Rc<RefCell<Option<AgentSessionRuntimeSelectionState>>>,
     runtime_catalog: Signal<Option<SessionRuntimeOptionCatalog>>,
+    /// Remembered Agent, provider, model and run-option preferences for this host.
+    runtime_prefs: Rc<RefCell<RuntimePreferences>>,
+    /// Bumped on session switches and runtime mutations so stale fetches do not win.
+    runtime_generation: Rc<Cell<u64>>,
     runtime_summary: Signal<Option<RuntimeSummaryView>>,
     runtime_option_views: Signal<Vec<RuntimeOptionView>>,
     runtime_reasoning: Signal<Vec<RuntimeChoiceView>>,
@@ -479,8 +486,10 @@ impl SessionService {
         let sidebar_backend: Arc<dyn SidebarBackend> = web.clone();
         let backend: Arc<dyn AgentBackend> = web.clone();
         let runtime = bundle.host_label();
+        let host_id = bundle.host_id().to_owned();
+        let runtime_prefs = RuntimePreferences::load_for_host(&host_id);
         let service = Self {
-            bundle_host_id: Rc::new(bundle.host_id().to_owned()),
+            bundle_host_id: Rc::new(host_id),
             web,
             backend,
             terminal_backend,
@@ -594,6 +603,7 @@ impl SessionService {
             new_workspaces: signal(Vec::new()),
             new_runtime_options: Rc::new(RefCell::new(Vec::new())),
             new_runtime_selection: Rc::new(RefCell::new(None)),
+            new_runtime_edit_gen: Rc::new(Cell::new(0)),
             new_runtime_summary: signal(None),
             new_runtime_option_views: signal(Vec::new()),
             new_runtime_reasoning: signal(Vec::new()),
@@ -640,6 +650,8 @@ impl SessionService {
             loading_row_details: Rc::new(RefCell::new(Default::default())),
             runtime_state: Rc::new(RefCell::new(None)),
             runtime_catalog: signal(None),
+            runtime_prefs: Rc::new(RefCell::new(runtime_prefs)),
+            runtime_generation: Rc::new(Cell::new(0)),
             runtime_summary: signal(None),
             runtime_option_views: signal(Vec::new()),
             runtime_reasoning: signal(Vec::new()),
@@ -1061,6 +1073,10 @@ impl SessionService {
                     let service = self.clone();
                     Rc::new(move || service.new_runtime_open.set(false))
                 },
+                on_choose_agent: Some({
+                    let service = self.clone();
+                    Rc::new(move |agent_id: &str| service.choose_new_agent(agent_id))
+                }),
                 on_choose_runtime: {
                     let service = self.clone();
                     Rc::new(move |id: &str| service.choose_new_runtime(id))
@@ -1121,6 +1137,7 @@ impl SessionService {
                         .and_then(|id| VibexSessionId::parse(id).ok())
                     {
                         service.reload(&id);
+                        service.refresh_runtime(&id);
                     }
                 })
             },
@@ -1826,6 +1843,11 @@ impl SessionService {
                         self.timeline.set(Vec::new());
                         *self.model.borrow_mut() = TimelineModel::default();
                     }
+                } else if self.runtime_state.borrow().is_none()
+                    && let Some(active) = self.active.get_untracked()
+                    && let Ok(session_id) = VibexSessionId::parse(active)
+                {
+                    self.refresh_runtime(&session_id);
                 }
                 self.connection.set(ConnectionState::Online);
                 self.connection_error.set(None);
@@ -2034,6 +2056,14 @@ impl SessionService {
                         self.attach_terminal(id, session.title.clone());
                     }
                     self.refresh_token_usage(&session_id);
+                    let needs_runtime_refresh = self
+                        .runtime_state
+                        .borrow()
+                        .as_ref()
+                        .is_none_or(|state| state.desired.agent_id != session.agent_id);
+                    if needs_runtime_refresh {
+                        self.refresh_runtime(&session_id);
+                    }
                     if !matches!(
                         session.state,
                         AgentSessionState::Running | AgentSessionState::Initializing
@@ -2075,10 +2105,12 @@ impl SessionService {
                 self.connection.set(ConnectionState::Connecting);
                 if let Some(session_id) = refetch.session_id.clone() {
                     self.reload(&session_id);
+                    self.refresh_runtime(&session_id);
                 } else if let Some(active) = self.active.get_untracked()
                     && let Ok(session_id) = VibexSessionId::parse(active)
                 {
                     self.reload(&session_id);
+                    self.refresh_runtime(&session_id);
                 }
                 self.refresh();
             }
@@ -2104,6 +2136,10 @@ impl SessionService {
             }
             BackendEvent::DeviceRenamed(renamed) => {
                 (self.on_device_renamed)(&renamed.display_name);
+            }
+            BackendEvent::RuntimeSelection(event) => {
+                self.note_online();
+                self.apply_runtime_selection(&event.session_id, event.state);
             }
             BackendEvent::Notification(intent) => {
                 self.note_online();
@@ -2209,8 +2245,9 @@ impl SessionService {
         self.armed_command.borrow_mut().take();
         self.armed_mentions.borrow_mut().clear();
         self.error.set(None);
+        self.runtime_generation
+            .set(self.runtime_generation.get().wrapping_add(1));
         self.runtime_state.replace(None);
-        self.runtime_catalog.set(None);
         self.runtime_summary.set(None);
         self.runtime_option_views.set(Vec::new());
         self.runtime_reasoning.set(Vec::new());
@@ -2368,9 +2405,10 @@ impl SessionService {
         let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
-        if self
-            .runtime_catalog
-            .with_untracked(|catalog| catalog.is_none())
+        if self.runtime_state.borrow().is_none()
+            || self
+                .runtime_catalog
+                .with_untracked(|catalog| catalog.is_none())
         {
             self.refresh_runtime(&session_id);
         }
@@ -2378,31 +2416,42 @@ impl SessionService {
 
     /// Reads the open session's selection and the runtime's catalogue.
     fn refresh_runtime(&self, session_id: &VibexSessionId) {
+        let generation = self.runtime_generation.get().wrapping_add(1);
+        self.runtime_generation.set(generation);
         let session_id = session_id.clone();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        // `open` is commonly called from a drawer row whose reactive owner is
+        // torn down the moment the drawer closes. Detaching keeps the runtime
+        // fetch alive so the composer chip populates immediately on arrival.
+        detach(async move {
             let requested = session_id.clone();
-            // The selection and the catalogue are two reads with different
-            // costs, and the composer's chip needs only the first: it names
-            // the Agent and the model the session is set to, and its mark is
-            // resolved from the model id that read carries. Awaiting them as
-            // one step meant a slow — or failing — catalogue left the chip on
-            // its "Model" placeholder until the reader opened the picker,
-            // which is what made the header look unloaded on arrival.
-            let state = crate::runtime::handle()
-                .spawn({
-                    let backend = backend.clone();
-                    async move { backend.runtime_selection(requested).await }
-                })
-                .await;
-            if let Ok(Ok(state)) = state {
+            // Launch selection and catalogue reads concurrently, but await the
+            // session selection first so the composer chip populates as soon as
+            // it returns instead of waiting behind the full catalogue.
+            let state_task = crate::runtime::handle().spawn({
+                let backend = backend.clone();
+                async move { backend.runtime_selection(requested).await }
+            });
+            let catalog_task =
+                crate::runtime::handle().spawn(async move { backend.list_runtime_options().await });
+
+            if let Ok(Ok(state)) = state_task.await {
+                if !service.alive.get() || service.runtime_generation.get() != generation {
+                    return;
+                }
                 service.apply_runtime_selection(&session_id, state);
             }
-            let catalog = crate::runtime::handle()
-                .spawn(async move { backend.list_runtime_options().await })
-                .await;
-            if let Ok(Ok(catalog)) = catalog {
+            if let Ok(Ok(catalog)) = catalog_task.await {
+                if !service.alive.get() {
+                    return;
+                }
+                if service.runtime_generation.get() != generation {
+                    // The catalogue is runtime-wide, so keep the fresher copy
+                    // cached without mutating a newer session's views.
+                    service.runtime_catalog.set(Some(catalog));
+                    return;
+                }
                 service.apply_runtime_catalog(&session_id, catalog);
             }
         });
@@ -2455,13 +2504,42 @@ impl SessionService {
         }
     }
 
+    /// Records and persists `selection` as the default, per-Agent, and per-model choice.
+    fn remember_runtime_selection(
+        &self,
+        selection: &SessionRuntimeSelection,
+        options: &[SessionRuntimeOption],
+    ) {
+        let mut prefs = self.runtime_prefs.borrow_mut();
+        prefs.remember(selection, options);
+        prefs.save_for_host(&self.bundle_host_id);
+    }
+
+    /// Resolves the preferred new-session selection from persisted preferences,
+    /// falling back to the open session and then the catalogue default.
+    fn resolve_new_runtime_selection(
+        &self,
+        options: &[SessionRuntimeOption],
+        agent_id: Option<&AgentId>,
+    ) -> Option<SessionRuntimeSelection> {
+        let active = self.current_selection();
+        self.runtime_prefs.borrow().resolve_new_session_selection(
+            options,
+            active.as_ref(),
+            agent_id,
+        )
+    }
+
     /// Writes the chip's summary from the selection alone.
     fn rebuild_runtime_summary(
         &self,
         selection: &SessionRuntimeSelection,
         options: &[SessionRuntimeOption],
     ) {
-        let views = build_runtime_views(Some(selection), options);
+        let views = {
+            let prefs = self.runtime_prefs.borrow();
+            build_runtime_views(Some(selection), options, Some(&prefs))
+        };
         self.runtime_summary.set(views.summary);
     }
 
@@ -2470,7 +2548,10 @@ impl SessionService {
         selection: &SessionRuntimeSelection,
         catalog: &SessionRuntimeOptionCatalog,
     ) {
-        let views = build_runtime_views(Some(selection), &catalog.options);
+        let views = {
+            let prefs = self.runtime_prefs.borrow();
+            build_runtime_views(Some(selection), &catalog.options, Some(&prefs))
+        };
         self.runtime_summary.set(views.summary);
         self.runtime_option_views.set(views.options);
         self.runtime_reasoning.set(views.reasoning);
@@ -2479,9 +2560,12 @@ impl SessionService {
     }
 
     fn rebuild_new_runtime_views(&self) {
-        let selection = self.new_runtime_selection.borrow().clone();
-        let options = self.new_runtime_options.borrow();
-        let views = build_runtime_views(selection.as_ref(), &options);
+        let views = {
+            let selection = self.new_runtime_selection.borrow().clone();
+            let options = self.new_runtime_options.borrow();
+            let prefs = self.runtime_prefs.borrow();
+            build_runtime_views(selection.as_ref(), &options, Some(&prefs))
+        };
         self.new_runtime_summary.set(views.summary);
         self.new_runtime_option_views.set(views.options);
         self.new_runtime_reasoning.set(views.reasoning);
@@ -2489,12 +2573,37 @@ impl SessionService {
         self.new_runtime_features.set(views.features);
     }
 
+    /// Switches the new-session draft Agent immediately to that Agent's last
+    /// remembered provider, model and options (matching Desktop).
+    fn choose_new_agent(&self, agent_id: &str) {
+        let Ok(agent_id) = AgentId::parse(agent_id) else {
+            return;
+        };
+        if self
+            .new_runtime_selection
+            .borrow()
+            .as_ref()
+            .is_some_and(|current| current.agent_id == agent_id)
+        {
+            return;
+        }
+        let options = self.new_runtime_options.borrow().clone();
+        let Some(next) = self.resolve_new_runtime_selection(&options, Some(&agent_id)) else {
+            return;
+        };
+        self.new_runtime_edit_gen
+            .set(self.new_runtime_edit_gen.get().wrapping_add(1));
+        *self.new_runtime_selection.borrow_mut() = Some(next.clone());
+        self.remember_runtime_selection(&next, &options);
+        self.rebuild_new_runtime_views();
+    }
+
     fn choose_new_runtime(&self, id: &str) {
         let Ok(index) = id.parse::<usize>() else {
             return;
         };
-        let option = self.new_runtime_options.borrow().get(index).cloned();
-        let Some(option) = option else {
+        let options = self.new_runtime_options.borrow().clone();
+        let Some(option) = options.get(index) else {
             return;
         };
         if option.availability != RuntimeOptionAvailability::Available {
@@ -2507,34 +2616,48 @@ impl SessionService {
         {
             return;
         }
-        *self.new_runtime_selection.borrow_mut() = Some(option.selection);
+        let next = self.runtime_prefs.borrow().with_remembered_options(option);
+        self.new_runtime_edit_gen
+            .set(self.new_runtime_edit_gen.get().wrapping_add(1));
+        *self.new_runtime_selection.borrow_mut() = Some(next.clone());
+        self.remember_runtime_selection(&next, &options);
         self.rebuild_new_runtime_views();
     }
 
     fn choose_new_reasoning(&self, value: &str) {
-        {
+        let updated = {
             let mut slot = self.new_runtime_selection.borrow_mut();
             let Some(selection) = slot.as_mut() else {
                 return;
             };
             selection.reasoning_effort = (value != "default").then(|| value.to_owned());
-        }
+            selection.clone()
+        };
+        self.new_runtime_edit_gen
+            .set(self.new_runtime_edit_gen.get().wrapping_add(1));
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&updated, &options);
         self.rebuild_new_runtime_views();
     }
 
     fn choose_new_mode(&self, value: &str) {
-        {
+        let updated = {
             let mut slot = self.new_runtime_selection.borrow_mut();
             let Some(selection) = slot.as_mut() else {
                 return;
             };
             selection.mode_id = (value != "default").then(|| value.to_owned());
-        }
+            selection.clone()
+        };
+        self.new_runtime_edit_gen
+            .set(self.new_runtime_edit_gen.get().wrapping_add(1));
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&updated, &options);
         self.rebuild_new_runtime_views();
     }
 
     fn choose_new_feature(&self, id: &str, value: Option<&str>) {
-        {
+        let updated = {
             let mut slot = self.new_runtime_selection.borrow_mut();
             let Some(selection) = slot.as_mut() else {
                 return;
@@ -2546,7 +2669,12 @@ impl SessionService {
             } else {
                 selection.config_values.remove(id);
             }
-        }
+            selection.clone()
+        };
+        self.new_runtime_edit_gen
+            .set(self.new_runtime_edit_gen.get().wrapping_add(1));
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&updated, &options);
         self.rebuild_new_runtime_views();
     }
 
@@ -2558,6 +2686,9 @@ impl SessionService {
         let Some(option) = catalog.and_then(|catalog| catalog.options.get(index).cloned()) else {
             return;
         };
+        if option.availability != RuntimeOptionAvailability::Available {
+            return;
+        }
         if let Some(current) = self.current_selection()
             && current.agent_id == option.selection.agent_id
             && current.auth_source == option.selection.auth_source
@@ -2565,7 +2696,8 @@ impl SessionService {
         {
             return;
         }
-        self.apply_selection(option.selection);
+        let next = self.runtime_prefs.borrow().with_remembered_options(&option);
+        self.apply_selection(next);
     }
 
     fn choose_reasoning(&self, value: &str) {
@@ -2844,10 +2976,15 @@ impl SessionService {
         let Some(state) = self.runtime_state.borrow().clone() else {
             return;
         };
+        let generation = self.runtime_generation.get().wrapping_add(1);
+        self.runtime_generation.set(generation);
         self.runtime_busy.set(true);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        // Choosing reasoning, mode, or an option closes the runtime sheet right
+        // after invoking this callback; detaching ensures the mutation finishes
+        // instead of being cancelled with the sheet's owner.
+        detach(async move {
             let requested = session_id.clone();
             let result = crate::runtime::handle()
                 .spawn(async move {
@@ -2867,6 +3004,7 @@ impl SessionService {
                 .await;
             if !service.alive.get()
                 || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+                || service.runtime_generation.get() != generation
             {
                 return;
             }
@@ -2875,7 +3013,11 @@ impl SessionService {
                 Ok(Ok(state)) => {
                     service.runtime_state.replace(Some(state.clone()));
                     if let Some(catalog) = service.runtime_catalog.get_untracked() {
+                        service.remember_runtime_selection(&state.desired, &catalog.options);
                         service.rebuild_runtime_views(&state.desired, &catalog);
+                    } else {
+                        service.remember_runtime_selection(&state.desired, &[]);
+                        service.rebuild_runtime_summary(&state.desired, &[]);
                     }
                     service.refresh();
                 }
@@ -3495,12 +3637,14 @@ impl SessionService {
         let session_id = session_id.clone();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let requested = session_id.clone();
             let result = crate::runtime::handle()
                 .spawn(async move { backend.session_token_usage(requested).await })
                 .await;
-            if service.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            if !service.alive.get()
+                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            {
                 return;
             }
             match result {
@@ -4713,6 +4857,8 @@ impl SessionService {
         let Some(selection) = self.new_runtime_selection.borrow().clone() else {
             return;
         };
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&selection, &options);
         let draft = self.new_session_draft();
         let base_ref = self.new_base_ref.get_untracked().trim().to_owned();
         self.new_busy.set(true);
@@ -4720,7 +4866,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let created = crate::runtime::handle()
                 .spawn(async move {
                     git.git_worktree_create(MutationRequest::new(GitWorktreeCreateRequest {
@@ -4735,6 +4881,9 @@ impl SessionService {
                     .await
                 })
                 .await;
+            if !service.alive.get() {
+                return;
+            }
             let worktree = match created {
                 Ok(Ok(created)) => created,
                 Ok(Err(error)) => {
@@ -4763,6 +4912,9 @@ impl SessionService {
             let result = crate::runtime::handle()
                 .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
+            if !service.alive.get() {
+                return;
+            }
             service.new_busy.set(false);
             match result {
                 Ok(Ok(session)) => {
@@ -5975,18 +6127,32 @@ impl SessionService {
         self.new_workspaces.set(Vec::new());
         self.new_workspace.set(None);
         self.new_runtime_open.set(false);
-        self.new_runtime_options.borrow_mut().clear();
-        *self.new_runtime_selection.borrow_mut() = None;
-        self.new_runtime_summary.set(None);
-        self.new_runtime_option_views.set(Vec::new());
-        self.new_runtime_reasoning.set(Vec::new());
-        self.new_runtime_modes.set(Vec::new());
-        self.new_runtime_features.set(Vec::new());
+        if !writing {
+            if let Some(catalog) = self.runtime_catalog.get_untracked() {
+                let options = catalog.options;
+                let preferred = self.resolve_new_runtime_selection(&options, None);
+                *self.new_runtime_options.borrow_mut() = options;
+                *self.new_runtime_selection.borrow_mut() = preferred;
+                self.rebuild_new_runtime_views();
+            } else {
+                self.new_runtime_options.borrow_mut().clear();
+                *self.new_runtime_selection.borrow_mut() = None;
+                self.new_runtime_summary.set(None);
+                self.new_runtime_option_views.set(Vec::new());
+                self.new_runtime_reasoning.set(Vec::new());
+                self.new_runtime_modes.set(Vec::new());
+                self.new_runtime_features.set(Vec::new());
+            }
+        }
+        let edit_gen = self.new_runtime_edit_gen.get();
         self.new_busy.set(true);
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
         let catalog_backend = self.backend.clone();
-        spawn(async move {
+        // New session can be opened from a drawer or menu whose owner tears
+        // down immediately; detaching prevents the workspace/catalogue fetch
+        // from being cancelled.
+        detach(async move {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     let spaces = workspaces.list_workspaces().await?;
@@ -5994,9 +6160,13 @@ impl SessionService {
                     Ok::<_, BackendError>((spaces, catalog))
                 })
                 .await;
+            if !service.alive.get() {
+                return;
+            }
             service.new_busy.set(false);
             match result {
                 Ok(Ok((spaces, catalog))) => {
+                    service.runtime_catalog.set(Some(catalog.clone()));
                     let workspace_choices = spaces
                         .iter()
                         .map(|space| WorkspaceChoice {
@@ -6005,6 +6175,10 @@ impl SessionService {
                             detail: space.workspace.root_path.clone(),
                         })
                         .collect::<Vec<_>>();
+                    service.workspace_records.set(spaces.clone());
+                    if !service.new_session_open.get_untracked() {
+                        return;
+                    }
                     let options = catalog.options;
                     let has_available = options
                         .iter()
@@ -6034,31 +6208,20 @@ impl SessionService {
                             .filter(|id| workspace_choices.iter().any(|choice| &choice.id == id))
                             .or_else(|| workspace_choices.first().map(|choice| choice.id.clone())),
                     );
-                    let preferred = service
-                        .runtime_state
-                        .borrow()
-                        .as_ref()
-                        .and_then(|state| {
-                            options
-                                .iter()
-                                .any(|option| {
-                                    option.availability == RuntimeOptionAvailability::Available
-                                        && option.selection.agent_id == state.desired.agent_id
-                                        && option.selection.auth_source == state.desired.auth_source
-                                        && option.selection.model == state.desired.model
-                                })
-                                .then(|| state.desired.clone())
-                        })
-                        .or_else(|| {
-                            options
-                                .iter()
-                                .find(|option| {
-                                    option.availability == RuntimeOptionAvailability::Available
-                                })
-                                .map(|option| option.selection.clone())
-                        });
+                    let existing = service.new_runtime_selection.borrow().clone();
+                    let preserve_existing =
+                        writing || service.new_runtime_edit_gen.get() != edit_gen;
+                    let preferred = if preserve_existing {
+                        existing
+                            .as_ref()
+                            .and_then(|selection| {
+                                RuntimePreferences::revalidate_selection(&options, selection)
+                            })
+                            .or_else(|| service.resolve_new_runtime_selection(&options, None))
+                    } else {
+                        service.resolve_new_runtime_selection(&options, None)
+                    };
                     service.new_workspaces.set(workspace_choices);
-                    service.workspace_records.set(spaces);
                     *service.new_runtime_options.borrow_mut() = options;
                     *service.new_runtime_selection.borrow_mut() = preferred;
                     service.rebuild_new_runtime_views();
@@ -6089,6 +6252,8 @@ impl SessionService {
         let (Some(workspace), Some(selection)) = (workspace, selection) else {
             return;
         };
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&selection, &options);
         self.new_busy.set(true);
         self.new_error.set(None);
         let draft = self.new_session_draft();
@@ -6097,7 +6262,7 @@ impl SessionService {
         // is given, so the page the reader is looking at is the session being
         // made.
         let session_id = VibexSessionId::new();
-        self.begin_pending_turn(&session_id, &workspace, &draft);
+        self.begin_pending_turn(&session_id, &workspace, &draft, &selection);
         let service = self.clone();
         let backend = self.backend.clone();
         let request_id = session_id.clone();
@@ -6150,6 +6315,7 @@ impl SessionService {
         session_id: &VibexSessionId,
         workspace: &WorkspaceSummary,
         draft: &NewSessionDraft,
+        selection: &SessionRuntimeSelection,
     ) {
         let title = draft
             .title
@@ -6170,6 +6336,10 @@ impl SessionService {
             started_at_ms: unix_timestamp_ms(),
         }));
         self.open(session_id.as_str());
+        // Seed the composer chip with the selection just submitted so it does
+        // not sit on the "Model" placeholder while the runtime creates the session.
+        let options = self.new_runtime_options.borrow().clone();
+        self.rebuild_runtime_summary(selection, &options);
         // `open` clears the transcript and reads nothing back yet, so the
         // placeholder turn is what puts the reader's own message on the page.
         self.publish();
@@ -6392,6 +6562,8 @@ impl SessionService {
         let Some(selection) = self.new_runtime_selection.borrow().clone() else {
             return;
         };
+        let options = self.new_runtime_options.borrow().clone();
+        self.remember_runtime_selection(&selection, &options);
         self.new_busy.set(true);
         self.new_error.set(None);
         let draft = self.new_session_draft();
@@ -6402,6 +6574,9 @@ impl SessionService {
             let root = crate::runtime::handle()
                 .spawn(async move { workspaces.ensure_temporary_session_root().await })
                 .await;
+            if !service.alive.get() {
+                return;
+            }
             let root = match root {
                 Ok(Ok(root)) => root,
                 Ok(Err(error)) => {
@@ -9672,6 +9847,7 @@ struct RuntimeViews {
 fn build_runtime_views(
     selection: Option<&SessionRuntimeSelection>,
     options: &[SessionRuntimeOption],
+    prefs: Option<&RuntimePreferences>,
 ) -> RuntimeViews {
     let matches_model = |option: &SessionRuntimeOption| {
         selection.is_some_and(|selection| {
@@ -9697,36 +9873,44 @@ fn build_runtime_views(
             .or_else(|| selection.model.model_id())
             .unwrap_or_default()
             .to_owned();
-        let reasoning_label = option
-            .and_then(|option| {
-                selection.reasoning_effort.as_ref().and_then(|value| {
-                    option
-                        .reasoning_efforts
-                        .iter()
-                        .find(|candidate| &candidate.value == value)
-                        .map(|candidate| {
-                            candidate
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| candidate.value.clone())
-                        })
-                })
+        let reasoning_label = selection
+            .reasoning_effort
+            .as_ref()
+            .map(|value| {
+                option
+                    .and_then(|option| {
+                        option
+                            .reasoning_efforts
+                            .iter()
+                            .find(|candidate| &candidate.value == value)
+                            .map(|candidate| {
+                                candidate
+                                    .label
+                                    .clone()
+                                    .unwrap_or_else(|| candidate.value.clone())
+                            })
+                    })
+                    .unwrap_or_else(|| value.clone())
             })
             .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
-        let mode_label = option
-            .and_then(|option| {
-                selection.mode_id.as_ref().and_then(|value| {
-                    option
-                        .modes
-                        .iter()
-                        .find(|candidate| &candidate.value == value)
-                        .map(|candidate| {
-                            candidate
-                                .label
-                                .clone()
-                                .unwrap_or_else(|| candidate.value.clone())
-                        })
-                })
+        let mode_label = selection
+            .mode_id
+            .as_ref()
+            .map(|value| {
+                option
+                    .and_then(|option| {
+                        option
+                            .modes
+                            .iter()
+                            .find(|candidate| &candidate.value == value)
+                            .map(|candidate| {
+                                candidate
+                                    .label
+                                    .clone()
+                                    .unwrap_or_else(|| candidate.value.clone())
+                            })
+                    })
+                    .unwrap_or_else(|| value.clone())
             })
             .unwrap_or_else(|| copy::text("Default", "默认", "預設").to_owned());
         RuntimeSummaryView {
@@ -9743,10 +9927,33 @@ fn build_runtime_views(
             options_set: !selection.config_values.is_empty(),
             reasoning_set: selection.reasoning_effort.is_some(),
             mode_set: selection.mode_id.is_some(),
-            available: option
-                .is_some_and(|option| option.availability == RuntimeOptionAvailability::Available),
+            // Before the catalogue arrives (`options.is_empty()`), treat the
+            // session's own selection as available so the chip does not flash
+            // an unavailable warning color on arrival.
+            available: if options.is_empty() {
+                true
+            } else {
+                option.is_some_and(|option| {
+                    option.availability == RuntimeOptionAvailability::Available
+                })
+            },
         }
     });
+    let preferred_indices: std::collections::BTreeSet<usize> = if let Some(prefs) = prefs {
+        let mut seen_agents = std::collections::BTreeSet::new();
+        let mut indices = std::collections::BTreeSet::new();
+        for opt in options {
+            if seen_agents.insert(opt.selection.agent_id.clone())
+                && let Some(index) =
+                    prefs.preferred_option_index_for_agent(options, &opt.selection.agent_id)
+            {
+                indices.insert(index);
+            }
+        }
+        indices
+    } else {
+        std::collections::BTreeSet::new()
+    };
     let option_views = options
         .iter()
         .enumerate()
@@ -9759,6 +9966,7 @@ fn build_runtime_views(
             // repeating under every model inside it.
             detail: String::new(),
             selected: matches_model(option),
+            preferred: preferred_indices.contains(&index),
             available: option.availability == RuntimeOptionAvailability::Available,
             // The provider, account or route this option draws from: what the
             // picker groups by, so a reader sees which models come from where
@@ -11481,5 +11689,242 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<ApplyPageAndOlderCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("apply-older-ok").unwrap();
+    }
+
+    fn test_runtime_option(
+        agent: &str,
+        provider_id: &str,
+        provider_label: &str,
+        model_id: &str,
+    ) -> vibex_core::SessionRuntimeOption {
+        vibex_core::SessionRuntimeOption {
+            selection: vibex_core::SessionRuntimeSelection {
+                agent_id: vibex_core::AgentId::parse(agent).unwrap(),
+                auth_source: vibex_core::RuntimeAuthSource::ProviderProfile {
+                    provider_profile_id: vibex_core::ProviderProfileId::parse(provider_id).unwrap(),
+                },
+                model: vibex_core::RuntimeModelSelection::Explicit {
+                    model_id: model_id.to_owned(),
+                },
+                reasoning_effort: None,
+                mode_id: None,
+                config_values: std::collections::BTreeMap::new(),
+            },
+            agent_label: agent.to_owned(),
+            auth_source_label: provider_label.to_owned(),
+            model_label: model_id.to_owned(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+            reasoning_efforts: vec![
+                vibex_core::SessionConfigValue {
+                    value: "low".to_owned(),
+                    label: Some("Low".to_owned()),
+                },
+                vibex_core::SessionConfigValue {
+                    value: "high".to_owned(),
+                    label: Some("High".to_owned()),
+                },
+            ],
+            modes: vec![
+                vibex_core::SessionConfigValue {
+                    value: "default".to_owned(),
+                    label: Some("Default".to_owned()),
+                },
+                vibex_core::SessionConfigValue {
+                    value: "plan".to_owned(),
+                    label: Some("Plan".to_owned()),
+                },
+            ],
+            features: vec![vibex_core::SessionRuntimeFeature {
+                id: "fast_mode".to_owned(),
+                label: "Fast mode".to_owned(),
+                description: None,
+                kind: vibex_core::SessionRuntimeFeatureKind::Toggle,
+                current_value: None,
+                default_value: None,
+                values: Vec::new(),
+            }],
+        }
+    }
+
+    #[test]
+    fn build_runtime_views_without_catalog_keeps_chip_available_and_preserves_raw_labels() {
+        let mut selection =
+            test_runtime_option("claude", "provider_openrouter", "OpenRouter", "claude-opus")
+                .selection;
+        selection.reasoning_effort = Some("high".to_owned());
+        selection.mode_id = Some("plan".to_owned());
+
+        let views = super::build_runtime_views(Some(&selection), &[], None);
+        let summary = views
+            .summary
+            .expect("summary should be built without catalog");
+        assert!(summary.available);
+        assert_eq!(summary.agent_id, "claude");
+        assert_eq!(summary.model, "claude-opus");
+        assert_eq!(summary.reasoning, "high");
+        assert_eq!(summary.mode, "plan");
+    }
+
+    #[test]
+    fn build_runtime_views_marks_each_agents_remembered_option_preferred() {
+        let _guard = super::tests::COPY_PREFERENCE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let previous = copy::preference();
+        copy::set_preference(copy::LanguagePreference::English);
+        let options = vec![
+            test_runtime_option("codex", "provider_openai", "OpenAI", "gpt-5.4"),
+            test_runtime_option("codex", "provider_azure", "Azure", "gpt-5.4-mini"),
+            test_runtime_option("claude", "provider_anthropic", "Anthropic", "claude-sonnet"),
+            test_runtime_option("claude", "provider_openrouter", "OpenRouter", "claude-opus"),
+        ];
+        let mut prefs = crate::runtime_prefs::RuntimePreferences::default();
+        prefs.remember(&options[3].selection, &options);
+        prefs.remember(&options[0].selection, &options);
+
+        let views = super::build_runtime_views(Some(&options[0].selection), &options, Some(&prefs));
+        assert!(views.options[0].selected && views.options[0].preferred);
+        assert!(!views.options[1].selected && !views.options[1].preferred);
+        assert!(!views.options[2].selected && !views.options[2].preferred);
+        assert!(!views.options[3].selected && views.options[3].preferred);
+        copy::set_preference(previous);
+    }
+
+    #[component]
+    fn RuntimeSelectionFlowCheckView() -> impl IntoElement {
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        *service.runtime_prefs.borrow_mut() = crate::runtime_prefs::RuntimePreferences::default();
+
+        let options = vec![
+            test_runtime_option("codex", "provider_openai", "OpenAI", "gpt-5.4"),
+            test_runtime_option("codex", "provider_azure", "Azure", "gpt-5.4-mini"),
+            test_runtime_option("claude", "provider_anthropic", "Anthropic", "claude-sonnet"),
+            test_runtime_option("claude", "provider_openrouter", "OpenRouter", "claude-opus"),
+        ];
+        *service.new_runtime_options.borrow_mut() = options.clone();
+        *service.new_runtime_selection.borrow_mut() = Some(options[0].selection.clone());
+        service.rebuild_new_runtime_views();
+
+        // Configure codex + azure + gpt-5.4-mini with low reasoning + fast_mode=true
+        service.choose_new_runtime("1");
+        service.choose_new_reasoning("low");
+        service.choose_new_feature("fast_mode", Some("true"));
+
+        // Switch Agent to claude -> pick openrouter + claude-opus + high + plan
+        service.choose_new_agent("claude");
+        assert_eq!(
+            service
+                .new_runtime_summary
+                .get_untracked()
+                .unwrap()
+                .agent_id,
+            "claude"
+        );
+        service.choose_new_runtime("3");
+        service.choose_new_reasoning("high");
+        service.choose_new_mode("plan");
+
+        // Switch Agent back to codex -> restores azure + gpt-5.4-mini + low + fast_mode=true
+        service.choose_new_agent("codex");
+        let codex_sel = service.new_runtime_selection.borrow().clone().unwrap();
+        assert_eq!(codex_sel.agent_id.as_str(), "codex");
+        assert_eq!(codex_sel.auth_source, options[1].selection.auth_source);
+        assert_eq!(codex_sel.model.model_id(), Some("gpt-5.4-mini"));
+        assert_eq!(codex_sel.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            codex_sel.config_values.get("fast_mode").map(String::as_str),
+            Some("true")
+        );
+
+        // Switch Agent back to claude -> restores openrouter + claude-opus + high + plan
+        service.choose_new_agent("claude");
+        let claude_sel = service.new_runtime_selection.borrow().clone().unwrap();
+        assert_eq!(claude_sel.auth_source, options[3].selection.auth_source);
+        assert_eq!(claude_sel.model.model_id(), Some("claude-opus"));
+        assert_eq!(claude_sel.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(claude_sel.mode_id.as_deref(), Some("plan"));
+
+        // Switch to another model (claude-sonnet) -> starts clean, then back to claude-opus -> restores high + plan
+        service.choose_new_runtime("2");
+        let sonnet_sel = service.new_runtime_selection.borrow().clone().unwrap();
+        assert_eq!(sonnet_sel.model.model_id(), Some("claude-sonnet"));
+        assert_eq!(sonnet_sel.reasoning_effort, None);
+        assert_eq!(sonnet_sel.mode_id, None);
+        service.choose_new_runtime("3");
+        let opus_again = service.new_runtime_selection.borrow().clone().unwrap();
+        assert_eq!(opus_again.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(opus_again.mode_id.as_deref(), Some("plan"));
+
+        // Live RuntimeSelection event updates an open existing session's composer chip
+        let session_id = vibex_core::VibexSessionId::new();
+        service.active.set(Some(session_id.as_str().to_owned()));
+        service.apply_event(vibex_backend::BackendEvent::RuntimeSelection(
+            vibex_core::AgentSessionRuntimeSelectionEvent {
+                session_id: session_id.clone(),
+                state: vibex_core::AgentSessionRuntimeSelectionState {
+                    desired: opus_again.clone(),
+                    effective: opus_again.clone(),
+                    status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+                    session_revision: 1,
+                    selection_revision: 1,
+                    current_binding_id: None,
+                    activation_generation: 1,
+                    pending_switch_id: None,
+                    actionable_error: None,
+                },
+                event: None,
+            },
+        ));
+        let live_summary = service
+            .runtime_summary
+            .get_untracked()
+            .expect("live runtime summary should update on RuntimeSelection event");
+        assert_eq!(live_summary.agent_id, "claude");
+        assert_eq!(live_summary.model, "claude-opus");
+        assert!(live_summary.available);
+
+        // Detached runtime update started from a transient Owner survives disposal
+        let detached_done = signal(false);
+        {
+            let transient = Owner::detached();
+            transient.run(|| {
+                super::detach(async move {
+                    let _ = crate::runtime::handle()
+                        .spawn(async move {
+                            tokio::time::sleep(Duration::from_millis(10)).await;
+                        })
+                        .await;
+                    detached_done.set(true);
+                });
+            });
+            transient.dispose();
+        }
+
+        service.shutdown();
+        view().child(text(move || {
+            if detached_done.get() {
+                "runtime-flow-ok"
+            } else {
+                "runtime-flow-waiting"
+            }
+        }))
+    }
+
+    #[test]
+    fn runtime_selection_remembers_agent_model_options_and_detached_refresh_survives_owner() {
+        let config = EngineConfig::new(Root::of::<RuntimeSelectionFlowCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("runtime-flow-ok").unwrap();
     }
 }

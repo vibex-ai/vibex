@@ -439,6 +439,7 @@ fn RuntimeShell() -> impl IntoElement {
             model: "Claude 4".to_owned(),
             detail: String::new(),
             selected: true,
+            preferred: false,
             available: true,
             source_key: "provider:claude".to_owned(),
             source_label: "Pro".to_owned(),
@@ -451,6 +452,7 @@ fn RuntimeShell() -> impl IntoElement {
             model: "GPT-5".to_owned(),
             detail: String::new(),
             selected: false,
+            preferred: false,
             available: true,
             source_key: "provider:codex".to_owned(),
             source_label: "Team".to_owned(),
@@ -463,6 +465,7 @@ fn RuntimeShell() -> impl IntoElement {
             model: "o3".to_owned(),
             detail: String::new(),
             selected: false,
+            preferred: false,
             available: true,
             source_key: "provider:openrouter".to_owned(),
             source_label: "OpenRouter".to_owned(),
@@ -1101,6 +1104,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             model: "Sonnet".to_owned(),
             detail: String::new(),
             selected: true,
+            preferred: false,
             available: true,
             source_key: "provider:claude".to_owned(),
             source_label: "Pro".to_owned(),
@@ -1113,6 +1117,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             model: "GPT-5".to_owned(),
             detail: String::new(),
             selected: false,
+            preferred: false,
             available: true,
             source_key: "provider:codex".to_owned(),
             source_label: "Team".to_owned(),
@@ -1141,6 +1146,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         busy: signal(false),
         on_open: Rc::new(move || new_runtime_open.set(true)),
         on_close: Rc::new(move || new_runtime_open.set(false)),
+        on_choose_agent: None,
         on_choose_runtime: Rc::new(move |id: &str| {
             let mut chosen = None;
             new_runtime_options.update(|options| {
@@ -3573,6 +3579,7 @@ fn ManyAgentsRuntimeShell() -> impl IntoElement {
                     source_label: provider.to_owned(),
                     detail: String::new(),
                     available: true,
+                    preferred: false,
                     selected,
                 },
             )

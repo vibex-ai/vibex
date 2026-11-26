@@ -24,6 +24,7 @@ mod migration;
 mod pairing;
 mod platform;
 mod runtime;
+mod runtime_prefs;
 mod session;
 mod settings;
 mod sidebar;
