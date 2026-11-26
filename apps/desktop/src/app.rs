@@ -54702,6 +54702,8 @@ impl VibexWorkbench {
                 let archive_pending = self
                     .pending_session_archive_ids
                     .contains(session.id.as_str());
+                let can_clone_to_instance =
+                    self.has_clone_target_instances() && !session.is_terminal();
                 div()
                     .id("title-session-actions")
                     .on_mouse_down(MouseButton::Left, |_, _, cx| cx.stop_propagation())
@@ -54720,6 +54722,7 @@ impl VibexWorkbench {
                                     session_id.clone(),
                                     session_title.clone(),
                                     pinned,
+                                    can_clone_to_instance,
                                     deletion_pending,
                                     archive_pending,
                                     tool_states.clone(),
@@ -55254,6 +55257,7 @@ impl VibexWorkbench {
         session_id: VibexSessionId,
         session_title: String,
         pinned: bool,
+        can_clone_to_instance: bool,
         deletion_pending: bool,
         archive_pending: bool,
         tool_states: Vec<SessionToolState>,
@@ -55267,10 +55271,12 @@ impl VibexWorkbench {
         Self::hold_sidebar_hover_preview_for_menu(&menu_entity, &entity, window, cx);
         let rename_entity = entity.clone();
         let pin_entity = entity.clone();
+        let clone_entity = entity.clone();
         let archive_entity = entity.clone();
         let delete_entity = entity;
         let rename_id = session_id.clone();
         let pin_id = session_id.clone();
+        let clone_id = session_id.clone();
         let archive_id = session_id.clone();
         let delete_id = session_id;
         let delete_label = strings.sidebar_delete;
@@ -55301,7 +55307,28 @@ impl VibexWorkbench {
                         let _ =
                             pin_entity.update(cx, |this, cx| this.toggle_session_pin(&pin_id, cx));
                     }),
-            )
+            );
+        if can_clone_to_instance {
+            menu = menu.item(
+                PopupMenuItem::new(locale::text(
+                    "Clone to Instance…",
+                    "克隆到其他实例…",
+                    "複製到其他執行個體…",
+                ))
+                .icon(sidebar_icon("icons/vibex/copy.svg"))
+                .disabled(deletion_pending || archive_pending)
+                .on_click(move |_, window, cx| {
+                    let _ = clone_entity.update(cx, |this, cx| {
+                        this.open_session_clone_dialog(
+                            session_clone::CloneSourceRequest::Sessions(vec![clone_id.clone()]),
+                            window,
+                            cx,
+                        );
+                    });
+                }),
+            );
+        }
+        menu = menu
             .separator()
             // A read-only group, not a command: these are the session's
             // answers, and the session cannot change them while it runs.

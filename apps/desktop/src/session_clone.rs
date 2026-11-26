@@ -37,12 +37,14 @@ use vibex_core::{
     AgentRuntimeOptionProbeRequest, AgentSession, AgentSnapshotEntry, AgentUpdateConfigRequest,
     CLONED_PREFERRED_RUNTIME_SELECTION_DIAGNOSTIC, ExportedCloneSession, ImportCloneSessionEntry,
     MAX_CLONE_SESSIONS_PER_BUNDLE, ModelProviderCatalogEntry, ModelProviderCredentialSecretRequest,
-    ModelProviderProfile, ModelProviderProfileCreateRequest, ModelProviderProfileId,
-    ModelProviderProfileStatus, ModelProviderProfileUpdateRequest, OpenWorkspaceRequest, ProjectId,
-    ProjectRecord, ProviderProfileId, ProviderProfileSummary, RuntimeAuthSource,
-    RuntimeModelSelection, SessionCloneBundle, SessionCloneExportRequest,
-    SessionCloneImportRequest, SessionRuntimeSelection, VibexSessionId, WorkspaceId, WorkspaceMode,
-    WorkspaceRecord, unix_timestamp_ms,
+    ModelProviderHeaderValue, ModelProviderProfile, ModelProviderProfileCreateRequest,
+    ModelProviderProfileId, ModelProviderProfileStatus, ModelProviderProfileUpdateRequest,
+    OpenWorkspaceRequest, ProjectId, ProjectRecord, ProviderProfileId, ProviderProfileSummary,
+    RemoteSidebarDropPosition, RemoteSidebarItemKind, RemoteSidebarItemRef,
+    RemoteSidebarOrganizationMutation, RuntimeAuthSource, RuntimeModelSelection,
+    SessionCloneBundle, SessionCloneExportRequest, SessionCloneImportRequest,
+    SessionRuntimeSelection, VibexSessionId, WorkspaceId, WorkspaceMode, WorkspaceRecord,
+    unix_timestamp_ms,
 };
 use vibex_desktop_model::{
     LocaleMode, SessionGroupUiState, SidebarAuthorityArrangement, SidebarFolderUiState,
@@ -676,17 +678,254 @@ fn collect_relevant_pins(
         .collect()
 }
 
+pub(super) struct ClonedSidebarApply<'a> {
+    pub authority_key: &'a str,
+    pub scope: &'a CollectedCloneScope,
+    pub target_project_id: &'a ProjectId,
+    pub target_workspace_id: &'a WorkspaceId,
+    pub session_id_map: &'a HashMap<String, String>,
+    pub mirrored_ids: &'a RemoteMirroredIds,
+    pub now_ms: i64,
+}
+
+#[derive(Default)]
+pub(super) struct RemoteMirroredIds {
+    pub folder_ids: HashMap<String, String>,
+    pub group_ids: HashMap<String, String>,
+}
+
+async fn mirror_cloned_organization_to_remote_sidebar(
+    target_backend: &BackendFacade,
+    scope: &CollectedCloneScope,
+    target_project_id: &ProjectId,
+    target_workspace_id: &WorkspaceId,
+    session_id_map: &HashMap<String, String>,
+) -> RemoteMirroredIds {
+    let mut mirrored = RemoteMirroredIds::default();
+    let has_organization = !scope.folders.is_empty()
+        || !scope.groups.is_empty()
+        || !scope.placements.is_empty()
+        || !scope.pinned_session_ids.is_empty();
+    if !has_organization {
+        return mirrored;
+    }
+
+    // Headless `vibex-server` instances do not host a Desktop sidebar bridge and
+    // return `unsupported` here immediately; Desktop-hosted remote authorities
+    // return their live snapshot so both shells share identical folder/group IDs.
+    let Ok(mut snapshot) = target_backend.sidebar().sidebar_organization().await else {
+        return mirrored;
+    };
+
+    let parent_by_old_item: HashMap<(u8, &str), Option<&str>> = scope
+        .placements
+        .iter()
+        .map(|placement| {
+            let key = match &placement.item {
+                SidebarOrganizationItem::Folder(id) => (0u8, id.as_str()),
+                SidebarOrganizationItem::Group(id) => (1u8, id.as_str()),
+                SidebarOrganizationItem::Session(id) => (2u8, id.as_str()),
+                SidebarOrganizationItem::Project(id) => (3u8, id.as_str()),
+            };
+            (key, placement.parent_folder_id.as_deref())
+        })
+        .collect();
+
+    for (old_folder_id, folder) in &scope.folders {
+        let parent_folder_id = if scope.root_folder_id.as_deref() == Some(old_folder_id.as_str()) {
+            None
+        } else {
+            parent_by_old_item
+                .get(&(0u8, old_folder_id.as_str()))
+                .copied()
+                .flatten()
+                .and_then(|old_parent| mirrored.folder_ids.get(old_parent).cloned())
+        };
+        let workspace_id = folder
+            .workspace_id
+            .as_ref()
+            .map(|_| target_workspace_id.as_str().to_string());
+        let before_ids: BTreeSet<String> = snapshot.folders.iter().map(|f| f.id.clone()).collect();
+        if let Ok(next_snap) = target_backend
+            .sidebar()
+            .mutate_sidebar_organization(
+                RemoteSidebarOrganizationMutation::CreateFolder {
+                    name: folder.name.clone(),
+                    project_id: Some(target_project_id.as_str().to_string()),
+                    workspace_id,
+                    parent_folder_id,
+                },
+                None,
+            )
+            .await
+        {
+            if let Some(created) = next_snap
+                .folders
+                .iter()
+                .find(|f| !before_ids.contains(&f.id))
+            {
+                let created_id = created.id.clone();
+                mirrored
+                    .folder_ids
+                    .insert(old_folder_id.clone(), created_id.clone());
+                snapshot = next_snap;
+                if let Some(days) = folder.auto_archive_after_days
+                    && let Ok(updated_snap) = target_backend
+                        .sidebar()
+                        .mutate_sidebar_organization(
+                            RemoteSidebarOrganizationMutation::SetFolderAutoArchive {
+                                folder_id: created_id,
+                                days: Some(days),
+                            },
+                            None,
+                        )
+                        .await
+                {
+                    snapshot = updated_snap;
+                }
+            } else {
+                snapshot = next_snap;
+            }
+        }
+    }
+
+    let session_id_btree: BTreeMap<String, String> = session_id_map
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    for (old_group_id, group) in &scope.groups {
+        let Some(remapped_group) = group.remap_sessions(
+            target_project_id.as_str(),
+            target_workspace_id.as_str(),
+            &session_id_btree,
+        ) else {
+            continue;
+        };
+        let parent_folder_id = parent_by_old_item
+            .get(&(1u8, old_group_id.as_str()))
+            .copied()
+            .flatten()
+            .and_then(|old_parent| mirrored.folder_ids.get(old_parent).cloned());
+        let before_ids: BTreeSet<String> = snapshot.groups.iter().map(|g| g.id.clone()).collect();
+        if let Ok(next_snap) = target_backend
+            .sidebar()
+            .mutate_sidebar_organization(
+                RemoteSidebarOrganizationMutation::CreateGroup {
+                    name: remapped_group.name.clone(),
+                    project_id: target_project_id.as_str().to_string(),
+                    workspace_id: target_workspace_id.as_str().to_string(),
+                    member_session_ids: remapped_group.member_session_ids.clone(),
+                    parent_folder_id,
+                },
+                None,
+            )
+            .await
+        {
+            if let Some(created) = next_snap
+                .groups
+                .iter()
+                .find(|g| !before_ids.contains(&g.id))
+            {
+                let created_id = created.id.clone();
+                mirrored
+                    .group_ids
+                    .insert(old_group_id.clone(), created_id.clone());
+                snapshot = next_snap;
+                if remapped_group.pinned
+                    && let Ok(updated_snap) = target_backend
+                        .sidebar()
+                        .mutate_sidebar_organization(
+                            RemoteSidebarOrganizationMutation::SetGroupPinned {
+                                group_id: created_id.clone(),
+                                pinned: true,
+                            },
+                            None,
+                        )
+                        .await
+                {
+                    snapshot = updated_snap;
+                }
+                if let Some(enabled) = remapped_group.auto_continue
+                    && let Ok(updated_snap) = target_backend
+                        .sidebar()
+                        .mutate_sidebar_organization(
+                            RemoteSidebarOrganizationMutation::SetGroupAutoContinue {
+                                group_id: created_id,
+                                enabled,
+                            },
+                            None,
+                        )
+                        .await
+                {
+                    snapshot = updated_snap;
+                }
+            } else {
+                snapshot = next_snap;
+            }
+        }
+    }
+
+    for placement in &scope.placements {
+        if let SidebarOrganizationItem::Session(old_sid) = &placement.item
+            && let Some(new_sid) = session_id_map.get(old_sid)
+            && let Some(old_parent) = placement.parent_folder_id.as_ref()
+            && let Some(new_parent) = mirrored.folder_ids.get(old_parent)
+        {
+            let _ = target_backend
+                .sidebar()
+                .mutate_sidebar_organization(
+                    RemoteSidebarOrganizationMutation::MoveItems {
+                        items: vec![RemoteSidebarItemRef {
+                            kind: RemoteSidebarItemKind::Session,
+                            id: new_sid.clone(),
+                        }],
+                        anchor: Some(RemoteSidebarItemRef {
+                            kind: RemoteSidebarItemKind::Folder,
+                            id: new_parent.clone(),
+                        }),
+                        position: RemoteSidebarDropPosition::Into,
+                        project_id: Some(target_project_id.as_str().to_string()),
+                    },
+                    None,
+                )
+                .await;
+        }
+    }
+
+    for old_pinned in &scope.pinned_session_ids {
+        if let Some(new_session_id) = session_id_map.get(old_pinned) {
+            let _ = target_backend
+                .sidebar()
+                .mutate_sidebar_organization(
+                    RemoteSidebarOrganizationMutation::SetSessionPinned {
+                        session_id: new_session_id.clone(),
+                        pinned: true,
+                    },
+                    None,
+                )
+                .await;
+        }
+    }
+
+    mirrored
+}
+
 pub(super) fn merge_cloned_organization_into_arrangement(
     arrangement: &mut SidebarAuthorityArrangement,
     scope: &CollectedCloneScope,
     target_project_id: &ProjectId,
     target_workspace_id: &WorkspaceId,
     session_id_map: &HashMap<String, String>,
+    mirrored_ids: &RemoteMirroredIds,
     now_ms: i64,
-) {
+) -> BTreeSet<String> {
     let mut folder_id_map: HashMap<String, String> = HashMap::new();
     for (idx, (old_folder_id, folder)) in scope.folders.iter().enumerate() {
-        let new_folder_id = format!("folder_clone_{now_ms}_{idx}");
+        let new_folder_id = mirrored_ids
+            .folder_ids
+            .get(old_folder_id)
+            .cloned()
+            .unwrap_or_else(|| format!("folder_clone_{now_ms}_{idx}"));
         folder_id_map.insert(old_folder_id.clone(), new_folder_id.clone());
         let workspace_id = folder
             .workspace_id
@@ -708,6 +947,7 @@ pub(super) fn merge_cloned_organization_into_arrangement(
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let mut group_id_map: HashMap<String, String> = HashMap::new();
+    let mut created_group_ids = BTreeSet::new();
     for (idx, (old_group_id, group)) in scope.groups.iter().enumerate() {
         let Some(remapped_group) = group.remap_sessions(
             target_project_id.as_str(),
@@ -716,8 +956,13 @@ pub(super) fn merge_cloned_organization_into_arrangement(
         ) else {
             continue;
         };
-        let new_group_id = format!("group_clone_{now_ms}_{idx}");
+        let new_group_id = mirrored_ids
+            .group_ids
+            .get(old_group_id)
+            .cloned()
+            .unwrap_or_else(|| format!("group_clone_{now_ms}_{idx}"));
         group_id_map.insert(old_group_id.clone(), new_group_id.clone());
+        created_group_ids.insert(new_group_id.clone());
         arrangement
             .organization
             .groups
@@ -769,6 +1014,19 @@ pub(super) fn merge_cloned_organization_into_arrangement(
                 .insert(new_session_id.clone());
         }
     }
+    for old_sid in scope.session_ids.iter().rev() {
+        if let Some(new_sid) = session_id_map.get(old_sid.as_str())
+            && !arrangement
+                .session_order
+                .iter()
+                .any(|existing| existing == new_sid)
+        {
+            arrangement.session_order.insert(0, new_sid.clone());
+        }
+    }
+    arrangement
+        .collapsed_project_ids
+        .remove(target_project_id.as_str());
     if !arrangement
         .project_order
         .iter()
@@ -779,6 +1037,8 @@ pub(super) fn merge_cloned_organization_into_arrangement(
             .insert(0, target_project_id.as_str().to_string());
     }
     arrangement.organization.normalize();
+    created_group_ids.retain(|id| arrangement.organization.groups.contains_key(id));
+    created_group_ids
 }
 
 fn normalize_url_key(url: Option<&str>) -> String {
@@ -1290,7 +1550,17 @@ async fn map_and_sync_providers_for_clone(
                             credentials: Vec::new(),
                             configured_models,
                             default_model_id: mp.default_model_id.clone(),
-                            headers: Vec::new(),
+                            headers: mp
+                                .headers
+                                .iter()
+                                .filter(|header| {
+                                    !matches!(
+                                        header.value,
+                                        ModelProviderHeaderValue::SecretReference(_)
+                                    )
+                                })
+                                .cloned()
+                                .collect(),
                             metadata: mp.metadata.clone(),
                             status: ModelProviderProfileStatus::Enabled,
                         }
@@ -1938,6 +2208,8 @@ impl SessionCloneDialog {
         self.phase = CloneDialogPhase::Cloning;
         cx.notify();
 
+        let scope_for_runner = scope.clone();
+        let target_is_remote = target_instance.id != LOCAL_RUNTIME_ID;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let confirmed_root = if open_new_directory {
                 let opened = target_backend
@@ -2011,11 +2283,27 @@ impl SessionCloneDialog {
                 }
             }
 
+            let mirrored_ids = if target_is_remote
+                && let (Some(pid), Some(wid)) = (&target_project_id, &target_workspace_id)
+            {
+                mirror_cloned_organization_to_remote_sidebar(
+                    &target_backend,
+                    &scope_for_runner,
+                    pid,
+                    wid,
+                    &session_id_map,
+                )
+                .await
+            } else {
+                RemoteMirroredIds::default()
+            };
+
             Ok::<_, String>((
                 target_project_id,
                 target_workspace_id,
                 confirmed_root,
                 session_id_map,
+                mirrored_ids,
                 first_target_session_id,
                 imported_session_count,
                 restorable_native_count,
@@ -2034,6 +2322,7 @@ impl SessionCloneDialog {
                             Some(target_workspace_id),
                             confirmed_root,
                             session_id_map,
+                            mirrored_ids,
                             first_target_session_id,
                             imported_session_count,
                             restorable_native_count,
@@ -2042,20 +2331,15 @@ impl SessionCloneDialog {
                             let authority_key = target_instance.authority_key.clone();
                             let now_ms = unix_timestamp_ms();
                             let _ = workbench.update(cx, |wb, cx| {
-                                wb.ui_state.sidebar.mutate_arrangement_for(
-                                    &authority_key,
-                                    |arrangement| {
-                                        merge_cloned_organization_into_arrangement(
-                                            arrangement,
-                                            &scope,
-                                            &target_project_id,
-                                            &target_workspace_id,
-                                            &session_id_map,
-                                            now_ms,
-                                        );
-                                    },
-                                );
-                                wb.queue_ui_state();
+                                wb.apply_cloned_organization_to_sidebar(ClonedSidebarApply {
+                                    authority_key: &authority_key,
+                                    scope: &scope,
+                                    target_project_id: &target_project_id,
+                                    target_workspace_id: &target_workspace_id,
+                                    session_id_map: &session_id_map,
+                                    mirrored_ids: &mirrored_ids,
+                                    now_ms,
+                                });
                                 cx.notify();
                             });
 
@@ -2931,7 +3215,88 @@ impl VibexWorkbench {
     /// desktop registry (e.g. embedded `local` + >= 1 paired remote, or >= 2
     /// paired remotes).
     pub(super) fn has_clone_target_instances(&self) -> bool {
-        !self.runtime_registry.runtimes.is_empty()
+        let active_id = self.runtime_registry.active_runtime_id();
+        self.runtime_registry
+            .runtimes
+            .iter()
+            .any(|runtime| runtime.id != active_id)
+            || (active_id != LOCAL_RUNTIME_ID && self.runtime.is_some())
+    }
+
+    pub(super) fn apply_cloned_organization_to_sidebar(&mut self, params: ClonedSidebarApply<'_>) {
+        let ClonedSidebarApply {
+            authority_key,
+            scope,
+            target_project_id,
+            target_workspace_id,
+            session_id_map,
+            mirrored_ids,
+            now_ms,
+        } = params;
+        let is_active_authority = self.ui_state.sidebar.active_authority() == authority_key;
+        if is_active_authority {
+            self.queue_agent_ui_state();
+        }
+        let mut created_group_ids = BTreeSet::new();
+        self.ui_state
+            .sidebar
+            .mutate_arrangement_for(authority_key, |arrangement| {
+                created_group_ids = merge_cloned_organization_into_arrangement(
+                    arrangement,
+                    scope,
+                    target_project_id,
+                    target_workspace_id,
+                    session_id_map,
+                    mirrored_ids,
+                    now_ms,
+                );
+            });
+
+        if authority_key == SidebarUiState::LOCAL_AUTHORITY
+            && !created_group_ids.is_empty()
+            && let Some(runtime) = self.runtime.clone()
+        {
+            let revision = self
+                .sidebar_organization_view_for(SidebarUiState::LOCAL_AUTHORITY)
+                .revision;
+            self.ui_state.sidebar.mutate_arrangement_for(
+                SidebarUiState::LOCAL_AUTHORITY,
+                |arrangement| {
+                    for group_id in &created_group_ids {
+                        let Some(group) = arrangement.organization.group_mut(group_id) else {
+                            continue;
+                        };
+                        group.disable_automatic_layout();
+                        let name = group.name.clone();
+                        let members = group
+                            .member_session_ids
+                            .iter()
+                            .filter_map(|id| VibexSessionId::parse(id).ok())
+                            .collect::<Vec<_>>();
+                        let applied = group.observed_layout();
+                        let layout = vibex_core::SessionGroupLayoutIntent {
+                            preset: applied.preset,
+                            lead_session_ref: applied.visible_session_refs.first().cloned(),
+                            preferred_live_panes: Some(applied.live_panes.max(1)),
+                        };
+                        let _ = runtime
+                            .vibex_use()
+                            .sync_user_group(group_id, &name, &members, &layout, revision);
+                    }
+                },
+            );
+        }
+
+        if is_active_authority {
+            self.sidebar_state.row_order = self.ui_state.sidebar.session_order.clone();
+            self.sidebar_state.pinned_ids = self.ui_state.sidebar.pinned_session_ids.clone();
+            self.sidebar_state.collapsed_ids = self.ui_state.sidebar.collapsed_project_ids.clone();
+            self.invalidate_sidebar_projection_cache();
+            self.publish_sidebar_invalidation();
+            self.queue_agent_ui_state();
+        } else {
+            self.queue_ui_state();
+        }
     }
 
     pub(super) fn active_instance_display_label(&self) -> String {
@@ -3724,17 +4089,31 @@ mod tests {
         };
         let mut map = HashMap::new();
         map.insert("session_1".to_string(), "session_target_1".to_string());
-        merge_cloned_organization_into_arrangement(
+        let mut mirrored = RemoteMirroredIds::default();
+        mirrored
+            .group_ids
+            .insert("grp_1".to_string(), "remote_grp_42".to_string());
+        let created_groups = merge_cloned_organization_into_arrangement(
             &mut arrangement,
             &scope,
             &ProjectId::parse("project_target").unwrap(),
             &WorkspaceId::parse("workspace_target").unwrap(),
             &map,
+            &mirrored,
             999,
         );
+        assert!(created_groups.contains("remote_grp_42"));
         assert!(arrangement.pinned_session_ids.contains("session_target_1"));
+        assert_eq!(
+            arrangement.session_order.first().map(String::as_str),
+            Some("session_target_1")
+        );
         assert_eq!(arrangement.organization.groups.len(), 1);
-        let cloned_group = arrangement.organization.groups.values().next().unwrap();
+        let cloned_group = arrangement
+            .organization
+            .groups
+            .get("remote_grp_42")
+            .expect("mirrored group id should be preserved");
         assert_eq!(
             cloned_group.member_session_ids,
             vec!["session_target_1".to_string()]
