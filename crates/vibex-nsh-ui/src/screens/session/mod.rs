@@ -595,14 +595,14 @@ pub struct CommandEntry {
 }
 
 /// Asks for the commands matching what follows `/`.
-type CommandQuery = Rc<dyn Fn(&str)>;
+pub(crate) type CommandQuery = Rc<dyn Fn(&str)>;
 
 /// Asks for the references matching what follows `@`.
-type MentionQuery = Rc<dyn Fn(&str)>;
+pub(crate) type MentionQuery = Rc<dyn Fn(&str)>;
 
 /// Which prefix opened the palette.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum PaletteKind {
+pub(crate) enum PaletteKind {
     Slash,
     Mention,
     Skill,
@@ -1257,6 +1257,13 @@ fn shell(
         on_attach_image: host.on_attach_new_image.clone(),
         on_attach_file: host.on_attach_new_file.clone(),
         on_remove_attachment: host.on_remove_new_attachment.clone(),
+        commands: host.commands,
+        mentions: host.mentions,
+        skills: host.skills,
+        on_command_query: host.on_command_query.clone(),
+        on_mention_query: host.on_mention_query.clone(),
+        on_skill_query: host.on_skill_query.clone(),
+        on_arm_entry: host.on_arm_entry.clone(),
         worktree_branch: host.new_worktree_branch,
         base_ref: host.new_base_ref,
         on_create_worktree: host.on_create_worktree_session.clone(),
@@ -1339,43 +1346,12 @@ fn shell(
                             )
                         }),
                 )
-                .child(when(
-                    move || {
-                        host.draft.with(|draft| draft.starts_with('/'))
-                            && !host.commands.with(|commands| commands.is_empty())
-                    },
-                    {
-                        let commands = host.commands;
-                        let draft = host.draft;
-                        let on_arm = host.on_arm_entry.clone();
-                        move || command_palette(commands, draft, PaletteKind::Slash, on_arm.clone())
-                    },
-                ))
-                .child(when(
-                    move || {
-                        mention_query(&host.draft.get()).is_some()
-                            && !host.mentions.with(|mentions| mentions.is_empty())
-                    },
-                    {
-                        let mentions = host.mentions;
-                        let draft = host.draft;
-                        let on_arm = host.on_arm_entry.clone();
-                        move || {
-                            command_palette(mentions, draft, PaletteKind::Mention, on_arm.clone())
-                        }
-                    },
-                ))
-                .child(when(
-                    move || {
-                        skill_query(&host.draft.get()).is_some()
-                            && !host.skills.with(|skills| skills.is_empty())
-                    },
-                    {
-                        let skills = host.skills;
-                        let draft = host.draft;
-                        let on_arm = host.on_arm_entry.clone();
-                        move || command_palette(skills, draft, PaletteKind::Skill, on_arm.clone())
-                    },
+                .child(composer_palettes(
+                    host.draft,
+                    host.commands,
+                    host.mentions,
+                    host.skills,
+                    host.on_arm_entry.clone(),
                 ))
                 .child(when(move || host.pending.get().is_some(), {
                     let pending = host.pending;
@@ -4305,10 +4281,96 @@ fn error_card(body: Memo<String>, query: Signal<String>, active: Memo<bool>) -> 
     )
 }
 
-/// The `/` command palette, above the composer.
+/// Dispatches `/`, `@`, and `$` composer trigger queries for the current draft.
+pub(crate) fn trigger_composer_palettes(
+    text: &str,
+    commands: Signal<Vec<CommandEntry>>,
+    mentions: Signal<Vec<CommandEntry>>,
+    skills: Signal<Vec<CommandEntry>>,
+    on_command: &CommandQuery,
+    on_mention: &MentionQuery,
+    on_skill: &MentionQuery,
+) {
+    match slash_query(text) {
+        Some(query) => on_command(query),
+        None => commands.set(Vec::new()),
+    }
+    match mention_query(text) {
+        Some(query) => on_mention(&query),
+        None => mentions.set(Vec::new()),
+    }
+    match skill_query(text) {
+        Some(query) => on_skill(&query),
+        None => skills.set(Vec::new()),
+    }
+}
+
+/// The `/`, `@`, and `$` palettes stacked above a composer.
+pub(crate) fn composer_palettes(
+    draft: Signal<String>,
+    commands: Signal<Vec<CommandEntry>>,
+    mentions: Signal<Vec<CommandEntry>>,
+    skills: Signal<Vec<CommandEntry>>,
+    on_arm: Rc<dyn Fn(&str)>,
+) -> impl IntoElement {
+    view()
+        .w_full()
+        .flex_shrink_0()
+        .flex_col()
+        .child(when(
+            move || palette_has_matches(draft, commands, PaletteKind::Slash),
+            {
+                let on_arm = on_arm.clone();
+                move || command_palette(commands, draft, PaletteKind::Slash, on_arm.clone())
+            },
+        ))
+        .child(when(
+            move || palette_has_matches(draft, mentions, PaletteKind::Mention),
+            {
+                let on_arm = on_arm.clone();
+                move || command_palette(mentions, draft, PaletteKind::Mention, on_arm.clone())
+            },
+        ))
+        .child(when(
+            move || palette_has_matches(draft, skills, PaletteKind::Skill),
+            move || command_palette(skills, draft, PaletteKind::Skill, on_arm.clone()),
+        ))
+}
+
+fn palette_query(draft: &str, kind: PaletteKind) -> Option<String> {
+    match kind {
+        PaletteKind::Slash => slash_query(draft).map(|query| query.trim().to_lowercase()),
+        PaletteKind::Mention => mention_query(draft).map(|query| query.trim().to_lowercase()),
+        PaletteKind::Skill => skill_query(draft).map(|query| query.trim().to_lowercase()),
+    }
+}
+
+fn palette_entry_matches(entry: &CommandEntry, query: &str) -> bool {
+    query.is_empty()
+        || entry.label.to_lowercase().contains(query)
+        || entry.insertion.to_lowercase().contains(query)
+        || entry.description.to_lowercase().contains(query)
+}
+
+fn palette_has_matches(
+    draft: Signal<String>,
+    entries: Signal<Vec<CommandEntry>>,
+    kind: PaletteKind,
+) -> bool {
+    let Some(query) = draft.with(|draft| palette_query(draft, kind)) else {
+        return false;
+    };
+    entries.with(|entries| {
+        entries
+            .iter()
+            .any(|entry| palette_entry_matches(entry, &query))
+    })
+}
+
+/// The `/`, `@`, or `$` command palette, above the composer.
 ///
-/// The list is what the session's runtime offers, narrowed by the text after
-/// the slash; pressing a row writes its insertion into the composer.
+/// The list is what the runtime offers, narrowed by the active trigger's
+/// fragment; pressing a row writes its insertion into the composer.
 fn command_palette(
     commands: Signal<Vec<CommandEntry>>,
     draft: Signal<String>,
@@ -4329,21 +4391,13 @@ fn command_palette(
                         .max_h(px(240.0))
                         .child(view().flex_col().child(each(
                             move || {
-                                let query = draft.with(|draft| {
-                                    draft
-                                        .strip_prefix('/')
-                                        .unwrap_or_default()
-                                        .trim()
-                                        .to_lowercase()
-                                });
+                                let query = draft
+                                    .with(|draft| palette_query(draft, kind))
+                                    .unwrap_or_default();
                                 commands.with(|commands| {
                                     commands
                                         .iter()
-                                        .filter(|command| {
-                                            query.is_empty()
-                                                || command.label.to_lowercase().contains(&query)
-                                                || command.insertion.to_lowercase().contains(&query)
-                                        })
+                                        .filter(|command| palette_entry_matches(command, &query))
                                         .cloned()
                                         .collect::<Vec<_>>()
                                 })
@@ -5093,18 +5147,15 @@ fn composer(
                 ))
                 .child(
                     compose::field(draft, compose::placeholder(), move |text: &str| {
-                        match text.strip_prefix('/') {
-                            Some(query) => on_query(query),
-                            None => commands.set(Vec::new()),
-                        }
-                        match mention_query(text) {
-                            Some(query) => on_mention(&query),
-                            None => mentions.set(Vec::new()),
-                        }
-                        match skill_query(text) {
-                            Some(query) => on_skill(&query),
-                            None => skills.set(Vec::new()),
-                        }
+                        trigger_composer_palettes(
+                            text,
+                            commands,
+                            mentions,
+                            skills,
+                            &on_query,
+                            &on_mention,
+                            &on_skill,
+                        );
                     })
                     .element_ref(&composer_input),
                 )
@@ -5989,9 +6040,6 @@ pub(crate) fn runtime_sheet(
                 .collect()
         });
     });
-    let finish_reasoning = close.clone();
-    let finish_mode = close.clone();
-    let finish_options = close.clone();
     bottom_sheet(
         move || open.get(),
         {
@@ -6003,7 +6051,7 @@ pub(crate) fn runtime_sheet(
             .max_h(move || px(window().height.0 * 0.78))
             .min_h(px(0.0))
             .child(sheet_header(
-                copy::text("Agent settings", "Agent 设置", "Agent 設定"),
+                copy::text("Session settings", "会话设置", "工作階段設定"),
                 move || {
                     dismiss_keyboard();
                     close();
@@ -6404,7 +6452,6 @@ pub(crate) fn runtime_sheet(
                                     reasoning,
                                     busy,
                                     host.on_choose_reasoning.clone(),
-                                    finish_reasoning.clone(),
                                 )
                             },
                         ))
@@ -6415,7 +6462,6 @@ pub(crate) fn runtime_sheet(
                                     modes,
                                     busy,
                                     host.on_choose_mode.clone(),
-                                    finish_mode.clone(),
                                 )
                             },
                         ))
@@ -6426,7 +6472,6 @@ pub(crate) fn runtime_sheet(
                                     features,
                                     busy,
                                     host.on_choose_feature.clone(),
-                                    finish_options.clone(),
                                 )
                             },
                         )),
@@ -6439,7 +6484,6 @@ fn choice_section(
     choices: Signal<Vec<RuntimeChoiceView>>,
     busy: Signal<bool>,
     on_choose: Rc<dyn Fn(&str)>,
-    close: Action,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -6452,13 +6496,11 @@ fn choice_section(
             move |choice, _| {
                 let value = choice.with(|choice| choice.value.clone());
                 let on_choose = on_choose.clone();
-                let close = close.clone();
                 surface::choice_pill(
                     move || choice.with(|choice| choice.label.clone()),
                     move || choice.with(|choice| choice.selected),
                     move || {
                         on_choose(&value);
-                        close();
                     },
                 )
                 .disabled(move || busy.get())
@@ -6470,7 +6512,6 @@ fn feature_section(
     features: Signal<Vec<RuntimeFeatureView>>,
     busy: Signal<bool>,
     on_choose: ChooseFeature,
-    close: Action,
 ) -> impl IntoElement {
     view()
         .w_full()
@@ -6481,7 +6522,6 @@ fn feature_section(
             |feature| feature.id.clone(),
             move |feature, _| {
                 let on_choose = on_choose.clone();
-                let close = close.clone();
                 view()
                     .w_full()
                     .gap(px(theme::SPACING_SM))
@@ -6537,13 +6577,11 @@ fn feature_section(
                                 let selected = value == snapshot.explicit_value;
                                 let id = snapshot.id.clone();
                                 let on_choose = on_choose.clone();
-                                let close = close.clone();
                                 surface::choice_pill(
                                     move || label.clone(),
                                     move || selected,
                                     move || {
                                         on_choose(&id, value.as_deref());
-                                        close();
                                     },
                                 )
                                 .disabled(move || busy.get())
@@ -7437,6 +7475,19 @@ fn runtime_mark_svg(model_id: &str, agent_id: &str) -> ImageSrc {
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
         .map(ImageSrc::svg_markup)
         .unwrap_or_else(|| icon!("sparkles"))
+}
+
+/// The Agent's own brand mark for the new-session hero, matching the desktop
+/// slogan line: resolve by Agent identity first, then fall back to the chosen
+/// model's brand mark and finally the generic Agent glyph.
+pub(crate) fn agent_mark_svg(agent_id: &str, agent_label: &str, model_id: &str) -> ImageSrc {
+    let identity = format!("{agent_id} {agent_label}");
+    vibex_brands::agent_mark(&identity)
+        .or_else(|| vibex_brands::model_mark(model_id))
+        .and_then(|mark| vibex_brands::mark_bytes(mark.path))
+        .and_then(|bytes| std::str::from_utf8(bytes).ok())
+        .map(ImageSrc::svg_markup)
+        .unwrap_or_else(|| ImageSrc::svg_markup(include_str!("../../../assets/icons/bot.svg")))
 }
 
 /// The unified composer trigger for Agent settings, shared between open
@@ -8713,8 +8764,17 @@ fn folder_archive_label(days: Option<u8>) -> String {
     }
 }
 
+/// What was typed after a leading `/` while it is still one command token.
+pub(crate) fn slash_query(text: &str) -> Option<&str> {
+    let after = text.strip_prefix('/')?;
+    if after.chars().any(char::is_whitespace) {
+        return None;
+    }
+    Some(after)
+}
+
 /// What was typed after `@` when it is still one reference, if any.
-fn mention_query(text: &str) -> Option<String> {
+pub(crate) fn mention_query(text: &str) -> Option<String> {
     let at = text.rfind('@')?;
     let after = &text[at + 1..];
     if after.chars().any(char::is_whitespace) {
@@ -8740,7 +8800,7 @@ fn insert_mention(text: &str, insertion: &str) -> String {
 }
 
 /// What was typed after `$` when it is still one skill name, if any.
-fn skill_query(text: &str) -> Option<String> {
+pub(crate) fn skill_query(text: &str) -> Option<String> {
     let at = text.rfind('$')?;
     let after = &text[at + 1..];
     if after.chars().any(char::is_whitespace) {
@@ -8809,5 +8869,59 @@ mod tests {
 
         let agent = super::runtime_mark_svg("no-such-model-xyz", "claude");
         assert_ne!(agent, sparkle, "the Agent's own mark answers second");
+    }
+
+    #[test]
+    fn agent_mark_prefers_agent_identity_then_model_then_bot() {
+        let bot = nsh_core::element::ImageSrc::svg_markup(include_str!(
+            "../../../assets/icons/bot.svg"
+        ));
+        let claude = super::agent_mark_svg("claude", "Claude Code", "deepseek-chat");
+        let deepseek_model = super::runtime_mark_svg("deepseek-chat", "");
+        assert_ne!(claude, bot);
+        assert_ne!(
+            claude, deepseek_model,
+            "known Agent identity wins over model brand on the new-session hero"
+        );
+
+        let custom_with_model =
+            super::agent_mark_svg("custom-agent", "Custom", "deepseek-chat");
+        assert_eq!(
+            custom_with_model, deepseek_model,
+            "unknown Agent falls back to the selected model's brand mark"
+        );
+
+        let unknown = super::agent_mark_svg("custom-agent", "Custom", "unknown-model");
+        assert_eq!(unknown, bot);
+    }
+
+    #[test]
+    fn palette_queries_match_slash_mention_and_skill_independently() {
+        assert_eq!(super::slash_query("/"), Some(""));
+        assert_eq!(super::slash_query("/rev"), Some("rev"));
+        assert_eq!(super::slash_query("/review src/lib.rs"), None);
+        assert_eq!(super::slash_query("hello /review"), None);
+
+        assert_eq!(
+            super::palette_query("check @crates/ui", super::PaletteKind::Mention),
+            Some("crates/ui".to_owned())
+        );
+        assert_eq!(
+            super::palette_query("use $trel", super::PaletteKind::Skill),
+            Some("trel".to_owned())
+        );
+        assert_eq!(
+            super::palette_query("/review @src/main.rs", super::PaletteKind::Mention),
+            Some("src/main.rs".to_owned())
+        );
+
+        let file = super::CommandEntry {
+            id: "reference:file:src/main.rs".to_owned(),
+            label: "@main.rs".to_owned(),
+            description: "apps/mobile-nsh/src/main.rs".to_owned(),
+            insertion: "@apps/mobile-nsh/src/main.rs ".to_owned(),
+        };
+        assert!(super::palette_entry_matches(&file, "mobile-nsh"));
+        assert!(!super::palette_entry_matches(&file, "nonexistent"));
     }
 }

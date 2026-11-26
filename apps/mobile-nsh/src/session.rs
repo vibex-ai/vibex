@@ -226,20 +226,25 @@ pub struct SessionService {
     /// The question the card shows, kept for typed submissions.
     question_request: Rc<RefCell<Option<ElicitationRequest>>>,
     commands: Signal<Vec<CommandEntry>>,
-    commands_loaded: Rc<Cell<bool>>,
+    commands_scope: Rc<RefCell<Option<PaletteScope>>>,
+    commands_generation: Rc<Cell<u64>>,
     /// What the `/` read answered, kept so a prefix the reader left and came
     /// back to fills the palette again without a second request.
     commands_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     mentions: Signal<Vec<CommandEntry>>,
-    mentions_loaded: Rc<Cell<bool>>,
+    mentions_scope: Rc<RefCell<Option<(PaletteScope, String)>>>,
+    mentions_generation: Rc<Cell<u64>>,
     mentions_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     skills: Signal<Vec<CommandEntry>>,
-    skills_loaded: Rc<Cell<bool>>,
+    skills_scope: Rc<RefCell<Option<PaletteScope>>>,
+    skills_generation: Rc<Cell<u64>>,
     skills_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     /// The raw entries behind the palettes, for arming a command or reference.
     entry_catalog: Rc<RefCell<BTreeMap<String, AgentCommandEntry>>>,
     armed_command: Rc<RefCell<Option<AgentCommandEntry>>>,
     armed_mentions: Rc<RefCell<Vec<(String, VibexUseMention)>>>,
+    new_armed_command: Rc<RefCell<Option<AgentCommandEntry>>>,
+    new_armed_mentions: Rc<RefCell<Vec<(String, VibexUseMention)>>>,
     terminal_open: Signal<bool>,
     terminal_visible: Signal<bool>,
     terminal_title: Signal<Option<SharedString>>,
@@ -525,17 +530,22 @@ impl SessionService {
             question: signal(None),
             question_request: Rc::new(RefCell::new(None)),
             commands: signal(Vec::new()),
-            commands_loaded: Rc::new(Cell::new(false)),
+            commands_scope: Rc::new(RefCell::new(None)),
+            commands_generation: Rc::new(Cell::new(0)),
             commands_catalog: Rc::new(RefCell::new(Vec::new())),
             mentions: signal(Vec::new()),
-            mentions_loaded: Rc::new(Cell::new(false)),
+            mentions_scope: Rc::new(RefCell::new(None)),
+            mentions_generation: Rc::new(Cell::new(0)),
             mentions_catalog: Rc::new(RefCell::new(Vec::new())),
             skills: signal(Vec::new()),
-            skills_loaded: Rc::new(Cell::new(false)),
+            skills_scope: Rc::new(RefCell::new(None)),
+            skills_generation: Rc::new(Cell::new(0)),
             skills_catalog: Rc::new(RefCell::new(Vec::new())),
             entry_catalog: Rc::new(RefCell::new(BTreeMap::new())),
             armed_command: Rc::new(RefCell::new(None)),
             armed_mentions: Rc::new(RefCell::new(Vec::new())),
+            new_armed_command: Rc::new(RefCell::new(None)),
+            new_armed_mentions: Rc::new(RefCell::new(Vec::new())),
             terminal_open: signal(false),
             terminal_visible: signal(false),
             terminal_title: signal(None),
@@ -1473,6 +1483,7 @@ impl SessionService {
                 Rc::new(move || {
                     service.new_runtime_open.set(false);
                     service.new_session_open.set(false);
+                    service.clear_visible_palettes();
                 })
             },
             on_create_worktree_session: {
@@ -2233,15 +2244,7 @@ impl SessionService {
         self.pending.set(None);
         self.question.set(None);
         *self.question_request.borrow_mut() = None;
-        self.commands.set(Vec::new());
-        self.commands_loaded.set(false);
-        self.commands_catalog.borrow_mut().clear();
-        self.mentions.set(Vec::new());
-        self.mentions_loaded.set(false);
-        self.mentions_catalog.borrow_mut().clear();
-        self.skills.set(Vec::new());
-        self.skills_loaded.set(false);
-        self.skills_catalog.borrow_mut().clear();
+        self.reset_palettes();
         self.armed_command.borrow_mut().take();
         self.armed_mentions.borrow_mut().clear();
         self.error.set(None);
@@ -3040,15 +3043,10 @@ impl SessionService {
         if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
             return;
         }
-        if let Some(command) = self.armed_command.borrow().clone()
-            && parse_slash_command_invocation(&text).is_some_and(|(name, _)| {
-                command
-                    .command_name
-                    .as_deref()
-                    .is_none_or(|candidate| candidate == name)
-            })
+        if let Some(command) =
+            matching_armed_command(self.armed_command.borrow().as_ref(), &text)
         {
-            self.execute_command(command, text);
+            self.execute_command(command, text, attachments, true);
             return;
         }
         let mentions = self.armed_mentions_for(&text);
@@ -3075,16 +3073,17 @@ impl SessionService {
     }
 
     fn armed_mentions_for(&self, text: &str) -> Vec<VibexUseMention> {
-        self.armed_mentions
-            .borrow()
-            .iter()
-            .filter(|(insertion, _)| !insertion.is_empty() && text.contains(insertion))
-            .map(|(_, mention)| mention.clone())
-            .collect()
+        armed_mentions_matching(&self.armed_mentions.borrow(), text)
     }
 
     /// Runs the `/` command the draft names instead of sending it as prose.
-    fn execute_command(&self, entry: AgentCommandEntry, text: String) {
+    fn execute_command(
+        &self,
+        entry: AgentCommandEntry,
+        text: String,
+        attachments: Vec<AttachmentItem>,
+        from_composer: bool,
+    ) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
@@ -3096,9 +3095,26 @@ impl SessionService {
         };
         self.sending.set(true);
         self.error.set(None);
+        let sent_text = text.clone();
+        let sent_attachment_ids = attachments
+            .iter()
+            .map(|item| item.id.clone())
+            .collect::<Vec<_>>();
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        // A slash command can be dispatched from the composer or from the
+        // new-session handover after its sheet closes, so the task must outlive
+        // the transient view scope.
+        detach(async move {
+            let sends = attachments
+                .iter()
+                .map(|item| MessageAttachment {
+                    label: item.label.clone(),
+                    mime_type: Some(item.mime_type.clone()),
+                    uri: Some(item.uri.clone()),
+                    inline_text_offset: None,
+                })
+                .collect::<Vec<_>>();
             let request_session = session_id.clone();
             let result = crate::runtime::handle()
                 .spawn(async move {
@@ -3112,7 +3128,7 @@ impl SessionService {
                             command_name: Some(name),
                             arguments,
                             prompt_id: entry.prompt_id,
-                            attachments: Vec::new(),
+                            attachments: sends,
                             reasoning_effort: None,
                             correlation_id: None,
                         }))
@@ -3129,9 +3145,18 @@ impl SessionService {
                             "命令無法執行。",
                         )));
                     } else {
+                        if from_composer {
+                            if service.draft.get_untracked().trim() == sent_text {
+                                service.draft.set(String::new());
+                            }
+                            service.attachments.update(|items| {
+                                items.retain(|item| !sent_attachment_ids.contains(&item.id))
+                            });
+                            service.stash_draft();
+                            service.persist_drafts();
+                        }
                         service.armed_command.borrow_mut().take();
-                        service.draft.set(String::new());
-                        service.attachments.set(Vec::new());
+                        service.armed_mentions.borrow_mut().clear();
                     }
                     service.reload(&session_id);
                 }
@@ -4438,10 +4463,84 @@ impl SessionService {
         }
     }
 
+    fn clear_visible_palettes(&self) {
+        self.commands.set(Vec::new());
+        self.mentions.set(Vec::new());
+        self.skills.set(Vec::new());
+    }
+
+    fn reset_palettes(&self) {
+        self.clear_visible_palettes();
+        *self.commands_scope.borrow_mut() = None;
+        self.commands_generation
+            .set(self.commands_generation.get().wrapping_add(1));
+        self.commands_catalog.borrow_mut().clear();
+        *self.mentions_scope.borrow_mut() = None;
+        self.mentions_generation
+            .set(self.mentions_generation.get().wrapping_add(1));
+        self.mentions_catalog.borrow_mut().clear();
+        *self.skills_scope.borrow_mut() = None;
+        self.skills_generation
+            .set(self.skills_generation.get().wrapping_add(1));
+        self.skills_catalog.borrow_mut().clear();
+    }
+
+    fn active_palette_scope(&self) -> Option<PaletteScope> {
+        if self.new_session_open.get_untracked() {
+            let selection = self.new_runtime_selection.borrow().clone();
+            let agent_id = selection.as_ref().map(|selection| selection.agent_id.clone());
+            // Without an open session, the authority requires an Agent id to
+            // route command and skill discovery.
+            agent_id.as_ref()?;
+            let provider_profile_id = selection
+                .as_ref()
+                .and_then(|selection| selection.provider_profile_id().cloned());
+            let workspace_id = self
+                .new_workspace
+                .get_untracked()
+                .and_then(|id| WorkspaceId::parse(id).ok());
+            return Some(PaletteScope {
+                new_session: true,
+                session_id: None,
+                workspace_id,
+                agent_id,
+                provider_profile_id,
+            });
+        }
+        let active = self.active.get_untracked()?;
+        let session_id = VibexSessionId::parse(active.as_str()).ok()?;
+        let (workspace_id, session_agent_id) = self.session_records.with(|sessions| {
+            sessions
+                .iter()
+                .find(|session| session.id.as_str() == active)
+                .map(|session| (Some(session.workspace_id.clone()), Some(session.agent_id.clone())))
+                .unwrap_or((None, None))
+        });
+        let (runtime_agent_id, provider_profile_id) = self
+            .runtime_state
+            .borrow()
+            .as_ref()
+            .map(|state| {
+                (
+                    Some(state.desired.agent_id.clone()),
+                    state.desired.provider_profile_id().cloned(),
+                )
+            })
+            .unwrap_or((None, None));
+        Some(PaletteScope {
+            new_session: false,
+            session_id: Some(session_id),
+            workspace_id,
+            agent_id: runtime_agent_id.or(session_agent_id),
+            provider_profile_id,
+        })
+    }
+
     fn arm_entry(&self, id: &str) {
         let Some(entry) = self.entry_catalog.borrow().get(id).cloned() else {
             return;
         };
+        let for_new_session = self.new_session_open.get_untracked();
         match entry.trigger {
             AgentCommandTrigger::Slash
                 if matches!(
@@ -4449,13 +4548,22 @@ impl SessionService {
                     AgentCommandSourceKind::Provider | AgentCommandSourceKind::Prompt
                 ) && entry.execution_behavior != AgentCommandExecutionBehavior::None =>
             {
-                *self.armed_command.borrow_mut() = Some(entry);
+                if for_new_session {
+                    *self.new_armed_command.borrow_mut() = Some(entry);
+                } else {
+                    *self.armed_command.borrow_mut() = Some(entry);
+                }
             }
             AgentCommandTrigger::Mention => {
                 let Some(mention) = mention_for_entry(&entry) else {
                     return;
                 };
-                let mut mentions = self.armed_mentions.borrow_mut();
+                let target = if for_new_session {
+                    &self.new_armed_mentions
+                } else {
+                    &self.armed_mentions
+                };
+                let mut mentions = target.borrow_mut();
                 mentions.retain(|(_, existing)| {
                     existing.reference != mention.reference
                         || existing.kind != mention.kind
@@ -4467,12 +4575,16 @@ impl SessionService {
         }
     }
 
-    /// Loads the `/` commands the open session offers.
+    /// Loads the `/` commands offered for the active session or new-session draft.
     ///
-    /// One read per session: the palette filters what came back locally as the
-    /// person keeps typing, so typing does not make a request per keystroke.
+    /// One read per `(session, workspace, agent, profile)` scope: the palette
+    /// filters locally as the reader keeps typing, and re-fetches automatically
+    /// if the workspace or runtime changes.
     fn query_commands(&self, _query: &str) {
-        if self.commands_loaded.get() {
+        let Some(scope) = self.active_palette_scope() else {
+            return;
+        };
+        if self.commands_scope.borrow().as_ref() == Some(&scope) {
             let refill = refill_palette(
                 &self.commands_catalog.borrow(),
                 &self.commands.get_untracked(),
@@ -4482,36 +4594,32 @@ impl SessionService {
             }
             return;
         }
-        let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let Ok(session_id) = VibexSessionId::parse(active) else {
-            return;
-        };
-        self.commands_loaded.set(true);
+        *self.commands_scope.borrow_mut() = Some(scope.clone());
+        let generation = self.commands_generation.get().wrapping_add(1);
+        self.commands_generation.set(generation);
+        let request = scope.discover_request(AgentCommandTrigger::Slash, None, 50);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
-                .spawn(async move {
-                    backend
-                        .discover_agent_commands(AgentCommandDiscoverRequest {
-                            agent_id: None,
-                            provider_profile_id: None,
-                            session_id: Some(session_id),
-                            workspace_id: None,
-                            trigger: Some(AgentCommandTrigger::Slash),
-                            query: None,
-                            limit: Some(30),
-                        })
-                        .await
-                })
+                .spawn(async move { backend.discover_agent_commands(request).await })
                 .await;
-            if let Ok(Ok(discovery)) = result {
-                service.remember_entries(&discovery);
-                let entries = command_entries(discovery);
-                *service.commands_catalog.borrow_mut() = entries.clone();
-                service.commands.set(entries);
+            if !service.alive.get()
+                || service.commands_generation.get() != generation
+                || service.new_session_open.get_untracked() != scope.new_session
+            {
+                return;
+            }
+            match result {
+                Ok(Ok(discovery)) => {
+                    service.remember_entries(&discovery);
+                    let entries = command_entries(discovery);
+                    *service.commands_catalog.borrow_mut() = entries.clone();
+                    service.commands.set(entries);
+                }
+                _ => {
+                    *service.commands_scope.borrow_mut() = None;
+                }
             }
         });
     }
@@ -4700,12 +4808,20 @@ impl SessionService {
         }
     }
 
-    /// Loads the `@` references the open session offers.
-    ///
-    /// Like the `/` list, one read per session: the palette narrows it
-    /// locally while the person types.
-    fn query_mentions(&self, _query: &str) {
-        if self.mentions_loaded.get() {
+    /// Loads the `@` file, Agent, and session references for the active
+    /// composer, forwarding the workspace and typed fragment so the authority
+    /// searches the workspace tree and descends into subdirectories.
+    fn query_mentions(&self, query: &str) {
+        let Some(scope) = self.active_palette_scope() else {
+            return;
+        };
+        let trimmed = query.trim().to_owned();
+        let same_scope = self
+            .mentions_scope
+            .borrow()
+            .as_ref()
+            .is_some_and(|(cached_scope, _)| cached_scope == &scope);
+        if same_scope {
             let refill = refill_palette(
                 &self.mentions_catalog.borrow(),
                 &self.mentions.get_untracked(),
@@ -4713,45 +4829,51 @@ impl SessionService {
             if let Some(entries) = refill {
                 self.mentions.set(entries);
             }
-            return;
+            if self.mentions_scope.borrow().as_ref() == Some(&(scope.clone(), trimmed.clone())) {
+                return;
+            }
         }
-        let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let Ok(session_id) = VibexSessionId::parse(active) else {
-            return;
-        };
-        self.mentions_loaded.set(true);
+        *self.mentions_scope.borrow_mut() = Some((scope.clone(), trimmed.clone()));
+        let generation = self.mentions_generation.get().wrapping_add(1);
+        self.mentions_generation.set(generation);
+        let limit = if trimmed.is_empty() { 30 } else { 50 };
+        let request = scope.discover_request(
+            AgentCommandTrigger::Mention,
+            (!trimmed.is_empty()).then_some(trimmed),
+            limit,
+        );
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
-                .spawn(async move {
-                    backend
-                        .discover_agent_commands(AgentCommandDiscoverRequest {
-                            agent_id: None,
-                            provider_profile_id: None,
-                            session_id: Some(session_id),
-                            workspace_id: None,
-                            trigger: Some(AgentCommandTrigger::Mention),
-                            query: None,
-                            limit: Some(40),
-                        })
-                        .await
-                })
+                .spawn(async move { backend.discover_agent_commands(request).await })
                 .await;
-            if let Ok(Ok(discovery)) = result {
-                service.remember_entries(&discovery);
-                let entries = command_entries(discovery);
-                *service.mentions_catalog.borrow_mut() = entries.clone();
-                service.mentions.set(entries);
+            if !service.alive.get()
+                || service.mentions_generation.get() != generation
+                || service.new_session_open.get_untracked() != scope.new_session
+            {
+                return;
+            }
+            match result {
+                Ok(Ok(discovery)) => {
+                    service.remember_entries(&discovery);
+                    let entries = command_entries(discovery);
+                    *service.mentions_catalog.borrow_mut() = entries.clone();
+                    service.mentions.set(entries);
+                }
+                _ => {
+                    *service.mentions_scope.borrow_mut() = None;
+                }
             }
         });
     }
 
-    /// Loads the `$` skills the open session offers.
+    /// Loads the `$` skills offered for the active session or new-session draft.
     fn query_skills(&self, _query: &str) {
-        if self.skills_loaded.get() {
+        let Some(scope) = self.active_palette_scope() else {
+            return;
+        };
+        if self.skills_scope.borrow().as_ref() == Some(&scope) {
             let refill =
                 refill_palette(&self.skills_catalog.borrow(), &self.skills.get_untracked());
             if let Some(entries) = refill {
@@ -4759,36 +4881,32 @@ impl SessionService {
             }
             return;
         }
-        let Some(active) = self.active.get_untracked() else {
-            return;
-        };
-        let Ok(session_id) = VibexSessionId::parse(active) else {
-            return;
-        };
-        self.skills_loaded.set(true);
+        *self.skills_scope.borrow_mut() = Some(scope.clone());
+        let generation = self.skills_generation.get().wrapping_add(1);
+        self.skills_generation.set(generation);
+        let request = scope.discover_request(AgentCommandTrigger::Dollar, None, 50);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let result = crate::runtime::handle()
-                .spawn(async move {
-                    backend
-                        .discover_agent_commands(AgentCommandDiscoverRequest {
-                            agent_id: None,
-                            provider_profile_id: None,
-                            session_id: Some(session_id),
-                            workspace_id: None,
-                            trigger: Some(AgentCommandTrigger::Dollar),
-                            query: None,
-                            limit: Some(40),
-                        })
-                        .await
-                })
+                .spawn(async move { backend.discover_agent_commands(request).await })
                 .await;
-            if let Ok(Ok(discovery)) = result {
-                service.remember_entries(&discovery);
-                let entries = command_entries(discovery);
-                *service.skills_catalog.borrow_mut() = entries.clone();
-                service.skills.set(entries);
+            if !service.alive.get()
+                || service.skills_generation.get() != generation
+                || service.new_session_open.get_untracked() != scope.new_session
+            {
+                return;
+            }
+            match result {
+                Ok(Ok(discovery)) => {
+                    service.remember_entries(&discovery);
+                    let entries = command_entries(discovery);
+                    *service.skills_catalog.borrow_mut() = entries.clone();
+                    service.skills.set(entries);
+                }
+                _ => {
+                    *service.skills_scope.borrow_mut() = None;
+                }
             }
         });
     }
@@ -6117,12 +6235,15 @@ impl SessionService {
         self.new_session_open.set(true);
         self.new_session_folder.set(folder);
         self.new_error.set(None);
+        self.clear_visible_palettes();
         if !writing {
             self.new_title.set(String::new());
             self.new_prompt.set(String::new());
             self.new_attachments.set(Vec::new());
             self.new_worktree_branch.set(String::new());
             self.new_base_ref.set(String::new());
+            self.new_armed_command.borrow_mut().take();
+            self.new_armed_mentions.borrow_mut().clear();
         }
         self.new_workspaces.set(Vec::new());
         self.new_workspace.set(None);
@@ -6347,10 +6468,16 @@ impl SessionService {
 
     fn new_session_draft(&self) -> NewSessionDraft {
         let title = self.new_title.get_untracked().trim().to_owned();
+        let text = self.new_prompt.get_untracked().trim().to_owned();
+        let command =
+            matching_armed_command(self.new_armed_command.borrow().as_ref(), &text);
+        let mentions = armed_mentions_matching(&self.new_armed_mentions.borrow(), &text);
         NewSessionDraft {
             title: (!title.is_empty()).then_some(title),
-            text: self.new_prompt.get_untracked().trim().to_owned(),
+            text,
             attachments: self.new_attachments.get_untracked(),
+            command,
+            mentions,
         }
     }
 
@@ -6400,10 +6527,14 @@ impl SessionService {
                 pending.session_id = session.id.as_str().to_owned();
             }
         });
+        self.new_armed_command.borrow_mut().take();
+        self.new_armed_mentions.borrow_mut().clear();
         self.open(session.id.as_str());
         self.publish();
-        if !draft.text.is_empty() || !draft.attachments.is_empty() {
-            self.deliver(draft.text, draft.attachments, Vec::new(), false);
+        if let Some(command) = draft.command {
+            self.execute_command(command, draft.text, draft.attachments, false);
+        } else if !draft.text.is_empty() || !draft.attachments.is_empty() {
+            self.deliver(draft.text, draft.attachments, draft.mentions, false);
         }
     }
 
@@ -9129,22 +9260,46 @@ async fn send_and_refetch(
     // The session's own selection is what the runtime expects the send to
     // carry; asking first also notices a runtime that cannot take a turn.
     let selection = backend.runtime_selection(session_id.clone()).await?.desired;
+    // Send through `send_message_with_mentions` so `@Agent` and `@session`
+    // mentions carry their authority-constructed routing notes and read grants;
+    // when `mentions` is empty on a backend without team support, the trait's
+    // default implementation falls back to `send_message`.
     backend
-        .send_message(MutationRequest::new(SendAgentMessageRequest {
-            session_id: session_id.clone(),
+        .send_message_with_mentions(MutationRequest::new(build_human_message_request(
+            session_id.clone(),
+            selection,
+            text,
+            attachments,
+            mentions,
+        )))
+        .await?;
+    fetch_page(backend, session_id).await
+}
+
+fn build_human_message_request(
+    session_id: VibexSessionId,
+    selection: SessionRuntimeSelection,
+    text: String,
+    attachments: Vec<MessageAttachment>,
+    mentions: Vec<VibexUseMention>,
+) -> vibex_core::HumanAgentMessageRequest {
+    let reasoning_effort = selection.reasoning_effort.clone();
+    vibex_core::HumanAgentMessageRequest {
+        mentions,
+        message: SendAgentMessageRequest {
+            session_id,
             message_idempotency_key: vibex_core::RequestId::new().into_string(),
             desired_runtime: selection,
             text,
             attachments,
-            mentions,
-            reasoning_effort: None,
+            mentions: Vec::new(),
+            reasoning_effort,
             correlation_id: None,
             delivery: UserMessageDelivery::Prompt,
             prompt_context: None,
             provenance: MessageProvenance::HumanInput,
-        }))
-        .await?;
-    fetch_page(backend, session_id).await
+        },
+    }
 }
 
 fn worktree_operation_status_label(status: GitWorktreeOperationStatus) -> &'static str {
@@ -9338,10 +9493,40 @@ fn summary(session: &AgentSession, spaces: &[WorkspaceSummary]) -> SessionSummar
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaletteScope {
+    new_session: bool,
+    session_id: Option<VibexSessionId>,
+    workspace_id: Option<WorkspaceId>,
+    agent_id: Option<AgentId>,
+    provider_profile_id: Option<vibex_core::ProviderProfileId>,
+}
+
+impl PaletteScope {
+    fn discover_request(
+        &self,
+        trigger: AgentCommandTrigger,
+        query: Option<String>,
+        limit: u32,
+    ) -> AgentCommandDiscoverRequest {
+        AgentCommandDiscoverRequest {
+            agent_id: self.agent_id.clone(),
+            provider_profile_id: self.provider_profile_id.clone(),
+            session_id: self.session_id.clone(),
+            workspace_id: self.workspace_id.clone(),
+            trigger: Some(trigger),
+            query,
+            limit: Some(limit),
+        }
+    }
+}
+
 struct NewSessionDraft {
     title: Option<String>,
     text: String,
     attachments: Vec<AttachmentItem>,
+    command: Option<AgentCommandEntry>,
+    mentions: Vec<VibexUseMention>,
 }
 
 /// A turn the page draws before the runtime has answered for it.
@@ -9444,6 +9629,7 @@ fn change_letter(kind: GitChangeKind) -> &'static str {
 const COMPOSER_AGENT_REFERENCE_KEY: &str = "vibexUseAgentReference";
 const COMPOSER_SELECTION_REFERENCE_KEY: &str = "vibexUseSelectionReference";
 const COMPOSER_SESSION_REFERENCE_KEY: &str = "vibexUseSessionReference";
+const COMPOSER_DELEGATE_NOW_KEY: &str = "vibexUseDelegateNow";
 
 fn mention_for_entry(entry: &AgentCommandEntry) -> Option<VibexUseMention> {
     let metadata = |key: &str| {
@@ -9476,11 +9662,38 @@ fn mention_for_entry(entry: &AgentCommandEntry) -> Option<VibexUseMention> {
     None
 }
 
+fn armed_mentions_matching(
+    armed: &[(String, VibexUseMention)],
+    text: &str,
+) -> Vec<VibexUseMention> {
+    armed
+        .iter()
+        .filter(|(insertion, _)| {
+            let needle = insertion.trim();
+            !needle.is_empty() && text.contains(needle)
+        })
+        .map(|(_, mention)| mention.clone())
+        .collect()
+}
+
+fn matching_armed_command(
+    armed: Option<&AgentCommandEntry>,
+    text: &str,
+) -> Option<AgentCommandEntry> {
+    let command = armed?;
+    let (name, _) = parse_slash_command_invocation(text)?;
+    command
+        .command_name
+        .as_deref()
+        .is_none_or(|candidate| candidate == name)
+        .then(|| command.clone())
+}
+
 fn parse_slash_command_invocation(text: &str) -> Option<(String, Option<String>)> {
     let rest = text.trim().strip_prefix('/')?;
     let mut parts = rest.splitn(2, char::is_whitespace);
     let name = parts.next()?.trim();
-    if name.is_empty() {
+    if name.is_empty() || name.contains('/') {
         return None;
     }
     let arguments = parts
@@ -9502,11 +9715,21 @@ fn command_entries(discovery: vibex_core::AgentCommandDiscovery) -> Vec<CommandE
         .chain(discovery.delegation_entries)
         .chain(discovery.session_entries)
     {
+        if entry
+            .metadata
+            .iter()
+            .any(|metadata| metadata.key == COMPOSER_DELEGATE_NOW_KEY)
+        {
+            continue;
+        }
         if seen.insert(entry.id.clone()) {
             entries.push(CommandEntry {
                 id: entry.id,
                 label: entry.label,
-                description: entry.description.unwrap_or_default(),
+                description: entry
+                    .description
+                    .or(entry.reference_path)
+                    .unwrap_or_default(),
                 insertion: entry.insertion_text,
             });
         }
@@ -11985,6 +12208,168 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<RuntimeSelectionFlowCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("runtime-flow-ok").unwrap();
+    }
+
+    #[test]
+    fn armed_mentions_match_after_trimming_trailing_space() {
+        let agent_ref = vibex_core::VibexUseMention::agent(
+            &vibex_core::AgentId::parse("codex").unwrap(),
+            &vibex_core::VibexUseRef::runtime_option("codex"),
+            Some("@Codex"),
+        );
+        let session_ref = vibex_core::VibexUseMention::session(
+            &vibex_core::VibexSessionId::new(),
+            Some("@Review"),
+        );
+        let armed = vec![
+            ("@Codex ".to_owned(), agent_ref.clone()),
+            ("@Review ".to_owned(), session_ref.clone()),
+        ];
+
+        // Trailing mention after `.trim()` still matches without the trailing space.
+        let matched = super::armed_mentions_matching(&armed, "Please ask @Codex");
+        assert_eq!(matched, vec![agent_ref.clone()]);
+
+        // Both mentions match when present; deleted ones are dropped.
+        let both = super::armed_mentions_matching(&armed, "@Codex check @Review");
+        assert_eq!(both, vec![agent_ref, session_ref]);
+        assert!(super::armed_mentions_matching(&armed, "plain prompt").is_empty());
+    }
+
+    #[test]
+    fn command_entries_show_file_reference_paths_and_drop_legacy_delegate_now() {
+        let file_entry = vibex_core::AgentCommandEntry {
+            id: "reference:file:crates/vibex-nsh-ui/src/lib.rs".into(),
+            trigger: vibex_core::AgentCommandTrigger::Mention,
+            source_kind: vibex_core::AgentCommandSourceKind::Reference,
+            label: "@lib.rs".into(),
+            description: None,
+            insertion_text: "@crates/vibex-nsh-ui/src/lib.rs ".into(),
+            command_name: None,
+            provider_kind: Some(vibex_core::ProviderKind::Acp),
+            prompt_id: None,
+            skill_id: None,
+            reference_path: Some("crates/vibex-nsh-ui/src/lib.rs".into()),
+            selection_behavior: vibex_core::AgentCommandSelectionBehavior::Insert,
+            execution_behavior: vibex_core::AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: Vec::new(),
+        };
+        let legacy_delegate = vibex_core::AgentCommandEntry {
+            id: "delegate:now:codex".into(),
+            trigger: vibex_core::AgentCommandTrigger::Mention,
+            source_kind: vibex_core::AgentCommandSourceKind::Reference,
+            label: "Delegate to Codex".into(),
+            description: Some("Legacy".into()),
+            insertion_text: "@Codex ".into(),
+            command_name: None,
+            provider_kind: None,
+            prompt_id: None,
+            skill_id: None,
+            reference_path: None,
+            selection_behavior: vibex_core::AgentCommandSelectionBehavior::Insert,
+            execution_behavior: vibex_core::AgentCommandExecutionBehavior::None,
+            destructive: false,
+            metadata: vec![vibex_core::ProviderBindingMetadata {
+                key: super::COMPOSER_DELEGATE_NOW_KEY.into(),
+                value: "true".into(),
+            }],
+        };
+        let discovery = vibex_core::AgentCommandDiscovery {
+            response: vibex_core::AgentCommandDiscoverResponse {
+                entries: vec![file_entry],
+                diagnostics: Vec::new(),
+            },
+            slash_commands: true,
+            skills: true,
+            quick_phrases: Vec::new(),
+            delegation_entries: vec![legacy_delegate],
+            session_entries: Vec::new(),
+        };
+
+        let entries = super::command_entries(discovery);
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].label, "@lib.rs");
+        assert_eq!(entries[0].description, "crates/vibex-nsh-ui/src/lib.rs");
+        assert_eq!(entries[0].insertion, "@crates/vibex-nsh-ui/src/lib.rs ");
+    }
+
+    #[test]
+    fn parse_slash_command_invocation_ignores_filesystem_paths() {
+        assert_eq!(
+            super::parse_slash_command_invocation("/review"),
+            Some(("review".into(), None))
+        );
+        assert_eq!(
+            super::parse_slash_command_invocation("/review src/lib.rs"),
+            Some(("review".into(), Some("src/lib.rs".into())))
+        );
+        assert_eq!(super::parse_slash_command_invocation("/usr/bin/env"), None);
+        assert_eq!(super::parse_slash_command_invocation("hello /review"), None);
+    }
+
+    #[test]
+    fn palette_scope_builds_workspace_and_query_scoped_discovery_requests() {
+        let workspace_id = vibex_core::WorkspaceId::new();
+        let agent_id = vibex_core::AgentId::parse("codex").unwrap();
+        let scope = super::PaletteScope {
+            new_session: true,
+            session_id: None,
+            workspace_id: Some(workspace_id.clone()),
+            agent_id: Some(agent_id.clone()),
+            provider_profile_id: None,
+        };
+
+        let mention_req = scope.discover_request(
+            vibex_core::AgentCommandTrigger::Mention,
+            Some("crates/vibex-nsh-ui/".to_owned()),
+            80,
+        );
+        assert_eq!(mention_req.session_id, None);
+        assert_eq!(mention_req.workspace_id, Some(workspace_id));
+        assert_eq!(mention_req.agent_id, Some(agent_id));
+        assert_eq!(mention_req.query.as_deref(), Some("crates/vibex-nsh-ui/"));
+        assert_eq!(mention_req.limit, Some(80));
+
+        let blank_req = scope.discover_request(vibex_core::AgentCommandTrigger::Dollar, None, 40);
+        assert_eq!(blank_req.query, None);
+        assert_eq!(blank_req.limit, Some(40));
+    }
+
+    #[test]
+    fn build_human_message_request_preserves_mentions_and_matches_reasoning_effort() {
+        let session_id = vibex_core::VibexSessionId::new();
+        let selection = vibex_core::SessionRuntimeSelection {
+            agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+            auth_source: vibex_core::RuntimeAuthSource::ProviderProfile {
+                provider_profile_id: vibex_core::ProviderProfileId::parse("provider_team").unwrap(),
+            },
+            model: vibex_core::RuntimeModelSelection::Explicit {
+                model_id: "gpt-5".into(),
+            },
+            reasoning_effort: Some("high".into()),
+            mode_id: None,
+            config_values: Default::default(),
+        };
+        let mention = vibex_core::VibexUseMention::agent(
+            &vibex_core::AgentId::parse("claude").unwrap(),
+            &vibex_core::VibexUseRef::runtime_option("claude"),
+            Some("@Claude"),
+        );
+        let request = super::build_human_message_request(
+            session_id.clone(),
+            selection,
+            "Ask @Claude to review".into(),
+            Vec::new(),
+            vec![mention.clone()],
+        );
+        assert_eq!(request.mentions, vec![mention]);
+        assert_eq!(request.message.session_id, session_id);
+        assert_eq!(request.message.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            request.message.desired_runtime.reasoning_effort.as_deref(),
+            Some("high")
+        );
     }
 
     struct FakeFileTreeBackend {

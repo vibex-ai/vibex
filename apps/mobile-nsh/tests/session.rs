@@ -1322,6 +1322,14 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
             insertion: "/review ".to_owned(),
         }]);
     });
+    let on_skill_query = Rc::new(move |_: &str| {
+        skills.set(vec![CommandEntry {
+            id: "skill:audit".to_owned(),
+            label: "$audit".to_owned(),
+            description: "Run repository audit skill".to_owned(),
+            insertion: "$audit ".to_owned(),
+        }]);
+    });
     let on_open_terminal = Rc::new(move || terminal_open.set(true));
     let on_new_session = Rc::new(move || new_session_open.set(true));
     let on_interrupt = Rc::new(move || {
@@ -1446,7 +1454,7 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         commands,
         mentions,
         skills,
-        on_skill_query: Rc::new(|_| {}),
+        on_skill_query,
         on_arm_entry: Rc::new(|_| {}),
         attachments,
         on_attach_image,
@@ -1724,31 +1732,34 @@ fn the_composer_opens_the_runtime_choices() {
         "reasoning depth should sit to the right of the model name ({model_bounds:?} vs {reasoning_bounds:?})"
     );
     app.press("Claude 4").unwrap();
-    app.wait_for("Agent settings").unwrap();
+    app.wait_for("Session settings").unwrap();
     // The fold header shows the provider's name ("Pro"), not the Agent's name.
     assert!(app.screen().shows("Pro"));
     assert!(!app.screen().shows("GPT-5"));
     app.press("role:button[Codex]").unwrap();
-    // The picker groups models under their provider, and a provider holding no
-    // current choice starts folded — so the Codex providers show their own
-    // names ("Team", "OpenRouter") rather than repeating the Agent name.
+    // The picker groups models under their provider, expanding the preferred or
+    // first provider ("Team") while keeping sibling providers ("OpenRouter")
+    // folded, and provider fold headers never repeat the Agent name.
     app.wait_for("role:button[Team]").unwrap();
     assert!(app.screen().shows("OpenRouter"));
     assert!(
         !app.screen().matches("role:button[Codex] >> nth=1").unwrap(),
         "provider fold headers must not repeat the Agent name"
     );
-    app.press("role:button[Team]").unwrap();
     app.wait_for("GPT-5").unwrap();
     assert!(
         !app.screen().matches("role:button[GPT-5 Team]").unwrap(),
         "the provider name stays on the fold header rather than inside the model row"
     );
-    // Reasoning lives inside the same Agent settings sheet as a segment tab.
+    // Reasoning lives inside the same Session settings sheet as a segment tab
+    // and selecting an option keeps the sheet open until manually closed.
     app.press("role:button[Reasoning]").unwrap();
     app.wait_for("Default").unwrap();
     app.press("Default").unwrap();
-    app.wait_for_gone("Default", std::time::Duration::from_secs(3))
+    assert!(app.screen().shows("Session settings"));
+    assert!(app.screen().shows("Default"));
+    app.press("role:button[Close]").unwrap();
+    app.wait_for_gone("Session settings", std::time::Duration::from_secs(3))
         .unwrap();
 }
 
@@ -2462,7 +2473,8 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
         std::time::Duration::from_secs(3),
     )
     .unwrap();
-    assert!(app.screen().shows("What are we working on?"));
+    assert!(app.screen().shows("Start something new with"));
+    assert!(!app.screen().shows("Tour this project"));
     app.press("role:button[Create]").unwrap();
     app.wait_for("Created session").unwrap();
 }
@@ -2479,10 +2491,31 @@ fn a_session_is_written_under_the_conversations_own_header() {
     // The transcript gives its place to the blank page, and comes back when
     // the session is given up.
     assert!(!app.screen().shows("Morning. The build is green."));
-    // A way to begin writes its message into the prompt card.
-    app.press("Tour this project").unwrap();
-    app.wait_for("text:/^Give me a tour of this project/")
+    // The centered Agent mark opens Session settings directly, and `/`, `@`, `$`
+    // palettes work in the new-session composer.
+    assert!(app.screen().shows("Start something new with"));
+    app.press("id:new-session-agent-mark").unwrap();
+    app.wait_for("Session settings").unwrap();
+    app.press("role:button[Close]").unwrap();
+    app.wait_for_gone("Session settings", std::time::Duration::from_secs(3))
         .unwrap();
+    app.type_text(COMPOSER, "/").unwrap();
+    app.wait_for("Review changes").unwrap();
+    app.press("Review changes").unwrap();
+    app.wait_for("text:/review ").unwrap();
+    app.type_text("text:/review ", "@").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("src/main.rs").unwrap();
+    app.wait_for(r"text:/main\.rs /").unwrap();
+    app.type_text(r"text:/main\.rs /", "$").unwrap();
+    app.wait_for("$audit").unwrap();
+    app.press("$audit").unwrap();
+    app.wait_for_gone("Run repository audit skill", std::time::Duration::from_secs(3))
+        .unwrap();
+    assert_eq!(
+        app.screen().input_text(r"text:/\$audit /").unwrap(),
+        Some("/review @src/main.rs $audit ")
+    );
     app.press("role:button[Cancel]").unwrap();
     app.wait_for("Morning. The build is green.").unwrap();
     assert!(
@@ -3630,7 +3663,7 @@ fn opening_agent_settings_reveals_an_offscreen_selected_agent_chip() {
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Model").unwrap();
     app.press("Model").unwrap();
-    app.wait_for("Agent settings").unwrap();
+    app.wait_for("Session settings").unwrap();
 
     let chip_bounds = |app: &Headless, label: &str| {
         app.screen()
@@ -3734,21 +3767,22 @@ fn new_session_places_workspace_above_composer_and_uses_unified_agent_settings()
         "workspace picker must live on the page above the composer ({workspace_bounds:?} vs {composer_bounds:?})"
     );
 
-    // Tapping the new-session runtime pill opens the unified Agent settings sheet,
+    // Tapping the new-session runtime pill opens the unified Session settings sheet,
     // not the removed "Agent and model" picker.
     app.press("Sonnet").unwrap();
-    app.wait_for("Agent settings").unwrap();
+    app.wait_for("Session settings").unwrap();
     assert!(!app.screen().shows("Agent and model"));
     assert!(app.screen().shows("Pro"));
     app.press("role:button[Codex]").unwrap();
     app.wait_for("role:button[Team]").unwrap();
-    app.press("role:button[Team]").unwrap();
     app.wait_for("GPT-5").unwrap();
     app.press("GPT-5").unwrap();
     app.press("role:button[Reasoning]").unwrap();
     app.wait_for("High").unwrap();
     app.press("High").unwrap();
-    app.wait_for_gone("Agent settings", std::time::Duration::from_secs(3))
+    assert!(app.screen().shows("Session settings"));
+    app.press("role:button[Close]").unwrap();
+    app.wait_for_gone("Session settings", std::time::Duration::from_secs(3))
         .unwrap();
 
     // The composer pill reflects both the new model and the reasoning depth on its right.

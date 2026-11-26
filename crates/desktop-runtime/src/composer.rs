@@ -20,7 +20,9 @@ use vibex_core::{
     ProviderProfileDefaultScope, ProviderProfileId, RuntimeOptionAvailability,
     SessionRuntimeOption, SessionRuntimeSelection, VibexResult, VibexUseRef, WorkspaceId,
 };
-use vibex_db::{AgentModelSourceDefaultRepository, ProviderProfileRepository, open_database};
+use vibex_db::{
+    AgentModelSourceDefaultRepository, ProviderProfileRepository, SessionRepository, open_database,
+};
 use vibex_desktop_model::runtime_selection_use_count;
 
 use crate::catalog::RuntimeComposerPreferences;
@@ -48,8 +50,9 @@ pub async fn discover_composer_commands(
     files: &FileHandle,
     providers: &ProviderHandle,
     vibex_use: Option<&Arc<VibexUseService>>,
-    request: AgentCommandDiscoverRequest,
+    mut request: AgentCommandDiscoverRequest,
 ) -> VibexResult<AgentCommandDiscovery> {
+    resolve_session_request_scope(files, &mut request);
     let manager = agent.manager();
     let mut response = manager.discover_commands(request.clone()).await?;
     let capabilities = manager.command_discovery_capabilities(&request)?;
@@ -74,6 +77,29 @@ pub async fn discover_composer_commands(
         delegation_entries,
         session_entries,
     })
+}
+
+/// Fills missing workspace and Agent scope from the target session when the
+/// caller only identified a `session_id`.
+fn resolve_session_request_scope(files: &FileHandle, request: &mut AgentCommandDiscoverRequest) {
+    if request.workspace_id.is_some() && request.agent_id.is_some() {
+        return;
+    }
+    let Some(session_id) = request.session_id.as_ref() else {
+        return;
+    };
+    let Ok(connection) = open_database(files.database_path()) else {
+        return;
+    };
+    let Ok(Some(session)) = SessionRepository::get(&connection, session_id) else {
+        return;
+    };
+    if request.workspace_id.is_none() {
+        request.workspace_id = Some(session.workspace_id);
+    }
+    if request.agent_id.is_none() {
+        request.agent_id = Some(session.agent_id);
+    }
 }
 
 /// Whether this request resolves the references the `@` trigger offers.
@@ -1167,5 +1193,73 @@ mod tests {
             .filter_map(|entry| entry.reference_path.as_deref())
             .collect::<Vec<_>>();
         assert_eq!(paths, vec!["flex-work-ai/docs/readme.md"]);
+    }
+
+    #[test]
+    fn session_scoped_discovery_resolves_missing_workspace_and_agent_for_file_mentions() {
+        let directory = tempfile::tempdir().unwrap();
+        let database_path = directory.path().join("vibex.db");
+        let workspace_root = directory.path().join("workspace");
+        std::fs::create_dir_all(&workspace_root).unwrap();
+        std::fs::write(workspace_root.join("README.md"), "# vibex\n").unwrap();
+
+        let mut connection = open_database(&database_path).unwrap();
+        apply_migrations(&mut connection).unwrap();
+        let (project, workspace) = WorkspaceRepository::ensure(
+            &connection,
+            &workspace_root,
+            vibex_core::WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let session_id = VibexSessionId::new();
+        let agent_id = AgentId::parse("codex").unwrap();
+        let session = vibex_core::AgentSession {
+            id: session_id.clone(),
+            title: "Demo".into(),
+            project_id: project.id,
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: agent_id.clone(),
+            state: vibex_core::AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+            last_message_at_ms: 1,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: Default::default(),
+            terminal: None,
+        };
+        SessionRepository::insert(&connection, &session).unwrap();
+
+        let files = FileHandle {
+            db_path: database_path,
+        };
+        let mut request = AgentCommandDiscoverRequest {
+            agent_id: None,
+            provider_profile_id: None,
+            session_id: Some(session_id),
+            workspace_id: None,
+            trigger: Some(AgentCommandTrigger::Mention),
+            query: Some("README".into()),
+            limit: Some(50),
+        };
+        resolve_session_request_scope(&files, &mut request);
+        assert_eq!(request.workspace_id, Some(workspace.id));
+        assert_eq!(request.agent_id, Some(agent_id));
+
+        let mut response = AgentCommandDiscoverResponse {
+            entries: Vec::new(),
+            diagnostics: Vec::new(),
+        };
+        append_file_reference_commands(&files, &request, &mut response).unwrap();
+        let paths = response
+            .entries
+            .iter()
+            .filter_map(|entry| entry.reference_path.as_deref())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["README.md"]);
     }
 }

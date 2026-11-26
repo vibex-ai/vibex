@@ -18,7 +18,8 @@ use nsh_base::button;
 use nsh_core::{element::ImageSrc, prelude::*};
 
 use crate::screens::session::{
-    self, AttachmentItem, BrowseDirs, RuntimePanel, RuntimePickerHost,
+    self, AttachmentItem, BrowseDirs, CommandEntry, CommandQuery, MentionQuery, RuntimePanel,
+    RuntimePickerHost, RuntimeSummaryView,
 };
 
 type Action = Rc<dyn Fn()>;
@@ -48,7 +49,7 @@ pub struct NewSessionHost {
     pub workspaces: Signal<Vec<WorkspaceChoice>>,
     /// The chosen workspace's id.
     pub workspace: Signal<Option<String>>,
-    /// The Agent settings picker shared with open sessions.
+    /// The Session settings picker shared with open sessions.
     pub runtime: RuntimePickerHost,
     pub busy: Signal<bool>,
     pub error: Signal<Option<SharedString>>,
@@ -61,6 +62,14 @@ pub struct NewSessionHost {
     pub on_attach_image: Action,
     pub on_attach_file: Action,
     pub on_remove_attachment: Rc<dyn Fn(&str)>,
+    /// The `/`, `@`, and `$` palettes shared with open sessions.
+    pub commands: Signal<Vec<CommandEntry>>,
+    pub mentions: Signal<Vec<CommandEntry>>,
+    pub skills: Signal<Vec<CommandEntry>>,
+    pub on_command_query: CommandQuery,
+    pub on_mention_query: MentionQuery,
+    pub on_skill_query: MentionQuery,
+    pub on_arm_entry: Rc<dyn Fn(&str)>,
     /// A branch name and optional base ref for a new worktree.
     pub worktree_branch: Signal<String>,
     pub base_ref: Signal<String>,
@@ -81,61 +90,6 @@ enum Picker {
     Attachment,
 }
 
-/// One way to begin: what it is for, and the message it starts.
-struct Starter {
-    icon: ImageSrc,
-    title: &'static str,
-    caption: &'static str,
-    prompt: &'static str,
-}
-
-fn starters() -> [Starter; 3] {
-    [
-        Starter {
-            icon: icon!("book-open-text"),
-            title: copy::text("Tour this project", "了解这个项目", "了解這個專案"),
-            caption: copy::text(
-                "How it is laid out and how to run it",
-                "梳理代码结构与运行方式",
-                "梳理程式碼結構與執行方式",
-            ),
-            prompt: copy::text(
-                "Give me a tour of this project: what it does, how the code is laid out, and how to build, run and test it.",
-                "带我了解这个项目：它是做什么的、代码如何组织，以及如何构建、运行和测试。",
-                "帶我了解這個專案：它是做什麼的、程式碼如何組織，以及如何建置、執行和測試。",
-            ),
-        },
-        Starter {
-            icon: icon!("list-checks"),
-            title: copy::text("Review my changes", "审查当前改动", "審查目前變更"),
-            caption: copy::text(
-                "Find problems in the working tree",
-                "检查工作区里尚未提交的修改",
-                "檢查工作區裡尚未提交的修改",
-            ),
-            prompt: copy::text(
-                "Review the uncommitted changes in the working tree. Point out bugs, risky edits and anything that needs a test.",
-                "审查工作区中尚未提交的改动，指出其中的缺陷、有风险的修改，以及需要补充测试的地方。",
-                "審查工作區中尚未提交的變更，指出其中的缺陷、有風險的修改，以及需要補充測試的地方。",
-            ),
-        },
-        Starter {
-            icon: icon!("wrench"),
-            title: copy::text("Fix a problem", "修复一个问题", "修復一個問題"),
-            caption: copy::text(
-                "Say what goes wrong and trace the cause",
-                "描述现象，定位原因并修复",
-                "描述現象，定位原因並修復",
-            ),
-            prompt: copy::text(
-                "Something is not working as expected. Here is what happens: ",
-                "有个地方的行为不符合预期，现象是：",
-                "有個地方的行為不符合預期，現象是：",
-            ),
-        },
-    ]
-}
-
 /// The page under the conversation's header while a session is being
 /// written: the blank canvas, the prompt card, and the sheets its choices
 /// open.
@@ -143,7 +97,6 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
     let picker = signal(None::<Picker>);
     let location = signal(Location::Workspace);
     let runtime_panel = signal(RuntimePanel::Model);
-    let input = element_ref();
     let error = host.error;
     let busy = host.busy;
     let workspace = host.workspace;
@@ -152,6 +105,14 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
     let runtime_summary = runtime.summary;
     let runtime_busy = runtime.busy;
     let on_open_runtime = runtime.on_open.clone();
+    let on_open_runtime_hero = runtime.on_open.clone();
+    let commands = host.commands;
+    let mentions = host.mentions;
+    let skills = host.skills;
+    let on_command_query = host.on_command_query.clone();
+    let on_mention_query = host.on_mention_query.clone();
+    let on_skill_query = host.on_skill_query.clone();
+    let on_arm_entry = host.on_arm_entry.clone();
     let workspace_name = move || {
         workspaces.with(|choices| {
             workspace
@@ -216,14 +177,26 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
         .flex_col()
         .pb_keyboard()
         .child(canvas(
-            prompt,
-            input,
+            runtime_summary,
+            move || busy.get() || runtime_busy.get(),
+            move || {
+                dismiss_keyboard();
+                runtime_panel.set(RuntimePanel::Model);
+                on_open_runtime_hero();
+            },
             location_icon,
             location_label,
             move || {
                 dismiss_keyboard();
                 picker.set(Some(Picker::Location));
             },
+        ))
+        .child(session::composer_palettes(
+            prompt,
+            commands,
+            mentions,
+            skills,
+            on_arm_entry,
         ))
         .child(
             view()
@@ -292,10 +265,21 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
                                 ))
                             },
                         ))
-                        .child(
-                            compose::field(prompt, compose::placeholder(), |_: &str| {})
-                                .element_ref(&input),
-                        )
+                        .child(compose::field(
+                            prompt,
+                            compose::placeholder(),
+                            move |text: &str| {
+                                session::trigger_composer_palettes(
+                                    text,
+                                    commands,
+                                    mentions,
+                                    skills,
+                                    &on_command_query,
+                                    &on_mention_query,
+                                    &on_skill_query,
+                                );
+                            },
+                        ))
                         .child(
                             compose::controls()
                                 .child(compose::add_button(
@@ -449,12 +433,13 @@ pub fn new_session(host: NewSessionHost) -> impl IntoElement {
         ))
 }
 
-/// Where the messages will be: a greeting, the workspace picker, and a few
-/// ways to begin. The starters give way to the keyboard; the greeting and
-/// workspace picker stay.
+/// Where the messages will be: the centered Vibex lockup, the slogan naming the
+/// chosen Agent (tapping its logo opens Session settings), and the workspace
+/// selector centered below.
 fn canvas(
-    prompt: Signal<String>,
-    input: ElementRef,
+    runtime_summary: Signal<Option<RuntimeSummaryView>>,
+    runtime_disabled: impl Fn() -> bool + 'static,
+    on_open_runtime: impl Fn() + 'static,
     location_icon: impl Fn() -> ImageSrc + 'static,
     location_label: impl IntoReactive<SharedString>,
     on_choose_location: impl Fn() + 'static,
@@ -463,44 +448,22 @@ fn canvas(
         .flex_1()
         .min_h(px(0.0))
         .overflow_hidden()
+        .items_center()
         .justify_center()
         .px(px(theme::SPACING_XL))
-        .gap(px(theme::SPACING_SM))
-        .child(
-            view()
-                .size(px(44.0))
-                .mb(px(theme::SPACING_SM))
-                .rounded(px(theme::RADIUS_BUTTON))
-                .bg(theme::fill)
-                .items_center()
-                .justify_center()
-                .child(brand::mark(22.0)),
-        )
-        .child(
-            text(copy::text(
-                "What are we working on?",
-                "这次要做点什么？",
-                "這次要做點什麼？",
-            ))
-            .text_size(px(theme::font_greeting()))
-            .font_weight(FontWeight::BOLD)
-            .text_color(theme::foreground),
-        )
-        .child(
-            text(copy::text(
-                "Describe the task, or begin with one of these.",
-                "描述要做的事，或者从下面选一个开始。",
-                "描述要做的事，或者從下面選一個開始。",
-            ))
-            .text_size(px(theme::font_detail()))
-            .line_height(theme::line_height_for(theme::font_detail()))
-            .text_color(theme::text_secondary),
-        )
+        .gap(px(theme::SPACING_MD))
+        .child(brand::wordmark_at(theme::font_wordmark()))
+        .child(slogan_line(
+            runtime_summary,
+            runtime_disabled,
+            on_open_runtime,
+        ))
         .child(
             view()
                 .w_full()
                 .flex_row()
                 .items_center()
+                .justify_center()
                 .pt(px(theme::SPACING_SM))
                 .child(
                     button()
@@ -545,30 +508,78 @@ fn canvas(
                         ),
                 ),
         )
-        .child(when(
-            move || keyboard_height().0 == 0.0,
-            move || {
-                view()
-                    .w_full()
-                    .pt(px(theme::SPACING_MD))
-                    .gap(px(theme::SPACING_SM))
-                    .children(starters().map(|starter| {
-                        let Starter {
-                            icon,
-                            title,
-                            caption,
-                            prompt: begin,
-                        } = starter;
-                        surface::card().child(
-                            surface::row_captioned(icon, title, caption, move || {
-                                prompt.set(begin.to_owned());
-                                input.focus();
-                            })
-                            .min_h(px(60.0)),
+}
+
+fn slogan_parts() -> (&'static str, &'static str) {
+    match copy::language() {
+        copy::Language::SimplifiedChinese => ("和", "开始新的工作"),
+        copy::Language::TraditionalChinese => ("和", "開始新的工作"),
+        _ => ("Start something new with", ""),
+    }
+}
+
+fn slogan_word(label: &'static str) -> impl IntoElement {
+    text(label)
+        .text_size(px(theme::font_title()))
+        .font_weight(FontWeight::SEMIBOLD)
+        .text_color(theme::foreground)
+}
+
+/// The new-session slogan carrying the selected Agent's brand mark.
+///
+/// Tapping the logo opens the unified Session settings sheet directly so the
+/// reader can switch Agent, model, or options right from the hero.
+fn slogan_line(
+    runtime_summary: Signal<Option<RuntimeSummaryView>>,
+    disabled: impl Fn() -> bool + 'static,
+    on_open_runtime: impl Fn() + 'static,
+) -> impl IntoElement {
+    let (lead, trail) = slogan_parts();
+    let mark_button = button()
+        .test_id("new-session-agent-mark")
+        .accessibility_label(copy::text("Open session settings", "打开会话设置", "開啟工作階段設定"))
+        .on_press(on_open_runtime)
+        .disabled(disabled)
+        .size(px(38.0))
+        .flex_shrink_0()
+        .items_center()
+        .justify_center()
+        .rounded(px(theme::RADIUS_CARD))
+        .active(|style| style.bg(theme::fill()).opacity(0.75))
+        .disabled_style(|style| style.opacity(0.45))
+        .child(dynamic(move || {
+            let mark = runtime_summary.with(|summary| {
+                summary.as_ref().map_or_else(
+                    || icon!("sparkles"),
+                    |summary| {
+                        session::agent_mark_svg(
+                            &summary.agent_id,
+                            &summary.agent,
+                            &summary.model_id,
                         )
-                    }))
-            },
-        ))
+                    },
+                )
+            });
+            svg(mark)
+                .size(px(28.0))
+                .flex_shrink_0()
+                .text_color(theme::foreground)
+        }));
+    let mut row = view()
+        .w_full()
+        .flex_row()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .gap(px(theme::SPACING_SM));
+    if !lead.is_empty() {
+        row = row.child(slogan_word(lead));
+    }
+    row = row.child(mark_button);
+    if !trail.is_empty() {
+        row = row.child(slogan_word(trail));
+    }
+    row
 }
 
 /// The mark a chosen row of a sheet wears at its end.
