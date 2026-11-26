@@ -910,6 +910,108 @@ function validateServerRelease() {
   assert(generator.includes("--server-artifact"), "manifest generator cannot add a server artifact");
 }
 
+// Three-part numeric comparison, used to keep the flake from claiming a
+// release the workspace has not reached yet.
+function compareVersions(left, right) {
+  const parse = (value) => value.split(".").map((part) => Number.parseInt(part, 10));
+  const a = parse(left);
+  const b = parse(right);
+  for (let index = 0; index < Math.max(a.length, b.length); index += 1) {
+    const delta = (a[index] ?? 0) - (b[index] ?? 0);
+    if (delta !== 0) return Math.sign(delta);
+  }
+  return 0;
+}
+
+// The flake republishes the Linux release binaries instead of building Vibex.
+// Keep the parts that make a prebuilt payload runnable on NixOS, the desktop
+// entry that puts Vibex in the application menu, and the release-time bump
+// under contract: a change to any of them breaks the install the issue asked
+// for, and none of it is exercised by the Rust or TypeScript gates.
+function validateNixFlake() {
+  assert(existsSync(path("flake.nix")), "the official Nix flake is missing");
+  assert(existsSync(path("flake.lock")), "the Nix flake is not locked");
+  const flake = source("flake.nix");
+  const pinned = /^\s*version = "([^"]+)";$/mu.exec(flake)?.[1];
+  // The flake is bumped after a release publishes, so between the version bump
+  // in `package.json` and the `publish-nix.yml` commit it legitimately trails
+  // the workspace. It must never run ahead: that would pin a payload the
+  // Release does not carry yet.
+  const workspaceVersion = readJson("package.json").version;
+  assert(
+    /^(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)$/u.test(pinned ?? ""),
+    `flake.nix pins a non-stable version: ${pinned}`
+  );
+  assert(
+    compareVersions(pinned, workspaceVersion) <= 0,
+    `flake.nix pins ${pinned}, ahead of the workspace ${workspaceVersion}`
+  );
+  for (const system of ["x86_64-linux", "aarch64-linux"]) {
+    const hash = new RegExp(`^\\s*${system} = "sha256-[A-Za-z0-9+/=]+";$`, "mu");
+    assert(hash.test(flake), `flake.nix has no ${system} release payload hash`);
+  }
+  for (const required of [
+    // Without these the published ELF tree cannot start on NixOS: the
+    // interpreter and RUNPATH still point at /lib64 and /usr/lib.
+    "autoPatchelfHook",
+    "runtimeDependencies",
+    // GTK reads its modules, pixbuf loaders and schemas from the environment,
+    // so the desktop binary is launched through a wrapper.
+    "wrapGAppsHook3",
+    "wrapGApp",
+    // The application-menu surface the request names.
+    "vibex-desktop.desktop",
+    "startupWMClass",
+    // The GUI resolves PDFium at ../lib/vibex-desktop/pdfium next to its own
+    // binary, the same layout every other Linux package ships.
+    "usr/lib/vibex-desktop",
+    // The terminal client ships beside the GUI so a shell user needs nothing
+    // extra; its launcher is a shell script, not an ELF.
+    "usr/bin/vibex-tui",
+    "usr/bin/vibex"
+  ]) {
+    assert(flake.includes(required), `flake.nix is missing ${required}`);
+  }
+  assert(
+    flake.includes("github:NixOS/nixpkgs/nixos-unstable"),
+    "flake.nix does not track nixpkgs-unstable"
+  );
+  assert(
+    flake.includes('vibex-${version}-linux-${arch}-deb.deb'),
+    "flake.nix no longer republishes the published Linux .deb"
+  );
+
+  const workflow = workflowSource(".github/workflows/publish-nix.yml");
+  for (const required of [
+    "types: [published]",
+    "scripts/publish-nix.mjs",
+    "flake.nix",
+    "RELEASE_PRERELEASE",
+    "gh release download",
+    "nix flake check",
+    "contents: write",
+    "nix build .#vibex",
+    "vibex-desktop.desktop"
+  ]) {
+    assert(workflow.includes(required), `Nix workflow is missing ${required}`);
+  }
+  assert(
+    workflow.includes("is not a stable x.y.z release"),
+    "Nix workflow does not refuse a prerelease tag"
+  );
+  // `publish-nix.yml` listens for `release: published`, but GitHub never starts
+  // a workflow from an event the default token produced, so the publish job has
+  // to dispatch it explicitly.
+  assert(
+    workflowSource(".github/workflows/release.yml").includes("gh workflow run publish-nix.yml"),
+    "publish workflow does not dispatch the Nix workflow; the Release event alone never reaches it"
+  );
+  const converter = source("scripts/publish-nix.mjs");
+  for (const required of ["--version", "sha256-", "flake.nix", "assertStable"]) {
+    assert(converter.includes(required), `publish-nix.mjs is missing ${required}`);
+  }
+}
+
 function validateSelfTest() {
   const tampered = source("apps/desktop/Packager.stable.toml").replace(
     'identifier = "dev.vibex.desktop"',
@@ -935,12 +1037,29 @@ function validateSelfTest() {
     rejected = true;
   }
   assert(rejected, "release checker self-test accepted bundled Wayland libraries");
+
+  const aheadFlake = source("flake.nix").replace(
+    /^\s*version = "([^"]+)";$/mu,
+    '      version = "99.0.0";'
+  );
+  rejected = false;
+  try {
+    const pinned = /^\s*version = "([^"]+)";$/mu.exec(aheadFlake)?.[1];
+    assert(
+      compareVersions(pinned, readJson("package.json").version) <= 0,
+      "fixture flake version ran ahead of the workspace"
+    );
+  } catch {
+    rejected = true;
+  }
+  assert(rejected, "release checker self-test accepted a flake pinned ahead of the workspace");
 }
 
 const checks = [
   runCheck("stable_identity", validateStableIdentity),
   runCheck("packaging", validatePackaging),
   runCheck("server_release", validateServerRelease),
+  runCheck("nix_flake", validateNixFlake),
   runCheck("ui_state_safety", validateUiStateSafety),
   runCheck("current_release_docs", validateCurrentReleaseDocs),
   runCheck("dependency_and_supply_chain", validateDependencyAndSupplyChain)

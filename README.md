@@ -343,6 +343,18 @@ Arch Linux users can install from the AUR instead, which republishes the release
 yay -S vibex-bin     # or: paru -S vibex-bin
 ```
 
+Nix users get the official flake, which packages the same release binaries for
+`x86_64-linux` and `aarch64-linux`:
+
+```bash
+nix run github:vibex-ai/vibex
+nix profile install github:vibex-ai/vibex#vibex
+```
+
+It installs the desktop entry and icon too, so Vibex appears in the application
+menu. NixOS and home-manager configurations can add the flake as an input and
+take `packages.${system}.vibex` from it.
+
 macOS and Windows packages are currently unsigned, so the first launch needs Gatekeeper or SmartScreen approval. See [Install](https://vibex.peatboy.com/docs/install) for the exact steps.
 
 ### First session

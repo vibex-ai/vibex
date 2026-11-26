@@ -1,0 +1,188 @@
+name: Publish Nix Flake
+
+# Pins the official flake to a stable GitHub Release and pushes the bump.
+#
+# The flake republishes the Linux `.deb` payloads the Release already carries;
+# it never builds Vibex from source. This job records the version and the
+# SHA-256 of both architecture payloads in `flake.nix`, proves the package builds
+# from those exact bytes with a real Nix evaluation and build, then commits the
+# single-file bump to the default branch.
+#
+# Stable only. A NixOS user pins the flake commit and reads the version from it,
+# so a prerelease would publish a package that calls itself a release while the
+# release page still calls it a candidate.
+#
+# This workflow is separate from `release.yml` so a Nix infrastructure outage
+# can never fail the GitHub Release, and so an older tag can be replayed.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Stable release tag to pin (for example v0.2.0)
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-nix-${{ github.event.release.tag_name || inputs.tag }}
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    name: Pin the Nix flake
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    permissions:
+      # The bump is a commit on the default branch, so this job needs to write
+      # contents even though the workflow default is read-only.
+      contents: write
+    steps:
+      - name: Resolve and validate the release tag
+        id: release
+        shell: bash
+        env:
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+          RELEASE_PRERELEASE: ${{ github.event.release.prerelease }}
+          INPUT_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+          tag="${RELEASE_TAG:-${INPUT_TAG:-}}"
+          if [[ -z "${tag}" ]]; then
+            echo "::error::No release tag supplied"
+            exit 1
+          fi
+          version="${tag#v}"
+          # A GitHub `release` event also fires for prereleases; the flake must
+          # never pin one.
+          if [[ "${RELEASE_PRERELEASE}" == "true" ]]; then
+            echo "::notice::${tag} is a prerelease; the flake tracks stable releases only."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          if [[ ! "${version}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::notice::${tag} is not a stable x.y.z release; the flake tracks stable releases only."
+            echo "publish=false" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          echo "publish=true" >> "${GITHUB_OUTPUT}"
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
+          echo "tag=${tag}" >> "${GITHUB_OUTPUT}"
+          echo "Pinning the flake to ${version}"
+
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: steps.release.outputs.publish == 'true'
+        with:
+          # The flake template lives on the default branch; the tagged commit
+          # itself may predate it.
+          ref: ${{ github.event.repository.default_branch }}
+          # The bump is pushed with the token below, so the checkout has to keep
+          # the credential it was cloned with rather than persist none.
+          token: ${{ github.token }}
+
+      - name: Download the release payloads once
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          src="${RUNNER_TEMP}/nix-srcdest"
+          mkdir -p "${src}"
+          gh release download "${TAG}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --dir "${src}" \
+            --pattern "vibex-${VERSION}-linux-*-deb.deb"
+          ls -l "${src}"
+          for arch in x86_64 aarch64; do
+            asset="${src}/vibex-${VERSION}-linux-${arch}-deb.deb"
+            test -s "${asset}" || { echo "::error::missing release asset ${asset}"; exit 1; }
+          done
+          echo "SRCDEST=${src}" >> "${GITHUB_ENV}"
+
+      - name: Install Nix
+        if: steps.release.outputs.publish == 'true'
+        uses: cachix/install-nix-action@382a9ed9481c7c1f94f68b72ef105b3417c73877 # v32.1.0
+        with:
+          # The build below uses `nix build`, which needs the experimental
+          # commands plus flakes.
+          extra_nix_config: |
+            experimental-features = nix-command flakes
+
+      - name: Record the release version and checksums in the flake
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          node scripts/publish-nix.mjs \
+            --version "${VERSION}" \
+            --archive-dir "${SRCDEST}" \
+            --skip-push
+
+      - name: Verify the package builds from the published payloads
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        run: |
+          set -euo pipefail
+          # `nix build` refetches every recorded hash, so a byte that drifted
+          # between the Release and the flake fails here rather than on a
+          # user's machine. The derivation unpacks the .deb, runs
+          # autoPatchelfHook over the ELF payload, and wraps the GTK desktop
+          # entry, so this step is what proves the package is runnable.
+          nix flake check
+          nix build .#vibex --no-link --print-out-paths
+          # The desktop entry is the install surface a NixOS user adds to their
+          # configuration, so a package without it is not a delivered feature.
+          output="$(nix build .#vibex --no-link --print-out-paths)"
+          test -f "${output}/share/applications/vibex-desktop.desktop"
+          test -x "${output}/bin/vibex-desktop"
+          test -x "${output}/bin/vibex-tui"
+          # Vibex resolves PDFium relative to its own binary on x86_64; the
+          # aarch64 payload carries none, so only assert it where it exists.
+          if [[ -d "${output}/lib/vibex-desktop" ]]; then
+            test -f "${output}/lib/vibex-desktop/pdfium/lib/libpdfium.so"
+          fi
+          # Run the terminal client: it links the same runtime libraries as the
+          # GUI without needing a display server, so `--help` proves the
+          # patched interpreter and RUNPATH actually resolve.
+          "${output}/bin/vibex-tui" --help >/dev/null
+
+      - name: Commit and push the flake bump
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+          TAG: ${{ steps.release.outputs.tag }}
+        run: |
+          set -euo pipefail
+          # A replay rewrites the bytes a completed run already pushed. The
+          # script treats an empty staged diff as "already pinned" instead of
+          # failing, so `git commit` never sees "nothing to commit".
+          node scripts/publish-nix.mjs \
+            --version "${VERSION}" \
+            --archive-dir "${SRCDEST}" \
+            --branch "${{ github.event.repository.default_branch }}"
+          echo "pushed the flake bump for ${TAG}"
+
+      - name: Report the pinned flake
+        if: steps.release.outputs.publish == 'true'
+        shell: bash
+        env:
+          VERSION: ${{ steps.release.outputs.version }}
+        run: |
+          set -euo pipefail
+          {
+            echo "### Nix flake pinned to ${VERSION}"
+            echo ""
+            echo 'Install it with `nix profile install github:vibex-ai/vibex` or add the flake as an input to a NixOS / home-manager configuration.'
+            echo ""
+            echo "https://github.com/vibex-ai/vibex/blob/main/flake.nix"
+          } >> "${GITHUB_STEP_SUMMARY}"

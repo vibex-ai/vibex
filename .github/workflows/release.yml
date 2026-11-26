@@ -878,3 +878,29 @@ jobs:
           else
             echo "::warning::could not dispatch publish-aur.yml for ${tag}; run it manually with -f tag=${tag}"
           fi
+      # `publish-nix.yml` listens for the same `release: published` event and is
+      # skipped by the same token rule, so the Nix flake is pinned the same
+      # explicit way. Only a stable release moves it: NixOS users pin the flake
+      # commit and read the version from it, so a candidate would publish a
+      # package that calls itself a release while the release page disagrees.
+      - name: Pin the Nix flake
+        if: steps.release.outputs.channel == 'stable'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ steps.release.outputs.tag }}"
+          # As above: a failure here must not fail a release whose artifacts are
+          # already published, and the workflow can be replayed for this tag.
+          #
+          # No `--ref`: the dispatch runs from the default branch, where
+          # `publish-nix.yml` and `flake.nix` exist. Dispatching at the tag would
+          # fail for any release cut before this workflow landed, which is
+          # exactly the replay case
+          # (`gh workflow run publish-nix.yml -f tag=v0.1.9`).
+          if gh workflow run publish-nix.yml -f tag="${tag}"; then
+            echo "dispatched publish-nix.yml for ${tag}"
+          else
+            echo "::warning::could not dispatch publish-nix.yml for ${tag}; run it manually with -f tag=${tag}"
+          fi

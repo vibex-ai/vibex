@@ -342,6 +342,15 @@ Arch Linux 用户也可以直接从 AUR 安装：该包由正式版的 `.deb` �
 yay -S vibex-bin     # 或：paru -S vibex-bin
 ```
 
+Nix 用户使用官方 flake：它同样打包发布出来的 Linux 二进制，覆盖 `x86_64-linux` 与 `aarch64-linux`。
+
+```bash
+nix run github:vibex-ai/vibex
+nix profile install github:vibex-ai/vibex#vibex
+```
+
+它还会安装 `.desktop` 文件与图标，因此 Vibex 会出现在应用菜单里。NixOS 与 home-manager 配置可以把该 flake 作为 input，并取用其中的 `packages.${system}.vibex`。
+
 macOS 和 Windows 安装包目前没有代码签名，首次打开需要 Gatekeeper 或 SmartScreen 放行。具体步骤见[安装](https://vibex.peatboy.com/docs/install)。
 
 ### 第一次会话

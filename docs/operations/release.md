@@ -432,3 +432,55 @@ node scripts/publish-aur.mjs --version 0.2.0 --dry-run
 Configure the repository secret `AUR_SSH_PRIVATE_KEY` with the private key whose
 public half is registered on the AUR account that owns `vibex-bin`. The workflow
 pins the AUR host keys instead of scanning them.
+
+## Nix flake
+
+`.github/workflows/publish-nix.yml` pins the official `flake.nix` to a stable
+GitHub Release, independently of `release.yml`: a Nix infrastructure outage must
+not withhold the release, and a single older tag can be replayed with
+`workflow_dispatch`.
+
+The flake republishes the Linux binaries the Release already carries instead of
+building Vibex from source, so the package is the same reviewed payload every
+other Linux channel ships:
+
+1. It refuses anything that is not a stable `x.y.z` tag. NixOS users pin the
+   flake commit and read the version from it, so an rc would publish a package
+   that calls itself a release while the release page still calls it a
+   candidate.
+2. `scripts/publish-nix.mjs` writes `version` and the SHA-256 (Nix SRI form) of
+   the x86_64 and aarch64 `.deb` payloads into `flake.nix`.
+3. `nix flake check` and `nix build .#vibex` build the package from those exact
+   bytes, so a payload that drifted from the Release fails in CI. The build runs
+   `autoPatchelfHook` over the ELF tree and wraps the GTK desktop binary, and
+   the dependency set is derived from the payload's `NEEDED` entries plus the
+   libraries GPUI dlopens (Vulkan loader, libEGL, Wayland client, X11/XCB,
+   libxkbcommon, fontconfig/freetype, dbus, systemd).
+4. The job commits the single-file bump to the default branch.
+
+The package installs the GUI, the `vibex` terminal client and its `vibex-tui`
+launcher, the PDFium payload at the layout the GUI resolves it from, and a
+visible desktop entry plus the hicolor icons, so Vibex appears in the
+application menu without any `NoDisplay=true` entry shadowing it.
+
+Users install it from the flake:
+
+```bash
+nix run github:vibex-ai/vibex
+nix profile install github:vibex-ai/vibex#vibex
+```
+
+Local dry run before a release:
+
+```bash
+node scripts/publish-nix.mjs --version 0.2.0 --dry-run
+```
+
+The workflow uses the repository-scoped `GITHUB_TOKEN`; no extra secret is
+required. The bump is a bot-authored commit on the default branch, so branch
+protection must allow `github-actions[bot]` to push (or the workflow will have
+to open a pull request instead).
+
+NixOS supplies the graphics driver through `/run/opengl-driver`; `libglvnd` and
+`vulkan-loader` are on the package RUNPATH and pick the host Mesa/NVIDIA driver
+up at runtime, which is why no driver is bundled.

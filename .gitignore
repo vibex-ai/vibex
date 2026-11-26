@@ -32,6 +32,10 @@ packaging/aur/*/vibex-*
 *.db-shm
 *.db-wal
 
+# `nix build` leaves this symlink in the repository root.
+/result
+/result-*
+
 # Local controlled-environment E2E state (credentials, harness homes, relay logs)
 .e2e-local-env/
 
