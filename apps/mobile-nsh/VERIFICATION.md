@@ -56,7 +56,7 @@ anything that needs a runtime or a phone are listed at the bottom.
 | iOS camera attachment | `ios/Vibex/CameraCapture.swift`, `attach_camera_photo` | ABI + branch checks | none | take a photo into the composer, HEIC/JPEG, permission refusal |
 | iOS share intake | `ios/VibexShare`, `ios/Vibex/ShareIntake.swift` | syntax; the App Group agrees on both sides and in both entitlements | none | share text/a link from Safari and Notes, cold start included |
 | iOS quick action | `ios/Vibex/AppDelegate.swift` | branch check (`vibex_mobile_nsh_new_session`) | none | long-press the icon and start a new session |
-| iOS background | `ios/Vibex/HostBridge.swift`, `take_connection_service` | ABI + branch checks | none | a turn that finishes after backgrounding still notifies |
+| iOS background | `ios/Vibex/HostBridge.swift`, `take_connection_service` | ABI + branch checks | none | backgrounding mid-turn, and what the app shows when the assertion expires |
 | iOS notifications | nsh's `notifications`, `vibex_mobile_nsh_install_notifications` | install called before `attach` (checked) | none | permission prompt, a press from a cold start opens the session |
 | Packaging | `scripts/build-{android,ios}.sh` | `bash -n` | syntax only | `nsh package`, signing, store upload |
 

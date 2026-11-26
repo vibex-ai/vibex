@@ -73,7 +73,7 @@ discovery, the composer camera, notifications, a share extension, a Home Screen
 quick action and a background task stand in for the Android host's equivalents
 (see "The iOS host" below). iOS has no foreground service, so "stay connected"
 is a `beginBackgroundTask` assertion for as long as the system allows rather
-than a service that keeps running; the settings entry says so.
+than a service that keeps running.
 
 ### The session shell
 
@@ -340,10 +340,11 @@ what shows.
 iOS has no foreground service, so "stay connected in the background" is the
 nearest equivalent: `HostBridge` holds a `beginBackgroundTask` assertion while
 a runtime is connected, which keeps the process runnable for as long as iOS
-allows (about 30 seconds, extended by the system when it sees fit). A turn that
-completes after that still posts its notification from the app's next
-wake-up; it is not the always-on service Android gets, and the app does not
-pretend otherwise.
+allows (about 30 seconds). When the assertion expires the system suspends the
+app: the connection stops, a turn still in flight cannot land, and nothing
+notifies until the person opens the app again. That is a real difference from
+the always-on service Android gets, and it is the reason the iOS build should
+finish a turn before it goes away rather than rely on the background.
 
 ## Theme
 
