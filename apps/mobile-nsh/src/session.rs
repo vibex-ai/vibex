@@ -221,10 +221,15 @@ pub struct SessionService {
     question_request: Rc<RefCell<Option<ElicitationRequest>>>,
     commands: Signal<Vec<CommandEntry>>,
     commands_loaded: Rc<Cell<bool>>,
+    /// What the `/` read answered, kept so a prefix the reader left and came
+    /// back to fills the palette again without a second request.
+    commands_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     mentions: Signal<Vec<CommandEntry>>,
     mentions_loaded: Rc<Cell<bool>>,
+    mentions_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     skills: Signal<Vec<CommandEntry>>,
     skills_loaded: Rc<Cell<bool>>,
+    skills_catalog: Rc<RefCell<Vec<CommandEntry>>>,
     /// The raw entries behind the palettes, for arming a command or reference.
     entry_catalog: Rc<RefCell<BTreeMap<String, AgentCommandEntry>>>,
     armed_command: Rc<RefCell<Option<AgentCommandEntry>>>,
@@ -498,10 +503,13 @@ impl SessionService {
             question_request: Rc::new(RefCell::new(None)),
             commands: signal(Vec::new()),
             commands_loaded: Rc::new(Cell::new(false)),
+            commands_catalog: Rc::new(RefCell::new(Vec::new())),
             mentions: signal(Vec::new()),
             mentions_loaded: Rc::new(Cell::new(false)),
+            mentions_catalog: Rc::new(RefCell::new(Vec::new())),
             skills: signal(Vec::new()),
             skills_loaded: Rc::new(Cell::new(false)),
+            skills_catalog: Rc::new(RefCell::new(Vec::new())),
             entry_catalog: Rc::new(RefCell::new(BTreeMap::new())),
             armed_command: Rc::new(RefCell::new(None)),
             armed_mentions: Rc::new(RefCell::new(Vec::new())),
@@ -2164,10 +2172,13 @@ impl SessionService {
         *self.question_request.borrow_mut() = None;
         self.commands.set(Vec::new());
         self.commands_loaded.set(false);
+        self.commands_catalog.borrow_mut().clear();
         self.mentions.set(Vec::new());
         self.mentions_loaded.set(false);
+        self.mentions_catalog.borrow_mut().clear();
         self.skills.set(Vec::new());
         self.skills_loaded.set(false);
+        self.skills_catalog.borrow_mut().clear();
         self.armed_command.borrow_mut().take();
         self.armed_mentions.borrow_mut().clear();
         self.error.set(None);
@@ -2345,31 +2356,86 @@ impl SessionService {
         let backend = self.backend.clone();
         spawn(async move {
             let requested = session_id.clone();
-            let result = crate::runtime::handle()
-                .spawn(async move {
-                    let state = backend.runtime_selection(requested.clone()).await?;
-                    let catalog = backend.list_runtime_options().await?;
-                    Ok::<_, BackendError>((state, catalog))
+            // The selection and the catalogue are two reads with different
+            // costs, and the composer's chip needs only the first: it names
+            // the Agent and the model the session is set to, and its mark is
+            // resolved from the model id that read carries. Awaiting them as
+            // one step meant a slow — or failing — catalogue left the chip on
+            // its "Model" placeholder until the reader opened the picker,
+            // which is what made the header look unloaded on arrival.
+            let state = crate::runtime::handle()
+                .spawn({
+                    let backend = backend.clone();
+                    async move { backend.runtime_selection(requested).await }
                 })
                 .await;
-            if let Ok(Ok((state, catalog))) = result {
-                service.apply_runtime(&session_id, state, catalog);
+            if let Ok(Ok(state)) = state {
+                service.apply_runtime_selection(&session_id, state);
+            }
+            let catalog = crate::runtime::handle()
+                .spawn(async move { backend.list_runtime_options().await })
+                .await;
+            if let Ok(Ok(catalog)) = catalog {
+                service.apply_runtime_catalog(&session_id, catalog);
             }
         });
     }
 
-    fn apply_runtime(
+    /// Takes the session's selection: enough for the composer's chip.
+    ///
+    /// The chip names the Agent and the model and draws the model's mark, all
+    /// of which this read answers. The picker's lists wait for the catalogue,
+    /// so the chip no longer waits behind a read it does not need.
+    fn apply_runtime_selection(
         &self,
         session_id: &VibexSessionId,
         state: AgentSessionRuntimeSelectionState,
-        catalog: SessionRuntimeOptionCatalog,
     ) {
         if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
             return;
         }
         self.runtime_state.replace(Some(state.clone()));
+        // A catalogue already held is reused, so a selection that arrives
+        // second still resolves its labels against the options on hand.
+        if let Some(catalog) = self.runtime_catalog.get_untracked() {
+            self.rebuild_runtime_views(&state.desired, &catalog);
+        } else {
+            self.rebuild_runtime_summary(&state.desired, &[]);
+        }
+    }
+
+    /// Takes the runtime's catalogue: the picker's lists, and the labels and
+    /// marks a held selection resolves against.
+    fn apply_runtime_catalog(
+        &self,
+        session_id: &VibexSessionId,
+        catalog: SessionRuntimeOptionCatalog,
+    ) {
+        if self.active.get_untracked().as_deref() != Some(session_id.as_str()) {
+            return;
+        }
         self.runtime_catalog.set(Some(catalog.clone()));
-        self.rebuild_runtime_views(&state.desired, &catalog);
+        // The selection is cloned out before anything writes: the rebuild
+        // touches signals, and a borrow held across it would panic if one of
+        // their subscribers read the state back.
+        let desired = self
+            .runtime_state
+            .borrow()
+            .as_ref()
+            .map(|state| state.desired.clone());
+        if let Some(desired) = desired {
+            self.rebuild_runtime_views(&desired, &catalog);
+        }
+    }
+
+    /// Writes the chip's summary from the selection alone.
+    fn rebuild_runtime_summary(
+        &self,
+        selection: &SessionRuntimeSelection,
+        options: &[SessionRuntimeOption],
+    ) {
+        let views = build_runtime_views(Some(selection), options);
+        self.runtime_summary.set(views.summary);
     }
 
     fn rebuild_runtime_views(
@@ -4236,6 +4302,13 @@ impl SessionService {
     /// person keeps typing, so typing does not make a request per keystroke.
     fn query_commands(&self, _query: &str) {
         if self.commands_loaded.get() {
+            let refill = refill_palette(
+                &self.commands_catalog.borrow(),
+                &self.commands.get_untracked(),
+            );
+            if let Some(entries) = refill {
+                self.commands.set(entries);
+            }
             return;
         }
         let Some(active) = self.active.get_untracked() else {
@@ -4265,7 +4338,9 @@ impl SessionService {
                 .await;
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
-                service.commands.set(command_entries(discovery));
+                let entries = command_entries(discovery);
+                *service.commands_catalog.borrow_mut() = entries.clone();
+                service.commands.set(entries);
             }
         });
     }
@@ -4460,6 +4535,13 @@ impl SessionService {
     /// locally while the person types.
     fn query_mentions(&self, _query: &str) {
         if self.mentions_loaded.get() {
+            let refill = refill_palette(
+                &self.mentions_catalog.borrow(),
+                &self.mentions.get_untracked(),
+            );
+            if let Some(entries) = refill {
+                self.mentions.set(entries);
+            }
             return;
         }
         let Some(active) = self.active.get_untracked() else {
@@ -4490,6 +4572,7 @@ impl SessionService {
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
                 let entries = command_entries(discovery);
+                *service.mentions_catalog.borrow_mut() = entries.clone();
                 service.mentions.set(entries);
             }
         });
@@ -4498,6 +4581,13 @@ impl SessionService {
     /// Loads the `$` skills the open session offers.
     fn query_skills(&self, _query: &str) {
         if self.skills_loaded.get() {
+            let refill = refill_palette(
+                &self.skills_catalog.borrow(),
+                &self.skills.get_untracked(),
+            );
+            if let Some(entries) = refill {
+                self.skills.set(entries);
+            }
             return;
         }
         let Some(active) = self.active.get_untracked() else {
@@ -4527,7 +4617,9 @@ impl SessionService {
                 .await;
             if let Ok(Ok(discovery)) = result {
                 service.remember_entries(&discovery);
-                service.skills.set(command_entries(discovery));
+                let entries = command_entries(discovery);
+                *service.skills_catalog.borrow_mut() = entries.clone();
+                service.skills.set(entries);
             }
         });
     }
@@ -8956,6 +9048,17 @@ fn command_entries(discovery: vibex_core::AgentCommandDiscovery) -> Vec<CommandE
     entries
 }
 
+/// What a palette should show when its prefix is typed again.
+///
+/// The screen empties a palette's list the moment the draft stops looking like
+/// that prefix, and the service reads the catalogue once per session. So a
+/// prefix the reader deleted and retyped has to be served from the read
+/// already made: `None` means there is nothing to refill from, and the palette
+/// stays shut — the bug this answers.
+fn refill_palette(held: &[CommandEntry], shown: &[CommandEntry]) -> Option<Vec<CommandEntry>> {
+    (!held.is_empty() && shown.is_empty()).then(|| held.to_vec())
+}
+
 /// The card the phone shows for a pending question.
 fn pending_question(request: &ElicitationRequest) -> PendingQuestion {
     PendingQuestion {
@@ -9352,6 +9455,11 @@ fn build_runtime_views(
             RuntimeModelSelection::Explicit { model_id } => model_id.clone(),
             _ => copy::text("Default", "默认", "預設").to_owned(),
         };
+        // The chip's mark is the model's own brand, so a session left on the
+        // Agent's default still has to name a model to draw: the option the
+        // catalogue matched answers with the model the Agent would run, and
+        // only when no option matches does the id stay empty (the mark then
+        // falls back to the Agent's, then to the sparkle).
         let model_id = option
             .and_then(|option| option.selection.model.model_id())
             .or_else(|| selection.model.model_id())
@@ -9950,6 +10058,35 @@ mod tests {
     /// Answering appends a resolution row and leaves the request's own row
     /// `pending`, so a client that reads only the request keeps offering a form
     /// the runtime has taken — and every press comes back "no longer pending".
+    /// A prefix typed again fills its palette from the one read already made.
+    ///
+    /// The screen clears a palette's list as soon as the draft stops matching
+    /// its prefix, while the service reads the catalogue once per session. A
+    /// refill that only checked "already loaded" left the list empty for good:
+    /// `/`, `@` or `$` deleted and retyped never opened the palette again.
+    #[test]
+    fn a_cleared_palette_refills_from_the_read_already_made() {
+        use super::{refill_palette, CommandEntry};
+        let entry = |id: &str| CommandEntry {
+            id: id.to_owned(),
+            label: id.to_owned(),
+            description: String::new(),
+            insertion: format!("/{id} "),
+        };
+        let held = vec![entry("review"), entry("test")];
+        // Cleared by the screen, catalogue in hand: refill it.
+        assert_eq!(
+            refill_palette(&held, &[]),
+            Some(held.clone()),
+            "a cleared palette is filled again from the catalogue"
+        );
+        // Still showing: nothing to do, and nothing is disturbed.
+        assert_eq!(refill_palette(&held, &held), None);
+        // Never read: there is nothing to refill from, so the caller must not
+        // pretend the palette has content.
+        assert_eq!(refill_palette(&[], &[]), None);
+    }
+
     #[test]
     fn a_resolution_retires_the_request_it_answers() {
         use vibex_core::{

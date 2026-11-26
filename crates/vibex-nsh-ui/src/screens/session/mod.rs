@@ -8707,3 +8707,45 @@ fn insert_skill(text: &str, insertion: &str) -> String {
 fn icon(markup: &'static str) -> ImageSrc {
     ImageSrc::svg_markup(markup)
 }
+
+#[cfg(test)]
+mod tests {
+    /// The composer's chip wears the selected model's own brand mark.
+    ///
+    /// It used to fall back to the generic sparkle for every model, because
+    /// the mark was resolved from a summary that arrived with the catalogue
+    /// rather than with the selection. The resolution itself is what this
+    /// pins: a model id the brand tables know must answer that brand's own
+    /// mark, not the fallback.
+    #[test]
+    fn a_known_model_resolves_its_brand_mark() {
+        let fallback = icon!("sparkles");
+        for model in [
+            "claude-sonnet-4-5",
+            "gpt-5",
+            "gemini-2.5-pro",
+            "qwen3-coder",
+            "deepseek-chat",
+        ] {
+            let mark = super::runtime_mark_svg(model, "");
+            assert_ne!(
+                mark, fallback,
+                "`{model}` draws its own brand mark, not the sparkle"
+            );
+        }
+    }
+
+    /// An unknown model still draws something, and the Agent answers next.
+    ///
+    /// A model the tables do not know leaves the Agent's mark; an Agent they
+    /// do not know either leaves the sparkle, so the chip is never blank.
+    #[test]
+    fn an_unknown_model_falls_back_to_the_agent_then_the_sparkle() {
+        let sparkle = icon!("sparkles");
+        let unknown_model = super::runtime_mark_svg("no-such-model-xyz", "");
+        assert_eq!(unknown_model, sparkle, "nothing left to draw");
+
+        let agent = super::runtime_mark_svg("no-such-model-xyz", "claude");
+        assert_ne!(agent, sparkle, "the Agent's own mark answers second");
+    }
+}
