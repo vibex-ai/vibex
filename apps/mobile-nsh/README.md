@@ -50,22 +50,30 @@ The page is backed by a real pairing service:
   each runtime's reachability;
 - paste reads the system clipboard through `nsh`.
 
-Scan and Find work in the app itself, without a Kotlin or Swift host:
+Scan and Find are native on both phones:
 
-- **Scan** uses the camera in the custom Android host (`android/`): the host
-  polls the app's request queue, opens the scanner and reports the code back
-  over JNI. The scanner matches the GPUI client's: portrait, a scrimmed
-  viewfinder with corner brackets, close, the pairing hint, and "Choose from
-  photos" for a screenshot (a picked image without a `vibex://` pairing entry
-  says so and keeps the scanner open). Without a host (or on iOS today) the
-  app falls back to the system photo picker and `rqrr`; nsh 0.6.0 gives a Rust
-  app's WebView no camera capability, which is why the host owns the camera.
-- **Find** uses the host's Android NSD when the custom host is present (with
-  the `NEARBY_WIFI_DEVICES` permission), and falls back to browsing
-  `_vibex._tcp.local.` in Rust with `mdns-sd`. Both validate the zero-config
-  TXT record, list the runtimes they resolve, and start a
+- **Scan** uses the custom host's camera (`android/` with Android's camera,
+  `ios/` with AVFoundation): the host polls the app's request queue, opens the
+  scanner and reports the code back through the host ABI. Both scanners match
+  the GPUI client's: portrait, a scrimmed viewfinder with corner brackets,
+  close, the pairing hint, and "Choose from photos" for a screenshot (a picked
+  image without a `vibex://` pairing entry says so and keeps the scanner
+  open). Without a host the app falls back to the system photo picker and
+  `rqrr`; nsh gives a Rust app's views no camera capability, which is why the
+  host owns the camera.
+- **Find** uses the host's discovery when the custom host is present (Android
+  NSD with the `NEARBY_WIFI_DEVICES` permission, Bonjour on iOS), and falls
+  back to browsing `_vibex._tcp.local.` in Rust with `mdns-sd`. Both validate
+  the zero-config TXT record, list the runtimes they resolve, and start a
   `ZeroConfigLanPairingSession` on tap; the desktop must approve the six-digit
   code the sheet shows.
+
+The iOS host is a first-class shell, not a fallback: the scanner, Bonjour
+discovery, the composer camera, notifications, a share extension, a Home Screen
+quick action and a background task stand in for the Android host's equivalents
+(see "The iOS host" below). iOS has no foreground service, so "stay connected"
+is a `beginBackgroundTask` assertion for as long as the system allows rather
+than a service that keeps running; the settings entry says so.
 
 ### The session shell
 
@@ -158,15 +166,22 @@ host keeps its native integrations; see "Embedding in the existing shells".
 here wrap it with the toolchain checks that make a failure actionable:
 
 ```sh
-apps/mobile-nsh/scripts/build-android.sh   # needs ANDROID_HOME and an NDK
-apps/mobile-nsh/scripts/build-ios.sh       # needs Xcode
+apps/mobile-nsh/scripts/build-android.sh        # needs ANDROID_HOME and an NDK
+apps/mobile-nsh/scripts/build-android-host.sh   # the Kotlin host around the library
+apps/mobile-nsh/scripts/build-ios.sh            # the nsh runner, needs Xcode
+apps/mobile-nsh/scripts/build-ios-host.sh       # the Swift host around the library
 ```
 
-Both forward extra arguments to `nsh package`, so `--run`, `--release` or a
-signing flag go through unchanged. Signing, the App Store/Play upload and the
-store metadata stay with the generated Gradle/Xcode projects (or a release CI
-step) rather than this repository; the app's name, id and version live in
-`nsh.json`, and the theme is generated from the design tokens (see "Theme").
+The two `build-*-host.sh` scripts are the ones that ship: they build the Rust
+library for each phone and package the custom host app that owns the native
+integrations (`android/`, `ios/`). They take extra `xcodebuild` arguments (iOS)
+or a `GRADLE` binary (Android). `build-ios.sh` and `build-android.sh` stay for
+the `nsh` CLI's own runners, which are how a screen is iterated on.
+
+Signing, the App Store/Play upload and the store metadata stay with the
+generated Gradle/Xcode projects (or a release CI step) rather than this
+repository; the app's name, id and version live in `nsh.json`, and the theme is
+generated from the design tokens (see "Theme").
 
 The Android path was exercised on a Linux machine with `nsh` 0.6.0, the
 Android SDK (platform/build-tools 35) and NDK 27.2: `nsh package` produced a
@@ -174,9 +189,16 @@ debug-signed universal APK (arm64-v8a, armeabi-v7a, x86_64). A build of the
 same app installs and opens the pairing page and its Link sheet on an API 35
 x86_64 emulator, and the universal APK installs and launches there too. The
 custom host was rebuilt with `nsh` 0.6.1 — crates, embed AAR and all three
-ABIs — and still packages a release APK. A store release needs `--keystore`;
-iOS still needs macOS and Xcode, so both the iOS build and its packaging
-script remain unverified here.
+ABIs — and still packages a release APK. A store release needs `--keystore`.
+
+The iOS host (`ios/`) is written but has never been built: this machine has no
+Xcode, so what is checked here is the Rust iOS target (`cargo check` and
+`clippy` for `aarch64-apple-ios`), the Swift sources' syntax, and the C ABI
+between them (`tests/ios_host_abi.rs`). `scripts/build-ios-host.sh` builds the
+static library for the device and the Apple-silicon simulator, merges it with
+`lipo`, generates `Vibex.xcodeproj` from `project.yml` with XcodeGen, and
+builds the app and its share extension. The first Mac run is expected to find
+the remaining Swift/API mismatches; none of them can be filed from here.
 
 ## Tests
 
@@ -244,15 +266,26 @@ NshHost.nativeRunRoot(handle)
 The `handle` field is the `NshView`'s native handle that nsh documents for
 custom Rust hosts; reading it is the only package-private access involved.
 
-**iOS** (Swift, with the symbols declared in the bridging header):
+**iOS**: `ios/` holds the shipping shell, and its ABI is declared in
+`ios/Headers/VibexMobile.h` (imported through
+`ios/Vibex/Vibex-Bridging-Header.h`). A host of its own needs the same five
+calls the Android one does:
 
 ```swift
+vibex_mobile_nsh_install_notifications()       // before the app finishes launching
 vibex_mobile_nsh_set_device_name(UIDevice.current.name)
 let app = vibex_mobile_nsh_attach(container)
 vibex_mobile_nsh_scan_result(payload)          // a scanned pairing link
 vibex_mobile_nsh_discovery_event(json)         // one discovery event
 vibex_mobile_nsh_detach(app)                   // when the shell goes away
 ```
+
+`vibex_mobile_nsh_set_{scanner,camera,discovery}_available` say which
+integrations the host carries, and `vibex_mobile_nsh_camera_photo` /
+`_camera_failed` / `_share_text` / `_new_session` answer the rest. The whole
+set is checked against the Rust exports and the Swift call sites by
+`tests/ios_host_abi.rs`, so a renamed symbol fails `cargo test` on Linux
+instead of at link time on a Mac.
 
 The app asks the shell to act through a small polled queue: the Scan entry
 queues "open the camera" and the Find sheet queues "start discovery". The
@@ -277,10 +310,40 @@ default: break
 }
 ```
 
-The custom host in `android/` is the reference: it mounts the app, reports the
-device name, and answers Scan with its camera through `nativeScanResult`. A
-host that supplies no camera leaves Scan on the photo picker; the app does not
-require one.
+The shells in `android/` and `ios/` are the reference implementations: each
+mounts the app, reports the device name, and answers the queue with its own
+camera and discovery. A host that supplies no camera leaves Scan on the photo
+picker; the app does not require one.
+
+## The iOS host
+
+`ios/` is a small Swift app (`project.yml` generates `Vibex.xcodeproj` with
+XcodeGen) around the same Rust library the Android host mounts:
+
+| File | What it does |
+| --- | --- |
+| `Vibex/AppDelegate.swift` | The window, mounting the app, URLs, the quick action, foreground/background |
+| `Vibex/HostBridge.swift` | Polls the request queue; answers scan, Find, camera, settings, screen-awake and background |
+| `Vibex/PairingScannerViewController.swift` | The pairing scanner (AVFoundation), gallery decode (Vision) |
+| `Vibex/LanDiscovery.swift` | Bonjour browsing of `_vibex._tcp`, emitting the discovery JSON contract |
+| `Vibex/CameraCapture.swift` | The composer's camera (`UIImagePickerController`), writing a JPEG for the app |
+| `Vibex/ShareIntake.swift` | Reads what the share extension left in the App Group container |
+| `VibexShare/ShareViewController.swift` | The "Share to Vibex" extension: writes the text, opens `vibex://share` |
+| `Resources/Info.plist` | The `vibex` scheme, Bonjour, the camera/photo/local-network usage strings |
+| `Vibex.entitlements`, `VibexShare.entitlements` | The App Group both sides share |
+
+Notifications are nsh's: `vibex_mobile_nsh_install_notifications` makes the
+platform's notification center the app's delegate before it launches, so a
+press that starts the process is delivered, and the app's own settings decide
+what shows.
+
+iOS has no foreground service, so "stay connected in the background" is the
+nearest equivalent: `HostBridge` holds a `beginBackgroundTask` assertion while
+a runtime is connected, which keeps the process runnable for as long as iOS
+allows (about 30 seconds, extended by the system when it sees fit). A turn that
+completes after that still posts its notification from the app's next
+wake-up; it is not the always-on service Android gets, and the app does not
+pretend otherwise.
 
 ## Theme
 

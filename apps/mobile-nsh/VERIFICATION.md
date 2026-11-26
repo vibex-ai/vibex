@@ -22,8 +22,8 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Area | Where it lives | Automated coverage | Verified on this machine | Confirm on device |
 | --- | --- | --- | --- | --- |
 | Pairing page, link, bare-code error | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs`, `crates/vibex-mobile-pairing` | 8 headless page tests, 14 pairing-crate tests | headless + unit | paste, clipboard, real claim round-trip |
-| Scan a QR code | `android/ScannerActivity.java`, `screens/pairing.rs`, `scan_photo` | emulator: portrait scanner with viewfinder/close/hint, camera permission, gallery decode (a picked QR was decoded; a non-Vibex code was rejected in place), host→app JNI result exercised | emulator | scan a real desktop QR on a phone |
-| Find runtimes on the LAN | `android/LanDiscovery.java`, `src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules; emulator: host NSD permission, Searching, empty state with Try Again, verification code and countdown | emulator: permission + browsing start + empty state | discovery and approval against a desktop on the same LAN |
+| Scan a QR code | `android/ScannerActivity.java`, `ios/Vibex/PairingScannerViewController.swift`, `screens/pairing.rs`, `scan_photo` | emulator: portrait scanner with viewfinder/close/hint, camera permission, gallery decode (a picked QR was decoded; a non-Vibex code was rejected in place), host→app JNI result exercised; iOS: Swift syntax, the C ABI and the request branches | emulator (Android) | scan a real desktop QR on a phone, on both shells |
+| Find runtimes on the LAN | `android/LanDiscovery.java`, `ios/Vibex/LanDiscovery.swift`, `src/discovery.rs`, zero-config session | 3 unit tests for the TXT rules; emulator: host NSD permission, Searching, empty state with Try Again, verification code and countdown; iOS: syntax + ABI only | emulator: permission + browsing start + empty state | discovery and approval against a desktop on the same LAN, on both shells |
 | Runtime actions, rename, details, remove | `screens/pairing.rs`, `apps/mobile-nsh/src/pairing.rs` | none headless (the sheet needs a saved credential) | emulator: actions sheet, rename dialog, details page, remove confirmation, back closes the top surface | rename and remove a real runtime, check the details against the desktop |
 | Three-page session shell | `screens/session/pager.rs`, `screens/session/workbench.rs` | horizontal and vertical gestures, modal-first back, retained draft/preview, terminal-mode routing, 320-point viewport | headless | real touch arbitration, system-edge behavior, safe areas, IME |
 | Streaming transcript and Markdown | `screens/session.rs` | `a_branch_may_build_a_service_and_start_its_task` (streaming row), bottom-follow | headless | long answers, code blocks, links |
@@ -52,6 +52,12 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Host request queue (legacy) | `src/host.rs`, `src/platform/*` | `host_requests_are_taken_once_in_order` | unit | no longer used by the app; kept for a shell that supplies its own scan/discovery |
 | Device name | `src/host.rs`, platform entry points | `a_platform_device_name_is_kept_when_usable` | unit | name shown in the runtime's paired-device list |
 | Platform embedding | `android/` host, `src/platform/android.rs` | compiled and run on the emulator | Android host mounts the app | iOS host (no Xcode) |
+| iOS host shell | `ios/Vibex`, `ios/VibexShare`, `src/platform/ios.rs` | Swift syntax; `cargo check`/`clippy` for `aarch64-apple-ios`; `tests/ios_host_abi.rs` (header = exports = Swift calls, request branches, App Group) | none: no Xcode here | mount, rotate, background/foreground, signing |
+| iOS camera attachment | `ios/Vibex/CameraCapture.swift`, `attach_camera_photo` | ABI + branch checks | none | take a photo into the composer, HEIC/JPEG, permission refusal |
+| iOS share intake | `ios/VibexShare`, `ios/Vibex/ShareIntake.swift` | syntax; the App Group agrees on both sides and in both entitlements | none | share text/a link from Safari and Notes, cold start included |
+| iOS quick action | `ios/Vibex/AppDelegate.swift` | branch check (`vibex_mobile_nsh_new_session`) | none | long-press the icon and start a new session |
+| iOS background | `ios/Vibex/HostBridge.swift`, `take_connection_service` | ABI + branch checks | none | a turn that finishes after backgrounding still notifies |
+| iOS notifications | nsh's `notifications`, `vibex_mobile_nsh_install_notifications` | install called before `attach` (checked) | none | permission prompt, a press from a cold start opens the session |
 | Packaging | `scripts/build-{android,ios}.sh` | `bash -n` | syntax only | `nsh package`, signing, store upload |
 
 ## Device pass, in order
@@ -107,8 +113,12 @@ anything that needs a runtime or a phone are listed at the bottom.
   all three ABIs) and still packages; the emulator exercises above were run on
   0.6.0. A real QR decode and a desktop approving the zero-config code still
   need a phone and a desktop on one LAN.
-- iOS still has no Xcode, so the iOS platform crate and `build-ios.sh` remain
-  uncompiled and unrun.
+- iOS still has no Xcode: `ios/` (the Swift host and its share extension),
+  `build-ios-host.sh` and the packaging path have never been built. What is
+  covered on this machine is the Rust iOS target (`cargo check`/`clippy` for
+  `aarch64-apple-ios`), the Swift syntax (tree-sitter), and the C ABI between
+  the two (`tests/ios_host_abi.rs`). The first run on a Mac is expected to
+  find Swift/API mismatches that nothing here can see.
 - No reachable runtime: pairing, sending, terminal frames, Git and file reads
   are verified against fixtures and types, not a live authority.
 - `apps/mobile` (the GPUI client) is untouched; the Native Shell client is a

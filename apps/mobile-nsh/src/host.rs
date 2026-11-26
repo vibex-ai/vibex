@@ -67,8 +67,8 @@ static DISCOVERY_AVAILABLE: std::sync::atomic::AtomicBool =
 /// Records that the host can scan a QR code with its camera. Called by the
 /// host before it mounts the app.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host sets this")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts set this")
 )]
 pub fn set_scanner_available(available: bool) {
     SCANNER_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
@@ -82,8 +82,8 @@ pub fn scanner_available() -> bool {
 
 /// Records that the host runs discovery (NSD) itself.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host sets this")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts set this")
 )]
 pub fn set_discovery_available(available: bool) {
     DISCOVERY_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
@@ -139,8 +139,8 @@ pub fn set_keep_screen_on(on: bool) {
 
 /// The pending screen-awake change: -1 none, 0 off, 1 on.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host is the one with a window")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts own windows")
 )]
 pub fn take_keep_screen_on() -> i32 {
     KEEP_SCREEN_ON_REQUEST.swap(-1, std::sync::atomic::Ordering::Relaxed)
@@ -153,9 +153,12 @@ pub fn set_connection_service(on: bool) {
 }
 
 /// The pending connection-service change: -1 none, 0 stop, 1 start.
+///
+/// Android starts a foreground service for it; iOS has none, so the shell
+/// holds a background task instead. The request is the same either way.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host owns the foreground service")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts keep the connection alive")
 )]
 pub fn take_connection_service() -> i32 {
     CONNECTION_SERVICE_REQUEST.swap(-1, std::sync::atomic::Ordering::Relaxed)
@@ -182,8 +185,8 @@ pub fn set_device_name(name: &str) {
 
 /// Records text a system share sent into the app.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host receives system shares")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts receive system shares")
 )]
 pub fn share_text(text: &str) {
     let text = text.trim();
@@ -197,8 +200,8 @@ pub fn share_text(text: &str) {
 }
 
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host sets this")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts set this")
 )]
 pub fn set_camera_available(available: bool) {
     CAMERA_AVAILABLE.store(available, std::sync::atomic::Ordering::Relaxed);
@@ -222,8 +225,8 @@ pub fn request_camera() -> bool {
 
 /// Records the path of the photo the camera host wrote.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host sets this")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts set this")
 )]
 pub fn set_camera_photo(path: &str) {
     if path.is_empty() {
@@ -244,8 +247,8 @@ pub fn take_camera_photo() -> Option<String> {
 
 /// Records that the host could not take a photo, and why.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host sets this")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts set this")
 )]
 pub fn set_camera_failure(reason: &str) {
     *CAMERA_FAILURE
@@ -290,8 +293,8 @@ pub fn take_update_url() -> Option<String> {
 
 /// Records a launcher shortcut asking for a new session.
 #[cfg_attr(
-    not(target_os = "android"),
-    allow(dead_code, reason = "the Android host owns the shortcuts")
+    not(any(target_os = "android", target_os = "ios")),
+    allow(dead_code, reason = "the phone hosts own the shortcuts")
 )]
 pub fn request_new_session() {
     NEW_SESSION_REQUESTED.store(true, std::sync::atomic::Ordering::Relaxed);

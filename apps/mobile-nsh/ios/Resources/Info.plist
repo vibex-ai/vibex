@@ -1,0 +1,82 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleDevelopmentRegion</key>
+	<string>$(DEVELOPMENT_LANGUAGE)</string>
+	<key>CFBundleDisplayName</key>
+	<string>Vibex</string>
+	<key>CFBundleExecutable</key>
+	<string>$(EXECUTABLE_NAME)</string>
+	<key>CFBundleIdentifier</key>
+	<string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>$(PRODUCT_NAME)</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleShortVersionString</key>
+	<string>$(MARKETING_VERSION)</string>
+	<key>CFBundleVersion</key>
+	<string>$(CURRENT_PROJECT_VERSION)</string>
+	<key>LSApplicationCategoryType</key>
+	<string>public.app-category.developer-tools</string>
+	<key>LSRequiresIPhoneOS</key>
+	<true/>
+	<key>UILaunchScreen</key>
+	<dict/>
+	<key>UIRequiredDeviceCapabilities</key>
+	<array>
+		<string>arm64</string>
+	</array>
+	<key>UISupportedInterfaceOrientations</key>
+	<array>
+		<string>UIInterfaceOrientationPortrait</string>
+	</array>
+	<!--
+		The app's own scheme: the desktop's "open on your phone" link, the
+		share extension's `vibex://share` ping, and a pairing link pasted into
+		another app.
+	-->
+	<key>CFBundleURLTypes</key>
+	<array>
+		<dict>
+			<key>CFBundleTypeRole</key>
+			<string>Viewer</string>
+			<key>CFBundleURLName</key>
+			<string>ai.vibex.mobile.nsh</string>
+			<key>CFBundleURLSchemes</key>
+			<array>
+				<string>vibex</string>
+			</array>
+		</dict>
+	</array>
+	<!--
+		Camera: the pairing scanner, and a photo for the composer.
+	-->
+	<key>NSCameraUsageDescription</key>
+	<string>Scan the QR code shown in Vibex desktop to pair this device, and take a photo to attach to a message.</string>
+	<!--
+		Bonjour discovery of a desktop runtime on the same network.
+	-->
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Discover Vibex desktops available for pairing on your local network.</string>
+	<key>NSBonjourServices</key>
+	<array>
+		<string>_vibex._tcp</string>
+	</array>
+	<!--
+		The photo library: a screenshot of a pairing QR code, and the images
+		the composer can attach.
+	-->
+	<key>NSPhotoLibraryUsageDescription</key>
+	<string>Attach images from your library to a Vibex session, and scan a pairing QR code from a screenshot.</string>
+	<!--
+		Text another app shares arrives through the extension, which writes to
+		the App Group container both targets declare. iOS has no foreground
+		service: the shell's background task (HostBridge) is the equivalent,
+		so no UIBackgroundModes are declared that nothing here would use.
+	-->
+</dict>
+</plist>
