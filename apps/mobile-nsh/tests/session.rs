@@ -2218,13 +2218,16 @@ fn a_folder_can_be_named_from_the_drawer() {
 /// keyboard's top edge.
 #[test]
 fn a_sheets_field_stays_above_the_keyboard() {
-    const KEYBOARD: f32 = 320.0;
-    // Android, where a sheet is its own window: its root keeps the window's
-    // whole height and the keyboard arrives as `env(keyboard-inset-height)`,
-    // so the app is what has to keep its content clear of the keys.
+    const HEIGHT: f32 = 844.0;
+    const KEYBOARD: f32 = 340.0;
+    // Realistic Android phone dimensions with system bar insets: previously
+    // padding inside the sheet collided with `nsh-base`'s `max_h`, pushing the
+    // action button below the field behind the keyboard.
     let mut config = EngineConfig::new(Root::of::<Shell>());
-    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(HEIGHT));
     config.environment.os = nsh_core::platform::Os::Android;
+    config.environment.safe_area.top = px(44.0);
+    config.environment.safe_area.bottom = px(24.0);
     let mut app = Headless::start(config).unwrap();
     app.wait_for("Good morning").unwrap();
     app.press("role:button[Sessions]").unwrap();
@@ -2233,27 +2236,32 @@ fn a_sheets_field_stays_above_the_keyboard() {
     app.press("New folder").unwrap();
     app.wait_for("Folder name").unwrap();
 
-    let field = |app: &Headless| {
+    let bounds_of = |app: &Headless, query: &str| {
         app.screen()
-            .layout("text:Folder name")
+            .layout(query)
             .unwrap()
-            .unwrap_or_else(|| panic!("the sheet's field is on screen"))
+            .unwrap_or_else(|| panic!("expected `{query}` on screen"))
             .bounds
     };
-    let at_rest = field(&app);
+    let field_at_rest = bounds_of(&app, "text:Folder name");
+    let button_at_rest = bounds_of(&app, "role:button[Create]");
     app.set_environment("keyboard up", |env| env.keyboard_height = px(KEYBOARD))
         .unwrap();
-    let lifted = field(&app);
-    // `start()` mounts a 390x1600 phone; the keyboard takes its height off the
-    // bottom edge.
-    let keyboard_top = 1600.0 - KEYBOARD;
+    let field_lifted = bounds_of(&app, "text:Folder name");
+    let button_lifted = bounds_of(&app, "role:button[Create]");
+    let keyboard_top = HEIGHT - KEYBOARD;
     assert!(
-        lifted.origin.y.0 + lifted.size.height.0 <= keyboard_top + 0.5,
-        "the field ends above the keyboard: {lifted:?}, keyboard top {keyboard_top}"
+        field_lifted.origin.y.0 + field_lifted.size.height.0 <= keyboard_top + 0.5,
+        "the field ends above the keyboard: {field_lifted:?}, keyboard top {keyboard_top}"
     );
     assert!(
-        lifted.origin.y.0 < at_rest.origin.y.0,
-        "the sheet rose with the keyboard: {at_rest:?} -> {lifted:?}"
+        button_lifted.origin.y.0 + button_lifted.size.height.0 <= keyboard_top + 0.5,
+        "the action button below the field ends above the keyboard: {button_lifted:?}, keyboard top {keyboard_top}"
+    );
+    assert!(
+        field_lifted.origin.y.0 < field_at_rest.origin.y.0
+            && button_lifted.origin.y.0 < button_at_rest.origin.y.0,
+        "the whole sheet rose with the keyboard: field {field_at_rest:?} -> {field_lifted:?}, button {button_at_rest:?} -> {button_lifted:?}"
     );
 }
 
@@ -2293,6 +2301,66 @@ fn the_project_row_menu_carries_the_desktop_actions() {
     assert!(app.screen().shows("New folder"));
     assert!(app.screen().shows("Start sessions in a new worktree"));
     assert!(app.screen().shows("Remove project"));
+}
+
+#[component]
+fn RemovableProjectShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    let removed = signal(Vec::<String>::new());
+    let base_rows = host.sidebar.rows.clone();
+    host.sidebar.rows = Rc::new(move |query| {
+        let removed = removed.get();
+        base_rows(query)
+            .into_iter()
+            .filter(|row| {
+                !removed.iter().any(|project_id| {
+                    row.id == *project_id || row.project_id.as_deref() == Some(project_id.as_str())
+                })
+            })
+            .collect()
+    });
+    let sessions = host.sessions;
+    host.on_remove_project = Rc::new(move |project_id: &str| {
+        let project_id = project_id.to_owned();
+        removed.update(|list| list.push(project_id.clone()));
+        sessions.update(|list| list.retain(|session| session.project_id != project_id));
+    });
+    session::session(host)
+}
+
+#[test]
+fn a_project_can_be_removed_from_the_drawer_with_one_confirmation() {
+    let mut config = EngineConfig::new(Root::of::<RemovableProjectShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    let dialogs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dialogs_cb = dialogs.clone();
+    app.on_dialog(move |dialog| {
+        dialogs_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let remove = dialog
+            .buttons
+            .iter()
+            .find(|button| button.text == "Remove")
+            .expect("the alert offers Remove");
+        nsh_testing::DialogAnswer::Press(remove.text.clone())
+    });
+    app.wait_for("Good morning").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[vibex]").unwrap();
+    app.long_press("role:button[vibex]").unwrap();
+    app.wait_for("Remove project").unwrap();
+    app.press("role:button[Remove project]").unwrap();
+    app.wait_until(
+        "the project row leaves the drawer",
+        std::time::Duration::from_secs(5),
+        |screen| screen.texts().iter().all(|text| *text != "vibex"),
+    )
+    .unwrap();
+    assert_eq!(
+        dialogs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "removing a project should prompt for confirmation exactly once"
+    );
 }
 
 #[test]
@@ -3013,10 +3081,12 @@ fn a_session_can_be_deleted_from_the_drawer() {
     let mut config = EngineConfig::new(Root::of::<OneSessionShell>());
     config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
     let mut app = Headless::start(config).unwrap();
-    // Deleting is confirmed before it happens: the drawer's own button is one
-    // press away from losing a conversation, so the alert's Delete is what
-    // actually runs the command.
-    app.on_dialog(|dialog| {
+    // Deleting is confirmed once before it happens: the drawer's menu asks via
+    // native alert and the service executes directly without prompting again.
+    let dialogs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let dialogs_cb = dialogs.clone();
+    app.on_dialog(move |dialog| {
+        dialogs_cb.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let delete = dialog
             .buttons
             .iter()
@@ -3034,6 +3104,11 @@ fn a_session_can_be_deleted_from_the_drawer() {
         |screen| screen.texts().iter().all(|text| *text != "Fix the tests"),
     )
     .unwrap();
+    assert_eq!(
+        dialogs.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "deleting a session should prompt for confirmation exactly once"
+    );
 }
 
 #[test]

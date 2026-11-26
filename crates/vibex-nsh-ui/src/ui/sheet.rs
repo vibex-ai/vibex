@@ -41,29 +41,34 @@ pub fn bottom_sheet(
             style.bg(nsh_core::color::black().opacity(theme::SHEET_BACKDROP_OPACITY))
         })
         .popup_style(|style| {
-            style
+            let style = style
                 .rounded_t(px(theme::RADIUS_SHEET))
-                .bg(theme::page_adaptive)
+                .bg(theme::page_adaptive);
+            // A sheet is its own modal window on Android (`ModalHost`), and
+            // that window keeps the screen's full height while reporting the
+            // IME through `keyboard_height()`. `nsh-base`'s `Sheet` still
+            // assumes Android shrinks the modal root and sets
+            // `bottom: -min(keyboard, safe_area.bottom)` together with
+            // `max_h(window - safe_top - keyboard_lift)`. Padding inside the
+            // sheet by `pb_keyboard()` made the panel's height (`content +
+            // keyboard`) hit `max_h` on real phones and pushed action buttons
+            // below the field behind the keyboard. Lifting the panel itself
+            // by `keyboard_lift` matches iOS so the whole sheet—including
+            // buttons below its text fields—stays above the keyboard.
+            if platform_name() == "android" {
+                style.bottom(move || {
+                    Length::from((keyboard_height() - safe_area().bottom).max(Points::ZERO))
+                })
+            } else {
+                style
+            }
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(false, _) = event {
                 on_close();
             }
         })
-        // A sheet is its own window on Android, and that window keeps the
-        // screen's whole height: the keyboard reaches the app as
-        // `env(keyboard-inset-height)` and nothing lifts the panel for it.
-        // Without this the field inside a sheet laid out under the keys — the
-        // content has to give them their room itself. Every other platform
-        // moves the panel, so the padding is Android's alone; there it would
-        // lift the content a second time.
-        .child(
-            view()
-                .w_full()
-                .flex_col()
-                .when(platform_name() == "android", |column| column.pb_keyboard())
-                .child(content),
-        )
+        .child(content)
 }
 
 /// The header of a sheet: what it is, and the one control that closes it.

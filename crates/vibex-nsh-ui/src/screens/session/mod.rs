@@ -6958,31 +6958,25 @@ fn scope_menu(
                     });
                     let remove = remove.clone();
                     let project_id = project_id.clone();
-                    spawn(async move {
-                        let answer = nsh_base::alert_dialog()
-                            .title(copy::text(
-                                "Remove this project?",
-                                "移除该项目？",
-                                "移除該專案？",
-                            ))
-                            .description(format!(
-                                "{} {}",
-                                count,
-                                copy::text(
-                                    "sessions leave the workbench with it. Nothing on disk is deleted.",
-                                    "个会话会一并移出工作台，磁盘上的文件不会被删除。",
-                                    "個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
-                                )
-                            ))
-                            .cancel("cancel", copy::text("Cancel", "取消", "取消"))
-                            .destructive("remove", copy::text("Remove", "移除", "移除"))
-                            .show()
-                            .await;
-                        if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("remove"))
-                        {
-                            remove(&project_id);
-                        }
-                    });
+                    confirm_destructive(
+                        copy::text(
+                            "Remove this project?",
+                            "移除该项目？",
+                            "移除該專案？",
+                        ),
+                        format!(
+                            "{} {}",
+                            count,
+                            copy::text(
+                                "sessions leave the workbench with it. Nothing on disk is deleted.",
+                                "个会话会一并移出工作台，磁盘上的文件不会被删除。",
+                                "個工作階段會一併移出工作台，磁碟上的檔案不會被刪除。",
+                            )
+                        ),
+                        "remove",
+                        copy::text("Remove", "移除", "移除"),
+                        move || remove(&project_id),
+                    );
                 }
             },
         )
@@ -8325,36 +8319,26 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                                 return;
                                             }
                                             let on_delete_sessions = on_delete_sessions.clone();
-                                            spawn(async move {
-                                                let answer = nsh_base::alert_dialog()
-                                                    .title(copy::text(
-                                                        "Delete selected sessions?",
-                                                        "删除所选会话？",
-                                                        "刪除所選工作階段？",
-                                                    ))
-                                                    .description(copy::text(
-                                                        "Their conversation history will be permanently deleted.",
-                                                        "对话记录将被永久删除。",
-                                                        "對話記錄將永久刪除。",
-                                                    ))
-                                                    .cancel(
-                                                        "cancel",
-                                                        copy::text("Cancel", "取消", "取消"),
-                                                    )
-                                                    .destructive(
-                                                        "delete",
-                                                        copy::text("Delete", "删除", "刪除"),
-                                                    )
-                                                    .show()
-                                                    .await;
-                                                if matches!(answer, Ok(answer) if answer.action.as_deref() == Some("delete"))
-                                                {
+                                            confirm_destructive(
+                                                copy::text(
+                                                    "Delete selected sessions?",
+                                                    "删除所选会话？",
+                                                    "刪除所選工作階段？",
+                                                ),
+                                                copy::text(
+                                                    "Their conversation history will be permanently deleted.",
+                                                    "对话记录将被永久删除。",
+                                                    "對話記錄將永久刪除。",
+                                                ),
+                                                "delete",
+                                                copy::text("Delete", "删除", "刪除"),
+                                                move || {
                                                     on_delete_sessions(&ids);
                                                     selected.update(|selected| {
                                                         selected.retain(|id| !ids.contains(id))
                                                     });
-                                                }
-                                            });
+                                                },
+                                            );
                                         },
                                     )
                                     .disabled(none_selected),
