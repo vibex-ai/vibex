@@ -309,13 +309,31 @@ impl Activity {
     }
 }
 
+/// The argument a file call names its target with.
+///
+/// Agents spell the same argument very differently: `file_path` is the
+/// harness's and Claude's spelling, `path` the generic ACP one, and
+/// Antigravity's `client_view_file`/`client_create_file`/`client_edit_file`
+/// send `absolute_path` or `target_file`. The list is ordered by how common
+/// each spelling is, so a call carrying more than one still reads the way its
+/// agent meant it.
+pub(crate) const FILE_PATH_KEYS: &[&str] = &[
+    "file_path",
+    "path",
+    "filePath",
+    "absolute_path",
+    "target_file",
+    "targetFile",
+    "file",
+];
+
 pub(crate) fn input_keys(kind: ActivityKind) -> &'static [&'static str] {
     match kind {
         ActivityKind::Command => &["command", "cmd", "commands", "script"],
         ActivityKind::FileRead
         | ActivityKind::FileEdit
         | ActivityKind::FileCreate
-        | ActivityKind::FileDelete => &["file_path", "path", "filePath"],
+        | ActivityKind::FileDelete => FILE_PATH_KEYS,
         ActivityKind::Search => &["pattern", "query", "regex", "q"],
         ActivityKind::Collaboration => &["description", "subagent_type", "agent", "prompt"],
         ActivityKind::Integration => &["name", "skill", "server", "tool"],
@@ -383,19 +401,59 @@ fn tool_input_target(tool: &ToolCallPayload, kind: ActivityKind) -> Option<Strin
 ///
 /// Agents title calls very differently: some send the command or path, others
 /// only the tool's name (`Bash`, `Read`), a generated id (`ACP tool call
-/// call_5d27…`) or the name over empty arguments (`Bash: {}`). Those titles
-/// leave the header to the call's own arguments.
+/// call_5d27…`) or the name over empty arguments (`Bash: {}`). One more shape
+/// carries nothing either: a bare `Running <tool>` opening, which is what
+/// Antigravity sends while a call is in flight. Those titles leave the header
+/// to the call's own arguments.
 fn summary_is_uninformative(summary: &str, tool_name: &str) -> bool {
     let summary = summary.trim();
     summary.is_empty()
         || summary.eq_ignore_ascii_case(tool_name.trim())
         || summary.starts_with("ACP tool call")
         || summary.ends_with(": {}")
+        || names_only_the_tool_being_run(summary, tool_name)
         || (!summary.contains(char::is_whitespace)
             && summary.len() <= 40
             && summary
                 .chars()
                 .all(|character| character.is_ascii_alphanumeric() || "_-.".contains(character)))
+}
+
+/// `Running client_view_file`: a status line whose only content is the tool.
+///
+/// The verb is one an agent uses for what a call is *doing*, and what follows
+/// is a tool identifier rather than a target — `Running cargo test` names the
+/// command, `Running client_view_file` names nothing a reader can act on. Only
+/// a name that is the tool's own, or one carrying the proxy prefix Antigravity
+/// puts on every tool it forwards (`client_`, `acp_`), qualifies; other prose
+/// keeps its title.
+fn names_only_the_tool_being_run(summary: &str, tool_name: &str) -> bool {
+    let Some((verb, rest)) = summary.split_once(char::is_whitespace) else {
+        return false;
+    };
+    if !matches!(
+        verb.to_ascii_lowercase().as_str(),
+        "running" | "executing" | "calling" | "invoking"
+    ) {
+        return false;
+    }
+    let rest = rest.trim();
+    if rest.is_empty() {
+        return false;
+    }
+    let bare = |name: &str| {
+        name.trim()
+            .rsplit("__")
+            .next()
+            .unwrap_or(name)
+            .trim_start_matches("client_")
+            .trim_start_matches("acp_")
+            .to_ascii_lowercase()
+    };
+    let forwarded = ["client_", "acp_"]
+        .iter()
+        .any(|prefix| rest.to_ascii_lowercase().starts_with(prefix));
+    forwarded || bare(rest) == bare(tool_name)
 }
 
 /// A tool's name as the header shows it when nothing better is known.
@@ -498,26 +556,85 @@ pub fn display_command(command: &str) -> &str {
 
 /// The first readable line a failed call left behind.
 fn failure_line(payload: Option<&TimelinePayload>, locale: Locale) -> Option<String> {
-    let text = match payload? {
-        TimelinePayload::ToolCall(tool) => crate::tool_detail::output(
-            tool.raw_extension.as_ref(),
-            tool.output_summary.as_deref(),
+    let (text, reported_path) = match payload? {
+        TimelinePayload::ToolCall(tool) => (
+            crate::tool_detail::output(
+                tool.raw_extension.as_ref(),
+                tool.output_summary.as_deref(),
+                None,
+                locale,
+            )?,
+            tool.raw_extension
+                .as_ref()
+                .filter(|extension| extension.locations.len() == 1)
+                .and_then(|extension| extension.locations.first())
+                .map(|location| location.uri.as_str()),
+        ),
+        TimelinePayload::Command(command) => (
+            crate::tool_detail::output(
+                command.raw_extension.as_ref(),
+                command.output_summary.as_deref(),
+                command.exit_code,
+                locale,
+            )?,
             None,
-            locale,
-        )?,
-        TimelinePayload::Command(command) => crate::tool_detail::output(
-            command.raw_extension.as_ref(),
-            command.output_summary.as_deref(),
-            command.exit_code,
-            locale,
-        )?,
+        ),
         _ => return None,
     };
+    if blames_another_file(&text, reported_path) {
+        return None;
+    }
     let heading = locale.text("Error", "错误", "錯誤");
     text.lines()
         .map(str::trim)
         .find(|line| !line.is_empty() && *line != heading)
         .map(|line| line.chars().take(240).collect())
+}
+
+/// Whether a failure message is about some other file than the row's own.
+///
+/// An agent can fail a row with a message it never meant for that row:
+/// Antigravity closes every still-open call of a turn with whichever error
+/// ended the step, so a read of `Cargo.toml` is stamped with the denial of a
+/// path in another directory. Repeating that line under this row would invent
+/// a cause. A message that quotes paths at all must mention this row's file;
+/// one that quotes none (a 502 from the provider, a broken pipe) is still this
+/// row's own. Only the row's file *name* is required: a message that reaches
+/// the file by another route — a relative path, a symlinked directory — still
+/// names it, and a denial of a same-named file elsewhere stays visible rather
+/// than being hidden on a guess.
+fn blames_another_file(message: &str, reported_path: Option<&str>) -> bool {
+    let Some(reported_path) = reported_path else {
+        return false;
+    };
+    if !message_quotes_a_path(message) {
+        return false;
+    }
+    let name = reported_path
+        .trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .find(|segment| !segment.is_empty());
+    let Some(name) = name.filter(|name| !name.is_empty()) else {
+        return false;
+    };
+    !message.contains(name) && !message.contains(reported_path)
+}
+
+/// Whether a message quotes any filesystem path.
+///
+/// Only a leading segment (`/`, `./`, `../`) or a Windows drive counts: a bare
+/// `/` inside prose is a separator, not a claim about a file.
+fn message_quotes_a_path(message: &str) -> bool {
+    message
+        .split(|character: char| character.is_whitespace() || "([\"',".contains(character))
+        .any(|token| {
+            token.starts_with('/')
+                || token.starts_with("./")
+                || token.starts_with("../")
+                || (token.len() > 2
+                    && token.as_bytes()[1] == b':'
+                    && (token.as_bytes()[2] == b'/' || token.as_bytes()[2] == b'\\'))
+        })
 }
 
 /// How long a settled row ran, from its first event to its last.

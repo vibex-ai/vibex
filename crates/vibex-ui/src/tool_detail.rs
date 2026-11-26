@@ -137,7 +137,7 @@ fn fields(value: &Value) -> Vec<(String, String)> {
             Value::Null => {}
             Value::String(text) if text.trim().is_empty() => {}
             Value::String(text) => out.push((path, text.clone())),
-            Value::Bool(_) | Value::Number(_) => out.push((path, value.to_string())),
+            Value::Bool(_) | Value::Number(_) => out.push((path, number_text(value))),
             Value::Array(items) if items.is_empty() => {}
             Value::Array(items)
                 if items
@@ -194,6 +194,24 @@ fn fields_text(fields: &[(String, String)]) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A JSON number as a reader expects to see it.
+///
+/// `serde_json` parses every number that carries a fraction as an `f64`, and
+/// its `Display` keeps the `.0`, so a line range that an agent serialized as
+/// `250.0` (Antigravity sends `start_line`/`end_line` as numbers, and its SDK
+/// stringifies them through a float) would read as a coordinate. A value that
+/// is a whole number is rewritten without the fraction; anything else keeps
+/// the representation the payload carried.
+fn number_text(value: &Value) -> String {
+    let Some(number) = value.as_f64() else {
+        return value.to_string();
+    };
+    if number.is_finite() && number.fract() == 0.0 && number.abs() < 9_007_199_254_740_992.0 {
+        return (number as i64).to_string();
+    }
+    value.to_string()
 }
 
 /// Status of one entry in a todo list an agent wrote through a tool call.
@@ -325,9 +343,11 @@ fn input_source(tool: &ToolCallPayload) -> Option<&str> {
 /// Most ACP agents report an edit as a plain tool call whose arguments carry
 /// the replaced and replacing text — `old_string`/`new_string` for Claude and
 /// the harness, `oldText`/`newText` or `old_str`/`new_str` elsewhere, an
-/// `edits` list for multi-edits — and a write as the new `content`. Reading
-/// those back as a file operation is what lets the timeline draw the change
-/// as a diff with line counts rather than as two quoted strings.
+/// `edits` list for multi-edits — and a write as the new `content`. Antigravity
+/// writes the whole file instead of a pair: `code_content` under
+/// `target_file`. Reading those back as a file operation is what lets the
+/// timeline draw the change as a diff with line counts rather than as two
+/// quoted strings, or as the whole new file under the arguments.
 pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
     let kind = timeline_activity::generic_activity_kind(&tool.tool_name, &tool.summary);
     if !matches!(
@@ -338,7 +358,7 @@ pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
     }
     let value = serde_json::from_str::<Value>(input_source(tool)?).ok()?;
     let object = value.as_object()?;
-    let path = ["file_path", "path", "filePath", "target_file", "file"]
+    let path = timeline_activity::FILE_PATH_KEYS
         .iter()
         .find_map(|key| object.get(*key)?.as_str())
         .map(str::to_string)
@@ -378,7 +398,7 @@ pub fn file_operation(tool: &ToolCallPayload) -> Option<FileOperationPayload> {
             new.join("\n"),
         )
     } else {
-        let content = ["content", "contents", "file_text", "text"]
+        let content = ["content", "contents", "file_text", "text", "code_content"]
             .iter()
             .find_map(|key| object.get(*key)?.as_str())?;
         (FileOperationKind::Write, None, content.to_string())
@@ -1049,6 +1069,63 @@ mod tests {
     }
 
     #[test]
+    fn antigravity_argument_spellings_read_as_the_harness_spelling_does() {
+        // `client_view_file` names its target `absolute_path`; the header must
+        // lead with that path and not fall back to the arguments as JSON.
+        let read = tool(
+            "read",
+            "Running client_view_file",
+            serde_json::json!({
+                "absolute_path": "/work/crates/app/Cargo.toml",
+                "start_line": 1.0,
+                "end_line": 250.0
+            }),
+        );
+        let payload = TimelinePayload::ToolCall(read.clone());
+        let activity =
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En);
+        assert_eq!(activity.icon(), ProcessActivityIcon::FileRead);
+        assert_eq!(activity.target(), "Cargo.toml");
+        assert_eq!(activity.path(), Some("/work/crates/app/Cargo.toml"));
+        let details = project(&row_for(&payload), Some(&payload), None, Locale::En);
+        let rendered = text(&details);
+        assert!(rendered.starts_with("/work/crates/app/Cargo.toml\n"));
+        // A line range serialized through a float still reads as line numbers.
+        // The argument map's key order is serde_json's, so each field is
+        // matched on its own line.
+        assert!(
+            rendered.lines().any(|line| line.trim() == "start_line: 1"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.lines().any(|line| line.trim() == "end_line: 250"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("250.0"), "{rendered}");
+        // Copying keeps the exact arguments the agent sent.
+        assert_eq!(details[0].copy_text(), read.input_summary.clone().unwrap());
+
+        // `client_create_file` writes the whole file as `code_content` under
+        // `target_file`: that is a write with a diff, not a quoted argument.
+        let write = tool(
+            "edit",
+            "Running client_create_file",
+            serde_json::json!({
+                "target_file": "/work/crates/app/src/term.rs",
+                "code_content": "fn term() {}\n"
+            }),
+        );
+        let operation = file_operation(&write).expect("a whole-file write is a file change");
+        assert_eq!(operation.operation, FileOperationKind::Write);
+        assert_eq!(operation.path, "/work/crates/app/src/term.rs");
+        assert_eq!(operation.new_text.as_deref(), Some("fn term() {}\n"));
+        assert_eq!(
+            operation.old_text, None,
+            "a create has no previous content to diff against"
+        );
+    }
+
+    #[test]
     fn todo_lists_and_questions_read_as_lists() {
         let todos = tool(
             "think",
@@ -1117,6 +1194,25 @@ mod tests {
         let mut opaque = tool("read", "ACP tool call call_5d276d", serde_json::json!({}));
         opaque.input_summary = None;
         assert_eq!(target(opaque), "read");
+        // A status line naming a forwarded tool says nothing; the same verb
+        // followed by prose keeps the prose as the target.
+        assert_eq!(
+            target(tool(
+                "read",
+                "Running client_view_file",
+                serde_json::json!({"absolute_path": "/work/app/src/lib.rs"})
+            )),
+            "lib.rs"
+        );
+        assert_eq!(
+            target(tool(
+                "read",
+                "Running the migration",
+                serde_json::json!({"absolute_path": "/work/app/src/lib.rs"})
+            )),
+            "Running the migration",
+            "prose keeps the header it was given"
+        );
     }
 
     #[test]
@@ -1211,5 +1307,77 @@ mod tests {
             Some("/workspace/tools")
         );
         assert_eq!(command_cwd(Some("/workspace"), None), Some("/workspace"));
+    }
+
+    #[test]
+    fn a_failure_message_about_another_file_is_not_this_rows_cause() {
+        // The row's own path lives in the extension's locations; no captured
+        // output, so the summary is what the reader is shown.
+        let located = |path: &str| {
+            AgentEventRawExtension::new(
+                Vec::new(),
+                None,
+                None,
+                vec![vibex_core::AgentEventLocation::new(path, None, None).0],
+                Default::default(),
+                false,
+            )
+        };
+        let mut row = tool(
+            "read",
+            "Running client_view_file",
+            serde_json::json!({"absolute_path": "/work/app/Cargo.toml"}),
+        );
+        row.status = vibex_core::ToolCallStatus::Failed;
+        row.raw_extension = Some(located("/work/app/Cargo.toml"));
+
+        // Antigravity stamps a whole batch of open calls with whichever error
+        // ended the step; a denial elsewhere does not explain this row.
+        row.output_summary = Some(
+            "Access to path \"/home/me/.cargo/registry/src/nsh-base-0.7.0/src/terminal.rs\" \
+             is denied. It is outside the allowed workspace directories: [/work/app]"
+                .into(),
+        );
+        let payload = TimelinePayload::ToolCall(row.clone());
+        let activity =
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En);
+        assert!(activity.is_failed());
+        assert_eq!(
+            activity.error_line(),
+            None,
+            "another file's denial is not this read's cause"
+        );
+
+        // The same row failing for its own reason still says why.
+        row.output_summary = Some(
+            "Access to path \"/work/app/Cargo.toml\" is denied. It is outside the allowed \
+             workspace directories: [/work]"
+                .into(),
+        );
+        let payload = TimelinePayload::ToolCall(row.clone());
+        let activity =
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En);
+        assert!(
+            activity
+                .error_line()
+                .is_some_and(|line| line.contains("Cargo.toml")),
+            "{:?}",
+            activity.error_line()
+        );
+
+        // A message that quotes no path at all (a provider 502) is still ours.
+        row.output_summary = Some(
+            "Encountered retryable error from model provider: Agent execution terminated due to \
+             error. (\"Error 502, Bad Gateway\")"
+                .into(),
+        );
+        let payload = TimelinePayload::ToolCall(row);
+        let activity =
+            timeline_activity::Activity::project(&row_for(&payload), Some(&payload), Locale::En);
+        assert!(
+            activity
+                .error_line()
+                .is_some_and(|line| line.starts_with("Encountered retryable error"))
+        );
     }
 }
