@@ -7,7 +7,7 @@
 
 use std::rc::Rc;
 
-use nsh_base::{Terminal, TerminalApi};
+use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::{DragOptions, Headless};
@@ -2422,6 +2422,69 @@ fn the_terminal_keyboard_sends_native_edits_and_return() {
     app.wait_for("text:input: [delete]").unwrap();
     app.press_key("enter").unwrap();
     app.wait_for("text:input: [return]").unwrap();
+}
+
+/// Tapping directly on rendered output text inside the grid must also focus
+/// the terminal keyboard rather than being swallowed by the selectable text
+/// node.
+#[test]
+fn tapping_terminal_text_takes_the_keyboard() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
+    app.press("hello from the pty").unwrap();
+    app.press_key("a").unwrap();
+    app.wait_for("text:input: a").unwrap();
+}
+
+/// Switching away from Terminal to Files or Changes hides the terminal behind
+/// `Display::None`, which reports zero bounds on layout. Returning to Terminal
+/// must preserve the existing screen intact and keep keyboard input working.
+#[test]
+fn switching_workbench_tabs_keeps_terminal_content_and_input() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("hello from the pty").unwrap();
+
+    app.press("role:button[Files]").unwrap();
+    app.wait_for("README.md").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+    app.press("role:button[Terminal]").unwrap();
+
+    app.wait_for("hello from the pty").unwrap();
+    app.press("hello from the pty").unwrap();
+    app.press_key("z").unwrap();
+    app.wait_for("text:input: z").unwrap();
+    app.press_key("backspace").unwrap();
+    app.wait_for("text:input: [delete]").unwrap();
+    app.press_key("enter").unwrap();
+    app.wait_for("text:input: [return]").unwrap();
+}
+
+/// Repeated Backspace presses across the hidden input's re-seed threshold must
+/// keep delivering delete bytes and leave subsequent typing and Return intact.
+#[test]
+fn terminal_keyboard_handles_repeated_backspaces_across_reseed() {
+    let mut config = EngineConfig::new(Root::of::<TerminalShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(320.0), px(640.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Keyboard]").unwrap();
+    app.press("role:button[Keyboard]").unwrap();
+    for _ in 0..12 {
+        app.press_key("backspace").unwrap();
+    }
+    app.wait_for("text:input: [delete]").unwrap();
+    app.press_key("k").unwrap();
+    app.wait_for("text:input: k").unwrap();
+    app.press_key("enter").unwrap();
+    app.wait_for("text:input: [return]").unwrap();
+    assert!(
+        !app.screen().shows("[delete][delete]"),
+        "re-seeding must never emit spurious multi-delete bursts"
+    );
 }
 
 #[test]

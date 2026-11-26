@@ -67,6 +67,28 @@ pub(crate) fn android_root() -> nsh_android::Root {
 #[cfg(target_os = "android")]
 nsh_android::main!(android_root());
 
+/// Registers the bundled monospace and Nerd Font symbol faces used by the
+/// mobile terminal grid so prompts with Powerline / Devicon glyphs render
+/// crisply on Android and iOS instead of showing missing-glyph tofu boxes.
+fn register_terminal_fonts() {
+    static BUNDLED_FONTS: &[&[u8]] = &[
+        include_bytes!("../../desktop/assets/fonts/lilex/Lilex-Regular.ttf"),
+        include_bytes!("../../desktop/assets/fonts/lilex/Lilex-Bold.ttf"),
+        include_bytes!("../../desktop/assets/fonts/nerd-symbols/SymbolsNerdFontMono-Regular.ttf"),
+    ];
+    spawn(async move {
+        let mut loaded = false;
+        for &bytes in BUNDLED_FONTS {
+            if register_font(bytes.to_vec()).await.is_ok() {
+                loaded = true;
+            }
+        }
+        if loaded {
+            vibex_nsh_ui::screens::terminal::notify_terminal_fonts_ready();
+        }
+    });
+}
+
 /// The app's UI set (`nsh.json` `"rust"`).
 #[native_module("vibex/native")]
 fn native(registry: &mut Registry) {
@@ -91,6 +113,7 @@ pub fn App() -> impl IntoElement {
     host::start(pairing.clone());
     let settings = SettingsState::new(&data);
     settings.apply();
+    register_terminal_fonts();
 
     let connected = pairing.connected();
     let switcher = pairing.switcher();

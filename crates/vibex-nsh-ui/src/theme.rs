@@ -786,18 +786,15 @@ pub fn backdrop(opacity: f32) -> Hsla {
 
 /// The face a terminal draws with.
 ///
-/// The theme file carries no `font-mono`, so the emulator would fall back to
-/// the generic `monospace` alias, which resolves to whatever the platform
-/// picks. These are the faces the phone actually ships (see
-/// `apps/mobile/src/theme.rs`): Android loads `DroidSansMono.ttf`, iOS carries
-/// Menlo, and both are metric-compatible with the 8-point cell the PTY is
-/// sized against.
-pub const TERMINAL_FONT_FAMILY: &str = if cfg!(target_os = "android") {
-    "Droid Sans Mono"
-} else if cfg!(target_os = "ios") {
-    "Menlo"
+/// Uses the bundled `Lilex` monospace face with `Symbols Nerd Font Mono` as
+/// its Powerline / Nerd Font icon fallback, falling back to `Menlo` on iOS
+/// and the platform's generic `monospace` family everywhere (never
+/// `"Droid Sans Mono"`, which Android's `Typeface.create` rejects and
+/// silently downgrades to proportional sans-serif).
+pub const TERMINAL_FONT_FAMILY: &str = if cfg!(target_os = "ios") {
+    "Lilex, 'Symbols Nerd Font Mono', Menlo, monospace"
 } else {
-    "monospace"
+    "Lilex, 'Symbols Nerd Font Mono', monospace"
 };
 
 /// The size a terminal cell is drawn at, in points.

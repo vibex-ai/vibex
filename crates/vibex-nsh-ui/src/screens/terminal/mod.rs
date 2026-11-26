@@ -1,12 +1,21 @@
-//! Workspace terminal tabs and the native terminal emulator. The authority owns the PTYs.
+//! Workspace terminal tabs and the native mobile terminal emulator. The
+//! authority owns the PTYs.
+
+mod emulator;
+mod grid;
 
 use std::{cell::RefCell, rc::Rc};
 
-use nsh_base::{Terminal, TerminalApi, TerminalEvent, button, input, terminal as terminal_view};
-use nsh_core::element::StyleRefinement;
-use nsh_core::prelude::*;
-use nsh_core::{AutoCapitalize, AutoFill, SubmitBehavior, element::Composition};
+use nsh_base::{button, input};
+use nsh_core::{
+    AutoCapitalize, AutoFill, PasteBehavior, SubmitBehavior,
+    element::{Composition, PasteEvent, StyleRefinement},
+    keymap::When,
+    prelude::*,
+};
 
+pub use self::grid::{Terminal, TerminalApi, TerminalEvent, notify_terminal_fonts_ready};
+use self::emulator::EmulatorModes;
 use crate::{
     copy, theme,
     ui::{action, field, surface},
@@ -33,6 +42,20 @@ const TERMINAL_KEY_ROW_HEIGHT: f32 = 50.0;
 /// One key's height in that row.
 const TERMINAL_KEY_HEIGHT: f32 = 32.0;
 
+/// Alternating space runways kept inside the invisible IME field so rapid
+/// soft-keyboard Backspace presses always have characters to delete even before
+/// a round-trip value sync arrives from Rust, and every re-seed produces a
+/// distinct `Prop::Value` string so `nsh-core` always flushes the new text back
+/// to the native `EditText` / `UITextField`.
+const INPUT_SEED_A: &str = "        ";
+const INPUT_SEED_B: &str = "         ";
+
+/// Minimum buffer length before the hidden IME field is re-seeded.
+const INPUT_RESEED_LOW: usize = 4;
+
+/// Maximum buffer length before the hidden IME field is re-seeded.
+const INPUT_RESEED_HIGH: usize = 64;
+
 /// The caret a terminal draws at the cursor's cell.
 ///
 /// A block, not a bar: that is what a terminal's cursor looks like, and on a
@@ -49,6 +72,7 @@ pub struct TerminalHost {
     pub title: Signal<Option<SharedString>>,
     pub error: Signal<Option<SharedString>>,
     pub term_ref: ComponentRef<Terminal>,
+    pub visible: Signal<bool>,
     pub on_data: TerminalAction,
     pub on_resize: Rc<dyn Fn(u32, u32)>,
     pub on_title: TerminalAction,
@@ -66,9 +90,11 @@ pub struct TerminalHost {
 pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let active = host.active;
     let busy = host.busy;
+    let visible = host.visible;
     let term_ref = host.term_ref;
     let find_open = host.find_open;
     let find_query = signal(String::new());
+    let composing_text = signal(None::<SharedString>);
     let control = signal(false);
     let alt = signal(false);
     let keyboard = element_ref();
@@ -101,12 +127,31 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             }
         }
     });
+    let focus_keyboard = Rc::new(move || {
+        if visible.get_untracked() && selected() && !busy.get_untracked() {
+            keyboard.focus();
+        }
+    });
+    let terminal_modes = Rc::new(move || {
+        term_ref
+            .api::<TerminalApi>()
+            .map(|api| api.modes())
+            .unwrap_or_default()
+    });
     effect(move || {
         active.get();
         control.set(false);
         alt.set(false);
         confirm.set(None);
         find_open.set(false);
+        composing_text.set(None);
+    });
+    effect(move || {
+        if !visible.get() {
+            control.set(false);
+            alt.set(false);
+            composing_text.set(None);
+        }
     });
     effect(move || {
         if !find_open.get() {
@@ -123,6 +168,18 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             api.text().to_lowercase().matches(query.as_str()).count()
         })
     });
+    let active_find_query = computed(move || {
+        if !find_open.get() {
+            return None;
+        }
+        let query = find_query.get();
+        if query.trim().is_empty() {
+            None
+        } else {
+            Some(SharedString::from(query))
+        }
+    });
+
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -174,14 +231,15 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         move || terminal_tabs(terminals, active, busy, confirm, select.clone())
                     }),
                 )
-                .child(
+                .child({
+                    let focus = focus_keyboard.clone();
                     surface::ghost_button(
                         icon!("keyboard"),
                         copy::text("Keyboard", "键盘", "鍵盤"),
-                        move || keyboard.focus(),
+                        move || focus(),
                     )
-                    .disabled(move || !selected() || busy.get()),
-                )
+                    .disabled(move || !selected() || busy.get())
+                })
                 .child(
                     surface::ghost_button(
                         icon!("search"),
@@ -348,7 +406,11 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                     ))
             }
         }))
-        .child(
+        .child({
+            let panel_focus = focus_keyboard.clone();
+            let grid_focus = focus_keyboard.clone();
+            let pty_reply = on_data.clone();
+            let input_modes = terminal_modes.clone();
             view()
                 .flex_1()
                 .min_h(px(0.0))
@@ -363,37 +425,46 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .test_id(TERMINAL_PANEL_ID)
                 .px(px(TERMINAL_INSET))
                 .py(px(TERMINAL_INSET))
-                // A tap anywhere on the panel opens the keyboard. The emulator
-                // focuses its own hidden sink on a press; this runs after it (an
-                // ancestor's press is delivered last) and hands focus to the
-                // input this screen controls, which is the one wired to the
-                // editing and input-method path above.
-                .on_press(move || keyboard.focus())
-                .child({
-                    let data = on_text.clone();
-                    terminal_view()
+                .on_press(move || panel_focus())
+                .child(
+                    grid::terminal()
                         .component_ref(&term_ref)
                         .accessibility_label(copy::text("Terminal grid", "终端网格", "終端機網格"))
-                        // The faces the phone carries, and a cell ladder that
-                        // fits a shell's 80 columns: the emulator draws its own
-                        // grid, so the size here is what the PTY is measured
-                        // against.
                         .font_family(theme::TERMINAL_FONT_FAMILY)
                         .font_size(px(theme::font_terminal()))
                         .line_height(px(theme::terminal_line_height()))
                         .cursor_style(cursor_style)
-                        .on_data(move |text: &SharedString| data(text))
+                        .composing(move || composing_text.get())
+                        .find_query(move || active_find_query.get())
+                        .on_data(move |text: &SharedString| pty_reply(text))
                         .on_resize(move |event: &TerminalEvent| {
                             if let TerminalEvent::Resize(cols, rows) = event {
                                 (host.on_resize)(*cols, *rows);
                             }
                         })
                         .on_title_change(move |title: &SharedString| (host.on_title)(title))
+                        .on_tap(move || grid_focus())
                         .w_full()
                         .flex_1()
-                        .min_h(px(0.0))
-                })
-                .child(terminal_keyboard(keyboard, active, on_text))
+                        .min_h(px(0.0)),
+                )
+                // Mount the single hidden IME input only while this terminal is
+                // actively visible and attached. Leaving the tab or page cleanly
+                // unmounts it (releasing Android's InputConnection and hiding the
+                // soft keyboard), and returning mounts a clean InputBox with
+                // fresh native geometry and edit count.
+                .child(when(
+                    move || visible.get() && selected(),
+                    move || {
+                        terminal_keyboard(
+                            keyboard,
+                            active,
+                            composing_text,
+                            input_modes.clone(),
+                            on_text.clone(),
+                        )
+                    },
+                ))
                 .child(when(
                     move || !selected(),
                     move || {
@@ -425,10 +496,10 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                                 ),
                             ))
                     },
-                )),
-        )
+                ))
+        })
         .child(when(selected, move || {
-            terminal_keys(control, alt, on_data.clone())
+            terminal_keys(control, alt, terminal_modes.clone(), on_data.clone())
         }))
         .child(when(
             move || keyboard_height().0 == 0.0,
@@ -446,6 +517,7 @@ fn terminal_tabs(
     scroll()
         .horizontal()
         .scrollbar(false)
+        .keyboard_taps(KeyboardTaps::Always)
         .flex_1()
         .min_w(px(0.0))
         .child(
@@ -471,10 +543,6 @@ fn terminal_tabs(
                         let id = choice.get_untracked().id;
                         let chosen =
                             move || active.with(|active| active.as_deref() == Some(id.as_str()));
-                        // A tab: the terminal's name, and the way to close it
-                        // inside the same pill. The chosen one is filled and
-                        // carries a mark of the accent, so which shell is open
-                        // reads at a glance on the dark chrome.
                         view()
                             .h(px(theme::CHIP_HEIGHT))
                             .flex_shrink_0()
@@ -560,27 +628,24 @@ fn terminal_tabs(
 fn terminal_keys(
     control: Signal<bool>,
     alt: Signal<bool>,
+    modes: Rc<dyn Fn() -> EmulatorModes>,
     data: TerminalAction,
 ) -> impl IntoElement {
-    let keys = [
-        ("Tab", "\t"),
-        ("↑", "\x1b[A"),
-        ("↓", "\x1b[B"),
-        ("←", "\x1b[D"),
-        ("→", "\x1b[C"),
-        ("Enter", "\r"),
-        ("⌫", "\u{7f}"),
-    ];
     let escape = data.clone();
+    let tab = data.clone();
+    let enter = data.clone();
+    let backspace = data.clone();
     let paste = data.clone();
+    let paste_modes = modes.clone();
+    let arrows: [(&'static str, char); 4] = [("↑", 'A'), ("↓", 'B'), ("←", 'D'), ("→", 'C')];
+
     scroll()
         .horizontal()
         .scrollbar(false)
+        // Keep the software keyboard open when tapping Esc/Ctrl/Tab/arrows.
+        .keyboard_taps(KeyboardTaps::Always)
         .flex_shrink_0()
         .w_full()
-        // The key row is part of the terminal, not of the page: it sits on the
-        // chrome tone under a hairline, so the grid above it stays the one
-        // recessed panel and the keys read as the shell's own accessory row.
         .bg(theme::terminal_chrome())
         .border_t_1()
         .border_color(theme::terminal_hairline())
@@ -597,10 +662,21 @@ fn terminal_keys(
                     move || control.get(),
                     move || control.update(|selected| *selected = !*selected),
                 ))
-                .children(keys.map(|(label, sequence)| {
+                .child(key_chip("Tab", || false, move || tab("\t")))
+                .children(arrows.map(|(label, code)| {
                     let data = data.clone();
-                    key_chip(label, || false, move || data(sequence))
+                    let modes = modes.clone();
+                    key_chip(label, || false, move || {
+                        let seq = if modes().application_cursor {
+                            format!("\x1bO{code}")
+                        } else {
+                            format!("\x1b[{code}")
+                        };
+                        data(&seq);
+                    })
                 }))
+                .child(key_chip("Enter", || false, move || enter("\r")))
+                .child(key_chip("⌫", || false, move || backspace("\u{7f}")))
                 .child(key_chip(
                     "Alt",
                     move || alt.get(),
@@ -611,54 +687,148 @@ fn terminal_keys(
                     || false,
                     move || {
                         let paste = paste.clone();
+                        let paste_modes = paste_modes.clone();
                         spawn(async move {
-                            paste(&terminal_newlines(&clipboard_string().await));
+                            let clip = clipboard_string().await;
+                            let payload =
+                                encode_paste(&clip, paste_modes().bracketed_paste);
+                            if !payload.is_empty() {
+                                paste(&payload);
+                            }
                         });
                     },
                 )),
         )
 }
 
-const INPUT_SEED: &str = " ";
-
 fn terminal_keyboard(
     keyboard: ElementRef,
     active: Signal<Option<String>>,
+    composing_text: Signal<Option<SharedString>>,
+    modes: Rc<dyn Fn() -> EmulatorModes>,
     send: TerminalAction,
 ) -> impl IntoElement {
-    let value = signal(INPUT_SEED.to_owned());
+    // `input_value` mirrors `on_change` during normal typing and composition so
+    // `nsh-core`'s prop differ stays in sync while `core::Prop::Value` sees
+    // `input.value == value` and emits nothing to the native `EditText` (zero
+    // mid-word `setText`/`setSelection` disruption). On re-seed/reset we flip
+    // between `INPUT_SEED_A` and `INPUT_SEED_B` and move the caret to the end.
+    let input_value = signal(INPUT_SEED_A.to_owned());
+    let committed = Rc::new(RefCell::new(INPUT_SEED_A.to_owned()));
     let pending = Rc::new(RefCell::new(None::<String>));
     let composing = signal(false);
+    let focused = signal(false);
+
+    let reseed = {
+        let committed = committed.clone();
+        move || {
+            let next_seed = if input_value.with_untracked(|value| value == INPUT_SEED_A) {
+                INPUT_SEED_B
+            } else {
+                INPUT_SEED_A
+            };
+            *committed.borrow_mut() = next_seed.to_owned();
+            input_value.set(next_seed.to_owned());
+            let end = next_seed.encode_utf16().count() as u32;
+            keyboard.set_selection(end, end);
+        }
+    };
+
     let reset = {
+        let reseed = reseed.clone();
         let pending = pending.clone();
         move || {
             composing.set(false);
+            composing_text.set(None);
             pending.borrow_mut().take();
-            value.set(INPUT_SEED.to_owned());
+            reseed();
         }
     };
+
+    let previous_active = stored(active.get_untracked());
     effect({
         let reset = reset.clone();
         move || {
-            active.get();
-            keyboard.blur();
-            reset();
+            let current = active.get();
+            if previous_active.replace(current.clone()) != current {
+                keyboard.blur();
+                reset();
+            }
         }
     });
+
+    // Hardware keyboard shortcuts while focused (navigation + Ctrl/Alt combos).
+    // Regular text, Backspace, and Enter flow through the native IME EditText
+    // path (`on_change` / `on_submit`) so soft keyboards and hardware keyboards
+    // never double-send characters.
+    {
+        let send = send.clone();
+        let modes = modes.clone();
+        effect(move || {
+            if !focused.get() {
+                return;
+            }
+            for &(key, seq) in HARDWARE_FIXED_KEYS {
+                let send = send.clone();
+                on_key_with(
+                    key,
+                    KeyOptions {
+                        when: When::Always,
+                        repeat: true,
+                        for_focus: true,
+                        ..Default::default()
+                    },
+                    move |_| send(seq),
+                );
+            }
+            for &(key, code) in HARDWARE_CURSOR_KEYS {
+                let send = send.clone();
+                let modes = modes.clone();
+                on_key_with(
+                    key,
+                    KeyOptions {
+                        when: When::Always,
+                        repeat: true,
+                        for_focus: true,
+                        ..Default::default()
+                    },
+                    move |_| {
+                        let seq = if modes().application_cursor {
+                            format!("\x1bO{code}")
+                        } else {
+                            format!("\x1b[{code}")
+                        };
+                        send(&seq);
+                    },
+                );
+            }
+        });
+    }
+
     let commit = {
+        let committed = committed.clone();
+        let reseed = reseed.clone();
         let send = send.clone();
         move |next: &str| {
-            let data = value.with_untracked(|previous| terminal_edit(previous, next));
-            value.set(if next.is_empty() {
-                INPUT_SEED.to_owned()
+            let data = {
+                let previous = committed.borrow();
+                terminal_edit(&previous, next)
+            };
+            if next.len() < INPUT_RESEED_LOW || next.len() > INPUT_RESEED_HIGH {
+                reseed();
             } else {
-                next.to_owned()
-            });
+                *committed.borrow_mut() = next.to_owned();
+                input_value.set(next.to_owned());
+            }
             if !data.is_empty() {
                 send(&data);
             }
         }
     };
+
+    let on_paste_send = send.clone();
+    let on_paste_modes = modes.clone();
+
     input()
         .element_ref(&keyboard)
         .absolute()
@@ -668,9 +838,8 @@ fn terminal_keyboard(
         .left_0()
         .size(px(theme::TOUCH_TARGET))
         // Opaque, with transparent ink: the field draws nothing, and no
-        // platform can mistake it for a decorative layer and leave it out of
-        // focus. `pointer_events` keeps it out of the way of the grid's own
-        // tap, which is what focuses it.
+        // platform mistakes it for a hidden decorative layer. `pointer_events`
+        // keeps it out of the way of touches on the terminal grid.
         .opacity(1.0)
         .text_color(theme::foreground().opacity(0.0))
         .caret(false)
@@ -679,39 +848,123 @@ fn terminal_keyboard(
         .auto_correct(false)
         .auto_capitalize(AutoCapitalize::None)
         .auto_fill(AutoFill::Off)
+        .paste_behavior(PasteBehavior::Report)
         .submit_behavior(SubmitBehavior::Submit)
-        .value(move || value.get())
-        .selected_range(move || {
-            let end = value.with(|value| value.encode_utf16().count() as u32);
-            (end, end)
-        })
+        .value(move || input_value.get())
+        .selected_range((
+            INPUT_SEED_A.encode_utf16().count() as u32,
+            INPUT_SEED_A.encode_utf16().count() as u32,
+        ))
+        .on_focus(move || focused.set(true))
         .on_change({
             let pending = pending.clone();
             let commit = commit.clone();
             move |next: &str| {
                 if composing.get_untracked() {
                     pending.replace(Some(next.to_owned()));
+                    input_value.set(next.to_owned());
                 } else {
                     commit(next);
                 }
             }
         })
-        .on_composition_change(move |composition: &Composition| {
-            composing.set(composition.composing);
-            if !composition.composing
-                && let Some(next) = pending.take()
-            {
-                commit(&next);
+        .on_composition_change({
+            let pending = pending.clone();
+            let commit = commit.clone();
+            move |composition: &Composition| {
+                composing.set(composition.composing);
+                composing_text.set(if composition.composing && !composition.text.is_empty() {
+                    Some(SharedString::from(composition.text.clone()))
+                } else {
+                    None
+                });
+                if !composition.composing
+                    && let Some(next) = pending.take()
+                {
+                    commit(&next);
+                }
+            }
+        })
+        .on_paste(move |event: &PasteEvent| {
+            let payload = encode_paste(&event.text, on_paste_modes().bracketed_paste);
+            if !payload.is_empty() {
+                on_paste_send(&payload);
             }
         })
         .on_submit({
+            let pending = pending.clone();
+            let commit = commit.clone();
             let reset = reset.clone();
             move |_: &str| {
+                if let Some(unflushed) = pending.take() {
+                    commit(&unflushed);
+                }
                 send("\r");
                 reset();
             }
         })
-        .on_blur(reset)
+        .on_blur(move || {
+            focused.set(false);
+            reset();
+        })
+}
+
+const HARDWARE_CURSOR_KEYS: &[(&str, char)] = &[
+    ("up", 'A'),
+    ("down", 'B'),
+    ("right", 'C'),
+    ("left", 'D'),
+    ("home", 'H'),
+    ("end", 'F'),
+];
+
+const HARDWARE_FIXED_KEYS: &[(&str, &str)] = &[
+    ("tab", "\t"),
+    ("shift+tab", "\x1b[Z"),
+    ("escape", "\x1b"),
+    ("delete", "\x1b[3~"),
+    ("pageup", "\x1b[5~"),
+    ("pagedown", "\x1b[6~"),
+    ("alt+left", "\x1bb"),
+    ("alt+right", "\x1bf"),
+    ("alt+backspace", "\x1b\x7f"),
+    ("ctrl+a", "\x01"),
+    ("ctrl+b", "\x02"),
+    ("ctrl+c", "\x03"),
+    ("ctrl+d", "\x04"),
+    ("ctrl+e", "\x05"),
+    ("ctrl+f", "\x06"),
+    ("ctrl+g", "\x07"),
+    ("ctrl+h", "\x08"),
+    ("ctrl+i", "\x09"),
+    ("ctrl+j", "\x0a"),
+    ("ctrl+k", "\x0b"),
+    ("ctrl+l", "\x0c"),
+    ("ctrl+m", "\x0d"),
+    ("ctrl+n", "\x0e"),
+    ("ctrl+o", "\x0f"),
+    ("ctrl+p", "\x10"),
+    ("ctrl+r", "\x12"),
+    ("ctrl+s", "\x13"),
+    ("ctrl+t", "\x14"),
+    ("ctrl+u", "\x15"),
+    ("ctrl+v", "\x16"),
+    ("ctrl+w", "\x17"),
+    ("ctrl+x", "\x18"),
+    ("ctrl+y", "\x19"),
+    ("ctrl+z", "\x1a"),
+];
+
+fn encode_paste(text: &str, bracketed: bool) -> String {
+    let normalized = terminal_newlines(text);
+    if normalized.is_empty() {
+        return normalized;
+    }
+    if bracketed {
+        format!("\x1b[200~{normalized}\x1b[201~")
+    } else {
+        normalized
+    }
 }
 
 fn terminal_edit(previous: &str, next: &str) -> String {
@@ -789,12 +1042,13 @@ fn modified_input(text: &str, control: bool, alt: bool) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{modified_input, terminal_edit};
+    use super::{encode_paste, modified_input, terminal_edit};
 
     #[test]
     fn native_input_edits_produce_pty_bytes() {
-        assert_eq!(terminal_edit(" ", " 你好"), "你好");
-        assert_eq!(terminal_edit(" 你好", " 你"), "\u{7f}");
+        assert_eq!(terminal_edit("        ", "        你好"), "你好");
+        assert_eq!(terminal_edit("        你好", "        你"), "\u{7f}");
+        assert_eq!(terminal_edit("        ", "       "), "\u{7f}");
         assert_eq!(terminal_edit(" ", ""), "\u{7f}");
         assert_eq!(terminal_edit(" 你", " 您"), "\u{7f}您");
         assert_eq!(terminal_edit(" ", " ls\r\npwd\n"), "ls\rpwd\r");
@@ -806,5 +1060,14 @@ mod tests {
         assert_eq!(modified_input("x", false, true), "\x1bx");
         assert_eq!(modified_input("你好", true, false), "你好");
         assert_eq!(modified_input("abc", true, true), "\x1b\x01bc");
+    }
+
+    #[test]
+    fn bracketed_paste_wraps_payload_only_when_enabled() {
+        assert_eq!(encode_paste("echo hi\n", false), "echo hi\r");
+        assert_eq!(
+            encode_paste("echo hi\n", true),
+            "\x1b[200~echo hi\r\x1b[201~"
+        );
     }
 }

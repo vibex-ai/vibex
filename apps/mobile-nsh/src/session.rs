@@ -15,7 +15,7 @@ use std::{
 };
 
 use base64::Engine as _;
-use nsh_base::{Terminal, TerminalApi};
+use vibex_nsh_ui::screens::terminal::{Terminal, TerminalApi};
 use nsh_core::element::ImageSrc;
 use nsh_core::picker::{FilePickRequest, PickRequest, PickedStatus};
 use nsh_core::platform::Lifecycle;
@@ -6562,8 +6562,14 @@ impl SessionService {
     }
 
     /// Tells the runtime the grid's new size.
+    ///
+    /// The terminal grid already ignores hidden `0x0` layout bounds, so any
+    /// resize reaching here carries a real viewport dimension. Always record
+    /// it — even if it arrives on the first layout frame before
+    /// `terminal_visible` flips — so the initial PTY attach/create uses the
+    /// phone's actual column count instead of the `80x24` fallback.
     fn terminal_resize(&self, cols: u32, rows: u32) {
-        if !self.terminal_visible.get_untracked() || cols <= 1 || rows <= 1 {
+        if cols <= 1 || rows <= 1 {
             return;
         }
         let size = (
