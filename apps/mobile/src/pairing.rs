@@ -1163,14 +1163,17 @@ impl PairingService {
         bundle: &MobileCredentialBundle,
         selection: MobileRouteSelection,
     ) {
-        {
+        let changed = {
             let mut meta = self.meta.borrow_mut();
             let entry = meta.entry(host_id.to_owned()).or_default();
-            if entry.preferred_route != selection {
+            let changed = entry.preferred_route != selection;
+            if changed {
                 entry.preferred_route = selection.clone();
-                drop(meta);
-                self.save_meta();
             }
+            changed
+        };
+        if changed {
+            self.save_meta();
         }
         let updated_routes = route_options(bundle, &selection);
         self.saved.update(|rows| {
@@ -2040,6 +2043,72 @@ mod tests {
             Some("Studio Mac")
         );
         text("note-runtime-name-ok")
+    }
+
+    #[component]
+    fn RoutePreferenceProbe() -> impl IntoElement {
+        let dir = data_dir().expect("test data_dir");
+        let service = PairingService::new(dir.clone());
+        let bundle = service.bundles.borrow()[0].clone();
+        assert!(
+            bundle.has_route(&MobileRouteSelection::Relay),
+            "the seeded runtime advertises a relay"
+        );
+
+        // Choosing a method marks it on the row and stores it for next time.
+        service.set_preferred_route("machine-1", &bundle, MobileRouteSelection::Relay);
+        let active_kind = |service: &PairingService| {
+            service.saved().get_untracked()[0]
+                .routes
+                .iter()
+                .find(|route| route.active)
+                .map(|route| route.kind)
+        };
+        assert_eq!(
+            active_kind(&service),
+            Some(RouteOptionKind::SelfHostedRelay)
+        );
+
+        // A cold start restores the choice instead of falling back to Auto.
+        let reopened = PairingService::new(dir);
+        assert_eq!(
+            active_kind(&reopened),
+            Some(RouteOptionKind::SelfHostedRelay),
+            "the chosen connection method must survive a restart"
+        );
+        text("route-preference-ok")
+    }
+
+    #[test]
+    fn the_chosen_connection_method_survives_a_restart() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PairingStore::new(dir.path().join(STORE_FILE));
+        let bundle = saved_bundle(
+            "machine-1",
+            Some("Studio Mac"),
+            vibex_mobile_pairing::MobileRemoteRouteBundle {
+                local_network: Some(vibex_mobile_pairing::MobileLocalNetworkCandidate {
+                    url: "https://192.168.1.20:8443".to_owned(),
+                    tls_certificate_der: "cert".to_owned(),
+                }),
+                direct_candidates: vec!["https://studio.tailnet.ts.net".to_owned()],
+                relay: Some(vibex_mobile_pairing::MobileRelayCandidate {
+                    url: "https://relay.example.com".to_owned(),
+                    room_id: vibex_core::RelayRoomId::new(),
+                    local_peer_id: vibex_core::RelayPeerId::new(),
+                    pc_peer_id: vibex_core::RelayPeerId::new(),
+                    pc_public_key: "relay-pub".to_owned(),
+                }),
+            },
+        );
+        store.upsert(bundle).unwrap();
+        std::fs::write(dir.path().join(LAST_HOST_FILE), "machine-1").unwrap();
+
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_engine::Root::of::<RoutePreferenceProbe>());
+        config.data_dir = Some(dir.path().to_path_buf());
+        let mut app = nsh_testing::Headless::start(config).unwrap();
+        app.wait_for("route-preference-ok").unwrap();
     }
 
     #[test]
