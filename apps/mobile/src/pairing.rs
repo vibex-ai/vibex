@@ -23,14 +23,14 @@ use nsh_core::prelude::*;
 use vibex_backend::{BackendError, BackendResult};
 use vibex_core::{RemoteLanPairingRequestState, RemoteServerKind, unix_timestamp_ms};
 use vibex_mobile_pairing::{
-    MobileCredentialBundle, MobilePairedRuntime, PairingStore, claim_entry,
+    MobileCredentialBundle, MobilePairedRuntime, MobileRouteSelection, PairingStore, claim_entry,
     claim_zero_config_lan_pairing, classify_entry, entry::is_pairing_link,
 };
 use vibex_mobile_ui::{
     copy,
     screens::pairing::{
-        HostDetails, NearbyPhase, NearbyRuntime, PairingHost, RuntimeKind, RuntimeStatus,
-        SavedRuntime,
+        HostDetails, NearbyPhase, NearbyRuntime, PairingHost, RouteOptionKind, RuntimeKind,
+        RuntimeRouteOption, RuntimeStatus, SavedRuntime,
     },
 };
 use vibex_remote_client::{ClientDeviceIdentity, ZeroConfigLanPairingSession};
@@ -56,15 +56,26 @@ struct HostMeta {
     device_name: Option<String>,
     #[serde(default)]
     server_kind: RemoteServerKind,
+    /// Phone-local custom name set via the Rename dialog (wins over server name).
+    #[serde(default)]
+    custom_name: Option<String>,
+    /// Machine/published name reported by the runtime (`server_display_name` or mDNS name).
+    #[serde(default)]
+    server_display_name: Option<String>,
+    /// User's active connection method choice for this runtime (defaults to `Auto`).
+    #[serde(default)]
+    preferred_route: MobileRouteSelection,
 }
 
 /// The runtime the page is connected to, once a claim or a probe succeeds.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct ConnectedRuntime {
     /// The label the shell shows for it.
     pub label: String,
     /// The credential the session shell's backend is built from.
     pub bundle: MobileCredentialBundle,
+    /// Which route(s) the session service should connect over.
+    pub route_selection: MobileRouteSelection,
 }
 
 /// The pairing page's state and actions.
@@ -142,13 +153,12 @@ impl PairingService {
         {
             for host in &imported.hosts {
                 let mut bundle = host.bundle.clone();
-                if let Some(name) = host
+                let custom_name = host
                     .name_override
                     .as_deref()
-                    .map(str::trim)
-                    .filter(|name| !name.is_empty())
-                {
-                    bundle.display_name = Some(name.to_owned());
+                    .and_then(vibex_core::normalize_remote_display_name);
+                if let Some(name) = custom_name.as_ref() {
+                    bundle.display_name = Some(name.clone());
                 }
                 let id = bundle.host_id().to_owned();
                 meta.insert(
@@ -158,6 +168,9 @@ impl PairingService {
                         last_connected_at_ms: host.last_connected_at_ms.unwrap_or(0),
                         device_name: None,
                         server_kind: host.server_kind,
+                        custom_name,
+                        server_display_name: None,
+                        preferred_route: MobileRouteSelection::Auto,
                     },
                 );
                 bundles.push(bundle);
@@ -194,17 +207,21 @@ impl PairingService {
                 .iter()
                 .map(|bundle| {
                     let id = bundle.host_id().to_owned();
-                    let kind = meta
-                        .get(&id)
+                    let host_meta = meta.get(&id);
+                    let kind = host_meta
                         .map(|meta| runtime_kind(meta.server_kind))
                         .unwrap_or(RuntimeKind::Unknown);
+                    let selected = host_meta
+                        .map(|meta| &meta.preferred_route)
+                        .unwrap_or(&MobileRouteSelection::Auto);
                     SavedRuntime {
                         id,
-                        name: bundle.host_label(),
+                        name: effective_host_name(bundle, host_meta),
                         status: RuntimeStatus::Unreachable,
                         kind,
                         address: bundle.record.server_url.clone(),
                         server_id: bundle.expected_server_id.clone(),
+                        routes: route_options(bundle, selected),
                     }
                 })
                 .collect::<Vec<_>>(),
@@ -275,6 +292,10 @@ impl PairingService {
                 Rc::new(move || service.start_nearby())
             },
             on_pick_saved: Rc::new(move |id| pick_saved.probe_runtime(id)),
+            on_pick_route: {
+                let service = self.clone();
+                Rc::new(move |id: &str, route_key: &str| service.pick_route(id, route_key))
+            },
             actions_id: self.actions_id,
             dialog_id: self.dialog_id,
             rename_open: self.rename_open,
@@ -511,6 +532,7 @@ impl PairingService {
         // Presenting the install's identity keeps a re-pair on the runtime's
         // existing device row, as the claim paths do.
         let previous_identity = self.identity.borrow().clone();
+        let candidate_name = candidate.name.clone();
         let name: SharedString = candidate.name.clone().into();
         spawn_detached(async move {
             let device = crate::host::device_name().unwrap_or_else(|| DEVICE_NAME.to_owned());
@@ -585,7 +607,13 @@ impl PairingService {
                             })
                             .await;
                         match claimed {
-                            Ok(claimed) => {
+                            Ok(mut claimed) => {
+                                if let Ok(paired) = &mut claimed
+                                    && paired.bundle.display_name.is_none()
+                                {
+                                    paired.bundle.display_name =
+                                        vibex_core::normalize_remote_display_name(&candidate_name);
+                                }
                                 service.stop_nearby();
                                 service.finish_claim(claimed)
                             }
@@ -804,23 +832,41 @@ impl PairingService {
             Ok(paired) => match self.store.upsert(paired.bundle.clone()) {
                 Ok(bundles) => {
                     let id = paired.bundle.host_id().to_owned();
+                    let merged = bundles
+                        .iter()
+                        .find(|bundle| bundle.host_id() == id)
+                        .cloned()
+                        .unwrap_or_else(|| paired.bundle.clone());
                     {
                         let mut meta = self.meta.borrow_mut();
                         let entry = meta.entry(id).or_default();
-                        entry.added_at_ms = unix_timestamp_ms();
-                        entry.server_kind = paired.server_kind;
+                        if entry.added_at_ms == 0 {
+                            entry.added_at_ms = unix_timestamp_ms();
+                        }
+                        if paired.server_kind != RemoteServerKind::Unknown {
+                            entry.server_kind = paired.server_kind;
+                        }
+                        if let Some(published) = paired
+                            .bundle
+                            .display_name
+                            .as_deref()
+                            .and_then(vibex_core::normalize_remote_display_name)
+                        {
+                            entry.server_display_name = Some(published);
+                        }
+                        entry.preferred_route = MobileRouteSelection::Auto;
                     }
                     self.save_meta();
                     if let Ok(identity) = ClientDeviceIdentity::from_private_key_base64(
-                        paired.bundle.record.auth.device_id.clone(),
-                        &paired.bundle.identity_private_key,
+                        merged.record.auth.device_id.clone(),
+                        &merged.identity_private_key,
                     ) {
                         *self.identity.borrow_mut() = Some(identity);
-                        crate::migration::save_identity(&self.data_dir, &paired.bundle);
+                        crate::migration::save_identity(&self.data_dir, &merged);
                     }
                     self.set_bundles(bundles);
                     self.busy.set(false);
-                    self.connect(paired.bundle);
+                    self.connect(merged, MobileRouteSelection::Auto);
                 }
                 Err(error) => self.fail(&error),
             },
@@ -862,16 +908,13 @@ impl PairingService {
             return;
         };
         let meta = self.meta.borrow().get(host_id).cloned().unwrap_or_default();
-        self.rename_draft.set(bundle.host_label());
+        let display = effective_host_name(&bundle, Some(&meta));
+        self.rename_draft.set(display.clone());
         self.details.set(Some(HostDetails {
             id: host_id.to_owned(),
-            name: bundle.host_label(),
+            name: display,
             kind: runtime_kind(meta.server_kind),
-            address: if vibex_core::is_official_relay_origin(&bundle.record.server_url) {
-                copy::text("Official relay", "官方中继服务", "官方中繼服務").to_owned()
-            } else {
-                bundle.record.server_url.clone()
-            },
+            address: details_address(&bundle),
             server_id: bundle.expected_server_id.clone(),
             device_name: meta.device_name.clone(),
             last_connected: (meta.last_connected_at_ms > 0)
@@ -888,7 +931,9 @@ impl PairingService {
             .iter()
             .find(|bundle| bundle.host_id() == host_id)
         {
-            self.rename_draft.set(bundle.host_label());
+            let meta = self.meta.borrow();
+            self.rename_draft
+                .set(effective_host_name(bundle, meta.get(host_id)));
         }
     }
 
@@ -945,50 +990,51 @@ impl PairingService {
         }
     }
 
-    /// Renames a saved runtime locally (the credential keeps the authority's
-    /// name until the runtime is reached again).
+    /// Renames a saved runtime locally on this phone.
+    ///
+    /// Clearing the name removes the local override and falls back to the
+    /// machine/published name reported by the runtime (never reverting to a
+    /// bare IP address when a runtime name is already known).
     fn rename_host(&self, host_id: &str, name: &str) {
-        let name = name.trim();
-        let mut bundle = self
+        let custom = vibex_core::normalize_remote_display_name(name);
+        let fallback_name = {
+            let mut meta = self.meta.borrow_mut();
+            let entry = meta.entry(host_id.to_owned()).or_default();
+            entry.custom_name = custom.clone();
+            custom.clone().or_else(|| entry.server_display_name.clone())
+        };
+        self.save_meta();
+        let updated = self
             .bundles
             .borrow()
             .iter()
             .find(|bundle| bundle.host_id() == host_id)
             .cloned()
-            .map(|bundle| {
-                let mut bundle = bundle;
-                bundle.display_name = if name.is_empty() {
-                    None
-                } else {
-                    Some(name.to_owned())
-                };
+            .map(|mut bundle| {
+                bundle.display_name = fallback_name;
                 bundle
             });
-        let Some(bundle) = bundle.take() else {
+        let Some(bundle) = updated else {
             return;
         };
-        match self.store.upsert(bundle) {
+        match self.store.update_in_place(bundle) {
             Ok(bundles) => {
-                let saved_bundle = bundles
-                    .iter()
-                    .find(|bundle| bundle.host_id() == host_id)
-                    .cloned();
-                let saved_name = saved_bundle
-                    .as_ref()
-                    .map(|bundle| bundle.host_label())
-                    .unwrap_or_default();
+                let saved_name = {
+                    let meta = self.meta.borrow();
+                    bundles
+                        .iter()
+                        .find(|bundle| bundle.host_id() == host_id)
+                        .map(|bundle| effective_host_name(bundle, meta.get(host_id)))
+                        .unwrap_or_default()
+                };
                 self.set_bundles(bundles);
-                if let Some(bundle) = saved_bundle
-                    && self
-                        .connected
-                        .get_untracked()
-                        .is_some_and(|connected| connected.bundle.host_id() == host_id)
+                if self
+                    .active_id
+                    .get_untracked()
+                    .as_deref()
+                    .is_some_and(|active| active == host_id)
                 {
                     self.connected_label.set(Some(saved_name.clone().into()));
-                    self.connected.set(Some(ConnectedRuntime {
-                        label: saved_name.clone(),
-                        bundle,
-                    }));
                 }
                 self.rename_draft.set(saved_name.clone());
                 if let Some(mut details) = self.details.get_untracked()
@@ -1020,14 +1066,13 @@ impl PairingService {
                     .connected
                     .get_untracked()
                     .is_some_and(|connected| connected.bundle.host_id() == host_id);
+                let empty = bundles.is_empty();
                 self.set_bundles(bundles);
                 self.details.set(None);
                 self.dialog_id.set(None);
                 self.actions_id.set(None);
-                if was_connected {
-                    self.connected.set(None);
-                    self.connected_label.set(None);
-                    self.active_id.set(None);
+                if was_connected || empty {
+                    self.disconnect();
                 }
             }
             Err(error) => self.fail(&error),
@@ -1041,7 +1086,7 @@ impl PairingService {
         // row green until the phone forgot the runtime.
         let bundles = self.bundles.borrow().clone();
         for bundle in bundles {
-            self.spawn_probe(bundle, false);
+            self.spawn_probe(bundle, None);
         }
     }
 
@@ -1058,7 +1103,13 @@ impl PairingService {
         });
     }
 
-    /// Probes the saved runtime with `host_id`.
+    /// Connects to the saved runtime with `host_id`.
+    ///
+    /// The connection method the reader last chose for this runtime is kept:
+    /// tapping the row means "open it", not "forget the route I picked". A
+    /// runtime that has no stored choice (or whose stored route disappeared
+    /// when it was repaired) falls back to `Auto`, which tries the direct
+    /// routes concurrently and reaches for the relay only if none answers.
     fn probe_runtime(&self, host_id: &str) {
         let bundle = self
             .bundles
@@ -1069,22 +1120,85 @@ impl PairingService {
         let Some(bundle) = bundle else {
             return;
         };
+        let preferred = self
+            .meta
+            .borrow()
+            .get(host_id)
+            .map(|meta| meta.preferred_route.clone())
+            .filter(|selection| bundle.has_route(selection))
+            .unwrap_or(MobileRouteSelection::Auto);
+        self.set_preferred_route(host_id, &bundle, preferred.clone());
         self.set_status(host_id, RuntimeStatus::Probing);
         self.error.set(None);
-        self.spawn_probe(bundle, true);
+        self.spawn_probe(bundle, Some(preferred));
     }
 
-    fn spawn_probe(&self, bundle: MobileCredentialBundle, connect_on_success: bool) {
+    /// Actively switches a saved runtime to a specific connection route chosen
+    /// from its "More" actions sheet and reconnects over that route.
+    pub fn pick_route(&self, host_id: &str, route_key: &str) {
+        let bundle = self
+            .bundles
+            .borrow()
+            .iter()
+            .find(|bundle| bundle.host_id() == host_id)
+            .cloned();
+        let Some(bundle) = bundle else {
+            return;
+        };
+        let requested = parse_route_key(route_key);
+        let selection = if bundle.has_route(&requested) {
+            requested
+        } else {
+            MobileRouteSelection::Auto
+        };
+        self.set_preferred_route(host_id, &bundle, selection.clone());
+        self.set_status(host_id, RuntimeStatus::Probing);
+        self.error.set(None);
+        self.spawn_probe(bundle, Some(selection));
+    }
+
+    fn set_preferred_route(
+        &self,
+        host_id: &str,
+        bundle: &MobileCredentialBundle,
+        selection: MobileRouteSelection,
+    ) {
+        {
+            let mut meta = self.meta.borrow_mut();
+            let entry = meta.entry(host_id.to_owned()).or_default();
+            if entry.preferred_route != selection {
+                entry.preferred_route = selection.clone();
+                drop(meta);
+                self.save_meta();
+            }
+        }
+        let updated_routes = route_options(bundle, &selection);
+        self.saved.update(|rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == host_id) {
+                row.routes = updated_routes;
+            }
+        });
+    }
+
+    fn spawn_probe(
+        &self,
+        bundle: MobileCredentialBundle,
+        connect_selection: Option<MobileRouteSelection>,
+    ) {
         let service = self.clone();
         let id = bundle.host_id().to_owned();
-        let probing = bundle.clone();
+        let probing = match &connect_selection {
+            Some(selection) => bundle.for_route_selection(selection),
+            None => bundle.clone(),
+        };
         spawn_detached(async move {
             // A panicking probe is an unreachable runtime, not a crash of the
             // page: the row simply stays red.
-            let online = crate::runtime::handle()
-                .spawn(async move { probing.probe_online().await })
+            let probe = crate::runtime::handle()
+                .spawn(async move { probing.probe_status().await })
                 .await
-                .unwrap_or(false);
+                .ok();
+            let online = probe.as_ref().is_some_and(|result| result.online);
             service.set_status(
                 &id,
                 if online {
@@ -1093,12 +1207,27 @@ impl PairingService {
                     RuntimeStatus::Unreachable
                 },
             );
-            if connect_on_success {
+            if let Some(probe) = probe {
+                if probe.server_kind != RemoteServerKind::Unknown {
+                    service.set_host_kind(&id, probe.server_kind);
+                }
+                if let Some(name) = probe.server_display_name.as_deref() {
+                    service.note_runtime_name(&id, name);
+                }
+            }
+            if let Some(selection) = connect_selection {
+                let latest = service
+                    .bundles
+                    .borrow()
+                    .iter()
+                    .find(|entry| entry.host_id() == id)
+                    .cloned()
+                    .unwrap_or(bundle);
                 // A saved runtime is entered even when the probe failed: the
                 // session service shows the connecting page and its own retry,
                 // which is where an unavailable runtime belongs. Refusing here
                 // left the reader on the list with a line of red text.
-                service.connect(bundle);
+                service.connect(latest, selection);
             }
         });
     }
@@ -1118,6 +1247,7 @@ impl PairingService {
             .into_iter()
             .map(|runtime| (runtime.id, runtime.status))
             .collect();
+        let meta = self.meta.borrow();
         let rows = bundles
             .iter()
             .map(|bundle| {
@@ -1126,61 +1256,78 @@ impl PairingService {
                     .iter()
                     .find(|(previous_id, _)| *previous_id == id)
                     .map_or(RuntimeStatus::Unreachable, |(_, status)| *status);
-                let kind = self
-                    .meta
-                    .borrow()
-                    .get(&id)
+                let host_meta = meta.get(&id);
+                let kind = host_meta
                     .map(|meta| runtime_kind(meta.server_kind))
                     .unwrap_or(RuntimeKind::Unknown);
+                let selected = host_meta
+                    .map(|meta| &meta.preferred_route)
+                    .unwrap_or(&MobileRouteSelection::Auto);
                 SavedRuntime {
                     id,
-                    name: bundle.host_label(),
+                    name: effective_host_name(bundle, host_meta),
                     status,
                     kind,
                     address: bundle.record.server_url.clone(),
                     server_id: bundle.expected_server_id.clone(),
+                    routes: route_options(bundle, selected),
                 }
             })
             .collect::<Vec<_>>();
+        drop(meta);
         *self.bundles.borrow_mut() = bundles;
         self.saved.set(rows);
     }
 
-    fn connect(&self, bundle: MobileCredentialBundle) {
+    fn connect(&self, bundle: MobileCredentialBundle, route_selection: MobileRouteSelection) {
         {
             let id = bundle.host_id().to_owned();
             let mut meta = self.meta.borrow_mut();
             let entry = meta.entry(id).or_default();
             entry.last_connected_at_ms = unix_timestamp_ms();
             entry.device_name = crate::host::device_name();
+            entry.preferred_route = route_selection.clone();
             drop(meta);
             self.save_meta();
         }
-        self.show_connected(bundle, true);
+        self.show_connected(bundle, route_selection, true);
     }
 
     /// Shows `bundle` as the connected runtime without treating it as a new
     /// connection, so a cold start does not move the "last connected" clock.
-    fn restore(&self, bundle: MobileCredentialBundle) {
-        self.show_connected(bundle, false);
+    fn restore(&self, bundle: MobileCredentialBundle, route_selection: MobileRouteSelection) {
+        self.show_connected(bundle, route_selection, false);
     }
 
-    fn show_connected(&self, bundle: MobileCredentialBundle, remember: bool) {
+    fn show_connected(
+        &self,
+        bundle: MobileCredentialBundle,
+        route_selection: MobileRouteSelection,
+        remember: bool,
+    ) {
         if remember {
             let _ = std::fs::write(&self.last_host_path, bundle.host_id());
         }
         self.switcher.set(false);
         let id = bundle.host_id().to_owned();
+        let label = {
+            let meta = self.meta.borrow();
+            effective_host_name(&bundle, meta.get(&id))
+        };
+        let routes = route_options(&bundle, &route_selection);
         self.saved.update(|saved| {
             if let Some(row) = saved.iter_mut().find(|row| row.id == id) {
                 row.status = RuntimeStatus::Reachable;
+                row.name = label.clone();
+                row.routes = routes;
             }
         });
-        self.active_id.set(Some(bundle.host_id().to_owned().into()));
-        self.connected_label.set(Some(bundle.host_label().into()));
+        self.active_id.set(Some(id.into()));
+        self.connected_label.set(Some(label.clone().into()));
         self.connected.set(Some(ConnectedRuntime {
-            label: bundle.host_label(),
+            label,
             bundle,
+            route_selection,
         }));
     }
 
@@ -1203,42 +1350,77 @@ impl PairingService {
             .find(|bundle| bundle.host_id() == id)
             .cloned();
         if let Some(bundle) = bundle {
-            self.restore(bundle);
+            let selection = self
+                .meta
+                .borrow()
+                .get(id)
+                .map(|meta| meta.preferred_route.clone())
+                .filter(|selection| bundle.has_route(selection))
+                .unwrap_or(MobileRouteSelection::Auto);
+            self.restore(bundle, selection);
         }
     }
 
-    /// Applies the runtime's new name to the credential and the page.
-    pub fn rename_connected(&self, display_name: &str) {
-        let Some(name) = vibex_core::normalize_remote_display_name(display_name) else {
-            return;
+    /// Records the runtime's published machine/display name and updates the
+    /// saved row, details sheet, and active label without rebuilding the
+    /// session shell (so the pager stays on its current pane).
+    ///
+    /// Returns the effective label after applying any phone-local custom name
+    /// override.
+    pub fn note_runtime_name(&self, host_id: &str, display_name: &str) -> Option<String> {
+        let name = vibex_core::normalize_remote_display_name(display_name)?;
+        let (effective, meta_changed) = {
+            let mut meta = self.meta.borrow_mut();
+            let entry = meta.entry(host_id.to_owned()).or_default();
+            let changed = entry.server_display_name.as_deref() != Some(name.as_str());
+            if changed {
+                entry.server_display_name = Some(name.clone());
+            }
+            let effective = entry
+                .custom_name
+                .as_deref()
+                .and_then(vibex_core::normalize_remote_display_name)
+                .unwrap_or_else(|| name.clone());
+            (effective, changed)
         };
-        let connected = self.connected.get_untracked();
-        let mut updated = None;
+        if meta_changed {
+            self.save_meta();
+        }
+        let mut updated_bundle = None;
         {
-            let Some(connected) = connected else {
-                return;
-            };
             let mut bundles = self.bundles.borrow_mut();
-            for bundle in bundles.iter_mut() {
-                if connected.bundle.host_id() == bundle.host_id() {
-                    if bundle.display_name.as_deref() == Some(name.as_str()) {
-                        break;
-                    }
-                    bundle.display_name = Some(name.clone());
-                    updated = Some(bundle.clone());
-                    break;
-                }
+            if let Some(bundle) = bundles
+                .iter_mut()
+                .find(|bundle| bundle.host_id() == host_id)
+                && bundle.display_name.as_deref() != Some(effective.as_str())
+            {
+                bundle.display_name = Some(effective.clone());
+                updated_bundle = Some(bundle.clone());
             }
         }
-        let Some(bundle) = updated else {
-            return;
-        };
-        if let Ok(bundles) = self.store.upsert(bundle.clone()) {
-            let label = bundle.host_label();
-            self.set_bundles(bundles);
-            self.connected_label.set(Some(label.clone().into()));
-            self.connected.set(Some(ConnectedRuntime { label, bundle }));
+        if let Some(bundle) = updated_bundle {
+            let _ = self.store.update_in_place(bundle);
         }
+        self.saved.update(|rows| {
+            if let Some(row) = rows.iter_mut().find(|row| row.id == host_id) {
+                row.name = effective.clone();
+            }
+        });
+        if self
+            .active_id
+            .get_untracked()
+            .as_deref()
+            .is_some_and(|active| active == host_id)
+        {
+            self.connected_label.set(Some(effective.clone().into()));
+        }
+        if let Some(mut details) = self.details.get_untracked()
+            && details.id == host_id
+        {
+            details.name = effective.clone();
+            self.details.set(Some(details));
+        }
+        Some(effective)
     }
 
     /// Applies the name the runtime gave this phone to the saved row.
@@ -1461,6 +1643,151 @@ fn decode_qr_photo(bytes: &[u8]) -> Option<String> {
     None
 }
 
+/// Resolves the display label for a saved runtime:
+/// phone-local custom name -> runtime's published machine name -> credential label.
+fn effective_host_name(bundle: &MobileCredentialBundle, meta: Option<&HostMeta>) -> String {
+    if let Some(custom) = meta
+        .and_then(|meta| meta.custom_name.as_deref())
+        .and_then(vibex_core::normalize_remote_display_name)
+    {
+        return custom;
+    }
+    if let Some(published) = meta
+        .and_then(|meta| meta.server_display_name.as_deref())
+        .and_then(vibex_core::normalize_remote_display_name)
+    {
+        return published;
+    }
+    bundle.host_label()
+}
+
+fn url_authority(url: &str) -> Option<String> {
+    let rest = url
+        .trim()
+        .split_once("://")
+        .map(|(_, rest)| rest)
+        .unwrap_or(url.trim());
+    let authority = rest.split(['/', '?', '#']).next()?.trim();
+    (!authority.is_empty()).then(|| authority.to_owned())
+}
+
+fn url_host(url: &str) -> Option<String> {
+    let authority = url_authority(url)?;
+    let host = if let Some(rest) = authority.strip_prefix('[') {
+        rest.split(']').next()?
+    } else {
+        authority.split(':').next()?
+    };
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+fn is_tailscale_host(host: &str) -> bool {
+    if host.to_ascii_lowercase().ends_with(".ts.net") {
+        return true;
+    }
+    host.parse::<std::net::Ipv4Addr>().ok().is_some_and(|ip| {
+        let [a, b, ..] = ip.octets();
+        a == 100 && (64..=127).contains(&b)
+    })
+}
+
+fn parse_route_key(key: &str) -> MobileRouteSelection {
+    match key.trim() {
+        "" | "auto" => MobileRouteSelection::Auto,
+        "lan" => MobileRouteSelection::LocalNetwork,
+        "relay" => MobileRouteSelection::Relay,
+        other => other
+            .strip_prefix("direct:")
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+            .map(|url| MobileRouteSelection::Direct {
+                url: url.to_owned(),
+            })
+            .unwrap_or(MobileRouteSelection::Auto),
+    }
+}
+
+fn route_options(
+    bundle: &MobileCredentialBundle,
+    selected: &MobileRouteSelection,
+) -> Vec<RuntimeRouteOption> {
+    let effective = if bundle.has_route(selected) {
+        selected
+    } else {
+        &MobileRouteSelection::Auto
+    };
+    let mut options = vec![RuntimeRouteOption {
+        key: "auto".to_owned(),
+        kind: RouteOptionKind::Auto,
+        detail: None,
+        active: matches!(effective, MobileRouteSelection::Auto),
+    }];
+    let Some(route) = bundle.route.as_ref() else {
+        return options;
+    };
+    if let Some(lan) = route.local_network.as_ref() {
+        options.push(RuntimeRouteOption {
+            key: "lan".to_owned(),
+            kind: RouteOptionKind::LocalNetwork,
+            detail: url_authority(&lan.url),
+            active: matches!(effective, MobileRouteSelection::LocalNetwork),
+        });
+    }
+    for url in &route.direct_candidates {
+        let kind = if url_host(url).as_deref().is_some_and(is_tailscale_host) {
+            RouteOptionKind::Tailscale
+        } else {
+            RouteOptionKind::Direct
+        };
+        let active = matches!(
+            effective,
+            MobileRouteSelection::Direct { url: selected_url }
+                if selected_url
+                    .trim()
+                    .trim_end_matches('/')
+                    .eq_ignore_ascii_case(url.trim().trim_end_matches('/'))
+        );
+        options.push(RuntimeRouteOption {
+            key: format!("direct:{url}"),
+            kind,
+            detail: url_authority(url),
+            active,
+        });
+    }
+    if let Some(relay) = route.relay.as_ref() {
+        let official = vibex_core::is_official_relay_origin(&relay.url);
+        options.push(RuntimeRouteOption {
+            key: "relay".to_owned(),
+            kind: if official {
+                RouteOptionKind::OfficialRelay
+            } else {
+                RouteOptionKind::SelfHostedRelay
+            },
+            detail: (!official).then(|| url_authority(&relay.url)).flatten(),
+            active: matches!(effective, MobileRouteSelection::Relay),
+        });
+    }
+    options
+}
+
+fn details_address(bundle: &MobileCredentialBundle) -> String {
+    let concrete: Vec<String> = route_options(bundle, &MobileRouteSelection::Auto)
+        .into_iter()
+        .skip(1)
+        .map(|option| match option.detail {
+            Some(detail) => format!("{} · {detail}", option.kind.label()),
+            None => option.kind.label().to_owned(),
+        })
+        .collect();
+    if concrete.len() > 1 {
+        concrete.join("\n")
+    } else if vibex_core::is_official_relay_origin(&bundle.record.server_url) {
+        copy::text("Official relay", "官方中继服务", "官方中繼服務").to_owned()
+    } else {
+        bundle.record.server_url.clone()
+    }
+}
+
 /// Maps the wire's runtime kind to the page's.
 fn runtime_kind(kind: RemoteServerKind) -> RuntimeKind {
     match kind {
@@ -1636,5 +1963,206 @@ mod tests {
         let candidate = candidate(vec!["http://127.0.0.1:1", "http://127.0.0.1:2"]);
         let started = crate::runtime::block_on(start_lan_session(&candidate, "Test Phone", None));
         assert!(started.is_err());
+    }
+
+    fn saved_bundle(
+        host_id: &str,
+        display_name: Option<&str>,
+        route: vibex_mobile_pairing::MobileRemoteRouteBundle,
+    ) -> MobileCredentialBundle {
+        let identity =
+            ClientDeviceIdentity::generate(vibex_core::DeviceId::new()).expect("identity");
+        MobileCredentialBundle {
+            schema_version: vibex_mobile_pairing::MOBILE_CREDENTIAL_SCHEMA_VERSION.to_owned(),
+            record: vibex_remote_client::RemoteCredentialRecord {
+                server_url: "https://studio.tailnet.ts.net".to_owned(),
+                auth: vibex_core::RemoteAuthProof {
+                    device_id: identity.device_id().clone(),
+                    auth_token: "grant-token".to_owned(),
+                },
+                device_identity_public_key: identity.public_key_base64(),
+                server_identity_public_key: Some("server-public-key".to_owned()),
+            },
+            identity_private_key: identity.private_key_base64(),
+            expected_server_id: host_id.to_owned(),
+            client_type: vibex_core::RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            display_name: display_name.map(str::to_owned),
+            route: Some(route),
+        }
+    }
+
+    #[component]
+    fn NoteRuntimeNameProbe() -> impl IntoElement {
+        let dir = data_dir().expect("test data_dir");
+        let store = PairingStore::new(dir.join(STORE_FILE));
+        let service = PairingService::new(dir);
+        assert_eq!(
+            service.saved().get_untracked()[0].name,
+            "studio.tailnet.ts.net"
+        );
+        let before_connected = service.connected().get_untracked().unwrap();
+
+        // Observing the runtime's machine name updates the row and persists it
+        // without rewriting `connected` (which would rebuild the session pager).
+        let label = service.note_runtime_name("machine-1", "Studio Mac");
+        assert_eq!(label.as_deref(), Some("Studio Mac"));
+        assert_eq!(service.saved().get_untracked()[0].name, "Studio Mac");
+        assert_eq!(
+            service.connected_label().get_untracked().as_deref(),
+            Some("Studio Mac")
+        );
+        assert_eq!(
+            service.connected().get_untracked().unwrap(),
+            before_connected
+        );
+        assert_eq!(
+            store.load().unwrap()[0].display_name.as_deref(),
+            Some("Studio Mac")
+        );
+
+        // Local custom rename wins over subsequent server display names.
+        service.rename_host("machine-1", "Workstation");
+        assert_eq!(service.saved().get_untracked()[0].name, "Workstation");
+        assert_eq!(
+            service.connected_label().get_untracked().as_deref(),
+            Some("Workstation")
+        );
+        let label = service.note_runtime_name("machine-1", "Studio Mac");
+        assert_eq!(label.as_deref(), Some("Workstation"));
+        assert_eq!(service.saved().get_untracked()[0].name, "Workstation");
+
+        // Clearing the local custom rename restores the machine name (not the Tailscale host).
+        service.rename_host("machine-1", "");
+        assert_eq!(service.saved().get_untracked()[0].name, "Studio Mac");
+        assert_eq!(
+            service.connected_label().get_untracked().as_deref(),
+            Some("Studio Mac")
+        );
+        text("note-runtime-name-ok")
+    }
+
+    #[test]
+    fn note_runtime_name_updates_saved_row_and_respects_custom_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PairingStore::new(dir.path().join(STORE_FILE));
+        let bundle = saved_bundle(
+            "machine-1",
+            None,
+            vibex_mobile_pairing::MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://studio.tailnet.ts.net".to_owned()],
+                relay: None,
+            },
+        );
+        store.upsert(bundle).unwrap();
+        std::fs::write(dir.path().join(LAST_HOST_FILE), "machine-1").unwrap();
+
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_engine::Root::of::<NoteRuntimeNameProbe>());
+        config.data_dir = Some(dir.path().to_path_buf());
+        let mut app = nsh_testing::Headless::start(config).unwrap();
+        app.wait_for("note-runtime-name-ok").unwrap();
+    }
+
+    #[component]
+    fn RemoveLastDeviceProbe() -> impl IntoElement {
+        let dir = data_dir().expect("test data_dir");
+        let service = PairingService::new(dir);
+        assert!(service.connected().get_untracked().is_some());
+        service.open_switcher();
+        assert!(service.switcher().get_untracked());
+
+        service.remove_host("machine-1");
+        assert!(service.saved().get_untracked().is_empty());
+        assert!(service.connected().get_untracked().is_none());
+        assert!(!service.switcher().get_untracked());
+        text("remove-last-device-ok")
+    }
+
+    #[test]
+    fn removing_last_device_clears_switcher_and_connection() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let store = PairingStore::new(dir.path().join(STORE_FILE));
+        let bundle = saved_bundle(
+            "machine-1",
+            Some("Studio Mac"),
+            vibex_mobile_pairing::MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://studio.tailnet.ts.net".to_owned()],
+                relay: None,
+            },
+        );
+        store.upsert(bundle).unwrap();
+        std::fs::write(dir.path().join(LAST_HOST_FILE), "machine-1").unwrap();
+
+        let mut config =
+            nsh_engine::EngineConfig::new(nsh_engine::Root::of::<RemoveLastDeviceProbe>());
+        config.data_dir = Some(dir.path().to_path_buf());
+        let mut app = nsh_testing::Headless::start(config).unwrap();
+        app.wait_for("remove-last-device-ok").unwrap();
+    }
+
+    #[test]
+    fn route_options_classify_lan_tailscale_direct_and_relay() {
+        let bundle = saved_bundle(
+            "machine-1",
+            Some("Studio Mac"),
+            vibex_mobile_pairing::MobileRemoteRouteBundle {
+                local_network: Some(vibex_mobile_pairing::MobileLocalNetworkCandidate {
+                    url: "https://192.168.1.20:8443".to_owned(),
+                    tls_certificate_der: "cert".to_owned(),
+                }),
+                direct_candidates: vec![
+                    "https://studio.tailnet.ts.net".to_owned(),
+                    "https://100.88.12.34:8443".to_owned(),
+                    "https://dev.example.com".to_owned(),
+                ],
+                relay: Some(vibex_mobile_pairing::MobileRelayCandidate {
+                    url: "https://relay.example.com".to_owned(),
+                    room_id: vibex_core::RelayRoomId::new(),
+                    local_peer_id: vibex_core::RelayPeerId::new(),
+                    pc_peer_id: vibex_core::RelayPeerId::new(),
+                    pc_public_key: "relay-pub".to_owned(),
+                }),
+            },
+        );
+
+        let options = route_options(&bundle, &MobileRouteSelection::Relay);
+        let summary: Vec<(RouteOptionKind, Option<&str>, bool)> = options
+            .iter()
+            .map(|opt| (opt.kind, opt.detail.as_deref(), opt.active))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                (RouteOptionKind::Auto, None, false),
+                (
+                    RouteOptionKind::LocalNetwork,
+                    Some("192.168.1.20:8443"),
+                    false
+                ),
+                (
+                    RouteOptionKind::Tailscale,
+                    Some("studio.tailnet.ts.net"),
+                    false
+                ),
+                (RouteOptionKind::Tailscale, Some("100.88.12.34:8443"), false),
+                (RouteOptionKind::Direct, Some("dev.example.com"), false),
+                (
+                    RouteOptionKind::SelfHostedRelay,
+                    Some("relay.example.com"),
+                    true
+                ),
+            ]
+        );
+        for option in &options {
+            let parsed = parse_route_key(&option.key);
+            assert!(
+                bundle.has_route(&parsed),
+                "key {} should match bundle",
+                option.key
+            );
+        }
     }
 }

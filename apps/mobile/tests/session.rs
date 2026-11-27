@@ -4245,3 +4245,46 @@ fn the_git_commit_message_stays_above_the_keyboard() {
         "commit bar must not double-pad for the bottom safe area while the keyboard is up: bottom {field_bottom}, keyboard top {keyboard_top}"
     );
 }
+
+#[component]
+fn SwitcherShell() -> impl IntoElement {
+    let switched = signal(false);
+    let mut host = host_with(None, None);
+    host.on_switch_runtime = Rc::new(move || switched.set(true));
+    on_back_press(session::handle_back);
+    view()
+        .size_full()
+        .child(session::session(host))
+        .child(when(move || switched.get(), || text("switcher-opened")))
+}
+
+#[test]
+fn opening_runtime_switcher_from_left_pane_keeps_left_pane_open() {
+    let config = EngineConfig::new(Root::of::<SwitcherShell>());
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Sessions]").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Switch runtime]").unwrap();
+    let before = app
+        .screen()
+        .layout("id:sessions-page")
+        .unwrap()
+        .unwrap()
+        .bounds;
+
+    app.press("role:button[Switch runtime]").unwrap();
+    app.wait_for("switcher-opened").unwrap();
+
+    // The pager must stay on the left pane so returning from the switcher lands
+    // back on the left pane rather than the main conversation screen.
+    let after = app
+        .screen()
+        .layout("id:sessions-page")
+        .unwrap()
+        .unwrap()
+        .bounds;
+    assert!(
+        (after.origin.x.0 - before.origin.x.0).abs() < 1.0,
+        "sessions pane must stay open when entering runtime switcher: before {before:?}, after {after:?}"
+    );
+}

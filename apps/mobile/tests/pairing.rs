@@ -148,3 +148,97 @@ fn settings_steps_the_text_size() {
     app.press("role:button[Decrease text size]").unwrap();
     app.wait_for("Standard").unwrap();
 }
+
+fn seed_multi_route_runtime(directory: &Path, display_name: Option<&str>, last_connected: bool) {
+    let identity =
+        vibex_remote_client::ClientDeviceIdentity::generate(vibex_core::DeviceId::new()).unwrap();
+    let bundle = vibex_mobile_pairing::MobileCredentialBundle {
+        schema_version: vibex_mobile_pairing::MOBILE_CREDENTIAL_SCHEMA_VERSION.to_owned(),
+        record: vibex_remote_client::RemoteCredentialRecord {
+            server_url: "https://studio.tailnet.ts.net".to_owned(),
+            auth: vibex_core::RemoteAuthProof {
+                device_id: identity.device_id().clone(),
+                auth_token: "grant-token".to_owned(),
+            },
+            device_identity_public_key: identity.public_key_base64(),
+            server_identity_public_key: Some("server-public-key".to_owned()),
+        },
+        identity_private_key: identity.private_key_base64(),
+        expected_server_id: "machine-1".to_owned(),
+        client_type: vibex_core::RemoteClientType::Mobile,
+        allow_insecure_local_dev: false,
+        display_name: display_name.map(str::to_owned),
+        route: Some(vibex_mobile_pairing::MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec![
+                "https://studio.tailnet.ts.net".to_owned(),
+                "https://direct.example.com".to_owned(),
+            ],
+            relay: Some(vibex_mobile_pairing::MobileRelayCandidate {
+                url: "https://relay.example.com".to_owned(),
+                room_id: vibex_core::RelayRoomId::new(),
+                local_peer_id: vibex_core::RelayPeerId::new(),
+                pc_peer_id: vibex_core::RelayPeerId::new(),
+                pc_public_key: "relay-pub".to_owned(),
+            }),
+        }),
+    };
+    vibex_mobile_pairing::PairingStore::new(directory.join("pairing.json"))
+        .upsert(bundle)
+        .unwrap();
+    if last_connected {
+        std::fs::write(directory.join("last-runtime.txt"), "machine-1").unwrap();
+    }
+}
+
+#[test]
+fn actions_sheet_shows_connection_methods_for_multi_route_runtime() {
+    let directory = TempDir::new().unwrap();
+    seed_multi_route_runtime(directory.path(), Some("Studio Mac"), false);
+    let mut app = start_at(directory.path());
+    assert!(app.screen().shows("Studio Mac"));
+    assert!(!app.screen().shows("studio.tailnet.ts.net"));
+
+    app.press("role:button[Runtime actions]").unwrap();
+    app.wait_for("Connection method").unwrap();
+    for expected in [
+        "Auto (Direct first)",
+        "Tailscale",
+        "Direct",
+        "Self-hosted relay",
+    ] {
+        assert!(app.screen().shows(expected), "`{expected}` is offered");
+    }
+}
+
+#[test]
+fn removing_the_only_saved_runtime_in_switcher_returns_to_initial_pairing_page() {
+    let directory = TempDir::new().unwrap();
+    seed_multi_route_runtime(directory.path(), Some("Studio Mac"), true);
+    let mut config = EngineConfig::new(Root::of::<vibex_mobile::App>());
+    config.data_dir = Some(directory.path().to_path_buf());
+    let mut app = Headless::start(config).unwrap();
+
+    // Open switcher from the connecting screen's Switch runtime button.
+    app.wait_for("role:button[Switch runtime]").unwrap();
+    app.press("role:button[Switch runtime]").unwrap();
+    app.wait_for("role:button[Back]").unwrap();
+    app.wait_for("Studio Mac").unwrap();
+
+    // Remove the only paired runtime.
+    app.press("role:button[Runtime actions]").unwrap();
+    app.wait_for("role:button[Remove]").unwrap();
+    app.press("role:button[Remove]").unwrap();
+    app.wait_for("Remove \"Studio Mac\"?").unwrap();
+    app.press("role:button[Remove]").unwrap();
+
+    // Should leave switcher mode automatically and land on the initial pairing page.
+    app.wait_for("ibex").unwrap();
+    assert!(app.screen().shows("Scan"));
+    assert!(app.screen().shows("Find"));
+    assert!(app.screen().shows("Link"));
+    assert!(
+        app.screen().layout("role:button[Back]").unwrap().is_none(),
+        "initial pairing page must not show a switcher Back button"
+    );
+}

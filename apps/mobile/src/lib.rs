@@ -498,6 +498,17 @@ fn install_service_effect(
     attempt: Signal<u64>,
 ) {
     let last_attempt = stored(0u64);
+    let active_route = stored(None::<vibex_mobile_pairing::MobileRouteSelection>);
+    // A rename made while connected only retitles the shell; it must not
+    // rebuild the session service (and its pager) underneath the reader.
+    let connected_label = pairing.connected_label();
+    effect(move || {
+        if let Some(label) = connected_label.get()
+            && let Some(service) = services.get_untracked()
+        {
+            service.set_runtime_label(label.as_str());
+        }
+    });
     effect(move || {
         let attempt_now = attempt.get();
         let connected = pairing.connected().get();
@@ -511,15 +522,18 @@ fn install_service_effect(
                 service.shutdown();
                 services.set(None);
             }
+            active_route.replace(None);
             host::set_connection_service(false);
             service_error.set(None);
             boot_connection.set(ConnectionState::Connecting);
             return;
         };
 
+        let same_route =
+            active_route.with(|route| route.as_ref() == Some(&runtime.route_selection));
         if existing
             .as_ref()
-            .is_some_and(|service| service.host_id() == runtime.bundle.host_id())
+            .is_some_and(|service| service.host_id() == runtime.bundle.host_id() && same_route)
         {
             if let Some(service) = existing {
                 if rebuilt {
@@ -535,6 +549,7 @@ fn install_service_effect(
             service.shutdown();
             services.set(None);
         }
+        active_route.replace(None);
         host::set_connection_service(false);
         service_error.set(None);
         boot_connection.set(ConnectionState::Connecting);
@@ -555,7 +570,15 @@ fn install_service_effect(
         };
         let runtime_renamed: Rc<dyn Fn(&str)> = {
             let pairing = pairing.clone();
-            Rc::new(move |name: &str| pairing.rename_connected(name))
+            let host_id = runtime.bundle.host_id().to_owned();
+            Rc::new(move |name: &str| {
+                if let Some(effective) = pairing.note_runtime_name(&host_id, name)
+                    && let Some(service) = services.get_untracked()
+                    && service.host_id() == host_id
+                {
+                    service.set_runtime_label(&effective);
+                }
+            })
         };
         let device_renamed: Rc<dyn Fn(&str)> = {
             let pairing = pairing.clone();
@@ -566,13 +589,14 @@ fn install_service_effect(
             let host_id = runtime.bundle.host_id().to_owned();
             Rc::new(move |kind| pairing.set_host_kind(&host_id, kind))
         };
+        let route_bundle = runtime.bundle.for_route_selection(&runtime.route_selection);
         // The shell's state must outlive this effect: the effect runs again
         // whenever the connection, the attempt counter or the lifecycle
         // changes, and a signal owned by the scope that created it would be
         // disposed while the service's tasks are still writing it.
         let built = Owner::detached().run(|| {
             SessionService::new(
-                &runtime.bundle,
+                &route_bundle,
                 disconnect,
                 switch_runtime,
                 open_settings,
@@ -583,6 +607,8 @@ fn install_service_effect(
         });
         match built {
             Ok(service) => {
+                service.set_runtime_label(&runtime.label);
+                active_route.replace(Some(runtime.route_selection.clone()));
                 services.set(Some(Rc::new(service)));
                 host::set_connection_service(true);
             }

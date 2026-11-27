@@ -505,7 +505,7 @@ pub struct SessionService {
     git_history_stale: Rc<Cell<bool>>,
     /// Last persisted disk-cache fingerprint `(last_seq, len, has_older)` per
     /// cache key so unchanged incremental syncs avoid redundant disk writes.
-    disk_timeline_fingerprints: Rc<RefCell<BTreeMap<String, (i64, usize, bool)>>>,
+    disk_timeline_fingerprints: Rc<RefCell<BTreeMap<String, TimelineCacheFingerprint>>>,
     /// The composer draft of each session this phone has seen.
     drafts: Rc<RefCell<BTreeMap<String, String>>>,
     attachment_drafts: Rc<RefCell<BTreeMap<String, Vec<AttachmentItem>>>>,
@@ -578,6 +578,10 @@ pub struct SessionService {
 }
 
 type ActivityDetailsCache = BTreeMap<String, (i64, Vec<ActivityDetail>)>;
+
+/// `(last sequence, item count, has older)` of the transcript last written to
+/// the on-disk cache for one key.
+type TimelineCacheFingerprint = (i64, usize, bool);
 
 impl SessionService {
     /// Builds the service for a connected runtime and loads its sessions.
@@ -874,6 +878,15 @@ impl SessionService {
     /// The runtime this service speaks to.
     pub fn host_id(&self) -> String {
         (*self.bundle_host_id).clone()
+    }
+
+    /// Updates the displayed runtime label (for example after a local rename
+    /// or when a local custom name overrides the server's published name).
+    pub fn set_runtime_label(&self, label: &str) {
+        let trimmed = label.trim();
+        if !trimmed.is_empty() {
+            self.runtime.set(Some(trimmed.to_owned().into()));
+        }
     }
 
     /// Reconnects when the app comes back to the foreground.
@@ -1877,6 +1890,7 @@ impl SessionService {
                 let name = info.server_display_name.trim();
                 if !name.is_empty() {
                     self.runtime.set(Some(name.to_owned().into()));
+                    (self.on_runtime_renamed)(name);
                 }
             }
             let failed = match &connected {
@@ -2444,7 +2458,6 @@ impl SessionService {
                     // Mobile does not render the usage-analytics screen; avoid
                     // triggering a full session/workspace reload after every turn.
                 }
-                _ => self.refresh(),
             },
             BackendEvent::RuntimeRenamed(renamed) => {
                 let name = renamed.display_name.clone();
@@ -13591,8 +13604,9 @@ mod terminal_lifecycle_tests {
     use nsh_testing::Headless;
     use tokio::sync::mpsc;
     use vibex_backend::{
-        BackendError, BackendFuture, BackendResult, MutationRequest, TerminalBackend,
-        TerminalFrame, TerminalFrameBatch, TerminalFrameSubscription,
+        BackendError, BackendEvent, BackendFuture, BackendProjection, BackendResult,
+        MutationRequest, TerminalBackend, TerminalFrame, TerminalFrameBatch,
+        TerminalFrameSubscription,
     };
     use vibex_core::{
         DeviceId, RemoteAuthProof, RemoteClientType, TerminalCreateRequest, TerminalId,
@@ -13602,6 +13616,7 @@ mod terminal_lifecycle_tests {
     use vibex_mobile_pairing::{
         MOBILE_CREDENTIAL_SCHEMA_VERSION, MobileCredentialBundle, MobileRemoteRouteBundle,
     };
+    use vibex_mobile_ui::screens::files::FilePreviewKindView;
     use vibex_mobile_ui::screens::terminal::{TerminalHost, terminal};
     use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
 
@@ -15259,5 +15274,545 @@ mod terminal_lifecycle_tests {
         app.wait_for("src").unwrap();
         app.press("src").unwrap();
         app.wait_for("main.rs").unwrap();
+    }
+
+    #[test]
+    fn mobile_timeline_resume_plan_handles_settled_in_progress_and_single_turn() {
+        let session_id = vibex_core::VibexSessionId::new();
+        let u1 = synthetic_timeline_item(
+            &session_id,
+            1,
+            vibex_core::TimelineItemKind::UserMessage,
+            "turn 1",
+        );
+        let a1 = synthetic_timeline_item(
+            &session_id,
+            2,
+            vibex_core::TimelineItemKind::AgentMessage,
+            "answer 1",
+        );
+        let u2 = synthetic_timeline_item(
+            &session_id,
+            3,
+            vibex_core::TimelineItemKind::UserMessage,
+            "turn 2",
+        );
+        let a2 = synthetic_timeline_item(
+            &session_id,
+            4,
+            vibex_core::TimelineItemKind::AgentMessage,
+            "answer 2",
+        );
+
+        let mut model = super::TimelineModel::default();
+        model.replace_authoritative(
+            session_id.clone(),
+            vec![u1.clone(), a1.clone(), u2.clone(), a2.clone()],
+        );
+
+        // Settled session resumes strictly after its last sequence with no boundary verify.
+        let plan = super::build_mobile_timeline_resume_plan(&model, &session_id, false)
+            .expect("settled session builds incremental resume plan");
+        assert_eq!(plan.after_sequence, 4);
+        assert_eq!(plan.verify_first, None);
+
+        // Running session re-reads from the trailing turn's UserMessage with verify_first,
+        // preserving earlier settled turns.
+        let live_plan = super::build_mobile_timeline_resume_plan(&model, &session_id, true)
+            .expect("live multi-turn session builds boundary resume plan");
+        assert_eq!(live_plan.after_sequence, 2);
+        assert_eq!(live_plan.verify_first, Some((3, u2.id.clone())));
+
+        // Marked lagged also uses the boundary plan.
+        model.mark_lagged();
+        let lagged_plan = super::build_mobile_timeline_resume_plan(&model, &session_id, false)
+            .expect("lagged multi-turn session builds boundary resume plan");
+        assert_eq!(lagged_plan.after_sequence, 2);
+        assert_eq!(lagged_plan.verify_first, Some((3, u2.id.clone())));
+
+        // Single-turn lagged model has no earlier settled prefix, so it falls back to full page.
+        let mut single = super::TimelineModel::default();
+        single.replace_authoritative(session_id.clone(), vec![u1, a1]);
+        single.mark_lagged();
+        assert_eq!(
+            super::build_mobile_timeline_resume_plan(&single, &session_id, false),
+            None
+        );
+    }
+
+    fn test_file_entry(
+        workspace_id: &WorkspaceId,
+        path: &str,
+        kind: vibex_core::FileEntryKind,
+        size_bytes: Option<u64>,
+    ) -> vibex_core::FileTreeEntry {
+        let name = path.rsplit('/').next().unwrap_or(path).to_owned();
+        vibex_core::FileTreeEntry {
+            workspace_id: workspace_id.clone(),
+            path: path.to_owned(),
+            name,
+            parent_path: path.rsplit_once('/').map(|(parent, _)| parent.to_owned()),
+            kind,
+            size_bytes,
+            modified_at_ms: None,
+            hidden: false,
+            ignored: false,
+        }
+    }
+
+    fn test_workspace_summary(
+        project_id: &vibex_core::ProjectId,
+        workspace_id: &WorkspaceId,
+    ) -> vibex_backend::WorkspaceSummary {
+        vibex_backend::WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: project_id.clone(),
+                name: "vibex".to_owned(),
+                root_path: "/work".to_owned(),
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: workspace_id.clone(),
+                project_id: project_id.clone(),
+                root_path: "/work".to_owned(),
+                mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+            git_branch: Some("main".to_owned()),
+        }
+    }
+
+    /// A `FileBackend` that counts the reads it answers, so tests can prove a
+    /// cache hit performed no request.
+    #[derive(Clone)]
+    struct CountingFileBackend {
+        tree_calls: Arc<std::sync::atomic::AtomicUsize>,
+        read_calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl vibex_backend::FileBackend for CountingFileBackend {
+        fn file_tree(
+            &self,
+            request: vibex_core::FileTreeRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::FileTreeEntry>> {
+            self.tree_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let workspace_id = request.workspace_id;
+            Box::pin(async move {
+                Ok(vec![test_file_entry(
+                    &workspace_id,
+                    "README.md",
+                    vibex_core::FileEntryKind::File,
+                    Some(12),
+                )])
+            })
+        }
+
+        fn search_files(
+            &self,
+            _request: vibex_core::FileSearchRequest,
+        ) -> BackendFuture<'_, Vec<vibex_core::FileSearchResult>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn read_file(
+            &self,
+            request: vibex_core::FileReadRequest,
+        ) -> BackendFuture<'_, vibex_core::FileReadResponse> {
+            self.read_calls
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async move {
+                Ok(vibex_core::FileReadResponse {
+                    workspace_id: request.workspace_id,
+                    path: request.path.clone(),
+                    name: "README.md".to_owned(),
+                    preview_kind: vibex_core::FilePreviewKind::Markdown,
+                    content: Some("# Hello".to_owned()),
+                    size_bytes: 7,
+                    modified_at_ms: None,
+                    language: Some("markdown".to_owned()),
+                    truncated: false,
+                    encoding: Default::default(),
+                    line_ending: Default::default(),
+                    content_revision: String::new(),
+                })
+            })
+        }
+
+        fn read_file_bytes(
+            &self,
+            _workspace_id: WorkspaceId,
+            _path: String,
+            _max_bytes: usize,
+        ) -> BackendFuture<'_, Vec<u8>> {
+            Box::pin(async move { Ok(Vec::new()) })
+        }
+
+        fn write_file(
+            &self,
+            _request: MutationRequest<vibex_core::FileWriteRequest>,
+        ) -> BackendFuture<'_, vibex_core::FileReadResponse> {
+            Box::pin(async move { Err(BackendError::unsupported("noop", "noop")) })
+        }
+
+        fn create_directory(
+            &self,
+            request: MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> BackendFuture<'_, vibex_core::FileTreeEntry> {
+            let entry = test_file_entry(
+                &request.payload.workspace_id,
+                &request.payload.path,
+                vibex_core::FileEntryKind::Directory,
+                None,
+            );
+            Box::pin(async move { Ok(entry) })
+        }
+
+        fn copy_path(
+            &self,
+            request: MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> BackendFuture<'_, vibex_core::FileTreeEntry> {
+            let entry = test_file_entry(
+                &request.payload.workspace_id,
+                request
+                    .payload
+                    .new_path
+                    .as_deref()
+                    .unwrap_or(&request.payload.path),
+                vibex_core::FileEntryKind::File,
+                None,
+            );
+            Box::pin(async move { Ok(entry) })
+        }
+
+        fn rename_path(
+            &self,
+            request: MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> BackendFuture<'_, vibex_core::FileTreeEntry> {
+            let entry = test_file_entry(
+                &request.payload.workspace_id,
+                request
+                    .payload
+                    .new_path
+                    .as_deref()
+                    .unwrap_or(&request.payload.path),
+                vibex_core::FileEntryKind::File,
+                None,
+            );
+            Box::pin(async move { Ok(entry) })
+        }
+
+        fn delete_path(
+            &self,
+            _request: MutationRequest<vibex_core::FileMutationRequest>,
+        ) -> BackendFuture<'_, ()> {
+            Box::pin(async move { Ok(()) })
+        }
+    }
+
+    #[component]
+    fn IncrementalSyncAndCacheCheckView() -> impl IntoElement {
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let ws1 = WorkspaceId::new();
+        let ws2 = WorkspaceId::new();
+        let project_id = vibex_core::ProjectId::new();
+        let session_a = vibex_core::VibexSessionId::new();
+        let session_b = vibex_core::VibexSessionId::new();
+        let session_c = vibex_core::VibexSessionId::new();
+
+        let make_session = |id: &vibex_core::VibexSessionId, ws: &WorkspaceId, updated: i64| {
+            vibex_core::AgentSession {
+                id: id.clone(),
+                project_id: project_id.clone(),
+                workspace_id: ws.clone(),
+                agent_id: vibex_core::AgentId::parse("codex").unwrap(),
+                title: "Session".to_owned(),
+                state: vibex_core::AgentSessionState::Idle,
+                safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+                workspace_root: "/work".to_owned(),
+                workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 1_000,
+                updated_at_ms: updated,
+                last_message_at_ms: updated,
+                archived_at_ms: None,
+                deleted_at_ms: None,
+                tools: Default::default(),
+                transport: Default::default(),
+                terminal: None,
+            }
+        };
+
+        let rec_a = make_session(&session_a, &ws1, 10_000);
+        let rec_b = make_session(&session_b, &ws1, 20_000);
+        let rec_c = make_session(&session_c, &ws2, 30_000);
+        service
+            .session_records
+            .set(vec![rec_a.clone(), rec_b.clone(), rec_c.clone()]);
+        service
+            .workspace_records
+            .set(vec![test_workspace_summary(&project_id, &ws1)]);
+        service.workspaces_stale.set(false);
+
+        // Seed a cached runtime catalogue and selection, as a first open would.
+        let option = test_runtime_option("codex", "provider_openai", "OpenAI", "gpt-5.4");
+        let catalog = vibex_core::SessionRuntimeOptionCatalog {
+            revision: 1,
+            agents: Vec::new(),
+            auth_sources: Vec::new(),
+            options: vec![option.clone()],
+        };
+        service.runtime_catalog.set(Some(catalog));
+        service.runtime_catalog_stale.set(false);
+        let selection_state = vibex_core::AgentSessionRuntimeSelectionState {
+            desired: option.selection.clone(),
+            effective: option.selection.clone(),
+            status: vibex_core::SessionRuntimeSelectionStatus::Ready,
+            session_revision: 1,
+            selection_revision: 1,
+            current_binding_id: None,
+            activation_generation: 1,
+            pending_switch_id: None,
+            actionable_error: None,
+        };
+
+        // A counting backend proves that a cache hit performs no file read.
+        let tree_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let read_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        service.file_backend = Arc::new(CountingFileBackend {
+            tree_calls: tree_calls.clone(),
+            read_calls: read_calls.clone(),
+        });
+
+        // 1. Seed session A with a transcript, an expanded row, a runtime
+        //    selection, a token usage view and a loaded file tree.
+        service.active.set(Some(session_a.as_str().to_owned()));
+        *service.files_workspace.borrow_mut() = Some(ws1.clone());
+        let page_items = vec![
+            synthetic_timeline_item(
+                &session_a,
+                1,
+                vibex_core::TimelineItemKind::UserMessage,
+                "hello",
+            ),
+            synthetic_timeline_item(
+                &session_a,
+                2,
+                vibex_core::TimelineItemKind::AgentMessage,
+                "world",
+            ),
+        ];
+        let start_sequence = page_items.first().map(|item| item.sequence);
+        let end_sequence = page_items.last().map(|item| item.sequence);
+        service.apply_page(
+            &session_a,
+            vibex_core::TimelinePage {
+                session_id: session_a.clone(),
+                items: page_items,
+                start_sequence,
+                end_sequence,
+                has_older: false,
+                has_newer: false,
+                starts_at_turn_start: true,
+                leading_turn_start: None,
+                omitted: None,
+            },
+        );
+        service
+            .row_details
+            .borrow_mut()
+            .insert("row-1".to_owned(), (2, Vec::new()));
+        service.apply_runtime_selection(&session_a, selection_state.clone());
+        service.token_usage.set(Some(super::TokenUsageView {
+            percent: Some(1),
+            used: 1_200,
+            size: 200_000,
+            input: 900,
+            output: 300,
+        }));
+        {
+            let mut tree = service.file_tree.borrow_mut();
+            tree.reset_workspace(ws1.clone());
+            let run = tree.begin_load("");
+            assert!(tree.apply_entries(
+                &ws1,
+                run,
+                "",
+                vec![test_file_entry(
+                    &ws1,
+                    "README.md",
+                    vibex_core::FileEntryKind::File,
+                    Some(7),
+                )],
+            ));
+        }
+        service.files_tree_stale.set(false);
+        service.publish_file_tree();
+
+        // 2. Switch A -> B inside one workspace: the tree stays loaded and
+        //    reopening Files does not re-read the root listing.
+        service.stash_active_session();
+        assert!(
+            service
+                .session_cache
+                .borrow()
+                .contains_key(session_a.as_str())
+        );
+        *service.reload_in_flight.borrow_mut() = Some(session_b.as_str().to_owned());
+        service.open(session_b.as_str());
+        assert_eq!(*service.files_workspace.borrow(), Some(ws1.clone()));
+        assert_eq!(
+            service.file_tree.borrow().load_state(""),
+            vibex_desktop_model::FileTreeLoadState::Loaded
+        );
+        service.open_files();
+        assert_eq!(
+            tree_calls.load(std::sync::atomic::Ordering::SeqCst),
+            0,
+            "reopening Files in the same workspace must not re-fetch a loaded root tree"
+        );
+
+        // 3. A live item for the background session lands in its cache even
+        //    though another session is on screen.
+        service.apply_event(BackendEvent::Timeline(vibex_core::TimelineLiveEvent {
+            session_id: session_a.clone(),
+            sequence: 3,
+            item: synthetic_timeline_item(
+                &session_a,
+                3,
+                vibex_core::TimelineItemKind::AgentMessage,
+                "live in background",
+            ),
+        }));
+        assert_eq!(
+            service
+                .session_cache
+                .borrow()
+                .get(session_a.as_str())
+                .expect("background session stays cached")
+                .items
+                .len(),
+            3
+        );
+
+        // 4. Switching back restores instantly, keeping the expanded row, the
+        //    runtime selection, the usage view and planning a delta at 3.
+        *service.reload_in_flight.borrow_mut() = Some(session_a.as_str().to_owned());
+        service.open(session_a.as_str());
+        assert_eq!(
+            service.conversation.get_untracked(),
+            super::ConversationState::Ready
+        );
+        assert_eq!(service.model.borrow().items.len(), 3);
+        assert!(service.row_details.borrow().contains_key("row-1"));
+        assert!(service.runtime_state.borrow().is_some());
+        assert!(service.token_usage.get_untracked().is_some());
+        let resume = service
+            .timeline_resume_plan_for_active(&session_a)
+            .expect("a cached session builds an incremental resume plan");
+        assert_eq!(resume.after_sequence, 3);
+        assert_eq!(resume.verify_first, None);
+
+        // An empty delta is a no-op; a forward delta appends in place.
+        let rev_before = service.model.borrow().revision;
+        service.apply_delta(&session_a, 3, Vec::new());
+        assert_eq!(service.model.borrow().revision, rev_before);
+        service.apply_delta(
+            &session_a,
+            3,
+            vec![synthetic_timeline_item(
+                &session_a,
+                4,
+                vibex_core::TimelineItemKind::AgentMessage,
+                "delta 4",
+            )],
+        );
+        assert_eq!(service.model.borrow().items.len(), 4);
+        assert_eq!(service.model.borrow().items.last().unwrap().sequence, 4);
+
+        // 5. A workspace switch stashes ws1 and restores it on the way back.
+        *service.reload_in_flight.borrow_mut() = Some(session_c.as_str().to_owned());
+        service.open(session_c.as_str());
+        assert!(service.workspace_cache.borrow().contains_key(ws1.as_str()));
+        *service.reload_in_flight.borrow_mut() = Some(session_a.as_str().to_owned());
+        service.open(session_a.as_str());
+        assert_eq!(
+            service.file_tree.borrow().load_state(""),
+            vibex_desktop_model::FileTreeLoadState::Loaded
+        );
+
+        // 6. Invalidation routing: Usage refreshes nothing, Management only
+        //    marks the catalogue stale, Sidebar only schedules the refresh.
+        service.refresh_in_flight.set(true);
+        service.refresh_dirty.set(false);
+        service.refresh_workspaces_pending.set(false);
+        service.apply_event(BackendEvent::ProjectionInvalidated(
+            BackendProjection::Usage,
+        ));
+        assert!(!service.refresh_dirty.get());
+        service.apply_event(BackendEvent::ProjectionInvalidated(
+            BackendProjection::Management,
+        ));
+        assert!(!service.refresh_dirty.get());
+        assert!(service.runtime_catalog_stale.get());
+        service.apply_event(BackendEvent::ProjectionInvalidated(
+            BackendProjection::Sidebar,
+        ));
+        assert!(service.refresh_dirty.get());
+        assert!(!service.refresh_workspaces_pending.get());
+
+        // 7. The new-session sheet reuses fresh workspaces and a fresh
+        //    catalogue without a request.
+        service.runtime_catalog_stale.set(false);
+        service.open_new_session();
+        assert!(service.new_session_open.get_untracked());
+        assert!(!service.new_busy.get_untracked());
+        assert_eq!(service.new_workspaces.get_untracked().len(), 1);
+        service.new_runtime_open.set(false);
+        service.new_session_open.set(false);
+        service.clear_visible_palettes();
+
+        // 8. A Files invalidation drops previews and marks the tree stale.
+        service.file_preview_cache.borrow_mut().insert(
+            (ws1.as_str().to_owned(), "README.md".to_owned()),
+            super::CachedFilePreview {
+                touched_at_ms: 1,
+                preview: super::FilePreview {
+                    title: "README.md".to_owned(),
+                    body: "# Hello".to_owned(),
+                    truncated: false,
+                    language: "markdown".to_owned(),
+                    kind: FilePreviewKindView::Markdown,
+                    image_uri: None,
+                    line: None,
+                },
+            },
+        );
+        service.apply_event(BackendEvent::ProjectionInvalidated(
+            BackendProjection::Files,
+        ));
+        assert!(service.files_tree_stale.get());
+        assert!(service.file_preview_cache.borrow().is_empty());
+
+        service.shutdown();
+        view().child(text("incremental-sync-cache-ok"))
+    }
+
+    #[test]
+    fn incremental_sync_and_caches_avoid_redundant_reloads() {
+        let config = EngineConfig::new(Root::of::<IncrementalSyncAndCacheCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("incremental-sync-cache-ok").unwrap();
     }
 }
