@@ -383,9 +383,11 @@ function validatePackaging() {
   for (const required of [
     "workflow_dispatch:",
     "artifacts_run_id",
+    "rebuild_targets",
     "run-id: ${{ inputs.artifacts_run_id }}",
     "ref: ${{ inputs.tag || github.ref }}",
     "Verify the reused run built this tag",
+    "Download rebuilt artifacts",
     "steps.release.outputs.commit"
   ]) {
     assert(

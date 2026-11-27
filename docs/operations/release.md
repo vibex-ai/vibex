@@ -38,29 +38,44 @@ Each job normalizes its filenames, writes SHA-256 sidecars, and uploads an
 immutable artifact. A final Ubuntu job collects the matrix before creating the
 GitHub Release, so a partial platform build can never be published.
 
-### Replaying a failed publish
+### Replaying a failed publish or partial build
 
-The aggregate job is the only step after the builds, so a failure there must not
-cost another hour of native packaging. Every bundle stays downloadable for 14
-days, and `Publish Release` also accepts a `workflow_dispatch` that publishes an
-existing tag from another run's artifacts:
+Every platform job runs by default on a tag push (desktop, server, Android and
+iOS), and every uploaded bundle stays downloadable for 14 days. When the
+aggregate publish step fails — or when only a subset of platform jobs failed
+while the rest succeeded — `Publish Release` accepts a `workflow_dispatch` that
+reuses the green bundles from `artifacts_run_id` without rebuilding everything:
 
 ```bash
-gh run view <run-id>            # the run whose build jobs are green
+gh run view <run-id>            # the run whose completed bundles are reused
+
+# Publish-only replay (rebuilds nothing):
 gh workflow run release.yml --ref main \
-  -f tag=v0.1.9 \
+  -f tag=v0.1.10 \
   -f artifacts_run_id=<run-id>
+
+# Selective rebuild + merge replay (rebuilds only failed targets from `main`):
+gh workflow run release.yml --ref main \
+  -f tag=v0.1.10 \
+  -f artifacts_run_id=<run-id> \
+  -f rebuild_targets=mobile-ios
 ```
 
-The replay starts no build job. It checks the tag out, resolves the commit the
-tag points at, refuses a run whose `head_sha` is not that commit — signing
-binaries built from another source would misdescribe the tag — downloads only
-the bundles named after it, and then signs, composes and publishes exactly as a
-tag push does. Because the dispatch runs the workflow file from the ref it is
-given, dispatch `main` after the fix has landed there; a replay cannot pick up a
-workflow file that exists only on a commit whose run already failed. Once the
-14-day retention has passed, nothing is left to reuse and the tag has to be
-pushed again.
+Leaving `rebuild_targets` empty starts no build job at all. Passing a
+comma-separated list (for example `mobile-ios`, `mobile-android`, `mobile`,
+`server-linux`, `server-macos`, `server-macos-aarch64`, `server`, `desktop`,
+`desktop-linux`, `desktop-macos-aarch64`, `desktop-windows-x86_64`, or `all`)
+rebuilds only the named targets from the dispatched ref, merges the newly built
+bundles over the reused bundles from `artifacts_run_id`, and still refuses to
+publish if any requested rebuild job fails.
+
+The publish job checks the tag out, resolves the commit the tag points at,
+verifies that `artifacts_run_id` built that exact commit, downloads the reused
+bundles, overlays any rebuilt bundles on top, and then signs, composes and
+publishes the full release exactly as a tag push does. Because the dispatch runs
+the workflow file and rebuilt targets from the ref it is given, dispatch `main`
+after the fix has landed there. Once the 14-day retention has passed, nothing is
+left to reuse and the tag has to be pushed again.
 
 Every macOS job pins `macos-15`: GitHub retired all macOS 14 runner images on
 2026-11-02, and a workflow that still asks for one is rejected while the job is

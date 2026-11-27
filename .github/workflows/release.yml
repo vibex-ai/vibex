@@ -4,27 +4,27 @@ on:
   push:
     tags:
       - "v[0-9]*"
-  # A release whose artifacts are already built is replayable without building
-  # them again: this dispatch publishes `tag` from the artifact bundles of
-  # `artifacts_run_id`, so a failure in the aggregate job costs the publish
-  # steps only, not another hour of native packaging. `download-artifact` reads
-  # another run's bundles through `run-id`, so the reused run only has to still
-  # hold them (14-day retention).
+  # A release whose artifacts are already built is replayable without rebuilding
+  # everything: this dispatch publishes `tag` from the artifact bundles of
+  # `artifacts_run_id` (14-day retention), and optionally rebuilds only the failed
+  # targets named in `rebuild_targets` from the dispatched ref before merging
+  # them over the reused bundles. Leaving `rebuild_targets` empty replays the
+  # publish job only; passing `all` rebuilds every platform.
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag to publish (for example v0.1.9)"
+        description: "Release tag to publish (for example v0.1.10)"
         required: true
         type: string
       artifacts_run_id:
-        description: "Run ID whose desktop, server, and Android artifacts are reused"
+        description: "Run ID whose existing release artifacts are reused"
         required: true
         type: string
-      rebuild_mobile_ios:
-        description: "Rebuild only the iOS release artifacts from the workflow ref instead of reusing them"
+      rebuild_targets:
+        description: "Optional comma-separated targets to rebuild instead of reusing (empty = reuse all; e.g. mobile-ios, mobile-android, server-linux, server-macos, desktop, desktop-macos-aarch64, all)"
         required: false
-        default: false
-        type: boolean
+        default: ""
+        type: string
 
 permissions:
   contents: read
@@ -41,13 +41,16 @@ env:
 jobs:
   release-meta:
     name: Resolve release metadata
-    # A replay publishes an existing tag from artifacts an earlier run already
-    # built, so it resolves its identity from the dispatch inputs instead.
-    if: ${{ github.event_name == 'push' }}
+    # Runs on every tag push, and on a replay only when `rebuild_targets` asks
+    # to rebuild one or more targets so every build job gets one consistent
+    # version, channel, and normalized target set. A pure publish-only replay
+    # skips this job and every build job.
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && inputs.rebuild_targets != '') }}
     runs-on: ubuntu-24.04
     outputs:
       version: ${{ steps.release.outputs.version }}
       channel: ${{ steps.release.outputs.channel }}
+      rebuild_targets: ${{ steps.release.outputs.rebuild_targets }}
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
@@ -62,7 +65,11 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          tag="${GITHUB_REF_NAME}"
+          tag="${{ inputs.tag || github.ref_name }}"
+          case "${tag}" in
+            v[0-9]*) ;;
+            *) echo "not a release tag: ${tag}" >&2; exit 1 ;;
+          esac
           version="${tag#v}"
           case "${version}" in
             *-preview.*) channel="preview" ;;
@@ -82,15 +89,54 @@ jobs:
           const packager = readFileSync(`apps/desktop/Packager.${channel}.toml`, "utf8");
           if (!packager.includes(`version = "${version}"`)) throw new Error(`Packager.${channel}.toml does not declare version ${version}`);
           NODE
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
-          echo "channel=${channel}" >> "${GITHUB_OUTPUT}"
+          rebuild_targets="$(node --input-type=module - "${{ inputs.rebuild_targets }}" <<'NODE'
+          const ALLOWED = new Set([
+            "all",
+            "desktop",
+            "desktop-linux",
+            "desktop-linux-x86_64",
+            "desktop-linux-aarch64",
+            "desktop-macos",
+            "desktop-macos-aarch64",
+            "desktop-macos-x86_64",
+            "desktop-windows",
+            "desktop-windows-x86_64",
+            "desktop-windows-aarch64",
+            "server",
+            "server-linux",
+            "server-macos",
+            "server-macos-aarch64",
+            "server-macos-x86_64",
+            "mobile",
+            "mobile-android",
+            "mobile-ios"
+          ]);
+          const tokens = (process.argv[2] ?? "")
+            .split(/[,s]+/u)
+            .map((token) => token.trim().toLowerCase())
+            .filter(Boolean);
+          const unknown = tokens.filter((token) => !ALLOWED.has(token));
+          if (unknown.length > 0) {
+            console.error(`unknown rebuild_targets: ${unknown.join(", ")}; allowed: ${[...ALLOWED].join(", ")}`);
+            process.exit(1);
+          }
+          const unique = [...new Set(tokens)];
+          process.stdout.write(unique.length > 0 ? `,${unique.join(",")},` : "");
+          NODE
+          )"
+          {
+            echo "version=${version}"
+            echo "channel=${channel}"
+            echo "rebuild_targets=${rebuild_targets}"
+          } >> "${GITHUB_OUTPUT}"
 
   desktop:
     name: Desktop ${{ matrix.platform }} ${{ matrix.arch }}
     needs: release-meta
-    # A replay reuses the bundles this job produced earlier instead of
-    # rebuilding them for an hour.
-    if: ${{ github.event_name == 'push' }}
+    # Runs for every platform/arch on a tag push; on a replay, runs only when
+    # `rebuild_targets` names `all`, `desktop`, a desktop platform, or a
+    # specific `desktop-<platform>-<arch>` target.
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (contains(needs.release-meta.outputs.rebuild_targets, ',all,') || contains(needs.release-meta.outputs.rebuild_targets, ',desktop,') || contains(needs.release-meta.outputs.rebuild_targets, ',desktop-'))) }}
     runs-on: ${{ matrix.runner }}
     timeout-minutes: 180
     strategy:
@@ -127,20 +173,42 @@ jobs:
             arch: aarch64
             target: aarch64-pc-windows-msvc
     steps:
+      - name: Check whether this target was requested
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          targets="${{ needs.release-meta.outputs.rebuild_targets }}"
+          platform="${{ matrix.platform }}"
+          arch="${{ matrix.arch }}"
+          if [[ "${targets}" == *",all,"* || "${targets}" == *",desktop,"* || "${targets}" == *",desktop-${platform},"* || "${targets}" == *",desktop-${platform}-${arch},"* ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Skipping desktop-${platform}-${arch} (reusing artifact from run ${{ inputs.artifacts_run_id }})"
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: steps.select.outputs.run == 'true'
       - uses: pnpm/action-setup@7088e561eb65bb68695d245aa206f005ef30921d # v4.1.0
+        if: steps.select.outputs.run == 'true'
         with:
           version: 11.3.0
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.select.outputs.run == 'true'
         with:
           node-version: 22
           cache: pnpm
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        if: steps.select.outputs.run == 'true'
         with:
           components: rustfmt, clippy
           targets: ${{ matrix.target }}
       - name: Install Linux native dependencies
-        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+        if: steps.select.outputs.run == 'true' && matrix.platform == 'linux' && matrix.arch == 'x86_64'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
@@ -163,7 +231,7 @@ jobs:
             patchelf \
             rpm
       - name: Install Linux arm64 cross dependencies
-        if: matrix.platform == 'linux' && matrix.arch == 'aarch64'
+        if: steps.select.outputs.run == 'true' && matrix.platform == 'linux' && matrix.arch == 'aarch64'
         run: |
           # Ubuntu 24.04 runners configure apt through a deb822 sources file.
           # Split it into amd64-only archive entries plus arm64 entries from
@@ -237,7 +305,7 @@ jobs:
             libzstd-dev:arm64 \
             rpm
       - name: Configure Linux arm64 cross environment
-        if: matrix.platform == 'linux' && matrix.arch == 'aarch64'
+        if: steps.select.outputs.run == 'true' && matrix.platform == 'linux' && matrix.arch == 'aarch64'
         shell: bash
         run: |
           {
@@ -253,16 +321,19 @@ jobs:
             echo "AR_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc-ar"
           } >> "${GITHUB_ENV}"
       - name: Install dependencies and packager
+        if: steps.select.outputs.run == 'true'
         shell: bash
         run: |
           pnpm install --frozen-lockfile
           cargo install cargo-packager --version "${CARGO_PACKAGER_VERSION}" --locked
       - name: Verify release contracts
+        if: steps.select.outputs.run == 'true'
         run: pnpm check:release
       - name: Test updater contracts
-        if: matrix.platform == 'linux' && matrix.arch == 'x86_64'
+        if: steps.select.outputs.run == 'true' && matrix.platform == 'linux' && matrix.arch == 'x86_64'
         run: cargo test -p vibex-app-update --locked
       - name: Build and package desktop artifact
+        if: steps.select.outputs.run == 'true'
         env:
           VIBEX_UPDATE_SIGNING_ENABLED: ${{ vars.VIBEX_UPDATE_SIGNING_ENABLED || 'false' }}
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
@@ -273,6 +344,7 @@ jobs:
           --channel ${{ needs.release-meta.outputs.channel }}
           --version ${{ needs.release-meta.outputs.version }}
       - name: Upload desktop artifacts
+        if: steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: desktop-${{ matrix.platform }}-${{ matrix.arch }}-${{ github.sha }}
@@ -283,7 +355,7 @@ jobs:
   server-linux:
     name: Server Linux
     needs: release-meta
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (contains(needs.release-meta.outputs.rebuild_targets, ',all,') || contains(needs.release-meta.outputs.rebuild_targets, ',server,') || contains(needs.release-meta.outputs.rebuild_targets, ',server-linux,'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 180
     steps:
@@ -330,7 +402,7 @@ jobs:
   server-macos:
     name: Server macOS ${{ matrix.arch }}
     needs: release-meta
-    if: ${{ github.event_name == 'push' }}
+    if: ${{ github.event_name == 'push' || (github.event_name == 'workflow_dispatch' && (contains(needs.release-meta.outputs.rebuild_targets, ',all,') || contains(needs.release-meta.outputs.rebuild_targets, ',server,') || contains(needs.release-meta.outputs.rebuild_targets, ',server-macos'))) }}
     # macOS 14 images no longer exist; the x86_64 binary is cross-built here.
     runs-on: macos-15
     timeout-minutes: 120
@@ -343,14 +415,35 @@ jobs:
           - arch: x86_64
             target: x86_64-apple-darwin
     steps:
+      - name: Check whether this target was requested
+        id: select
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "${{ github.event_name }}" == "push" ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+          targets="${{ needs.release-meta.outputs.rebuild_targets }}"
+          arch="${{ matrix.arch }}"
+          if [[ "${targets}" == *",all,"* || "${targets}" == *",server,"* || "${targets}" == *",server-macos,"* || "${targets}" == *",server-macos-${arch},"* ]]; then
+            echo "run=true" >> "${GITHUB_OUTPUT}"
+          else
+            echo "Skipping server-macos-${arch} (reusing artifact from run ${{ inputs.artifacts_run_id }})"
+            echo "run=false" >> "${GITHUB_OUTPUT}"
+          fi
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        if: steps.select.outputs.run == 'true'
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
+        if: steps.select.outputs.run == 'true'
         with:
           node-version: 22
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
+        if: steps.select.outputs.run == 'true'
         with:
           targets: ${{ matrix.target }}
       - name: Build, sign, check, and package
+        if: steps.select.outputs.run == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -363,6 +456,7 @@ jobs:
           scripts/check-server-macos.sh "${binary}" "${arch}"
           node scripts/package-server-release.mjs             --version "${version}" --arch "${arch}" --os macos             --binary "${binary}" --output target/server-artifacts
       - name: Upload server artifacts
+        if: steps.select.outputs.run == 'true'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           # The matrix has one entry per architecture, so the name has to carry
@@ -385,7 +479,7 @@ jobs:
     # this one as an update. Mobile packaging runs by default on every tag
     # push; set the repository variable VIBEX_MOBILE_RELEASES_ENABLED to false
     # only as an opt-out switch when a mobile host is temporarily unbuildable.
-    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false' }}
+    if: ${{ (github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false') || (github.event_name == 'workflow_dispatch' && (contains(needs.release-meta.outputs.rebuild_targets, ',all,') || contains(needs.release-meta.outputs.rebuild_targets, ',mobile,') || contains(needs.release-meta.outputs.rebuild_targets, ',mobile-android,'))) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -508,28 +602,13 @@ jobs:
     # See mobile-android: the Apple packages run by default and follow the
     # same opt-out switch, and the bundle ids are the ones every released build
     # used, so a re-signed IPA replaces the installed app instead of landing
-    # beside it. A replay can also rebuild only iOS (`rebuild_mobile_ios: true`)
-    # while reusing desktop, server and Android bundles from `artifacts_run_id`.
-    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.rebuild_mobile_ios) || (github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false') }}
+    # beside it.
+    if: ${{ (github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false') || (github.event_name == 'workflow_dispatch' && (contains(needs.release-meta.outputs.rebuild_targets, ',all,') || contains(needs.release-meta.outputs.rebuild_targets, ',mobile,') || contains(needs.release-meta.outputs.rebuild_targets, ',mobile-ios,'))) }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
-      - name: Resolve iOS release version
-        id: version
-        shell: bash
-        run: |
-          set -euo pipefail
-          version="${{ needs.release-meta.outputs.version }}"
-          if [[ -z "${version}" ]]; then
-            tag="${{ inputs.tag }}"
-            case "${tag}" in
-              v[0-9]*) version="${tag#v}" ;;
-              *) echo "not a release tag: ${tag}" >&2; exit 1 ;;
-            esac
-          fi
-          echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
@@ -542,14 +621,14 @@ jobs:
       - name: Build the nsh iOS host
         env:
           VIBEX_MOBILE_PROFILE: release
-          VIBEX_MOBILE_VERSION: ${{ steps.version.outputs.version }}
+          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
           VIBEX_IOS_SKIP_XCODEBUILD: "1"
         run: bash apps/mobile/scripts/build-ios-host.sh
       - name: Build unsigned simulator app
         run: >-
           xcodebuild -project apps/mobile/ios/Vibex.xcodeproj
           -scheme Vibex -sdk iphonesimulator -configuration Release
-          MARKETING_VERSION=${{ steps.version.outputs.version }}
+          MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
           -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
           CODE_SIGNING_REQUIRED=NO build
       # Ships the device IPA as well as the simulator bundle. It carries no
@@ -559,7 +638,7 @@ jobs:
       # docs/operations/ios-unsigned-install.md.
       - name: Package unsigned device IPA
         env:
-          VIBEX_MOBILE_VERSION: ${{ steps.version.outputs.version }}
+          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
         run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
       - name: Normalize iOS artifacts and checksums
         shell: bash
@@ -569,8 +648,8 @@ jobs:
           mkdir -p "${output}"
           # The Rust device and simulator static archives, which this host links
           # per SDK (`iphoneos` / `iphonesimulator`) instead of a fat archive.
-          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks "${output}/vibex-${{ steps.version.outputs.version }}-ios-staticlib.zip"
-          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ steps.version.outputs.version }}-ios-simulator.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
+          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
           for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"
           done
@@ -592,11 +671,10 @@ jobs:
     needs: [release-meta, desktop, server-linux, server-macos, mobile-android, mobile-ios]
     # A mobile job that was not asked to run is `skipped`, not `success`: the
     # desktop, server and container artifacts must still publish while mobile
-    # packaging is switched off. A mobile job that actually ran and failed still
-    # holds the release, which is what "a partial build never publishes" means.
-    # A replay starts no build job at all, so every `needs` result is `skipped`
-    # and the artifacts come from the run named in the dispatch inputs.
-    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped')) || (needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped'))) }}
+    # packaging is switched off. Any job that actually ran and failed still
+    # holds the release — both on tag pushes and on replays that rebuild a
+    # subset of targets via `rebuild_targets`.
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && (needs.release-meta.result == 'success' || needs.release-meta.result == 'skipped') && (needs.desktop.result == 'success' || needs.desktop.result == 'skipped') && (needs.server-linux.result == 'success' || needs.server-linux.result == 'skipped') && (needs.server-macos.result == 'success' || needs.server-macos.result == 'skipped') && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped')) || (needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped'))) }}
     runs-on: ubuntu-24.04
     steps:
       # The release body compares the published tag against the previous one and
@@ -670,12 +748,16 @@ jobs:
           merge-multiple: false
           run-id: ${{ inputs.artifacts_run_id }}
           github-token: ${{ github.token }}
-      - name: Download rebuilt iOS artifacts
-        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_mobile_ios
+      # When `rebuild_targets` rebuilt a subset of targets in this replay run,
+      # stage them in a separate directory and copy them second so rebuilt
+      # binaries deterministically replace any older copy from `artifacts_run_id`.
+      - name: Download rebuilt artifacts
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_targets != ''
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: mobile-ios-${{ github.sha }}
-          path: target/release-downloads/mobile-ios-rebuilt
+          pattern: "*-*-${{ github.sha }}"
+          path: target/release-rebuilt
+          merge-multiple: false
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt
@@ -684,7 +766,12 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p target/publish
-          find target/release-downloads -type f ! -name 'release-assets.json' -exec cp {} target/publish/ \;
+          if [[ -d target/release-downloads ]]; then
+            find target/release-downloads -type f ! -name 'release-assets.json' -exec cp -f {} target/publish/ \;
+          fi
+          if [[ -d target/release-rebuilt ]]; then
+            find target/release-rebuilt -type f ! -name 'release-assets.json' -exec cp -f {} target/publish/ \;
+          fi
           test -n "$(find target/publish -type f -not -name '*.sha256' -print -quit)"
       - name: Stage localized release notes
         shell: bash
