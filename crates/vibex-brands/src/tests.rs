@@ -204,8 +204,16 @@ fn antigravity_mark_rasters_as_an_arch_with_transparent_corners() {
     let image = image::load_from_memory(&png)
         .expect("the bytes are a PNG")
         .to_rgba8();
-    assert_eq!(image.get_pixel(0, 0).0[3], 0, "top-left corner stays transparent");
-    assert_eq!(image.get_pixel(63, 0).0[3], 0, "top-right corner stays transparent");
+    assert_eq!(
+        image.get_pixel(0, 0).0[3],
+        0,
+        "top-left corner stays transparent"
+    );
+    assert_eq!(
+        image.get_pixel(63, 0).0[3],
+        0,
+        "top-right corner stays transparent"
+    );
     assert_eq!(
         image.get_pixel(32, 60).0[3],
         0,

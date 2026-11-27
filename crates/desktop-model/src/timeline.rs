@@ -152,6 +152,12 @@ impl TimelineModel {
     ///
     /// Returns `Ok(true)` if `self.items` changed, `Ok(false)` if unchanged,
     /// and `Err(())` if the model does not currently hold `session_id`.
+    ///
+    /// The error carries no payload on purpose: the only failure is "this
+    /// model is not the one the caller is describing", and every caller
+    /// answers it by dropping the delta, so a dedicated error type would add
+    /// a name without adding information.
+    #[allow(clippy::result_unit_err)]
     pub fn apply_authoritative_tail(
         &mut self,
         session_id: &VibexSessionId,

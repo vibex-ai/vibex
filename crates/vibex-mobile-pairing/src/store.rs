@@ -119,10 +119,7 @@ impl PairingStore {
     ) -> BackendResult<Vec<MobileCredentialBundle>> {
         let host_id = bundle.host_id().to_owned();
         let mut runtimes = self.load()?;
-        if let Some(existing) = runtimes
-            .iter()
-            .find(|runtime| runtime.host_id() == host_id)
-        {
+        if let Some(existing) = runtimes.iter().find(|runtime| runtime.host_id() == host_id) {
             bundle.merge_from_existing(existing);
         }
         runtimes.retain(|runtime| runtime.host_id() != host_id);

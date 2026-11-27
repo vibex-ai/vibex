@@ -8643,16 +8643,18 @@ mod tests {
         let request = RemoteRpcRequestV2::new(
             RemoteOperationKind::DeviceManagement,
             Some(
-                serde_json::to_value(RemoteDeviceRequest::ListDevices(
-                    RemoteDeviceListRequest {
-                        auth: admin.clone(),
-                    },
-                ))
+                serde_json::to_value(RemoteDeviceRequest::ListDevices(RemoteDeviceListRequest {
+                    auth: admin.clone(),
+                }))
                 .unwrap(),
             ),
         );
         let response = run_rpc_isolated(state, admin, request).await;
-        assert!(response.error.is_none(), "unexpected RPC error: {:?}", response.error);
+        assert!(
+            response.error.is_none(),
+            "unexpected RPC error: {:?}",
+            response.error
+        );
         let listed: RemoteDeviceListResponse =
             serde_json::from_value(response.payload.unwrap()).unwrap();
         assert!(!listed.devices.is_empty());

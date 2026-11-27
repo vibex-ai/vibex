@@ -137,9 +137,7 @@ impl RouteOptionKind {
             RouteOptionKind::LocalNetwork => copy::text("Local network", "局域网", "區域網路"),
             RouteOptionKind::Tailscale => "Tailscale",
             RouteOptionKind::Direct => copy::text("Direct", "直连", "直連"),
-            RouteOptionKind::OfficialRelay => {
-                copy::text("Official relay", "官方中继", "官方中繼")
-            }
+            RouteOptionKind::OfficialRelay => copy::text("Official relay", "官方中继", "官方中繼"),
             RouteOptionKind::SelfHostedRelay => {
                 copy::text("Self-hosted relay", "自建中继", "自建中繼")
             }
@@ -786,8 +784,8 @@ fn manual_sheet(
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(|| theme::border_adaptive())
-                .bg(|| theme::card_adaptive())
+                .border_color(theme::border_adaptive)
+                .bg(theme::card_adaptive)
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
@@ -952,8 +950,8 @@ fn nearby_sheet(host: PairingHost, open: Signal<bool>, clock: Signal<i64>) -> im
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(|| theme::border_adaptive())
-                .bg(|| theme::card_adaptive())
+                .border_color(theme::border_adaptive)
+                .bg(theme::card_adaptive)
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event {
@@ -1325,8 +1323,8 @@ fn actions_sheet(host: PairingHost) -> impl IntoElement {
             style
                 .rounded_t(px(theme::RADIUS_SHEET))
                 .border_t_1()
-                .border_color(|| theme::border_adaptive())
-                .bg(|| theme::card_adaptive())
+                .border_color(theme::border_adaptive)
+                .bg(theme::card_adaptive)
         })
         .on_open_change(move |event: &SheetEvent| {
             if let SheetEvent::OpenChange(next, _) = event
@@ -1427,56 +1425,49 @@ fn actions_sheet(host: PairingHost) -> impl IntoElement {
                             )
                         }
                     }))
-                    .child(when(
-                        move || current_routes().len() > 2,
-                        {
+                    .child(when(move || current_routes().len() > 2, {
+                        let on_pick_route = on_pick_route.clone();
+                        move || {
                             let on_pick_route = on_pick_route.clone();
-                            move || {
-                                let on_pick_route = on_pick_route.clone();
-                                view()
-                                    .w_full()
-                                    .flex_col()
-                                    .child(
-                                        view()
-                                            .w_full()
-                                            .h(px(1.0))
-                                            .my(px(theme::SPACING_XS))
-                                            .bg(theme::border_subtle),
-                                    )
-                                    .child(
-                                        text(copy::text(
-                                            "Connection method",
-                                            "连接方式",
-                                            "連線方式",
-                                        ))
+                            view()
+                                .w_full()
+                                .flex_col()
+                                .child(
+                                    view()
+                                        .w_full()
+                                        .h(px(1.0))
+                                        .my(px(theme::SPACING_XS))
+                                        .bg(theme::border_subtle),
+                                )
+                                .child(
+                                    text(copy::text("Connection method", "连接方式", "連線方式"))
                                         .px(px(theme::SPACING_MD))
                                         .py(px(theme::SPACING_XS))
                                         .text_size(px(theme::font_caption()))
                                         .text_color(theme::text_muted),
-                                    )
-                                    .child(each(
-                                        current_routes,
-                                        |option| option.key.clone(),
-                                        move |option, _| {
-                                            let on_pick_route = on_pick_route.clone();
-                                            route_option_row(option, move |route_key| {
-                                                if let Some(id) = actions_id.get_untracked() {
-                                                    on_pick_route(id.as_str(), route_key);
-                                                    actions_id.set(None);
-                                                }
-                                            })
-                                        },
-                                    ))
-                                    .child(
-                                        view()
-                                            .w_full()
-                                            .h(px(1.0))
-                                            .my(px(theme::SPACING_XS))
-                                            .bg(theme::border_subtle),
-                                    )
-                            }
-                        },
-                    ))
+                                )
+                                .child(each(
+                                    current_routes,
+                                    |option| option.key.clone(),
+                                    move |option, _| {
+                                        let on_pick_route = on_pick_route.clone();
+                                        route_option_row(option, move |route_key| {
+                                            if let Some(id) = actions_id.get_untracked() {
+                                                on_pick_route(id.as_str(), route_key);
+                                                actions_id.set(None);
+                                            }
+                                        })
+                                    },
+                                ))
+                                .child(
+                                    view()
+                                        .w_full()
+                                        .h(px(1.0))
+                                        .my(px(theme::SPACING_XS))
+                                        .bg(theme::border_subtle),
+                                )
+                        }
+                    }))
                     .child(action_row(
                         icon(include_str!("../../assets/icons/pencil.svg")),
                         copy::text("Rename", "重命名", "重新命名"),

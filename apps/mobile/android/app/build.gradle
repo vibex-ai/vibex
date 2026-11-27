@@ -14,7 +14,7 @@ def releasedApplicationId = 'ai.vibex.mobile'
 // is derived from the version name. Android orders installs by this integer
 // alone, and the derivation is the one every released build used, so a new
 // build always outranks the one on the phone.
-def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.9'
+def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.10'
 
 def vibexVersionCode = {
     def matcher = (vibexVersionName =~ /^(\d+)\.(\d+)\.(\d+)(?:-(preview|rc)\.(\d+))?$/)

@@ -22,9 +22,9 @@ Confirm that the public repository contains only source-owned changes and that
 private Trellis task paths are not staged. Do not publish a package from a dirty
 or unverified source identity.
 
-`pnpm check:mobile-native` belongs to the preflight only while mobile packaging is
-enabled. It cannot pass while the phone client is still on `gpui-pre` and the
-shared UI crates build against `gpui-fast`; see [Mobile](#mobile).
+`pnpm check:mobile-native` belongs to the preflight unconditionally now that the
+phone client is on the same backend the desktop runs on and mobile packaging is
+on again; see [Mobile](#mobile).
 
 ## Desktop
 
@@ -200,20 +200,24 @@ built from the verified tag.
 
 ## Mobile
 
-Android and iOS packaging is opt-in while the mobile client is ported to the
-backend the desktop runs on. The desktop, the TUI, `vibex-server` and the
-container images build against `gpui-fast`; the shipping phone client is
-`apps/mobile`, which replaces the GPUI one and is packaged by its own hosts
-(`apps/mobile/android`, `apps/mobile/ios`). Both mobile jobs are gated on
-the repository variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the
-jobs are skipped, the publish job still releases the desktop, headless server and
-container artifacts, and the Downloads table simply omits the Android and iOS
-rows. The signed updater manifest drops its Android entry with them, because the
-APK is required only from a release that packaged the phone client; a phone keeps
-installing whatever build it already runs until packaging returns. A mobile job
-that does run and fails still holds the release. Set the variable to `true` once
-the nsh client is ready to ship, and gate that release on
-`pnpm check:mobile-native` again.
+Android and iOS packaging ships with every release again. The phone client was
+ported off the `gpui-pre-mobile` platform layer onto Native Shell, so it no
+longer links a second `gpui` beside the desktop's `gpui-fast`; `apps/mobile` is
+the only mobile client in the tree and `pnpm check:mobile-native` is part of the
+preflight. Both mobile jobs are gated on the repository variable
+`VIBEX_MOBILE_RELEASES_ENABLED`, which **must be `true` before the tag is
+pushed** — a release cut with it unset silently ships without the phone
+packages, the Downloads table omits the Android and iOS rows, and the signed
+updater manifest drops its Android entry. That switch exists so a release can
+still be cut when a mobile host is temporarily unbuildable; it is not the
+shipping state.
+
+The gate is fail-safe in one direction only: a mobile job that was skipped does
+not hold the release, but a mobile job that actually ran and failed still does.
+The publish job treats `skipped` as acceptable and `failure` as fatal, and
+`check-release` pins that pair. `scripts/check-release.mjs` also pins the switch
+itself, so removing it from the workflow fails the preflight rather than
+quietly turning mobile packaging back on.
 
 The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
 
@@ -238,9 +242,13 @@ The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
   applicationId.
 
 `apps/mobile/scripts/check-upgrade.mjs` (part of `pnpm check:mobile-native`)
-pins the ids, the versionCode derivation and the legacy file list against the
-GPUI client's build files, so a change that would break the upgrade fails before
-a release is built.
+pins the released application id, the versionCode derivation, the iOS bundle
+ids and build-number derivation, and the legacy file list. It reads those values
+from a table in the script rather than from the GPUI client's build files,
+because that client is gone from the tree while its builds are still installed;
+a change that would break the upgrade therefore fails before a release is built.
+Add a row to that table when a release ships a version name the table does not
+carry yet.
 
 Android and iOS are built independently from the desktop package. Tagged
 releases publish signed Android APK/AAB files plus an unsigned iOS simulator

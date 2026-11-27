@@ -36,7 +36,6 @@ pub fn toast(
     let generation = signal(0u64);
     let expire = Rc::new(on_dismiss.clone());
     effect({
-        let notice = notice;
         let expire = expire.clone();
         move || {
             if notice.get().is_some() {
@@ -101,7 +100,9 @@ mod tests {
     /// able to leave without the reader doing anything.
     #[test]
     fn a_toast_expires_on_its_own() {
-        assert!(super::TOAST_LIFETIME_MS <= 8_000);
-        assert!(super::TOAST_LIFETIME_MS >= 2_000);
+        const {
+            assert!(super::TOAST_LIFETIME_MS <= 8_000);
+            assert!(super::TOAST_LIFETIME_MS >= 2_000);
+        }
     }
 }

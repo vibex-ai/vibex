@@ -4319,7 +4319,7 @@ impl SessionService {
             }
             (
                 model.items.clone(),
-                model.leading_turn_start.clone(),
+                model.leading_turn_start,
                 model.needs_authoritative_refetch,
             )
         };
@@ -4672,7 +4672,7 @@ impl SessionService {
         }
         let (items, leading_turn_start) = {
             let model = self.model.borrow();
-            (model.items.clone(), model.leading_turn_start.clone())
+            (model.items.clone(), model.leading_turn_start)
         };
         let Some(last_seq) = items.last().map(|item| item.sequence) else {
             return;
@@ -4734,21 +4734,18 @@ impl SessionService {
             if !service.alive.get() {
                 return;
             }
-            match result {
-                Ok(Ok(usage)) => {
-                    let view = usage.map(token_usage_view);
-                    if let Some(entry) = service
-                        .session_cache
-                        .borrow_mut()
-                        .get_mut(session_id.as_str())
-                    {
-                        entry.token_usage = view.clone();
-                    }
-                    if service.active.get_untracked().as_deref() == Some(session_id.as_str()) {
-                        service.token_usage.set(view);
-                    }
+            if let Ok(Ok(usage)) = result {
+                let view = usage.map(token_usage_view);
+                if let Some(entry) = service
+                    .session_cache
+                    .borrow_mut()
+                    .get_mut(session_id.as_str())
+                {
+                    entry.token_usage = view.clone();
                 }
-                _ => {}
+                if service.active.get_untracked().as_deref() == Some(session_id.as_str()) {
+                    service.token_usage.set(view);
+                }
             }
         });
     }
@@ -4826,7 +4823,7 @@ impl SessionService {
                 && model.prepend_authoritative_page(
                     session_id,
                     &page.items,
-                    page.leading_turn_start.clone(),
+                    page.leading_turn_start,
                 )
             {
                 true
@@ -14373,7 +14370,7 @@ mod terminal_lifecycle_tests {
                 has_older: true,
                 has_newer: false,
                 starts_at_turn_start: false,
-                leading_turn_start: Some(initial_lead.clone()),
+                leading_turn_start: Some(initial_lead),
                 omitted: None,
             },
         );

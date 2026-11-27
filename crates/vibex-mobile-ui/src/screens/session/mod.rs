@@ -583,6 +583,10 @@ pub type BrowseDirs = Rc<dyn Fn(Option<&str>)>;
 /// Opens one row's full detail.
 type ToggleDetail = Rc<dyn Fn(&str, i64)>;
 type RevealRow = Rc<dyn Fn(&str, bool)>;
+/// The last older-history snapshot the auto-load saw: the cursor, the row
+/// count and the oldest loaded key. Held behind `Rc<RefCell<_>>` so the
+/// scroll and load handlers share one value without re-rendering.
+type AutoOlderSnapshot = Rc<RefCell<Option<(Option<String>, usize, Option<String>)>>>;
 
 /// One entry of the composer's `/` palette.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -2112,8 +2116,7 @@ fn timeline_view(
             },
         );
     }
-    let last_auto_older_snapshot: Rc<RefCell<Option<(Option<String>, usize, Option<String>)>>> =
-        Rc::new(RefCell::new(None));
+    let last_auto_older_snapshot: AutoOlderSnapshot = Rc::new(RefCell::new(None));
     let auto_older_gen: Rc<Cell<u64>> = Rc::new(Cell::new(0));
     {
         let on_load_older = on_load_older.clone();
@@ -3662,8 +3665,8 @@ fn copy_message(body: Memo<String>) -> ButtonElement {
         move || {
             crate::motion::tick();
             // 0.7 answers whether the clipboard took it; this row has no use
-            // for the answer, so it is dropped.
-            let _ = set_clipboard(body.get_untracked());
+            // for the answer, so the future is dropped explicitly.
+            drop(set_clipboard(body.get_untracked()));
         },
     )
     .disabled(move || body.with(String::is_empty))
@@ -4062,7 +4065,7 @@ fn activity_details_view(
                                     copy::text("Copy detail", "复制详情", "複製詳細資料"),
                                     move || {
                                         crate::motion::tick();
-                                        let _ = set_clipboard(detail.copy.clone());
+                                        drop(set_clipboard(detail.copy.clone()));
                                     },
                                 )
                                 .accessibility_label(label),
@@ -6290,7 +6293,7 @@ pub(crate) fn runtime_sheet(
                                                         let fold_key = key.clone();
                                                         let open = move || {
                                                             !collapsed.with(|folded| {
-                                                                folded.iter().any(|folded| *folded == fold_key)
+                                                                folded.contains(&fold_key)
                                                             })
                                                         };
                                                         let toggle = {
@@ -6339,7 +6342,7 @@ pub(crate) fn runtime_sheet(
                                                                     .active(|style| {
                                                                         style.bg(theme::row_pressed_bg())
                                                                     })
-                                                                    .on_press(move || toggle())
+                                                                    .on_press(toggle)
                                                                     .child(
                                                                         view()
                                                                             .flex_shrink_0()
@@ -7607,7 +7610,7 @@ fn agent_icon(agent: &str) -> &'static str {
     vibex_brands::agent_mark(agent)
         .and_then(|mark| vibex_brands::mark_bytes(mark.path))
         .and_then(|bytes| std::str::from_utf8(bytes).ok())
-        .unwrap_or_else(|| include_str!("../../../assets/icons/bot.svg"))
+        .unwrap_or(include_str!("../../../assets/icons/bot.svg"))
 }
 
 /// A quiet action written out in words, with an optional glyph before them.
@@ -7742,14 +7745,11 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     let auto_scroll = signal(0.0f32);
     let list_ref = element_ref();
     {
-        let list_ref = list_ref;
-        let list_offset = list_offset;
-        let scroll_travel = scroll_travel;
-        let auto_scroll = auto_scroll;
         effect(move || {
             // One ticker per page: it runs only while a row is carried near
-            // an edge, and moves the list a step at a time.
-            let _ = set_interval(
+            // an edge, and moves the list a step at a time. The handle is
+            // dropped because the ticker is bound to the owner, not to it.
+            drop(set_interval(
                 std::time::Duration::from_millis(DRAG_SCROLL_TICK_MS),
                 move || {
                     if drag.with_untracked(Option::is_none) {
@@ -7764,7 +7764,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     scroll_travel.update(|travel| *travel += edge * DRAG_SCROLL_STEP);
                     list_ref.scroll_to_offset(px(offset), false);
                 },
-            );
+            ));
         });
     }
     effect(move || {
@@ -7990,7 +7990,6 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         // carry itself rather than from the element that began it.
         end_drag: {
             let rows = host.sidebar.rows.clone();
-            let query = query;
             let move_row = host.sidebar.on_move_row.clone();
             let toggle = host.sidebar.on_toggle_row.clone();
             Rc::new(move || {

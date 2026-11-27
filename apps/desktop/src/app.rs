@@ -91808,6 +91808,10 @@ fn runtime_attribution_line(attribution: &str) -> String {
 /// most of a session's life and is reported in the tooltip and in the panel.
 /// Both branches read the catalogue when it describes the selection, because
 /// the catalogue's labels are the names the reader chose.
+///
+/// The chip itself now names the `supplier/model` pair, so this bare form is
+/// kept only as the reference the paired label is tested against.
+#[cfg(test)]
 fn runtime_model_label(
     option: Option<&SessionRuntimeOption>,
     selection: &SessionRuntimeSelection,

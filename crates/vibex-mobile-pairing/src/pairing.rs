@@ -240,9 +240,9 @@ impl MobileCredentialBundle {
                         || lan_url
                             .as_deref()
                             .is_some_and(|lan| lan.eq_ignore_ascii_case(&normalized))
-                        || merged
-                            .iter()
-                            .any(|existing_url: &String| existing_url.eq_ignore_ascii_case(&normalized))
+                        || merged.iter().any(|existing_url: &String| {
+                            existing_url.eq_ignore_ascii_case(&normalized)
+                        })
                     {
                         continue;
                     }
@@ -271,10 +271,9 @@ impl MobileCredentialBundle {
             MobileRouteSelection::Direct { url } => {
                 let target = normalize_route_url(url);
                 self.route.as_ref().is_some_and(|route| {
-                    route
-                        .direct_candidates
-                        .iter()
-                        .any(|candidate| normalize_route_url(candidate).eq_ignore_ascii_case(&target))
+                    route.direct_candidates.iter().any(|candidate| {
+                        normalize_route_url(candidate).eq_ignore_ascii_case(&target)
+                    })
                 })
             }
             MobileRouteSelection::Relay => self
@@ -321,11 +320,13 @@ impl MobileCredentialBundle {
                         relay: None,
                     })
             }
-            MobileRouteSelection::Relay => route.relay.clone().map(|relay| MobileRemoteRouteBundle {
-                local_network: None,
-                direct_candidates: Vec::new(),
-                relay: Some(relay),
-            }),
+            MobileRouteSelection::Relay => {
+                route.relay.clone().map(|relay| MobileRemoteRouteBundle {
+                    local_network: None,
+                    direct_candidates: Vec::new(),
+                    relay: Some(relay),
+                })
+            }
         };
         if let Some(selected_route) = selected_route {
             narrowed.route = Some(selected_route);

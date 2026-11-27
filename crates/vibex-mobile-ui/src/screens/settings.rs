@@ -242,7 +242,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
         index_row(
             icon(include_str!("../../assets/icons/message-square.svg")),
             copy::text("Conversation", "会话", "工作階段"),
-            || String::new(),
+            String::new,
             navigate(host.page, SettingsPage::Conversation),
         )
         .into_element(),
@@ -266,7 +266,7 @@ fn root_page(host: SettingsHost, confirm_clear: Signal<bool>) -> impl IntoElemen
     let device_row = index_row(
         icon(include_str!("../../assets/icons/settings.svg")),
         copy::text("This device", "本机", "本機"),
-        || String::new(),
+        String::new,
         navigate(host.page, SettingsPage::Device),
     );
     let about_row = index_row(
@@ -660,8 +660,7 @@ fn language_page(host: SettingsHost) -> impl IntoElement {
 }
 
 fn conversation_page(host: SettingsHost) -> impl IntoElement {
-    let mut rows: Vec<AnyElement> = Vec::new();
-    rows.push(
+    let mut rows: Vec<AnyElement> = vec![
         toggle_row(
             copy::text("Token usage", "Token 使用量", "Token 使用量"),
             copy::text(
@@ -674,7 +673,7 @@ fn conversation_page(host: SettingsHost) -> impl IntoElement {
             None,
         )
         .into_element(),
-    );
+    ];
     rows.push(divider().into_element());
     rows.push(
         toggle_row(
@@ -754,8 +753,7 @@ fn conversation_page(host: SettingsHost) -> impl IntoElement {
 
 fn notifications_page(host: SettingsHost) -> impl IntoElement {
     let master = host.notifications;
-    let mut rows: Vec<AnyElement> = Vec::new();
-    rows.push(
+    let mut rows: Vec<AnyElement> = vec![
         toggle_row(
             copy::text("Enable notifications", "启用通知", "啟用通知"),
             copy::text(
@@ -768,7 +766,7 @@ fn notifications_page(host: SettingsHost) -> impl IntoElement {
             None,
         )
         .into_element(),
-    );
+    ];
     rows.push(divider().into_element());
     rows.push(
         toggle_row(
@@ -828,8 +826,7 @@ fn notifications_page(host: SettingsHost) -> impl IntoElement {
 }
 
 fn device_page(host: SettingsHost) -> impl IntoElement {
-    let mut rows: Vec<AnyElement> = Vec::new();
-    rows.push(
+    let mut rows: Vec<AnyElement> = vec![
         toggle_row(
             copy::text("Haptic feedback", "触感反馈", "觸感回饋"),
             copy::text(
@@ -842,7 +839,7 @@ fn device_page(host: SettingsHost) -> impl IntoElement {
             None,
         )
         .into_element(),
-    );
+    ];
     rows.push(divider().into_element());
     rows.push(
         toggle_row(
@@ -957,7 +954,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             nav_row(
                 copy::text("Check for updates", "检查更新", "檢查更新"),
                 icon(include_str!("../../assets/icons/refresh.svg")),
-                move || on_check(),
+                on_check,
             )
             .into_element(),
             when(

@@ -154,7 +154,9 @@ impl Icon {
             }
             Self::Clock => include_bytes!("../../../apps/desktop/assets/icons/clock.svg"),
             Self::New => include_bytes!("../../../crates/vibex-mobile-ui/assets/icons/plus.svg"),
-            Self::More => include_bytes!("../../../crates/vibex-mobile-ui/assets/icons/ellipsis.svg"),
+            Self::More => {
+                include_bytes!("../../../crates/vibex-mobile-ui/assets/icons/ellipsis.svg")
+            }
             Self::FolderClosed => include_bytes!("../../../apps/desktop/assets/icons/folder.svg"),
             Self::FolderOpen => {
                 include_bytes!("../../../crates/vibex-mobile-ui/assets/icons/folder-open.svg")

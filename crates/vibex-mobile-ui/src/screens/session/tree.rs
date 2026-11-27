@@ -214,7 +214,6 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
     // that slot move over one place; the signals carry the transition.
     {
         let rows = visible;
-        let carried = carried;
         let shifts = state.shifts;
         effect(move || {
             let slot = slot.get();

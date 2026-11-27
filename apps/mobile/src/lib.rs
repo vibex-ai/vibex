@@ -207,7 +207,7 @@ pub fn App() -> impl IntoElement {
             .header_visible(false)
             .flex_1()
             .relative()
-            .bg(|| vibex_mobile_ui::theme::block_page())
+            .bg(vibex_mobile_ui::theme::block_page)
             .child(dynamic({
                 let pairing = pairing.clone();
                 let settings = settings.clone();
@@ -446,7 +446,6 @@ fn settings_host(
         }),
         on_switch_runtime: {
             let pairing = pairing.clone();
-            let open = open;
             Rc::new(move || {
                 open.set(false);
                 pairing.open_switcher();

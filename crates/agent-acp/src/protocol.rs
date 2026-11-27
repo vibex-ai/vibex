@@ -50,9 +50,9 @@ use agent_client_protocol_schema::{
         AuthenticateRequest, BooleanConfigOptionCapabilities, CancelNotification,
         ClientCapabilities, ClientSessionCapabilities, ContentBlock, ElicitationCapabilities,
         ElicitationFormCapabilities, FileSystemCapabilities, Implementation, InitializeRequest,
-        LoadSessionRequest, LogoutRequest, NewSessionRequest, PromptRequest,
-        ResumeSessionRequest, SessionConfigOptionsCapabilities, SessionId,
-        SetSessionConfigOptionRequest, SetSessionModeRequest,
+        LoadSessionRequest, LogoutRequest, NewSessionRequest, PromptRequest, ResumeSessionRequest,
+        SessionConfigOptionsCapabilities, SessionId, SetSessionConfigOptionRequest,
+        SetSessionModeRequest,
     },
 };
 use serde_json::{Value, json};
@@ -1132,8 +1132,14 @@ mod tests {
     #[test]
     fn boolean_config_options_are_advertised_unconditionally() {
         for parameterized in [false, true] {
-            let capabilities = &build_initialize_params(true, true, false, false, false, parameterized)
-                ["clientCapabilities"];
+            let capabilities = &build_initialize_params(
+                true,
+                true,
+                false,
+                false,
+                false,
+                parameterized,
+            )["clientCapabilities"];
             assert_eq!(
                 capabilities["session"],
                 json!({ "configOptions": { "boolean": {} } }),
