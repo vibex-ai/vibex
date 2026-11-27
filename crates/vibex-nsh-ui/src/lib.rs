@@ -1,11 +1,11 @@
 //! The shared UI layer of Vibex's native mobile client, drawn with Native
 //! Shell (`nsh`).
 //!
-//! The crate replaces `apps/mobile`'s GPUI view layer screen by screen. It
-//! keeps what the product already decided — the desktop token palette, the
-//! compact phone spacing ladder, the copy, the information architecture —
-//! while the rendering, text, scrolling and input are the platform's own
-//! through `nsh`.
+//! The crate is the mobile client's view layer. It replaced the GPUI client's
+//! screen by screen and keeps what the product already decided — the desktop
+//! token palette, the compact phone spacing ladder, the copy, the information
+//! architecture — while the rendering, text, scrolling and input are the
+//! platform's own through `nsh`.
 //!
 //! Layers, from the bottom:
 //!

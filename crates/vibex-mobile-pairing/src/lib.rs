@@ -1,12 +1,10 @@
 //! The phone's pairing core: entries, claims, credentials and the on-device
 //! store.
 //!
-//! This is platform-neutral: it holds no GPUI and no nsh types, so both mobile
-//! clients can pair through the same rules. It is the pairing module the GPUI
-//! client keeps in `apps/mobile/src/pairing.rs`, with the device name it used
-//! to read from the host passed in instead; the GPUI client still carries its
-//! copy until its own build is green again, at which point that module becomes
-//! a re-export of this crate.
+//! This is platform-neutral: it holds no GPUI and no nsh types, so a host can
+//! pair through the same rules. The mobile client's pairing used to read the
+//! device name itself; here it is passed in, which is what lets the same rules
+//! serve a host that names the phone differently.
 //!
 //! Layers:
 //!

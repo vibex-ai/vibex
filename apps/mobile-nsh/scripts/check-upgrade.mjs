@@ -1,19 +1,27 @@
 // Guards the one thing a phone user cannot fix: an update that installs
-// beside the old app instead of replacing it, or that installs over it but
-// cannot see the data it left.
+// beside the app already on the phone instead of replacing it, or that
+// replaces it but cannot see the data it left.
 //
-// The nsh client takes the GPUI client's place on both platforms, so the two
-// have to agree on:
+// The GPUI client that used to ship on these phones is gone from the tree, but
+// its builds are still installed. This client has to keep accepting them as
+// "the same app" forever, so the values that decide that are pinned here
+// rather than read from files that no longer exist:
 //
-// - Android: `applicationId` (a different one is a second app, and Android
-//   answers with "uninstall the existing app first"), and the `versionCode`
+// - Android `applicationId` (a different one is a second app, and Android
+//   answers with "uninstall the existing app first") and the `versionCode`
 //   derivation (an update only installs when the integer is at least the
-//   installed one, and the two clients compute it the same way).
-// - iOS: `CFBundleIdentifier` of the app and of its share extension (iOS
-//   installs a different bundle id side by side).
+//   installed one).
+// - iOS `CFBundleIdentifier` of the app and of its share extension (iOS
+//   installs a different bundle id side by side), and the build number, which
+//   iOS also compares.
+// - The files the old clients wrote, listed in `src/migration.rs`, which is
+//   still what carries the runtimes and drafts over.
 //
-// The data side is checked in Rust: `apps/mobile-nsh/src/migration.rs` reads
-// the files the GPUI client wrote and its tests pin both platforms' layouts.
+// The released values these pin, from `0.1.0-rc.10` (versionCode 100510) and
+// `0.1.9` (109999):
+//
+//   major*10000000 + minor*100000 + patch*1000 + rank
+//   rank: 999 release, 500+seq rc, 100+seq preview
 //
 // Run directly or through `pnpm check:mobile-native`.
 
@@ -24,57 +32,95 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "../../..");
 const SELF_TEST = process.argv.includes("--self-test");
 
-const LEGACY_ANDROID_BUILD = "apps/mobile/android/app/build.gradle";
-const NEXT_ANDROID_BUILD = "apps/mobile-nsh/android/app/build.gradle";
-const LEGACY_IOS_PROJECT = "apps/mobile/ios/project.yml";
-const NEXT_IOS_PROJECT = "apps/mobile-nsh/ios/project.yml";
-const NEXT_APP_MANIFEST = "apps/mobile-nsh/nsh.json";
-const NEXT_MIGRATION = "apps/mobile-nsh/src/migration.rs";
-const NEXT_IOS_BUILD = "apps/mobile-nsh/scripts/build-ios-host.sh";
+const ANDROID_BUILD = "apps/mobile-nsh/android/app/build.gradle";
+const IOS_PROJECT = "apps/mobile-nsh/ios/project.yml";
+const IOS_BUILD = "apps/mobile-nsh/scripts/build-ios-host.sh";
+const APP_MANIFEST = "apps/mobile-nsh/nsh.json";
+const MIGRATION = "apps/mobile-nsh/src/migration.rs";
+const APP_ROOT = "apps/mobile-nsh/src/lib.rs";
 
-function source(path) {
+/** The id every released build used, on both platforms. */
+const RELEASED_APP_ID = "ai.vibex.mobile";
+const RELEASED_EXTENSION_ID = "ai.vibex.mobile.share";
+
+/** Version names this app already shipped and the versionCode of each. */
+const RELEASED_VERSION_CODES = new Map([
+  ["0.1.0-rc.10", 100510],
+  ["0.1.9", 109999]
+]);
+
+/** The legacy files the upgrade has to keep reading. */
+const LEGACY_FILES = [
+  "remote-hosts.json",
+  "remote-credentials.json",
+  "client-identity.json",
+  "app-settings.json",
+  "composer-state.json"
+];
+
+function read(path) {
   return readFileSync(join(ROOT, path), "utf8");
+}
+
+function exists(path) {
+  return existsSync(join(ROOT, path));
 }
 
 function assert(condition, code) {
   if (!condition) throw new Error(code);
 }
 
-/** The first `name 'value'` / `name: value` at the top level of a Gradle file. */
+/**
+ * The `versionCode` derivation of a Gradle file, evaluated in JS.
+ *
+ * The equations are pinned separately, so this only has to prove that the
+ * build file still derives the number rather than hard-coding one.
+ */
+function gradleVersionCode(text) {
+  const match = text.match(
+    /def preRank = channel == null \? 999 : \(channel == 'rc' \? 500 : 100\) \+ sequence\s*\n\s*return major \* 10000000 \+ minor \* 100000 \+ patch \* 1000 \+ preRank/u
+  );
+  return match !== null;
+}
+
+/** The same arithmetic, as the checker's own reference implementation. */
+export function referenceVersionCode(version) {
+  const match = version.match(/^(\d+)\.(\d+)\.(\d+)(?:-(preview|rc)\.(\d+))?$/u);
+  if (!match) throw new Error(`cannot derive a versionCode from '${version}'`);
+  const [, major, minor, patch, channel, sequence] = match;
+  const rank = channel === undefined ? 999 : (channel === "rc" ? 500 : 100) + Number(sequence ?? 0);
+  return Number(major) * 10000000 + Number(minor) * 100000 + Number(patch) * 1000 + rank;
+}
+
+/** The first `name = 'value'` (or `name 'value'`) at a Gradle file's top level. */
 function gradleValue(text, name) {
-  const match = text.match(new RegExp(`^\\s*${name}\\s+['"]([^'"]+)['"]`, "mu"));
-  return match?.[1] ?? null;
+  return (
+    text.match(new RegExp(`^\\s*${name}\\s*=?\\s*['"]([^'"]+)['"]`, "mu"))?.[1] ?? null
+  );
 }
 
-/** The `versionCode …` line, in the shape both builds derive it. */
-function versionCodeExpression(text, label) {
-  const match = text.match(/^\s*versionCode\s+([A-Za-z_][\w.]*)\s*$/mu);
-  assert(match, `${label}: build.gradle has no derived versionCode`);
-  return match[1];
-}
-
-/** The derivation block both builds have to share, whitespace-normalized. */
-function versionCodeDerivation(text, label) {
-  const match = text.match(/def vibexVersionCode = \{[\s\S]*?\n\}\(\)/u);
-  assert(match, `${label}: build.gradle lost its versionCode derivation`);
-  return match[0].replace(/\s+/gu, " ").trim();
-}
-
-function yamlValue(text, key, label) {
-  const match = text.match(new RegExp(`^\\s*${key}:\\s*(\\S+)\\s*$`, "mu"));
-  assert(match, `${label}: no ${key}`);
-  return match[1];
+/**
+ * The `applicationId` a Gradle file declares, following a `def` constant.
+ *
+ * The build names it through a constant so the comment above it can explain
+ * why the value may never change; the constant is what has to be checked.
+ */
+function gradleApplicationId(text) {
+  const direct = text.match(/^\s*applicationId\s+['"]([^'"]+)['"]/mu)?.[1];
+  if (direct) return direct;
+  const reference = text.match(/^\s*applicationId\s+([A-Za-z_][\w.]*)\s*$/mu)?.[1];
+  return reference ? gradleValue(text, `def ${reference}`) ?? null : null;
 }
 
 /** The block of a named target in an XcodeGen spec (up to the next sibling). */
-function targetBlock(text, target, label) {
+function targetBlock(text, target) {
   const lines = text.split("\n");
   const start = lines.findIndex((line) => line === `  ${target}:`);
-  assert(start >= 0, `${label}: no ${target} target`);
+  if (start < 0) return null;
   let end = lines.length;
   for (let index = start + 1; index < lines.length; index += 1) {
     // A sibling target, or the next top-level key (`schemes:`), ends it.
-    if (/^  \S/u.test(lines[index]) || /^\S/u.test(lines[index])) {
+    if (/^ {2}\S/u.test(lines[index]) || /^\S/u.test(lines[index])) {
       end = index;
       break;
     }
@@ -82,123 +128,124 @@ function targetBlock(text, target, label) {
   return lines.slice(start, end).join("\n");
 }
 
-/** The bundle identifier of a named target in an XcodeGen spec. */
-function bundleId(text, target, label) {
-  return yamlValue(
-    targetBlock(text, target, label),
-    "PRODUCT_BUNDLE_IDENTIFIER",
-    `${label}:${target}`
-  );
+function bundleId(text, target) {
+  const block = targetBlock(text, target);
+  if (block === null) return null;
+  return block.match(/^\s*PRODUCT_BUNDLE_IDENTIFIER:\s*(\S+)\s*$/mu)?.[1] ?? null;
 }
 
-export function validateUpgradeContract(read = source) {
-  const legacyAndroid = read(LEGACY_ANDROID_BUILD);
-  const nextAndroid = read(NEXT_ANDROID_BUILD);
-
-  const legacyId = gradleValue(legacyAndroid, "applicationId");
-  const nextId = gradleValue(nextAndroid, "applicationId");
-  // The nsh build may name it through a constant, which is the point: the
-  // comment there explains why the id is the GPUI client's.
-  const nextIdResolved =
-    nextId ?? nextAndroid.match(/legacyApplicationId = '([^']+)'/u)?.[1] ?? null;
-  assert(nextIdResolved, "the nsh Android build has no applicationId");
+export function validateUpgradeContract(readFile = read, existsFile = exists) {
+  const android = readFile(ANDROID_BUILD);
+  const applicationId = gradleApplicationId(android);
   assert(
-    legacyId === nextIdResolved,
-    `android_application_id_changed: the GPUI client shipped ${legacyId}, the nsh build declares ${nextIdResolved}; Android would install it as a second app`
+    applicationId === RELEASED_APP_ID,
+    `android_application_id_changed: the build declares ${applicationId}, not ${RELEASED_APP_ID}; an installed app would be joined by a second one instead of being updated`
+  );
+  assert(
+    gradleVersionCode(android),
+    "android_version_code_scheme_changed: the versionCode is no longer derived with the released arithmetic, so a new build can rank below the one on the phone"
+  );
+  // The version the build stamps has to be the one the release tag names, or
+  // the derived versionCode describes a different release.
+  assert(
+    /^\s*versionName\s+vibexVersionName\s*$/mu.test(android),
+    "android_version_name_not_stamped: the APK would not carry the version its versionCode was derived from"
   );
 
+  const ios = readFile(IOS_PROJECT);
   assert(
-    versionCodeExpression(legacyAndroid, "gpui") ===
-      versionCodeExpression(nextAndroid, "nsh"),
-    "android_version_code_source_changed: the two builds read different variables"
+    bundleId(ios, "Vibex") === RELEASED_APP_ID,
+    `ios_bundle_id_changed: the app is ${bundleId(ios, "Vibex")}, not ${RELEASED_APP_ID}; iOS would install it beside the one on the phone`
   );
   assert(
-    versionCodeDerivation(legacyAndroid, "gpui") ===
-      versionCodeDerivation(nextAndroid, "nsh"),
-    "android_version_code_scheme_changed: the nsh build derives a different versionCode from the same version name"
-  );
-  // The release workflow stamps the tag's version; a build that fell back to a
-  // stale literal would compute a versionCode the installed app outranks.
-  assert(
-    /^\s*versionName\s+vibexVersionName\s*$/mu.test(nextAndroid),
-    "android_version_name_missing: the nsh build must stamp the version it derives the versionCode from"
-  );
-
-  const legacyIos = read(LEGACY_IOS_PROJECT);
-  const nextIos = read(NEXT_IOS_PROJECT);
-  const nextAppId = bundleId(nextIos, "Vibex", "nsh");
-  assert(
-    bundleId(legacyIos, "Vibex", "gpui") === nextAppId,
-    `ios_bundle_id_changed: the GPUI client shipped ${bundleId(legacyIos, "Vibex", "gpui")}, the nsh build declares ${nextAppId}; iOS would install it side by side`
-  );
-  // The GPUI client had no share extension. The new one's id only has to live
-  // under the app's, so both targets re-sign with a single team profile and
-  // the extension is replaced with its app.
-  const nextExtensionId = bundleId(nextIos, "VibexShare", "nsh");
-  assert(
-    nextExtensionId.startsWith(`${nextAppId}.`),
-    `ios_extension_bundle_id_off: ${nextExtensionId} is not under the app's bundle id ${nextAppId}`
-  );
-  assert(
-    !nextIos.includes(".nsh"),
-    "ios_bundle_id_changed: an nsh-suffixed bundle id cannot replace the GPUI app"
+    bundleId(ios, "VibexShare") === RELEASED_EXTENSION_ID,
+    `ios_extension_bundle_id_changed: the share extension is ${bundleId(ios, "VibexShare")}, not ${RELEASED_EXTENSION_ID}`
   );
   // A managed entitlement cannot be signed with a free Apple ID, which is how
-  // this app is installed, and adding one to the upgrade would strand the
-  // install path the GPUI client used.
+  // this app is installed, so asking for one would strand the install path.
   assert(
-    !nextIos.includes("CODE_SIGN_ENTITLEMENTS"),
+    !ios.includes("CODE_SIGN_ENTITLEMENTS"),
     "ios_entitlement_added: the install path re-signs with a free Apple ID, which cannot sign managed capabilities"
   );
-  // iOS decides whether a bundle may replace the installed one partly on
-  // `CFBundleVersion`, and the GPUI client shipped build 1 for every release.
-  // The packaging script derives an increasing one from the version.
-  const iosHostScript = read(NEXT_IOS_BUILD);
-  assert(
-    iosHostScript.includes("CURRENT_PROJECT_VERSION=${build_number}") &&
-      iosHostScript.includes("MARKETING_VERSION=${VIBEX_MOBILE_VERSION}"),
-    "ios_build_number_not_derived: an install would keep the GPUI client's build 1"
-  );
-
-  const appJson = JSON.parse(read(NEXT_APP_MANIFEST));
-  assert(
-    appJson.id === nextIdResolved,
-    `nsh_json_id_mismatch: nsh.json names ${appJson.id}, the app is ${nextIdResolved}`
-  );
-
-  const migration = read(NEXT_MIGRATION);
-  for (const required of [
-    "remote-hosts.json",
-    "remote-credentials.json",
-    "client-identity.json",
-    "app-settings.json",
-    "composer-state.json",
+  for (const entitlements of [
+    "apps/mobile-nsh/ios/Vibex.entitlements",
+    "apps/mobile-nsh/ios/VibexShare.entitlements"
   ]) {
     assert(
-      migration.includes(required),
-      `migration_lost_file:${required}: the upgrade would drop what the GPUI client saved`
+      !existsFile(entitlements),
+      `ios_entitlement_file_present:${entitlements}: a managed entitlement breaks free re-signing and the upgrade`
+    );
+  }
+  // iOS compares the build number as well as the version: the released build
+  // was always 1, so a fixed literal would make every future install seal the
+  // phone to the first one.
+  const iosBuild = readFile(IOS_BUILD);
+  assert(
+    iosBuild.includes("CURRENT_PROJECT_VERSION=${build_number}") &&
+      iosBuild.includes("MARKETING_VERSION=${VIBEX_MOBILE_VERSION}"),
+    "ios_build_number_not_derived: an install would keep the released build 1 and never move forward"
+  );
+
+  const manifest = JSON.parse(readFile(APP_MANIFEST));
+  assert(
+    manifest.id === RELEASED_APP_ID,
+    `nsh_json_id_mismatch: nsh.json names ${manifest.id}, the app is ${RELEASED_APP_ID}`
+  );
+  // The nsh store lives in `<support>/<app id>`; the id the app mounts has to
+  // be the one the packaged manifest names, or the app reads an empty store.
+  assert(
+    readFile(APP_ROOT).includes(`const APP_ID: &str = "${RELEASED_APP_ID}";`),
+    "app_id_not_mounted: the phone root mounts a different app id than nsh.json names"
+  );
+
+  const migration = readFile(MIGRATION);
+  for (const file of LEGACY_FILES) {
+    assert(
+      migration.includes(file),
+      `migration_lost_file:${file}: the upgrade would drop what the installed app saved`
     );
   }
 }
 
 function runSelfTest() {
+  // The unmutated tree has to pass first: without this, a checker that rejects
+  // everything would still pass every negative case below.
+  validateUpgradeContract();
+
+  // The reference arithmetic has to reproduce what was actually published.
+  for (const [version, expected] of RELEASED_VERSION_CODES) {
+    const actual = referenceVersionCode(version);
+    assert(
+      actual === expected,
+      `self_test_version_code_drift: ${version} derives ${actual}, published as ${expected}`
+    );
+  }
+
   const files = new Map(
-    [
-      LEGACY_ANDROID_BUILD,
-      NEXT_ANDROID_BUILD,
-      LEGACY_IOS_PROJECT,
-      NEXT_IOS_PROJECT,
-      NEXT_APP_MANIFEST,
-      NEXT_MIGRATION,
-      NEXT_IOS_BUILD,
-    ].map((path) => [path, source(path)])
+    [ANDROID_BUILD, IOS_PROJECT, IOS_BUILD, APP_MANIFEST, MIGRATION, APP_ROOT].map((path) => [
+      path,
+      read(path)
+    ])
   );
-  const read = (path) => files.get(path);
+  const readFile = (path) => files.get(path);
+  // The entitlement files being gone is part of the contract, so the stand-in
+  // reports them absent and everything else from disk.
+  const existsFile = (path) =>
+    path.endsWith(".entitlements") ? false : exists(path);
 
   function expectRejected(path, from, to, code) {
     const original = files.get(path);
     assert(original.includes(from), `self-test marker missing in ${path}: ${from}`);
-    expectRejectedWith(path, original.replace(from, to), code);
+    files.set(path, original.replace(from, to));
+    let rejected = false;
+    try {
+      validateUpgradeContract(readFile, existsFile);
+    } catch {
+      rejected = true;
+    } finally {
+      files.set(path, original);
+    }
+    assert(rejected, code);
   }
 
   function expectRejectedWith(path, mutated, code) {
@@ -206,7 +253,7 @@ function runSelfTest() {
     files.set(path, mutated);
     let rejected = false;
     try {
-      validateUpgradeContract(read);
+      validateUpgradeContract(readFile, existsFile);
     } catch {
       rejected = true;
     } finally {
@@ -216,47 +263,59 @@ function runSelfTest() {
   }
 
   expectRejected(
-    NEXT_ANDROID_BUILD,
-    "legacyApplicationId = 'ai.vibex.mobile'",
-    "legacyApplicationId = 'ai.vibex.mobile.nsh'",
+    ANDROID_BUILD,
+    "def releasedApplicationId = 'ai.vibex.mobile'",
+    "def releasedApplicationId = 'ai.vibex.mobile.nsh'",
     "self_test_accepted_a_changed_android_application_id"
   );
   expectRejected(
-    NEXT_ANDROID_BUILD,
+    ANDROID_BUILD,
     "return major * 10000000 + minor * 100000 + patch * 1000 + preRank",
     "return major * 100000 + minor * 1000 + patch",
     "self_test_accepted_a_changed_version_code_scheme"
   );
   expectRejected(
-    NEXT_IOS_PROJECT,
+    IOS_PROJECT,
     "PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile\n        PRODUCT_NAME: Vibex",
     "PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.nsh\n        PRODUCT_NAME: Vibex",
     "self_test_accepted_a_changed_ios_bundle_id"
   );
+  expectRejected(
+    IOS_PROJECT,
+    "PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.share",
+    "PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.nsh.share",
+    "self_test_accepted_a_changed_ios_extension_id"
+  );
   // Any entitlement at all breaks the free-account install path, so the
   // checker must reject one being added, not only a stale reference.
   expectRejectedWith(
-    NEXT_IOS_PROJECT,
-    `${files.get(NEXT_IOS_PROJECT)}\n        CODE_SIGN_ENTITLEMENTS: Vibex.entitlements\n`,
+    IOS_PROJECT,
+    `${files.get(IOS_PROJECT)}\n        CODE_SIGN_ENTITLEMENTS: Vibex.entitlements\n`,
     "self_test_accepted_an_entitlement"
   );
   expectRejected(
-    NEXT_APP_MANIFEST,
+    IOS_BUILD,
+    "CURRENT_PROJECT_VERSION=${build_number}",
+    "CURRENT_PROJECT_VERSION=1",
+    "self_test_accepted_a_fixed_ios_build_number"
+  );
+  expectRejected(
+    APP_MANIFEST,
     '"id": "ai.vibex.mobile"',
     '"id": "ai.vibex.mobile.nsh"',
     "self_test_accepted_a_changed_nsh_json_id"
   );
   expectRejected(
-    NEXT_MIGRATION,
+    APP_ROOT,
+    'const APP_ID: &str = "ai.vibex.mobile";',
+    'const APP_ID: &str = "ai.vibex.mobile.nsh";',
+    "self_test_accepted_a_changed_mounted_app_id"
+  );
+  expectRejected(
+    MIGRATION,
     "composer-state.json",
     "composer-state-v2.json",
     "self_test_accepted_a_dropped_legacy_file"
-  );
-  expectRejected(
-    NEXT_IOS_BUILD,
-    'CURRENT_PROJECT_VERSION=${build_number}',
-    'CURRENT_PROJECT_VERSION=1',
-    "self_test_accepted_a_fixed_ios_build_number"
   );
 }
 
@@ -266,7 +325,7 @@ try {
   console.log(
     SELF_TEST
       ? "Mobile upgrade checker self-test passed"
-      : "Mobile upgrade contract verified (application id, versionCode, bundle id, legacy files)"
+      : "Mobile upgrade contract verified (application id, versionCode, bundle ids, build number, legacy files)"
   );
 } catch (error) {
   console.error(error instanceof Error ? error.message : "mobile_upgrade_check_failed");

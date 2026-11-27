@@ -3,7 +3,7 @@
 ## 1. Scope / Trigger
 
 Read this when changing timeline activity identity, details, grouping,
-reasoning preferences, or disclosure motion in `apps/desktop`, `apps/mobile`,
+reasoning preferences, or disclosure motion in `apps/desktop`,
 `apps/mobile-nsh`, or `crates/vibex-tui`.
 Desktop remains the visual and semantic baseline. Mobile adapts it to touch;
 TUI retains character-grid navigation and incremental Markdown rendering.
@@ -222,10 +222,10 @@ are optional, and absent or unknown choices resolve to the shipped default:
 
 - Shared detail tests cover empty snapshots, generic argument targets,
   lossless input copy, unknown envelopes, and failure exit codes.
-- `apps/mobile/src/timeline_tests.rs` drives production turn rendering at
-  phone widths and different rem/scale settings. Assert header bounds, touch
-  and keyboard disclosure, copy independence, capped output height, reasoning
-  tail alignment, and explicit choices across updates.
+- `apps/mobile-nsh/tests/session.rs` and the headless tests beside the session
+  screen drive production turn rendering at phone widths and different text-size
+  steps. Assert header bounds, touch disclosure, copy independence, capped output
+  height, reasoning tail alignment, and explicit choices across updates.
 - `crates/vibex-tui/tests/timeline.rs` drives real projection and rendering:
   mixed counts, visible running/failing rows, cache corrections, search/copy,
   three-level expansion, Unicode/ASCII connector columns, selection after

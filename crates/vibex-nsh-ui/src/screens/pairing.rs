@@ -1,11 +1,10 @@
 //! The pairing page: the phone's front door while no runtime is connected.
 //!
-//! The GPUI client's pairing page (`apps/mobile/src/app.rs`, `render_pairing`)
-//! has three ways in — scan the desktop's QR code, find a runtime on the same
-//! network, or paste a pairing link — plus the runtimes this phone saved
-//! before. The structure, the copy and the spacing are the same here; what
-//! changes is who draws them: `nsh` mounts platform views, so the camera, the
-//! keyboard, the sheets and the scrolling are the platform's.
+//! The GPUI client's pairing page had three ways in — scan the desktop's QR
+//! code, find a runtime on the same network, or paste a pairing link — plus the
+//! runtimes this phone saved before. The structure, the copy and the spacing are
+//! the same here; what changed is who draws them: `nsh` mounts platform views,
+//! so the camera, the keyboard, the sheets and the scrolling are the platform's.
 //!
 //! The page owns only transient view state (which sheet is open, what is
 //! typed). The saved runtimes, their reachability, the claim in flight and its

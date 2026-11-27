@@ -33,15 +33,13 @@ const ASSET_EXTENSIONS = new Set([
   ".woff2"
 ]);
 const GENERATED_ASSET_ROOTS = [
-  resolve(ROOT, "apps/mobile/android/app/src/main/jniLibs"),
-  resolve(ROOT, "apps/mobile/ios/VibexFFI.xcframework"),
-  // A local Gradle build copies the registered Android emoji font into
-  // `app/build/intermediates/.../mergeReleaseAssets/fonts/`. That tree is a
-  // generated output of `apps/mobile/android/app/src/main/assets/fonts`, which
-  // the policy already registers, so counting the copy would report the same
-  // font twice and fail the gate on a developer machine that built an APK.
-  // The build directory is git-ignored, so no packaged input lives here.
-  resolve(ROOT, "apps/mobile/android/app/build")
+  // A local Gradle build copies the app's own assets under `app/build/`, and
+  // the Rust library `scripts/build-ios-host.sh` links lands in
+  // `ios/Frameworks/`. Both are git-ignored outputs of registered inputs, and
+  // counting them would report the same file twice on a developer machine that
+  // has built an APK or an IPA.
+  resolve(ROOT, "apps/mobile-nsh/android/app/build"),
+  resolve(ROOT, "apps/mobile-nsh/ios/Frameworks")
 ];
 
 function fail(message) {
@@ -419,7 +417,9 @@ function auditInputs(policyState, runtime) {
     auditExpression(input.licenseExpression, input.id, policyState);
   }
 
-  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile")];
+  // Every app that ships artwork. The GPUI mobile client that used to carry its
+  // own copies is gone; the nsh client keeps its app icon in `ios/Resources`.
+  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile-nsh")];
   const unregistered = scanRoots
     .filter(existsSync)
     .flatMap(walkFiles)

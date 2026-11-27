@@ -13,14 +13,14 @@ runtime core:
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Full GPUI workbench over the authoritative `DesktopRuntime` |
 | Headless server | `apps/server` | The same `DesktopRuntime` as a daemon (`vibex-server`) for cloud deployment |
-| Native mobile (GPUI) | `apps/mobile` | iOS/Android GPUI remote client and compact GUI composition |
-| Native mobile (nsh) | `apps/mobile-nsh` | iOS/Android Native Shell client: platform views over the same remote projections |
+| Native mobile | `apps/mobile-nsh` | iOS/Android Native Shell client: platform views over the same remote projections |
 | Self-hosted Relay | `apps/relay-server` | Encrypted frame transport only |
 
-The GPUI mobile client is the shipping one until the Native Shell client
-reaches parity screen by screen. Both are clients of the same authority and
-the same projections; neither owns state. A screen may exist in both while it
-migrates, and the pair must share copy, palette and behavior.
+The Native Shell client replaced the GPUI mobile client, which was removed from
+the tree. It is a client of the same authority and the same projections and
+owns no state. Anyone still running the removed build gets this one as an
+in-place update: it keeps that client's application id, bundle ids and signing
+key, and imports its data on first launch.
 
 ## Authority Invariant
 
@@ -120,42 +120,41 @@ theme generation.
   runtime reports) and written with a revision guard; Git status, staging,
   commit, revert, commit detail and branch checkout call the same backend
   contracts the desktop workbench uses.
-- The platform names the phone for pairing (`nativeSetDeviceName` /
-  `vibex_mobile_nsh_set_device_name`), and packaging is `nsh package` behind
-  `apps/mobile-nsh/scripts/build-{android,ios}.sh`.
+- The platform names the phone for pairing (`NshHost.nativeSetDeviceName` /
+  `vibex_mobile_nsh_set_device_name`), and packaging is
+  `apps/mobile-nsh/scripts/build-android-host.sh` and `build-ios-host.sh`, with
+  `package-ios-unsigned-ipa.sh` producing the unsigned device IPA.
 - The UI layer is written to be reusable if the desktop moves to `nsh`'s GPUI
   backend; it must not assume a phone-only composition.
 
-### GPUI mobile client
+### Host boundary
 
-`apps/mobile` is a Rust crate with `cdylib`, `staticlib`, and `rlib` outputs.
-It builds its platform through `apps/mobile/src/platform.rs`, which wraps the
-pinned `gpui-pre-mobile` platform crate:
+`apps/mobile-nsh` is the only mobile client. The Java and Swift hosts are thin
+adapters over what the runtime cannot reach, and everything they own is a seam
+the app calls back through:
 
-- Android enters through `GpuiHostActivity`, a plain `Activity` that owns a
-  `SurfaceView` and hands the surface, input, insets, and lifecycle to
-  `android_host.rs`. `gpui-pre-mobile`'s host entry owns a process-lived render
-  thread, so an Activity the system reclaims is recreated and re-attaches to the
-  same GPUI window instead of trying to build a second platform. `android_main`
-  is exported but never runs: the manifest declares no NativeActivity and no
-  `android.app.lib_name`.
-- The platform keys its windows by a host id the Java host names on every call.
-  Vibex names one constant id, because it shows one fullscreen panel: a
-  recreated Activity returns to the panel it left, with its state, rather than
-  opening a second window. Registering `on_open_window` before the first surface
-  arrives is what builds that window; without it the surface stays undrawn.
-- iOS exports `vibex_mobile_register_app` and `vibex_mobile_set_lifecycle`; the
-  Objective-C host in `apps/mobile/ios/Vibex/main.m` enters `UIApplicationMain`,
-  registers the root view, drives frames, and forwards lifecycle phases.
+- Android enters through `com.longbridge.nsh.MainActivity`, a `singleTask`
+  Activity that hosts the `nsh` view. It owns the camera capture and the QR
+  scanner, the connection foreground service, LAN discovery, the share intake
+  and the APK install hand-off; each one reports back through a
+  `NshHost.native*` method. Every class that declares one of those methods loads
+  `libnsh.so` itself, because a restored scanner Activity can run before the main
+  Activity.
+- iOS enters through `AppDelegate`, which mounts the host view, routes
+  `vibex://share`, registers the quick action and schedules local notifications.
+  `HostBridge` keeps the connection through a `beginBackgroundTask` window; iOS
+  has no foreground service.
+- Both hosts keep the released application identity so a phone still running the
+  removed client takes this one as an update. `apps/mobile-nsh/scripts/check-upgrade.mjs`
+  pins the ids, the versionCode scheme, the iOS build number and the legacy file
+  names; changing one is a release decision, not a rename.
+- `nsh` reports safe areas and keyboard insets to the app as root geometry. The
+  hosts do not compute content rectangles, and no device-specific notch or
+  keyboard constant belongs in a screen.
 
-The checked-in project definitions live under `apps/mobile/android` and
-`apps/mobile/ios`. Generated libraries, XCFramework contents, Xcode projects,
-and APKs are build outputs and are never source dependencies.
-
-GPUI owns platform safe-area and IME inset reporting. The application loads its
-reviewed Latin/CJK fonts before opening the window and applies effective insets
-at the root composition; device-specific notch or keyboard constants do not
-belong in mobile Views.
+The checked-in project definitions live under `apps/mobile-nsh/android` and
+`apps/mobile-nsh/ios` (generated from `ios/project.yml`). Built libraries,
+Xcode projects and APKs are build outputs and are never source dependencies.
 
 ## Remote Data Flow
 
@@ -166,7 +165,7 @@ DesktopRuntime
   -> AutoRemoteTransport
   -> WebRemoteBackend
   -> AgentWorkflowController / shared UI projections
-  -> native mobile GPUI views
+  -> native mobile platform views (nsh)
 ```
 
 Zero-configuration LAN pairing is a separate bootstrap path before that flow:
@@ -304,9 +303,9 @@ approval-pending, and destructive-confirmation states are all first-class.
 ## Dependency Direction
 
 ```text
-apps/desktop -> NativeBackend -> typed domain services -> crates/core
-apps/mobile  -> remote facade -> RemoteGateway -> DesktopRuntime
-Relay        -> encrypted frames only
+apps/desktop    -> NativeBackend -> typed domain services -> crates/core
+apps/mobile-nsh -> remote facade -> RemoteGateway -> DesktopRuntime
+Relay           -> encrypted frames only
 ```
 
 No shared UI module may import a runtime composition root, database, socket,
@@ -349,7 +348,7 @@ directly or introduce a second authority.
 pnpm check:licenses
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
-cargo test -p vibex-mobile --locked
+cargo test -p vibex-mobile-nsh --locked
 pnpm smoke:relay:local
 ```
 

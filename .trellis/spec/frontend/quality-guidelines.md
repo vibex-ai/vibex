@@ -90,33 +90,42 @@ Add tests or story coverage for:
 - Mobile layout for session detail, Git change, terminal, and Provider switch.
 - Dark mode snapshots or visual checks for major screens.
 
-## Scenario: Native Mobile GPUI Contract
+## Scenario: Native Mobile Host Contract
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `apps/mobile`, shared Agent timeline projections, native
-  pairing/storage/input code, or the vendored mobile platform integration.
+- Trigger: changing `apps/mobile-nsh`, `crates/vibex-nsh-ui`, shared Agent
+  timeline projections, or the native pairing/storage/input code.
 - The contract covers Android and iOS source structure and the GUI session
   behavior. It does not require a platform SDK on every development machine.
 
 ### 2. Signatures
 
 ```text
-cargo check -p vibex-mobile --locked
-cargo ndk -t arm64-v8a check -p vibex-mobile --locked
-cargo test -p vibex-mobile --locked
+cargo check -p vibex-mobile-nsh --locked
+cargo test -p vibex-mobile-nsh --locked
 node scripts/check-mobile-native.mjs
 node scripts/check-mobile-native.mjs --self-test
+node apps/mobile-nsh/scripts/check-upgrade.mjs
+node apps/mobile-nsh/scripts/check-upgrade.mjs --self-test
 pnpm build:mobile:android
 pnpm build:mobile:ios
 ```
 
 ### 3. Contracts
 
-- `apps/mobile` is a Rust GPUI crate. Android enters through NativeActivity and
-  `gpui_android`; iOS exports the Rust entry point and uses `gpui_ios`' UIKit
-  loop. No DOM, browser host, or downloaded application bundle is part of the
-  product.
+- `apps/mobile-nsh` is the mobile client: an `nsh` app whose views are the
+  platform's own (Android views, UIKit), with the screens in
+  `crates/vibex-nsh-ui`. The Java and Swift hosts own only what the runtime
+  cannot reach — camera, scanner, notifications, the connection service, LAN
+  discovery, share intake — and reach the library through one JNI/FFI boundary
+  that `scripts/check-mobile-native.mjs` pins. No DOM, browser host, or
+  downloaded application bundle is part of the product.
+- The client keeps the application id, bundle ids, versionCode scheme and
+  signing key of the GPUI client it replaced, so a phone still running that
+  build takes this one as an update and keeps its data. `check-upgrade.mjs`
+  pins all of it; changing any of them is a deliberate release decision, not a
+  rename.
 - The mobile view consumes `AgentWorkflowController` and the shared desktop
   timeline projection. User bubbles, Agent Markdown, process/tool details,
   approval cards, and the composer remain GUI components; a terminal cannot be
@@ -128,17 +137,12 @@ pnpm build:mobile:ios
 - Pairing, route selection, reconnect, and credential storage stay outside View
   rendering. Credentials are validated, atomically persisted, and redacted from
   diagnostics; the PC remains the state authority.
-- Native typography is the platform's own: the interface names GPUI's virtual
-  `.SystemUIFont` (SF on iOS, Roboto on Android) and code surfaces name the
-  platform's monospace family (`Droid Sans Mono` on Android, `Menlo` on iOS), so
-  the phone carries every system weight and the platform's CJK cascade
-  (PingFang, Noto Sans CJK) without bundling a UI face. The one bundled payload
-  is the Android emoji fallback: Noto Color Emoji in its CBDT build at
-  `apps/mobile/android/app/src/main/assets/fonts/NotoColorEmoji.ttf`, which
-  `gpui-mobile` reads when the system emoji font is COLR v1 (Android 13+) and
-  swash cannot rasterize it; dropping the asset leaves every emoji on those
-  devices at `.notdef`. The WenQuanYi TTC under `apps/mobile/assets/fonts` is
-  desktop input only, and it is a **patched** upstream payload: its
+- Native typography is the platform's own: the phone draws with the platform's
+  text engine and system families (SF on iOS, Roboto on Android), so it carries
+  every system weight and the platform's CJK cascade (PingFang, Noto Sans CJK)
+  without bundling a UI face or an emoji font. The WenQuanYi TTC under
+  `apps/desktop/assets/fonts` is desktop input only, and it is a **patched**
+  upstream payload: its
   `MODIFICATIONS.txt` records that 11,390 full-width glyphs — every modern
   Hangul syllable plus the covered extension-A and compatibility ideographs —
   carried a 1/8 em advance against full-em outlines upstream, which collapses
@@ -160,25 +164,18 @@ pnpm build:mobile:ios
   is the one place the default is named, and on Linux it names the bundled
   code family — the same face the `monospace` alias resolves to. A reader's
   choice still wins, and it is installed through `load_selected_font_families`.
-- `Window::insets()` is the only safe-area/IME geometry source. GPUI refreshes
-  the window when platform insets change, and the root composition applies the
-  effective top/right/bottom/left padding.
-- Native text fields explicitly move GPUI focus on touch and request the soft
-  keyboard. Pairing honors the transport encoded in the trusted
+- The phone's safe-area and keyboard geometry come from the platform through
+  `nsh`; the app applies the reported top/right/bottom/left padding and never
+  derives a content rectangle of its own.
+- The phone's text fields are the platform's own (Android `EditText`, UIKit
+  text input through `nsh`'s text engine), so composition, selection, IME
+  actions and the caret are the system's. The app owns the document; it never
+  reimplements an input method or shadows the keyboard height with a guess.
+- Pairing honors the transport encoded in the trusted
   `vibex://open/<transport>` entry instead of silently preferring another route.
-- Android text fields expose a real focusable `View` and non-null
-  `InputConnection` to the IME. Calling `showSoftInput` against NativeActivity's
-  DecorView is not text-input integration. The Java editor is a platform adapter;
-  the focused GPUI input handler remains the document owner and synchronizes text
-  and selection back to that editor.
-- Android `TextWatcher` and selection offsets cross the JNI boundary as UTF-16
-  ranges and are queued onto the GPUI thread before they reach an input handler.
-  Stale ranges are clamped before slicing, and shaped placeholder offsets must
-  never become document offsets when the document is empty.
-- Android platform initialization accepts a replacement `AndroidApp` when an
-  Activity is recreated in the same process and clears pending IME events for the
-  previous Activity. A process-global one-shot Activity handle is invalid for the
-  NativeActivity lifecycle.
+- The Android host Activity is recreated freely: a replacement Activity handle
+  replaces the old one, and pending events addressed to the previous instance
+  are dropped rather than delivered into a dead view.
 - The session page is the center of a three-page horizontal composition. A
   right-moving finger opens the project/session page from the left; a
   left-moving finger opens the workspace-tools page from the right. Both pages
@@ -280,39 +277,36 @@ pnpm build:mobile:ios
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-mobile --locked` covers storage permissions/atomicity and
-  malformed-file removal, secret-redacted `Debug`, UTF-8/UTF-16 IME editing,
-  empty-placeholder hit testing, stale selection clamping, both main-page swipe
-  directions, inverse side-page closing, terminal/cancelled gesture recovery,
-  the menu-button fallback, rendered move/end delivery after an overlay appears,
-  full-viewport travel, snap decisions, Markdown block projection, and route
-  bundle validation.
+- `cargo test -p vibex-mobile-nsh --locked` covers storage atomicity and
+  malformed-file removal, secret-redacted `Debug`, the settings/draft/host
+  migration from the removed client, pairing flows, the theme sync, and route
+  bundle validation. The screens themselves are covered by the headless tests in
+  `crates/vibex-nsh-ui`.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
-- `node scripts/check-mobile-native.mjs --self-test` covers the negative source
-  contract, native entry points, vendored platform dependencies, GUI session
-  markers, and forbidden legacy paths.
-- Android-target compilation must include `gpui_android`; a host-only mobile
-  check cannot validate code behind `cfg(target_os = "android")`. Platform unit
-  tests assert event-time velocity, fling bounds, and frame-rate-independent
-  momentum decay. Mobile GPUI tests assert a non-zero first-frame timeline
-  extent and drawer/timeline scroll isolation.
+- `node scripts/check-mobile-native.mjs --self-test` checks the host contract in
+  both directions: every native method the Java host declares has a Rust export,
+  the manifest keeps the permissions and components those paths need, and the
+  iOS project/plists keep the keys the Swift code reads. `check-upgrade.mjs`
+  pins the application id, versionCode scheme, bundle ids and legacy files.
+- Android-target compilation (`cargo check --target aarch64-linux-android`) must
+  pass; a host-only check cannot validate code behind `cfg(target_os =
+  "android")`.
 - Android and iOS device validation must separately exercise touch/keyboard,
   full-page navigation in both directions, safe-area/IME changes, timeline
   streaming, approval and elicitation resolution, new-session creation,
-  send/stop/continue, reconnect, bundled Latin/CJK text, and credential redaction
-  before a release claim.
-- Android device validation must also inspect the served editor/InputConnection,
-  perform insert/delete/cursor/insert editing, and recreate the Activity at least
-  twice in the same process while checking native and Java crash logs.
+  send/stop/continue, reconnect, and credential redaction before a release
+  claim.
+- Android device validation must also recreate the Activity at least twice in
+  the same process while checking native and Java crash logs.
 
 ### 7. Wrong vs Correct
 
 ```text
 Wrong: copy a terminal screen into mobile, keep a second session reducer, or
        load a remote page at runtime.
-Correct: native GPUI -> shared AgentWorkflowController -> authoritative desktop
-         timeline -> compact GUI cards and composer.
+Correct: native views (nsh) -> shared AgentWorkflowController -> authoritative
+         desktop timeline -> compact GUI cards and composer.
 
 Wrong: stop drawer event propagation and call the scrolling issue fixed while
        Android still ends every pan at `ACTION_UP` and unmeasured Turns have no
@@ -326,73 +320,67 @@ Correct: menu fallback + full-page Sessions <- right swipe - center session -
          left swipe -> full-page workspace tools with internal tabs.
 ```
 
-## Scenario: Android Insets During Rotation
+## Scenario: Phone Safe Areas And The Android Host
 
 ### 1. Scope / Trigger
 
-- Changing Android host callbacks, window geometry, or safe-area handling.
-- A `SurfaceView` resize and the GPUI render-thread resize are asynchronous;
-  either can run before the latest system-bar/cutout inset notification.
+- Changing the Android host Activity, the iOS host view, or anything that
+  depends on where the system bars and the keyboard leave the content.
+- `nsh` owns the window and reports insets to the app as root geometry; the
+  hosts must not compute their own content rectangles.
 
 ### 2. Signatures
 
 ```text
-GpuiHostActivity.nativeInsets(left, top, right, bottom)
-android_insets::report(left, top, right, bottom)
-android_insets::observe(window, cx)
-AndroidWindow::update_safe_area_from_content_rect(left, top, right, bottom)
+Native_rootSize(handle, id, width, height, top, right, bottom, left)
+nsh_view.insets -> the app's safe-area values
 ```
 
 ### 3. Contracts
 
-- The Java/JNI payload contains four **edge distances in physical pixels**,
-  not the corners of a content rectangle derived from the Java view size.
-- JNI publishes the latest value without reading or mutating the GPUI window.
-  Retain notifications that precede window creation and coalesce bursts to
-  the latest value; duplicate reports must not schedule repeated repaints.
-- On the GPUI thread, convert edge distances to the platform's content-rect API
-  using that same window's current physical size, then refresh the GPUI window.
-  Computing the rect and consuming it against different orientations is invalid.
-- The window observer lives with the existing GPUI window across Activity and
-  Surface recreation. Rotation must not rebuild application/session state.
-- Inset-only changes must refresh layout even when no resize or remote event
-  occurs. System-bar and IME insets continue to overlap, not stack.
+- The platform reports **edge distances in density-independent points** for the
+  current window; the app lays out inside them. A host that derives the rect
+  from its own view size and then hands it to a different-width window produces
+  the "inset wider than the viewport" bug, which no amount of waiting fixes.
+- Insets are edge distances, not a content rectangle: bars and the keyboard
+  overlap, they do not stack, and an inset change must refresh layout even when
+  no resize or remote event occurs.
+- The host Activity is `singleTask` with `adjustResize`: a share or pairing link
+  re-enters the running app instead of stacking a second task, and the keyboard
+  shrinks the view rather than covering the composer.
+- Rotation must not rebuild application state; the app process owns the session
+  and the host view is re-attached to it.
 
 ### 4. Validation & Error Matrix
 
 | Condition | Required result |
 | --- | --- |
-| Insets arrive before the window exists | Apply the latest report when the window opens. |
-| Insets arrive before or after a queued rotation | Preserve actual edge distances in both orders. |
-| Portrait → landscape → portrait | Restore usable portrait bounds without stale right/bottom padding. |
-| Repeated equal reports | No additional inset-driven repaint. |
-| Rapid rotation or Activity recreation | Consume current insets; retain the same logical GPUI window. |
-| System bars change without a resize | Refresh root layout. |
+| Insets arrive before the view is laid out | Apply the latest report when the view appears. |
+| Portrait → landscape → portrait | Restore usable portrait bounds with no stale right/bottom padding. |
+| System bars change without a resize | Refresh layout from the new edge distances. |
+| Keyboard opens over the composer | The composer stays above it, and the timeline scrolls to the caret. |
+| A share or pairing link arrives while the app runs | `singleTask` re-enters the Activity through `onNewIntent`, no second task. |
 
 ### 5. Good / Base / Bad Cases
 
-- Good: transmit `bars.right`, then calculate `window_width - bars.right` on
-  the render thread immediately before the platform consumes that rectangle.
+- Good: report `top/right/bottom/left` edge distances and let the app pad itself.
 - Base: first launch and resume restore the platform-reported safe area.
-- Bad: transmit `view_width - bars.right`; consuming that coordinate against a
-  previous landscape width can produce a right inset wider than the portrait
-  viewport. Waiting an arbitrary number of milliseconds does not fix the contract.
+- Bad: transmit `view_width - bars.right`, or let the WebView-era
+  `setDecorFitsSystemWindows` rectangle reach a differently sized window.
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-mobile --lib android_insets::tests --locked` covers both rotation event orders,
-  startup replay, latest-value delivery, and duplicate notifications.
-- `node scripts/check-mobile-native.mjs --self-test` rejects a Java content-rect
-  payload and missing observer/refresh wiring.
-- Build the Android target. On a device, repeat rotations in both directions
-  and inspect native inset/resize logs and compositor dimensions, including
-  return to portrait and a background/foreground cycle.
+- `node scripts/check-mobile-native.mjs --self-test` rejects an Activity that
+  drops `adjustResize`, `singleTask`, or the insets bridge.
+- Build the Android target. On a device, repeat rotations in both directions,
+  open and close the keyboard, and check the composer and the drawer do not sit
+  under the system bars.
 
 ### 7. Wrong vs Correct
 
 ```text
-Wrong: Java view size → content rect → previous GPUI size → oversized padding.
-Correct: Java edge distances → latest-value channel → GPUI size → content rect.
+Wrong: host view size -> content rect -> a differently sized window -> oversized padding.
+Correct: host edge distances -> app layout -> padded content in the current window.
 ```
 
 ## Scenario: Native Mobile QR Pairing Entry
@@ -405,13 +393,12 @@ Correct: Java edge distances → latest-value channel → GPUI size → content 
 ### 2. Signatures
 
 ```text
-scanner::launch() -> BackendResult<()>
-scanner::subscribe() -> UnboundedReceiver<String>
-Android nativeOnPairingQrScanned(value: String) -> ()
-iOS vibex_mobile_pairing_qr_scanned(value: *const char) -> ()
+PairingHost.on_scan -> Action
+host::request_scan() -> HostRequest::Scan
+Android NshHost.nativeScanResult(value: String) -> ()
+iOS vibex_mobile_nsh_scan_result(value: *const char) -> ()
 claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
-Android Activity static initializer -> System.loadLibrary("vibex_mobile")
-initialize_android_tls(AndroidApp) -> application Context registered before GPUI
+Android NshHost static initializer -> System.loadLibrary("nsh")
 ```
 
 ### 3. Contracts
@@ -419,27 +406,24 @@ initialize_android_tls(AndroidApp) -> application Context registered before GPUI
 - An unpaired mobile client opens on a QR pairing surface. The primary action
   launches the platform camera scanner; the screen must not expose a text field
   for pasting the pairing link or secret fragment.
-- Android uses a non-exported camera Activity and iOS uses a full-screen native
-  camera presentation. Both accept only full `vibex://open/<transport>#/pair/...`
+- Android uses a non-exported camera Activity and iOS presents its own scanner
+  view controller. Both accept only full `vibex://open/<transport>#/pair/...`
   entries and leave unrelated QR codes unhandled.
-- Every Android Activity that declares a Java-to-Rust native method explicitly
-  loads `libvibex_mobile.so` in a static initializer. NativeActivity manifest
-  metadata loads the entry library but does not associate Java JNI callbacks
-  with the application ClassLoader. The scanner may be restored directly after
-  process death, so it cannot rely on `GpuiNativeActivity` loading first.
-- The Android package locates the `rustls-platform-verifier` AAR through locked
-  Cargo metadata and initializes it with the application Context before GPUI or
-  remote networking starts. Missing JVM support is a packaging failure, not a
-  reason to weaken TLS verification.
+- Every Android class that declares a Java-to-Rust native method loads
+  `libnsh.so` in a static initializer. The scanner Activity may be restored
+  directly after process death, so it cannot rely on the main Activity loading
+  first; `check-mobile-native.mjs` compares every declared native method with
+  the Rust export.
 - Native callbacks enqueue the opaque link without logging or persisting it.
-  GPUI consumes the result once, then delegates parsing, expiry, selected-route,
-  identity, claim, and credential validation to the existing pairing owner.
+  The app consumes the result once, then delegates parsing, expiry,
+  selected-route, identity, claim, and credential validation to the pairing
+  owner in `crates/vibex-mobile-pairing`.
 - Camera permissions are declared by each platform host. Permission denial or a
   missing camera returns to the pairing screen and never falls back to manual
   secret entry.
-- A successful claim persists only the validated credential bundle through
-  `CredentialStorage`; session/private transport keys retain their existing
-  in-memory and redaction boundaries.
+- A successful claim persists only the validated credential bundle through the
+  app's storage; session/private transport keys keep their in-memory and
+  redaction boundaries.
 
 ### 4. Validation & Error Matrix
 
@@ -447,56 +431,50 @@ initialize_android_tls(AndroidApp) -> application Context registered before GPUI
 | --- | --- |
 | Camera permission denied or camera unavailable | Show a native camera error, dismiss the scanner, and keep the QR pairing screen available. |
 | QR value does not start with `vibex://open/` | Keep scanning; do not forward or log the value. |
-| Pairing offer is malformed, expired, or route-invalid | Existing structured pairing error is shown on the QR pairing screen; no credential is saved. |
+| Pairing offer is malformed, expired, or route-invalid | The structured pairing error is shown on the QR pairing screen; no credential is saved. |
 | Native result callback fires more than once | Consume one pending value and let the pairing busy guard prevent duplicate claims. |
-| An Android Activity declares a native callback without loading `vibex_mobile` | `check-mobile-native` fails; never ship the resulting `UnsatisfiedLinkError` crash path. |
-| Android TLS verifier AAR or application-Context initialization is missing | Native contract/build check fails before device qualification; do not fall back to accepting invalid certificates. |
-| Pairing claim and credential validation succeed | Atomically save the bundle and enter the existing connecting flow. |
+| A host declares a native callback with no Rust export | `check-mobile-native` fails; never ship the `UnsatisfiedLinkError` path. |
+| Pairing claim and credential validation succeed | Atomically save the bundle and enter the connecting flow. |
 
 ### 5. Good / Base / Bad Cases
 
 - Good: scan a Desktop-generated Direct, Tailnet, or self-hosted Relay QR code;
-  the encoded transport reaches `claim_pairing_link` unchanged and pairing uses
-  that route.
+  the encoded transport reaches `claim_pairing_link` unchanged.
 - Good: after process death Android restores the scanner Activity first, loads
   the Rust library, delivers one JNI result, and enters the paired interface.
-- Base: cancel the native scanner and remain on the QR pairing screen with no
-  state or credential mutation.
-- Bad: render `TextInput::new("Paste pairing link", ...)`, log a scanned value,
-  or parse and claim the offer independently in Android/iOS host code.
-- Bad: rely only on `android.app.lib_name`, or assume the main NativeActivity
-  always runs before a secondary Activity invokes its JNI callback.
+- Base: cancel the native scanner and remain on the QR pairing screen.
+- Bad: render a "paste pairing link" text field, log a scanned value, or parse
+  and claim the offer inside the Java/Swift host.
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-mobile --locked` asserts pending scan results are consumed
-  once and retains pairing route, credential validation, storage, and redaction
-  coverage.
-- `node scripts/check-mobile-native.mjs` asserts Android/iOS camera declarations,
-  native result bridges, explicit Android library loading, TLS runtime
-  packaging/initialization, the GPUI scanner queue, and absence of
-  `pairing_input`; its self-test must reject each missing Android bridge.
-- Android/iOS platform builds compile their CameraX/ML Kit and AVFoundation
-  implementations. Device qualification covers allow, deny, cancel, unrelated
-  QR, expired offer, and one successful pairing for every supported route.
+- `cargo test -p vibex-mobile-nsh --locked` asserts pending scan results are
+  consumed once and retains pairing route, credential validation, storage, and
+  redaction coverage.
+- `node scripts/check-mobile-native.mjs` asserts the camera declarations, the
+  native result bridge, library loading, and the absence of a paste field; its
+  self-test must reject each missing bridge.
+- Device qualification covers allow, deny, cancel, unrelated QR, expired offer,
+  and one successful pairing for every supported route.
 
 ### 7. Wrong vs Correct
 
 ```text
-Wrong: manifest library metadata -> restored scanner Activity -> unresolved JNI callback crash.
-Correct: Activity System.loadLibrary -> one-shot GPUI queue -> claim_pairing_link -> validated credential storage.
+Wrong: scanner Activity restored -> JNI callback into an unloaded library -> crash.
+Correct: static initializer -> one-shot result queue -> claim_pairing_link -> validated storage.
 ```
 
 ### Convention: Runtime Switching Uses The Pairing Page
 
-`MobileApp::open_pairing` opens `MobileOverlay::Pairing` directly from the
-project/session footer, Settings, and the unavailable-connection screen. The
-pairing page owns the saved-runtime list and its management actions; do not
-insert a separate runtime-list page before it.
+`screens::pairing::pairing` opens directly from the project/session footer,
+Settings, and the unavailable-connection screen. The pairing page owns the
+saved-runtime list and its management actions; do not insert a separate
+runtime-list page before it.
 
 - Opening this page preserves the active backend, controller, selected session,
-  and composer draft. `RootMode` continues to describe the underlying connection;
-  `is_pairing_visible()` also recognizes the pairing overlay and its child sheets.
+  and composer draft. The screen the app is showing continues to describe the
+  underlying connection, and a pairing visit is tracked alongside it so Back
+  returns to the page it came from.
 - An in-app visit shows a leading Back button. A first-launch pairing page has
   no parent and no Back button. The button and system Back share
   `handle_navigate_back`: dismiss a runtime sheet or pairing fallback first,
@@ -512,7 +490,7 @@ insert a separate runtime-list page before it.
   removing the active runtime retains the existing fallback-selection behavior.
 - Disconnect never deletes a saved runtime. Every Disconnect surface — the
   active runtime's action sheet, the unavailable-connection screen, and
-  Settings — drops the transport through `MobileApp::disconnect_host` and
+  Settings — drops the transport through `PairingHost.on_disconnect` and
   returns to the pairing page with the credential, the runtime list, and the
   active selection untouched. Delete only through the runtime action sheet's
   confirmed Remove, which names the credential it erases.
@@ -521,7 +499,7 @@ insert a separate runtime-list page before it.
 Footer -> pairing -> runtime actions -> details -> Back -> actions -> Back -> pairing -> Back -> footer
 ```
 
-Run `cargo test -p vibex-mobile --locked`, mobile Clippy, and
+Run `cargo test -p vibex-mobile-nsh --locked`, mobile Clippy, and
 `pnpm check:mobile-native`. UI interaction coverage must activate the footer and
 Back button, dispatch the system Back key, preserve backend/session/draft identity,
 and unwind nested runtime sheets to the page that opened pairing. Host tests do
@@ -533,7 +511,7 @@ threads still share those subscribers.
 
 ### Convention: The Connecting Page Wears The Product Lockup
 
-`MobileApp::render_connecting` is the launch-time connection screen and the
+`screens::connecting::connecting` is the launch-time connection screen and the
 post-failure unavailable page; the two states share one renderer and differ only
 in `operation_busy`.
 
@@ -548,14 +526,15 @@ in `operation_busy`.
   ten passes, 0.42 spread, 30 fps cap). The unavailable page is a decision the
   reader has to make, so its lockup is parked on the idle tone — motion there
   would claim a connection attempt that has already failed. Honour
-  `theme::reduce_motion()` and `crate::lifecycle::is_backgrounded()`, the same
-  rule the sidebar activity marks follow.
+  `theme::reduce_motion()` and the app's backgrounded signal, the same rule the
+  sidebar activity marks follow.
 - **The three failure actions lead with a glyph.** Retry, Disconnect and Switch
   host each draw the icon the app already uses for that action elsewhere
   (`rotate-ccw`, `plug-zap`, `chevrons-right-left`), spaced from the label by
   `SPACING_SM`, inside a row that keeps `theme::TOUCH_TARGET` height. Never
-  introduce an icon outside `MobileAssets`; an unregistered path paints nothing
-  without an error.
+  draw an icon outside `crates/vibex-nsh-ui/assets/icons`: `icon!` inlines it at
+  compile time, and a path that is not there fails the build rather than
+  painting nothing.
 
 ### Convention: The Phone's Text Ladder Is Mixed, Not Faded
 
@@ -578,10 +557,10 @@ composited over an already-dim surface**.
 - **The root paints text in the foreground.** A page that chooses no colour
   inherits body text; only rows that are deliberately quiet step down. The shell
   inherited `text_secondary` once and every page turned grey at once.
-- **Measure, do not eyeball.** `apps/mobile/src/theme.rs` carries the contrast
-  helper and the assertions: any new text token joins that table with its floor,
-  in both appearances, or it will regress unnoticed. A rung painted with alpha
-  must be composited over its surface before it is measured.
+- **Measure, do not eyeball.** `crates/vibex-nsh-ui/src/theme.rs` carries the
+  contrast helper and the assertions: any new text token joins that table with
+  its floor, in both appearances, or it will regress unnoticed. A rung painted
+  with alpha must be composited over its surface before it is measured.
 
 
 ## Convention: Panel Results Are Hints, Never In-Panel Strips
@@ -668,19 +647,18 @@ still paints the kit's `Notification`, which is what a touch client wants — th
 close button a pointer reveals on hover is not reachable without one — while the
 desktop card is the workbench's own, with no close control at all.
 
-- Nothing is painted from notice state. `MobileApp` queues notices in
-  `pending_hints` and hands them to the layer once per frame, because the paths
-  that raise them — async completions, platform callbacks, storage failures —
-  run without a window. A page never reads a "current notice" field, so a
-  message cannot outlive the state it described.
+- Nothing is painted from notice state. A screen keeps the message in a signal
+  and reads it reactively (`ui::toast::toast`), so the paths that raise one —
+  async completions, platform callbacks, storage failures — never paint into a
+  page that has already moved on. A page never reads a "current notice" field,
+  so a message cannot outlive the state it described.
 - A hint's text is its identity. Pushing the same message again replaces the
   hint already on screen instead of stacking a copy of it, so a repeating event
   — a connection that keeps dropping — cannot fill the corner with identical
   cards.
-- The layer is bottom-centred and inset-aware. `theme::sync_notification_metrics`
-  recomputes its width and margins from the live window each frame: rotation
-  changes the usable width, and the gesture bar and the software keyboard both
-  arrive as bottom insets that a toast has to clear. Do not fix these at startup.
+- The toast floats under the page's top bar, inset-aware: rotation changes the
+  usable width, and the top inset clears the status bar and the page's own bar.
+  Do not fix its position at startup.
 - Sheet-scoped validation is the one exception, and only while it belongs to a
   field the user is filling in (the runtime sheet's switch failure, the new
   project path prompt). It is dismissible with the surface that owns it.
@@ -688,15 +666,15 @@ desktop card is the workbench's own, with no close control at all.
   abandons the previous backend with requests in flight, and each one fails on
   the socket that just closed; announcing that failure puts a transport message
   about a connection the user already left onto whatever screen replaced it.
-  Gate the answer with `MobileApp::still_connected_to` (or the equivalent
-  active-host check) before applying data or announcing a failure. What the user
+  Gate the answer with the active-host check before applying data or announcing
+  a failure. What the user
   asked for directly is still announced — a send that did not land is worth
   saying — and connection *state* changes are announced once, by the event that
   reports them, not once per in-flight request.
 
-Tests that assert a notice was announced — or that none was — must open their
-window through `add_rooted_window_view`, because the layer lives on the kit's
-`Root`.
+Tests that assert a notice was announced — or that none was — must mount the
+screen that owns the signal, because the toast reads that signal rather than a
+global queue.
 
 
 ## Scenario: Native File Dialog Backend Isolation
@@ -1483,7 +1461,7 @@ push_decl::<FileReadResponse>(&mut output);
 ### 1. Scope / Trigger
 
 - Trigger: anything that changes how Markdown reaches a screen in `apps/desktop` or
-  `apps/mobile` — timeline answers, reasoning rows, plan rows, user message bodies,
+  `apps/mobile-nsh` — timeline answers, reasoning rows, plan rows, user message bodies,
   file previews, release notes — or that changes the shared projections in
   `crates/vibex-ui/src/markdown.rs` or the code workbench's image/link resolution.
 - The renderer is gpui-component's text view (`gpui_base::text::TextView`, exposed

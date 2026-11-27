@@ -3,10 +3,10 @@
 //! `nsh_core::element::background` is `tokio::spawn`, which needs an ambient
 //! runtime; an engine task does not carry one, so a spawn from a press handler
 //! dies with the task and leaves the page waiting on a signal nothing will set.
-//! The GPUI client keeps the same helper for the same reason
-//! (`apps/mobile/src/background_connection.rs`). Pairing, probes and the
-//! session shell's network work run on this runtime, off the engine thread,
-//! and the engine task awaits the returned handle.
+//! The GPUI client the phone shipped before kept the same helper for the same
+//! reason. Pairing, probes and the session shell's network work run on this
+//! runtime, off the engine thread, and the engine task awaits the returned
+//! handle.
 
 use std::sync::OnceLock;
 

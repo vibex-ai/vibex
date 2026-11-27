@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # Packages the unsigned iOS device IPA of the nsh client.
 #
-# Same contract as `apps/mobile/scripts/package-ios-unsigned-ipa.sh` — and the
-# same idea: producing the file needs no Apple account, certificate or
-# provisioning profile, because whoever installs it re-signs it with their own
-# free Apple ID. The bundle id is the GPUI client's (`ai.vibex.mobile`), so a
+# Producing the file needs no Apple account, certificate or provisioning
+# profile, because whoever installs it re-signs it with their own free Apple ID.
+# The bundle id is the one every released build used (`ai.vibex.mobile`), so a
 # re-signed build replaces the installed app instead of landing beside it, and
 # the installer keeps its data. See docs/operations/ios-unsigned-install.md.
 #

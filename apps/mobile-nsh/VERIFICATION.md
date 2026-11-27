@@ -126,5 +126,6 @@ anything that needs a runtime or a phone are listed at the bottom.
   find Swift/API mismatches that nothing here can see.
 - No reachable runtime: pairing, sending, terminal frames, Git and file reads
   are verified against fixtures and types, not a live authority.
-- `apps/mobile` (the GPUI client) is untouched; the Native Shell client is a
-  separate app and shares `crates/vibex-mobile-pairing` with it.
+- The GPUI client (`apps/mobile`) has been removed; this is the only mobile
+  client, and the upgrade path from that build is verified on an emulator (see
+  the upgrade row) but not yet on a phone.

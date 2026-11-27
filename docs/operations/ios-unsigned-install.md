@@ -30,12 +30,12 @@ repository.
 1. Push the workflow to the default branch. `workflow_dispatch` only lists a
    workflow that already exists there.
 2. Open **Actions → Mobile iOS Unsigned IPA → Run workflow**. Leave the version
-   input empty to stamp the version declared in `apps/mobile/Cargo.toml`.
+   input empty to stamp the version declared in `apps/mobile-nsh/Cargo.toml`.
 3. Download `mobile-ios-unsigned-<sha>` from the finished run and unzip it.
 
 The tagged release workflow publishes the same file as
-`vibex-<version>-ios-unsigned.ipa` alongside the XCFramework and the simulator
-bundle, so a release always carries a device artifact.
+`vibex-<version>-ios-unsigned.ipa` alongside the static library and the
+simulator bundle, so a release always carries a device artifact.
 
 ### On a Mac
 

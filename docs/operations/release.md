@@ -310,7 +310,7 @@ variable of the same name), exactly like the desktop updater.
 
   ```bash
   VIBEX_MOBILE_PROFILE=release VIBEX_UPDATE_PUBLIC_KEY=<repository variable> \
-    bash apps/mobile/scripts/build-android.sh
+    bash apps/mobile-nsh/scripts/build-android-host.sh
   ```
 - Settings reach the update section from the drawer footer and from the
   top-right entry on the first pairing screen, so an update can be installed

@@ -2,19 +2,18 @@ plugins {
     id 'com.android.application'
 }
 
-// The nsh client replaces the GPUI one on the same phones, so it keeps the
-// package the GPUI app shipped as (`ai.vibex.mobile`). Android treats a
-// different applicationId as a different app: an update would install beside
-// the old one and leave its data behind, which is exactly the "uninstall the
-// existing app first" prompt this avoids. The Java package stays
-// `ai.vibex.mobile.nsh` (it is `namespace`, not the identity).
-def legacyApplicationId = 'ai.vibex.mobile'
+// The package this app has always shipped as. It was the GPUI client's id
+// before that client was removed; anyone who still has that build installed
+// gets this one as an update instead of a second app, and keeps their data.
+// Do not change it: Android treats a different applicationId as a different
+// app, and the install turns into "uninstall the existing app first" with
+// everything on the phone left behind.
+def releasedApplicationId = 'ai.vibex.mobile'
 
 // The release tag is the source of truth for the version, so the versionCode
-// is derived from the version name the same way the GPUI app derived it: an
-// update installs only when this integer is at least the installed one, and
-// the two clients have to keep agreeing on the formula or the first nsh
-// release silently refuses to replace the GPUI one.
+// is derived from the version name. Android orders installs by this integer
+// alone, and the derivation is the one every released build used, so a new
+// build always outranks the one on the phone.
 def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.9'
 
 def vibexVersionCode = {
@@ -39,9 +38,9 @@ android {
     compileSdk 35
 
     defaultConfig {
-        applicationId legacyApplicationId
-        // The GPUI app's minSdk. A lower one would be harmless, but keeping it
-        // means the same devices that ran the old build can run this one.
+        applicationId releasedApplicationId
+        // The minSdk every released build used: lowering it is harmless, but
+        // raising it would drop phones that already run this app.
         minSdk 28
         targetSdk 35
         versionCode vibexVersionCode
@@ -63,10 +62,10 @@ android {
         release {
             minifyEnabled false
             // No signing config on purpose: the release APK and AAB are signed
-            // by `apps/mobile/scripts/sign-android-release.sh` with the same
-            // key the GPUI releases used. A key mismatch is the other way an
-            // upgrade turns into "uninstall the existing app", so the debug key
-            // must never leak into a release build.
+            // by `scripts/sign-android-release.sh` with the release keystore.
+            // A key mismatch is the other way an upgrade turns into "uninstall
+            // the existing app", so the debug key must never leak into a
+            // release build.
         }
     }
 

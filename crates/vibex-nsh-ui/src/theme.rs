@@ -6,9 +6,9 @@
 //! palette. Names resolve through [`theme`] and are resolved for the current
 //! appearance by `nsh`; a screen reads [`foreground`], never a hex value.
 //!
-//! The spacing, radius and type constants are the phone client's own ladder
-//! (`apps/mobile/src/theme.rs`). They stay here while the GPUI client is still
-//! shipping, so a screen migrated to `nsh` keeps the numbers its pair has.
+//! The spacing, radius and type constants are the phone client's own ladder,
+//! carried over from the GPUI client the phone shipped before. They are shared
+//! by every screen, so a control keeps the numbers its neighbours have.
 
 use std::cell::Cell;
 

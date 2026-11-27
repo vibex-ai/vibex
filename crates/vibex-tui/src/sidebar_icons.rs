@@ -153,13 +153,19 @@ impl Icon {
                 include_bytes!("../../../apps/desktop/assets/icons/circle-question-mark.svg")
             }
             Self::Clock => include_bytes!("../../../apps/desktop/assets/icons/clock.svg"),
-            Self::New => include_bytes!("../../../apps/mobile/assets/icons/plus.svg"),
-            Self::More => include_bytes!("../../../apps/mobile/assets/icons/ellipsis.svg"),
+            Self::New => include_bytes!("../../../crates/vibex-nsh-ui/assets/icons/plus.svg"),
+            Self::More => include_bytes!("../../../crates/vibex-nsh-ui/assets/icons/ellipsis.svg"),
             Self::FolderClosed => include_bytes!("../../../apps/desktop/assets/icons/folder.svg"),
-            Self::FolderOpen => include_bytes!("../../../apps/mobile/assets/icons/folder-open.svg"),
+            Self::FolderOpen => {
+                include_bytes!("../../../crates/vibex-nsh-ui/assets/icons/folder-open.svg")
+            }
             Self::NewFolder => include_bytes!("../../../apps/desktop/assets/icons/folder-plus.svg"),
-            Self::Collapse => include_bytes!("../../../apps/mobile/assets/icons/chevron-down.svg"),
-            Self::Expand => include_bytes!("../../../apps/mobile/assets/icons/chevron-right.svg"),
+            Self::Collapse => {
+                include_bytes!("../../../crates/vibex-nsh-ui/assets/icons/chevron-down.svg")
+            }
+            Self::Expand => {
+                include_bytes!("../../../crates/vibex-nsh-ui/assets/icons/chevron-right.svg")
+            }
         }
     }
 

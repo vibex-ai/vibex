@@ -1,16 +1,16 @@
 # Frontend Development Guidelines
 
-These guidelines define the current Rust GPUI presentation architecture for
-Vibex. `apps/desktop` is the visual and information-architecture baseline.
-`apps/mobile` is a native iOS/Android GPUI client that projects the same Agent
-session model into a compact native surface.
+These guidelines define the current Rust presentation architecture for Vibex.
+`apps/desktop` is the visual and information-architecture baseline.
+`apps/mobile-nsh` is the native iOS/Android client: platform views over the
+shared screen crate, projecting the same Agent session model into a compact
+native surface.
 
 Primary evidence:
 
 - [Architecture Baseline](../guides/architecture-baseline.md)
 - `apps/desktop`
-- `apps/mobile`
-- `apps/mobile/src/platform.rs` and the pinned `gpui-pre-mobile` platform crate
+- `apps/mobile-nsh` and `crates/vibex-nsh-ui`
 
 ## Required Reading Order
 

@@ -39838,7 +39838,7 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-desktop-reviewed-icons:b64c1591a672366d",
+      "bom-ref": "asset:vibex-desktop-reviewed-icons:2900c8ad09aa6e0a",
       "name": "Vibex Desktop GPUI reviewed icon bundle",
       "version": "0.1.1",
       "licenses": [
@@ -39849,7 +39849,7 @@
       "hashes": [
         {
           "alg": "SHA-256",
-          "content": "b64c1591a672366d0797b3c19701097ef502ca32a4ca62f55f455b73b3a3d858"
+          "content": "2900c8ad09aa6e0a8226fbe6639e95086bc1c4b93172100d3c3caa003c49f4d1"
         }
       ],
       "externalReferences": [
@@ -39920,47 +39920,6 @@
     },
     {
       "type": "file",
-      "bom-ref": "asset:vibex-mobile-brand-marks:84a77e160e305979",
-      "name": "Vibex native mobile brand mark",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "AGPL-3.0-or-later"
-        }
-      ],
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "84a77e160e3059796c7edc27494bedef446102b0eeea6f7ce7945836c3d44e2a"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand"
-        }
-      ],
-      "properties": [
-        {
-          "name": "vibex:input-kind",
-          "value": "asset"
-        },
-        {
-          "name": "vibex:asset-root",
-          "value": "apps/mobile/assets/brand"
-        },
-        {
-          "name": "vibex:file-count",
-          "value": "1"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "AGPL-3.0-or-later"
-        }
-      ]
-    },
-    {
-      "type": "file",
       "bom-ref": "asset:vibex-mobile-application-icons:b690a33c976cf781",
       "name": "Vibex native mobile application icons",
       "version": "0.1.1",
@@ -39978,7 +39937,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
+          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset"
         }
       ],
       "properties": [
@@ -39988,7 +39947,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
+          "value": "apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset"
         },
         {
           "name": "vibex:file-count",
@@ -39997,47 +39956,6 @@
         {
           "name": "vibex:selected-license",
           "value": "AGPL-3.0-or-later"
-        }
-      ]
-    },
-    {
-      "type": "file",
-      "bom-ref": "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
-      "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.1",
-      "licenses": [
-        {
-          "expression": "ISC"
-        }
-      ],
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "60418f3d673b6ca667acad363101e46e50f70fce1406535ccee6b9d8964c265c"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/lucide-icons/lucide"
-        }
-      ],
-      "properties": [
-        {
-          "name": "vibex:input-kind",
-          "value": "asset"
-        },
-        {
-          "name": "vibex:asset-root",
-          "value": "apps/mobile/assets/icons"
-        },
-        {
-          "name": "vibex:file-count",
-          "value": "40"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "ISC"
         }
       ]
     },
@@ -40152,7 +40070,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/mobile/assets/fonts/wqy-microhei"
+          "value": "apps/desktop/assets/fonts/wqy-microhei"
         },
         {
           "name": "vibex:file-count",
@@ -40161,47 +40079,6 @@
         {
           "name": "vibex:selected-license",
           "value": "Apache-2.0"
-        }
-      ]
-    },
-    {
-      "type": "file",
-      "bom-ref": "font:vibex-mobile-android-emoji:f1b204593bacbc43",
-      "name": "Noto Color Emoji CBDT bitmap font for the native Android client",
-      "version": "2.042",
-      "licenses": [
-        {
-          "expression": "OFL-1.1"
-        }
-      ],
-      "hashes": [
-        {
-          "alg": "SHA-256",
-          "content": "f1b204593bacbc43ebea2d8d065434d120392be3abf45f705955f8396b6a8d5e"
-        }
-      ],
-      "externalReferences": [
-        {
-          "type": "vcs",
-          "url": "https://github.com/googlefonts/noto-emoji"
-        }
-      ],
-      "properties": [
-        {
-          "name": "vibex:input-kind",
-          "value": "font"
-        },
-        {
-          "name": "vibex:asset-root",
-          "value": "apps/mobile/android/app/src/main/assets/fonts"
-        },
-        {
-          "name": "vibex:file-count",
-          "value": "2"
-        },
-        {
-          "name": "vibex:selected-license",
-          "value": "OFL-1.1"
         }
       ]
     },
@@ -40470,19 +40347,11 @@
       "dependsOn": []
     },
     {
-      "ref": "asset:vibex-desktop-reviewed-icons:b64c1591a672366d",
+      "ref": "asset:vibex-desktop-reviewed-icons:2900c8ad09aa6e0a",
       "dependsOn": []
     },
     {
       "ref": "asset:vibex-mobile-application-icons:b690a33c976cf781",
-      "dependsOn": []
-    },
-    {
-      "ref": "asset:vibex-mobile-brand-marks:84a77e160e305979",
-      "dependsOn": []
-    },
-    {
-      "ref": "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
       "dependsOn": []
     },
     {
@@ -47844,6 +47713,7 @@
         "cargo:sha2@0.10.9:c19b7c6f923b580a",
         "cargo:tokio@1.52.3:c19b7c6f923b580a",
         "cargo:tracing@0.1.44:c19b7c6f923b580a",
+        "cargo:uuid@1.23.3:c19b7c6f923b580a",
         "cargo:vibex-config-switch@0.1.9:15ba9694989d1411",
         "cargo:vibex-core@0.1.9:a1f32ad3e304847a",
         "cargo:vibex-db@0.1.9:b0d5d96e1f6cacc2",
@@ -48090,7 +47960,7 @@
       "ref": "cargo:vibex-desktop@0.1.9:8be20e5fa4f9b6f0",
       "dependsOn": [
         "asset:vibex-desktop-application-icons:6d723c8f201e9676",
-        "asset:vibex-desktop-reviewed-icons:b64c1591a672366d",
+        "asset:vibex-desktop-reviewed-icons:2900c8ad09aa6e0a",
         "cargo:anyhow@1.0.102:c19b7c6f923b580a",
         "cargo:base64@0.22.1:c19b7c6f923b580a",
         "cargo:chrono@0.4.45:c19b7c6f923b580a",
@@ -48383,8 +48253,6 @@
       "ref": "cargo:vibex-ui@0.1.9:5b03b27578a01810",
       "dependsOn": [
         "asset:vibex-mobile-application-icons:b690a33c976cf781",
-        "asset:vibex-mobile-brand-marks:84a77e160e305979",
-        "asset:vibex-mobile-native-icons:60418f3d673b6ca6",
         "cargo:gpui-component@0.11.0:c19b7c6f923b580a",
         "cargo:gpui-fast@0.1.19:c19b7c6f923b580a",
         "cargo:markdown@1.0.0:c19b7c6f923b580a",
@@ -48396,8 +48264,7 @@
         "cargo:vibex-core@0.1.9:a1f32ad3e304847a",
         "cargo:vibex-desktop-model@0.1.9:3eccb8226f5ee757",
         "cargo:vibex-locale@0.1.9:f543b0d548399aaa",
-        "cargo:vibex-terminal-ui@0.1.9:81e25774d4aead5f",
-        "font:vibex-mobile-android-emoji:f1b204593bacbc43"
+        "cargo:vibex-terminal-ui@0.1.9:81e25774d4aead5f"
       ]
     },
     {
@@ -49848,10 +49715,6 @@
     },
     {
       "ref": "font:vibex-desktop-wqy-microhei:9156793900779965",
-      "dependsOn": []
-    },
-    {
-      "ref": "font:vibex-mobile-android-emoji:f1b204593bacbc43",
       "dependsOn": []
     },
     {

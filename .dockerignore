@@ -17,8 +17,8 @@ node_modules/
 coverage/
 dist/
 apps/*/dist/
-apps/mobile/android/
-apps/mobile/artifacts/
+apps/mobile-nsh/android/
+apps/mobile-nsh/artifacts/
 apps/desktop/src-tauri/gen/
 apps/desktop/src-tauri/icons/
 docs/

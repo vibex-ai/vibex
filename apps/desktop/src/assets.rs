@@ -74,7 +74,7 @@ pub const BUNDLED_CODE_FAMILY: &str = "Lilex";
 /// the same bytes embedded twice cost 5 MB in the binary and another copy on
 /// the heap the first time the editor opened.
 pub(crate) const WQY_MICROHEI: &[u8] =
-    include_bytes!("../../mobile/assets/fonts/wqy-microhei/wqy-microhei.ttc");
+    include_bytes!("../assets/fonts/wqy-microhei/wqy-microhei.ttc");
 /// The bundled symbol family, used by the terminal and the code workbench.
 ///
 /// Agent TUIs draw status marks, file icons and arrows from the private-use

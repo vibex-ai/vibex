@@ -2722,9 +2722,9 @@ RemoteMutationContract {
 - `vibex-ui`: revision-conflict tests preserve local and server buffers and
   support explicit reload; shared workbench controllers retain their existing
   capability and stale-completion tests.
-- `vibex-mobile`: native build/tests cover multiline editing, lifecycle
-  confirmations, generation/session fences, runtime defaults/unavailable
-  options, and terminal close confirmation.
+- `vibex-mobile-nsh`: native build/tests cover pairing, reconnect, composer
+  drafts, generation/session fences, runtime defaults/unavailable options, and
+  terminal close confirmation.
 - Required integration gates after contract changes: targeted package tests,
   no-dependency Clippy with warnings denied, `pnpm check:mobile-native`, graph
   and license checks, and the local Relay smoke test.
@@ -3175,7 +3175,7 @@ CredentialStore / ClientIdentityStore
 - `cargo test -p vibex-remote timeline_live_events_use_a_connection_scoped_domain_sequence
   --locked` must prove interleaved session payload sequences remain unchanged
   while their outer domain sequences are contiguous.
-- `cargo check -p vibex-mobile --locked` proves the native mobile transport,
+- `cargo check -p vibex-mobile-nsh --locked` proves the native mobile transport,
   bounded WebSocket channel, storage traits, and shared Backend graph remain
   native-platform-safe.
 - Direct smoke must cover `/api/v2/info` probe without offer consumption,

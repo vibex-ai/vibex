@@ -625,7 +625,7 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing Android signing contract ${required}`);
   }
-  const androidSigningScript = source("apps/mobile/scripts/sign-android-release.sh");
+  const androidSigningScript = source("apps/mobile-nsh/scripts/sign-android-release.sh");
   for (const required of ["apksigner", "zipalign", "jarsigner", "VIBEX_RELEASE_CHANNEL"]) {
     assert(
       androidSigningScript.includes(required),

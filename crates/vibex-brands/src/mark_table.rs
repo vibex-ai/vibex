@@ -42,7 +42,7 @@ const CATALOG_AGENT_BRANDS: &[(&str, Mark)] = &[
 ///
 /// The bytes are the desktop asset pack, included rather than duplicated:
 /// the two clients must draw the same mark, and a second copy on disk is a
-/// second copy to drift. `apps/mobile` bundles them the same way.
+/// second copy to drift. `crates/vibex-nsh-ui` bundles them the same way.
 const MARK_ASSETS: &[(&str, &[u8])] = &[
     ("agents/antigravity.svg", include_bytes!("../../../apps/desktop/assets/icons/agents/antigravity.svg")),
     ("agents/amp-acp.svg", include_bytes!("../../../apps/desktop/assets/icons/agents/amp-acp.svg")),

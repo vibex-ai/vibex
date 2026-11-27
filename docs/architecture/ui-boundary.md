@@ -4,20 +4,19 @@
 
 `.trellis/spec/guides/architecture-baseline.md` is the product and architecture
 authority. `apps/desktop` is the information-architecture and Agent-session
-baseline. `apps/mobile` derives the same session semantics through typed remote
-projections and applies the native compact visual treatment used by Zedra.
+baseline. The mobile client derives the same session semantics through typed
+remote projections and applies the native compact visual treatment used by
+Zedra.
 
 ## Product Boundary
 
 - `apps/desktop` is the complete local GPUI workbench and owns the
   `DesktopRuntime`.
-- `apps/mobile` is a native GPUI iOS/Android client built on the published
-  `gpui-pre` family plus `gpui-pre-mobile`'s Android/iOS platform layer. It is
-  the shipping mobile client until the Native Shell client reaches parity.
-- `apps/mobile-nsh` is the iOS/Android client rebuilt on Native Shell (`nsh`):
+- `apps/mobile-nsh` is the iOS/Android client, built on Native Shell (`nsh`):
   one Rust app whose views are the platform's own (UIKit, Android views), with
-  the UI layer in `crates/vibex-nsh-ui`. It is a client under the same rules as
-  the GPUI client; the two run side by side while screens migrate.
+  the UI layer in `crates/vibex-nsh-ui`. It replaced the GPUI mobile client,
+  which was removed from the tree; anyone still running that build gets this one
+  as an in-place update.
 - Mobile renders a GUI Agent timeline: user messages, Markdown responses,
   process/tool details, approvals, and the composer. It does not replace the
   session page with a terminal UI.
@@ -75,10 +74,8 @@ platform's own.
 node scripts/generate-tokens.mjs
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
-cargo test -p vibex-mobile --locked
 cargo test -p vibex-mobile-nsh --locked   # theme sync + headless pairing flows
 ```
 
 Platform SDK builds are separate validation: Android requires the Android
-SDK/NDK and `cargo-ndk`; iOS requires Xcode, XcodeGen, and the Apple Rust
-targets.
+SDK/NDK; iOS requires Xcode, XcodeGen, and the Apple Rust targets.

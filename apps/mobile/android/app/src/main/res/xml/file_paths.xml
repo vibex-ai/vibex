@@ -1,8 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<!-- The updater stages a verified APK under <filesDir>/updates/<version>/, so
-     that subtree is the only thing the installer-facing provider exposes. -->
-<paths>
-    <files-path
-        name="updates"
-        path="updates/" />
-</paths>

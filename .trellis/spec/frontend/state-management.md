@@ -502,7 +502,7 @@ desktop::locale::resolve_locale(LocaleMode, Option<&str>) -> ResolvedLocale
   non-Chinese fallback.
 - `cargo test -p vibex-desktop locale::tests --locked` covers System versus
   explicit desktop modes.
-- `cargo test -p vibex-mobile --locked` covers deterministic Simplified,
+- `cargo test -p vibex-mobile-nsh --locked` covers deterministic Simplified,
   Traditional, English, and unknown-copy selection.
 - Android/iOS release validation must launch a fresh install under Simplified
   Chinese, Traditional Chinese, English, and one unsupported system language.
@@ -4087,9 +4087,9 @@ return api.desktopUiStateImport(request);
 
 ### 1. Scope / Trigger
 
-- Trigger: Native GPUI desktop and native GPUI mobile need the same Agent timeline,
-  approval, file editor, and Git review behavior over either `NativeBackend` or
-  `WebRemoteBackend`.
+- Trigger: the native desktop and the native mobile client need the same Agent
+  timeline, approval, file editor, and Git review behavior over either
+  `NativeBackend` or `WebRemoteBackend`.
 - The shared controller lives in `vibex-ui`; it may depend on
   `desktop-model` projections but must not depend on `DesktopRuntime`, HTTP
   envelopes, React, or provider-native payloads.
@@ -4231,8 +4231,9 @@ if operation.generation == generation
 
 ### 1. Scope / Trigger
 
-- Trigger: Native GPUI desktop and native GPUI mobile need one recoverable Terminal
-  surface and one compact ManagementCenter over Native/Remote Backend facades.
+- Trigger: the native desktop and the native mobile client need one recoverable
+  Terminal surface and one compact ManagementCenter over Native/Remote Backend
+  facades.
 - Portable ANSI presentation is owned by `vibex-terminal-ui`; PTY/process and
   socket ownership remain in the backend. The shared controller consumes raw
   `TerminalFrameBatch` bytes and never treats provider/config payloads as UI state.

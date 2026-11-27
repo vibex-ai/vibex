@@ -1,16 +1,16 @@
 # Vibex Mobile on Native Shell
 
-The Vibex mobile client, rebuilt on [Native Shell](https://nsh.dev) (`nsh`).
-It replaces `apps/mobile`'s GPUI view layer screen by screen; the rest of
-`apps/mobile` keeps shipping until the last screen moves.
+The Vibex mobile client, built on [Native Shell](https://nsh.dev) (`nsh`). It
+replaced the GPUI mobile client (`apps/mobile`), which has been removed from the
+tree; a phone still running that build takes this one as an in-place update.
 
 ## Why
 
-`apps/mobile` draws its whole surface with GPUI (`gpui-pre-mobile`), including
-text input, selection, scrolling and navigation. On a phone that means the app
-reimplements what the platform already does, and the result feels foreign:
-caret and selection handles, the keyboard, scroll physics and the back gesture
-are drawn by us instead of by iOS and Android.
+The GPUI mobile client drew its whole surface with GPUI (`gpui-pre-mobile`),
+including text input, selection, scrolling and navigation. On a phone that meant
+the app reimplemented what the platform already does, and the result felt
+foreign: caret and selection handles, the keyboard, scroll physics and the back
+gesture were drawn by us instead of by iOS and Android.
 
 `nsh` mounts each platform's own views — UIKit on iOS, Android views on
 Android — over a Rust engine. The same Rust crate runs on both, and the
@@ -193,7 +193,7 @@ ABIs — and still packages a release APK. A store release needs `--keystore`.
 
 ## Upgrading from the GPUI client
 
-This client replaces `apps/mobile` on the same phones, so it keeps that app's
+This client replaced `apps/mobile` on the same phones, so it keeps that app's
 identity: Android `applicationId ai.vibex.mobile` with the same `versionCode`
 scheme, iOS bundle id `ai.vibex.mobile`, and no iOS entitlements (the GPUI
 client had none, and a free Apple ID — how this app is installed — cannot sign
@@ -389,9 +389,9 @@ cargo run -p vibex-mobile-nsh --bin gen-theme
 
 `cargo test -p vibex-mobile-nsh` fails when the checked-in file is stale.
 
-The phone's spacing, radius and type ladder live in `crates/vibex-nsh-ui/src/theme.rs`
-and come from `apps/mobile/src/theme.rs`. The palette is shared with the
-desktop through the token source.
+The phone's spacing, radius and type ladder live in
+`crates/vibex-nsh-ui/src/theme.rs`, carried over from the GPUI client's theme.
+The palette is shared with the desktop through the token source.
 
 ## Parity contract
 

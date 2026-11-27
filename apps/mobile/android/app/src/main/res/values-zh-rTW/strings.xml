@@ -1,9 +1,0 @@
-<?xml version="1.0" encoding="utf-8"?>
-<resources>
-    <string name="remote_connection_channel_name">桌面端連線</string>
-    <string name="remote_connection_channel_description">Vibex 桌面端連線狀態</string>
-    <string name="remote_connection_notification_title">Vibex</string>
-    <string name="remote_connection_notification_body">已連線到桌面端</string>
-    <string name="shortcut_new_session">新增工作階段</string>
-    <string name="shortcut_new_session_long">開始一個新的工作階段</string>
-</resources>

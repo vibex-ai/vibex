@@ -196,16 +196,16 @@ function tgit --wraps git; git --git-dir=(git rev-parse --show-toplevel)/.trelli
 ## 2. Project state
 
 Vibex is a Rust-first, local-first AI coding workbench, `0.1.9`,
-AGPL-3.0-or-later. Two GPUI surfaces share one design system, and a terminal
-client renders the same runtime:
+AGPL-3.0-or-later. A GPUI desktop, a native mobile client and a terminal client
+share one design system and render the same runtime:
 
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| Native mobile | `apps/mobile` | Rust + GPUI with `gpui-pre-mobile` (Android/iOS platform layer) |
+| Native mobile | `apps/mobile-nsh` | Rust on Native Shell (`nsh`): platform views (UIKit, Android) over `crates/vibex-nsh-ui` |
 | Terminal | `apps/tui` | Rust, character grid over the runtime protocol |
 
-Layout: `apps/` (desktop, mobile, tui, relay-server, server) · `crates/` (~25 Rust
+Layout: `apps/` (desktop, mobile-nsh, tui, relay-server, server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
 diagnostics, vibex-ui, vibex-terminal-ui, vibex-tui, ...) · `scripts/` (Node build,
 release, and license tooling) · `.trellis/` (workflow, spec, tasks).
@@ -224,8 +224,8 @@ desktop / mobile / remote:
 - Shared UI contracts and projections live in `crates/vibex-ui`; the desktop app is
   not compiled as the mobile app.
 - Relay is transport, not a second database or state authority.
-- There is no WebUI/PWA product. `apps/mobile` is a native GPUI client and Relay
-  and Desktop packages never host mobile application assets.
+- There is no WebUI/PWA product. `apps/mobile-nsh` is the native mobile client
+  and Relay and Desktop packages never host mobile application assets.
 
 Toolchain: Rust 1.99.1 (pinned by `rust-toolchain.toml`), edition 2024,
 Node.js 22, pnpm 11.3.0 (pinned by `package.json`).

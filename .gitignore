@@ -2,18 +2,16 @@
 node_modules/
 dist/
 apps/*/dist/
-apps/mobile/android/.gradle/
-apps/mobile/android/**/build/
-apps/mobile/android/local.properties
-apps/mobile/android/app/src/main/jniLibs/
-apps/mobile/ios/*.xcodeproj/
-apps/mobile/ios/VibexFFI.xcframework/
+apps/mobile-nsh/android/.gradle/
+apps/mobile-nsh/android/**/build/
+apps/mobile-nsh/android/local.properties
+apps/mobile-nsh/android/app/src/main/jniLibs/
 # The nsh iOS host: the project is generated from `ios/project.yml`, and the
 # static library `scripts/build-ios-host.sh` merges land in `ios/Frameworks/`.
 apps/mobile-nsh/ios/*.xcodeproj/
 apps/mobile-nsh/ios/Frameworks/
 apps/mobile-nsh/ios/.xcodegen/
-apps/mobile/artifacts/
+apps/mobile-nsh/artifacts/
 crates/core/bindings/
 *.tsbuildinfo
 .idea/

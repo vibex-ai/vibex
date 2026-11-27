@@ -5,17 +5,16 @@ repository does not maintain copied, patched, or shimmed third-party source tree
 beyond two reviewed exceptions: the small first-party `gpui-tokio` bridge and the
 vendored Android IME host.
 
-## Scenario: Published gpui-pre And gpui-kit With A Git-Pinned gpui-pre-mobile
+## Scenario: Published GPUI And nsh Crates, No Forked Platform Layer
 
 ### 1. Scope / Trigger
 
 - Trigger: changing `Cargo.lock`, bumping the `gpui-pre` family, bumping the
-  gpui-kit family, bumping `gpui-pre-mobile`, or changing a third-party
-  license decision.
-- GPUI arrives from three sources: the published `gpui-pre` family on crates.io
-  (zed snapshots), the published gpui-kit crates on crates.io, and
-  `gpui-pre-mobile` pinned to a Git revision for the Android/iOS platform layer.
-  Glue with no published equivalent lives in this workspace.
+  gpui-kit family, bumping `nsh`, or changing a third-party license decision.
+- Both front ends arrive from crates.io: the `gpui-pre` family and the gpui-kit
+  crates for the desktop, and the `nsh` family for the mobile client. Nothing in
+  the graph is a Git pin or a vendored tree. Glue with no published equivalent
+  lives in this workspace.
 
 ### 2. Signatures
 
@@ -32,21 +31,20 @@ gpui-base = "0.9.1"
 ```
 
 ```toml
-# apps/mobile/Cargo.toml
-[target.'cfg(any(target_os = "android", target_os = "ios"))'.dependencies]
-gpui-mobile = { package = "gpui-pre-mobile", git = "https://github.com/<reviewed-gpui-mobile-remote>", rev = "<pinned-gpui-mobile-rev>" }
+# Cargo.toml (workspace dependencies)
+nsh-core = { version = "0.7.0", default-features = false, features = ["svg"] }
+nsh-base = { version = "0.7.0", default-features = false, features = ["term", "editor", "highlight"] }
 ```
 
 ```text
 crates/gpui-tokio/                    first-party copy of zed's gpui_tokio (no published crate)
-apps/mobile/src/platform.rs           the only place that builds the mobile Platform
-apps/mobile/android/app/src/main/java/dev/gpui/mobile/GpuiInputActivity.java
-                                      vendored IME host; package and class names are the JNI contract
 Cargo.lock                            one Vibex workspace lockfile
 cargo metadata --locked --format-version 1
 pnpm check:licenses                   SPDX, asset, SBOM, and notice gate
 pnpm check:rust                       locked fmt/check/clippy/test gate
-pnpm check:mobile-native              native mobile crate and project contract
+pnpm check:mobile-native              mobile host contract (JNI exports, manifest, iOS project)
+apps/mobile-nsh/scripts/check-upgrade.mjs
+                                      released application id, bundle ids, versionCode scheme
 ```
 
 ### 3. Contracts
@@ -54,36 +52,20 @@ pnpm check:mobile-native              native mobile crate and project contract
 - The `gpui-pre` family resolves from crates.io at the exact `=0.3.12` pins. Do not
   reintroduce a `[patch.crates-io]` block that redirects it to a local fork, and do
   not rename a fork to satisfy the version constraint.
-- `gpui-pre-mobile` resolves from its pinned Git revision; the pin moves only with
-  a reviewed dependency-source change, never as a floating branch.
-- gpui-kit 0.9.1 pins `gpui-pre =0.3.12`, and Cargo cannot hold two exact pins in
-  the same `0.3` range, so the mobile platform layer must accept 0.3.12 or the
-  workspace does not resolve at all. Upstream `longbridge/gpui-mobile` still pins
-  `=0.3.10` at its latest revision `7548ebc`, so the pin names the reviewed
-  `PeatBoy/gpui-mobile` revision `d8945a8`: upstream `7548ebc` plus the 0.3.12
-  version bump, the re-vendored 0.3.12 `gpui-pre-wgpu` with the headless/offscreen
-  patch re-applied, and the `WgpuContext::new` call sites the renderer API moved
-  (adapter selection now tests the surface configuration the renderer will use).
-  That branch is proposed upstream as `longbridge/gpui-mobile#56`. The revision is
-  a commit hash, so its contents are fixed by the pin; when the pull request
-  lands, the pin returns to upstream at the merge commit and this paragraph names
-  that revision instead. Keep `scripts/check-mobile-native.mjs` carrying
-  whichever revision is pinned.
-- Do not take the 0.3.12 support from a fork that also carries API the published
-  `gpui-pre` does not have. `longbridge/gpui-mobile` can resolve a revision from
-  a fork network (`de6527f`, which reaches `Bombatomica64/gpui-mobile`), but its
-  Android module imports `TextInputPurpose` and reads
-  `TextInputConfiguration::purpose`, and neither exists in the crates.io
-  `gpui-pre 0.3.12`. That revision compiles only against that fork's own
-  `gpui-pre` patch, which the source policy forbids here. Verify a candidate
-  revision against the published crate before pinning it.
+- The mobile client's framework is the published `nsh` family on crates.io at
+  `0.7.0`. It is not a Git pin, a fork, or a vendored tree: a bump moves the
+  workspace requirements and `Cargo.lock` together, and nothing in this
+  repository patches it. A behaviour that only a fork provides is not a reason
+  to add one; upstream it or do without.
 - `crates/gpui-tokio` is the only first-party copy of upstream Rust code. It is a
   verbatim copy of zed's Apache-2.0 `gpui_tokio` with re-pointed dependency
   coordinates, kept because no `gpui-pre-tokio` package exists. Keep it verbatim;
   changes belong upstream.
-- The vendored Android IME host is the only copied third-party source tree. Its
-  Java package (`dev.gpui.mobile`) and class names are referenced by
-  `#[no_mangle]` JNI exports, so renaming or relocating it breaks the keyboard.
+- The mobile hosts' Java and Swift are first-party, not vendored third-party
+  source. Their package and class names are part of the JNI/FFI contract
+  (`ai.vibex.mobile.nsh.NshHost`, `com.longbridge.nsh.MainActivity`), so moving
+  one renames a symbol the other side exports; `scripts/check-mobile-native.mjs`
+  compares the two.
 - The gpui-kit family resolves from crates.io on caret requirements, so a patch
   release is picked up by `cargo update` within the reviewed lockfile. Move a
   pin only with a reviewed dependency-source change; do not vendor or patch the
@@ -96,12 +78,10 @@ pnpm check:mobile-native              native mobile crate and project contract
   regenerated license outputs together.
 - A gpui-kit bump is not complete until the kit surfaces Vibex bridges are
   re-verified: `crates/vibex-ui`'s `component_palette` test fails when the kit
-  adds or removes a color token the bridge does not map, and
-  `scripts/check-mobile-native.mjs` carries the reviewed `gpui-pre-mobile`
-  revision, so both move in the same change as the manifest.
-- A `gpui-pre` bump is not complete until the two hand-written platform adapters
-  compile against the new snapshot, because nothing on the default host target
-  reaches them:
+  adds or removes a color token the bridge does not map.
+- A `gpui-pre` bump is not complete until the hand-written platform adapter
+  compiles against the new snapshot, because nothing on the default host target
+  reaches it:
   - `apps/desktop/src/platform/bounded_text.rs` implements `Platform` by
     delegation, so every method the snapshot adds must be forwarded there. The
     0.3.9 bump added `on_displays_changed`; 0.3.11 added `platform_info` (which
@@ -109,20 +89,12 @@ pnpm check:mobile-native              native mobile crate and project contract
     0.3.12 adds no trait method: `Platform`, `PlatformWindow` and the other
     platform traits are unchanged, and the snapshot's work is in image decoding
     (animated WebP) and element internals.
-  - `apps/mobile/src/android_host.rs` is `cfg(target_os = "android")`, and the
-    Android build needs an NDK the quality gates do not require. 0.3.9 changed
-    `gpui-pre-mobile`'s Android host entry from a process-global surface
-    (`surface_created(window, scale)`, `surface_destroyed()`, `resumed()`,
-    `paused()`) to one keyed by a `HostId`, and split window construction out
-    into `on_open_window`, which must be registered before the first surface
-    arrives. `apps/mobile/Cargo.toml` carries the reviewed revision and
-    `scripts/check-mobile-native.mjs` asserts the registration.
-- Moving the `gpui-pre-mobile` pin can move crates outside the GPUI family: the
-  platform layer pins `libc = "=0.2.189"` for the iOS targets, and because Cargo
-  cannot hold two exact requirements inside one compatible range, that exact pin
-  reaches the whole graph. The 0.3.9 move left `libc` where the lock already had
-  it, but a package that needs a newer `libc` fails to resolve rather than
-  silently diverging. Review the whole lockfile diff, not just the `gpui-*` rows.
+- An `nsh` bump is not complete until the mobile host still matches the
+  framework: `cargo check -p vibex-mobile-nsh --target aarch64-linux-android`
+  compiles the JNI module the desktop gates skip, and
+  `scripts/check-mobile-native.mjs` re-reads the Java/Swift hosts against the
+  exports. The `nsh` crates are published, so the lockfile is the only record of
+  which version shipped.
 - No other tracked `vendor/` tree, Git submodule, local third-party path patch,
   compatibility shim, or copied upstream source is approved.
 - Use crates.io packages unmodified unless the user explicitly approves a new
@@ -139,13 +111,12 @@ pnpm check:mobile-native              native mobile crate and project contract
 | A `[patch.crates-io]` entry redirects `gpui-pre*` to a path | Reject the change: the tree must not carry a renamed GPUI fork. |
 | `cargo metadata` resolves two `gpui-pre` versions | Reject: every GPUI consumer must share one version. |
 | `gpui-base` resolves to a different version than `gpui-component` | Reject: the motion types a `Plot::hover` implementation passes would not unify with the kit's. |
-| `apps/mobile` resolves a `vendor/zed` path dependency | `pnpm check:mobile-native` fails. |
-| The `gpui-pre-mobile` revision in `apps/mobile/Cargo.toml` moves without `scripts/check-mobile-native.mjs` | `pnpm check:mobile-native` fails; the reviewed revision and the checker move together. |
-| The `gpui-pre-mobile` pin names a revision that does not accept the pinned `gpui-pre` | `cargo metadata` fails to resolve the graph; review the pin before changing anything else. |
+| A mobile or desktop manifest resolves a `vendor/zed` path dependency | `pnpm check:mobile-native` fails for the mobile tree; the desktop keeps `crates/gpui-tokio` as its only copy. |
+| A mobile host class or native method is renamed on one side only | `pnpm check:mobile-native` fails; the JNI symbol and the Java declaration must move together. |
 | A `gpui-pre` snapshot adds a `Platform` or `PlatformWindow` method | The delegating adapter in `apps/desktop/src/platform/bounded_text.rs` fails to compile on the host target; forward the method there. |
-| A `gpui-pre-mobile` bump changes the Android host entry | `pnpm check:rust` still passes, because `android_host.rs` is `cfg(target_os = "android")` and nothing on the host target compiles it. Type-check it against the Android target before committing; see the Tests Required section. |
+| An `nsh` bump changes the Android host entry | `pnpm check:rust` still passes, because `src/platform/android.rs` is `cfg(target_os = "android")` and nothing on the host target compiles it. Type-check it against the Android target before committing; see the Tests Required section. |
 | A gpui-kit bump adds or removes a color token the palette bridge does not map | `cargo test -p vibex-ui` fails on `the_bridge_covers_every_framework_token`. |
-| The vendored `GpuiInputActivity` package or class name changes | `pnpm check:mobile-native` fails; the JNI export would no longer match. |
+| The Android host package or class name changes | `check-mobile-native` fails; the JNI export names the package, so both sides have to move. |
 | An unapproved or missing SPDX selection enters the graph | `pnpm check:licenses` fails; do not silently broaden the policy. |
 | A font or icon asset moves between trees | Update the policy `assetInputs`/`fontInputs` count and tree hash in the same change; see [Audited Asset Provenance Pin](#scenario-audited-asset-provenance-pin-and-generated-license-artifacts). |
 | A workspace crate is added or removed | The license graph approves it from `license.workspace`, but the SBOM and the notices stay stale until `node scripts/check-licenses.mjs --write` runs. |
@@ -158,12 +129,9 @@ pnpm check:mobile-native              native mobile crate and project contract
   `pnpm check:mobile-native`, and `pnpm check:licenses`.
 - Base: ordinary development uses `--locked`; neither the crates.io pins nor the
   Git revision pin move automatically.
-- Base: the `gpui-pre-mobile` pin names a `longbridge/gpui-mobile` revision that
-  accepts the pinned `gpui-pre`; the manifest and
-  `scripts/check-mobile-native.mjs` name the same revision. While upstream lags
-  the pinned `gpui-pre`, the pin names the reviewed `PeatBoy/gpui-mobile`
-  revision carrying the version bump that is open upstream as
-  `longbridge/gpui-mobile#56`.
+- Base: the mobile framework is the published `nsh` family, so a bump is a
+  version change plus a reviewed lockfile; the hosts' JNI/FFI contract is
+  re-checked against it before the bump lands.
 - Base: a non-GPUI dependency changes the root lock without moving any pin; no
   source-policy review is needed.
 - Bad: fork zed again and publish it under the `gpui-pre` name so the version
@@ -176,14 +144,14 @@ pnpm check:mobile-native              native mobile crate and project contract
 
 - `cargo metadata --locked --format-version 1` resolves successfully with exactly
   one `gpui-pre` version in the graph.
-- `pnpm check:mobile-native` verifies the mobile manifest pins, the platform
-  facade, and the vendored IME host.
-- A `gpui-pre` or `gpui-pre-mobile` bump type-checks `apps/mobile/src/android_host.rs`
-  for an Android target, not only the host target the quality gates cover. With
-  no NDK installed, compile that file from a scratch crate that includes it by
-  `#[path]`, supplies its `crate::` imports, and stubs the crates whose C
-  dependencies need the NDK; a build of the pre-bump file must fail against the
-  new platform layer, or the harness proves nothing.
+- `pnpm check:mobile-native` verifies every native method the Java host declares
+  has a Rust export, and that the manifest and iOS project keep the surface those
+  paths need.
+- An `nsh` bump type-checks `apps/mobile-nsh/src/platform/android.rs` for an
+  Android target, not only the host target the quality gates cover. With no NDK
+  installed, `cargo check -p vibex-mobile-nsh --target aarch64-linux-android`
+  after setting the target linker is enough; a bump that changes the JNI surface
+  also fails `check-mobile-native`.
 - `cargo test -p vibex-ui` proves the palette bridge still covers every color
   token the resolved gpui-kit version defines.
 - `pnpm check:rust` accepts an empty reviewed future-incompatibility allowlist and
@@ -348,15 +316,15 @@ bytes, `\0`.
 - A new workspace crate inherits `license.workspace` and needs no new license
   decision, but it is absent from the SBOM and the notices until `--write` runs.
 - `--write` is idempotent: a second run produces no further diff.
-- The unregistered-asset scan covers source-owned trees only. Generated build
-  outputs — `apps/mobile/android/app/src/main/jniLibs`,
-  `apps/mobile/android/app/build`, and `apps/mobile/ios/VibexFFI.xcframework` —
-  are excluded by `GENERATED_ASSET_ROOTS`, because they are copies of inputs the
-  policy already pins (Gradle's `mergeReleaseAssets/fonts/` copy of the Android
-  emoji font, the packaged native libraries). Pinning a copy would either
-  double-count the same bytes or demand a second policy entry for a file nobody
-  authored; add a new root to that list only when the directory is build output,
-  never to make a real source asset disappear.
+- The unregistered-asset scan covers the two shipping apps —
+  `apps/desktop` and `apps/mobile-nsh` — plus `crates/vibex-nsh-ui/assets`,
+  where the mobile screens' icons live. Generated build outputs
+  (`apps/mobile-nsh/android/app/build` and `apps/mobile-nsh/ios/Frameworks`) are
+  excluded by `GENERATED_ASSET_ROOTS`, because they are copies of inputs the
+  policy already pins. Pinning a copy would either double-count the same bytes or
+  demand a second policy entry for a file nobody authored; add a new root to that
+  list only when the directory is build output, never to make a real source
+  asset disappear.
 
 ### 4. Validation & Error Matrix
 
@@ -422,7 +390,7 @@ git commit -m "chore(licenses): refresh the SBOM"
 ```bash
 # 1. What actually drifted since the pin was last written?
 git log -1 --format=%H -- docs/licenses/desktop-policy.json
-git diff --name-status <that-commit> HEAD -- apps/mobile/assets/icons
+git diff --name-status <that-commit> HEAD -- apps/mobile-nsh/ios/Resources/Assets.xcassets
 
 # 2. Review each listed file against the provenance its entry declares.
 # 3. Write the count and digest the failure reported into both pin fields.

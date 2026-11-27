@@ -141,10 +141,9 @@ if [[ -n "${VIBEX_MOBILE_VERSION:-}" ]]; then
     gradle_args+=("-PvibexVersion=${VIBEX_MOBILE_VERSION}")
 fi
 "$GRADLE" -q :app:assembleRelease :app:bundleRelease "${gradle_args[@]}"
-# The release build is unsigned on purpose: `apps/mobile/scripts/
-# sign-android-release.sh` signs it with the same key the GPUI client's
-# releases used, which is the other half of an in-place upgrade (a different
-# signing key is as fatal as a different application id).
+# The release build is unsigned on purpose: `scripts/sign-android-release.sh`
+# signs it with the release keystore, which is the other half of an in-place
+# upgrade (a different signing key is as fatal as a different application id).
 apk="$android/app/build/outputs/apk/release/app-release-unsigned.apk"
 [[ -f "$apk" ]] || {
     echo "error: Gradle did not produce $apk" >&2

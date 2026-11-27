@@ -374,10 +374,10 @@ jobs:
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
-    # Publishes the nsh client (`apps/mobile-nsh`), which replaces the GPUI one
-    # and keeps its applicationId, versionCode scheme and signing key so an
-    # installed GPUI build upgrades in place. Packaging is still opt-in until
-    # that client has shipped once: set the repository variable
+    # Publishes the nsh client (`apps/mobile-nsh`), the only mobile client in
+    # the tree. It keeps the applicationId, versionCode scheme and signing key
+    # of the GPUI client it replaced, so a phone still running that build gets
+    # this one as an update. Set the repository variable
     # VIBEX_MOBILE_RELEASES_ENABLED to true to publish Android and iOS.
     if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
@@ -474,7 +474,7 @@ jobs:
           VIBEX_ANDROID_KEY_ALIAS: ${{ vars.VIBEX_ANDROID_KEY_ALIAS || 'vibex' }}
           VIBEX_RELEASE_CHANNEL: ${{ needs.release-meta.outputs.channel }}
         run: |
-          bash apps/mobile/scripts/sign-android-release.sh \
+          bash apps/mobile-nsh/scripts/sign-android-release.sh \
             apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk \
             apps/mobile-nsh/android/app/build/outputs/bundle/release/app-release.aab \
             target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk \
@@ -500,8 +500,8 @@ jobs:
     name: Mobile iOS release artifact
     needs: release-meta
     # See mobile-android: the Apple packages follow the same switch, and the
-    # nsh host keeps the GPUI client's bundle ids so a re-signed IPA replaces
-    # the installed app instead of landing beside it.
+    # bundle ids are the ones every released build used, so a re-signed IPA
+    # replaces the installed app instead of landing beside it.
     if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15

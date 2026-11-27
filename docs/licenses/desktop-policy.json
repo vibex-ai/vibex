@@ -6,7 +6,7 @@
   "gplFallbackDisposition": {
     "status": "activated",
     "activated": true,
-    "rationale": "Vibex is licensed AGPL-3.0-or-later and uses the published gpui-pre family (a snapshot of zed) whose tracing packages are GPL-3.0-or-later, plus gpui-pre-mobile, which is tri-licensed and consumed under AGPL-3.0-or-later.",
+    "rationale": "Vibex is licensed AGPL-3.0-or-later and uses the published gpui-pre family (a snapshot of zed) whose tracing packages are GPL-3.0-or-later. The mobile client's nsh crates are consumed under their published permissive terms.",
     "activationGate": "GPL-3.0-or-later remains limited to the published gpui-pre tracing family; any additional copyleft family requires explicit allowlist review."
   },
   "allowedLicenses": [
@@ -151,7 +151,7 @@
         ".svg"
       ],
       "expectedFileCount": 237,
-      "treeSha256": "b64c1591a672366d0797b3c19701097ef502ca32a4ca62f55f455b73b3a3d858",
+      "treeSha256": "2900c8ad09aa6e0a8226fbe6639e95086bc1c4b93172100d3c3caa003c49f4d1",
       "licenseExpression": "AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks",
       "source": "https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons",
       "licenseEvidence": "84 Lucide SVGs (ISC); 15 SVG Logos and 3 Simple Icons SVGs (CC0-1.0); 1 Material Icon Theme, 1 VSCode Icons SVG, and 1 Ant Design icon (MIT); 1 Vibex mark and 2 drawn interface icons (AGPL-3.0-or-later); 30 Agent brand SVGs from the Agent Client Protocol registry and official vendor sources; 59 OpenRouter model/provider brand SVGs vectorized from the OpenRouter model catalog and linked provider marks; 24 provider marks from the LobeHub static icon set (MIT), redistributed as monochrome vectors; several monochrome provider marks redrawn from the same vendors' public logos for theme-paintable use. All vendor brand marks are third-party marks: brand names and marks remain the property of their respective owners.",
@@ -235,25 +235,11 @@
       "licenseEvidence": "First-party Vibex artwork. The icon-macos-*.png renditions derive from the same Vibex app icon as icon.png and only place that artwork on the macOS app icon grid: an 824x824 body on a 1024x1024 canvas with the platform corner radius, which the packaged macOS bundle needs because macOS draws an app icon exactly as provided."
     },
     {
-      "id": "vibex-mobile-brand-marks",
-      "name": "Vibex native mobile brand mark",
-      "version": "0.1.1",
-      "ownerPackage": "vibex-ui",
-      "root": "apps/mobile/assets/brand",
-      "extensions": [
-        ".svg"
-      ],
-      "expectedFileCount": 1,
-      "treeSha256": "84a77e160e3059796c7edc27494bedef446102b0eeea6f7ce7945836c3d44e2a",
-      "licenseExpression": "AGPL-3.0-or-later",
-      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/assets/brand"
-    },
-    {
       "id": "vibex-mobile-application-icons",
       "name": "Vibex native mobile application icons",
       "version": "0.1.1",
       "ownerPackage": "vibex-ui",
-      "root": "apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset",
+      "root": "apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset",
       "extensions": [
         ".json",
         ".png"
@@ -261,22 +247,7 @@
       "expectedFileCount": 19,
       "treeSha256": "b690a33c976cf781364eabd7d3a7d8e376164d4616a1a0f435c8a56e2687cee5",
       "licenseExpression": "AGPL-3.0-or-later",
-      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Vibex/Assets.xcassets/AppIcon.appiconset"
-    },
-    {
-      "id": "vibex-mobile-native-icons",
-      "name": "Vibex native mobile Lucide controls",
-      "version": "0.1.1",
-      "ownerPackage": "vibex-ui",
-      "root": "apps/mobile/assets/icons",
-      "extensions": [
-        ".svg"
-      ],
-      "expectedFileCount": 40,
-      "treeSha256": "60418f3d673b6ca667acad363101e46e50f70fce1406535ccee6b9d8964c265c",
-      "licenseExpression": "ISC",
-      "source": "https://github.com/lucide-icons/lucide",
-      "licenseEvidence": "The native mobile toolbar controls are derived from Lucide SVG paths and redistributed under the Lucide ISC license."
+      "source": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset"
     }
   ],
   "fontInputs": [
@@ -317,7 +288,7 @@
       "name": "WenQuanYi Micro Hei desktop CJK fallback",
       "version": "0.2.0-beta",
       "ownerPackage": "vibex-desktop",
-      "root": "apps/mobile/assets/fonts/wqy-microhei",
+      "root": "apps/desktop/assets/fonts/wqy-microhei",
       "extensions": [
         ".ttc",
         ".txt"
@@ -326,27 +297,7 @@
       "treeSha256": "915679390077996520e0ee7e7d048cd5ee7475d28bd406c0e9fa1e9c31cc7b86",
       "licenseExpression": "Apache-2.0",
       "source": "https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/",
-      "licenseEvidence": "Upstream 0.2.0-beta (SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212), accompanied by the complete Apache-2.0 license. Every full-width glyph in the upstream TTC declares a 256/2048 em advance while drawing full-em ink, which draws all Korean syllables on top of each other; the payload here carries a repaired hmtx that gives all 11,390 of those glyphs their em advance (Hangul syllables, CJK compatibility ideographs, CJK extension A). No outlines, cmap or naming data changed. It is embedded by the desktop shell and its image editor; the native mobile client draws CJK from the platform's own fonts and no longer carries it."
-    },
-    {
-      "id": "vibex-mobile-android-emoji",
-      "name": "Noto Color Emoji CBDT bitmap font for the native Android client",
-      "version": "2.042",
-      "ownerPackage": "vibex-ui",
-      "root": "apps/mobile/android/app/src/main/assets/fonts",
-      "files": [
-        "NotoColorEmoji.ttf",
-        "OFL.txt"
-      ],
-      "extensions": [
-        ".ttf",
-        ".txt"
-      ],
-      "expectedFileCount": 2,
-      "treeSha256": "f1b204593bacbc43ebea2d8d065434d120392be3abf45f705955f8396b6a8d5e",
-      "licenseExpression": "OFL-1.1",
-      "source": "https://github.com/googlefonts/noto-emoji",
-      "licenseEvidence": "Noto Color Emoji 2.042 in its CBDT/CBLC bitmap build, the only colour-emoji format swash can rasterize. gpui-mobile's Android platform reads this exact APK asset path when the system emoji font is COLR v1 (Android 13+) and otherwise logs \"no compatible emoji font loaded - emoji glyphs may not render\". Copyright 2022 Google Inc.; the complete SIL Open Font License 1.1 text ships beside the font. The reviewed binary is the asset carried by the gpui-mobile example pack, unchanged across the revisions this workspace pins (`7548ebc` and the `0.3.12` bump built on it); its embedded name table identifies noto-emoji 20231129 and its SHA-256 is c2f19f6a404baa7da7a710b018c2892d7b51386983ddca146811f76aea0b6861."
+      "licenseEvidence": "Upstream 0.2.0-beta (SHA-256 e4bca8df123ce01b104780f576ea1a58b9a5ff1662a91124b6d3180cb6c88212), accompanied by the complete Apache-2.0 license. Every full-width glyph in the upstream TTC declares a 256/2048 em advance while drawing full-em ink, which draws all Korean syllables on top of each other; the payload here carries a repaired hmtx that gives all 11,390 of those glyphs their em advance (Hangul syllables, CJK compatibility ideographs, CJK extension A). No outlines, cmap or naming data changed. It is embedded by the desktop shell and its image editor, which is the only consumer."
     },
     {
       "id": "vibex-desktop-nerd-symbols",

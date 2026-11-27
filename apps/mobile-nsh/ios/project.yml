@@ -26,14 +26,12 @@ targets:
     platform: iOS
     sources:
       - path: Vibex
+      # `Resources/Assets.xcassets` (the app icon, reviewed under
+      # `vibex-mobile-application-icons` in `docs/licenses/desktop-policy.json`)
+      # comes in with this directory.
       - path: Resources
         excludes:
           - Info.plist
-      # The app icon is the shipping artwork already reviewed under
-      # `vibex-mobile-application-icons` in `docs/licenses/desktop-policy.json`;
-      # copying it here would register a second provenance input for the same
-      # files. It moves into this directory when the GPUI client goes away.
-      - path: ../../mobile/ios/Vibex/Assets.xcassets
     settings:
       base:
         PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile
@@ -44,12 +42,11 @@ targets:
         # iPhone only: the scanner and the composer are laid out for a phone,
         # as the Android host is.
         TARGETED_DEVICE_FAMILY: "1"
-        # No entitlements on purpose. The GPUI client had none either, and the
-        # install path for this app is re-signing the unsigned IPA with a free
-        # Apple ID, which cannot sign a managed capability such as App Groups.
-        # Asking for one would break both the upgrade in place and the free
-        # install, for a share handoff that a `vibex://share?text=…` URL does
-        # without any entitlement.
+        # No entitlements on purpose. The install path for this app is
+        # re-signing the unsigned IPA with a free Apple ID, which cannot sign a
+        # managed capability such as App Groups. Asking for one would break both
+        # the upgrade in place and the free install, for a share handoff that a
+        # `vibex://share?text=…` URL does without any entitlement.
         SWIFT_OBJC_BRIDGING_HEADER: Vibex/Vibex-Bridging-Header.h
         HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
         # The Rust static library (`libvibex_mobile_nsh.a`, built by

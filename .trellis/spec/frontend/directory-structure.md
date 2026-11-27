@@ -19,10 +19,13 @@ crates/vibex-remote-client/
   src/                   Remote adapter, sync, Direct/Relay transports
 apps/desktop/
   src/                   NativeBackend and DesktopRuntime composition
-apps/mobile/
-  src/                   Native GPUI app, input, pairing, storage, Markdown view
-  android/                Checked-in NativeActivity Gradle project
-  ios/                    XcodeGen project and Objective-C host
+apps/mobile-nsh/
+  src/                   nsh app entry, pairing, storage, host bridge, migration
+  android/                Checked-in Gradle project (Java host, nsh view)
+  ios/                    XcodeGen project, Swift host and share extension
+crates/vibex-nsh-ui/
+  src/                    Mobile screens, panels and compact composition
+  assets/icons/           The icon set the mobile screens draw
 apps/relay-server/
   src/                   User-self-hosted zero-knowledge Relay service
 ```
@@ -35,8 +38,9 @@ apps/relay-server/
   projections and capability-gated actions.
 - `shell` owns layout/navigation only; it does not duplicate domain behavior per
   platform.
-- `apps/mobile` owns platform bootstrap and compact composition, not a second
-  protocol or state authority.
+- `apps/mobile-nsh` owns platform bootstrap and compact composition, and
+  `crates/vibex-nsh-ui` owns the screens; neither is a second protocol or state
+  authority.
 
 ## State Boundaries
 

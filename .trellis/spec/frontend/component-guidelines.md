@@ -34,7 +34,8 @@ Keep layout state explicit and serializable enough for persistence or restore.
 
 ### Compact Right Rail
 
-The mobile right rail (`apps/mobile/src/workbench.rs`) is the drawer that hosts
+The mobile right rail (`crates/vibex-nsh-ui/src/screens/session/tree.rs` and the
+workspace panels in `crates/vibex-nsh-ui/src/screens`) is the drawer that hosts
 Files, Git, and Terminal. It owns its entire header, and the drawer that carries
 it must not draw a second one: a duplicate title row costs a phone a whole band
 of height to repeat the tab that is already selected, and it leaves two controls

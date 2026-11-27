@@ -195,9 +195,10 @@ embeds the other product's assets.
 
 ## Mobile Packaging Rules
 
-- `apps/mobile` contains the source-owned Android and iOS project definitions.
-- Rust is built as a shared library for Android and a static library packaged in
-  an XCFramework for iOS.
+- `apps/mobile-nsh` contains the source-owned Android and iOS project
+  definitions; it is the only mobile client in the tree.
+- Rust is built as a shared library for Android and as a static library for
+  iOS, which the Xcode project links.
 - Build outputs (`jniLibs`, XCFramework contents, APKs, and Xcode projects) are
   ignored and must be regenerated from the exact source identity.
 - Mobile release validation must exercise the GUI Agent timeline, pairing,
