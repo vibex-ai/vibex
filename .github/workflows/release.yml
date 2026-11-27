@@ -377,9 +377,10 @@ jobs:
     # Publishes the nsh client (`apps/mobile`), the only mobile client in
     # the tree. It keeps the applicationId, versionCode scheme and signing key
     # of the GPUI client it replaced, so a phone still running that build gets
-    # this one as an update. Set the repository variable
-    # VIBEX_MOBILE_RELEASES_ENABLED to true to publish Android and iOS.
-    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
+    # this one as an update. Mobile packaging runs by default on every tag
+    # push; set the repository variable VIBEX_MOBILE_RELEASES_ENABLED to false
+    # only as an opt-out switch when a mobile host is temporarily unbuildable.
+    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
@@ -499,10 +500,11 @@ jobs:
   mobile-ios:
     name: Mobile iOS release artifact
     needs: release-meta
-    # See mobile-android: the Apple packages follow the same switch, and the
-    # bundle ids are the ones every released build used, so a re-signed IPA
-    # replaces the installed app instead of landing beside it.
-    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
+    # See mobile-android: the Apple packages run by default and follow the
+    # same opt-out switch, and the bundle ids are the ones every released build
+    # used, so a re-signed IPA replaces the installed app instead of landing
+    # beside it.
+    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false' }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
     timeout-minutes: 120

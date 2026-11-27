@@ -37,9 +37,9 @@ done
 
 build_staticlib() {
     local triple="$1"
-    echo "building libvibex_mobile.a for $triple"
-    cargo rustc -p vibex-mobile --target "$triple" --lib --crate-type staticlib "${flags[@]}"
-    local lib="target/$triple/$profile_dir/libvibex_mobile.a"
+    echo "building libvibex_mobile.a for $triple" >&2
+    cargo rustc -p vibex-mobile --target "$triple" --lib --crate-type staticlib "${flags[@]}" >&2
+    local lib="$here/../../target/$triple/$profile_dir/libvibex_mobile.a"
     [[ -f "$lib" ]] || {
         echo "error: $lib was not produced" >&2
         exit 1

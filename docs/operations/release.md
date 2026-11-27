@@ -204,20 +204,19 @@ Android and iOS packaging ships with every release again. The phone client was
 ported off the `gpui-pre-mobile` platform layer onto Native Shell, so it no
 longer links a second `gpui` beside the desktop's `gpui-fast`; `apps/mobile` is
 the only mobile client in the tree and `pnpm check:mobile-native` is part of the
-preflight. Both mobile jobs are gated on the repository variable
-`VIBEX_MOBILE_RELEASES_ENABLED`, which **must be `true` before the tag is
-pushed** — a release cut with it unset silently ships without the phone
-packages, the Downloads table omits the Android and iOS rows, and the signed
-updater manifest drops its Android entry. That switch exists so a release can
-still be cut when a mobile host is temporarily unbuildable; it is not the
-shipping state.
+preflight. Both mobile jobs run by default on every tag push. The repository variable
+`VIBEX_MOBILE_RELEASES_ENABLED` acts only as an explicit opt-out switch: when
+unset (or anything other than `false`), Android and iOS build and ship with
+the release; setting it to `false` skips both mobile jobs, omits the Android
+and iOS rows from the Downloads table, and drops the Android entry from the
+signed updater manifest so a release can still be cut if a mobile host is
+temporarily unbuildable.
 
 The gate is fail-safe in one direction only: a mobile job that was skipped does
 not hold the release, but a mobile job that actually ran and failed still does.
 The publish job treats `skipped` as acceptable and `failure` as fatal, and
-`check-release` pins that pair. `scripts/check-release.mjs` also pins the switch
-itself, so removing it from the workflow fails the preflight rather than
-quietly turning mobile packaging back on.
+`check-release` pins both the default-on opt-out condition
+(`VIBEX_MOBILE_RELEASES_ENABLED != 'false'`) and the skipped-job handling.
 
 The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
 

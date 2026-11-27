@@ -347,15 +347,17 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing ${required}`);
   }
-  // Mobile packaging is opt-in while the phone client is ported to gpui-fast.
-  // The switch and the publish job's tolerance for a skipped mobile job are one
-  // mechanism: dropping either half from the workflow would silently publish
-  // without testing it, or withhold the whole release again.
+  // Mobile packaging runs by default on tag pushes, with
+  // VIBEX_MOBILE_RELEASES_ENABLED == 'false' as an explicit opt-out switch.
+  // The opt-out switch and the publish job's tolerance for a skipped mobile
+  // job are one mechanism: keep mobile on by default (never opt-in on `== 'true'`)
+  // while still letting an explicit opt-out ship desktop and server releases.
   assert(
-    releaseWorkflow.includes("VIBEX_MOBILE_RELEASES_ENABLED") &&
+    (releaseWorkflow.match(/vars\.VIBEX_MOBILE_RELEASES_ENABLED != 'false'/gu) ?? []).length === 2 &&
+      !releaseWorkflow.includes("vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true'") &&
       releaseWorkflow.includes("needs.mobile-android.result == 'skipped'") &&
       releaseWorkflow.includes("needs.mobile-ios.result == 'skipped'"),
-    "publish workflow lost the mobile-release switch or its skipped-job handling"
+    "publish workflow must run mobile builds by default with VIBEX_MOBILE_RELEASES_ENABLED != 'false' and skipped-job handling"
   );
   // The APK is the one mobile artifact the signed updater manifest insists on,
   // so that requirement has to follow the same switch. Demanding it
