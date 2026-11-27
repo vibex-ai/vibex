@@ -91,9 +91,9 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
     private func open(_ url: URL) {
         guard url.scheme == "vibex" else { return }
         if url.host == "share" {
-            // The share extension's ping: it wrote the text to the App Group
-            // container, and the app takes it now.
-            ShareIntake.takePending()
+            // The share extension's handoff: the text rides in this URL (or,
+            // when it was too long, on the pasteboard it names).
+            ShareIntake.take(from: url)
             return
         }
         url.absoluteString.withCString { vibex_mobile_nsh_scan_result($0) }
@@ -119,12 +119,6 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 
     // MARK: - Lifecycle
 
-    func applicationDidBecomeActive(_ application: UIApplication) {
-        // A share can also land while the app is already running in the
-        // background, where no URL is opened for it.
-        ShareIntake.takePending()
-    }
-
     func applicationDidEnterBackground(_ application: UIApplication) {
         bridge?.didEnterBackground()
     }
@@ -143,5 +137,5 @@ final class AppDelegate: UIResponder, UIApplicationDelegate {
 /// The quick action types the app registers, and answers.
 enum Shortcut {
     /// "New session": open the new-session composer.
-    static let newSession = "ai.vibex.mobile.nsh.new-session"
+    static let newSession = "ai.vibex.mobile.new-session"
 }

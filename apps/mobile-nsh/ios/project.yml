@@ -36,7 +36,7 @@ targets:
       - path: ../../mobile/ios/Vibex/Assets.xcassets
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.nsh
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile
         PRODUCT_NAME: Vibex
         INFOPLIST_FILE: Resources/Info.plist
         GENERATE_INFOPLIST_FILE: NO
@@ -44,7 +44,12 @@ targets:
         # iPhone only: the scanner and the composer are laid out for a phone,
         # as the Android host is.
         TARGETED_DEVICE_FAMILY: "1"
-        CODE_SIGN_ENTITLEMENTS: Vibex.entitlements
+        # No entitlements on purpose. The GPUI client had none either, and the
+        # install path for this app is re-signing the unsigned IPA with a free
+        # Apple ID, which cannot sign a managed capability such as App Groups.
+        # Asking for one would break both the upgrade in place and the free
+        # install, for a share handoff that a `vibex://share?text=…` URL does
+        # without any entitlement.
         SWIFT_OBJC_BRIDGING_HEADER: Vibex/Vibex-Bridging-Header.h
         HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
         # The Rust static library (`libvibex_mobile_nsh.a`, built by
@@ -93,11 +98,10 @@ targets:
           - Info.plist
     settings:
       base:
-        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.nsh.share
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.share
         PRODUCT_NAME: VibexShare
         INFOPLIST_FILE: VibexShare/Info.plist
         GENERATE_INFOPLIST_FILE: NO
-        CODE_SIGN_ENTITLEMENTS: VibexShare.entitlements
         APPLICATION_EXTENSION_API_ONLY: YES
         SKIP_INSTALL: YES
     dependencies:

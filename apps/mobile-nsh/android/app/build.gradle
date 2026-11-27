@@ -2,22 +2,71 @@ plugins {
     id 'com.android.application'
 }
 
+// The nsh client replaces the GPUI one on the same phones, so it keeps the
+// package the GPUI app shipped as (`ai.vibex.mobile`). Android treats a
+// different applicationId as a different app: an update would install beside
+// the old one and leave its data behind, which is exactly the "uninstall the
+// existing app first" prompt this avoids. The Java package stays
+// `ai.vibex.mobile.nsh` (it is `namespace`, not the identity).
+def legacyApplicationId = 'ai.vibex.mobile'
+
+// The release tag is the source of truth for the version, so the versionCode
+// is derived from the version name the same way the GPUI app derived it: an
+// update installs only when this integer is at least the installed one, and
+// the two clients have to keep agreeing on the formula or the first nsh
+// release silently refuses to replace the GPUI one.
+def vibexVersionName = project.findProperty('vibexVersion') ?: '0.1.9'
+
+def vibexVersionCode = {
+    def matcher = (vibexVersionName =~ /^(\d+)\.(\d+)\.(\d+)(?:-(preview|rc)\.(\d+))?$/)
+    if (!matcher.matches()) {
+        throw new GradleException("cannot derive an Android versionCode from '${vibexVersionName}'")
+    }
+    def major = matcher[0][1] as int
+    def minor = matcher[0][2] as int
+    def patch = matcher[0][3] as int
+    def channel = matcher[0][4]
+    def sequence = matcher[0][5] ? (matcher[0][5] as int) : 0
+    if (sequence > 99) {
+        throw new GradleException("prerelease sequence ${sequence} in '${vibexVersionName}' overflows the versionCode")
+    }
+    def preRank = channel == null ? 999 : (channel == 'rc' ? 500 : 100) + sequence
+    return major * 10000000 + minor * 100000 + patch * 1000 + preRank
+}()
+
 android {
     namespace 'ai.vibex.mobile.nsh'
     compileSdk 35
 
     defaultConfig {
-        applicationId 'ai.vibex.mobile.nsh'
-        minSdk 26
+        applicationId legacyApplicationId
+        // The GPUI app's minSdk. A lower one would be harmless, but keeping it
+        // means the same devices that ran the old build can run this one.
+        minSdk 28
         targetSdk 35
-        versionCode 1
-        versionName '0.1.9'
+        versionCode vibexVersionCode
+        versionName vibexVersionName
+
+        // A release ships one ABI so the download stays a download; a local
+        // build packages every library the host script produced, so the
+        // emulator and a phone both run from the same APK.
+        def abis = (project.findProperty('vibexAbis') ?: '')
+            .split(',')
+            .collect { it.trim() }
+            .findAll { !it.isEmpty() }
+        if (!abis.isEmpty()) {
+            ndk { abiFilters(*abis) }
+        }
     }
 
     buildTypes {
         release {
             minifyEnabled false
-            signingConfig signingConfigs.debug
+            // No signing config on purpose: the release APK and AAB are signed
+            // by `apps/mobile/scripts/sign-android-release.sh` with the same
+            // key the GPUI releases used. A key mismatch is the other way an
+            // upgrade turns into "uninstall the existing app", so the debug key
+            // must never leak into a release build.
         }
     }
 

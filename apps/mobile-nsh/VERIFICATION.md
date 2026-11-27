@@ -52,13 +52,14 @@ anything that needs a runtime or a phone are listed at the bottom.
 | Host request queue (legacy) | `src/host.rs`, `src/platform/*` | `host_requests_are_taken_once_in_order` | unit | no longer used by the app; kept for a shell that supplies its own scan/discovery |
 | Device name | `src/host.rs`, platform entry points | `a_platform_device_name_is_kept_when_usable` | unit | name shown in the runtime's paired-device list |
 | Platform embedding | `android/` host, `src/platform/android.rs` | compiled and run on the emulator | Android host mounts the app | iOS host (no Xcode) |
-| iOS host shell | `ios/Vibex`, `ios/VibexShare`, `src/platform/ios.rs` | Swift syntax; `cargo check`/`clippy` for `aarch64-apple-ios`; `tests/ios_host_abi.rs` (header = exports = Swift calls, request branches, App Group) | none: no Xcode here | mount, rotate, background/foreground, signing |
+| iOS host shell | `ios/Vibex`, `ios/VibexShare`, `src/platform/ios.rs` | Swift syntax; `cargo check`/`clippy` for `aarch64-apple-ios`; `tests/ios_host_abi.rs` (header = exports = Swift calls, request branches, share handoff, bundle id) | none: no Xcode here | mount, rotate, background/foreground, signing |
 | iOS camera attachment | `ios/Vibex/CameraCapture.swift`, `attach_camera_photo` | ABI + branch checks | none | take a photo into the composer, HEIC/JPEG, permission refusal |
-| iOS share intake | `ios/VibexShare`, `ios/Vibex/ShareIntake.swift` | syntax; the App Group agrees on both sides and in both entitlements | none | share text/a link from Safari and Notes, cold start included |
+| iOS share intake | `ios/VibexShare`, `ios/Vibex/ShareIntake.swift` | syntax; both sides name the same URL scheme, host and query keys, and no entitlement is declared | none | share text/a link from Safari and Notes, cold start included, long text via the pasteboard |
 | iOS quick action | `ios/Vibex/AppDelegate.swift` | branch check (`vibex_mobile_nsh_new_session`) | none | long-press the icon and start a new session |
 | iOS background | `ios/Vibex/HostBridge.swift`, `take_connection_service` | ABI + branch checks | none | backgrounding mid-turn, and what the app shows when the assertion expires |
 | iOS notifications | nsh's `notifications`, `vibex_mobile_nsh_install_notifications` | install called before `attach` (checked) | none | permission prompt, a press from a cold start opens the session |
-| Packaging | `scripts/build-{android,ios}.sh` | `bash -n` | syntax only | `nsh package`, signing, store upload |
+| Packaging | `scripts/build-{android,ios}-host.sh`, `scripts/package-ios-unsigned-ipa.sh` | `bash -n`; `scripts/check-upgrade.mjs` pins the application id, versionCode scheme, bundle ids and legacy file names | Android release APK built and inspected locally | signing, store upload, installer re-sign |
+| Upgrade over the GPUI client | `src/migration.rs`, `android/app/build.gradle`, `ios/project.yml` | 8 unit tests for the two data layouts and the settings/draft/host imports; the upgrade checker; **emulator: the old 0.1.0-rc.10 APK installed, then the new one installed over it (same id, versionCode 100510 → 109999), first launch imported the old settings and draft into `storage.json`, a second launch after restoring the old file imported nothing** | emulator (Android) | the same on a phone with a real release key; the iOS path on a Mac |
 
 ## Device pass, in order
 
@@ -83,7 +84,11 @@ anything that needs a runtime or a phone are listed at the bottom.
 9. **Theme**: switch the system appearance; check safe areas and the keyboard.
 10. **Host**: camera scan, nearby discovery, and the device name in the
     runtime's paired-device list.
-11. **Package** both apps and install them from the signed artifacts.
+11. **Upgrade**: install the previous release (the GPUI client or an earlier
+    nsh build with the same id), then install this one over it — no uninstall
+    prompt, no second icon — and check that the paired runtime, the appearance,
+    the language and an unsent draft are still there on first launch.
+12. **Package** both apps and install them from the signed artifacts.
 
 ## P1 additions since the first matrix
 

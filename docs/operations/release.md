@@ -202,22 +202,49 @@ built from the verified tag.
 
 Android and iOS packaging is opt-in while the mobile client is ported to the
 backend the desktop runs on. The desktop, the TUI, `vibex-server` and the
-container images build against `gpui-fast`; `apps/mobile` still builds through
-the `gpui-pre-mobile` platform layer, so a phone build links two different
-`gpui` crates and cannot compile. Both mobile jobs are gated on the repository
-variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the jobs are skipped,
-the publish job still releases the desktop, headless server and container
-artifacts, and the Downloads table simply omits the Android and iOS rows. The
-signed updater manifest drops its Android entry with them, because the APK is
-required only from a release that packaged the phone client; a phone keeps
+container images build against `gpui-fast`; the shipping phone client is
+`apps/mobile-nsh`, which replaces the GPUI one and is packaged by its own hosts
+(`apps/mobile-nsh/android`, `apps/mobile-nsh/ios`). Both mobile jobs are gated on
+the repository variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the
+jobs are skipped, the publish job still releases the desktop, headless server and
+container artifacts, and the Downloads table simply omits the Android and iOS
+rows. The signed updater manifest drops its Android entry with them, because the
+APK is required only from a release that packaged the phone client; a phone keeps
 installing whatever build it already runs until packaging returns. A mobile job
-that does run and fails still holds the release. Set the variable to
-`true` once the platform layer is ported, and gate that release on
+that does run and fails still holds the release. Set the variable to `true` once
+the nsh client is ready to ship, and gate that release on
 `pnpm check:mobile-native` again.
+
+The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
+
+- **Android** keeps `applicationId ai.vibex.mobile` and derives `versionCode`
+  from the version name with the GPUI client's scheme
+  (`major*10000000 + minor*100000 + patch*1000 + rank`, rank 999 for a release),
+  so `0.1.9` is `109999`. An installed GPUI build is replaced, not duplicated.
+  The release job prints the built APK's id and versionCode and refuses to sign
+  one that does not reach the version it ships as.
+- **iOS** keeps `CFBundleIdentifier ai.vibex.mobile` for the app (the share
+  extension is `ai.vibex.mobile.share`), so a re-signed IPA updates in place.
+  Neither target declares an entitlement, which is what keeps a free Apple ID
+  able to sign it.
+- **Data** carries over. `apps/mobile-nsh/src/migration.rs` reads the GPUI
+  client's `remote-hosts.json`, `remote-credentials.json`,
+  `client-identity.json`, `app-settings.json` and `composer-state.json` from
+  where that client wrote them (the top of the Android files directory,
+  `Application Support/Vibex` on iOS), imports them once into the nsh store, and
+  leaves the old files alone.
+- **Signing** has to match on Android as well: the same release keystore signs
+  both clients, because Android enforces signing-key continuity on top of the
+  applicationId.
+
+`apps/mobile-nsh/scripts/check-upgrade.mjs` (part of `pnpm check:mobile-native`)
+pins the ids, the versionCode derivation and the legacy file list against the
+GPUI client's build files, so a change that would break the upgrade fails before
+a release is built.
 
 Android and iOS are built independently from the desktop package. Tagged
 releases publish signed Android APK/AAB files plus an unsigned iOS simulator
-app, an unsigned iOS device IPA, and the XCFramework as GitHub Release
+app, an unsigned iOS device IPA, and the Rust static library as GitHub Release
 artifacts. Android signing credentials stay in GitHub Actions secrets and are
 never checked into the repository.
 
@@ -228,14 +255,15 @@ pnpm package:mobile:ios
 ```
 
 The Android release job installs the checked-in Gradle wrapper, Android API 35,
-and a pinned NDK on the free Ubuntu runner, then aligns and verifies the APK
-with `apksigner` and signs the AAB with `jarsigner`. RC and preview releases
-fall back to an ephemeral CI key when no repository key is configured; stable
-releases fail until a release keystore is configured. The iOS job runs on a free
-GitHub-hosted macOS runner, installs XcodeGen, builds both Apple Rust targets,
-performs a code-signing-disabled simulator build, and packages the unsigned
-device IPA. No Apple account, certificate, or provisioning profile is involved
-anywhere in that job: the installer re-signs the IPA with their own Apple ID.
+and a pinned NDK on the free Ubuntu runner, builds the nsh host's arm64 slices,
+then aligns and verifies the APK with `apksigner` and signs the AAB with
+`jarsigner`. RC and preview releases fall back to an ephemeral CI key when no
+repository key is configured; stable releases fail until a release keystore is
+configured. The iOS job runs on a free GitHub-hosted macOS runner, installs
+XcodeGen, builds both Apple Rust targets, performs a code-signing-disabled
+simulator build, and packages the unsigned device IPA. No Apple account,
+certificate, or provisioning profile is involved anywhere in that job: the
+installer re-signs the IPA with their own Apple ID.
 `.github/workflows/mobile-ios-unsigned.yml` builds the same IPA on demand for a
 commit that is not a release tag. See
 [Installing the Unsigned iOS Build](./ios-unsigned-install.md).
@@ -270,6 +298,12 @@ variable of the same name), exactly like the desktop updater.
   the only new platform surface. Because the app is not distributed through
   Google Play, the sideload flow carries no store policy constraint; a Play
   build would have to use Play In-App Updates instead.
+- The nsh client's Settings → "Check for updates" reads the latest GitHub
+  release and hands its APK to the same installer through the same provider; it
+  does not verify the signed manifest yet. The install still cannot come from
+  anything but this project: Android enforces the applicationId, the
+  versionCode and the signing key, which is also what makes the upgrade in
+  place work.
 - A build without the verification key still shows the version and the update
   row, but states that update checks are not enabled and offers no action.
   Export the key when building locally to exercise the real flow:

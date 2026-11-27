@@ -431,11 +431,11 @@ impl From<crate::migration::ImportedSettings> for StoredSettings {
             font_scale: settings
                 .font_scale_percent
                 .unwrap_or_else(default_font_scale),
-            reduce_motion: false,
-            notifications: true,
-            notify_completed: true,
-            notify_needs_input: true,
-            notify_failed: true,
+            reduce_motion: settings.reduce_motion.unwrap_or_default(),
+            notifications: settings.notifications.unwrap_or_else(default_true),
+            notify_completed: settings.notify_completed.unwrap_or_else(default_true),
+            notify_needs_input: settings.notify_needs_input.unwrap_or_else(default_true),
+            notify_failed: settings.notify_failed.unwrap_or_else(default_true),
             show_token_usage: true,
             show_plan_goal: true,
             show_generation_status: true,

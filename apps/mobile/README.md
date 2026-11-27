@@ -1,5 +1,12 @@
 # Vibex Mobile
 
+> **Superseded by `apps/mobile-nsh`.** This GPUI client is the shipping one
+> today, but the nsh client in [`apps/mobile-nsh`](../mobile-nsh) replaces it on
+> the same phones: it keeps this app's Android `applicationId` and iOS bundle id,
+> so an install upgrades it in place, and it imports this client's data on first
+> launch. `pnpm build:mobile:*` and `pnpm package:mobile:*` already build the nsh
+> client; the commands below still work by calling this tree's scripts directly.
+
 `vibex-mobile` is the native GPUI client for iOS and Android. It runs on the
 published `gpui-pre` family with `gpui-pre-mobile` supplying the Android and iOS
 platform layer, connects to the authoritative desktop runtime, and renders Vibex

@@ -45,7 +45,7 @@
 			<key>CFBundleTypeRole</key>
 			<string>Viewer</string>
 			<key>CFBundleURLName</key>
-			<string>ai.vibex.mobile.nsh</string>
+			<string>ai.vibex.mobile</string>
 			<key>CFBundleURLSchemes</key>
 			<array>
 				<string>vibex</string>
@@ -73,10 +73,12 @@
 	<key>NSPhotoLibraryUsageDescription</key>
 	<string>Attach images from your library to a Vibex session, and scan a pairing QR code from a screenshot.</string>
 	<!--
-		Text another app shares arrives through the extension, which writes to
-		the App Group container both targets declare. iOS has no foreground
-		service: the shell's background task (HostBridge) is the equivalent,
-		so no UIBackgroundModes are declared that nothing here would use.
+		Text another app shares arrives through the extension as
+		`vibex://share?text=…`. A shared App Group container would need a
+		managed entitlement that a free Apple ID cannot sign, so the text
+		travels in the URL instead. iOS has no foreground service: the shell's
+		background task (HostBridge) is the equivalent, so no UIBackgroundModes
+		are declared that nothing here would use.
 	-->
 </dict>
 </plist>

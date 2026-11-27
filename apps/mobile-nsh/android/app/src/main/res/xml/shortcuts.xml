@@ -7,8 +7,8 @@
         android:shortcutLongLabel="@string/shortcut_new_session"
         android:shortcutShortLabel="@string/shortcut_new_session">
         <intent
-            android:action="ai.vibex.mobile.nsh.NEW_SESSION"
+            android:action="ai.vibex.mobile.NEW_SESSION"
             android:targetClass="com.longbridge.nsh.MainActivity"
-            android:targetPackage="ai.vibex.mobile.nsh" />
+            android:targetPackage="ai.vibex.mobile" />
     </shortcut>
 </shortcuts>

@@ -13,9 +13,17 @@ android="$here/android"
 
 : "${ANDROID_HOME:?set ANDROID_HOME to the Android SDK}"
 : "${JAVA_HOME:?set JAVA_HOME to a JDK 17-21 (Gradle does not run on 25)}"
-GRADLE="${GRADLE:-gradle}"
-command -v "$GRADLE" >/dev/null 2>&1 || {
-    echo "error: Gradle 8.9+ is not on PATH (or set GRADLE)" >&2
+# The project's own wrapper when it is there (it downloads the pinned Gradle and
+# is what CI uses), otherwise whatever `gradle` the machine has.
+if [[ -z "${GRADLE:-}" ]]; then
+    if [[ -x "$android/gradlew" ]]; then
+        GRADLE="$android/gradlew"
+    else
+        GRADLE="gradle"
+    fi
+fi
+("$GRADLE" --version >/dev/null 2>&1) || {
+    echo "error: Gradle 8.9+ is not available (project wrapper missing, or set GRADLE)" >&2
     exit 1
 }
 ndk="${ANDROID_NDK_HOME:-}"
@@ -40,9 +48,32 @@ build_abi() {
         "$android/app/src/main/jniLibs/$abi/libnsh.so"
 }
 
-build_abi aarch64-linux-android arm64-v8a aarch64-linux-android26-clang llvm-ar
-build_abi armv7-linux-androideabi armeabi-v7a armv7a-linux-androideabi26-clang llvm-ar
-build_abi x86_64-linux-android x86_64 x86_64-linux-android26-clang llvm-ar
+# A published APK ships arm64 only, as the GPUI client's release did: the other
+# ABIs exist for a local emulator run. Override with VIBEX_MOBILE_ABIS.
+# A local build packages every ABI the host script produced, so the emulator and
+# a phone both run from the same APK.
+abis="${VIBEX_MOBILE_ABIS:-arm64-v8a,armeabi-v7a,x86_64}"
+
+# minSdk is 28 in `app/build.gradle`: the API level here has to match it, or the
+# NDK links against a libc the app does not ship.
+api="${VIBEX_MOBILE_ANDROID_API:-28}"
+for abi in ${abis//,/ }; do
+    case "$abi" in
+        arm64-v8a)
+            build_abi aarch64-linux-android arm64-v8a "aarch64-linux-android${api}-clang" llvm-ar
+            ;;
+        armeabi-v7a)
+            build_abi armv7-linux-androideabi armeabi-v7a "armv7a-linux-androideabi${api}-clang" llvm-ar
+            ;;
+        x86_64)
+            build_abi x86_64-linux-android x86_64 "x86_64-linux-android${api}-clang" llvm-ar
+            ;;
+        *)
+            echo "error: unknown ABI ${abi} (arm64-v8a, armeabi-v7a, x86_64)" >&2
+            exit 1
+            ;;
+    esac
+done
 
 # The nsh AAR without its own libnsh.so: the app's Rust library replaces it
 # so NshView and Native.runRust are this app.
@@ -102,10 +133,26 @@ rm -f "$android/app/libs/nsh.aar"
     AndroidManifest.xml classes.jar proguard.txt R.txt)
 
 cd "$android"
-"$GRADLE" -q :app:assembleRelease
-apk="$android/app/build/outputs/apk/release/app-release.apk"
+# The release workflow stamps the tag's version in; a local build uses the one
+# `build.gradle` derives the versionCode from. The two have to agree: Android
+# only replaces an installed app whose versionCode the new one reaches.
+gradle_args=("-PvibexAbis=${abis}")
+if [[ -n "${VIBEX_MOBILE_VERSION:-}" ]]; then
+    gradle_args+=("-PvibexVersion=${VIBEX_MOBILE_VERSION}")
+fi
+"$GRADLE" -q :app:assembleRelease :app:bundleRelease "${gradle_args[@]}"
+# The release build is unsigned on purpose: `apps/mobile/scripts/
+# sign-android-release.sh` signs it with the same key the GPUI client's
+# releases used, which is the other half of an in-place upgrade (a different
+# signing key is as fatal as a different application id).
+apk="$android/app/build/outputs/apk/release/app-release-unsigned.apk"
 [[ -f "$apk" ]] || {
     echo "error: Gradle did not produce $apk" >&2
     exit 1
 }
-echo "packaged $apk"
+aab="$android/app/build/outputs/bundle/release/app-release.aab"
+[[ -f "$aab" ]] || {
+    echo "error: Gradle did not produce $aab" >&2
+    exit 1
+}
+echo "packaged $apk (unsigned) and $aab"

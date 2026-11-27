@@ -32,7 +32,6 @@ concurrency:
 env:
   CARGO_INCREMENTAL: "0"
   CARGO_PACKAGER_VERSION: "0.11.8"
-  CARGO_NDK_VERSION: "4.1.2"
 
 jobs:
   release-meta:
@@ -375,11 +374,11 @@ jobs:
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
-    # The mobile client still builds on the gpui-pre platform layer while the
-    # desktop moved to gpui-fast, so `cargo ndk` cannot compile the shared UI
-    # crates for a phone. Mobile packaging is therefore opt-in until that layer
-    # is ported: set the repository variable VIBEX_MOBILE_RELEASES_ENABLED to
-    # true to publish Android and iOS again.
+    # Publishes the nsh client (`apps/mobile-nsh`), which replaces the GPUI one
+    # and keeps its applicationId, versionCode scheme and signing key so an
+    # installed GPUI build upgrades in place. Packaging is still opt-in until
+    # that client has shipped once: set the repository variable
+    # VIBEX_MOBILE_RELEASES_ENABLED to true to publish Android and iOS.
     if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     runs-on: ubuntu-24.04
     timeout-minutes: 120
@@ -387,6 +386,7 @@ jobs:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
+          # The published APK is arm64 only, as the GPUI client's release was.
           targets: aarch64-linux-android
       - uses: actions/setup-java@cf277c60eb25467037889841efdb72551f06f6c3 # v4.9.1
         with:
@@ -400,7 +400,9 @@ jobs:
         with:
           packages: platform-tools
       - name: Verify native mobile contract
-        run: node scripts/check-mobile-native.mjs
+        # The upgrade contract is what keeps an install an update: same
+        # applicationId / bundle id, same versionCode scheme, same legacy files.
+        run: node scripts/check-mobile-native.mjs && node apps/mobile-nsh/scripts/check-upgrade.mjs
       - name: Install Android SDK and NDK
         run: |
           yes | sdkmanager --licenses >/dev/null || true
@@ -410,16 +412,39 @@ jobs:
             echo "ANDROID_NDK_HOME=${ndk_path}"
             echo "ANDROID_NDK_ROOT=${ndk_path}"
           } >> "${GITHUB_ENV}"
-      - name: Install cargo-ndk
-        run: cargo install cargo-ndk --version "${CARGO_NDK_VERSION}" --locked
-      - name: Build Android APK and AAB
+      - name: Build the nsh Android host
         env:
           VIBEX_MOBILE_PROFILE: release
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+          VIBEX_MOBILE_ABIS: arm64-v8a
           # Baked into the APK so the phone verifies the signed update manifest
           # it reads from the published release.
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
-        run: bash apps/mobile/scripts/build-android.sh
+          GRADLE: ${{ github.workspace }}/apps/mobile-nsh/android/gradlew
+        run: bash apps/mobile-nsh/scripts/build-android-host.sh
+      # An update replaces the installed app only when this APK carries the
+      # GPUI client's applicationId and a versionCode at least as high. Both are
+      # silent failures at install time on a phone, so they are checked here,
+      # before signing, where the output is still readable.
+      - name: Verify the APK upgrades the GPUI client
+        run: |
+          set -euo pipefail
+          apk="apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          aapt2="${ANDROID_HOME}/build-tools/35.0.0/aapt2"
+          badging="$("${aapt2}" dump badging "${apk}" | head -n 1)"
+          echo "${badging}"
+          case "${badging}" in
+            *"package: name='ai.vibex.mobile' "*) ;;
+            *)
+              echo "the APK is not ai.vibex.mobile: Android would install it beside the old app" >&2
+              exit 1
+              ;;
+          esac
+          version_code="$(printf '%s' "${badging}" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
+          if [[ -z "${version_code}" || "${version_code}" -lt 109999 ]]; then
+            echo "versionCode ${version_code} does not reach 0.1.9's 109999: an installed client would outrank it" >&2
+            exit 1
+          fi
       - name: Sign Android release artifacts
         env:
           VIBEX_ANDROID_KEYSTORE_BASE64: ${{ secrets.VIBEX_ANDROID_KEYSTORE_BASE64 }}
@@ -429,8 +454,8 @@ jobs:
           VIBEX_RELEASE_CHANNEL: ${{ needs.release-meta.outputs.channel }}
         run: |
           bash apps/mobile/scripts/sign-android-release.sh \
-            apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk \
-            apps/mobile/android/app/build/outputs/bundle/release/app-release.aab \
+            apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            apps/mobile-nsh/android/app/build/outputs/bundle/release/app-release.aab \
             target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk \
             target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.aab
       - name: Normalize Android artifacts and checksums
@@ -453,8 +478,9 @@ jobs:
   mobile-ios:
     name: Mobile iOS release artifact
     needs: release-meta
-    # See mobile-android: the Apple packages are withheld for the same reason
-    # and the same repository variable turns them back on.
+    # See mobile-android: the Apple packages follow the same switch, and the
+    # nsh host keeps the GPUI client's bundle ids so a re-signed IPA replaces
+    # the installed app instead of landing beside it.
     if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED == 'true' }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
@@ -465,36 +491,43 @@ jobs:
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
       - name: Verify native mobile contract
-        run: node scripts/check-mobile-native.mjs
+        # The upgrade contract is what keeps an install an update: same
+        # applicationId / bundle id, same versionCode scheme, same legacy files.
+        run: node scripts/check-mobile-native.mjs && node apps/mobile-nsh/scripts/check-upgrade.mjs
       - name: Install XcodeGen
         run: brew install xcodegen
-      - name: Build iOS XCFramework
+      - name: Build the nsh iOS host
         env:
           VIBEX_MOBILE_PROFILE: release
-        run: bash apps/mobile/scripts/build-ios.sh
+          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+          VIBEX_IOS_SKIP_XCODEBUILD: "1"
+        run: bash apps/mobile-nsh/scripts/build-ios-host.sh
       - name: Build unsigned simulator app
         run: >-
-          xcodebuild -project apps/mobile/ios/Vibex.xcodeproj
+          xcodebuild -project apps/mobile-nsh/ios/Vibex.xcodeproj
           -scheme Vibex -sdk iphonesimulator -configuration Release
           MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
-          -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
+          -derivedDataPath target/mobile-nsh-ios CODE_SIGNING_ALLOWED=NO
           CODE_SIGNING_REQUIRED=NO build
       # Ships the device IPA as well as the simulator bundle. It carries no
       # signature on purpose: producing a signed one needs an Apple account, and
-      # the installer re-signs this file with their own. See
+      # the installer re-signs this file with their own. The bundle id is the
+      # GPUI client's, so that re-signed update replaces it in place. See
       # docs/operations/ios-unsigned-install.md.
       - name: Package unsigned device IPA
         env:
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
-        run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
+        run: bash apps/mobile-nsh/scripts/package-ios-unsigned-ipa.sh
       - name: Normalize iOS artifacts and checksums
         shell: bash
         run: |
           set -euo pipefail
-          output="target/mobile-ios-artifacts"
+          output="target/mobile-nsh-ios-artifacts"
           mkdir -p "${output}"
-          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/VibexFFI.xcframework "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-xcframework.zip"
-          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
+          # The Rust library as a static archive, which is what this host links
+          # instead of the GPUI client's XCFramework.
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile-nsh/ios/Frameworks/libvibex_mobile_nsh.a "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
+          ditto -c -k --sequesterRsrc --keepParent target/mobile-nsh-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
           for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"
           done
@@ -502,7 +535,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mobile-ios-${{ github.sha }}
-          path: target/mobile-ios-artifacts/**
+          path: target/mobile-nsh-ios-artifacts/**
           if-no-files-found: error
           retention-days: 14
 

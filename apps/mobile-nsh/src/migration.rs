@@ -1,11 +1,17 @@
 //! Imports the files the GPUI mobile client left on the phone.
 //!
-//! The two clients are separate applications today, so this only helps when
-//! they share a data directory (the new build installed over the old package).
+//! This client ships as the same application (`ai.vibex.mobile`), so the
+//! system replaces the GPUI build in place and the phone keeps its files. That
+//! is also why the old files are still on disk but not where `nsh` keeps its
+//! state: `nsh` writes `<support>/nsh/<app id>`, while the GPUI build wrote at
+//! the top of the files directory on Android and in `Application Support/Vibex`
+//! on iOS. [`legacy_dirs_in`] walks to both, so the imports below find them.
+//!
 //! What can be carried over is carried over once: the saved credentials and
 //! their names/timestamps, the install-wide device identity, the appearance and
 //! language preferences, and the unsent composer drafts. The old files are left
-//! in place; nothing here deletes them.
+//! in place; nothing here deletes them, and a second launch finds the new store
+//! already filled and imports nothing.
 
 use std::{
     collections::BTreeMap,
@@ -27,6 +33,59 @@ const LEGACY_IDENTITY: &str = "client-identity.json";
 const LEGACY_SETTINGS: &str = "app-settings.json";
 const LEGACY_COMPOSER: &str = "composer-state.json";
 const LEGACY_IDENTITY_SCHEMA: &str = "vibex-native-mobile-client-identity.v1";
+
+/// The directory name the GPUI client gave its own data on iOS
+/// (`$HOME/Library/Application Support/Vibex`).
+const LEGACY_IOS_FOLDER: &str = "Vibex";
+
+/// Where the GPUI client's files may be on `os`, best first.
+///
+/// `nsh` keeps an app in `<support>/<app id>`, below the directory the platform
+/// handed it, while the GPUI client wrote into a directory of its own:
+///
+/// - Android: `nsh` is `<filesDir>/nsh/ai.vibex.mobile`, the old client wrote
+///   `<filesDir>` itself — the new directory's grandparent.
+/// - iOS: `nsh` is `<Application Support>/nsh/ai.vibex.mobile`, the old client
+///   wrote `<Application Support>/Vibex` — a named folder, because
+///   `Application Support` is shared with every other app on the device.
+///
+/// The app's own directory always comes first, so a host that pointed `nsh` at
+/// the old directory keeps working. Old files that are not there make every
+/// import a no-op, which is what a fresh install sees.
+fn legacy_dirs_in(os: &str, data_dir: &Path) -> Vec<PathBuf> {
+    let mut dirs = vec![data_dir.to_path_buf()];
+    let Some(parent) = data_dir.parent() else {
+        return dirs;
+    };
+    // Only `nsh`'s own directory says where the platform root is: a host that
+    // pointed the app somewhere else (the old directory itself, a test temp
+    // dir) gets no ancestor searched, so nothing outside the app is ever read.
+    if parent.file_name().is_none_or(|name| name != "nsh") {
+        return dirs;
+    }
+    let Some(root) = parent.parent() else {
+        return dirs;
+    };
+    match os {
+        // The GPUI client kept its files at the top of the app's own files
+        // directory, which no other app can see.
+        "android" => dirs.push(root.to_path_buf()),
+        // A named folder, not the shared Application Support itself: another
+        // app's `app-settings.json` must never be read as this one's.
+        "ios" | "macos" => dirs.push(root.join(LEGACY_IOS_FOLDER)),
+        // No other platform ran the GPUI mobile client.
+        _ => {}
+    }
+    dirs
+}
+
+/// The first place `name` exists, in [`legacy_dirs_in`] order.
+fn legacy_file_in(os: &str, data_dir: &Path, name: &str) -> Option<PathBuf> {
+    legacy_dirs_in(os, data_dir)
+        .into_iter()
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
 
 /// One runtime imported from the old hosts file.
 #[derive(Clone, Debug)]
@@ -77,9 +136,16 @@ struct LegacyHostsV1 {
 /// Reads the saved runtimes, preferring the hosts file and falling back to the
 /// single-credential file an older build wrote.
 pub fn import_hosts(data_dir: &Path) -> Option<ImportedHosts> {
-    let mut hosts = read_hosts(&data_dir.join(LEGACY_HOSTS));
+    import_hosts_in(std::env::consts::OS, data_dir)
+}
+
+fn import_hosts_in(os: &str, data_dir: &Path) -> Option<ImportedHosts> {
+    let mut hosts = legacy_file_in(os, data_dir, LEGACY_HOSTS)
+        .map(|path| read_hosts(&path))
+        .unwrap_or_default();
     if hosts.is_empty()
-        && let Some(bundle) = read_single_credential(&data_dir.join(LEGACY_CREDENTIAL))
+        && let Some(path) = legacy_file_in(os, data_dir, LEGACY_CREDENTIAL)
+        && let Some(bundle) = read_single_credential(&path)
     {
         hosts.push(ImportedHost {
             bundle,
@@ -172,36 +238,78 @@ fn read_single_credential(path: &Path) -> Option<MobileCredentialBundle> {
 pub struct ImportedSettings {
     pub theme: Option<String>,
     pub language: Option<String>,
+    pub reduce_motion: Option<bool>,
     pub haptics: Option<bool>,
     pub keep_screen_on: Option<bool>,
     pub font_scale_percent: Option<u32>,
+    pub notifications: Option<bool>,
+    pub notify_completed: Option<bool>,
+    pub notify_needs_input: Option<bool>,
+    pub notify_failed: Option<bool>,
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct LegacySettingsFile {
     #[serde(default)]
+    schema_version: Option<String>,
+    #[serde(default)]
     theme: Option<String>,
     #[serde(default)]
     language: Option<String>,
+    #[serde(default)]
+    reduce_motion: Option<bool>,
     #[serde(default)]
     haptics: Option<bool>,
     #[serde(default)]
     keep_screen_on: Option<bool>,
     #[serde(default)]
     font_scale_percent: Option<u32>,
+    #[serde(default)]
+    notifications: Option<bool>,
+    #[serde(default)]
+    notify_completed: Option<bool>,
+    #[serde(default)]
+    notify_needs_input: Option<bool>,
+    #[serde(default)]
+    notify_failed: Option<bool>,
 }
+
+/// The v1 settings file wrote all four notification switches as `false`
+/// because the defaults it serialized were `false`, not because the reader
+/// turned them off. Carrying that shape over would silence a phone that was
+/// never asked, so it is repaired to "on" here exactly as the GPUI client
+/// repaired it in place.
+const LEGACY_SETTINGS_V1: &str = "vibex-native-mobile-app-settings.v1";
 
 /// Reads the old settings document, if it is there.
 pub fn import_settings(data_dir: &Path) -> Option<ImportedSettings> {
-    let text = fs::read_to_string(data_dir.join(LEGACY_SETTINGS)).ok()?;
+    import_settings_in(std::env::consts::OS, data_dir)
+}
+
+fn import_settings_in(os: &str, data_dir: &Path) -> Option<ImportedSettings> {
+    let path = legacy_file_in(os, data_dir, LEGACY_SETTINGS)?;
+    let text = fs::read_to_string(path).ok()?;
     let file = serde_json::from_str::<LegacySettingsFile>(&text).ok()?;
+    let derived_defaults = file.schema_version.as_deref() == Some(LEGACY_SETTINGS_V1)
+        && file.notifications == Some(false)
+        && file.notify_completed == Some(false)
+        && file.notify_needs_input == Some(false)
+        && file.notify_failed == Some(false);
+    let switch = |stored: Option<bool>| {
+        if derived_defaults { Some(true) } else { stored }
+    };
     Some(ImportedSettings {
         theme: file.theme,
         language: file.language,
+        reduce_motion: file.reduce_motion,
         haptics: file.haptics,
         keep_screen_on: file.keep_screen_on,
         font_scale_percent: file.font_scale_percent,
+        notifications: switch(file.notifications),
+        notify_completed: switch(file.notify_completed),
+        notify_needs_input: switch(file.notify_needs_input),
+        notify_failed: switch(file.notify_failed),
     })
 }
 
@@ -239,7 +347,14 @@ pub fn migrate_drafts(data_dir: &Path) {
 }
 
 pub fn import_drafts(data_dir: &Path) -> BTreeMap<String, String> {
-    let Ok(text) = fs::read_to_string(data_dir.join(LEGACY_COMPOSER)) else {
+    import_drafts_in(std::env::consts::OS, data_dir)
+}
+
+fn import_drafts_in(os: &str, data_dir: &Path) -> BTreeMap<String, String> {
+    let Some(path) = legacy_file_in(os, data_dir, LEGACY_COMPOSER) else {
+        return BTreeMap::new();
+    };
+    let Ok(text) = fs::read_to_string(path) else {
         return BTreeMap::new();
     };
     let Ok(file) = serde_json::from_str::<LegacyComposerFile>(&text) else {
@@ -261,8 +376,16 @@ pub fn import_identity(
     data_dir: &Path,
     hosts: &[MobileCredentialBundle],
 ) -> Option<ClientDeviceIdentity> {
-    let private_key = fs::read_to_string(data_dir.join(LEGACY_IDENTITY))
-        .ok()
+    import_identity_in(std::env::consts::OS, data_dir, hosts)
+}
+
+fn import_identity_in(
+    os: &str,
+    data_dir: &Path,
+    hosts: &[MobileCredentialBundle],
+) -> Option<ClientDeviceIdentity> {
+    let private_key = legacy_file_in(os, data_dir, LEGACY_IDENTITY)
+        .and_then(|path| fs::read_to_string(path).ok())
         .and_then(|text| serde_json::from_str::<LegacyIdentityFile>(&text).ok())
         .filter(|file| file.schema_version == LEGACY_IDENTITY_SCHEMA)
         .map(|file| file.private_key)
@@ -367,6 +490,129 @@ mod tests {
         let drafts = import_drafts(directory.path());
         assert_eq!(drafts.get("s1").map(String::as_str), Some("hello"));
         assert!(!drafts.contains_key("s2"));
+    }
+
+    /// The Android layout after an in-place upgrade: `nsh` keeps
+    /// `<filesDir>/nsh/ai.vibex.mobile` while the GPUI build wrote into
+    /// `<filesDir>` itself.
+    #[test]
+    fn the_android_upgrade_finds_the_old_files_above_the_new_directory() {
+        let files = tempfile::tempdir().unwrap();
+        let data = files.path().join("nsh").join("ai.vibex.mobile");
+        fs::create_dir_all(&data).unwrap();
+        write(
+            files.path(),
+            LEGACY_SETTINGS,
+            r#"{"schemaVersion":"vibex-native-mobile-app-settings.v3","theme":"system","language":"ja"}"#,
+        );
+        write(
+            files.path(),
+            LEGACY_COMPOSER,
+            r#"{"schemaVersion":"vibex-native-mobile-composer.v1","sessions":[{"sessionId":"s1","draft":"kept"}]}"#,
+        );
+        write(
+            files.path(),
+            LEGACY_IDENTITY,
+            r#"{"schemaVersion":"vibex-native-mobile-client-identity.v1","privateKey":"unused"}"#,
+        );
+        let settings =
+            import_settings_in("android", &data).expect("the old settings, two levels up");
+        assert_eq!(settings.theme.as_deref(), Some("system"));
+        assert_eq!(settings.language.as_deref(), Some("ja"));
+        assert_eq!(
+            import_drafts_in("android", &data)
+                .get("s1")
+                .map(String::as_str),
+            Some("kept")
+        );
+        assert!(legacy_file_in("android", &data, LEGACY_IDENTITY).is_some());
+        // Nothing is moved or deleted: a re-launch re-reads the same files.
+        assert!(files.path().join(LEGACY_SETTINGS).is_file());
+        assert!(!data.join(LEGACY_SETTINGS).exists());
+    }
+
+    /// The iOS layout after an in-place upgrade: `nsh` keeps
+    /// `<Application Support>/nsh/ai.vibex.mobile` while the GPUI build wrote
+    /// into `<Application Support>/Vibex`.
+    #[test]
+    fn the_ios_upgrade_finds_the_old_directory_beside_nsh() {
+        let support = tempfile::tempdir().unwrap();
+        let data = support.path().join("nsh").join("ai.vibex.mobile");
+        fs::create_dir_all(&data).unwrap();
+        let old = support.path().join(LEGACY_IOS_FOLDER);
+        fs::create_dir_all(&old).unwrap();
+        write(
+            &old,
+            LEGACY_SETTINGS,
+            r#"{"schemaVersion":"vibex-native-mobile-app-settings.v3","theme":"dark"}"#,
+        );
+        let settings = import_settings_in("ios", &data)
+            .expect("the old settings in Application Support/Vibex");
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+    }
+
+    /// The v1 settings file wrote `false` into every notification switch
+    /// because that is what the defaults it serialized were. The reader never
+    /// chose that, so the upgrade must not silence the phone.
+    #[test]
+    fn a_v1_settings_file_does_not_carry_its_derived_off_switches() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            LEGACY_SETTINGS,
+            r#"{"schemaVersion":"vibex-native-mobile-app-settings.v1","theme":"dark","notifications":false,"notifyCompleted":false,"notifyNeedsInput":false,"notifyFailed":false}"#,
+        );
+        let settings = import_settings(directory.path()).unwrap();
+        assert_eq!(settings.notifications, Some(true));
+        assert_eq!(settings.notify_completed, Some(true));
+        assert_eq!(settings.notify_needs_input, Some(true));
+        assert_eq!(settings.notify_failed, Some(true));
+        assert_eq!(settings.theme.as_deref(), Some("dark"));
+    }
+
+    /// A reader who really turned every switch off wrote a v3 file, and that
+    /// choice survives.
+    #[test]
+    fn a_v3_settings_file_keeps_switches_that_were_turned_off() {
+        let directory = tempfile::tempdir().unwrap();
+        write(
+            directory.path(),
+            LEGACY_SETTINGS,
+            r#"{"schemaVersion":"vibex-native-mobile-app-settings.v3","notifications":false,"notifyCompleted":false,"notifyNeedsInput":false,"notifyFailed":false,"reduceMotion":true}"#,
+        );
+        let settings = import_settings(directory.path()).unwrap();
+        assert_eq!(settings.notifications, Some(false));
+        assert_eq!(settings.notify_completed, Some(false));
+        assert_eq!(settings.reduce_motion, Some(true));
+    }
+
+    /// Only `nsh`'s own layout makes an ancestor a place to look. A host that
+    /// keeps the app somewhere else must not pick up an unrelated
+    /// `app-settings.json` that happens to sit above it.
+    #[test]
+    fn an_unrelated_ancestor_is_not_searched() {
+        let elsewhere = tempfile::tempdir().unwrap();
+        write(
+            elsewhere.path(),
+            LEGACY_SETTINGS,
+            r#"{"schemaVersion":"vibex-native-mobile-app-settings.v3","theme":"dark"}"#,
+        );
+        let data = elsewhere.path().join("some-host").join("ai.vibex.mobile");
+        fs::create_dir_all(&data).unwrap();
+        assert!(import_settings(&data).is_none());
+        assert!(legacy_file_in("android", &data, LEGACY_SETTINGS).is_none());
+    }
+
+    /// The new store wins: once the app has saved its own settings, the old
+    /// file is not read again on every launch.
+    #[test]
+    fn an_empty_old_directory_imports_nothing() {
+        let files = tempfile::tempdir().unwrap();
+        let data = files.path().join("nsh").join("ai.vibex.mobile");
+        fs::create_dir_all(&data).unwrap();
+        assert!(import_settings(&data).is_none());
+        assert!(import_drafts(&data).is_empty());
+        assert!(legacy_file_in("android", &data, LEGACY_IDENTITY).is_none());
     }
 
     fn valid_bundle(server_id: &str) -> MobileCredentialBundle {

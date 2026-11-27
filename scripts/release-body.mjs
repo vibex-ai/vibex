@@ -219,7 +219,10 @@ function mobileArtifacts(version) {
     iOS: [
       { name: `vibex-${version}-ios-unsigned.ipa`, label: "Unsigned IPA" },
       { name: `vibex-${version}-ios-simulator.app.zip`, label: "Simulator app" },
-      { name: `vibex-${version}-ios-xcframework.zip`, label: "XCFramework" }
+      // The nsh host links a static library, not the GPUI client's
+      // XCFramework; the row falls back to a dash when neither is published.
+      { name: `vibex-${version}-ios-xcframework.zip`, label: "XCFramework" },
+      { name: `vibex-${version}-ios-staticlib.zip`, label: "Static library" }
     ]
   };
 }

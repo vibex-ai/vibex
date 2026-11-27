@@ -46,10 +46,10 @@ pnpm package:mobile:ios
 ```
 
 `package:mobile:ios` builds the device bundle and writes the IPA plus its
-SHA-256 sidecar to `target/mobile-ios-artifacts/`. Set `VIBEX_MOBILE_VERSION` to
-override the stamped version. Both steps need macOS with Xcode, because the
-device link resolves the iOS SDK through `xcrun`; the script re-runs
-`build:mobile:ios` by itself when the XCFramework is missing.
+SHA-256 sidecar to `target/mobile-nsh-ios-artifacts/`. Set `VIBEX_MOBILE_VERSION`
+to override the stamped version. Both steps need macOS with Xcode, because the
+device link resolves the iOS SDK through `xcrun`; the script generates the
+project and the static library by itself when they are missing.
 
 ## Installing the build
 
@@ -75,10 +75,31 @@ free a slot first.
 
 ### Xcode with a personal team
 
-Open `apps/mobile/ios/Vibex.xcodeproj`, select the `Vibex` target, set your Apple
-ID under **Signing & Capabilities** with **Automatically manage signing**, and
-run against the device. Xcode registers the device and issues the free profile.
-This is the same flow as any other personal-team build.
+Open `apps/mobile-nsh/ios/Vibex.xcodeproj` (generate it with
+`pnpm build:mobile:ios` first), select the `Vibex` target, set your Apple ID
+under **Signing & Capabilities** with **Automatically manage signing**, and run
+against the device. Xcode registers the device and issues the free profile. This
+is the same flow as any other personal-team build.
+
+### Upgrading an installed build
+
+Every option above replaces the app in place instead of installing a second
+copy — including over the GPUI client this one supersedes — because the bundle
+id is unchanged (`ai.vibex.mobile`). What the old build kept in its container
+survives the update: runtimes, the device identity, appearance and language,
+and unsent drafts are imported on the first launch from the old files, which are
+left in place. Two conditions apply:
+
+- Keep the same bundle id. `scripts/package-ios-unsigned-ipa.sh` refuses to
+  package a bundle whose `CFBundleIdentifier` is not `ai.vibex.mobile`, because
+  that is the whole upgrade.
+- Keep the same Apple ID (or team). A different signer is a different app to
+  iOS, and the install becomes a second copy with its own data.
+
+The nsh build declares no entitlements, exactly like the GPUI client, so a free
+personal team can sign it. Adding a managed capability — App Groups most of all
+— would break both the free install and the upgrade, which is why the share
+handoff travels in a `vibex://share?text=…` URL instead of a shared container.
 
 ### TrollStore
 
@@ -92,14 +113,16 @@ nothing else.
 Free Apple IDs cannot sign apps that request managed entitlements. The mobile
 client requests none, which is what makes the unsigned artifact practical:
 
-- Notifications are local. `apps/mobile/ios/Vibex/Notifications.m` schedules
-  them through `UNUserNotificationCenter` with no server push, so the app needs
-  no `aps-environment` entitlement.
-- LAN discovery only browses Bonjour. `apps/mobile/ios/Vibex/LanDiscovery.m`
+- Notifications are local. `apps/mobile-nsh/ios/HostBridge.swift` and the
+  nsh notification center schedule them through `UNUserNotificationCenter` with
+  no server push, so the app needs no `aps-environment` entitlement.
+- LAN discovery only browses Bonjour. `apps/mobile-nsh/ios/LanDiscovery.swift`
   runs an `NSNetServiceBrowser`, which is covered by the `NSBonjourServices` and
-  `NSLocalNetworkUsageDescription` keys already in `apps/mobile/ios/project.yml`
-  and needs no multicast entitlement.
-- The project carries no `.entitlements` file at all.
+  `NSLocalNetworkUsageDescription` keys already in
+  `apps/mobile-nsh/ios/Resources/Info.plist` and needs no multicast entitlement.
+- Neither target carries an `.entitlements` file. The share extension hands its
+  text over in a `vibex://share` URL rather than a shared App Group, because the
+  App Groups capability is managed and a free Apple ID cannot sign it.
 
 Adding a capability that needs a managed entitlement would break this path, so
 treat that as a deliberate trade-off rather than a detail.

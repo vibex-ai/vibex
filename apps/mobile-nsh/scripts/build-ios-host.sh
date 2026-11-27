@@ -54,6 +54,36 @@ mkdir -p "$ios/Frameworks"
 rm -f "$ios/Frameworks/libvibex_mobile_nsh.a"
 lipo -create "$device_lib" "$simulator_lib" -output "$ios/Frameworks/libvibex_mobile_nsh.a"
 
+# The version the tag stamps in: `MARKETING_VERSION` from `project.yml` is the
+# development default, and the release workflow passes the tag's. Both clients
+# share a bundle id, so the version is also what an installer's "update" line
+# shows.
+#
+# `CFBundleVersion` is derived from it with the Android versionCode's arithmetic
+# (`0.1.9` → `109999`) rather than left at the project's literal 1: iOS compares
+# build numbers when it decides whether a bundle may replace the installed one,
+# and the GPUI client shipped build 1 for every release, which leaves no room to
+# grow. The expression mirrors `apps/mobile-nsh/android/app/build.gradle`.
+version_args=()
+if [[ -n "${VIBEX_MOBILE_VERSION:-}" ]]; then
+    if [[ ! "${VIBEX_MOBILE_VERSION}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-(preview|rc)\.([0-9]+))?$ ]]; then
+        echo "error: cannot derive an iOS build number from '${VIBEX_MOBILE_VERSION}'" >&2
+        exit 1
+    fi
+    major="${BASH_REMATCH[1]}"
+    minor="${BASH_REMATCH[2]}"
+    patch="${BASH_REMATCH[3]}"
+    channel="${BASH_REMATCH[4]}"
+    sequence="${BASH_REMATCH[6]:-0}"
+    case "${channel}" in
+        "") rank=999 ;;
+        rc) rank=$((500 + sequence)) ;;
+        *) rank=$((100 + sequence)) ;;
+    esac
+    build_number=$((major * 10000000 + minor * 100000 + patch * 1000 + rank))
+    version_args+=("MARKETING_VERSION=${VIBEX_MOBILE_VERSION}" "CURRENT_PROJECT_VERSION=${build_number}")
+fi
+
 (cd "$ios" && xcodegen generate --spec project.yml)
 
 # Signing stays the project's: a device build needs a team, a simulator build
@@ -72,5 +102,6 @@ xcodebuild \
     -destination "$destination" \
     -derivedDataPath "$here/../../target/mobile-nsh-ios" \
     CODE_SIGNING_ALLOWED="${VIBEX_IOS_SIGNING_ALLOWED:-YES}" \
+    "${version_args[@]}" \
     "$@" \
     build

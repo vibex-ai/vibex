@@ -191,6 +191,29 @@ x86_64 emulator, and the universal APK installs and launches there too. The
 custom host was rebuilt with `nsh` 0.6.1 — crates, embed AAR and all three
 ABIs — and still packages a release APK. A store release needs `--keystore`.
 
+## Upgrading from the GPUI client
+
+This client replaces `apps/mobile` on the same phones, so it keeps that app's
+identity: Android `applicationId ai.vibex.mobile` with the same `versionCode`
+scheme, iOS bundle id `ai.vibex.mobile`, and no iOS entitlements (the GPUI
+client had none, and a free Apple ID — how this app is installed — cannot sign
+a managed one). An installed GPUI build is upgraded in place; nothing asks for
+the old app to be uninstalled first, and no second icon appears.
+
+The data the old build left is imported on the first launch
+(`src/migration.rs`): saved runtimes and their credentials, the install-wide
+device identity, appearance, language and notification switches, and unsent
+drafts. `nsh` keeps its state under `<support>/<app id>`, while the GPUI client
+wrote at the top of the Android files directory and in `Application
+Support/Vibex` on iOS, so the imports look in both places. They run only when
+the new store has no value yet, they never delete or move the old files, and a
+second launch therefore imports nothing.
+
+`scripts/check-upgrade.mjs` pins all of that against the GPUI client's build
+files — the application id, the `versionCode` derivation, the iOS bundle ids and
+the legacy file names — so a change that would turn an update into a second app
+fails `pnpm check:mobile-native` instead of on someone's phone.
+
 The iOS host (`ios/`) is written but has never been built: this machine has no
 Xcode, so what is checked here is the Rust iOS target (`cargo check` and
 `clippy` for `aarch64-apple-ios`), the Swift sources' syntax, and the C ABI
@@ -242,10 +265,13 @@ notifications, the foreground service, the camera and the discovery bridge.
 **Android** (Kotlin; the symbol names match this class):
 
 ```kotlin
+// The Java package is this crate's own (`namespace`); the application id is
+// `ai.vibex.mobile`, the GPUI client's, so an install upgrades it in place.
+// The library is `libnsh.so`, this crate's name, not the crate's package id.
 package ai.vibex.mobile.nsh
 
 object NshHost {
-    init { System.loadLibrary("vibex_mobile_nsh") }
+    init { System.loadLibrary("nsh") }
     external fun nativeRunRoot(handle: Long)
     external fun nativeScanResult(value: String)
     external fun nativeDiscoveryEvent(value: String)
@@ -327,10 +353,16 @@ XcodeGen) around the same Rust library the Android host mounts:
 | `Vibex/PairingScannerViewController.swift` | The pairing scanner (AVFoundation), gallery decode (Vision) |
 | `Vibex/LanDiscovery.swift` | Bonjour browsing of `_vibex._tcp`, emitting the discovery JSON contract |
 | `Vibex/CameraCapture.swift` | The composer's camera (`UIImagePickerController`), writing a JPEG for the app |
-| `Vibex/ShareIntake.swift` | Reads what the share extension left in the App Group container |
-| `VibexShare/ShareViewController.swift` | The "Share to Vibex" extension: writes the text, opens `vibex://share` |
+| `Vibex/ShareIntake.swift` | Reads the text the share URL carried (`vibex://share?text=…`) |
+| `VibexShare/ShareViewController.swift` | The "Share to Vibex" extension: opens that URL, pasteboard for long text |
 | `Resources/Info.plist` | The `vibex` scheme, Bonjour, the camera/photo/local-network usage strings |
-| `Vibex.entitlements`, `VibexShare.entitlements` | The App Group both sides share |
+
+The share handoff is a URL rather than a shared App Group container. A free
+Apple ID — the account the unsigned install path uses — cannot sign the App
+Groups entitlement, and that entitlement is also the one capability the GPUI
+client did without. The extension therefore puts the text in a `vibex://share`
+URL (or on the pasteboard, with `?pasteboard=1`, when it is too long), which
+keeps the share working on the same install path an upgrade lands on.
 
 Notifications are nsh's: `vibex_mobile_nsh_install_notifications` makes the
 platform's notification center the app's delegate before it launches, so a

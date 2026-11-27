@@ -288,8 +288,11 @@ public final class MainActivity extends Activity {
     }
 
     private void readShortcut(Intent intent) {
+        // The action ships as the GPUI client's: a shortcut the launcher saved
+        // before the upgrade still fires after it, and the string is the app's
+        // identity, not this package's.
         if (intent != null
-                && "ai.vibex.mobile.nsh.NEW_SESSION".equals(intent.getAction())) {
+                && "ai.vibex.mobile.NEW_SESSION".equals(intent.getAction())) {
             NshHost.nativeNewSession();
         }
     }

@@ -167,8 +167,12 @@ fn the_host_answers_every_request_the_app_makes() {
 }
 
 #[test]
-fn the_share_extension_and_the_app_agree_on_their_container() {
-    let group = "group.ai.vibex.mobile.nsh";
+fn the_share_extension_and_the_app_agree_on_their_handoff() {
+    // The handoff is a URL, not an App Group: a free Apple ID — the account
+    // the unsigned install path uses — cannot sign the App Groups
+    // entitlement, and the GPUI client this build replaces had no
+    // entitlements either. Both sides have to name the same scheme host and
+    // query keys for a share to arrive.
     let app = fs::read_to_string(
         Path::new(env!("CARGO_MANIFEST_DIR")).join("ios/Vibex/ShareIntake.swift"),
     )
@@ -177,20 +181,52 @@ fn the_share_extension_and_the_app_agree_on_their_container() {
         Path::new(env!("CARGO_MANIFEST_DIR")).join("ios/VibexShare/ShareViewController.swift"),
     )
     .expect("the share extension");
-    for source in [&app, &extension] {
-        assert!(
-            source.contains(group),
-            "both sides of a share must name the app group {group}"
-        );
+    for (key, value) in [
+        ("scheme", "vibex"),
+        ("host", "share"),
+        ("text", "text"),
+        ("pasteboard", "pasteboard"),
+    ] {
+        for (side, source) in [("app", &app), ("extension", &extension)] {
+            assert!(
+                source.contains(&format!("\"{value}\"")),
+                "the {side} side of a share must name {key} as {value}"
+            );
+        }
     }
+    // Asking for an App Group would make the bundle un-signable with a free
+    // Apple ID, and the install path depends on that.
     for entitlements in ["ios/Vibex.entitlements", "ios/VibexShare.entitlements"] {
-        let text = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join(entitlements))
-            .expect(entitlements);
         assert!(
-            text.contains(group),
-            "{entitlements} must declare the app group {group}"
+            !Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join(entitlements)
+                .exists(),
+            "{entitlements} must stay deleted: a managed entitlement breaks free re-signing"
         );
     }
+    let project = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("ios/project.yml"))
+        .expect("the iOS project");
+    assert!(
+        !project.contains("CODE_SIGN_ENTITLEMENTS"),
+        "the iOS project must not ask for entitlements"
+    );
+}
+
+#[test]
+fn the_app_keeps_the_gpui_bundle_id_so_an_update_replaces_it() {
+    // iOS installs a different bundle id side by side, so the upgrade in place
+    // — and the data the old build left in Application Support/Vibex — depends
+    // on this id staying the GPUI client's.
+    let project = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("ios/project.yml"))
+        .expect("the iOS project");
+    assert!(
+        project.contains("PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile\n"),
+        "the app bundle id must stay ai.vibex.mobile"
+    );
+    assert!(
+        !project.contains("ai.vibex.mobile.nsh"),
+        "no target may keep the old nsh bundle id"
+    );
 }
 
 #[test]
