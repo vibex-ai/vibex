@@ -322,6 +322,7 @@ pub struct SessionService {
     /// first message by then, so the page shows it at once with a working
     /// header over it, and the runtime's own rows replace it when they arrive.
     pending_turn: Signal<Option<PendingTurn>>,
+    pending_turn_seq: Rc<Cell<u64>>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     new_runtime_selection: Rc<RefCell<Option<SessionRuntimeSelection>>>,
@@ -610,6 +611,7 @@ impl SessionService {
             scheduled_sends: signal(Vec::new()),
             new_session_open: signal(false),
             pending_turn: signal(None),
+            pending_turn_seq: Rc::new(Cell::new(0)),
             new_workspaces: signal(Vec::new()),
             new_runtime_options: Rc::new(RefCell::new(Vec::new())),
             new_runtime_selection: Rc::new(RefCell::new(None)),
@@ -1828,12 +1830,25 @@ impl SessionService {
                     .unwrap_or_default();
                 self.workspace_records.set(spaces.clone());
                 let _ = self.reload_sidebar().await;
-                let rows = sessions
+                let pending = self.pending_turn.get_untracked();
+                let mut rows = sessions
                     .iter()
                     .map(|session| summary(session, &spaces))
                     .collect::<Vec<_>>();
+                if let Some(pending) = pending.as_ref()
+                    && !self.has_authoritative_turn_after(
+                        &pending.session_id,
+                        pending.baseline_sequence,
+                    )
+                    && let Some(row) = rows.iter_mut().find(|row| row.id == pending.session_id)
+                {
+                    row.state = SessionState::Running;
+                }
                 let active_exists = self.active.get_untracked().is_some_and(|active| {
                     sessions.iter().any(|session| session.id.as_str() == active)
+                        || pending
+                            .as_ref()
+                            .is_some_and(|pending| pending.session_id == active)
                 });
                 self.sessions.set(rows);
                 *self.session_states.borrow_mut() = sessions
@@ -2041,9 +2056,24 @@ impl SessionService {
                     .borrow_mut()
                     .insert(session.id.as_str().to_owned(), session.state);
                 self.record_sidebar_session(&session);
-                let row = self
+                let mut row = self
                     .workspace_records
                     .with(|workspaces| summary(&session, workspaces));
+                let live_state = matches!(
+                    session.state,
+                    AgentSessionState::Running | AgentSessionState::Initializing
+                );
+                if !live_state
+                    && self.pending_turn.get_untracked().is_some_and(|pending| {
+                        pending.session_id == session.id.as_str()
+                            && !self.has_authoritative_turn_after(
+                                &pending.session_id,
+                                pending.baseline_sequence,
+                            )
+                    })
+                {
+                    row.state = SessionState::Running;
+                }
                 self.sessions.update(|sessions| {
                     if let Some(existing) =
                         sessions.iter_mut().find(|existing| existing.id == row.id)
@@ -2056,6 +2086,9 @@ impl SessionService {
                 if self.active.get_untracked().as_deref() == Some(session.id.as_str())
                     && let Ok(session_id) = VibexSessionId::parse(session.id.as_str())
                 {
+                    if live_state {
+                        self.sending.set(false);
+                    }
                     if session.is_terminal()
                         && self.terminal_visible.get_untracked()
                         && let Some(id) = session
@@ -2066,6 +2099,7 @@ impl SessionService {
                     {
                         self.attach_terminal(id, session.title.clone());
                     }
+                    self.publish();
                     self.refresh_token_usage(&session_id);
                     let needs_runtime_refresh = self
                         .runtime_state
@@ -2075,10 +2109,7 @@ impl SessionService {
                     if needs_runtime_refresh {
                         self.refresh_runtime(&session_id);
                     }
-                    if !matches!(
-                        session.state,
-                        AgentSessionState::Running | AgentSessionState::Initializing
-                    ) {
+                    if !live_state {
                         self.flush_queue();
                     }
                 }
@@ -2264,6 +2295,13 @@ impl SessionService {
         *self.edit_state.borrow_mut() = None;
         self.sync_queue();
         self.load_cached_timeline(&session_id);
+        if self
+            .pending_turn
+            .get_untracked()
+            .is_some_and(|pending| pending.session_id == session_id.as_str())
+        {
+            self.publish();
+        }
         self.refresh_runtime(&session_id);
         self.refresh_token_usage(&session_id);
         self.reload(&session_id);
@@ -2289,9 +2327,6 @@ impl SessionService {
 
     /// Replaces the message the composer was opened on.
     fn replace_message(&self, text: &str) {
-        let Some(edit) = self.edit_state.borrow().clone() else {
-            return;
-        };
         let Some(active) = self.active.get_untracked() else {
             return;
         };
@@ -2302,12 +2337,19 @@ impl SessionService {
         if text.is_empty() || self.sending.get_untracked() {
             return;
         }
+        let Some(edit) = self.edit_state.borrow_mut().take() else {
+            return;
+        };
         let mentions = self.armed_mentions_for(&text);
+        self.editing.set(false);
+        let (raw_draft, raw_attachments) = self.clear_composer_for_send();
         self.sending.set(true);
         self.error.set(None);
+        let (pending_token, baseline_sequence) =
+            self.begin_existing_pending_turn(&session_id, &text, &[]);
         let service = self.clone();
         let backend = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let selection_backend = backend.clone();
             let selection_id = session_id.clone();
             let selection = crate::runtime::handle()
@@ -2317,11 +2359,35 @@ impl SessionService {
                 Ok(Ok(state)) => state.desired,
                 Ok(Err(error)) => {
                     service.sending.set(false);
+                    service.finish_pending_turn(pending_token);
+                    if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        *service.edit_state.borrow_mut() = Some(edit);
+                        service.editing.set(true);
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
                     service.fail(&error);
                     return;
                 }
                 Err(error) => {
                     service.sending.set(false);
+                    service.finish_pending_turn(pending_token);
+                    if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        *service.edit_state.borrow_mut() = Some(edit);
+                        service.editing.set(true);
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
                     service.fail(&BackendError::failed(
                         "session_task_failed",
                         format!("reading the runtime did not finish: {error}"),
@@ -2347,19 +2413,42 @@ impl SessionService {
                 })
                 .await;
             service.sending.set(false);
+            service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(_)) => {
-                    service.edit_state.borrow_mut().take();
-                    service.editing.set(false);
-                    service.draft.set(String::new());
-                    service.armed_mentions.borrow_mut().clear();
                     service.reload(&session_id);
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("replacing the message did not finish: {error}"),
-                )),
+                Ok(Err(error)) => {
+                    if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        *service.edit_state.borrow_mut() = Some(edit);
+                        service.editing.set(true);
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&error);
+                }
+                Err(error) => {
+                    if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        *service.edit_state.borrow_mut() = Some(edit);
+                        service.editing.set(true);
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&BackendError::failed(
+                        "session_task_failed",
+                        format!("replacing the message did not finish: {error}"),
+                    ));
+                }
             }
         });
     }
@@ -3033,16 +3122,22 @@ impl SessionService {
         };
         let text = text.trim().to_owned();
         let attachments = self.attachments.get_untracked();
-        if (text.is_empty() && attachments.is_empty()) || self.sending.get_untracked() {
+        if text.is_empty() && attachments.is_empty() {
             return;
         }
         if let Some(command) = matching_armed_command(self.armed_command.borrow().as_ref(), &text) {
+            if self.sending.get_untracked() && !self.turn_live() {
+                return;
+            }
             self.execute_command(command, text, attachments, true);
             return;
         }
         let mentions = self.armed_mentions_for(&text);
         if self.turn_live() {
             self.enqueue(active, text, attachments, mentions);
+            return;
+        }
+        if self.sending.get_untracked() {
             return;
         }
         self.deliver(text, attachments, mentions, true);
@@ -3061,6 +3156,10 @@ impl SessionService {
                     AgentSessionState::Running | AgentSessionState::Initializing
                 )
             })
+            || self
+                .pending_turn
+                .get_untracked()
+                .is_some_and(|pending| pending.session_id == active)
     }
 
     fn armed_mentions_for(&self, text: &str) -> Vec<VibexUseMention> {
@@ -3084,13 +3183,18 @@ impl SessionService {
         let Some((name, arguments)) = parse_slash_command_invocation(&text) else {
             return;
         };
+        let composer_snapshot = from_composer.then(|| self.clear_composer_for_send());
+        if !from_composer {
+            self.armed_command.borrow_mut().take();
+            self.armed_mentions.borrow_mut().clear();
+        }
         self.sending.set(true);
         self.error.set(None);
-        let sent_text = text.clone();
-        let sent_attachment_ids = attachments
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
+        let (pending_token, baseline_sequence) = if from_composer {
+            self.begin_existing_pending_turn(&session_id, &text, &attachments)
+        } else {
+            self.existing_or_new_pending_turn(&session_id, &text, &attachments)
+        };
         let service = self.clone();
         let backend = self.backend.clone();
         // A slash command can be dispatched from the composer or from the
@@ -3127,35 +3231,62 @@ impl SessionService {
                 })
                 .await;
             service.sending.set(false);
+            service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(result)) => {
                     if result.status == AgentCommandExecuteStatus::Failed {
+                        if let Some((raw_draft, raw_attachments)) = composer_snapshot
+                            && !service.has_authoritative_turn_after(
+                                session_id.as_str(),
+                                baseline_sequence,
+                            )
+                        {
+                            service.restore_composer_after_failed_send(
+                                session_id.as_str(),
+                                raw_draft,
+                                raw_attachments,
+                            );
+                        }
+                        service.publish();
                         service.fail_text(result.message.as_deref().unwrap_or(copy::text(
                             "The command could not run.",
                             "命令无法执行。",
                             "命令無法執行。",
                         )));
-                    } else {
-                        if from_composer {
-                            if service.draft.get_untracked().trim() == sent_text {
-                                service.draft.set(String::new());
-                            }
-                            service.attachments.update(|items| {
-                                items.retain(|item| !sent_attachment_ids.contains(&item.id))
-                            });
-                            service.stash_draft();
-                            service.persist_drafts();
-                        }
-                        service.armed_command.borrow_mut().take();
-                        service.armed_mentions.borrow_mut().clear();
                     }
                     service.reload(&session_id);
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("running the command did not finish: {error}"),
-                )),
+                Ok(Err(error)) => {
+                    if let Some((raw_draft, raw_attachments)) = composer_snapshot
+                        && !service
+                            .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&error);
+                }
+                Err(error) => {
+                    if let Some((raw_draft, raw_attachments)) = composer_snapshot
+                        && !service
+                            .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&BackendError::failed(
+                        "session_task_failed",
+                        format!("running the command did not finish: {error}"),
+                    ));
+                }
             }
         });
     }
@@ -3172,12 +3303,13 @@ impl SessionService {
         let mentions = self.armed_mentions_for(&text);
         let due = unix_timestamp_ms() + (seconds as i64) * 1000;
         self.schedule_open.set(false);
+        let (raw_draft, raw_attachments) = self.clear_composer_for_send();
         let service = self.clone();
         let session_id = active.clone();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::EnqueueScheduledSend {
                 session_id: session_id.clone(),
-                text: text.clone(),
+                text,
                 attachments: attachments
                     .iter()
                     .map(|attachment| MessageAttachment {
@@ -3190,18 +3322,9 @@ impl SessionService {
                 mentions,
                 scheduled_at_ms: due,
             };
-            match service.submit_sidebar(mutation, None).await {
-                Ok(()) => {
-                    if service.active.get_untracked().as_deref() == Some(active.as_str())
-                        && service.draft.get_untracked().trim() == text
-                        && service.attachments.get_untracked() == attachments
-                    {
-                        service.draft.set(String::new());
-                        service.attachments.set(Vec::new());
-                        service.armed_mentions.borrow_mut().clear();
-                    }
-                }
-                Err(error) => service.fail(&error),
+            if let Err(error) = service.submit_sidebar(mutation, None).await {
+                service.restore_composer_after_failed_send(&active, raw_draft, raw_attachments);
+                service.fail(&error);
             }
         });
     }
@@ -3358,8 +3481,8 @@ impl SessionService {
         attachments: Vec<AttachmentItem>,
         mentions: Vec<VibexUseMention>,
     ) {
+        let (raw_draft, raw_attachments) = self.clear_composer_for_send();
         let service = self.clone();
-        let sent_text = text.clone();
         spawn(async move {
             let mutation = RemoteSidebarOrganizationMutation::EnqueueQueuedSend {
                 session_id: session.clone(),
@@ -3375,18 +3498,9 @@ impl SessionService {
                     .collect(),
                 mentions,
             };
-            match service.submit_sidebar(mutation, None).await {
-                Ok(()) => {
-                    if service.active.get_untracked().as_deref() == Some(session.as_str())
-                        && service.draft.get_untracked().trim() == sent_text
-                        && service.attachments.get_untracked() == attachments
-                    {
-                        service.draft.set(String::new());
-                        service.attachments.set(Vec::new());
-                        service.armed_mentions.borrow_mut().clear();
-                    }
-                }
-                Err(error) => service.fail(&error),
+            if let Err(error) = service.submit_sidebar(mutation, None).await {
+                service.restore_composer_after_failed_send(&session, raw_draft, raw_attachments);
+                service.fail(&error);
             }
         });
     }
@@ -3504,13 +3618,18 @@ impl SessionService {
         let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
+        let composer_snapshot = from_composer.then(|| self.clear_composer_for_send());
+        if !from_composer {
+            self.armed_command.borrow_mut().take();
+            self.armed_mentions.borrow_mut().clear();
+        }
         self.sending.set(true);
         self.error.set(None);
-        let sent_text = text.clone();
-        let sent_attachment_ids = attachments
-            .iter()
-            .map(|item| item.id.clone())
-            .collect::<Vec<_>>();
+        let (pending_token, baseline_sequence) = if from_composer {
+            self.begin_existing_pending_turn(&session_id, &text, &attachments)
+        } else {
+            self.existing_or_new_pending_turn(&session_id, &text, &attachments)
+        };
         let service = self.clone();
         let backend = self.backend.clone();
         // A prompt is sent from the composer, and from the new-session sheet
@@ -3536,30 +3655,45 @@ impl SessionService {
                 ))
                 .await;
             service.sending.set(false);
+            service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(page)) => {
-                    if from_composer {
-                        if service.draft.get_untracked() == sent_text {
-                            service.draft.set(String::new());
-                        }
-                        service.attachments.update(|items| {
-                            items.retain(|item| !sent_attachment_ids.contains(&item.id))
-                        });
-                    }
-                    service.armed_command.borrow_mut().take();
-                    service.armed_mentions.borrow_mut().clear();
-                    service.stash_draft();
-                    service.persist_drafts();
                     service.apply_page(&session_id, page);
                     crate::settings::haptic(nsh_core::Haptic::Notification(
                         nsh_core::HapticNotification::Success,
                     ));
                 }
-                Ok(Err(error)) => service.fail(&error),
-                Err(error) => service.fail(&BackendError::failed(
-                    "session_task_failed",
-                    format!("sending the message did not finish: {error}"),
-                )),
+                Ok(Err(error)) => {
+                    if let Some((raw_draft, raw_attachments)) = composer_snapshot
+                        && !service
+                            .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&error);
+                }
+                Err(error) => {
+                    if let Some((raw_draft, raw_attachments)) = composer_snapshot
+                        && !service
+                            .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        service.restore_composer_after_failed_send(
+                            session_id.as_str(),
+                            raw_draft,
+                            raw_attachments,
+                        );
+                    }
+                    service.publish();
+                    service.fail(&BackendError::failed(
+                        "session_task_failed",
+                        format!("sending the message did not finish: {error}"),
+                    ));
+                }
             }
         });
     }
@@ -3783,10 +3917,49 @@ impl SessionService {
         let state = active
             .as_ref()
             .and_then(|active| self.session_states.borrow().get(active).copied());
+        let pending_for_active = self
+            .pending_turn
+            .get_untracked()
+            .filter(|pending| active.as_deref() == Some(pending.session_id.as_str()));
         let model = self.model.borrow();
-        let turns = model.conversation_turns_with_reasoning_mode(
+        let pending_has_authoritative = pending_for_active.as_ref().is_some_and(|pending| {
+            model.items.iter().any(|item| {
+                item.session_id.as_str() == pending.session_id
+                    && pending
+                        .baseline_sequence
+                        .is_none_or(|baseline| item.sequence > baseline)
+            })
+        });
+        let pending_has_response = pending_for_active.as_ref().is_some_and(|pending| {
+            model.items.iter().any(|item| {
+                item.session_id.as_str() == pending.session_id
+                    && pending
+                        .baseline_sequence
+                        .is_none_or(|baseline| item.sequence > baseline)
+                    && matches!(
+                        item.payload,
+                        TimelinePayload::AgentMessage(_) | TimelinePayload::Error(_)
+                    )
+            })
+        });
+        let live_state = matches!(
             state,
-            state == Some(AgentSessionState::Running),
+            Some(AgentSessionState::Running | AgentSessionState::Initializing)
+        );
+        // While a freshly sent turn is waiting for the runtime's `SessionUpdated(Running)`
+        // event (or for its first timeline item), treat the session as running so the
+        // authoritative `UserMessage` does not briefly render as a finished idle turn.
+        let effective_state = if pending_for_active.is_some()
+            && !live_state
+            && (!pending_has_authoritative || !pending_has_response)
+        {
+            Some(AgentSessionState::Running)
+        } else {
+            state
+        };
+        let turns = model.conversation_turns_with_reasoning_mode(
+            effective_state,
+            effective_state == Some(AgentSessionState::Running),
             ReasoningDisplayMode::LatestAtBottom,
         );
         let mut entries = Vec::new();
@@ -3799,14 +3972,7 @@ impl SessionService {
         // default glyph instead of the Agent's logo.
         let turn_agent = active
             .as_deref()
-            .and_then(|active| {
-                self.session_records.with_untracked(|sessions| {
-                    sessions
-                        .iter()
-                        .find(|session| session.id.as_str() == active)
-                        .map(|session| session.agent_id.as_str().to_owned())
-                })
-            })
+            .map(|active| self.session_agent_id(active))
             .unwrap_or_default();
         let disclosures = self.turn_disclosures.borrow();
         for turn in &turns {
@@ -3819,18 +3985,26 @@ impl SessionService {
                 entries.push(self.entry_from_row(row, turn, &model.items));
             }
             let mut parent = None;
-            if turn
+            let has_visible_process_rows = turn
                 .process_rows
                 .iter()
-                .any(|row| show_reasoning || row.kind != TimelineRowKind::Reasoning)
-            {
-                let mut header = process_header(turn, &turn_agent);
+                .any(|row| show_reasoning || row.kind != TimelineRowKind::Reasoning);
+            if has_visible_process_rows || (!finished && !answered && !turn.pending_permission) {
+                let header_agent = if !turn_agent.is_empty() {
+                    turn_agent.as_str()
+                } else {
+                    pending_for_active
+                        .as_ref()
+                        .map_or("", |pending| pending.agent_id.as_str())
+                };
+                let mut header = process_header(turn, header_agent);
                 // A finished turn's work folds, whether or not it ended on a
                 // written conclusion: the desktop's rule is the same one, and
                 // its header carries the chevron for a turn that simply
                 // stopped with rows to show. Keying on a conclusion alone left
                 // those turns with no way to collapse their rows.
-                header.expandable = !turn.pending_permission && (finished || answered);
+                header.expandable =
+                    has_visible_process_rows && !turn.pending_permission && (finished || answered);
                 header.expanded =
                     !header.expandable || disclosures.get(&header.id).copied().unwrap_or(!finished);
                 parent = Some(header.id.clone());
@@ -3924,36 +4098,57 @@ impl SessionService {
             }
         }
         drop(disclosures);
-        // The reader's own turn, when the session it belongs to is still being
-        // made: their message and a working header, so the page says work has
-        // begun before the runtime can say anything at all.
-        if let Some(pending) = self.pending_turn.get_untracked()
-            && active.as_deref() == Some(pending.session_id.as_str())
-            && entries.is_empty()
+        // The reader's own turn while the runtime has not yet emitted its
+        // authoritative rows (for both a newly created session and a follow-up
+        // message in an existing one): render their bubble, the working header,
+        // and the generating row immediately so sending never feels frozen.
+        if let Some(pending) = pending_for_active.as_ref()
+            && !pending_has_authoritative
         {
+            let turn_id = format!("pending-turn:{}:{}", pending.session_id, pending.token);
+            let header_agent = if !turn_agent.is_empty() {
+                turn_agent.clone()
+            } else {
+                pending.agent_id.clone()
+            };
             entries.push(TimelineEntry {
-                id: format!("pending-turn:{}", pending.session_id),
+                id: turn_id.clone(),
                 kind: EntryKind::User,
                 body: pending.text.clone(),
                 attachments: pending.attachments.clone(),
+                turn_id: turn_id.clone(),
                 started_at_ms: pending.started_at_ms,
                 ..TimelineEntry::default()
             });
             entries.push(TimelineEntry {
-                id: format!("pending-live:{}", pending.session_id),
-                kind: EntryKind::Generating,
-                title: copy::text("Agent", "Agent", "Agent").to_owned(),
-                body: format!("{}…", copy::text("Preparing", "准备中", "準備中")),
+                id: format!("pending-header:{}:{}", pending.session_id, pending.token),
+                kind: EntryKind::ProcessHeader,
                 streaming: true,
-                turn_id: format!("pending-turn:{}", pending.session_id),
+                turn_id: turn_id.clone(),
                 started_at_ms: pending.started_at_ms,
+                complete: false,
+                expandable: false,
+                expanded: true,
+                agent: header_agent,
                 ..TimelineEntry::default()
             });
+            if self.show_generation_status.get_untracked() {
+                entries.push(TimelineEntry {
+                    id: format!("pending-live:{}:{}", pending.session_id, pending.token),
+                    kind: EntryKind::Generating,
+                    title: copy::text("Agent", "Agent", "Agent").to_owned(),
+                    body: format!("{}…", copy::text("Preparing", "准备中", "準備中")),
+                    streaming: true,
+                    turn_id,
+                    started_at_ms: pending.started_at_ms,
+                    ..TimelineEntry::default()
+                });
+            }
         }
         let latest_ended_normally = turns
             .last()
             .is_some_and(|turn| turn.complete && !turn.failed && !turn.pending_permission);
-        let needs_continue = state.is_some_and(|state| {
+        let needs_continue = effective_state.is_some_and(|state| {
             vibex_core::agent_session_turn_requires_continuation(state, Some(latest_ended_normally))
         });
         let plan = plan_view(&model.items);
@@ -6362,8 +6557,10 @@ impl SessionService {
         // opens on it before the request goes out: the runtime takes the id it
         // is given, so the page the reader is looking at is the session being
         // made.
+        let raw_new_prompt = self.new_prompt.get_untracked();
+        let raw_new_attachments = self.new_attachments.get_untracked();
         let session_id = VibexSessionId::new();
-        self.begin_pending_turn(&session_id, &workspace, &draft, &selection);
+        let pending_token = self.begin_pending_turn(&session_id, &workspace, &draft, &selection);
         let service = self.clone();
         let backend = self.backend.clone();
         let request_id = session_id.clone();
@@ -6392,17 +6589,215 @@ impl SessionService {
                 Ok(Err(error)) => {
                     // Nothing was made, so nothing may keep showing a turn the
                     // runtime will never answer for.
-                    service.pending_turn.set(None);
+                    if let Some(token) = pending_token {
+                        service.finish_pending_turn(token);
+                    }
+                    if service.new_prompt.get_untracked().trim().is_empty()
+                        && !raw_new_prompt.trim().is_empty()
+                    {
+                        service.new_prompt.set(raw_new_prompt);
+                    }
+                    if service.new_attachments.get_untracked().is_empty()
+                        && !raw_new_attachments.is_empty()
+                    {
+                        service.new_attachments.set(raw_new_attachments);
+                    }
+                    service.publish();
                     service.new_error.set(Some(error_text(&error)));
                 }
                 Err(error) => {
-                    service.pending_turn.set(None);
+                    if let Some(token) = pending_token {
+                        service.finish_pending_turn(token);
+                    }
+                    if service.new_prompt.get_untracked().trim().is_empty()
+                        && !raw_new_prompt.trim().is_empty()
+                    {
+                        service.new_prompt.set(raw_new_prompt);
+                    }
+                    if service.new_attachments.get_untracked().is_empty()
+                        && !raw_new_attachments.is_empty()
+                    {
+                        service.new_attachments.set(raw_new_attachments);
+                    }
+                    service.publish();
                     service.new_error.set(Some(
                         format!("creating the session did not finish: {error}").into(),
                     ));
                 }
             }
         });
+    }
+
+    fn next_pending_turn_token(&self) -> u64 {
+        let next = self.pending_turn_seq.get().wrapping_add(1).max(1);
+        self.pending_turn_seq.set(next);
+        next
+    }
+
+    fn has_authoritative_turn_after(
+        &self,
+        session_id: &str,
+        baseline_sequence: Option<i64>,
+    ) -> bool {
+        self.model.borrow().items.iter().any(|item| {
+            item.session_id.as_str() == session_id
+                && baseline_sequence.is_none_or(|baseline| item.sequence > baseline)
+        })
+    }
+
+    fn session_agent_id(&self, session_id: &str) -> String {
+        self.session_records
+            .with_untracked(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == session_id)
+                    .map(|session| session.agent_id.as_str().to_owned())
+            })
+            .or_else(|| {
+                (self.active.get_untracked().as_deref() == Some(session_id))
+                    .then(|| {
+                        self.runtime_state
+                            .borrow()
+                            .as_ref()
+                            .map(|state| state.desired.agent_id.as_str().to_owned())
+                    })
+                    .flatten()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Clears the open composer immediately on send, returning the prior draft
+    /// and attachments so a failed request can put them back if nothing new was
+    /// typed in the meantime.
+    fn clear_composer_for_send(&self) -> (String, Vec<AttachmentItem>) {
+        let raw_draft = self.draft.get_untracked();
+        let raw_attachments = self.attachments.get_untracked();
+        self.draft.set(String::new());
+        self.attachments.set(Vec::new());
+        self.reset_palettes();
+        self.armed_command.borrow_mut().take();
+        self.armed_mentions.borrow_mut().clear();
+        self.stash_draft();
+        self.persist_drafts();
+        (raw_draft, raw_attachments)
+    }
+
+    fn restore_composer_after_failed_send(
+        &self,
+        session_id: &str,
+        raw_draft: String,
+        raw_attachments: Vec<AttachmentItem>,
+    ) {
+        if self.active.get_untracked().as_deref() == Some(session_id) {
+            if self.draft.get_untracked().trim().is_empty() && !raw_draft.trim().is_empty() {
+                self.draft.set(raw_draft);
+            }
+            if self.attachments.get_untracked().is_empty() && !raw_attachments.is_empty() {
+                self.attachments.set(raw_attachments);
+            }
+            self.stash_draft();
+            self.persist_drafts();
+        } else {
+            let mut drafts = self.drafts.borrow_mut();
+            if drafts.get(session_id).is_none_or(|d| d.trim().is_empty())
+                && !raw_draft.trim().is_empty()
+            {
+                drafts.insert(session_id.to_owned(), raw_draft);
+            }
+            drop(drafts);
+            let mut att_drafts = self.attachment_drafts.borrow_mut();
+            if att_drafts.get(session_id).is_none_or(Vec::is_empty) && !raw_attachments.is_empty() {
+                att_drafts.insert(session_id.to_owned(), raw_attachments);
+            }
+            drop(att_drafts);
+            self.persist_drafts();
+        }
+    }
+
+    /// Appends an optimistic pending turn to an existing session immediately on
+    /// send so the bubble, working header, and generating row appear before the
+    /// runtime answers.
+    fn begin_existing_pending_turn(
+        &self,
+        session_id: &VibexSessionId,
+        text: &str,
+        attachments: &[AttachmentItem],
+    ) -> (u64, Option<i64>) {
+        let id = session_id.as_str();
+        let baseline_sequence = self
+            .model
+            .borrow()
+            .items
+            .iter()
+            .filter(|item| item.session_id == *session_id)
+            .map(|item| item.sequence)
+            .max();
+        let mut previous_state = None;
+        self.sessions.update(|sessions| {
+            if let Some(row) = sessions.iter_mut().find(|row| row.id == id) {
+                previous_state = Some(row.state);
+                row.state = SessionState::Running;
+            }
+        });
+        let token = self.next_pending_turn_token();
+        let title = self.sessions.with_untracked(|sessions| {
+            sessions
+                .iter()
+                .find(|row| row.id == id)
+                .map(|row| row.title.clone())
+                .unwrap_or_default()
+        });
+        let agent_id = self.session_agent_id(id);
+        self.pending_turn.set(Some(PendingTurn {
+            token,
+            session_id: id.to_owned(),
+            text: text.to_owned(),
+            attachments: attachments.to_vec(),
+            title,
+            agent_id,
+            baseline_sequence,
+            previous_state,
+            started_at_ms: unix_timestamp_ms(),
+        }));
+        self.publish();
+        (token, baseline_sequence)
+    }
+
+    fn existing_or_new_pending_turn(
+        &self,
+        session_id: &VibexSessionId,
+        text: &str,
+        attachments: &[AttachmentItem],
+    ) -> (u64, Option<i64>) {
+        if let Some(pending) = self.pending_turn.get_untracked()
+            && pending.session_id == session_id.as_str()
+        {
+            return (pending.token, pending.baseline_sequence);
+        }
+        self.begin_existing_pending_turn(session_id, text, attachments)
+    }
+
+    fn finish_pending_turn(&self, token: u64) {
+        let Some(pending) = self.pending_turn.get_untracked() else {
+            return;
+        };
+        if pending.token != token {
+            return;
+        }
+        self.pending_turn.set(None);
+        let authoritative = self
+            .session_states
+            .borrow()
+            .get(&pending.session_id)
+            .copied()
+            .map(display_state);
+        if let Some(state) = authoritative.or(pending.previous_state) {
+            self.sessions.update(|sessions| {
+                if let Some(row) = sessions.iter_mut().find(|row| row.id == pending.session_id) {
+                    row.state = state;
+                }
+            });
+        }
     }
 
     /// Puts the reader's own turn on the page while the session is being made.
@@ -6417,7 +6812,7 @@ impl SessionService {
         workspace: &WorkspaceSummary,
         draft: &NewSessionDraft,
         selection: &SessionRuntimeSelection,
-    ) {
+    ) -> Option<u64> {
         let title = draft
             .title
             .clone()
@@ -6426,16 +6821,30 @@ impl SessionService {
         self.new_runtime_open.set(false);
         self.new_session_open.set(false);
         self.new_session_folder.set(None);
+        self.new_prompt.set(String::new());
+        self.new_attachments.set(Vec::new());
+        self.new_title.set(String::new());
+        self.new_armed_command.borrow_mut().take();
+        self.new_armed_mentions.borrow_mut().clear();
+        self.reset_palettes();
         // A row of its own in the drawer, so the session the reader is on is
         // where they expect it, under the words they just wrote.
         self.record_pending_session(session_id, workspace, &title);
-        self.pending_turn.set(Some(PendingTurn {
-            session_id: session_id.as_str().to_owned(),
-            text: draft.text.clone(),
-            attachments: draft.attachments.clone(),
-            title,
-            started_at_ms: unix_timestamp_ms(),
-        }));
+        let token = (!draft.text.is_empty() || !draft.attachments.is_empty()).then(|| {
+            let token = self.next_pending_turn_token();
+            self.pending_turn.set(Some(PendingTurn {
+                token,
+                session_id: session_id.as_str().to_owned(),
+                text: draft.text.clone(),
+                attachments: draft.attachments.clone(),
+                title,
+                agent_id: selection.agent_id.as_str().to_owned(),
+                baseline_sequence: None,
+                previous_state: None,
+                started_at_ms: unix_timestamp_ms(),
+            }));
+            token
+        });
         self.open(session_id.as_str());
         // Seed the composer chip with the selection just submitted so it does
         // not sit on the "Model" placeholder while the runtime creates the session.
@@ -6444,6 +6853,7 @@ impl SessionService {
         // `open` clears the transcript and reads nothing back yet, so the
         // placeholder turn is what puts the reader's own message on the page.
         self.publish();
+        token
     }
 
     fn new_session_draft(&self) -> NewSessionDraft {
@@ -6504,6 +6914,7 @@ impl SessionService {
         self.pending_turn.update(|pending| {
             if let Some(pending) = pending.as_mut() {
                 pending.session_id = session.id.as_str().to_owned();
+                pending.agent_id = session.agent_id.as_str().to_owned();
             }
         });
         self.new_armed_command.borrow_mut().take();
@@ -6517,26 +6928,42 @@ impl SessionService {
         }
     }
 
-    /// Takes the placeholder turn down once the runtime's own rows are here.
+    /// Takes the placeholder turn down once the runtime's own rows and state
+    /// have taken over for this session.
     fn settle_pending_turn(&self) {
         let Some(pending) = self.pending_turn.get_untracked() else {
             return;
         };
         if self.active.get_untracked().as_deref() != Some(pending.session_id.as_str()) {
-            self.pending_turn.set(None);
             return;
         }
-        // Only once the transcript has something of its own to show. The
-        // placeholder's own rows are not it: they are what is being replaced.
-        let real = self.timeline.with(|entries| {
-            entries.iter().any(|entry| {
-                !entry.id.starts_with("pending-turn:") && !entry.id.starts_with("pending-live:")
-            })
+        if !self.has_authoritative_turn_after(&pending.session_id, pending.baseline_sequence) {
+            return;
+        }
+        let live_state = self
+            .session_states
+            .borrow()
+            .get(&pending.session_id)
+            .copied()
+            .is_some_and(|state| {
+                matches!(
+                    state,
+                    AgentSessionState::Running | AgentSessionState::Initializing
+                )
+            });
+        let has_response = self.model.borrow().items.iter().any(|item| {
+            item.session_id.as_str() == pending.session_id
+                && pending
+                    .baseline_sequence
+                    .is_none_or(|baseline| item.sequence > baseline)
+                && matches!(
+                    item.payload,
+                    TimelinePayload::AgentMessage(_) | TimelinePayload::Error(_)
+                )
         });
-        if !real {
-            return;
+        if live_state || has_response {
+            self.pending_turn.set(None);
         }
-        self.pending_turn.set(None);
     }
 
     fn browse_project_dirs(&self, path: Option<String>) {
@@ -9558,7 +9985,9 @@ struct NewSessionDraft {
 /// meanwhile: their message, and a working header over it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct PendingTurn {
-    /// The session the sheet was for, so a turn is only drawn on its own page.
+    /// Monotonic token so a stale send completion never tears down a newer turn.
+    token: u64,
+    /// The session this turn belongs to, so it is only drawn on its own page.
     session_id: String,
     /// What the reader wrote, as the bubble shows it.
     text: String,
@@ -9567,6 +9996,15 @@ struct PendingTurn {
     /// runtime's own arrives. The reader's own words say more than
     /// "New session" does.
     title: String,
+    /// The Agent running this turn, so the working header draws its logo right away.
+    agent_id: String,
+    /// Highest authoritative sequence already present before this turn was sent.
+    /// Any item with a greater sequence (or any item when `None`) signals that
+    /// the runtime has taken over the turn.
+    baseline_sequence: Option<i64>,
+    /// Drawer row state before this turn optimistically switched it to `Running`,
+    /// used to roll back cleanly if the send fails before acceptance.
+    previous_state: Option<SessionState>,
     started_at_ms: i64,
 }
 
@@ -11129,6 +11567,314 @@ mod queue_view_tests {
         assert_eq!(views[0].id, 1);
         assert_eq!(views[1].id, 3);
         assert_eq!(views[1].text, "third");
+    }
+}
+
+#[cfg(test)]
+mod optimistic_send_tests {
+    use nsh_engine::{EngineConfig, Root};
+    use nsh_testing::Headless;
+    use std::rc::Rc;
+    use vibex_core::{
+        AgentId, AgentSession, AgentSessionState, DeviceId, ProjectId, RemoteAuthProof,
+        RemoteClientType, TimelineItem, TimelineItemId, TimelinePayload, UserMessagePayload,
+        VibexSessionId, WorkspaceId,
+    };
+    use vibex_mobile_pairing::{
+        MOBILE_CREDENTIAL_SCHEMA_VERSION, MobileCredentialBundle, MobileRemoteRouteBundle,
+    };
+    use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
+
+    use super::*;
+
+    fn test_bundle() -> MobileCredentialBundle {
+        let device_id = DeviceId::new();
+        let identity = ClientDeviceIdentity::generate(device_id.clone()).unwrap();
+        let server = ClientDeviceIdentity::generate(DeviceId::new()).unwrap();
+        MobileCredentialBundle {
+            schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_owned(),
+            record: RemoteCredentialRecord {
+                server_url: "https://desktop.example".to_owned(),
+                auth: RemoteAuthProof {
+                    device_id,
+                    auth_token: "grant".to_owned(),
+                },
+                device_identity_public_key: identity.public_key_base64(),
+                server_identity_public_key: Some(server.public_key_base64()),
+            },
+            identity_private_key: identity.private_key_base64(),
+            expected_server_id: "server-test".to_owned(),
+            client_type: RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            display_name: Some("Test Studio".to_owned()),
+            route: Some(MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://desktop.example".to_owned()],
+                relay: None,
+            }),
+        }
+    }
+
+    fn make_timeline_item(
+        session_id: &VibexSessionId,
+        sequence: i64,
+        timestamp_ms: i64,
+        source: vibex_core::TimelineSource,
+        payload: TimelinePayload,
+    ) -> TimelineItem {
+        TimelineItem {
+            id: TimelineItemId::new(),
+            session_id: session_id.clone(),
+            sequence,
+            timestamp_ms,
+            source,
+            kind: payload.kind(),
+            correlation_id: None,
+            provider_correlation_id: None,
+            redaction_state: vibex_core::TimelineRedactionState::None,
+            execution_attribution: None,
+            payload_depth: vibex_core::TimelinePayloadDepth::default(),
+            payload,
+        }
+    }
+
+    fn seed_existing_session(service: &SessionService) -> (VibexSessionId, AgentSession) {
+        let session_id = VibexSessionId::new();
+        let session = AgentSession {
+            id: session_id.clone(),
+            project_id: ProjectId::new(),
+            workspace_id: WorkspaceId::new(),
+            agent_id: AgentId::parse("codex").unwrap(),
+            title: "Existing session".to_owned(),
+            state: AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            workspace_root: "/work".to_owned(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            created_at_ms: 1_000,
+            updated_at_ms: 2_000,
+            last_message_at_ms: 2_000,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: Default::default(),
+            terminal: None,
+        };
+        service.active.set(Some(session_id.as_str().to_owned()));
+        service.session_records.set(vec![session.clone()]);
+        service
+            .session_states
+            .borrow_mut()
+            .insert(session_id.as_str().to_owned(), AgentSessionState::Idle);
+        service.sessions.set(vec![SessionSummary {
+            id: session_id.as_str().to_owned(),
+            title: session.title.clone(),
+            agent: "codex".to_owned(),
+            meta: String::new(),
+            state: SessionState::Idle,
+            terminal: false,
+            project_id: session.project_id.as_str().to_owned(),
+            project_name: "vibex".to_owned(),
+            workspace_id: session.workspace_id.as_str().to_owned(),
+            workspace_label: "main".to_owned(),
+        }]);
+        service.model.borrow_mut().replace_authoritative(
+            session_id.clone(),
+            vec![
+                make_timeline_item(
+                    &session_id,
+                    1,
+                    1_000,
+                    vibex_core::TimelineSource::User,
+                    TimelinePayload::UserMessage(UserMessagePayload {
+                        text: "First prompt".to_owned(),
+                        ..UserMessagePayload::default()
+                    }),
+                ),
+                make_timeline_item(
+                    &session_id,
+                    2,
+                    1_500,
+                    vibex_core::TimelineSource::Agent,
+                    TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                        text: "First answer".to_owned(),
+                        is_final: true,
+                    }),
+                ),
+            ],
+        );
+        service.publish();
+        (session_id, session)
+    }
+
+    #[component]
+    fn OptimisticSendFlowProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        let (session_id, mut session) = seed_existing_session(&service);
+
+        // 1. Draft with trailing whitespace clears immediately and renders optimistic turn.
+        service.draft.set("Follow up   ".to_owned());
+        let (raw_draft, raw_attachments) = service.clear_composer_for_send();
+        assert_eq!(raw_draft, "Follow up   ");
+        assert!(raw_attachments.is_empty());
+        assert_eq!(service.draft.get_untracked(), "");
+
+        let (token, baseline) = service.begin_existing_pending_turn(&session_id, "Follow up", &[]);
+        assert_eq!(baseline, Some(2));
+        assert_eq!(
+            service.sessions.with_untracked(|rows| rows[0].state),
+            SessionState::Running
+        );
+        let entries = service.timeline.get_untracked();
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == EntryKind::User && entry.body == "First prompt")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id.starts_with("pending-turn:")
+                    && entry.kind == EntryKind::User
+                    && entry.body == "Follow up")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id.starts_with("pending-header:")
+                    && entry.kind == EntryKind::ProcessHeader
+                    && !entry.complete
+                    && entry.streaming
+                    && entry.agent == "codex")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.id.starts_with("pending-live:")
+                    && entry.kind == EntryKind::Generating
+                    && entry.streaming)
+        );
+
+        // 2. Authoritative UserMessage arrives before SessionUpdated(Running):
+        //    optimistic rows step aside with zero duplicates, while ProcessHeader
+        //    and Generating stay live seamlessly.
+        let live_item = make_timeline_item(
+            &session_id,
+            3,
+            2_500,
+            vibex_core::TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Follow up".to_owned(),
+                ..UserMessagePayload::default()
+            }),
+        );
+        service.apply_event(BackendEvent::Timeline(vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 3,
+            item: live_item,
+        }));
+        let entries = service.timeline.get_untracked();
+        assert!(
+            entries
+                .iter()
+                .all(|entry| !entry.id.starts_with("pending-"))
+        );
+        assert_eq!(
+            entries
+                .iter()
+                .filter(|entry| entry.kind == EntryKind::User && entry.body == "Follow up")
+                .count(),
+            1
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == EntryKind::ProcessHeader
+                    && !entry.complete
+                    && entry.streaming
+                    && entry.agent == "codex")
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.kind == EntryKind::Generating && entry.streaming)
+        );
+
+        // 3. SessionUpdated(Running) settles pending_turn and releases sending.
+        service.sending.set(true);
+        session.state = AgentSessionState::Running;
+        service.apply_event(BackendEvent::SessionUpdated(session.clone()));
+        assert!(!service.sending.get_untracked());
+        assert!(service.pending_turn.get_untracked().is_none());
+
+        // 4. Failed send on next turn rolls back pending turn, restores state,
+        //    and restores draft only if the user has not typed a new draft.
+        session.state = AgentSessionState::Idle;
+        service.apply_event(BackendEvent::SessionUpdated(session));
+        service.draft.set("Retry me ".to_owned());
+        let (failed_draft, failed_attachments) = service.clear_composer_for_send();
+        let (failed_token, _) = service.begin_existing_pending_turn(&session_id, "Retry me", &[]);
+        assert_ne!(failed_token, token);
+        assert!(
+            service
+                .timeline
+                .get_untracked()
+                .iter()
+                .any(|entry| entry.id.starts_with("pending-turn:"))
+        );
+        service.finish_pending_turn(failed_token);
+        service.restore_composer_after_failed_send(
+            session_id.as_str(),
+            failed_draft,
+            failed_attachments,
+        );
+        service.publish();
+        assert_eq!(service.draft.get_untracked(), "Retry me ");
+        assert_eq!(
+            service.sessions.with_untracked(|rows| rows[0].state),
+            SessionState::Idle
+        );
+        assert!(
+            service
+                .timeline
+                .get_untracked()
+                .iter()
+                .all(|entry| !entry.id.starts_with("pending-"))
+        );
+
+        // If user already started typing something new, rollback must not clobber it.
+        service.draft.set("Already typing".to_owned());
+        service.restore_composer_after_failed_send(
+            session_id.as_str(),
+            "Old draft".to_owned(),
+            Vec::new(),
+        );
+        assert_eq!(service.draft.get_untracked(), "Already typing");
+
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "optimistic-send-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn existing_session_optimistic_send_handoff_and_rollback() {
+        let config = EngineConfig::new(Root::of::<OptimisticSendFlowProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("optimistic-send-ok").unwrap();
     }
 }
 

@@ -1237,6 +1237,7 @@ fn shell(
     let composer_host = host.clone();
     let composer_input = element_ref();
     let jump_to_message = signal(None::<i64>);
+    let scroll_to_end_rev = signal(0u64);
     let runtime_panel = signal(RuntimePanel::Model);
     let creating = host.new_session_open;
     // Whether the group tabs take the bar's room above the transcript: the
@@ -1332,7 +1333,13 @@ fn shell(
                         .relative()
                         .flex_1()
                         .min_h(px(0.0))
-                        .child(timeline_view(host.clone(), jump_to_message, pager, tab))
+                        .child(timeline_view(
+                            host.clone(),
+                            jump_to_message,
+                            scroll_to_end_rev,
+                            pager,
+                            tab,
+                        ))
                         // A failure floats here and leaves on its own. Drawn
                         // into the page it had no way out: it outlived the
                         // condition it described, and the reader had to leave
@@ -1371,7 +1378,14 @@ fn shell(
                             session.as_ref().is_some_and(|session| !session.terminal)
                         })
                     },
-                    move || composer(composer_host.clone(), composer_input, runtime_panel),
+                    move || {
+                        composer(
+                            composer_host.clone(),
+                            composer_input,
+                            runtime_panel,
+                            scroll_to_end_rev,
+                        )
+                    },
                 )),
         )
         .child(runtime_sheet(
@@ -1878,6 +1892,7 @@ fn connection_banner(
 fn timeline_view(
     host: SessionHost,
     jump_to_message: Signal<Option<i64>>,
+    scroll_to_end_rev: Signal<u64>,
     pager: Pager,
     tab: Signal<WorkbenchTab>,
 ) -> impl IntoElement {
@@ -2038,6 +2053,18 @@ fn timeline_view(
         reveal.set(None);
     });
     let away_from_end = signal(false);
+    effect(move || {
+        let rev = scroll_to_end_rev.get();
+        if rev == 0 {
+            return;
+        }
+        set_timeout(std::time::Duration::from_millis(16), move || {
+            if scroll_to_end_rev.get_untracked() == rev {
+                list_ref.scroll_to_end(!crate::motion::reduce_motion());
+                away_from_end.set(false);
+            }
+        });
+    });
     let find_reveal: Rc<dyn Fn(&str)> = Rc::new(move |id| {
         let query = find_query.with_untracked(|query| query.trim().to_lowercase());
         let open_detail = source.with_untracked(|entries| {
@@ -4960,6 +4987,7 @@ fn composer(
     host: SessionHost,
     composer_input: ElementRef,
     runtime_panel: Signal<RuntimePanel>,
+    scroll_to_end_rev: Signal<u64>,
 ) -> impl IntoElement {
     let draft = host.draft;
     let sending = host.sending;
@@ -5023,10 +5051,12 @@ fn composer(
                 .is_some_and(|session| session.state == SessionState::Running)
         })
     });
+    let composer_busy = move || sending.get() && !running.get();
+    let composer_busy_untracked = move || sending.get_untracked() && !running.get_untracked();
     let submit: Rc<dyn Fn()> = {
         let send = send.clone();
         Rc::new(move || {
-            if sending.get_untracked() {
+            if composer_busy_untracked() {
                 return;
             }
             let text = draft.get_untracked();
@@ -5036,20 +5066,23 @@ fn composer(
             if text.is_empty() && attachments.with(|items| items.is_empty()) {
                 return;
             }
-            // The service clears the field once the runtime accepted the
-            // message, so a failed send leaves the draft where it was.
+            // Dismissing the keyboard ends any active IME composition before the
+            // service clears the draft so native inputs apply the empty value at
+            // once, and reveals the optimistic turn at the bottom of the list.
+            dismiss_keyboard();
             if editing.get_untracked() {
                 on_replace_message(text);
             } else {
                 send(text);
             }
+            scroll_to_end_rev.update(|rev| *rev = rev.wrapping_add(1));
         })
     };
     let add_open = signal(false);
     let has_content = computed(move || {
         !draft.with(|draft| draft.trim().is_empty()) || !attachments.with(Vec::is_empty)
     });
-    let can_send = move || !sending.get() && active.with(Option::is_some) && has_content.get();
+    let can_send = move || !composer_busy() && active.with(Option::is_some) && has_content.get();
     // The notices, the cards and the prompt card stand in one column. The
     // sheets the card raises are kept out of it: they take no room, and a gap
     // beside one would still be a gap.
@@ -5169,7 +5202,7 @@ fn composer(
                                     add_open.set(true);
                                 },
                             )
-                            .disabled(move || sending.get() || active.with(Option::is_none)),
+                            .disabled(move || composer_busy() || active.with(Option::is_none)),
                         )
                         .child(
                             view()
@@ -5891,7 +5924,7 @@ pub(crate) fn runtime_sheet(
     host: RuntimePickerHost,
     panel: Signal<RuntimePanel>,
 ) -> impl IntoElement {
-    use crate::ui::sheet::{bottom_sheet, sheet_card, sheet_header};
+    use crate::ui::sheet::{bottom_sheet, sheet_header};
     let open = host.open;
     let close = host.on_close;
     let on_choose_agent = host.on_choose_agent;
@@ -6284,7 +6317,12 @@ pub(crate) fn runtime_sheet(
                                                             }),
                                                         );
                                                         let selected_here = options.iter().any(|o| o.selected);
-                                                        sheet_card()
+                                                        view()
+                                                            .w_full()
+                                                            .flex_col()
+                                                            .rounded(px(theme::RADIUS_GROUP))
+                                                            .bg(theme::block_surface)
+                                                            .overflow_hidden()
                                                             .child(
                                                                 button()
                                                                     .w_full()
