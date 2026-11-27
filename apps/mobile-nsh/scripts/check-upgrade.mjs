@@ -30,6 +30,7 @@ const LEGACY_IOS_PROJECT = "apps/mobile/ios/project.yml";
 const NEXT_IOS_PROJECT = "apps/mobile-nsh/ios/project.yml";
 const NEXT_APP_MANIFEST = "apps/mobile-nsh/nsh.json";
 const NEXT_MIGRATION = "apps/mobile-nsh/src/migration.rs";
+const NEXT_IOS_BUILD = "apps/mobile-nsh/scripts/build-ios-host.sh";
 
 function source(path) {
   return readFileSync(join(ROOT, path), "utf8");
@@ -149,6 +150,15 @@ export function validateUpgradeContract(read = source) {
     !nextIos.includes("CODE_SIGN_ENTITLEMENTS"),
     "ios_entitlement_added: the install path re-signs with a free Apple ID, which cannot sign managed capabilities"
   );
+  // iOS decides whether a bundle may replace the installed one partly on
+  // `CFBundleVersion`, and the GPUI client shipped build 1 for every release.
+  // The packaging script derives an increasing one from the version.
+  const iosHostScript = read(NEXT_IOS_BUILD);
+  assert(
+    iosHostScript.includes("CURRENT_PROJECT_VERSION=${build_number}") &&
+      iosHostScript.includes("MARKETING_VERSION=${VIBEX_MOBILE_VERSION}"),
+    "ios_build_number_not_derived: an install would keep the GPUI client's build 1"
+  );
 
   const appJson = JSON.parse(read(NEXT_APP_MANIFEST));
   assert(
@@ -180,6 +190,7 @@ function runSelfTest() {
       NEXT_IOS_PROJECT,
       NEXT_APP_MANIFEST,
       NEXT_MIGRATION,
+      NEXT_IOS_BUILD,
     ].map((path) => [path, source(path)])
   );
   const read = (path) => files.get(path);
@@ -240,6 +251,12 @@ function runSelfTest() {
     "composer-state.json",
     "composer-state-v2.json",
     "self_test_accepted_a_dropped_legacy_file"
+  );
+  expectRejected(
+    NEXT_IOS_BUILD,
+    'CURRENT_PROJECT_VERSION=${build_number}',
+    'CURRENT_PROJECT_VERSION=1',
+    "self_test_accepted_a_fixed_ios_build_number"
   );
 }
 

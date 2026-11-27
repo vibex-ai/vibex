@@ -426,7 +426,9 @@ jobs:
       # GPUI client's applicationId and a versionCode at least as high. Both are
       # silent failures at install time on a phone, so they are checked here,
       # before signing, where the output is still readable.
-      - name: Verify the APK upgrades the GPUI client
+      - name: Verify the APK upgrades the installed client
+        env:
+          VERSION: ${{ needs.release-meta.outputs.version }}
         run: |
           set -euo pipefail
           apk="apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk"
@@ -440,9 +442,28 @@ jobs:
               exit 1
               ;;
           esac
+          # The same arithmetic `app/build.gradle` uses, recomputed here so a
+          # drift between the two fails the release instead of the phone.
+          if [[ ! "${VERSION}" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)(-(preview|rc)\.([0-9]+))?$ ]]; then
+            echo "cannot derive a versionCode from '${VERSION}'" >&2
+            exit 1
+          fi
+          rank=999
+          case "${BASH_REMATCH[5]}" in
+            "") ;;
+            rc) rank=$((500 + ${BASH_REMATCH[6]})) ;;
+            *) rank=$((100 + ${BASH_REMATCH[6]})) ;;
+          esac
+          expected=$((${BASH_REMATCH[1]} * 10000000 + ${BASH_REMATCH[2]} * 100000 + ${BASH_REMATCH[3]} * 1000 + rank))
           version_code="$(printf '%s' "${badging}" | sed -n "s/.*versionCode='\([0-9]*\)'.*/\1/p")"
-          if [[ -z "${version_code}" || "${version_code}" -lt 109999 ]]; then
-            echo "versionCode ${version_code} does not reach 0.1.9's 109999: an installed client would outrank it" >&2
+          if [[ "${version_code}" != "${expected}" ]]; then
+            echo "versionCode ${version_code} is not ${expected} for ${VERSION}: the APK and the release disagree" >&2
+            exit 1
+          fi
+          # The GPUI client's last versionCode is the floor an update must
+          # clear; 0.1.9's release is 109999.
+          if [[ "${version_code}" -lt 109999 ]]; then
+            echo "versionCode ${version_code} does not reach the GPUI client's 109999: an installed client would outrank it" >&2
             exit 1
           fi
       - name: Sign Android release artifacts

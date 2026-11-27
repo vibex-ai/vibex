@@ -73,7 +73,7 @@ if [[ -n "${VIBEX_MOBILE_VERSION:-}" ]]; then
     major="${BASH_REMATCH[1]}"
     minor="${BASH_REMATCH[2]}"
     patch="${BASH_REMATCH[3]}"
-    channel="${BASH_REMATCH[4]}"
+    channel="${BASH_REMATCH[5]}"
     sequence="${BASH_REMATCH[6]:-0}"
     case "${channel}" in
         "") rank=999 ;;
