@@ -5079,6 +5079,11 @@ fn composer(
         })
     };
     let add_open = signal(false);
+    effect(move || {
+        active.get();
+        plan_open.set(false);
+        add_open.set(false);
+    });
     let has_content = computed(move || {
         !draft.with(|draft| draft.trim().is_empty()) || !attachments.with(Vec::is_empty)
     });
@@ -6997,11 +7002,7 @@ fn scope_menu(
                     let remove = remove.clone();
                     let project_id = project_id.clone();
                     confirm_destructive(
-                        copy::text(
-                            "Remove this project?",
-                            "移除该项目？",
-                            "移除該專案？",
-                        ),
+                        copy::text("Remove this project?", "移除该项目？", "移除該專案？"),
                         format!(
                             "{} {}",
                             count,
@@ -8895,9 +8896,8 @@ mod tests {
 
     #[test]
     fn agent_mark_prefers_agent_identity_then_model_then_bot() {
-        let bot = nsh_core::element::ImageSrc::svg_markup(include_str!(
-            "../../../assets/icons/bot.svg"
-        ));
+        let bot =
+            nsh_core::element::ImageSrc::svg_markup(include_str!("../../../assets/icons/bot.svg"));
         let claude = super::agent_mark_svg("claude", "Claude Code", "deepseek-chat");
         let deepseek_model = super::runtime_mark_svg("deepseek-chat", "");
         assert_ne!(claude, bot);
@@ -8906,8 +8906,7 @@ mod tests {
             "known Agent identity wins over model brand on the new-session hero"
         );
 
-        let custom_with_model =
-            super::agent_mark_svg("custom-agent", "Custom", "deepseek-chat");
+        let custom_with_model = super::agent_mark_svg("custom-agent", "Custom", "deepseek-chat");
         assert_eq!(
             custom_with_model, deepseek_model,
             "unknown Agent falls back to the selected model's brand mark"

@@ -1865,9 +1865,7 @@ impl SessionService {
                     if let Some(first) = sessions.first() {
                         self.open(first.id.as_str());
                     } else {
-                        self.active.set(None);
-                        self.timeline.set(Vec::new());
-                        *self.model.borrow_mut() = TimelineModel::default();
+                        self.clear_active_session();
                     }
                 } else if self.runtime_state.borrow().is_none()
                     && let Some(active) = self.active.get_untracked()
@@ -2135,9 +2133,7 @@ impl SessionService {
                 self.persist_drafts();
                 let active = self.active.get_untracked();
                 if active.as_ref().is_some_and(|active| ids.contains(active)) {
-                    self.active.set(None);
-                    self.timeline.set(Vec::new());
-                    *self.model.borrow_mut() = TimelineModel::default();
+                    self.clear_active_session();
                 }
             }
             // A gap in the stream is not a reason to trust what is on screen:
@@ -2263,18 +2259,60 @@ impl SessionService {
         self.close_terminal();
         self.terminal_choices.set(Vec::new());
         self.active.set(Some(session_id.as_str().to_owned()));
+        self.clear_active_session_chrome();
+        self.conversation.set(ConversationState::Loading);
+        self.load_cached_timeline(&session_id);
+        if self
+            .pending_turn
+            .get_untracked()
+            .is_some_and(|pending| pending.session_id == session_id.as_str())
+        {
+            self.publish();
+        }
+        self.refresh_runtime(&session_id);
+        self.refresh_token_usage(&session_id);
+        self.reload(&session_id);
+    }
+
+    /// Clears the active session pointer and all session-scoped composer,
+    /// transcript, and sheet state.
+    fn clear_active_session(&self) {
+        self.active.set(None);
+        self.draft.set(String::new());
+        self.attachments.set(Vec::new());
+        self.conversation.set(ConversationState::Ready);
+        self.clear_active_session_chrome();
+    }
+
+    /// Resets all transcript, composer-bar, runtime, and sheet state scoped to
+    /// the currently open session.
+    fn clear_active_session_chrome(&self) {
         *self.model.borrow_mut() = TimelineModel::default();
         self.turn_disclosures.borrow_mut().clear();
         self.expanded_rows.borrow_mut().clear();
         self.row_details.borrow_mut().clear();
         self.loading_row_details.borrow_mut().clear();
-        self.conversation.set(ConversationState::Loading);
         self.timeline.set(Vec::new());
         self.has_older.set(false);
         self.loading_older.set(false);
         self.pending.set(None);
         self.question.set(None);
         *self.question_request.borrow_mut() = None;
+        self.plan.set(None);
+        self.goal.set(None);
+        self.needs_continue.set(false);
+        self.auto_continue_armed.set(false);
+        self.schedule_open.set(false);
+        self.history_open.set(false);
+        self.history.set(Vec::new());
+        self.find_open.set(false);
+        self.team_open.set(false);
+        self.team_tasks.set(Vec::new());
+        self.team_busy.set(false);
+        self.team_error.set(None);
+        self.attachment_preview.set(None);
+        self.sending.set(false);
+        self.resolving.set(false);
         self.reset_palettes();
         self.armed_command.borrow_mut().take();
         self.armed_mentions.borrow_mut().clear();
@@ -2294,17 +2332,6 @@ impl SessionService {
         self.editing.set(false);
         *self.edit_state.borrow_mut() = None;
         self.sync_queue();
-        self.load_cached_timeline(&session_id);
-        if self
-            .pending_turn
-            .get_untracked()
-            .is_some_and(|pending| pending.session_id == session_id.as_str())
-        {
-            self.publish();
-        }
-        self.refresh_runtime(&session_id);
-        self.refresh_token_usage(&session_id);
-        self.reload(&session_id);
     }
 
     /// Puts `text` in the composer as a replacement for `sequence`.
@@ -2412,7 +2439,10 @@ impl SessionService {
                         .await
                 })
                 .await;
-            service.sending.set(false);
+            let is_active = service.active.get_untracked().as_deref() == Some(session_id.as_str());
+            if is_active {
+                service.sending.set(false);
+            }
             service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(_)) => {
@@ -2421,8 +2451,10 @@ impl SessionService {
                 Ok(Err(error)) => {
                     if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
                     {
-                        *service.edit_state.borrow_mut() = Some(edit);
-                        service.editing.set(true);
+                        if is_active {
+                            *service.edit_state.borrow_mut() = Some(edit);
+                            service.editing.set(true);
+                        }
                         service.restore_composer_after_failed_send(
                             session_id.as_str(),
                             raw_draft,
@@ -2435,8 +2467,10 @@ impl SessionService {
                 Err(error) => {
                     if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
                     {
-                        *service.edit_state.borrow_mut() = Some(edit);
-                        service.editing.set(true);
+                        if is_active {
+                            *service.edit_state.borrow_mut() = Some(edit);
+                            service.editing.set(true);
+                        }
                         service.restore_composer_after_failed_send(
                             session_id.as_str(),
                             raw_draft,
@@ -3230,7 +3264,9 @@ impl SessionService {
                         .await
                 })
                 .await;
-            service.sending.set(false);
+            if service.active.get_untracked().as_deref() == Some(session_id.as_str()) {
+                service.sending.set(false);
+            }
             service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(result)) => {
@@ -3468,9 +3504,7 @@ impl SessionService {
                 .sessions
                 .with(|sessions| sessions.iter().any(|session| session.id == active))
         }) {
-            self.active.set(None);
-            self.timeline.set(Vec::new());
-            *self.model.borrow_mut() = TimelineModel::default();
+            self.clear_active_session();
         }
     }
 
@@ -3509,6 +3543,7 @@ impl SessionService {
         let Some(active) = self.active.get_untracked() else {
             self.queued.set(Vec::new());
             self.queue_paused.set(false);
+            self.queue_manual.set(false);
             self.scheduled.set(false);
             *self.scheduled_message_id.borrow_mut() = None;
             return;
@@ -3654,7 +3689,9 @@ impl SessionService {
                     mentions,
                 ))
                 .await;
-            service.sending.set(false);
+            if service.active.get_untracked().as_deref() == Some(session_id.as_str()) {
+                service.sending.set(false);
+            }
             service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(page)) => {
@@ -4145,12 +4182,16 @@ impl SessionService {
                 });
             }
         }
-        let latest_ended_normally = turns
-            .last()
-            .is_some_and(|turn| turn.complete && !turn.failed && !turn.pending_permission);
-        let needs_continue = effective_state.is_some_and(|state| {
-            vibex_core::agent_session_turn_requires_continuation(state, Some(latest_ended_normally))
-        });
+        let latest_ended_normally = vibex_core::latest_timeline_turn_ended_normally(&model.items);
+        let needs_continue = if self.conversation.get_untracked() == ConversationState::Loading
+            && model.items.is_empty()
+        {
+            false
+        } else {
+            effective_state.is_some_and(|state| {
+                vibex_core::agent_session_turn_requires_continuation(state, latest_ended_normally)
+            })
+        };
         let plan = plan_view(&model.items);
         let goal = goal_view(&model.items);
         let editable = turns
@@ -4173,12 +4214,19 @@ impl SessionService {
         self.needs_continue.set(needs_continue);
         if !needs_continue {
             self.auto_continue_armed.set(false);
-        } else if self.auto_continue.get_untracked() && !self.auto_continue_armed.get() {
+        } else if let Some(armed_session) = active.clone()
+            && self.auto_continue.get_untracked()
+            && !self.auto_continue_armed.get()
+        {
             self.auto_continue_armed.set(true);
             let service = self.clone();
             spawn(async move {
                 timer(Duration::from_secs(2)).await;
-                service.continue_turn();
+                if service.active.get_untracked().as_deref() == Some(armed_session.as_str())
+                    && service.needs_continue.get_untracked()
+                {
+                    service.continue_turn();
+                }
             });
         }
         self.editable_sequence.set(editable);
@@ -4549,10 +4597,15 @@ impl SessionService {
                         .await
                 })
                 .await;
-            service.resolving.set(false);
+            let is_active = service.active.get_untracked().as_deref() == Some(session_id.as_str());
+            if is_active {
+                service.resolving.set(false);
+            }
             match result {
                 Ok(Ok(_)) => {
-                    service.pending.set(None);
+                    if is_active {
+                        service.pending.set(None);
+                    }
                     service.reload(&session_id);
                     crate::settings::haptic(nsh_core::Haptic::Selection);
                 }
@@ -4617,10 +4670,16 @@ impl SessionService {
                         .await
                 })
                 .await;
-            service.resolving.set(false);
+            let is_active = service.active.get_untracked().as_deref() == Some(session_id.as_str());
+            if is_active {
+                service.resolving.set(false);
+            }
             match result {
                 Ok(Ok(_)) => {
-                    service.question.set(None);
+                    if is_active {
+                        service.question.set(None);
+                        *service.question_request.borrow_mut() = None;
+                    }
                     service.reload(&session_id);
                     crate::settings::haptic(nsh_core::Haptic::Selection);
                 }
@@ -6377,8 +6436,7 @@ impl SessionService {
                 self.open(&next);
             }
             None => {
-                self.active.set(None);
-                self.timeline.set(Vec::new());
+                self.clear_active_session();
             }
         }
     }
@@ -11875,6 +11933,195 @@ mod optimistic_send_tests {
         let config = EngineConfig::new(Root::of::<OptimisticSendFlowProbe>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("optimistic-send-ok").unwrap();
+    }
+
+    fn make_timeline_page(
+        session_id: &VibexSessionId,
+        items: Vec<TimelineItem>,
+    ) -> vibex_core::TimelinePage {
+        let start_sequence = items.first().map(|item| item.sequence);
+        let end_sequence = items.last().map(|item| item.sequence);
+        vibex_core::TimelinePage {
+            session_id: session_id.clone(),
+            items,
+            start_sequence,
+            end_sequence,
+            has_older: false,
+            has_newer: false,
+            starts_at_turn_start: true,
+            leading_turn_start: None,
+            omitted: None,
+        }
+    }
+
+    #[component]
+    fn SessionSwitchComposerIsolationProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let (session_a, _) = seed_existing_session(&service);
+        let session_b = VibexSessionId::new();
+        service
+            .session_states
+            .borrow_mut()
+            .insert(session_b.as_str().to_owned(), AgentSessionState::Idle);
+
+        // Session A ends with an interrupted user turn -> needs_continue = true,
+        // and carries other session-scoped composer bars / sheets.
+        let paused_items = vec![make_timeline_item(
+            &session_a,
+            1,
+            1_000,
+            vibex_core::TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Interrupted turn".to_owned(),
+                ..UserMessagePayload::default()
+            }),
+        )];
+        service.apply_page(
+            &session_a,
+            make_timeline_page(&session_a, paused_items.clone()),
+        );
+        assert!(service.needs_continue.get_untracked());
+
+        service.auto_continue_armed.set(true);
+        service.plan.set(Some(PlanView {
+            title: "Plan A".to_owned(),
+            steps: Vec::new(),
+            completed: 0,
+            current: 0,
+        }));
+        service.goal.set(Some(GoalView {
+            objective: "Goal A".to_owned(),
+            phase: GoalPhaseView::Active,
+            progress: None,
+            can_pause: true,
+            can_resume: false,
+            can_clear: true,
+        }));
+        service.pending.set(Some(PendingPermission {
+            request_id: "perm-a".to_owned(),
+            title: "Allow tool".to_owned(),
+            details: Vec::new(),
+            options: Vec::new(),
+        }));
+        service.question.set(Some(PendingQuestion {
+            request_id: "q-a".to_owned(),
+            title: "Question".to_owned(),
+            message: "Pick one".to_owned(),
+            fields: Vec::new(),
+        }));
+        service.editing.set(true);
+        service.schedule_open.set(true);
+        service.history_open.set(true);
+        service.find_open.set(true);
+        service.team_open.set(true);
+        service.sending.set(true);
+        service.resolving.set(true);
+
+        // Switching to Session B must immediately clear every composer bar and sheet.
+        service.open(session_b.as_str());
+        assert_eq!(
+            service.active.get_untracked().as_deref(),
+            Some(session_b.as_str())
+        );
+        assert!(!service.needs_continue.get_untracked());
+        assert!(!service.auto_continue_armed.get());
+        assert!(service.plan.get_untracked().is_none());
+        assert!(service.goal.get_untracked().is_none());
+        assert!(service.pending.get_untracked().is_none());
+        assert!(service.question.get_untracked().is_none());
+        assert!(!service.editing.get_untracked());
+        assert!(!service.schedule_open.get_untracked());
+        assert!(!service.history_open.get_untracked());
+        assert!(!service.find_open.get_untracked());
+        assert!(!service.team_open.get_untracked());
+        assert!(!service.sending.get_untracked());
+        assert!(!service.resolving.get_untracked());
+
+        // Re-publishing while Session B is still loading (or empty and idle) must NOT
+        // raise a false-positive "last turn was paused" banner.
+        service.publish();
+        assert!(!service.needs_continue.get_untracked());
+
+        service.apply_page(&session_b, make_timeline_page(&session_b, Vec::new()));
+        assert!(!service.needs_continue.get_untracked());
+
+        // A normally completed turn on Session B keeps needs_continue = false.
+        let normal_items = vec![
+            make_timeline_item(
+                &session_b,
+                1,
+                1_000,
+                vibex_core::TimelineSource::User,
+                TimelinePayload::UserMessage(UserMessagePayload {
+                    text: "Hello B".to_owned(),
+                    ..UserMessagePayload::default()
+                }),
+            ),
+            make_timeline_item(
+                &session_b,
+                2,
+                1_200,
+                vibex_core::TimelineSource::Agent,
+                TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                    text: "Done B".to_owned(),
+                    is_final: true,
+                }),
+            ),
+        ];
+        service.apply_page(&session_b, make_timeline_page(&session_b, normal_items));
+        assert!(!service.needs_continue.get_untracked());
+
+        // Switching back to Session A restores Session A's own cached paused state,
+        // and switching back to Session B clears it again.
+        service.open(session_a.as_str());
+        assert!(service.needs_continue.get_untracked());
+        service.apply_page(&session_a, make_timeline_page(&session_a, paused_items));
+        assert!(service.needs_continue.get_untracked());
+
+        service.open(session_b.as_str());
+        assert!(!service.needs_continue.get_untracked());
+
+        // Clearing the active session (e.g. session deleted) resets every composer bar.
+        service.needs_continue.set(true);
+        service.queue_manual.set(true);
+        service.draft.set("unsent".to_owned());
+        service.clear_active_session();
+        assert!(service.active.get_untracked().is_none());
+        assert!(!service.needs_continue.get_untracked());
+        assert!(!service.queue_manual.get_untracked());
+        assert_eq!(service.draft.get_untracked(), "");
+        assert_eq!(
+            service.conversation.get_untracked(),
+            ConversationState::Ready
+        );
+
+        service.shutdown();
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "session-switch-chrome-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn switching_sessions_clears_composer_bars_and_avoids_false_paused_notice() {
+        let config = EngineConfig::new(Root::of::<SessionSwitchComposerIsolationProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("session-switch-chrome-ok").unwrap();
     }
 }
 
