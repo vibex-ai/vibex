@@ -312,7 +312,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
     bridge.includes("beginBackgroundTask(withName:") && bridge.includes("endBackgroundTask("),
     "ios_background_task_missing"
   );
-  assert(iosDiscovery.includes("NSNetServiceBrowser"), "ios_discovery_browser_missing");
+  assert(iosDiscovery.includes("NetServiceBrowser"), "ios_discovery_browser_missing");
   assert(
     iosDiscovery.includes('searchForServices(ofType: "_vibex._tcp."'),
     "ios_discovery_service_type_missing"

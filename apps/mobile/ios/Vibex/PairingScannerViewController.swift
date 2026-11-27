@@ -260,7 +260,7 @@ final class PairingScannerViewController: UIViewController {
             showNoPairingCodeFound()
             return
         }
-        for observation in (request.results ?? []).compactMap({ $0 as? VNBarcodeObservation }) {
+        for observation in request.results ?? [] {
             guard let value = observation.payloadStringValue,
                   Self.isPairingEntry(value)
             else {

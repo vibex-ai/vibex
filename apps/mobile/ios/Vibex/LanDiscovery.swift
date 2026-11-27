@@ -11,10 +11,10 @@
 //  (`apps/mobile/src/host.rs`), so Find lists the runtimes with the
 //  native browser instead of the in-process mDNS daemon.
 //
-//  Resolution uses `NSNetService` rather than the Network framework: resolving
+//  Resolution uses `NetService` rather than the Network framework: resolving
 //  through `NWConnection` means opening a TCP connection to the runtime just
-//  to learn its address, while `NSNetService` reports the addresses and the
-//  port the record carries without dialling. `NSNetService` is deprecated in
+//  to learn its address, while `NetService` reports the addresses and the
+//  port the record carries without dialling. `NetService` is deprecated in
 //  favour of the Network framework, which has no address-level resolution
 //  that does not connect, so the deprecation is accepted here: it is a build
 //  warning, not a broken build.
@@ -31,13 +31,13 @@ import Foundation
 @MainActor
 private final class Browser: NSObject {
     var onEvent: ((String) -> Void)?
-    private var browser: NSNetServiceBrowser?
-    private var services: [String: NSNetService] = [:]
+    private var browser: NetServiceBrowser?
+    private var services: [String: NetService] = [:]
     private var known: Set<String> = []
 
     func start() {
         stop()
-        let browser = NSNetServiceBrowser()
+        let browser = NetServiceBrowser()
         browser.delegate = self
         browser.searchForServices(ofType: "_vibex._tcp.", inDomain: "local.")
         self.browser = browser
@@ -69,10 +69,10 @@ private final class Browser: NSObject {
     }
 
     /// The TXT record of `service` as text, only the values that are UTF-8.
-    private func txt(of service: NSNetService) -> [String: String] {
+    private func txt(of service: NetService) -> [String: String] {
         guard let data = service.txtRecordData() else { return [:] }
         var values: [String: String] = [:]
-        for (key, raw) in NSNetService.dictionary(fromTXTRecord: data) {
+        for (key, raw) in NetService.dictionary(fromTXTRecord: data) {
             if let value = String(data: raw, encoding: .utf8) {
                 values[key] = value
             }
@@ -82,7 +82,7 @@ private final class Browser: NSObject {
 
     /// The IPv4 addresses in `service.addresses`, numeric and most reachable
     /// first.
-    private func hosts(of service: NSNetService) -> [String] {
+    private func hosts(of service: NetService) -> [String] {
         var hosts: [String] = []
         for data in service.addresses ?? [] {
             let host = data.withUnsafeBytes { (buffer: UnsafeRawBufferPointer) -> String in
@@ -121,7 +121,7 @@ private final class Browser: NSObject {
     }
 
     /// Reports one resolved service as the bridge's `candidate` message.
-    private func report(_ service: NSNetService) {
+    private func report(_ service: NetService) {
         let key = service.name
         let hosts = hosts(of: service)
         guard !hosts.isEmpty, service.port != 0 else {
@@ -137,7 +137,7 @@ private final class Browser: NSObject {
             "hosts": hosts,
             "host": hosts[0],
             "port": service.port,
-            "interfaceScope": service.domain ?? "",
+            "interfaceScope": service.domain,
             "txt": values,
         ]
         if let name = values["display_name"], !name.isEmpty {
@@ -151,10 +151,10 @@ private final class Browser: NSObject {
 // The delegates are Objective-C protocols, so their methods are not isolated;
 // each one asserts the main actor, which is the run loop the browse started on
 // and therefore the one the callbacks arrive on.
-extension Browser: NSNetServiceBrowserDelegate {
+extension Browser: NetServiceBrowserDelegate {
     nonisolated func netServiceBrowser(
-        _ browser: NSNetServiceBrowser,
-        didFind service: NSNetService,
+        _ browser: NetServiceBrowser,
+        didFind service: NetService,
         moreComing: Bool
     ) {
         MainActor.assumeIsolated {
@@ -165,32 +165,33 @@ extension Browser: NSNetServiceBrowserDelegate {
     }
 
     nonisolated func netServiceBrowser(
-        _ browser: NSNetServiceBrowser,
-        didRemove service: NSNetService,
+        _ browser: NetServiceBrowser,
+        didRemove service: NetService,
         moreComing: Bool
     ) {
+        let name = service.name
         MainActor.assumeIsolated {
-            services.removeValue(forKey: service.name)
-            if known.remove(service.name) != nil {
+            _ = services.removeValue(forKey: name)
+            if known.remove(name) != nil {
                 emit([
                     "kind": "removed",
-                    "key": service.name,
-                    "serviceInstance": service.name,
+                    "key": name,
+                    "serviceInstance": name,
                 ])
             }
         }
     }
 
     nonisolated func netServiceBrowser(
-        _ browser: NSNetServiceBrowser,
+        _ browser: NetServiceBrowser,
         didNotSearch errorDict: [String: NSNumber]
     ) {
         MainActor.assumeIsolated {
             // The dictionary is keyed by the constant the callback documents.
-            let code = errorDict[NSNetServicesErrorCode]?.intValue
-            // `NSNetServicesMissingRequiredConfigurationError` is what a
-            // refused local-network grant answers a browse with.
-            if code == NSNetServicesError.missingRequiredConfiguration.rawValue {
+            let code = errorDict[NetService.errorCode]?.intValue
+            // `missingRequiredConfigurationError` is what a refused
+            // local-network grant answers a browse with.
+            if code == NetService.ErrorCode.missingRequiredConfigurationError.rawValue {
                 emit(["kind": "permission_denied"])
             } else {
                 emit([
@@ -203,19 +204,20 @@ extension Browser: NSNetServiceBrowserDelegate {
     }
 }
 
-extension Browser: NSNetServiceDelegate {
-    nonisolated func netServiceDidResolveAddress(_ sender: NSNetService) {
+extension Browser: NetServiceDelegate {
+    nonisolated func netServiceDidResolveAddress(_ sender: NetService) {
         MainActor.assumeIsolated {
             report(sender)
         }
     }
 
     nonisolated func netService(
-        _ sender: NSNetService,
+        _ sender: NetService,
         didNotResolve errorDict: [String: NSNumber]
     ) {
+        let name = sender.name
         MainActor.assumeIsolated {
-            services.removeValue(forKey: sender.name)
+            _ = services.removeValue(forKey: name)
         }
     }
 }

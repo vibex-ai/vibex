@@ -17,9 +17,14 @@ on:
         required: true
         type: string
       artifacts_run_id:
-        description: "Run ID whose desktop and server artifacts are reused"
+        description: "Run ID whose desktop, server, and Android artifacts are reused"
         required: true
         type: string
+      rebuild_mobile_ios:
+        description: "Rebuild only the iOS release artifacts from the workflow ref instead of reusing them"
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: read
@@ -503,13 +508,28 @@ jobs:
     # See mobile-android: the Apple packages run by default and follow the
     # same opt-out switch, and the bundle ids are the ones every released build
     # used, so a re-signed IPA replaces the installed app instead of landing
-    # beside it.
-    if: ${{ github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false' }}
+    # beside it. A replay can also rebuild only iOS (`rebuild_mobile_ios: true`)
+    # while reusing desktop, server and Android bundles from `artifacts_run_id`.
+    if: ${{ (always() && github.event_name == 'workflow_dispatch' && inputs.rebuild_mobile_ios) || (github.event_name == 'push' && vars.VIBEX_MOBILE_RELEASES_ENABLED != 'false') }}
     # macOS 14 images no longer exist; macOS 15 ships the Xcode 16 SDK.
     runs-on: macos-15
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Resolve iOS release version
+        id: version
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.release-meta.outputs.version }}"
+          if [[ -z "${version}" ]]; then
+            tag="${{ inputs.tag }}"
+            case "${tag}" in
+              v[0-9]*) version="${tag#v}" ;;
+              *) echo "not a release tag: ${tag}" >&2; exit 1 ;;
+            esac
+          fi
+          echo "version=${version}" >> "${GITHUB_OUTPUT}"
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
@@ -522,14 +542,14 @@ jobs:
       - name: Build the nsh iOS host
         env:
           VIBEX_MOBILE_PROFILE: release
-          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+          VIBEX_MOBILE_VERSION: ${{ steps.version.outputs.version }}
           VIBEX_IOS_SKIP_XCODEBUILD: "1"
         run: bash apps/mobile/scripts/build-ios-host.sh
       - name: Build unsigned simulator app
         run: >-
           xcodebuild -project apps/mobile/ios/Vibex.xcodeproj
           -scheme Vibex -sdk iphonesimulator -configuration Release
-          MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
+          MARKETING_VERSION=${{ steps.version.outputs.version }}
           -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
           CODE_SIGNING_REQUIRED=NO build
       # Ships the device IPA as well as the simulator bundle. It carries no
@@ -539,7 +559,7 @@ jobs:
       # docs/operations/ios-unsigned-install.md.
       - name: Package unsigned device IPA
         env:
-          VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
+          VIBEX_MOBILE_VERSION: ${{ steps.version.outputs.version }}
         run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
       - name: Normalize iOS artifacts and checksums
         shell: bash
@@ -549,8 +569,8 @@ jobs:
           mkdir -p "${output}"
           # The Rust device and simulator static archives, which this host links
           # per SDK (`iphoneos` / `iphonesimulator`) instead of a fat archive.
-          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
-          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks "${output}/vibex-${{ steps.version.outputs.version }}-ios-staticlib.zip"
+          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ steps.version.outputs.version }}-ios-simulator.app.zip"
           for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"
           done
@@ -576,7 +596,7 @@ jobs:
     # holds the release, which is what "a partial build never publishes" means.
     # A replay starts no build job at all, so every `needs` result is `skipped`
     # and the artifacts come from the run named in the dispatch inputs.
-    if: ${{ always() && (github.event_name == 'workflow_dispatch' || (needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped'))) }}
+    if: ${{ always() && ((github.event_name == 'workflow_dispatch' && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped')) || (needs.release-meta.result == 'success' && needs.desktop.result == 'success' && needs.server-linux.result == 'success' && needs.server-macos.result == 'success' && (needs.mobile-android.result == 'success' || needs.mobile-android.result == 'skipped') && (needs.mobile-ios.result == 'success' || needs.mobile-ios.result == 'skipped'))) }}
     runs-on: ubuntu-24.04
     steps:
       # The release body compares the published tag against the previous one and
@@ -650,6 +670,12 @@ jobs:
           merge-multiple: false
           run-id: ${{ inputs.artifacts_run_id }}
           github-token: ${{ github.token }}
+      - name: Download rebuilt iOS artifacts
+        if: github.event_name == 'workflow_dispatch' && inputs.rebuild_mobile_ios
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: mobile-ios-${{ github.sha }}
+          path: target/release-downloads/mobile-ios-rebuilt
       - uses: dtolnay/rust-toolchain@d124f86f28ff42855784ff3319f48ac182c248f8 # 1.99.1
         with:
           components: rustfmt
