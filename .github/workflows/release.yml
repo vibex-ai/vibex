@@ -547,9 +547,9 @@ jobs:
           set -euo pipefail
           output="target/mobile-ios-artifacts"
           mkdir -p "${output}"
-          # The Rust library as a static archive, which is what this host links
-          # instead of the GPUI client's XCFramework.
-          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks/libvibex_mobile.a "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
+          # The Rust device and simulator static archives, which this host links
+          # per SDK (`iphoneos` / `iphonesimulator`) instead of a fat archive.
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
           ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
           for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"

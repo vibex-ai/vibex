@@ -269,7 +269,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // beside it names it too, which is how it nearly passed while removed.
   assert(
     /^\s+- "-force_load"$/mu.test(iosProject) &&
-      iosProject.includes("$(SRCROOT)/Frameworks/libvibex_mobile.a"),
+      iosProject.includes("$(SRCROOT)/Frameworks/$(PLATFORM_NAME)/libvibex_mobile.a"),
     "ios_static_library_link_missing: nsh's UI set is only reachable with -force_load"
   );
   assert(

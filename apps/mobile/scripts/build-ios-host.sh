@@ -11,9 +11,11 @@
 #   rustup target add aarch64-apple-ios aarch64-apple-ios-sim
 #   brew install xcodegen
 #
-# The static library is built for the device and the Apple-silicon simulator
-# and merged into one universal archive; `ios/Frameworks/` and the generated
-# `Vibex.xcodeproj` are build products and are not tracked.
+# The static library is built for the device (`iphoneos`) and the Apple-silicon
+# simulator (`iphonesimulator`) into separate SDK subdirectories under
+# `ios/Frameworks/` — both are arm64 Mach-O archives so `lipo` cannot merge
+# them into one fat file. `ios/Frameworks/` and the generated `Vibex.xcodeproj`
+# are build products and are not tracked.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -28,7 +30,7 @@ if [[ "$profile" == "release" ]]; then
     profile_dir="release"
 fi
 
-for tool in xcodegen xcodebuild lipo; do
+for tool in xcodegen xcodebuild; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "error: $tool is required (Xcode's command-line tools and 'brew install xcodegen')" >&2
         exit 1
@@ -50,9 +52,12 @@ build_staticlib() {
 device_lib="$(build_staticlib aarch64-apple-ios)"
 simulator_lib="$(build_staticlib aarch64-apple-ios-sim)"
 
-mkdir -p "$ios/Frameworks"
-rm -f "$ios/Frameworks/libvibex_mobile.a"
-lipo -create "$device_lib" "$simulator_lib" -output "$ios/Frameworks/libvibex_mobile.a"
+mkdir -p "$ios/Frameworks/iphoneos" "$ios/Frameworks/iphonesimulator"
+rm -f "$ios/Frameworks/libvibex_mobile.a" \
+    "$ios/Frameworks/iphoneos/libvibex_mobile.a" \
+    "$ios/Frameworks/iphonesimulator/libvibex_mobile.a"
+cp "$device_lib" "$ios/Frameworks/iphoneos/libvibex_mobile.a"
+cp "$simulator_lib" "$ios/Frameworks/iphonesimulator/libvibex_mobile.a"
 
 # The version the tag stamps in: `MARKETING_VERSION` from `project.yml` is the
 # development default, and the release workflow passes the tag's. Both clients

@@ -57,7 +57,7 @@ targets:
         OTHER_LDFLAGS:
           - "$(inherited)"
           - "-force_load"
-          - "$(SRCROOT)/Frameworks/libvibex_mobile.a"
+          - "$(SRCROOT)/Frameworks/$(PLATFORM_NAME)/libvibex_mobile.a"
           # `native-static-libs` on a device build lists it; Xcode links it
           # through the SDK, not as a framework.
           - "-liconv"
