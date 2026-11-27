@@ -2589,6 +2589,31 @@ fn a_new_session_picks_a_workspace_and_runtime_then_opens() {
     app.wait_for("Created session").unwrap();
 }
 
+/// The new-session page is a page, not a one-shot: closing it and asking
+/// again must show it again.
+#[test]
+fn the_new_session_page_opens_again_after_it_is_closed() {
+    let mut app = start();
+    for attempt in 1..=2 {
+        app.press("role:button[Sessions]").unwrap();
+        app.wait_for("role:button[New session]").unwrap();
+        app.press(NEW_SESSION).unwrap();
+        app.wait_for("role:button[Choose workspace]").unwrap();
+        assert!(
+            app.screen().shows("Start something new with"),
+            "the page is shown on attempt {attempt}"
+        );
+        app.press("role:button[Cancel]").unwrap();
+        app.wait_for("Morning. The build is green.").unwrap();
+        assert!(
+            !app.screen()
+                .matches("role:button[Choose workspace]")
+                .unwrap(),
+            "the page is gone on attempt {attempt}"
+        );
+    }
+}
+
 #[test]
 fn a_session_is_written_under_the_conversations_own_header() {
     let mut app = start();

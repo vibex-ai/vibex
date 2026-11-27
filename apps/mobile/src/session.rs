@@ -447,7 +447,17 @@ pub struct SessionService {
     /// The folder a session created from its row menu is filed into once the
     /// runtime answers. The folder row's menu promises that destination.
     new_session_folder: Signal<Option<String>>,
+    /// The new-session page is working: a create, or the read of the choices
+    /// it needs. The page's own controls read this.
     new_busy: Signal<bool>,
+    /// A create from the page is in flight, kept apart from the choices read
+    /// so one finishing cannot report the other done.
+    new_creating: Rc<Cell<bool>>,
+    /// A read of the page's choices is in flight.
+    new_choices_busy: Rc<Cell<bool>>,
+    /// The read that owns the page's choices. Asking for the page again
+    /// supersedes an earlier read, which then writes nothing.
+    new_choices_gen: Rc<Cell<u64>>,
     new_error: Signal<Option<SharedString>>,
     workspace_records: Signal<Vec<WorkspaceSummary>>,
     resolving: Signal<bool>,
@@ -772,6 +782,9 @@ impl SessionService {
             new_attachments: signal(Vec::new()),
             new_session_folder: signal(None),
             new_busy: signal(false),
+            new_creating: Rc::new(Cell::new(false)),
+            new_choices_busy: Rc::new(Cell::new(false)),
+            new_choices_gen: Rc::new(Cell::new(0)),
             new_error: signal(None),
             workspace_records: signal(Vec::new()),
             resolving: signal(false),
@@ -6119,7 +6132,7 @@ impl SessionService {
 
     /// Creates a worktree from the chosen workspace and opens a session in it.
     fn create_worktree_session(&self) {
-        if self.new_busy.get_untracked() {
+        if self.new_creating.get() {
             return;
         }
         let Some(workspace_id) = self.new_workspace.get_untracked() else {
@@ -6152,7 +6165,8 @@ impl SessionService {
         self.remember_runtime_selection(&selection, &options);
         let draft = self.new_session_draft();
         let base_ref = self.new_base_ref.get_untracked().trim().to_owned();
-        self.new_busy.set(true);
+        self.new_creating.set(true);
+        self.refresh_new_busy();
         self.new_error.set(None);
         let service = self.clone();
         let git = self.git_backend.clone();
@@ -6178,12 +6192,14 @@ impl SessionService {
             let worktree = match created {
                 Ok(Ok(created)) => created,
                 Ok(Err(error)) => {
-                    service.new_busy.set(false);
+                    service.new_creating.set(false);
+                    service.refresh_new_busy();
                     service.new_error.set(Some(error_text(&error)));
                     return;
                 }
                 Err(error) => {
-                    service.new_busy.set(false);
+                    service.new_creating.set(false);
+                    service.refresh_new_busy();
                     service.new_error.set(Some(
                         format!("creating the worktree did not finish: {error}").into(),
                     ));
@@ -6206,7 +6222,8 @@ impl SessionService {
             if !service.alive.get() {
                 return;
             }
-            service.new_busy.set(false);
+            service.new_creating.set(false);
+            service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
                     service.finish_new_session(session, draft);
@@ -7366,6 +7383,13 @@ impl SessionService {
         }
     }
 
+    /// The page is working while either half of it is: a create, or the read
+    /// of the choices it needs.
+    fn refresh_new_busy(&self) {
+        self.new_busy
+            .set(self.new_creating.get() || self.new_choices_busy.get());
+    }
+
     /// Starts writing a new session, with the runtime's choices.
     pub fn open_new_session(&self) {
         let workspace = self.session_records.with(|sessions| {
@@ -7384,9 +7408,15 @@ impl SessionService {
         project: Option<String>,
         folder: Option<String>,
     ) {
-        if self.new_busy.get_untracked() {
-            return;
-        }
+        // The page always opens. It used to be refused while the choices it
+        // needs were still being read, so closing the page during that read
+        // and asking again did nothing at all: the tap was swallowed and the
+        // page never came back.
+        //
+        // A read already on its way belongs to the page as it was; this one
+        // takes over, and the older read writes nothing when it lands.
+        let generation = self.new_choices_gen.get().wrapping_add(1);
+        self.new_choices_gen.set(generation);
         // A session already being written keeps what was written: asking
         // again only points it at the place that was asked for.
         let writing = self.new_session_open.get_untracked();
@@ -7432,10 +7462,17 @@ impl SessionService {
             .then(|| self.runtime_catalog.get_untracked())
             .flatten();
         if let (Some(spaces), Some(catalog)) = (cached_spaces.clone(), cached_catalog.clone()) {
+            // This ask needs no read, so any read an earlier ask left behind
+            // is now stale and must not keep the page's controls disabled: it
+            // returns without clearing the flag, because its generation is
+            // gone.
+            self.new_choices_busy.set(false);
+            self.refresh_new_busy();
             self.apply_new_session_choices(spaces, catalog, workspace, project, writing, edit_gen);
             return;
         }
-        self.new_busy.set(true);
+        self.new_choices_busy.set(true);
+        self.refresh_new_busy();
         let service = self.clone();
         let workspaces = self.workspace_backend.clone();
         let catalog_backend = self.backend.clone();
@@ -7466,7 +7503,13 @@ impl SessionService {
             if !service.alive.get() {
                 return;
             }
-            service.new_busy.set(false);
+            // A later ask owns the page now: this read's answer is stale, and
+            // it must not clear the busy state that ask set.
+            if service.new_choices_gen.get() != generation {
+                return;
+            }
+            service.new_choices_busy.set(false);
+            service.refresh_new_busy();
             match result {
                 Ok(Ok((spaces, catalog))) => {
                     service.workspaces_stale.set(false);
@@ -7552,7 +7595,7 @@ impl SessionService {
 
     /// Creates the session the sheet describes.
     fn create_new_session(&self) {
-        if self.new_busy.get_untracked() {
+        if self.new_creating.get() {
             return;
         }
         let Some(workspace_id) = self.new_workspace.get_untracked() else {
@@ -7570,7 +7613,8 @@ impl SessionService {
         };
         let options = self.new_runtime_options.borrow().clone();
         self.remember_runtime_selection(&selection, &options);
-        self.new_busy.set(true);
+        self.new_creating.set(true);
+        self.refresh_new_busy();
         self.new_error.set(None);
         let draft = self.new_session_draft();
         // The id is made here rather than left to the runtime, because the page
@@ -7601,7 +7645,8 @@ impl SessionService {
             let result = crate::runtime::handle()
                 .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
-            service.new_busy.set(false);
+            service.new_creating.set(false);
+            service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
                     service.finish_new_session(session, draft);
@@ -8113,7 +8158,7 @@ impl SessionService {
     }
 
     fn create_temporary_session(&self) {
-        if self.new_busy.get_untracked() {
+        if self.new_creating.get() {
             return;
         }
         let Some(selection) = self.new_runtime_selection.borrow().clone() else {
@@ -8121,7 +8166,8 @@ impl SessionService {
         };
         let options = self.new_runtime_options.borrow().clone();
         self.remember_runtime_selection(&selection, &options);
-        self.new_busy.set(true);
+        self.new_creating.set(true);
+        self.refresh_new_busy();
         self.new_error.set(None);
         let draft = self.new_session_draft();
         let service = self.clone();
@@ -8137,12 +8183,14 @@ impl SessionService {
             let root = match root {
                 Ok(Ok(root)) => root,
                 Ok(Err(error)) => {
-                    service.new_busy.set(false);
+                    service.new_creating.set(false);
+                    service.refresh_new_busy();
                     service.new_error.set(Some(error_text(&error)));
                     return;
                 }
                 Err(error) => {
-                    service.new_busy.set(false);
+                    service.new_creating.set(false);
+                    service.refresh_new_busy();
                     service.new_error.set(Some(
                         format!("creating the temporary root did not finish: {error}").into(),
                     ));
@@ -8162,7 +8210,8 @@ impl SessionService {
             let result = crate::runtime::handle()
                 .spawn(async move { backend.create_session(MutationRequest::new(request)).await })
                 .await;
-            service.new_busy.set(false);
+            service.new_creating.set(false);
+            service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
                     service.finish_new_session(session, draft);
@@ -15811,5 +15860,95 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<IncrementalSyncAndCacheCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("incremental-sync-cache-ok").unwrap();
+    }
+
+    /// A backend whose choice reads never answer, so the page is opened while
+    /// the first read is still on its way — the state a phone sits in when the
+    /// link is slow.
+    struct SilentChoicesBackend;
+
+    impl vibex_backend::WorkspaceBackend for SilentChoicesBackend {
+        fn list_workspaces(
+            &self,
+        ) -> vibex_backend::BackendFuture<'_, Vec<vibex_backend::WorkspaceSummary>> {
+            Box::pin(std::future::pending())
+        }
+
+        fn open_workspace(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::OpenWorkspaceRequest>,
+        ) -> vibex_backend::BackendFuture<'_, vibex_backend::WorkspaceSummary> {
+            Box::pin(std::future::pending())
+        }
+
+        fn get_workspace(
+            &self,
+            _workspace_id: WorkspaceId,
+        ) -> vibex_backend::BackendFuture<'_, vibex_backend::WorkspaceSummary> {
+            Box::pin(std::future::pending())
+        }
+
+        fn delete_workspace(
+            &self,
+            _request: vibex_backend::MutationRequest<WorkspaceId>,
+        ) -> vibex_backend::BackendFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+
+        fn delete_project(
+            &self,
+            _request: vibex_backend::MutationRequest<vibex_core::ProjectId>,
+        ) -> vibex_backend::BackendFuture<'_, ()> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    #[component]
+    fn NewSessionReopensCheckView() -> impl IntoElement {
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.workspace_backend = Arc::new(SilentChoicesBackend);
+        service.workspaces_stale.set(true);
+        service.runtime_catalog_stale.set(true);
+
+        // The first ask starts the read the page waits on.
+        service.open_new_session();
+        assert!(
+            service.new_session_open.get_untracked(),
+            "the page opens on the first ask"
+        );
+        assert!(
+            service.new_busy.get_untracked(),
+            "the choices are still being read"
+        );
+
+        // The reader closes it before the read answers...
+        service.new_session_open.set(false);
+
+        // ...and asks again. The page must open again, even though that first
+        // read has not come back yet.
+        service.open_new_session();
+        assert!(
+            service.new_session_open.get_untracked(),
+            "the page opens again while the first read is still on its way"
+        );
+
+        service.shutdown();
+        view().child(text("new-session-reopens-ok"))
+    }
+
+    #[test]
+    fn the_new_session_page_reopens_before_its_choices_arrive() {
+        let config = EngineConfig::new(Root::of::<NewSessionReopensCheckView>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("new-session-reopens-ok").unwrap();
     }
 }
