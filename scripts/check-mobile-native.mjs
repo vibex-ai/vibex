@@ -1,6 +1,6 @@
 // The phone client's contract, checked without an Android device or an Xcode.
 //
-// `apps/mobile-nsh` is the only mobile client in this tree. Its Kotlin/Swift
+// `apps/mobile` is the only mobile client in this tree. Its Kotlin/Swift
 // hosts own the platform surface the `nsh` runtime cannot reach — the camera,
 // the scanner, notifications, the connection service, LAN discovery and the
 // share intake — and they meet the Rust library at a JNI/FFI boundary that no
@@ -12,7 +12,7 @@
 // Java side declares has a Rust export, the manifest keeps the permissions and
 // components those features need, and the iOS project keeps the same keys its
 // plists and Swift code expect. The upgrade path (applicationId, versionCode,
-// bundle ids) is pinned next door in `apps/mobile-nsh/scripts/check-upgrade.mjs`.
+// bundle ids) is pinned next door in `apps/mobile/scripts/check-upgrade.mjs`.
 //
 // Run directly or through `pnpm check:mobile-native`.
 
@@ -23,28 +23,28 @@ import { fileURLToPath } from "node:url";
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const SELF_TEST = process.argv.includes("--self-test");
 
-const ANDROID = "apps/mobile-nsh/android/app/src/main/AndroidManifest.xml";
-const ANDROID_BUILD = "apps/mobile-nsh/android/app/build.gradle";
+const ANDROID = "apps/mobile/android/app/src/main/AndroidManifest.xml";
+const ANDROID_BUILD = "apps/mobile/android/app/build.gradle";
 const ANDROID_ACTIVITY =
-  "apps/mobile-nsh/android/app/src/main/java/com/longbridge/nsh/MainActivity.java";
-const ANDROID_HOST_JAVA = "apps/mobile-nsh/android/app/src/main/java/ai/vibex/mobile/nsh/NshHost.java";
+  "apps/mobile/android/app/src/main/java/com/longbridge/nsh/MainActivity.java";
+const ANDROID_HOST_JAVA = "apps/mobile/android/app/src/main/java/ai/vibex/mobile/NativeHost.java";
 const ANDROID_SCANNER =
-  "apps/mobile-nsh/android/app/src/main/java/com/longbridge/nsh/ScannerActivity.java";
+  "apps/mobile/android/app/src/main/java/com/longbridge/nsh/ScannerActivity.java";
 const ANDROID_SERVICE =
-  "apps/mobile-nsh/android/app/src/main/java/com/longbridge/nsh/ConnectionService.java";
+  "apps/mobile/android/app/src/main/java/com/longbridge/nsh/ConnectionService.java";
 const ANDROID_DISCOVERY =
-  "apps/mobile-nsh/android/app/src/main/java/com/longbridge/nsh/LanDiscovery.java";
-const ANDROID_PATHS = "apps/mobile-nsh/android/app/src/main/res/xml/file_paths.xml";
-const ANDROID_SHORTCUTS = "apps/mobile-nsh/android/app/src/main/res/xml/shortcuts.xml";
-const ANDROID_PLATFORM = "apps/mobile-nsh/src/platform/android.rs";
+  "apps/mobile/android/app/src/main/java/com/longbridge/nsh/LanDiscovery.java";
+const ANDROID_PATHS = "apps/mobile/android/app/src/main/res/xml/file_paths.xml";
+const ANDROID_SHORTCUTS = "apps/mobile/android/app/src/main/res/xml/shortcuts.xml";
+const ANDROID_PLATFORM = "apps/mobile/src/platform/android.rs";
 
-const IOS_PROJECT = "apps/mobile-nsh/ios/project.yml";
-const IOS_PLIST = "apps/mobile-nsh/ios/Resources/Info.plist";
-const IOS_DELEGATE = "apps/mobile-nsh/ios/Vibex/AppDelegate.swift";
-const IOS_BRIDGE = "apps/mobile-nsh/ios/Vibex/HostBridge.swift";
-const IOS_DISCOVERY = "apps/mobile-nsh/ios/Vibex/LanDiscovery.swift";
-const IOS_SHARE_APP = "apps/mobile-nsh/ios/Vibex/ShareIntake.swift";
-const IOS_SHARE_EXTENSION = "apps/mobile-nsh/ios/VibexShare/ShareViewController.swift";
+const IOS_PROJECT = "apps/mobile/ios/project.yml";
+const IOS_PLIST = "apps/mobile/ios/Resources/Info.plist";
+const IOS_DELEGATE = "apps/mobile/ios/Vibex/AppDelegate.swift";
+const IOS_BRIDGE = "apps/mobile/ios/Vibex/HostBridge.swift";
+const IOS_DISCOVERY = "apps/mobile/ios/Vibex/LanDiscovery.swift";
+const IOS_SHARE_APP = "apps/mobile/ios/Vibex/ShareIntake.swift";
+const IOS_SHARE_EXTENSION = "apps/mobile/ios/VibexShare/ShareViewController.swift";
 
 /** Every host file the client is made of. */
 const HOST_FILES = [
@@ -95,10 +95,9 @@ function jniSymbol(packageName, className, method) {
 
 function validateContract(read = source, exists = (path) => existsSync(join(ROOT, path))) {
   assert(!exists("apps/mobile-wasm"), "legacy_mobile_wasm_tree_present");
-  // The GPUI client was removed; a copy coming back would ship two clients that
-  // both claim the same application id and the same store.
-  assert(!exists("apps/mobile"), "removed_gpui_mobile_tree_present");
-  assert(!exists("apps/mobile/nsh.json"), "removed_gpui_mobile_app_present");
+  // `apps/mobile` now *is* the nsh client; the GPUI one it replaced is gone, and
+  // what proves the tree is the current client is the app manifest beside it.
+  assert(!exists("apps/mobile-wasm"), "legacy_mobile_wasm_tree_present");
 
   for (const path of HOST_FILES) {
     assert(exists(path), `mobile_host_file_missing:${path}`);
@@ -128,17 +127,17 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // unit test on a desktop reaches.
   const exports = new Set(rustJniExports(platform));
   for (const method of javaNativeMethods(hostJava)) {
-    const symbol = jniSymbol("ai.vibex.mobile.nsh", "NshHost", method);
+    const symbol = jniSymbol("ai.vibex.mobile", "NativeHost", method);
     assert(exports.has(symbol), `android_jni_export_missing:${method}`);
   }
   // The view comes from the nsh AAR and calls back into the same class.
   assert(
-    exports.has("Java_ai_vibex_mobile_nsh_NshHost_nativeRunRoot"),
+    exports.has("Java_ai_vibex_mobile_NativeHost_nativeRunRoot"),
     "android_jni_root_export_missing"
   );
   for (const required of [
     'System.loadLibrary("nsh")',
-    "public final class NshHost"
+    "public final class NativeHost"
   ]) {
     assert(hostJava.includes(required), `android_host_library_contract_missing:${required}`);
   }
@@ -146,7 +145,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // The app may not be built out of a javac-invisible package: the Rust JNI
   // names, the Java package and the namespace all have to agree.
   assert(
-    androidBuild.includes("namespace 'ai.vibex.mobile.nsh'"),
+    androidBuild.includes("namespace 'ai.vibex.mobile'"),
     "android_namespace_missing: the JNI symbol names depend on the Java package"
   );
 
@@ -270,7 +269,7 @@ function validateContract(read = source, exists = (path) => existsSync(join(ROOT
   // beside it names it too, which is how it nearly passed while removed.
   assert(
     /^\s+- "-force_load"$/mu.test(iosProject) &&
-      iosProject.includes("$(SRCROOT)/Frameworks/libvibex_mobile_nsh.a"),
+      iosProject.includes("$(SRCROOT)/Frameworks/libvibex_mobile.a"),
     "ios_static_library_link_missing: nsh's UI set is only reachable with -force_load"
   );
   assert(
@@ -380,7 +379,7 @@ function runSelfTest() {
   );
   expectRejected(
     ANDROID_BUILD,
-    "namespace 'ai.vibex.mobile.nsh'",
+    "namespace 'ai.vibex.mobile'",
     "namespace 'ai.vibex.mobile.other'",
     "self_test_accepted_a_mismatched_jni_namespace"
   );

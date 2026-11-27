@@ -410,7 +410,7 @@ DesktopRuntime / vibex-server
 - `crates/vibex-backend` 提供原生适配器与远程适配器共享的、与供应商无关的能力 facade。
 - `crates/vibex-ui` 负责语义化 token、可移植组件模型、工作流控制器和 shell 组合。
 - `crates/vibex-remote-client` 负责配对、重连、同步以及 Direct、Tailnet 和 Relay 路由选择。
-- `apps/desktop` 负责原生工作台和 `DesktopRuntime`；`apps/mobile-nsh` 与 `apps/tui` 只把共享投影组合成各自的界面。
+- `apps/desktop` 负责原生工作台和 `DesktopRuntime`；`apps/mobile` 与 `apps/tui` 只把共享投影组合成各自的界面。
 
 详细契约请阅读 [UI 架构边界](docs/architecture/ui-boundary.md)、[平台支持矩阵](docs/platform/support-matrix.md)、[Remote Protocol v2](docs/remote/protocol-v2.md)、[SSH Remote Runtime](docs/remote/ssh-runtime.md)，以及 [IM 聊天频道](docs/im-channels.md)。
 

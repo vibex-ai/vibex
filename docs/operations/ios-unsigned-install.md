@@ -30,7 +30,7 @@ repository.
 1. Push the workflow to the default branch. `workflow_dispatch` only lists a
    workflow that already exists there.
 2. Open **Actions → Mobile iOS Unsigned IPA → Run workflow**. Leave the version
-   input empty to stamp the version declared in `apps/mobile-nsh/Cargo.toml`.
+   input empty to stamp the version declared in `apps/mobile/Cargo.toml`.
 3. Download `mobile-ios-unsigned-<sha>` from the finished run and unzip it.
 
 The tagged release workflow publishes the same file as
@@ -46,7 +46,7 @@ pnpm package:mobile:ios
 ```
 
 `package:mobile:ios` builds the device bundle and writes the IPA plus its
-SHA-256 sidecar to `target/mobile-nsh-ios-artifacts/`. Set `VIBEX_MOBILE_VERSION`
+SHA-256 sidecar to `target/mobile-ios-artifacts/`. Set `VIBEX_MOBILE_VERSION`
 to override the stamped version. Both steps need macOS with Xcode, because the
 device link resolves the iOS SDK through `xcrun`; the script generates the
 project and the static library by itself when they are missing.
@@ -75,7 +75,7 @@ free a slot first.
 
 ### Xcode with a personal team
 
-Open `apps/mobile-nsh/ios/Vibex.xcodeproj` (generate it with
+Open `apps/mobile/ios/Vibex.xcodeproj` (generate it with
 `pnpm build:mobile:ios` first), select the `Vibex` target, set your Apple ID
 under **Signing & Capabilities** with **Automatically manage signing**, and run
 against the device. Xcode registers the device and issues the free profile. This
@@ -113,13 +113,13 @@ nothing else.
 Free Apple IDs cannot sign apps that request managed entitlements. The mobile
 client requests none, which is what makes the unsigned artifact practical:
 
-- Notifications are local. `apps/mobile-nsh/ios/HostBridge.swift` and the
+- Notifications are local. `apps/mobile/ios/HostBridge.swift` and the
   nsh notification center schedule them through `UNUserNotificationCenter` with
   no server push, so the app needs no `aps-environment` entitlement.
-- LAN discovery only browses Bonjour. `apps/mobile-nsh/ios/LanDiscovery.swift`
+- LAN discovery only browses Bonjour. `apps/mobile/ios/LanDiscovery.swift`
   runs an `NSNetServiceBrowser`, which is covered by the `NSBonjourServices` and
   `NSLocalNetworkUsageDescription` keys already in
-  `apps/mobile-nsh/ios/Resources/Info.plist` and needs no multicast entitlement.
+  `apps/mobile/ios/Resources/Info.plist` and needs no multicast entitlement.
 - Neither target carries an `.entitlements` file. The share extension hands its
   text over in a `vibex://share` URL rather than a shared App Group, because the
   App Groups capability is managed and a free Apple ID cannot sign it.

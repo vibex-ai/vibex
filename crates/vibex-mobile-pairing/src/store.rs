@@ -111,17 +111,43 @@ impl PairingStore {
     /// Adds or replaces the runtime with the same host id, at the front.
     ///
     /// Returns the new list. Re-pairing the same desktop updates its entry
-    /// instead of growing the picker, which is what the runtime's paired-device
-    /// list shows too.
+    /// instead of growing the picker and retains previously learned routes
+    /// (LAN, Tailscale, direct URLs, relay) rather than overwriting them.
     pub fn upsert(
+        &self,
+        mut bundle: MobileCredentialBundle,
+    ) -> BackendResult<Vec<MobileCredentialBundle>> {
+        let host_id = bundle.host_id().to_owned();
+        let mut runtimes = self.load()?;
+        if let Some(existing) = runtimes
+            .iter()
+            .find(|runtime| runtime.host_id() == host_id)
+        {
+            bundle.merge_from_existing(existing);
+        }
+        runtimes.retain(|runtime| runtime.host_id() != host_id);
+        runtimes.insert(0, bundle);
+        self.save(&runtimes)?;
+        Ok(runtimes)
+    }
+
+    /// Updates an existing runtime in place without reordering the list.
+    ///
+    /// If the runtime has already been removed, leaves the store unchanged so
+    /// an in-flight probe or rename cannot resurrect a deleted host.
+    pub fn update_in_place(
         &self,
         bundle: MobileCredentialBundle,
     ) -> BackendResult<Vec<MobileCredentialBundle>> {
         let host_id = bundle.host_id().to_owned();
         let mut runtimes = self.load()?;
-        runtimes.retain(|runtime| runtime.host_id() != host_id);
-        runtimes.insert(0, bundle);
-        self.save(&runtimes)?;
+        if let Some(slot) = runtimes
+            .iter_mut()
+            .find(|runtime| runtime.host_id() == host_id)
+        {
+            *slot = bundle;
+            self.save(&runtimes)?;
+        }
         Ok(runtimes)
     }
 
@@ -151,7 +177,10 @@ fn write_error(error: &std::io::Error) -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use vibex_core::{DeviceId, RemoteAuthProof, RemoteClientType};
+    use crate::pairing::{
+        MobileLocalNetworkCandidate, MobileRelayCandidate, MobileRemoteRouteBundle,
+    };
+    use vibex_core::{DeviceId, RelayPeerId, RelayRoomId, RemoteAuthProof, RemoteClientType};
     use vibex_remote_client::RemoteCredentialRecord;
 
     fn bundle(host: &str) -> MobileCredentialBundle {
@@ -219,6 +248,85 @@ mod tests {
         let runtimes = store.remove("desktop").unwrap();
         assert_eq!(runtimes.len(), 1);
         assert_eq!(runtimes[0].expected_server_id, "laptop");
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn upsert_merges_routes_across_repairings_of_the_same_host() {
+        let (store, directory) = store();
+        let mut lan = bundle("desktop");
+        lan.display_name = Some("Studio Mac".to_owned());
+        lan.route = Some(MobileRemoteRouteBundle {
+            local_network: Some(MobileLocalNetworkCandidate {
+                url: "https://192.168.1.50:8443".to_owned(),
+                tls_certificate_der: "cert".to_owned(),
+            }),
+            direct_candidates: Vec::new(),
+            relay: None,
+        });
+        store.upsert(lan).unwrap();
+
+        let mut tailscale = bundle("desktop");
+        tailscale.display_name = None;
+        tailscale.route = Some(MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: vec!["https://studio.tailnet.ts.net".to_owned()],
+            relay: None,
+        });
+        store.upsert(tailscale).unwrap();
+
+        let mut relay = bundle("desktop");
+        relay.display_name = None;
+        relay.route = Some(MobileRemoteRouteBundle {
+            local_network: None,
+            direct_candidates: Vec::new(),
+            relay: Some(MobileRelayCandidate {
+                url: "https://relay.example.com".to_owned(),
+                room_id: RelayRoomId::new(),
+                local_peer_id: RelayPeerId::new(),
+                pc_peer_id: RelayPeerId::new(),
+                pc_public_key: "pub".to_owned(),
+            }),
+        });
+        let runtimes = store.upsert(relay).unwrap();
+        assert_eq!(runtimes.len(), 1);
+        let merged = &runtimes[0];
+        assert_eq!(merged.display_name.as_deref(), Some("Studio Mac"));
+        let route = merged.route.as_ref().unwrap();
+        assert_eq!(
+            route.local_network.as_ref().map(|c| c.url.as_str()),
+            Some("https://192.168.1.50:8443")
+        );
+        assert_eq!(
+            route.direct_candidates,
+            vec!["https://studio.tailnet.ts.net".to_owned()]
+        );
+        assert_eq!(
+            route.relay.as_ref().map(|c| c.url.as_str()),
+            Some("https://relay.example.com")
+        );
+        let _ = fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn update_in_place_preserves_order_and_ignores_removed_hosts() {
+        let (store, directory) = store();
+        store.upsert(bundle("desktop")).unwrap();
+        store.upsert(bundle("laptop")).unwrap();
+
+        let mut updated = bundle("desktop");
+        updated.display_name = Some("Studio Mac".to_owned());
+        let runtimes = store.update_in_place(updated).unwrap();
+        assert_eq!(
+            runtimes
+                .iter()
+                .map(|r| (r.expected_server_id.as_str(), r.display_name.as_deref()))
+                .collect::<Vec<_>>(),
+            vec![("laptop", Some("laptop")), ("desktop", Some("Studio Mac"))]
+        );
+
+        let runtimes = store.update_in_place(bundle("deleted")).unwrap();
+        assert_eq!(runtimes.len(), 2);
         let _ = fs::remove_dir_all(directory);
     }
 

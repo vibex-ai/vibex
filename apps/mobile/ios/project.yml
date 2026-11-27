@@ -1,0 +1,120 @@
+name: Vibex
+options:
+  minimumXcodeGenVersion: "2.45.0"
+  projectFormat: xcode15_3
+  bundleIdPrefix: ai.vibex
+  deploymentTarget:
+    iOS: "17.0"
+  # The project file is generated; `scripts/build-ios-host.sh` runs this.
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.9"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.9"
+    ENABLE_USER_SCRIPT_SANDBOXING: NO
+    CLANG_ENABLE_OBJC_ARC: YES
+    # The Rust library is arm64 only: the device and the Apple-silicon
+    # simulator. An Intel Mac builds the simulator slice it can run.
+    ARCHS: [arm64]
+    ONLY_ACTIVE_ARCH: YES
+
+targets:
+  Vibex:
+    type: application
+    platform: iOS
+    sources:
+      - path: Vibex
+      # `Resources/Assets.xcassets` (the app icon, reviewed under
+      # `vibex-mobile-application-icons` in `docs/licenses/desktop-policy.json`)
+      # comes in with this directory.
+      - path: Resources
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile
+        PRODUCT_NAME: Vibex
+        INFOPLIST_FILE: Resources/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        # iPhone only: the scanner and the composer are laid out for a phone,
+        # as the Android host is.
+        TARGETED_DEVICE_FAMILY: "1"
+        # No entitlements on purpose. The install path for this app is
+        # re-signing the unsigned IPA with a free Apple ID, which cannot sign a
+        # managed capability such as App Groups. Asking for one would break both
+        # the upgrade in place and the free install, for a share handoff that a
+        # `vibex://share?text=…` URL does without any entitlement.
+        SWIFT_OBJC_BRIDGING_HEADER: Vibex/Vibex-Bridging-Header.h
+        HEADER_SEARCH_PATHS: ["$(inherited)", "$(SRCROOT)/Headers"]
+        # The Rust static library (`libvibex_mobile.a`, built by
+        # `scripts/build-ios-host.sh`). `-force_load` keeps the archive's
+        # objects that only registration reaches — nsh's UI set and native
+        # components collect through linker sections, which a plain `-l`
+        # drops for an object nothing references by symbol.
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-force_load"
+          - "$(SRCROOT)/Frameworks/libvibex_mobile.a"
+          # `native-static-libs` on a device build lists it; Xcode links it
+          # through the SDK, not as a framework.
+          - "-liconv"
+        # Frameworks the Rust crates and the shell use. `native-static-libs`
+        # on a device build lists the first block; the rest are the shell's
+        # own (camera, QR decoding, sharing).
+        LD_RUNPATH_SEARCH_PATHS: ["$(inherited)", "@executable_path/Frameworks"]
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: Foundation.framework
+      - sdk: CoreGraphics.framework
+      - sdk: CoreFoundation.framework
+      - sdk: CoreText.framework
+      - sdk: QuartzCore.framework
+      - sdk: Security.framework
+      - sdk: Network.framework
+      - sdk: AuthenticationServices.framework
+      - sdk: CoreTelephony.framework
+      - sdk: ImageIO.framework
+      - sdk: IOSurface.framework
+      - sdk: AVFoundation.framework
+      - sdk: Vision.framework
+      - sdk: PhotosUI.framework
+      - sdk: UniformTypeIdentifiers.framework
+      - sdk: UserNotifications.framework
+      - target: VibexShare
+        embed: true
+
+  VibexShare:
+    type: app-extension
+    platform: iOS
+    sources:
+      - path: VibexShare
+        excludes:
+          - Info.plist
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: ai.vibex.mobile.share
+        PRODUCT_NAME: VibexShare
+        INFOPLIST_FILE: VibexShare/Info.plist
+        GENERATE_INFOPLIST_FILE: NO
+        APPLICATION_EXTENSION_API_ONLY: YES
+        SKIP_INSTALL: YES
+    dependencies:
+      - sdk: UIKit.framework
+      - sdk: UniformTypeIdentifiers.framework
+
+# A scheme the build script can name: Xcode's automatic schemes only exist
+# once the project has been opened in the IDE, and `xcodebuild -scheme Vibex`
+# runs before that.
+schemes:
+  Vibex:
+    build:
+      targets:
+        Vibex: all
+        VibexShare: [run, archive]
+    run:
+      config: Debug
+    archive:
+      config: Release

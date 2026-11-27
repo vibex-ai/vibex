@@ -38,8 +38,8 @@ const GENERATED_ASSET_ROOTS = [
   // `ios/Frameworks/`. Both are git-ignored outputs of registered inputs, and
   // counting them would report the same file twice on a developer machine that
   // has built an APK or an IPA.
-  resolve(ROOT, "apps/mobile-nsh/android/app/build"),
-  resolve(ROOT, "apps/mobile-nsh/ios/Frameworks")
+  resolve(ROOT, "apps/mobile/android/app/build"),
+  resolve(ROOT, "apps/mobile/ios/Frameworks")
 ];
 
 function fail(message) {
@@ -419,7 +419,7 @@ function auditInputs(policyState, runtime) {
 
   // Every app that ships artwork. The GPUI mobile client that used to carry its
   // own copies is gone; the nsh client keeps its app icon in `ios/Resources`.
-  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile-nsh")];
+  const scanRoots = [resolve(ROOT, "apps/desktop"), resolve(ROOT, "apps/mobile")];
   const unregistered = scanRoots
     .filter(existsSync)
     .flatMap(walkFiles)

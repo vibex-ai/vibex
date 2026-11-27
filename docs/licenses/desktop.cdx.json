@@ -39937,7 +39937,7 @@
       "externalReferences": [
         {
           "type": "vcs",
-          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset"
+          "url": "https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Resources/Assets.xcassets/AppIcon.appiconset"
         }
       ],
       "properties": [
@@ -39947,7 +39947,7 @@
         },
         {
           "name": "vibex:asset-root",
-          "value": "apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset"
+          "value": "apps/mobile/ios/Resources/Assets.xcassets/AppIcon.appiconset"
         },
         {
           "name": "vibex:file-count",

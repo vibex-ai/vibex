@@ -625,7 +625,7 @@ function validatePackaging() {
   ]) {
     assert(releaseWorkflow.includes(required), `publish workflow is missing Android signing contract ${required}`);
   }
-  const androidSigningScript = source("apps/mobile-nsh/scripts/sign-android-release.sh");
+  const androidSigningScript = source("apps/mobile/scripts/sign-android-release.sh");
   for (const required of ["apksigner", "zipalign", "jarsigner", "VIBEX_RELEASE_CHANNEL"]) {
     assert(
       androidSigningScript.includes(required),
@@ -640,7 +640,7 @@ function validatePackaging() {
   // replaced by it in place. Its release path has to keep producing the same
   // artifacts (an APK and an AAB, plus the unsigned device IPA) and keep the
   // identity that makes an in-place upgrade possible.
-  const androidHostScript = source("apps/mobile-nsh/scripts/build-android-host.sh");
+  const androidHostScript = source("apps/mobile/scripts/build-android-host.sh");
   assert(
     androidHostScript.includes(":app:bundleRelease"),
     "Android release workflow must produce an AAB"
@@ -659,24 +659,24 @@ function validatePackaging() {
   // The versionCode and applicationId are what make an install an update; the
   // checker pins both against the GPUI client's build file.
   assert(
-    releaseWorkflow.includes("apps/mobile-nsh/scripts/check-upgrade.mjs") ||
+    releaseWorkflow.includes("apps/mobile/scripts/check-upgrade.mjs") ||
       releaseWorkflow.includes("Verify native mobile contract"),
     "publish workflow does not run the mobile upgrade contract"
   );
-  const iosBuildScript = source("apps/mobile-nsh/scripts/build-ios-host.sh");
+  const iosBuildScript = source("apps/mobile/scripts/build-ios-host.sh");
   assert(
     iosBuildScript.includes("--crate-type staticlib"),
     "iOS release build must emit a static library"
   );
   assert(
-    iosBuildScript.includes("cargo rustc -p vibex-mobile-nsh"),
+    iosBuildScript.includes("cargo rustc -p vibex-mobile"),
     "iOS release build must select the nsh library target"
   );
   // The unsigned device IPA is how an iOS build ships without an Apple account.
   // Keep it unsigned by contract: a signed bundle would need credentials the
   // release pipeline deliberately does not hold, and the artifact name would
   // stop describing its contents.
-  const iosIpaScript = source("apps/mobile-nsh/scripts/package-ios-unsigned-ipa.sh");
+  const iosIpaScript = source("apps/mobile/scripts/package-ios-unsigned-ipa.sh");
   for (const required of [
     "build-ios-host.sh",
     "VIBEX_IOS_SIGNING_ALLOWED=NO",

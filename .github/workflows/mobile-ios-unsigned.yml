@@ -38,7 +38,7 @@ jobs:
         with:
           targets: aarch64-apple-ios, aarch64-apple-ios-sim
       - name: Verify native mobile contract
-        run: node scripts/check-mobile-native.mjs && node apps/mobile-nsh/scripts/check-upgrade.mjs
+        run: node scripts/check-mobile-native.mjs && node apps/mobile/scripts/check-upgrade.mjs
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Build the nsh iOS host
@@ -47,15 +47,15 @@ jobs:
           # An empty value makes the script fall back to the mobile crate version.
           VIBEX_MOBILE_VERSION: ${{ inputs.version }}
           VIBEX_IOS_SKIP_XCODEBUILD: "1"
-        run: bash apps/mobile-nsh/scripts/build-ios-host.sh
+        run: bash apps/mobile/scripts/build-ios-host.sh
       - name: Package unsigned device IPA
         env:
           VIBEX_MOBILE_VERSION: ${{ inputs.version }}
-        run: bash apps/mobile-nsh/scripts/package-ios-unsigned-ipa.sh
+        run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
       - name: Upload unsigned IPA
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mobile-ios-unsigned-${{ github.sha }}
-          path: target/mobile-nsh-ios-artifacts/**
+          path: target/mobile-ios-artifacts/**
           if-no-files-found: error
           retention-days: 14

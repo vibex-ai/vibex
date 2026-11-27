@@ -13,7 +13,7 @@ runtime core:
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Full GPUI workbench over the authoritative `DesktopRuntime` |
 | Headless server | `apps/server` | The same `DesktopRuntime` as a daemon (`vibex-server`) for cloud deployment |
-| Native mobile | `apps/mobile-nsh` | iOS/Android Native Shell client: platform views over the same remote projections |
+| Native mobile | `apps/mobile` | iOS/Android Native Shell client: platform views over the same remote projections |
 | Self-hosted Relay | `apps/relay-server` | Encrypted frame transport only |
 
 The Native Shell client replaced the GPUI mobile client, which was removed from
@@ -58,7 +58,7 @@ becomes a second authority or database.
    controllers, and shell composition. Views do not own transport or authority.
 6. `crates/vibex-remote-client` owns pairing, reconnect, synchronization, and
    Direct/Tailnet/Relay transport. Relay never becomes a second database.
-7. `crates/vibex-nsh-ui` owns the Native Shell UI layer (tokens, styled controls,
+7. `crates/vibex-mobile-ui` owns the Native Shell UI layer (tokens, styled controls,
    screens). It depends on `nsh-core` and `nsh-base` only, never on GPUI, and it
    holds no transport or authority: the app's host seams supply both.
 8. `crates/vibex-mobile-pairing` owns the phone's pairing core: entry
@@ -90,13 +90,13 @@ drop approval/error states.
 
 ### Native Shell (nsh) mobile client
 
-`apps/mobile-nsh` is a Rust app for Native Shell (`nsh`): `nsh.json` names this
+`apps/mobile` is a Rust app for Native Shell (`nsh`): `nsh.json` names this
 crate's root component, and `nsh` mounts each platform's own views (UIKit on
 iOS, Android views on Android) over the engine. The UI layer is
-`crates/vibex-nsh-ui`; the app crate holds only the root, the host seams and the
+`crates/vibex-mobile-ui`; the app crate holds only the root, the host seams and the
 theme generation.
 
-- The palette is generated into `apps/mobile-nsh/theme.json` from
+- The palette is generated into `apps/mobile/theme.json` from
   `crates/vibex-ui/theme/tokens.json`, so both clients read one token source.
 - Native behavior is the point of the move: text input, selection, scrolling,
   navigation and the keyboard are the platform's. Screens keep the phone's
@@ -120,16 +120,16 @@ theme generation.
   runtime reports) and written with a revision guard; Git status, staging,
   commit, revert, commit detail and branch checkout call the same backend
   contracts the desktop workbench uses.
-- The platform names the phone for pairing (`NshHost.nativeSetDeviceName` /
-  `vibex_mobile_nsh_set_device_name`), and packaging is
-  `apps/mobile-nsh/scripts/build-android-host.sh` and `build-ios-host.sh`, with
+- The platform names the phone for pairing (`NativeHost.nativeSetDeviceName` /
+  `vibex_mobile_set_device_name`), and packaging is
+  `apps/mobile/scripts/build-android-host.sh` and `build-ios-host.sh`, with
   `package-ios-unsigned-ipa.sh` producing the unsigned device IPA.
 - The UI layer is written to be reusable if the desktop moves to `nsh`'s GPUI
   backend; it must not assume a phone-only composition.
 
 ### Host boundary
 
-`apps/mobile-nsh` is the only mobile client. The Java and Swift hosts are thin
+`apps/mobile` is the only mobile client. The Java and Swift hosts are thin
 adapters over what the runtime cannot reach, and everything they own is a seam
 the app calls back through:
 
@@ -137,7 +137,7 @@ the app calls back through:
   Activity that hosts the `nsh` view. It owns the camera capture and the QR
   scanner, the connection foreground service, LAN discovery, the share intake
   and the APK install hand-off; each one reports back through a
-  `NshHost.native*` method. Every class that declares one of those methods loads
+  `NativeHost.native*` method. Every class that declares one of those methods loads
   `libnsh.so` itself, because a restored scanner Activity can run before the main
   Activity.
 - iOS enters through `AppDelegate`, which mounts the host view, routes
@@ -145,15 +145,15 @@ the app calls back through:
   `HostBridge` keeps the connection through a `beginBackgroundTask` window; iOS
   has no foreground service.
 - Both hosts keep the released application identity so a phone still running the
-  removed client takes this one as an update. `apps/mobile-nsh/scripts/check-upgrade.mjs`
+  removed client takes this one as an update. `apps/mobile/scripts/check-upgrade.mjs`
   pins the ids, the versionCode scheme, the iOS build number and the legacy file
   names; changing one is a release decision, not a rename.
 - `nsh` reports safe areas and keyboard insets to the app as root geometry. The
   hosts do not compute content rectangles, and no device-specific notch or
   keyboard constant belongs in a screen.
 
-The checked-in project definitions live under `apps/mobile-nsh/android` and
-`apps/mobile-nsh/ios` (generated from `ios/project.yml`). Built libraries,
+The checked-in project definitions live under `apps/mobile/android` and
+`apps/mobile/ios` (generated from `ios/project.yml`). Built libraries,
 Xcode projects and APKs are build outputs and are never source dependencies.
 
 ## Remote Data Flow
@@ -304,7 +304,7 @@ approval-pending, and destructive-confirmation states are all first-class.
 
 ```text
 apps/desktop    -> NativeBackend -> typed domain services -> crates/core
-apps/mobile-nsh -> remote facade -> RemoteGateway -> DesktopRuntime
+apps/mobile -> remote facade -> RemoteGateway -> DesktopRuntime
 Relay           -> encrypted frames only
 ```
 
@@ -348,7 +348,7 @@ directly or introduce a second authority.
 pnpm check:licenses
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
-cargo test -p vibex-mobile-nsh --locked
+cargo test -p vibex-mobile --locked
 pnpm smoke:relay:local
 ```
 

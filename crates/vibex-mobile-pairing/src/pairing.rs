@@ -11,11 +11,11 @@ use vibex_core::{
 };
 use vibex_remote_client::{
     AutoRemoteTransport, AutoRemoteTransportConfig, ClientDeviceIdentity, DirectCandidate,
-    LanPairingSession, PAIRING_FRAGMENT_PREFIX, PairingClaimRoute, PairingEntryHint,
-    PairingEntryHintKind, RelayClientConfig, RemoteClientConfig, RemoteCredentialRecord,
-    WebRemoteBackend, ZeroConfigLanPairingSession, claim_pairing_offer,
-    claim_pairing_offer_via_relay, pairing_claim_request, parse_pairing_offer_fragment,
-    select_pairing_claim_route,
+    DirectWebSocketTransport, LanPairingSession, PAIRING_FRAGMENT_PREFIX, PairingClaimRoute,
+    PairingEntryHint, PairingEntryHintKind, RelayClientConfig, RelayE2eeTransport,
+    RemoteClientConfig, RemoteCredentialRecord, WebRemoteBackend, ZeroConfigLanPairingSession,
+    choose_direct_candidate, claim_pairing_offer, claim_pairing_offer_via_relay,
+    pairing_claim_request, parse_pairing_offer_fragment, select_pairing_claim_route,
 };
 
 pub const MOBILE_CREDENTIAL_SCHEMA_VERSION: &str = "vibex-native-mobile-credentials.v1";
@@ -23,6 +23,47 @@ pub const MOBILE_CREDENTIAL_SCHEMA_VERSION: &str = "vibex-native-mobile-credenti
 /// How long a saved runtime has to answer the reachability probe before the
 /// phone stops waiting and calls it unreachable.
 const PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(8);
+
+/// Maximum number of non-LAN direct candidate URLs kept when merging routes
+/// across re-pairings. Leaves one slot for `local_network` within the
+/// transport's 16-candidate cap.
+const MAX_MERGED_DIRECT_CANDIDATES: usize = 15;
+
+/// Which route(s) a saved runtime should use when connecting.
+///
+/// `Auto` (the default) probes all direct routes concurrently (LAN, Tailscale,
+/// custom HTTPS direct URLs), picks the lowest-latency reachable route (breaking
+/// ties by priority, with LAN first), and falls back to the relay only if every
+/// direct route is unreachable.
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum MobileRouteSelection {
+    #[default]
+    Auto,
+    LocalNetwork,
+    Direct {
+        url: String,
+    },
+    Relay,
+}
+
+/// Reachability plus identity metadata observed from probing a saved runtime.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MobileRuntimeProbe {
+    pub online: bool,
+    pub server_display_name: Option<String>,
+    pub server_kind: RemoteServerKind,
+}
+
+impl MobileRuntimeProbe {
+    fn offline() -> Self {
+        Self {
+            online: false,
+            server_display_name: None,
+            server_kind: RemoteServerKind::Unknown,
+        }
+    }
+}
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -162,6 +203,136 @@ impl MobileCredentialBundle {
         &self.expected_server_id
     }
 
+    /// Merges previously known routes and display name from `existing` into
+    /// `self` so re-pairing the same machine over a different transport (LAN,
+    /// Tailscale, direct HTTPS, or relay) retains all previously learned routes
+    /// instead of overwriting them.
+    pub fn merge_from_existing(&mut self, existing: &MobileCredentialBundle) {
+        if self
+            .display_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .is_none()
+        {
+            self.display_name = existing.display_name.clone();
+        }
+        match (&mut self.route, &existing.route) {
+            (Some(incoming), Some(prev)) => {
+                if incoming.local_network.is_none() {
+                    incoming.local_network = prev.local_network.clone();
+                }
+                if incoming.relay.is_none() {
+                    incoming.relay = prev.relay.clone();
+                }
+                let lan_url = incoming
+                    .local_network
+                    .as_ref()
+                    .map(|candidate| normalize_route_url(&candidate.url));
+                let mut merged = Vec::new();
+                for candidate in incoming
+                    .direct_candidates
+                    .iter()
+                    .chain(prev.direct_candidates.iter())
+                {
+                    let normalized = normalize_route_url(candidate);
+                    if normalized.is_empty()
+                        || lan_url
+                            .as_deref()
+                            .is_some_and(|lan| lan.eq_ignore_ascii_case(&normalized))
+                        || merged
+                            .iter()
+                            .any(|existing_url: &String| existing_url.eq_ignore_ascii_case(&normalized))
+                    {
+                        continue;
+                    }
+                    merged.push(normalized);
+                    if merged.len() >= MAX_MERGED_DIRECT_CANDIDATES {
+                        break;
+                    }
+                }
+                incoming.direct_candidates = merged;
+            }
+            (None, Some(prev)) => {
+                self.route = Some(prev.clone());
+            }
+            _ => {}
+        }
+    }
+
+    /// Whether this credential currently carries the requested route.
+    pub fn has_route(&self, selection: &MobileRouteSelection) -> bool {
+        match selection {
+            MobileRouteSelection::Auto => true,
+            MobileRouteSelection::LocalNetwork => self
+                .route
+                .as_ref()
+                .is_some_and(|route| route.local_network.is_some()),
+            MobileRouteSelection::Direct { url } => {
+                let target = normalize_route_url(url);
+                self.route.as_ref().is_some_and(|route| {
+                    route
+                        .direct_candidates
+                        .iter()
+                        .any(|candidate| normalize_route_url(candidate).eq_ignore_ascii_case(&target))
+                })
+            }
+            MobileRouteSelection::Relay => self
+                .route
+                .as_ref()
+                .is_some_and(|route| route.relay.is_some()),
+        }
+    }
+
+    /// Returns a clone whose route table is narrowed to `selection`.
+    ///
+    /// If the requested route is not present on this credential, returns the
+    /// full `Auto` bundle unchanged so the phone still connects cleanly.
+    pub fn for_route_selection(&self, selection: &MobileRouteSelection) -> MobileCredentialBundle {
+        let mut narrowed = self.clone();
+        if matches!(selection, MobileRouteSelection::Auto) {
+            return narrowed;
+        }
+        let Some(route) = self.route.as_ref() else {
+            return narrowed;
+        };
+        let selected_route = match selection {
+            MobileRouteSelection::Auto => None,
+            MobileRouteSelection::LocalNetwork => {
+                route
+                    .local_network
+                    .clone()
+                    .map(|local_network| MobileRemoteRouteBundle {
+                        local_network: Some(local_network),
+                        direct_candidates: Vec::new(),
+                        relay: None,
+                    })
+            }
+            MobileRouteSelection::Direct { url } => {
+                let target = normalize_route_url(url);
+                route
+                    .direct_candidates
+                    .iter()
+                    .find(|candidate| normalize_route_url(candidate).eq_ignore_ascii_case(&target))
+                    .cloned()
+                    .map(|matched| MobileRemoteRouteBundle {
+                        local_network: None,
+                        direct_candidates: vec![matched],
+                        relay: None,
+                    })
+            }
+            MobileRouteSelection::Relay => route.relay.clone().map(|relay| MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: Vec::new(),
+                relay: Some(relay),
+            }),
+        };
+        if let Some(selected_route) = selected_route {
+            narrowed.route = Some(selected_route);
+        }
+        narrowed
+    }
+
     /// Prefer the human-readable route authority for the mobile picker, then
     /// fall back to a bounded server-id label for QR/relay-only credentials.
     ///
@@ -253,6 +424,49 @@ impl MobileCredentialBundle {
         Ok(Arc::new(WebRemoteBackend::from_auto(transport)))
     }
 
+    /// Probes whether the runtime is reachable and returns any published
+    /// display name and server kind observed from a direct gateway info check.
+    ///
+    /// The probe carries the credential's pinned server identity, so a host
+    /// that answers for a different server counts as unreachable, and it cannot
+    /// claim a pairing offer or rotate a device grant.
+    pub async fn probe_status(&self) -> MobileRuntimeProbe {
+        if self.validate().is_err() {
+            return MobileRuntimeProbe::offline();
+        }
+        let Ok(config) = self.auto_transport_config() else {
+            return MobileRuntimeProbe::offline();
+        };
+        tokio::time::timeout(PROBE_TIMEOUT, async move {
+            if !config.direct_candidates.is_empty()
+                && let Ok(probe) = DirectWebSocketTransport::new(config.remote.clone())
+                && let Ok(results) = probe
+                    .probe_direct_candidates(config.direct_candidates.clone())
+                    .await
+                && let Some(best) = choose_direct_candidate(results)
+            {
+                return MobileRuntimeProbe {
+                    online: true,
+                    server_display_name: published_display_name(&best.info.server_display_name),
+                    server_kind: best.info.server_kind,
+                };
+            }
+            if let Some(relay) = config.relay.clone()
+                && let Ok(transport) = RelayE2eeTransport::new(relay)
+                && transport.probe().await.is_ok()
+            {
+                return MobileRuntimeProbe {
+                    online: true,
+                    server_display_name: None,
+                    server_kind: RemoteServerKind::Unknown,
+                };
+            }
+            MobileRuntimeProbe::offline()
+        })
+        .await
+        .unwrap_or_else(|_| MobileRuntimeProbe::offline())
+    }
+
     /// Asks the runtime whether it is up, through the transport's own bounded
     /// info probe.
     ///
@@ -261,12 +475,7 @@ impl MobileCredentialBundle {
     /// claim a pairing offer or rotate a device grant. The transport it builds
     /// belongs to this one call.
     pub async fn probe_online(&self) -> bool {
-        let Ok(backend) = self.backend() else {
-            return false;
-        };
-        tokio::time::timeout(PROBE_TIMEOUT, backend.transport().probe_online())
-            .await
-            .is_ok_and(|probe| probe.is_ok_and(|online| online))
+        self.probe_status().await.online
     }
 
     pub fn auto_transport_config(&self) -> BackendResult<AutoRemoteTransportConfig> {
@@ -615,6 +824,10 @@ fn published_display_name(value: &str) -> Option<String> {
     vibex_core::normalize_remote_display_name(value)
 }
 
+fn normalize_route_url(url: &str) -> String {
+    url.trim().trim_end_matches('/').to_string()
+}
+
 /// True when the scanned or pasted entry is a `vibex-server` connection
 /// string.
 ///
@@ -734,6 +947,31 @@ fn invalid_pairing_entry() -> BackendError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn test_bundle(
+        server_id: &str,
+        display_name: Option<&str>,
+        route: MobileRemoteRouteBundle,
+    ) -> MobileCredentialBundle {
+        MobileCredentialBundle {
+            schema_version: MOBILE_CREDENTIAL_SCHEMA_VERSION.to_string(),
+            record: RemoteCredentialRecord {
+                server_url: "https://desktop.example".to_string(),
+                auth: RemoteAuthProof {
+                    device_id: DeviceId::new(),
+                    auth_token: "grant".to_string(),
+                },
+                device_identity_public_key: "public-key".to_string(),
+                server_identity_public_key: Some("server-key".to_string()),
+            },
+            identity_private_key: "private-key".to_string(),
+            expected_server_id: server_id.to_string(),
+            client_type: RemoteClientType::Mobile,
+            allow_insecure_local_dev: false,
+            display_name: display_name.map(str::to_string),
+            route: Some(route),
+        }
+    }
 
     #[test]
     fn scanned_entries_route_to_the_matching_pairing_flow() {
@@ -907,5 +1145,122 @@ mod tests {
             bundle.validate().unwrap_err().code,
             "remote_url_secret_boundary_invalid"
         );
+    }
+
+    #[test]
+    fn merging_routes_retains_lan_tailscale_and_relay_and_display_name() {
+        let lan = test_bundle(
+            "machine-1",
+            Some("My Studio"),
+            MobileRemoteRouteBundle {
+                local_network: Some(MobileLocalNetworkCandidate {
+                    url: "https://192.168.1.20:8443".to_string(),
+                    tls_certificate_der: "cert-der".to_string(),
+                }),
+                direct_candidates: Vec::new(),
+                relay: None,
+            },
+        );
+        let mut tailscale = test_bundle(
+            "machine-1",
+            None,
+            MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: vec!["https://studio.tailnet.ts.net/".to_string()],
+                relay: None,
+            },
+        );
+        tailscale.merge_from_existing(&lan);
+        assert_eq!(tailscale.display_name.as_deref(), Some("My Studio"));
+        let route = tailscale.route.as_ref().unwrap();
+        assert_eq!(
+            route.local_network.as_ref().map(|c| c.url.as_str()),
+            Some("https://192.168.1.20:8443")
+        );
+        assert_eq!(
+            route.direct_candidates,
+            vec!["https://studio.tailnet.ts.net".to_string()]
+        );
+
+        let mut relay = test_bundle(
+            "machine-1",
+            None,
+            MobileRemoteRouteBundle {
+                local_network: None,
+                direct_candidates: Vec::new(),
+                relay: Some(MobileRelayCandidate {
+                    url: "https://relay.selfhosted.example".to_string(),
+                    room_id: vibex_core::RelayRoomId::new(),
+                    local_peer_id: RelayPeerId::new(),
+                    pc_peer_id: RelayPeerId::new(),
+                    pc_public_key: "relay-pub".to_string(),
+                }),
+            },
+        );
+        relay.merge_from_existing(&tailscale);
+        assert_eq!(relay.display_name.as_deref(), Some("My Studio"));
+        let route = relay.route.as_ref().unwrap();
+        assert!(route.local_network.is_some());
+        assert_eq!(
+            route.direct_candidates,
+            vec!["https://studio.tailnet.ts.net".to_string()]
+        );
+        assert_eq!(
+            route.relay.as_ref().map(|c| c.url.as_str()),
+            Some("https://relay.selfhosted.example")
+        );
+    }
+
+    #[test]
+    fn route_selection_narrows_bundle_and_falls_back_when_missing() {
+        let bundle = test_bundle(
+            "machine-1",
+            Some("Workstation"),
+            MobileRemoteRouteBundle {
+                local_network: Some(MobileLocalNetworkCandidate {
+                    url: "https://192.168.1.20:8443".to_string(),
+                    tls_certificate_der: "cert-der".to_string(),
+                }),
+                direct_candidates: vec![
+                    "https://workstation.tailnet.ts.net".to_string(),
+                    "https://direct.example.com".to_string(),
+                ],
+                relay: Some(MobileRelayCandidate {
+                    url: "https://relay.example.com".to_string(),
+                    room_id: vibex_core::RelayRoomId::new(),
+                    local_peer_id: RelayPeerId::new(),
+                    pc_peer_id: RelayPeerId::new(),
+                    pc_public_key: "relay-pub".to_string(),
+                }),
+            },
+        );
+
+        let lan = bundle.for_route_selection(&MobileRouteSelection::LocalNetwork);
+        let lan_route = lan.route.as_ref().unwrap();
+        assert!(lan_route.local_network.is_some());
+        assert!(lan_route.direct_candidates.is_empty());
+        assert!(lan_route.relay.is_none());
+
+        let ts = bundle.for_route_selection(&MobileRouteSelection::Direct {
+            url: "https://workstation.tailnet.ts.net/".to_string(),
+        });
+        let ts_route = ts.route.as_ref().unwrap();
+        assert!(ts_route.local_network.is_none());
+        assert_eq!(
+            ts_route.direct_candidates,
+            vec!["https://workstation.tailnet.ts.net".to_string()]
+        );
+        assert!(ts_route.relay.is_none());
+
+        let relay = bundle.for_route_selection(&MobileRouteSelection::Relay);
+        let relay_route = relay.route.as_ref().unwrap();
+        assert!(relay_route.local_network.is_none());
+        assert!(relay_route.direct_candidates.is_empty());
+        assert!(relay_route.relay.is_some());
+
+        let missing = bundle.for_route_selection(&MobileRouteSelection::Direct {
+            url: "https://nonexistent.example.com".to_string(),
+        });
+        assert_eq!(missing.route, bundle.route);
     }
 }

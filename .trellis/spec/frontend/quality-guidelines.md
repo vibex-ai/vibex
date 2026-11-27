@@ -94,7 +94,7 @@ Add tests or story coverage for:
 
 ### 1. Scope / Trigger
 
-- Trigger: changing `apps/mobile-nsh`, `crates/vibex-nsh-ui`, shared Agent
+- Trigger: changing `apps/mobile`, `crates/vibex-mobile-ui`, shared Agent
   timeline projections, or the native pairing/storage/input code.
 - The contract covers Android and iOS source structure and the GUI session
   behavior. It does not require a platform SDK on every development machine.
@@ -102,21 +102,21 @@ Add tests or story coverage for:
 ### 2. Signatures
 
 ```text
-cargo check -p vibex-mobile-nsh --locked
-cargo test -p vibex-mobile-nsh --locked
+cargo check -p vibex-mobile --locked
+cargo test -p vibex-mobile --locked
 node scripts/check-mobile-native.mjs
 node scripts/check-mobile-native.mjs --self-test
-node apps/mobile-nsh/scripts/check-upgrade.mjs
-node apps/mobile-nsh/scripts/check-upgrade.mjs --self-test
+node apps/mobile/scripts/check-upgrade.mjs
+node apps/mobile/scripts/check-upgrade.mjs --self-test
 pnpm build:mobile:android
 pnpm build:mobile:ios
 ```
 
 ### 3. Contracts
 
-- `apps/mobile-nsh` is the mobile client: an `nsh` app whose views are the
+- `apps/mobile` is the mobile client: an `nsh` app whose views are the
   platform's own (Android views, UIKit), with the screens in
-  `crates/vibex-nsh-ui`. The Java and Swift hosts own only what the runtime
+  `crates/vibex-mobile-ui`. The Java and Swift hosts own only what the runtime
   cannot reach — camera, scanner, notifications, the connection service, LAN
   discovery, share intake — and reach the library through one JNI/FFI boundary
   that `scripts/check-mobile-native.mjs` pins. No DOM, browser host, or
@@ -277,11 +277,11 @@ pnpm build:mobile:ios
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-mobile-nsh --locked` covers storage atomicity and
+- `cargo test -p vibex-mobile --locked` covers storage atomicity and
   malformed-file removal, secret-redacted `Debug`, the settings/draft/host
   migration from the removed client, pairing flows, the theme sync, and route
   bundle validation. The screens themselves are covered by the headless tests in
-  `crates/vibex-nsh-ui`.
+  `crates/vibex-mobile-ui`.
 - `cargo test -p vibex-ui --locked` covers the shared controller, timeline
   projection, approval surfaces, and compact shell semantics.
 - `node scripts/check-mobile-native.mjs --self-test` checks the host contract in
@@ -395,10 +395,10 @@ Correct: host edge distances -> app layout -> padded content in the current wind
 ```text
 PairingHost.on_scan -> Action
 host::request_scan() -> HostRequest::Scan
-Android NshHost.nativeScanResult(value: String) -> ()
-iOS vibex_mobile_nsh_scan_result(value: *const char) -> ()
+Android NativeHost.nativeScanResult(value: String) -> ()
+iOS vibex_mobile_scan_result(value: *const char) -> ()
 claim_pairing_link(link: String) -> BackendResult<MobileCredentialBundle>
-Android NshHost static initializer -> System.loadLibrary("nsh")
+Android HostBridge static initializer -> System.loadLibrary("nsh")
 ```
 
 ### 3. Contracts
@@ -448,7 +448,7 @@ Android NshHost static initializer -> System.loadLibrary("nsh")
 
 ### 6. Tests Required
 
-- `cargo test -p vibex-mobile-nsh --locked` asserts pending scan results are
+- `cargo test -p vibex-mobile --locked` asserts pending scan results are
   consumed once and retains pairing route, credential validation, storage, and
   redaction coverage.
 - `node scripts/check-mobile-native.mjs` asserts the camera declarations, the
@@ -499,7 +499,7 @@ runtime-list page before it.
 Footer -> pairing -> runtime actions -> details -> Back -> actions -> Back -> pairing -> Back -> footer
 ```
 
-Run `cargo test -p vibex-mobile-nsh --locked`, mobile Clippy, and
+Run `cargo test -p vibex-mobile --locked`, mobile Clippy, and
 `pnpm check:mobile-native`. UI interaction coverage must activate the footer and
 Back button, dispatch the system Back key, preserve backend/session/draft identity,
 and unwind nested runtime sheets to the page that opened pairing. Host tests do
@@ -532,7 +532,7 @@ in `operation_busy`.
   host each draw the icon the app already uses for that action elsewhere
   (`rotate-ccw`, `plug-zap`, `chevrons-right-left`), spaced from the label by
   `SPACING_SM`, inside a row that keeps `theme::TOUCH_TARGET` height. Never
-  draw an icon outside `crates/vibex-nsh-ui/assets/icons`: `icon!` inlines it at
+  draw an icon outside `crates/vibex-mobile-ui/assets/icons`: `icon!` inlines it at
   compile time, and a path that is not there fails the build rather than
   painting nothing.
 
@@ -557,7 +557,7 @@ composited over an already-dim surface**.
 - **The root paints text in the foreground.** A page that chooses no colour
   inherits body text; only rows that are deliberately quiet step down. The shell
   inherited `text_secondary` once and every page turned grey at once.
-- **Measure, do not eyeball.** `crates/vibex-nsh-ui/src/theme.rs` carries the
+- **Measure, do not eyeball.** `crates/vibex-mobile-ui/src/theme.rs` carries the
   contrast helper and the assertions: any new text token joins that table with
   its floor, in both appearances, or it will regress unnoticed. A rung painted
   with alpha must be composited over its surface before it is measured.
@@ -1461,7 +1461,7 @@ push_decl::<FileReadResponse>(&mut output);
 ### 1. Scope / Trigger
 
 - Trigger: anything that changes how Markdown reaches a screen in `apps/desktop` or
-  `apps/mobile-nsh` — timeline answers, reasoning rows, plan rows, user message bodies,
+  `apps/mobile` — timeline answers, reasoning rows, plan rows, user message bodies,
   file previews, release notes — or that changes the shared projections in
   `crates/vibex-ui/src/markdown.rs` or the code workbench's image/link resolution.
 - The renderer is gpui-component's text view (`gpui_base::text::TextView`, exposed

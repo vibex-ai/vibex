@@ -13,7 +13,7 @@ or to gpui-fast.
 
 - `apps/desktop` runs on `gpui-fast` through the `gpui-fast` feature of
   `gpui-component`, `gpui-base`, `gpui-fps` and `gpui-kit-assets`.
-- The mobile client is `apps/mobile-nsh`, which draws with Native Shell rather
+- The mobile client is `apps/mobile`, which draws with Native Shell rather
   than GPUI; this migration is desktop-only.
 - `GPUI_VIEW_RETENTION=0` draws every view from scratch at runtime.
   `GPUI_SCROLL_LAYERS=0` turns off scroll layers. Neither disables retained

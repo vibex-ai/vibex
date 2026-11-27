@@ -2,7 +2,7 @@
 
 These guidelines describe the current source-backed backend contracts for Vibex.
 The PC `DesktopRuntime` remains authoritative while GPUI Desktop and the native
-mobile client (`apps/mobile-nsh`) consume shared Native/Remote capabilities.
+mobile client (`apps/mobile`) consume shared Native/Remote capabilities.
 
 Primary evidence:
 - [Architecture Baseline](../guides/architecture-baseline.md) for current cross-platform UI and remote architecture.

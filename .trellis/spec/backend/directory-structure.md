@@ -1,7 +1,7 @@
 # Backend Directory Structure
 
 Vibex uses a Rust-first workspace. GPUI Desktop is the local product shell and
-the native mobile client (`apps/mobile-nsh`) is a remote client; Axum owns
+the native mobile client (`apps/mobile`) is a remote client; Axum owns
 RemoteGateway/Relay adapters,
 SQLite owns durable local state, and typed services own Agent/File/Git/PTY
 behavior.
@@ -30,7 +30,7 @@ crates/
   implementations.
 - `vibex-remote-client` owns reconnect/sync/transport logic; views do not parse
   wire envelopes.
-- `apps/mobile-nsh` owns native bootstrap, pairing/storage, input, and compact
+- `apps/mobile` owns native bootstrap, pairing/storage, input, and compact
   composition. It does not own domain state.
 - `relay-server` forwards encrypted payloads and never becomes an authority.
 
@@ -38,7 +38,7 @@ crates/
 
 ```text
 apps/desktop    -> NativeBackend -> typed domain services -> crates/core
-apps/mobile-nsh -> remote facade -> RemoteGateway -> DesktopRuntime
+apps/mobile -> remote facade -> RemoteGateway -> DesktopRuntime
 Relay        -> encrypted transport only
 ```
 

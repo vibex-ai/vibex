@@ -203,8 +203,8 @@ built from the verified tag.
 Android and iOS packaging is opt-in while the mobile client is ported to the
 backend the desktop runs on. The desktop, the TUI, `vibex-server` and the
 container images build against `gpui-fast`; the shipping phone client is
-`apps/mobile-nsh`, which replaces the GPUI one and is packaged by its own hosts
-(`apps/mobile-nsh/android`, `apps/mobile-nsh/ios`). Both mobile jobs are gated on
+`apps/mobile`, which replaces the GPUI one and is packaged by its own hosts
+(`apps/mobile/android`, `apps/mobile/ios`). Both mobile jobs are gated on
 the repository variable `VIBEX_MOBILE_RELEASES_ENABLED`. While it is unset the
 jobs are skipped, the publish job still releases the desktop, headless server and
 container artifacts, and the Downloads table simply omits the Android and iOS
@@ -227,7 +227,7 @@ The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
   extension is `ai.vibex.mobile.share`), so a re-signed IPA updates in place.
   Neither target declares an entitlement, which is what keeps a free Apple ID
   able to sign it.
-- **Data** carries over. `apps/mobile-nsh/src/migration.rs` reads the GPUI
+- **Data** carries over. `apps/mobile/src/migration.rs` reads the GPUI
   client's `remote-hosts.json`, `remote-credentials.json`,
   `client-identity.json`, `app-settings.json` and `composer-state.json` from
   where that client wrote them (the top of the Android files directory,
@@ -237,7 +237,7 @@ The nsh client is a drop-in upgrade for the GPUI one, on both platforms:
   both clients, because Android enforces signing-key continuity on top of the
   applicationId.
 
-`apps/mobile-nsh/scripts/check-upgrade.mjs` (part of `pnpm check:mobile-native`)
+`apps/mobile/scripts/check-upgrade.mjs` (part of `pnpm check:mobile-native`)
 pins the ids, the versionCode derivation and the legacy file list against the
 GPUI client's build files, so a change that would break the upgrade fails before
 a release is built.
@@ -310,7 +310,7 @@ variable of the same name), exactly like the desktop updater.
 
   ```bash
   VIBEX_MOBILE_PROFILE=release VIBEX_UPDATE_PUBLIC_KEY=<repository variable> \
-    bash apps/mobile-nsh/scripts/build-android-host.sh
+    bash apps/mobile/scripts/build-android-host.sh
   ```
 - Settings reach the update section from the drawer footer and from the
   top-right entry on the first pairing screen, so an update can be installed

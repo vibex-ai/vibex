@@ -374,7 +374,7 @@ jobs:
   mobile-android:
     name: Mobile Android release artifact
     needs: release-meta
-    # Publishes the nsh client (`apps/mobile-nsh`), the only mobile client in
+    # Publishes the nsh client (`apps/mobile`), the only mobile client in
     # the tree. It keeps the applicationId, versionCode scheme and signing key
     # of the GPUI client it replaced, so a phone still running that build gets
     # this one as an update. Set the repository variable
@@ -402,7 +402,7 @@ jobs:
       - name: Verify native mobile contract
         # The upgrade contract is what keeps an install an update: same
         # applicationId / bundle id, same versionCode scheme, same legacy files.
-        run: node scripts/check-mobile-native.mjs && node apps/mobile-nsh/scripts/check-upgrade.mjs
+        run: node scripts/check-mobile-native.mjs && node apps/mobile/scripts/check-upgrade.mjs
       - name: Install Android SDK and NDK
         run: |
           yes | sdkmanager --licenses >/dev/null || true
@@ -420,8 +420,8 @@ jobs:
           # Baked into the APK so the phone verifies the signed update manifest
           # it reads from the published release.
           VIBEX_UPDATE_PUBLIC_KEY: ${{ vars.VIBEX_UPDATE_PUBLIC_KEY }}
-          GRADLE: ${{ github.workspace }}/apps/mobile-nsh/android/gradlew
-        run: bash apps/mobile-nsh/scripts/build-android-host.sh
+          GRADLE: ${{ github.workspace }}/apps/mobile/android/gradlew
+        run: bash apps/mobile/scripts/build-android-host.sh
       # An update replaces the installed app only when this APK carries the
       # GPUI client's applicationId and a versionCode at least as high. Both are
       # silent failures at install time on a phone, so they are checked here,
@@ -431,7 +431,7 @@ jobs:
           VERSION: ${{ needs.release-meta.outputs.version }}
         run: |
           set -euo pipefail
-          apk="apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk"
+          apk="apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk"
           aapt2="${ANDROID_HOME}/build-tools/35.0.0/aapt2"
           badging="$("${aapt2}" dump badging "${apk}" | head -n 1)"
           echo "${badging}"
@@ -474,9 +474,9 @@ jobs:
           VIBEX_ANDROID_KEY_ALIAS: ${{ vars.VIBEX_ANDROID_KEY_ALIAS || 'vibex' }}
           VIBEX_RELEASE_CHANNEL: ${{ needs.release-meta.outputs.channel }}
         run: |
-          bash apps/mobile-nsh/scripts/sign-android-release.sh \
-            apps/mobile-nsh/android/app/build/outputs/apk/release/app-release-unsigned.apk \
-            apps/mobile-nsh/android/app/build/outputs/bundle/release/app-release.aab \
+          bash apps/mobile/scripts/sign-android-release.sh \
+            apps/mobile/android/app/build/outputs/apk/release/app-release-unsigned.apk \
+            apps/mobile/android/app/build/outputs/bundle/release/app-release.aab \
             target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.apk \
             target/mobile-android/vibex-${{ needs.release-meta.outputs.version }}-android-arm64.aab
       - name: Normalize Android artifacts and checksums
@@ -514,7 +514,7 @@ jobs:
       - name: Verify native mobile contract
         # The upgrade contract is what keeps an install an update: same
         # applicationId / bundle id, same versionCode scheme, same legacy files.
-        run: node scripts/check-mobile-native.mjs && node apps/mobile-nsh/scripts/check-upgrade.mjs
+        run: node scripts/check-mobile-native.mjs && node apps/mobile/scripts/check-upgrade.mjs
       - name: Install XcodeGen
         run: brew install xcodegen
       - name: Build the nsh iOS host
@@ -522,13 +522,13 @@ jobs:
           VIBEX_MOBILE_PROFILE: release
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
           VIBEX_IOS_SKIP_XCODEBUILD: "1"
-        run: bash apps/mobile-nsh/scripts/build-ios-host.sh
+        run: bash apps/mobile/scripts/build-ios-host.sh
       - name: Build unsigned simulator app
         run: >-
-          xcodebuild -project apps/mobile-nsh/ios/Vibex.xcodeproj
+          xcodebuild -project apps/mobile/ios/Vibex.xcodeproj
           -scheme Vibex -sdk iphonesimulator -configuration Release
           MARKETING_VERSION=${{ needs.release-meta.outputs.version }}
-          -derivedDataPath target/mobile-nsh-ios CODE_SIGNING_ALLOWED=NO
+          -derivedDataPath target/mobile-ios CODE_SIGNING_ALLOWED=NO
           CODE_SIGNING_REQUIRED=NO build
       # Ships the device IPA as well as the simulator bundle. It carries no
       # signature on purpose: producing a signed one needs an Apple account, and
@@ -538,17 +538,17 @@ jobs:
       - name: Package unsigned device IPA
         env:
           VIBEX_MOBILE_VERSION: ${{ needs.release-meta.outputs.version }}
-        run: bash apps/mobile-nsh/scripts/package-ios-unsigned-ipa.sh
+        run: bash apps/mobile/scripts/package-ios-unsigned-ipa.sh
       - name: Normalize iOS artifacts and checksums
         shell: bash
         run: |
           set -euo pipefail
-          output="target/mobile-nsh-ios-artifacts"
+          output="target/mobile-ios-artifacts"
           mkdir -p "${output}"
           # The Rust library as a static archive, which is what this host links
           # instead of the GPUI client's XCFramework.
-          ditto -c -k --sequesterRsrc --keepParent apps/mobile-nsh/ios/Frameworks/libvibex_mobile_nsh.a "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
-          ditto -c -k --sequesterRsrc --keepParent target/mobile-nsh-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
+          ditto -c -k --sequesterRsrc --keepParent apps/mobile/ios/Frameworks/libvibex_mobile.a "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-staticlib.zip"
+          ditto -c -k --sequesterRsrc --keepParent target/mobile-ios/Build/Products/Release-iphonesimulator/Vibex.app "${output}/vibex-${{ needs.release-meta.outputs.version }}-ios-simulator.app.zip"
           for artifact in "${output}"/*.zip "${output}"/*.ipa; do
             shasum -a 256 "${artifact}" > "${artifact}.sha256"
           done
@@ -556,7 +556,7 @@ jobs:
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: mobile-ios-${{ github.sha }}
-          path: target/mobile-nsh-ios-artifacts/**
+          path: target/mobile-ios-artifacts/**
           if-no-files-found: error
           retention-days: 14
 

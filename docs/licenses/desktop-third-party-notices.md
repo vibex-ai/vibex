@@ -1126,7 +1126,7 @@ This inventory records source and license provenance. The corresponding license 
 | gpui-kit bundled Lucide icon set | 1830 | https://github.com/longbridge/gpui-kit | Apache-2.0 AND ISC | (Apache-2.0 AND ISC) |
 | Vibex Desktop GPUI reviewed icon bundle | 237 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/icons | AGPL-3.0-or-later AND ISC AND MIT AND CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks | (AGPL-3.0-or-later AND (ISC AND (MIT AND (CC0-1.0 AND LicenseRef-Third-Party-Brand-Marks)))) |
 | Vibex desktop application and tray icons | 15 | https://github.com/vibex-ai/vibex/tree/main/apps/desktop/assets/app-icons | AGPL-3.0-or-later | AGPL-3.0-or-later |
-| Vibex native mobile application icons | 19 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile-nsh/ios/Resources/Assets.xcassets/AppIcon.appiconset | AGPL-3.0-or-later | AGPL-3.0-or-later |
+| Vibex native mobile application icons | 19 | https://github.com/vibex-ai/vibex/tree/main/apps/mobile/ios/Resources/Assets.xcassets/AppIcon.appiconset | AGPL-3.0-or-later | AGPL-3.0-or-later |
 | IBM Plex Sans desktop interface fonts | 5 | https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/ibm-plex-sans | OFL-1.1 | OFL-1.1 |
 | Lilex desktop code fonts | 5 | https://github.com/zed-industries/zed/tree/49d9758/assets/fonts/lilex | OFL-1.1 | OFL-1.1 |
 | WenQuanYi Micro Hei desktop CJK fallback | 3 | https://sourceforge.net/projects/wqy/files/wqy-microhei/0.2.0-beta/ | Apache-2.0 | Apache-2.0 |

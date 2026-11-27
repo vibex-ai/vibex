@@ -1,0 +1,64 @@
+[package]
+name = "vibex-mobile"
+version = "0.1.9"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Vibex mobile client, rebuilt on Native Shell (nsh)."
+
+[lib]
+name = "vibex_mobile"
+crate-type = ["cdylib", "staticlib", "rlib"]
+
+[dependencies]
+nsh-base.workspace = true
+nsh-core.workspace = true
+vibex-backend = { path = "../../crates/vibex-backend" }
+vibex-core = { path = "../../crates/core" }
+vibex-desktop-model = { path = "../../crates/desktop-model" }
+vibex-mobile-pairing = { path = "../../crates/vibex-mobile-pairing" }
+vibex-remote-client = { path = "../../crates/vibex-remote-client" }
+base64.workspace = true
+log.workspace = true
+# Commit times are shown in the reader's own zone and language.
+chrono = { version = "0.4.45", default-features = false, features = ["clock", "std"] }
+mdns-sd.workspace = true
+image = { workspace = true, features = ["png", "jpeg"] }
+rqrr = "0.11"
+serde.workspace = true
+serde_json.workspace = true
+futures-channel.workspace = true
+futures-util.workspace = true
+# One pairing address attempt is bounded; `background` work is a Tokio task.
+tokio = { workspace = true, features = ["time"] }
+vibex-mobile-ui = { path = "../../crates/vibex-mobile-ui" }
+vibex-ui = { path = "../../crates/vibex-ui", default-features = false }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+nsh-platform-ios = { version = "0.7.0", default-features = false }
+# The unified log and the notification center the iOS backend builds on: the
+# shell's C ABI installs both before the app runs.
+nsh-platform-apple = { version = "0.7.0", default-features = false }
+objc2 = "0.6.5"
+objc2-ui-kit = { version = "0.3.2", default-features = false, features = [
+  "std",
+  "UIView",
+  "UIResponder",
+  "objc2-core-foundation",
+] }
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Aliased: with the plain key, cargo does not pass the extern to this crate
+# when the Android package is built from the app's workspace (the generated
+# runner depends on the same package), so `platform/android.rs` failed to
+# compile. The alias keeps the same package and version.
+nsh-android = { package = "nsh-platform-android", version = "0.7.0", default-features = false }
+jni = "0.22"
+
+[dev-dependencies]
+# The headless driver: mounts the real root with no platform, so the app's
+# flows are tested as the engine renders them.
+nsh-engine = { version = "0.7.0", default-features = false }
+nsh-testing = { version = "0.7.0", default-features = false }
+tempfile = "3"

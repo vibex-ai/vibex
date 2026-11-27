@@ -3,7 +3,7 @@ members = [
   "apps/desktop",
   "apps/server",
   "apps/relay-server",
-  "apps/mobile-nsh",
+  "apps/mobile",
   "crates/app-update",
   "crates/agent",
   "crates/agent-acp",
@@ -33,7 +33,7 @@ members = [
   "crates/vibex-brands",
   "crates/vibex-mobile-pairing",
   "crates/vibex-locale",
-  "crates/vibex-nsh-ui",
+  "crates/vibex-mobile-ui",
   "crates/vibex-remote-client",
   "crates/vibex-ui",
   "crates/vibex-terminal-ui",
@@ -127,7 +127,7 @@ gpui-base = "0.11.0"
 # The native mobile client's UI stack (Native Shell, nsh.dev). Every nsh crate
 # in the graph must stay on one version. `svg` draws the brand mark and icons
 # natively; `nsh-base` ships unstyled behavior only, so the app's look lives in
-# `crates/vibex-nsh-ui`.
+# `crates/vibex-mobile-ui`.
 #
 # On the released 0.7.0: it carries the fix our fork of 0.6.1 held, so a dialog's
 # window now reports the keyboard it raises to `env(keyboard-inset-height)`

@@ -202,10 +202,10 @@ share one design system and render the same runtime:
 | Surface | Source | Stack |
 | --- | --- | --- |
 | Native desktop | `apps/desktop` | Rust + GPUI |
-| Native mobile | `apps/mobile-nsh` | Rust on Native Shell (`nsh`): platform views (UIKit, Android) over `crates/vibex-nsh-ui` |
+| Native mobile | `apps/mobile` | Rust on Native Shell (`nsh`): platform views (UIKit, Android) over `crates/vibex-mobile-ui` |
 | Terminal | `apps/tui` | Rust, character grid over the runtime protocol |
 
-Layout: `apps/` (desktop, mobile-nsh, tui, relay-server, server) · `crates/` (~25 Rust
+Layout: `apps/` (desktop, mobile, tui, relay-server, server) · `crates/` (~25 Rust
 crates: agent/ACP adapters, db, fs, git, terminal, relay, remote, content,
 diagnostics, vibex-ui, vibex-terminal-ui, vibex-tui, ...) · `scripts/` (Node build,
 release, and license tooling) · `.trellis/` (workflow, spec, tasks).
@@ -224,7 +224,7 @@ desktop / mobile / remote:
 - Shared UI contracts and projections live in `crates/vibex-ui`; the desktop app is
   not compiled as the mobile app.
 - Relay is transport, not a second database or state authority.
-- There is no WebUI/PWA product. `apps/mobile-nsh` is the native mobile client
+- There is no WebUI/PWA product. `apps/mobile` is the native mobile client
   and Relay and Desktop packages never host mobile application assets.
 
 Toolchain: Rust 1.99.1 (pinned by `rust-toolchain.toml`), edition 2024,

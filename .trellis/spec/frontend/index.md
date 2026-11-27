@@ -2,7 +2,7 @@
 
 These guidelines define the current Rust presentation architecture for Vibex.
 `apps/desktop` is the visual and information-architecture baseline.
-`apps/mobile-nsh` is the native iOS/Android client: platform views over the
+`apps/mobile` is the native iOS/Android client: platform views over the
 shared screen crate, projecting the same Agent session model into a compact
 native surface.
 
@@ -10,7 +10,7 @@ Primary evidence:
 
 - [Architecture Baseline](../guides/architecture-baseline.md)
 - `apps/desktop`
-- `apps/mobile-nsh` and `crates/vibex-nsh-ui`
+- `apps/mobile` and `crates/vibex-mobile-ui`
 
 ## Required Reading Order
 

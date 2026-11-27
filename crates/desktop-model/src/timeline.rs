@@ -135,6 +135,82 @@ impl TimelineModel {
         true
     }
 
+    /// Applies an authoritative forward delta strictly above `after_sequence`,
+    /// preserving the prefix at or below `after_sequence`, any concurrent live
+    /// items strictly above the delta's last sequence, and the window's
+    /// `leading_turn_start`.
+    ///
+    /// - When `items` is empty, nothing in `(after_sequence, ..)` is dropped
+    ///   (so concurrent live items that arrived while the read was in flight
+    ///   survive). `needs_authoritative_refetch` is cleared only if no newer
+    ///   items exist above `after_sequence`.
+    /// - When `items` is non-empty with last sequence `tail_end`, items in
+    ///   `(after_sequence, tail_end]` are replaced by the authoritative delta
+    ///   (removing stale compacted chunks or updating in-progress items in
+    ///   place) while any concurrent live items with `sequence > tail_end` are
+    ///   preserved.
+    ///
+    /// Returns `Ok(true)` if `self.items` changed, `Ok(false)` if unchanged,
+    /// and `Err(())` if the model does not currently hold `session_id`.
+    pub fn apply_authoritative_tail(
+        &mut self,
+        session_id: &VibexSessionId,
+        after_sequence: i64,
+        items: impl IntoIterator<Item = TimelineItem>,
+    ) -> Result<bool, ()> {
+        if self.session_id.as_ref() != Some(session_id) {
+            return Err(());
+        }
+        let mut page = BTreeMap::new();
+        for item in items {
+            if item.session_id == *session_id
+                && item.sequence > after_sequence
+                && item.sequence >= 0
+            {
+                page.insert(item.sequence, item);
+            }
+        }
+        let keep_len = self
+            .items
+            .partition_point(|item| item.sequence <= after_sequence);
+        if page.is_empty() {
+            if keep_len == self.items.len() {
+                self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
+                self.needs_authoritative_refetch = false;
+            }
+            return Ok(false);
+        }
+
+        let incoming: Vec<TimelineItem> = page.into_values().collect();
+        let tail_end = incoming.last().expect("incoming is non-empty").sequence;
+
+        if keep_len == self.items.len() {
+            self.items.extend(incoming);
+            self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
+            self.needs_authoritative_refetch = false;
+            self.revision = self.revision.wrapping_add(1);
+            return Ok(true);
+        }
+
+        let preserve_from = self.items.partition_point(|item| item.sequence <= tail_end);
+        let replaced_slice = &self.items[keep_len..preserve_from];
+        let content_changed = replaced_slice != incoming.as_slice();
+        if content_changed {
+            let live_tail = self.items.split_off(preserve_from);
+            self.items.truncate(keep_len);
+            self.items.extend(incoming);
+            self.items.extend(live_tail);
+            self.revision = self.revision.wrapping_add(1);
+        }
+        self.authoritative_end_sequence = self.items.last().map(|item| item.sequence);
+        if preserve_from == self.items.len()
+            || self.items.last().is_some_and(|i| i.sequence <= tail_end)
+        {
+            self.needs_authoritative_refetch = false;
+        }
+        Ok(content_changed)
+    }
+
     pub fn apply_live(&mut self, event: TimelineLiveEvent) -> bool {
         self.apply_live_batch(std::iter::once(event)) > 0
     }
@@ -1129,6 +1205,101 @@ mod tests {
                 .iter()
                 .all(|turn| turn.pending_permission_ids.is_empty()),
             "the session answered the card, so no turn may still report it pending"
+        );
+    }
+
+    #[test]
+    fn apply_authoritative_tail_handles_empty_append_compaction_and_live_race() {
+        let session = VibexSessionId::parse("session_tail").unwrap();
+        let other = VibexSessionId::parse("session_other").unwrap();
+        let msg = |text: &str| {
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: text.into(),
+                is_final: true,
+            })
+        };
+
+        let mut model = TimelineModel::default();
+        model.replace_authoritative(
+            session.clone(),
+            vec![item(&session, 1, msg("one")), item(&session, 2, msg("two"))],
+        );
+        let rev_initial = model.revision;
+
+        // Wrong session rejects cleanly.
+        assert_eq!(
+            model.apply_authoritative_tail(&other, 2, Vec::new()),
+            Err(())
+        );
+
+        // Empty delta makes no change and does not bump revision.
+        model.mark_lagged();
+        assert_eq!(
+            model.apply_authoritative_tail(&session, 2, Vec::new()),
+            Ok(false)
+        );
+        assert_eq!(model.revision, rev_initial);
+        assert!(!model.needs_authoritative_refetch);
+
+        // Pure forward append extends in place and bumps revision.
+        assert_eq!(
+            model.apply_authoritative_tail(
+                &session,
+                2,
+                vec![
+                    item(&session, 3, msg("three")),
+                    item(&session, 4, msg("four"))
+                ]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            model.items.iter().map(|i| i.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert_eq!(model.authoritative_end_sequence, Some(4));
+        assert_eq!(model.revision, rev_initial + 1);
+
+        // Concurrent live item 6 arrives while a boundary delta for (2, 5] is in flight;
+        // stale compacted item 4 is removed, item 3 is updated, item 5 is inserted,
+        // and concurrent live item 6 survives.
+        model.apply_live(TimelineLiveEvent {
+            session_id: session.clone(),
+            sequence: 6,
+            item: item(&session, 6, msg("live-six")),
+        });
+        assert_eq!(
+            model.apply_authoritative_tail(
+                &session,
+                2,
+                vec![
+                    item(&session, 3, msg("three-compacted")),
+                    item(&session, 5, msg("five")),
+                ]
+            ),
+            Ok(true)
+        );
+        assert_eq!(
+            model.items.iter().map(|i| i.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5, 6]
+        );
+        assert!(matches!(
+            &model.items[2].payload,
+            TimelinePayload::AgentMessage(m) if m.text == "three-compacted"
+        ));
+        assert!(matches!(
+            &model.items[4].payload,
+            TimelinePayload::AgentMessage(m) if m.text == "live-six"
+        ));
+
+        // Empty stale delta while live item 6 already exists must not wipe item 6.
+        assert_eq!(
+            model.apply_authoritative_tail(&session, 5, Vec::new()),
+            Ok(false)
+        );
+        assert_eq!(
+            model.items.iter().map(|i| i.sequence).collect::<Vec<_>>(),
+            vec![1, 2, 3, 5, 6]
         );
     }
 }

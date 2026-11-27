@@ -502,7 +502,7 @@ desktop::locale::resolve_locale(LocaleMode, Option<&str>) -> ResolvedLocale
   non-Chinese fallback.
 - `cargo test -p vibex-desktop locale::tests --locked` covers System versus
   explicit desktop modes.
-- `cargo test -p vibex-mobile-nsh --locked` covers deterministic Simplified,
+- `cargo test -p vibex-mobile --locked` covers deterministic Simplified,
   Traditional, English, and unknown-copy selection.
 - Android/iOS release validation must launch a fresh install under Simplified
   Chinese, Traditional Chinese, English, and one unsupported system language.

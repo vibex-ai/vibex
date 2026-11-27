@@ -4,7 +4,7 @@
 
 Read this when changing timeline activity identity, details, grouping,
 reasoning preferences, or disclosure motion in `apps/desktop`,
-`apps/mobile-nsh`, or `crates/vibex-tui`.
+`apps/mobile`, or `crates/vibex-tui`.
 Desktop remains the visual and semantic baseline. Mobile adapts it to touch;
 TUI retains character-grid navigation and incremental Markdown rendering.
 The desktop runtime remains the sole owner of session state.
@@ -222,7 +222,7 @@ are optional, and absent or unknown choices resolve to the shipped default:
 
 - Shared detail tests cover empty snapshots, generic argument targets,
   lossless input copy, unknown envelopes, and failure exit codes.
-- `apps/mobile-nsh/tests/session.rs` and the headless tests beside the session
+- `apps/mobile/tests/session.rs` and the headless tests beside the session
   screen drive production turn rendering at phone widths and different text-size
   steps. Assert header bounds, touch disclosure, copy independence, capped output
   height, reasoning tail alignment, and explicit choices across updates.

@@ -12,9 +12,9 @@ Zedra.
 
 - `apps/desktop` is the complete local GPUI workbench and owns the
   `DesktopRuntime`.
-- `apps/mobile-nsh` is the iOS/Android client, built on Native Shell (`nsh`):
+- `apps/mobile` is the iOS/Android client, built on Native Shell (`nsh`):
   one Rust app whose views are the platform's own (UIKit, Android views), with
-  the UI layer in `crates/vibex-nsh-ui`. It replaced the GPUI mobile client,
+  the UI layer in `crates/vibex-mobile-ui`. It replaced the GPUI mobile client,
   which was removed from the tree; anyone still running that build gets this one
   as an in-place update.
 - Mobile renders a GUI Agent timeline: user messages, Markdown responses,
@@ -36,13 +36,13 @@ Shared across desktop and mobile:
 - Semantic tokens in `crates/vibex-ui/theme/tokens.json`; the nsh client
   generates its theme file from the same source rather than defining colors.
 - Platform-neutral pairing (entries, claims, credentials, the on-device store)
-  in `crates/vibex-mobile-pairing`, shared by the mobile clients.
+  in `crates/vibex-mobile-pairing`, which the client and its tests share.
 - Remote/Relay protocol behavior and tests.
 
-The native mobile renderers own only platform bootstrap, pairing/storage, input,
-and the compact composition of those shared projections. Neither client may
-introduce a second Agent protocol, a local authority, or a separate
-terminal-first session experience. `crates/vibex-nsh-ui` is composition only: it
+The native mobile renderer owns only platform bootstrap, pairing/storage, input,
+and the compact composition of those shared projections. It may not introduce a
+second Agent protocol, a local authority, or a separate terminal-first session
+experience. `crates/vibex-mobile-ui` is composition only: it
 depends on `nsh-core` and `nsh-base`, never on GPUI, transport or runtime code.
 
 ## Visual Contract
@@ -61,8 +61,8 @@ The nsh client mounts into the existing Kotlin and Swift shells (the nsh
 platform crates' `NshView`/`AppView`), which keep the notifications, the
 foreground service, the camera and the discovery bridge. Host observations
 reach the app through its host-event channel; the shells never own state.
-The nsh client draws the same palette from `apps/mobile-nsh/theme.json`
-(generated from the token source; `cargo run -p vibex-mobile-nsh --bin
+The nsh client draws the same palette from `apps/mobile/theme.json`
+(generated from the token source; `cargo run -p vibex-mobile --bin
 gen-theme` refreshes it, and a test fails when it is stale). Its parity contract
 keeps information architecture, copy, spacing and states identical, while text
 metrics, scrolling, the keyboard, selection and navigation transitions are the
@@ -74,7 +74,7 @@ platform's own.
 node scripts/generate-tokens.mjs
 pnpm check:mobile-native
 cargo test -p vibex-ui --locked
-cargo test -p vibex-mobile-nsh --locked   # theme sync + headless pairing flows
+cargo test -p vibex-mobile --locked   # theme sync + headless pairing flows
 ```
 
 Platform SDK builds are separate validation: Android requires the Android

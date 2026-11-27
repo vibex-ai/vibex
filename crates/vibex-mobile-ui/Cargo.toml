@@ -1,0 +1,17 @@
+[package]
+name = "vibex-mobile-ui"
+version = "0.1.9"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "The Native Shell (nsh) UI layer of the Vibex mobile client."
+
+[dependencies]
+alacritty_terminal.workspace = true
+nsh-core.workspace = true
+nsh-base.workspace = true
+unicode-segmentation.workspace = true
+unicode-width.workspace = true
+vibex-brands = { path = "../vibex-brands" }
+vibex-locale = { path = "../vibex-locale" }

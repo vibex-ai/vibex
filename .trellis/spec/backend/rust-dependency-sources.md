@@ -43,7 +43,7 @@ cargo metadata --locked --format-version 1
 pnpm check:licenses                   SPDX, asset, SBOM, and notice gate
 pnpm check:rust                       locked fmt/check/clippy/test gate
 pnpm check:mobile-native              mobile host contract (JNI exports, manifest, iOS project)
-apps/mobile-nsh/scripts/check-upgrade.mjs
+apps/mobile/scripts/check-upgrade.mjs
                                       released application id, bundle ids, versionCode scheme
 ```
 
@@ -63,7 +63,7 @@ apps/mobile-nsh/scripts/check-upgrade.mjs
   changes belong upstream.
 - The mobile hosts' Java and Swift are first-party, not vendored third-party
   source. Their package and class names are part of the JNI/FFI contract
-  (`ai.vibex.mobile.nsh.NshHost`, `com.longbridge.nsh.MainActivity`), so moving
+  (`ai.vibex.mobile.NativeHost`, `com.longbridge.nsh.MainActivity`), so moving
   one renames a symbol the other side exports; `scripts/check-mobile-native.mjs`
   compares the two.
 - The gpui-kit family resolves from crates.io on caret requirements, so a patch
@@ -90,7 +90,7 @@ apps/mobile-nsh/scripts/check-upgrade.mjs
     platform traits are unchanged, and the snapshot's work is in image decoding
     (animated WebP) and element internals.
 - An `nsh` bump is not complete until the mobile host still matches the
-  framework: `cargo check -p vibex-mobile-nsh --target aarch64-linux-android`
+  framework: `cargo check -p vibex-mobile --target aarch64-linux-android`
   compiles the JNI module the desktop gates skip, and
   `scripts/check-mobile-native.mjs` re-reads the Java/Swift hosts against the
   exports. The `nsh` crates are published, so the lockfile is the only record of
@@ -147,9 +147,9 @@ apps/mobile-nsh/scripts/check-upgrade.mjs
 - `pnpm check:mobile-native` verifies every native method the Java host declares
   has a Rust export, and that the manifest and iOS project keep the surface those
   paths need.
-- An `nsh` bump type-checks `apps/mobile-nsh/src/platform/android.rs` for an
+- An `nsh` bump type-checks `apps/mobile/src/platform/android.rs` for an
   Android target, not only the host target the quality gates cover. With no NDK
-  installed, `cargo check -p vibex-mobile-nsh --target aarch64-linux-android`
+  installed, `cargo check -p vibex-mobile --target aarch64-linux-android`
   after setting the target linker is enough; a bump that changes the JNI surface
   also fails `check-mobile-native`.
 - `cargo test -p vibex-ui` proves the palette bridge still covers every color
@@ -317,9 +317,9 @@ bytes, `\0`.
   decision, but it is absent from the SBOM and the notices until `--write` runs.
 - `--write` is idempotent: a second run produces no further diff.
 - The unregistered-asset scan covers the two shipping apps —
-  `apps/desktop` and `apps/mobile-nsh` — plus `crates/vibex-nsh-ui/assets`,
+  `apps/desktop` and `apps/mobile` — plus `crates/vibex-mobile-ui/assets`,
   where the mobile screens' icons live. Generated build outputs
-  (`apps/mobile-nsh/android/app/build` and `apps/mobile-nsh/ios/Frameworks`) are
+  (`apps/mobile/android/app/build` and `apps/mobile/ios/Frameworks`) are
   excluded by `GENERATED_ASSET_ROOTS`, because they are copies of inputs the
   policy already pins. Pinning a copy would either double-count the same bytes or
   demand a second policy entry for a file nobody authored; add a new root to that
@@ -390,7 +390,7 @@ git commit -m "chore(licenses): refresh the SBOM"
 ```bash
 # 1. What actually drifted since the pin was last written?
 git log -1 --format=%H -- docs/licenses/desktop-policy.json
-git diff --name-status <that-commit> HEAD -- apps/mobile-nsh/ios/Resources/Assets.xcassets
+git diff --name-status <that-commit> HEAD -- apps/mobile/ios/Resources/Assets.xcassets
 
 # 2. Review each listed file against the provenance its entry declares.
 # 3. Write the count and digest the failure reported into both pin fields.
