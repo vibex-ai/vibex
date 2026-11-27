@@ -228,7 +228,7 @@ pub fn git(host: GitHost) -> impl IntoElement {
     view()
         .flex_1()
         .min_h(px(0.0))
-        .pb_safe_area()
+        .pb_keyboard()
         .child(
             view()
                 .flex_1()
@@ -282,6 +282,12 @@ pub fn git(host: GitHost) -> impl IntoElement {
                     .otherwise(move || commit_detail_view(commit)),
                 )
         }))
+        // `pb_keyboard` covers the keyboard while it is up; with it down the
+        // surface still has to clear the home indicator.
+        .child(when(
+            move || keyboard_height().0 == 0.0,
+            || view().pb_safe_area().flex_shrink_0(),
+        ))
         .child(branch_sheet(
             host.branch_menu,
             host.branches,
@@ -911,7 +917,6 @@ fn commit_bar(host: GitHost) -> impl IntoElement {
     view()
         .w_full()
         .flex_shrink_0()
-        .pb_keyboard()
         .gap(px(theme::SPACING_SM))
         .px(px(theme::SPACING_MD))
         .pt(px(theme::SPACING_SM))
@@ -1747,5 +1752,21 @@ fn status_color(status: &str) -> Hsla {
         "D" | "!" => theme::accent_red(),
         "M" | "R" | "C" | "T" => theme::status_modified(),
         _ => theme::text_muted(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn rollback_undo_icon_inherits_current_color() {
+        let svg = include_str!("../../assets/icons/undo.svg");
+        assert!(
+            svg.contains("stroke=\"currentColor\""),
+            "undo.svg must use currentColor so it follows theme ink instead of looking permanently grey"
+        );
+        assert!(
+            !svg.contains("stroke=\"#"),
+            "undo.svg must not hardcode a hex stroke color: {svg}"
+        );
     }
 }

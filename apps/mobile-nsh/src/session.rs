@@ -8214,7 +8214,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             if !service.workbench_is_current(generation) {
                 return;
             }
@@ -8349,7 +8349,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
@@ -8390,7 +8390,7 @@ impl SessionService {
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
         let path = path.to_owned();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 return;
             };
@@ -9041,7 +9041,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.workbench_is_current(generation) {
                     service.git_remote_busy.set(None);
@@ -9105,7 +9105,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.workbench_is_current(generation) {
                     service.git_committing.set(false);
@@ -9365,7 +9365,7 @@ impl SessionService {
         let service = self.clone();
         let git = self.git_backend.clone();
         let agent = self.backend.clone();
-        spawn(async move {
+        detach(async move {
             let Some(workspace) = service.workspace(&agent).await else {
                 if service.workbench_is_current(generation) {
                     service.git_remote_busy.set(None);

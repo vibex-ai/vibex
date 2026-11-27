@@ -1535,7 +1535,10 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         }),
         on_toggle_git_directory: Rc::new(|_| {}),
         on_toggle_git_directories: Rc::new(|| {}),
-        on_revert_git_selection: Rc::new(|_| {}),
+        on_revert_git_selection: Rc::new(move |paths| {
+            git_changes.update(|rows| rows.retain(|row| !paths.iter().any(|p| p == &row.path)));
+            git_selected.update(|selected| selected.retain(|p| !paths.iter().any(|r| r == p)));
+        }),
         git_message,
         git_committing,
         git_amend,
@@ -4090,4 +4093,94 @@ fn readonly_file_viewer_supports_selection_and_copy_without_editing() {
     app.press("fn main() {").unwrap();
     assert_eq!(app.screen().count("role:textbox").unwrap(), 0);
     assert!(app.screen().shows("fn main() {"));
+}
+
+#[test]
+fn the_git_rollback_button_tracks_selection_and_reverts_on_confirm() {
+    let mut app = start();
+    let dialogs = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = dialogs.clone();
+    app.on_dialog(move |dialog| {
+        seen.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let rollback = dialog
+            .buttons
+            .iter()
+            .find(|button| button.text == "Rollback")
+            .expect("the alert offers Rollback");
+        nsh_testing::DialogAnswer::Press(rollback.text.clone())
+    });
+
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("src/main.rs").unwrap();
+
+    // Deselecting all changes disables the rollback control; selecting them
+    // again enables it.
+    app.press("role:button[Select all changes]").unwrap();
+    assert!(
+        app.press("role:button[Rollback selected]").is_err(),
+        "rollback must be disabled when no changes are selected"
+    );
+    app.press("role:button[Select all changes]").unwrap();
+
+    // Pressing rollback while selected opens one confirmation dialog and
+    // discards the selected change once confirmed.
+    app.press("role:button[Rollback selected]").unwrap();
+    app.wait_for("No changes").unwrap();
+    assert_eq!(dialogs.load(std::sync::atomic::Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_git_commit_message_stays_above_the_keyboard() {
+    const HEIGHT: f32 = 844.0;
+    const KEYBOARD: f32 = 340.0;
+    let mut config = EngineConfig::new(Root::of::<Shell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(HEIGHT));
+    config.environment.os = nsh_core::platform::Os::Android;
+    config.environment.safe_area.top = px(44.0);
+    config.environment.safe_area.bottom = px(24.0);
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Files, Git, and terminal]")
+        .unwrap();
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.press("role:button[Changes]").unwrap();
+    app.wait_for("text:Commit message").unwrap();
+
+    let bounds_of = |app: &Headless, query: &str| {
+        app.screen()
+            .layout(query)
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected `{query}` on screen"))
+            .bounds
+    };
+    let field_at_rest = bounds_of(&app, "text:Commit message");
+    let commit_at_rest = bounds_of(&app, "role:button[Commit]");
+
+    app.set_environment("keyboard up", |env| env.keyboard_height = px(KEYBOARD))
+        .unwrap();
+
+    let field_lifted = bounds_of(&app, "text:Commit message");
+    let commit_lifted = bounds_of(&app, "role:button[Commit]");
+    let keyboard_top = HEIGHT - KEYBOARD;
+    let field_bottom = field_lifted.origin.y.0 + field_lifted.size.height.0;
+    let commit_bottom = commit_lifted.origin.y.0 + commit_lifted.size.height.0;
+    assert!(
+        field_bottom <= keyboard_top + 0.5,
+        "commit message input must stay above the keyboard: {field_lifted:?}, keyboard top {keyboard_top}"
+    );
+    assert!(
+        commit_bottom <= keyboard_top + 0.5,
+        "commit button must stay above the keyboard: {commit_lifted:?}, keyboard top {keyboard_top}"
+    );
+    assert!(
+        field_lifted.origin.y.0 < field_at_rest.origin.y.0
+            && commit_lifted.origin.y.0 < commit_at_rest.origin.y.0,
+        "commit bar must lift with the keyboard: field {field_at_rest:?} -> {field_lifted:?}, button {commit_at_rest:?} -> {commit_lifted:?}"
+    );
+    assert!(
+        keyboard_top - field_bottom <= 16.0,
+        "commit bar must not double-pad for the bottom safe area while the keyboard is up: bottom {field_bottom}, keyboard top {keyboard_top}"
+    );
 }
