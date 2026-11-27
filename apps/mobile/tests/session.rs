@@ -754,6 +754,21 @@ fn sidebar_fixture(
     }
 }
 
+/// One row of the files fixture: a directory or a file at `depth`.
+fn file_row_fixture(path: &str, directory: bool, depth: usize, expanded: bool) -> FileEntry {
+    FileEntry {
+        path: path.to_owned(),
+        name: path.rsplit('/').next().unwrap_or(path).to_owned(),
+        directory,
+        depth,
+        expanded,
+        loading: false,
+        git: None,
+        icon: Default::default(),
+        ignored: false,
+    }
+}
+
 fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestion>) -> SessionHost {
     let sessions = signal(sessions());
     let active = signal(Some("s1".to_owned()));
@@ -1017,25 +1032,6 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     let git_history_more = signal(false);
     let git_history_loading = signal(false);
     let git_history_query = signal(String::new());
-    let on_search_git_history = Rc::new(move |query: &str| {
-        git_history_query.set(query.to_owned());
-        let needle = query.trim().to_lowercase();
-        if needle.is_empty() {
-            git_history.set(initial_commits.clone());
-        } else {
-            git_history.set(
-                initial_commits
-                    .iter()
-                    .filter(|row| {
-                        row.subject.to_lowercase().contains(&needle)
-                            || row.short_hash.to_lowercase().contains(&needle)
-                            || row.detail.to_lowercase().contains(&needle)
-                    })
-                    .cloned()
-                    .collect(),
-            );
-        }
-    });
     let git_commit_detail = signal(None::<CommitDetailPreview>);
     let on_open_git_commit = Rc::new(move |hash: &str| {
         git_commit_detail.set(Some(CommitDetailPreview {
@@ -1057,6 +1053,26 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
     });
     let on_toggle_git_history = Rc::new(move || {
         git_show_history.set(!git_show_history.get_untracked());
+    });
+    // The real service asks the runtime, which filters the whole history; the
+    // fixture answers from the rows it holds.
+    let all_git_history = git_history;
+    let on_search_git_history = Rc::new(move |query: &str| {
+        git_history_query.set(query.to_owned());
+        let needle = query.trim().to_lowercase();
+        git_history.set(
+            all_git_history
+                .get_untracked()
+                .into_iter()
+                .filter(|commit| {
+                    needle.is_empty()
+                        || commit.subject.to_lowercase().contains(&needle)
+                        || commit.detail.to_lowercase().contains(&needle)
+                        || commit.short_hash.to_lowercase().contains(&needle)
+                        || commit.hash.to_lowercase().contains(&needle)
+                })
+                .collect(),
+        );
     });
     let on_stage = Rc::new(move |path: &str| {
         git_changes.update(|changes| {
@@ -1509,7 +1525,30 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         files_error,
         on_open_files: Rc::new(move || files_open.set(true)),
         on_refresh_files: Rc::new(|| {}),
-        on_collapse_files: Rc::new(|| {}),
+        on_collapse_files: {
+            // The real service flips every folder open or closed; the fixture
+            // keeps the same two-way behavior over its own rows.
+            let entries = files_entries;
+            Rc::new(move || {
+                let expand = !entries
+                    .get_untracked()
+                    .iter()
+                    .filter(|row| row.directory)
+                    .all(|row| row.expanded);
+                entries.set(if expand {
+                    vec![
+                        file_row_fixture("src", true, 1, true),
+                        file_row_fixture("src/main.rs", false, 2, false),
+                        file_row_fixture("README.md", false, 1, false),
+                    ]
+                } else {
+                    vec![
+                        file_row_fixture("src", true, 1, false),
+                        file_row_fixture("README.md", false, 1, false),
+                    ]
+                });
+            })
+        },
         on_open_dir,
         on_open_file,
         on_files_back,
@@ -2863,6 +2902,28 @@ fn the_files_surface_lists_a_directory_and_reads_a_file() {
     app.press("main.rs").unwrap();
     app.wait_for("role:button[Go to line]").unwrap();
     assert!(!app.screen().matches("role:button[Save]").unwrap());
+}
+
+/// The one control that opens or closes every folder at once.
+///
+/// It used to only ever collapse, so a second press did nothing and the tree
+/// could not be opened in one step. It now flips between the two.
+#[test]
+fn the_folders_button_opens_and_closes_the_whole_tree() {
+    let mut config = EngineConfig::new(Root::of::<FilesShell>());
+    config.viewport = nsh_core::geometry::Size::new(px(390.0), px(1600.0));
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("README.md").unwrap();
+    assert!(!app.screen().shows("main.rs"));
+
+    app.press("role:button[Expand or collapse folders]")
+        .unwrap();
+    app.wait_for("main.rs").unwrap();
+
+    app.press("role:button[Expand or collapse folders]")
+        .unwrap();
+    app.wait_for_gone("main.rs", std::time::Duration::from_secs(3))
+        .unwrap();
 }
 
 /// The shell with its Git surface open.
