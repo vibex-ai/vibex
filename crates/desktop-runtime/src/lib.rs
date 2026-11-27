@@ -4408,6 +4408,25 @@ impl DesktopRuntime {
                 }
             }
         }));
+        let mut session_interrupts = self.agent.manager.subscribe_session_interrupts();
+        let interrupt_tx = self.events.clone();
+        tasks.push(tokio::spawn(async move {
+            loop {
+                match session_interrupts.recv().await {
+                    Ok(session_id) => {
+                        let _ = interrupt_tx.send(DesktopEvent::SessionInterrupted(session_id));
+                    }
+                    Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                        let _ = interrupt_tx.send(DesktopEvent::Lagged {
+                            stream: DesktopEventStream::Fanout,
+                            skipped,
+                            refetch: AuthoritativeRefetch::for_stream(DesktopEventStream::Fanout),
+                        });
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }));
         let mut runtime_events = self.agent.runtime_lifecycle.subscribe();
         let runtime_tx = self.events.clone();
         tasks.push(tokio::spawn(async move {

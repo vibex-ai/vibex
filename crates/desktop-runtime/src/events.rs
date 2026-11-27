@@ -75,6 +75,13 @@ pub enum DesktopEvent {
     /// is drawing. A read in flight still describes the row, so the ids are the
     /// only account of the removal that arrives in time to answer it.
     SessionsRemoved(Vec<VibexSessionId>),
+    /// A session whose running turn was explicitly interrupted.
+    ///
+    /// Any client — desktop, mobile, TUI, or IM — can stop a running turn. The
+    /// resulting `SessionUpdated` only reports `Idle`, so the shell needs this
+    /// signal to pause auto-continue for that stopped turn without disabling
+    /// the session's auto-continue preference.
+    SessionInterrupted(VibexSessionId),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),
     ProviderConfigChanged(ProviderConfigChangedEvent),

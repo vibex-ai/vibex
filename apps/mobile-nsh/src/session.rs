@@ -8,7 +8,7 @@
 
 use std::{
     cell::{Cell, RefCell},
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet},
     rc::Rc,
     sync::Arc,
     time::Duration,
@@ -419,6 +419,9 @@ pub struct SessionService {
     show_reasoning: Signal<bool>,
     auto_continue: Signal<bool>,
     auto_continue_armed: Rc<Cell<bool>>,
+    /// Sessions whose running turn was explicitly stopped by the user; holds
+    /// back auto-continue for that stopped turn without disabling the setting.
+    auto_continue_paused_turn_sessions: Rc<RefCell<BTreeSet<String>>>,
     find_open: Signal<bool>,
     plan: Signal<Option<PlanView>>,
     goal: Signal<Option<GoalView>>,
@@ -685,6 +688,7 @@ impl SessionService {
             show_reasoning: signal(crate::settings::show_reasoning()),
             auto_continue: signal(crate::settings::auto_continue()),
             auto_continue_armed: Rc::new(Cell::new(false)),
+            auto_continue_paused_turn_sessions: Rc::new(RefCell::new(BTreeSet::new())),
             find_open: signal(false),
             plan: signal(None),
             goal: signal(None),
@@ -1851,10 +1855,21 @@ impl SessionService {
                             .is_some_and(|pending| pending.session_id == active)
                 });
                 self.sessions.set(rows);
-                *self.session_states.borrow_mut() = sessions
-                    .iter()
-                    .map(|session| (session.id.as_str().to_owned(), session.state))
-                    .collect();
+                {
+                    let mut states = self.session_states.borrow_mut();
+                    let mut paused_turns = self.auto_continue_paused_turn_sessions.borrow_mut();
+                    for session in &sessions {
+                        if states.get(session.id.as_str()).is_some_and(|prev| {
+                            session_snapshot_starts_a_turn(*prev, session.state)
+                        }) {
+                            paused_turns.remove(session.id.as_str());
+                        }
+                    }
+                    *states = sessions
+                        .iter()
+                        .map(|session| (session.id.as_str().to_owned(), session.state))
+                        .collect();
+                }
                 self.session_records.set(sessions.clone());
                 // The transcript is projected from these records (the Agent
                 // that ran a turn is one of them), and it was projected before
@@ -2050,9 +2065,15 @@ impl SessionService {
             }
             BackendEvent::SessionUpdated(session) => {
                 self.note_online();
-                self.session_states
+                let previous_state = self
+                    .session_states
                     .borrow_mut()
                     .insert(session.id.as_str().to_owned(), session.state);
+                if previous_state
+                    .is_some_and(|prev| session_snapshot_starts_a_turn(prev, session.state))
+                {
+                    self.clear_paused_turn_auto_continue(session.id.as_str());
+                }
                 self.record_sidebar_session(&session);
                 let mut row = self
                     .workspace_records
@@ -2126,6 +2147,9 @@ impl SessionService {
                 self.session_states
                     .borrow_mut()
                     .retain(|id, _| !ids.contains(id));
+                self.auto_continue_paused_turn_sessions
+                    .borrow_mut()
+                    .retain(|id| !ids.contains(id));
                 self.drafts.borrow_mut().retain(|id, _| !ids.contains(id));
                 self.attachment_drafts
                     .borrow_mut()
@@ -2182,6 +2206,10 @@ impl SessionService {
             BackendEvent::Notification(intent) => {
                 self.note_online();
                 self.present_notification(intent);
+            }
+            BackendEvent::SessionInterrupted(session_id) => {
+                self.note_online();
+                self.pause_next_auto_continue(session_id.as_str());
             }
             BackendEvent::Disconnected => {
                 self.connection.set(ConnectionState::Connecting);
@@ -2369,6 +2397,7 @@ impl SessionService {
         };
         let mentions = self.armed_mentions_for(&text);
         self.editing.set(false);
+        self.clear_paused_turn_auto_continue(session_id.as_str());
         let (raw_draft, raw_attachments) = self.clear_composer_for_send();
         self.sending.set(true);
         self.error.set(None);
@@ -2882,10 +2911,26 @@ impl SessionService {
 
     pub fn set_auto_continue(&self, enabled: bool) {
         self.auto_continue.set(enabled);
+        self.auto_continue_paused_turn_sessions.borrow_mut().clear();
         if !enabled {
             self.auto_continue_armed.set(false);
         }
         self.publish();
+    }
+
+    fn pause_next_auto_continue(&self, session_id: &str) {
+        self.auto_continue_paused_turn_sessions
+            .borrow_mut()
+            .insert(session_id.to_owned());
+        if self.active.get_untracked().as_deref() == Some(session_id) {
+            self.auto_continue_armed.set(false);
+        }
+    }
+
+    fn clear_paused_turn_auto_continue(&self, session_id: &str) {
+        self.auto_continue_paused_turn_sessions
+            .borrow_mut()
+            .remove(session_id);
     }
 
     fn open_team(&self) {
@@ -3004,6 +3049,7 @@ impl SessionService {
         let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
+        self.clear_paused_turn_auto_continue(session_id.as_str());
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -3217,6 +3263,7 @@ impl SessionService {
         let Some((name, arguments)) = parse_slash_command_invocation(&text) else {
             return;
         };
+        self.clear_paused_turn_auto_continue(session_id.as_str());
         let composer_snapshot = from_composer.then(|| self.clear_composer_for_send());
         if !from_composer {
             self.armed_command.borrow_mut().take();
@@ -3434,6 +3481,7 @@ impl SessionService {
     }
 
     fn resume_auto_continue(&self, id: &str) {
+        self.clear_paused_turn_auto_continue(id);
         self.sidebar_mutation(
             RemoteSidebarOrganizationMutation::SetSessionAutoContinuePaused {
                 session_ids: vec![id.to_owned()],
@@ -3653,6 +3701,7 @@ impl SessionService {
         let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
+        self.clear_paused_turn_auto_continue(session_id.as_str());
         let composer_snapshot = from_composer.then(|| self.clear_composer_for_send());
         if !from_composer {
             self.armed_command.borrow_mut().take();
@@ -4212,7 +4261,12 @@ impl SessionService {
         self.plan.set(plan);
         self.goal.set(goal);
         self.needs_continue.set(needs_continue);
-        if !needs_continue {
+        let paused_turn = active.as_ref().is_some_and(|id| {
+            self.auto_continue_paused_turn_sessions
+                .borrow()
+                .contains(id)
+        });
+        if !needs_continue || paused_turn {
             self.auto_continue_armed.set(false);
         } else if let Some(armed_session) = active.clone()
             && self.auto_continue.get_untracked()
@@ -4224,6 +4278,11 @@ impl SessionService {
                 timer(Duration::from_secs(2)).await;
                 if service.active.get_untracked().as_deref() == Some(armed_session.as_str())
                     && service.needs_continue.get_untracked()
+                    && service.auto_continue.get_untracked()
+                    && !service
+                        .auto_continue_paused_turn_sessions
+                        .borrow()
+                        .contains(&armed_session)
                 {
                     service.continue_turn();
                 }
@@ -5171,6 +5230,9 @@ impl SessionService {
         let Ok(session_id) = VibexSessionId::parse(active) else {
             return;
         };
+        // Match desktop's Stop semantics: hold back auto-continue for the turn
+        // the user explicitly stopped without disabling the setting itself.
+        self.pause_next_auto_continue(session_id.as_str());
         let service = self.clone();
         let backend = self.backend.clone();
         spawn(async move {
@@ -5439,6 +5501,7 @@ impl SessionService {
     }
 
     fn set_session_auto_continue(&self, id: &str, enabled: bool) {
+        self.clear_paused_turn_auto_continue(id);
         self.auto_continue_sessions.update(|sessions| {
             if enabled {
                 if !sessions.iter().any(|candidate| candidate == id) {
@@ -11335,6 +11398,14 @@ fn is_transient_rpc_error(error: &BackendError) -> bool {
     )
 }
 
+fn session_snapshot_starts_a_turn(previous: AgentSessionState, current: AgentSessionState) -> bool {
+    matches!(previous, AgentSessionState::Idle | AgentSessionState::Error)
+        && matches!(
+            current,
+            AgentSessionState::Running | AgentSessionState::Initializing
+        )
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
@@ -12122,6 +12193,115 @@ mod optimistic_send_tests {
         let config = EngineConfig::new(Root::of::<SessionSwitchComposerIsolationProbe>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("session-switch-chrome-ok").unwrap();
+    }
+
+    #[component]
+    fn InterruptAutoContinuePauseProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let (session_a, mut session_record) = seed_existing_session(&service);
+        let session_b = VibexSessionId::new();
+        service
+            .session_states
+            .borrow_mut()
+            .insert(session_b.as_str().to_owned(), AgentSessionState::Idle);
+        service.set_auto_continue(true);
+
+        // Session A is running a turn, and the user taps Stop.
+        session_record.state = AgentSessionState::Running;
+        service.apply_event(BackendEvent::SessionUpdated(session_record.clone()));
+        service.interrupt_active();
+        assert!(
+            service
+                .auto_continue_paused_turn_sessions
+                .borrow()
+                .contains(session_a.as_str()),
+            "stopping a turn must mark that session's stopped turn as paused"
+        );
+        assert!(
+            service.auto_continue.get_untracked(),
+            "stopping a turn must not disable the auto-continue setting"
+        );
+
+        // The interrupted turn settles to Idle with an unfinished user turn.
+        // The Continue banner still appears, but auto-continue must NOT arm.
+        session_record.state = AgentSessionState::Idle;
+        service.apply_event(BackendEvent::SessionUpdated(session_record.clone()));
+        let paused_items = vec![make_timeline_item(
+            &session_a,
+            1,
+            1_000,
+            vibex_core::TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Stopped turn".to_owned(),
+                ..UserMessagePayload::default()
+            }),
+        )];
+        service.apply_page(
+            &session_a,
+            make_timeline_page(&session_a, paused_items.clone()),
+        );
+        assert!(service.needs_continue.get_untracked());
+        assert!(
+            !service.auto_continue_armed.get(),
+            "auto-continue must stay disarmed for the turn the user stopped"
+        );
+
+        // Switching away and back to Session A must preserve the turn-scoped pause.
+        service.open(session_b.as_str());
+        service.open(session_a.as_str());
+        service.apply_page(&session_a, make_timeline_page(&session_a, paused_items));
+        assert!(service.needs_continue.get_untracked());
+        assert!(
+            !service.auto_continue_armed.get(),
+            "switching sessions must not clear the stopped turn's auto-continue pause"
+        );
+
+        // Starting a new turn (Idle -> Running) releases the turn-scoped pause,
+        // so an abnormal stop on that next turn arms auto-continue again.
+        session_record.state = AgentSessionState::Running;
+        service.apply_event(BackendEvent::SessionUpdated(session_record.clone()));
+        assert!(
+            !service
+                .auto_continue_paused_turn_sessions
+                .borrow()
+                .contains(session_a.as_str()),
+            "starting a new turn must clear the previous stop's turn-scoped pause"
+        );
+        session_record.state = AgentSessionState::Idle;
+        service.apply_event(BackendEvent::SessionUpdated(session_record));
+        assert!(service.needs_continue.get_untracked());
+        assert!(
+            service.auto_continue_armed.get(),
+            "a subsequent abnormally ended turn must re-arm auto-continue"
+        );
+
+        service.shutdown();
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "interrupt-auto-continue-pause-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn interrupt_pauses_auto_continue_for_stopped_turn_and_rearms_on_next_turn() {
+        let config = EngineConfig::new(Root::of::<InterruptAutoContinuePauseProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("interrupt-auto-continue-pause-ok").unwrap();
     }
 }
 

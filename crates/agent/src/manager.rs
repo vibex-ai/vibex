@@ -188,6 +188,10 @@ pub struct AgentManager {
     /// session list need the ids to drop the rows a read in flight still
     /// describes.
     session_removals: broadcast::Sender<Vec<VibexSessionId>>,
+    /// Sessions whose running turn was explicitly interrupted. Clients that
+    /// drive turn-scoped policies such as auto-continue need to distinguish an
+    /// explicit stop from an unexpected abort that settled to `Idle`.
+    session_interrupts: broadcast::Sender<VibexSessionId>,
     notification_events: broadcast::Sender<AgentNotificationIntent>,
     runtime_selection: OnceLock<Weak<RuntimeSelectionService>>,
     runtime_lifecycle: OnceLock<Weak<RuntimeLifecycleService>>,
@@ -683,6 +687,7 @@ impl AgentManager {
         let (live_events, _) = broadcast::channel(512);
         let (session_events, _) = broadcast::channel(256);
         let (session_removals, _) = broadcast::channel(256);
+        let (session_interrupts, _) = broadcast::channel(256);
         let (notification_events, _) = broadcast::channel(256);
         let manager = Self {
             db_path,
@@ -692,6 +697,7 @@ impl AgentManager {
             live_events,
             session_events,
             session_removals,
+            session_interrupts,
             notification_events,
             runtime_selection: OnceLock::new(),
             runtime_lifecycle: OnceLock::new(),
@@ -787,6 +793,11 @@ impl AgentManager {
     /// Sessions a committed deletion removed, as the ids a client should drop.
     pub fn subscribe_session_removals(&self) -> broadcast::Receiver<Vec<VibexSessionId>> {
         self.session_removals.subscribe()
+    }
+
+    /// Sessions whose running turn was explicitly interrupted.
+    pub fn subscribe_session_interrupts(&self) -> broadcast::Receiver<VibexSessionId> {
+        self.session_interrupts.subscribe()
     }
 
     pub fn subscribe_notifications(&self) -> broadcast::Receiver<AgentNotificationIntent> {
@@ -6059,6 +6070,7 @@ impl AgentManager {
                 for item in cancelled {
                     self.publish_timeline_item(item)?;
                 }
+                let _ = self.session_interrupts.send(session.id.clone());
                 return Ok(());
             }
         }
@@ -6085,6 +6097,7 @@ impl AgentManager {
                     for item in cancelled {
                         self.publish_timeline_item(item)?;
                     }
+                    let _ = self.session_interrupts.send(session.id.clone());
                     return Ok(());
                 }
                 return Err(error);
@@ -6106,6 +6119,7 @@ impl AgentManager {
                 capabilities,
             })
             .await?;
+        let _ = self.session_interrupts.send(session.id.clone());
         // The provider stopped, so any card it was parked on can no longer be
         // answered. Clearing the rows before the state settles is what stops
         // the unwinding turn from re-parking the session in `NeedsInput` from
@@ -11428,8 +11442,14 @@ mod tests {
             .await
             .unwrap();
 
+        let mut interrupts = manager.subscribe_session_interrupts();
         // The reader ignores the form and interrupts. The row must stop asking.
         manager.interrupt(&session.id).await.unwrap();
+        assert_eq!(
+            interrupts.try_recv().unwrap(),
+            session.id,
+            "an explicit interrupt must broadcast the session id for turn-scoped policies"
+        );
 
         let conn = manager.open_migrated().unwrap();
         assert_eq!(

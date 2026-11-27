@@ -181,6 +181,9 @@ fn map_desktop_event(event: DesktopEvent) -> BackendEvent {
         DesktopEvent::Timeline(event) => BackendEvent::Timeline(event),
         DesktopEvent::SessionUpdated(session) => BackendEvent::SessionUpdated(session),
         DesktopEvent::SessionsRemoved(session_ids) => BackendEvent::SessionsRemoved(session_ids),
+        DesktopEvent::SessionInterrupted(session_id) => {
+            BackendEvent::SessionInterrupted(session_id)
+        }
         DesktopEvent::Runtime(event) => BackendEvent::Runtime(event),
         DesktopEvent::RuntimeSelection(event) => BackendEvent::RuntimeSelection(event),
         DesktopEvent::ProviderConfigChanged(_) => {

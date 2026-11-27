@@ -3824,3 +3824,102 @@ async fn picking_a_collaborator_lands_the_caret_on_its_chip(cx: &mut TestAppCont
         });
     });
 }
+
+/// Stopping a running turn from a remote client pauses only that stopped turn's
+/// auto-continue on Desktop, matching Desktop's own Stop button.
+#[gpui::test]
+fn remote_interrupt_event_pauses_next_auto_continue_without_disabling_session(
+    cx: &mut TestAppContext,
+) {
+    let (workbench, cx, _) = fixture(cx, 1);
+    let session_id = session(0).id.clone();
+
+    assert_eq!(
+        map_backend_event(BackendEvent::SessionInterrupted(session_id.clone())),
+        Some(DesktopEvent::SessionInterrupted(session_id.clone())),
+        "native backend interrupt events must reach Desktop's event loop"
+    );
+
+    cx.update(|_, cx| {
+        workbench.update(cx, |workbench, cx| {
+            workbench.set_auto_continue_enabled(session_id.clone(), true, cx);
+
+            let mut running = session(0);
+            running.state = AgentSessionState::Running;
+            running.updated_at_ms = 50;
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(running), cx);
+
+            // Simulate a remote (mobile) client interrupting the running turn.
+            workbench.apply_desktop_event(DesktopEvent::SessionInterrupted(session_id.clone()), cx);
+            assert!(
+                workbench
+                    .auto_continue_paused_turn_session_ids
+                    .contains(session_id.as_str()),
+                "remote interrupt must hold back auto-continue for the stopped turn"
+            );
+            assert!(
+                !workbench
+                    .auto_continue_paused_session_ids
+                    .contains(session_id.as_str()),
+                "remote interrupt must not create a persisted session pause"
+            );
+            assert!(
+                workbench.auto_continue_enabled(&session_id),
+                "remote interrupt must leave the session's auto-continue setting enabled"
+            );
+
+            // When the stopped turn settles to Idle without ending normally,
+            // Desktop must NOT start an auto-continue countdown.
+            let mut settled = session(0);
+            settled.state = AgentSessionState::Idle;
+            settled.updated_at_ms = 70;
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(settled), cx);
+            workbench.cache_auto_continue_turn_status(&session_id, 70, Some(false), cx);
+            workbench.sync_auto_continue_for_session(&session_id, cx);
+            assert!(
+                workbench
+                    .auto_continue_remaining_seconds(&session_id)
+                    .is_none(),
+                "stopped turn must not trigger auto-continue after settling"
+            );
+
+            // Even if SessionUpdated(Idle) raced ahead and armed a countdown
+            // before SessionInterrupted arrived, SessionInterrupted cancels it.
+            workbench
+                .auto_continue_paused_turn_session_ids
+                .remove(session_id.as_str());
+            workbench.sync_auto_continue_for_session(&session_id, cx);
+            assert!(
+                workbench
+                    .auto_continue_remaining_seconds(&session_id)
+                    .is_some(),
+                "without the turn-scoped pause, an abnormally settled turn arms the countdown"
+            );
+            let dirty = workbench
+                .apply_desktop_event(DesktopEvent::SessionInterrupted(session_id.clone()), cx);
+            assert!(
+                dirty,
+                "cancelling an active countdown must mark the shell dirty"
+            );
+            assert!(
+                workbench
+                    .auto_continue_remaining_seconds(&session_id)
+                    .is_none(),
+                "a late SessionInterrupted must cancel the raced countdown"
+            );
+
+            // Once a new turn starts (Idle -> Running), the turn-scoped pause
+            // clears so subsequent turns auto-continue normally again.
+            let mut next_running = session(0);
+            next_running.state = AgentSessionState::Running;
+            next_running.updated_at_ms = 90;
+            workbench.apply_desktop_event(DesktopEvent::SessionUpdated(next_running), cx);
+            assert!(
+                !workbench
+                    .auto_continue_paused_turn_session_ids
+                    .contains(session_id.as_str()),
+                "starting a new turn must release the previous stop's turn-scoped pause"
+            );
+        });
+    });
+}

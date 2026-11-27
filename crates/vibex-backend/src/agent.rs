@@ -68,6 +68,8 @@ pub enum BackendEvent {
     /// A deletion deletes the row rather than updating it, so there is no
     /// snapshot to carry the change: the ids are the whole account of it.
     SessionsRemoved(Vec<vibex_core::VibexSessionId>),
+    /// A session whose running turn was explicitly interrupted.
+    SessionInterrupted(vibex_core::VibexSessionId),
     Notification(AgentNotificationIntent),
     Runtime(RuntimeSessionEvent),
     RuntimeSelection(AgentSessionRuntimeSelectionEvent),

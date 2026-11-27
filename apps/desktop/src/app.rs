@@ -6220,6 +6220,9 @@ fn map_backend_event(event: BackendEvent) -> Option<DesktopEvent> {
         BackendEvent::SessionsRemoved(session_ids) => {
             Some(DesktopEvent::SessionsRemoved(session_ids))
         }
+        BackendEvent::SessionInterrupted(session_id) => {
+            Some(DesktopEvent::SessionInterrupted(session_id))
+        }
         BackendEvent::Runtime(event) => Some(DesktopEvent::Runtime(event)),
         BackendEvent::RuntimeSelection(event) => Some(DesktopEvent::RuntimeSelection(event)),
         BackendEvent::ModelGateway(event) => Some(DesktopEvent::ModelGateway(event)),
@@ -34257,6 +34260,17 @@ impl VibexWorkbench {
                 self.queue_ui_state();
                 self.load_agent_overview(cx);
                 true
+            }
+            DesktopEvent::SessionInterrupted(session_id) => {
+                // Any client (mobile, TUI, IM, or desktop) stopping a running
+                // turn pauses only the continuation that would follow that
+                // stopped turn, leaving the session's auto-continue preference
+                // intact for subsequent turns.
+                let had_countdown = self
+                    .auto_continue_countdowns
+                    .contains_key(session_id.as_str());
+                self.pause_next_auto_continue(&session_id);
+                had_countdown
             }
             DesktopEvent::Runtime(event) => {
                 let changed = self
