@@ -47,3 +47,4 @@ pub mod motion;
 pub mod screens;
 pub mod theme;
 pub mod ui;
+pub mod update;

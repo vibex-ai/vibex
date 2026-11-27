@@ -20,6 +20,7 @@ use nsh_core::{element::ImageSrc, prelude::*};
 use crate::{
     copy, theme,
     ui::{action, brand, field},
+    update,
 };
 
 /// The page's top padding above the wordmark.
@@ -491,13 +492,20 @@ pub fn pairing(host: PairingHost) -> impl IntoElement {
                     let busy = host.busy;
                     move || {
                         let open_settings = open_settings.clone();
-                        action::floating_icon(
-                            icon(include_str!("../../assets/icons/settings.svg")),
-                            copy::text("Settings", "设置", "設定"),
-                            move || open_settings.as_ref()(),
-                        )
-                        .disabled(move || busy.get())
-                        .disabled_style(|style| style.opacity(0.4))
+                        view()
+                            .flex_row()
+                            .items_center()
+                            .gap(px(theme::SPACING_SM))
+                            .child(update::floating_button())
+                            .child(
+                                action::floating_icon(
+                                    icon(include_str!("../../assets/icons/settings.svg")),
+                                    copy::text("Settings", "设置", "設定"),
+                                    move || open_settings.as_ref()(),
+                                )
+                                .disabled(move || busy.get())
+                                .disabled_style(|style| style.opacity(0.4)),
+                            )
                     }
                 })),
         )

@@ -135,6 +135,7 @@ pub fn App() -> impl IntoElement {
     let settings = SettingsState::new(&data);
     settings.apply();
     register_terminal_fonts();
+    vibex_mobile_ui::update::watch();
 
     let connected = pairing.connected();
     let switcher = pairing.switcher();
@@ -479,6 +480,9 @@ fn start_host_poller(services: Signal<Option<Rc<SessionService>>>) {
                 && let Some(service) = services.get_untracked()
             {
                 service.open_new_session();
+            }
+            if let Some(url) = vibex_mobile_ui::update::take_install() {
+                host::request_update_install(&url);
             }
         }
     });

@@ -11,6 +11,9 @@ description = "The Native Shell (nsh) UI layer of the Vibex mobile client."
 alacritty_terminal.workspace = true
 nsh-core.workspace = true
 nsh-base.workspace = true
+semver.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 unicode-segmentation.workspace = true
 unicode-width.workspace = true
 vibex-brands = { path = "../vibex-brands" }

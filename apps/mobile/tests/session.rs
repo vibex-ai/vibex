@@ -4313,3 +4313,64 @@ fn opening_runtime_switcher_from_left_pane_keeps_left_pane_open() {
         "sessions pane must stay open when entering runtime switcher: before {before:?}, after {after:?}"
     );
 }
+
+#[component]
+fn UpdateShell() -> impl IntoElement {
+    let installed = signal(None::<SharedString>);
+    vibex_mobile_ui::update::status().set(vibex_mobile_ui::update::Availability::Available {
+        version: "9.9.9".to_owned(),
+        download: Some("https://example.com/vibex-9.9.9.apk".to_owned()),
+    });
+    spawn(async move {
+        loop {
+            timer(std::time::Duration::from_millis(20)).await;
+            if let Some(url) = vibex_mobile_ui::update::take_install() {
+                installed.set(Some(url.into()));
+                break;
+            }
+        }
+    });
+    on_back_press(session::handle_back);
+    view()
+        .size_full()
+        .child(session::session(host_with(None, None)))
+        .child(when(
+            move || installed.get().is_some(),
+            move || text(move || installed.get().unwrap_or_default()),
+        ))
+}
+
+#[test]
+fn update_button_sits_left_of_settings_in_drawer_footer_and_queues_install() {
+    let config = EngineConfig::new(Root::of::<UpdateShell>());
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Sessions]").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("role:button[Install update]").unwrap();
+
+    let update_bounds = app
+        .screen()
+        .layout("id:sessions-page >> role:button[Install update]")
+        .unwrap()
+        .expect("update button in drawer footer")
+        .bounds;
+    let settings_bounds = app
+        .screen()
+        .layout("id:sessions-page >> role:button[Settings]")
+        .unwrap()
+        .expect("settings button in drawer footer")
+        .bounds;
+    assert!(
+        update_bounds.origin.x.0 + update_bounds.size.width.0 <= settings_bounds.origin.x.0,
+        "drawer update button must sit to the left of Settings: update={update_bounds:?}, settings={settings_bounds:?}"
+    );
+    assert!(
+        (update_bounds.origin.y.0 - settings_bounds.origin.y.0).abs() < 1.0,
+        "drawer update button must align vertically with Settings: update={update_bounds:?}, settings={settings_bounds:?}"
+    );
+
+    app.press("id:sessions-page >> role:button[Install update]")
+        .unwrap();
+    app.wait_for("text:https://example.com/vibex-9.9.9.apk")
+        .unwrap();
+}

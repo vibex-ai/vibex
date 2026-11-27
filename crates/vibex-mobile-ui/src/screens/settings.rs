@@ -11,7 +11,7 @@ use std::rc::Rc;
 use nsh_base::button;
 use nsh_core::{element::ImageSrc, platform::Appearance, prelude::*};
 
-use crate::{copy, theme, ui::action};
+use crate::{copy, theme, ui::action, update};
 
 /// The page the settings centre is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -864,13 +864,6 @@ fn device_page(host: SettingsHost) -> impl IntoElement {
 }
 
 fn about_page(host: SettingsHost) -> impl IntoElement {
-    let update_status = signal(None::<SharedString>);
-    let update_url = signal(None::<String>);
-    let on_check = {
-        let status = update_status;
-        let url = update_url;
-        move || check_for_updates(status, url)
-    };
     let on_install = host.on_install_update.clone();
     view()
         .w_full()
@@ -954,13 +947,13 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
             nav_row(
                 copy::text("Check for updates", "检查更新", "檢查更新"),
                 icon(include_str!("../../assets/icons/refresh.svg")),
-                on_check,
+                update::refresh,
             )
             .into_element(),
             when(
-                move || update_status.get().is_some(),
+                move || !matches!(update::status().get(), update::Availability::Unknown),
                 move || {
-                    text(move || update_status.get().unwrap_or_default())
+                    text(update::message)
                         .w_full()
                         .px(px(theme::SPACING_LG))
                         .pb(px(theme::SPACING_MD))
@@ -969,7 +962,7 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                 },
             )
             .into_element(),
-            when(move || update_url.get().is_some(), {
+            when(update::available, {
                 let on_install = on_install.clone();
                 move || {
                     let on_install = on_install.clone();
@@ -980,10 +973,12 @@ fn about_page(host: SettingsHost) -> impl IntoElement {
                         .child(
                             action::primary(
                                 copy::text("Install update", "安装更新", "安裝更新"),
-                                icon(include_str!("../../assets/icons/check.svg")),
+                                icon(include_str!("../../assets/icons/arrow-up.svg")),
                                 move || {
-                                    if let Some(url) = update_url.get_untracked() {
+                                    if let Some(url) = update::download() {
                                         on_install(&url);
+                                    } else {
+                                        update::install();
                                     }
                                 },
                             )
@@ -1644,56 +1639,6 @@ fn previous_font_scale_percent(current: u32) -> u32 {
         Some(0) | None => steps[steps.len() - 1],
         Some(index) => steps[index - 1],
     }
-}
-
-fn check_for_updates(status: Signal<Option<SharedString>>, url: Signal<Option<String>>) {
-    url.set(None);
-    status.set(Some(copy::text("Checking…", "检查中…", "檢查中…").into()));
-    spawn(async move {
-        let result =
-            nsh_core::element::fetch("https://api.github.com/repos/peatboy/vibex/releases/latest")
-                .await;
-        let message = match result {
-            Ok(response) if response.ok() => {
-                let body = response.text();
-                let tag = body
-                    .split("\"tag_name\"")
-                    .nth(1)
-                    .and_then(|rest| rest.split('"').nth(1))
-                    .map(str::to_owned);
-                let download = body
-                    .match_indices("\"browser_download_url\"")
-                    .filter_map(|(index, _)| {
-                        let rest = &body[index + 22..];
-                        let value = rest.split('"').nth(1)?;
-                        value.ends_with(".apk").then(|| value.to_owned())
-                    })
-                    .next();
-                url.set(download);
-                match tag {
-                    Some(tag) => {
-                        let tag = tag.trim_start_matches('v');
-                        if tag == env!("CARGO_PKG_VERSION") {
-                            copy::text("Up to date", "已是最新版本", "已是最新版本").to_owned()
-                        } else {
-                            format!(
-                                "{} {tag}",
-                                copy::text("Available:", "可更新到：", "可更新至：")
-                            )
-                        }
-                    }
-                    None => copy::text("No release information", "没有发布信息", "沒有發佈資訊")
-                        .to_owned(),
-                }
-            }
-            Ok(_) => copy::text("Update check failed", "检查更新失败", "檢查更新失敗").to_owned(),
-            Err(error) => format!(
-                "{}: {error}",
-                copy::text("Update check failed", "检查更新失败", "檢查更新失敗")
-            ),
-        };
-        status.set(Some(message.into()));
-    });
 }
 
 fn open_url(url: &'static str) {

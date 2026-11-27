@@ -7,6 +7,7 @@
 
 use std::path::Path;
 
+use nsh_core::prelude::*;
 use nsh_engine::{EngineConfig, Root};
 use nsh_testing::Headless;
 use tempfile::TempDir;
@@ -241,4 +242,106 @@ fn removing_the_only_saved_runtime_in_switcher_returns_to_initial_pairing_page()
         app.screen().layout("role:button[Back]").unwrap().is_none(),
         "initial pairing page must not show a switcher Back button"
     );
+}
+
+#[component]
+fn PairingWithUpdate() -> impl IntoElement {
+    let installed = signal(None::<SharedString>);
+    vibex_mobile_ui::update::status().set(vibex_mobile_ui::update::Availability::Available {
+        version: "9.9.9".to_owned(),
+        download: Some("https://example.com/vibex-9.9.9.apk".to_owned()),
+    });
+    spawn(async move {
+        loop {
+            timer(std::time::Duration::from_millis(20)).await;
+            if let Some(url) = vibex_mobile_ui::update::take_install() {
+                installed.set(Some(url.into()));
+                break;
+            }
+        }
+    });
+    type PairFn = std::rc::Rc<dyn Fn(&str, &str)>;
+    let noop: std::rc::Rc<dyn Fn()> = std::rc::Rc::new(|| {});
+    let noop_pick: std::rc::Rc<dyn Fn(&str)> = std::rc::Rc::new(|_| {});
+    let noop_pair: PairFn = std::rc::Rc::new(|_, _| {});
+    let host = vibex_mobile_ui::screens::pairing::PairingHost {
+        saved: signal(Vec::new()),
+        nearby: signal(Vec::new()),
+        nearby_phase: signal(vibex_mobile_ui::screens::pairing::NearbyPhase::Searching),
+        on_stop_nearby: noop.clone(),
+        on_retry_nearby: noop.clone(),
+        busy: signal(false),
+        error: signal(None),
+        on_scan: noop.clone(),
+        on_connect: noop_pair.clone(),
+        on_paste: std::rc::Rc::new(|_| {}),
+        on_find: noop.clone(),
+        on_pick_saved: noop_pick.clone(),
+        on_pick_route: noop_pair.clone(),
+        actions_id: signal(None),
+        dialog_id: signal(None),
+        rename_open: signal(false),
+        remove_open: signal(false),
+        on_show_actions: noop_pick.clone(),
+        on_close_actions: noop.clone(),
+        on_open_rename: noop_pick.clone(),
+        on_close_rename: noop.clone(),
+        on_open_remove: noop_pick.clone(),
+        on_close_remove: noop.clone(),
+        on_show_details: noop_pick.clone(),
+        on_remove_saved: noop_pick.clone(),
+        on_rename_saved: noop_pair,
+        rename_draft: signal(String::new()),
+        switcher: signal(false),
+        on_close_switcher: noop.clone(),
+        connected_label: signal(None),
+        active_id: signal(None),
+        on_disconnect: noop.clone(),
+        on_clear_runtimes: noop.clone(),
+        details: signal(None),
+        on_close_details: noop.clone(),
+        on_pick_nearby: noop_pick,
+        on_open_settings: noop.clone(),
+        on_open_platform_settings: noop,
+    };
+    view()
+        .size_full()
+        .child(vibex_mobile_ui::screens::pairing::pairing(host))
+        .child(when(
+            move || installed.get().is_some(),
+            move || text(move || installed.get().unwrap_or_default()),
+        ))
+}
+
+#[test]
+fn update_button_sits_left_of_settings_on_pairing_page_and_queues_install() {
+    let config = EngineConfig::new(Root::of::<PairingWithUpdate>());
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("ibex").unwrap();
+    app.wait_for("role:button[Install update]").unwrap();
+
+    let update_bounds = app
+        .screen()
+        .layout("role:button[Install update]")
+        .unwrap()
+        .expect("update button on pairing page")
+        .bounds;
+    let settings_bounds = app
+        .screen()
+        .layout("role:button[Settings]")
+        .unwrap()
+        .expect("settings button on pairing page")
+        .bounds;
+    assert!(
+        update_bounds.origin.x.0 + update_bounds.size.width.0 <= settings_bounds.origin.x.0,
+        "update button must sit to the left of Settings: update={update_bounds:?}, settings={settings_bounds:?}"
+    );
+    assert!(
+        (update_bounds.origin.y.0 - settings_bounds.origin.y.0).abs() < 1.0,
+        "update button must align vertically with Settings: update={update_bounds:?}, settings={settings_bounds:?}"
+    );
+
+    app.press("role:button[Install update]").unwrap();
+    app.wait_for("text:https://example.com/vibex-9.9.9.apk")
+        .unwrap();
 }

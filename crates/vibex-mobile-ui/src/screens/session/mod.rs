@@ -36,6 +36,7 @@ use crate::{
         menu::{self, Menu, MenuEntry, MenuSide},
         surface,
     },
+    update,
 };
 
 mod find;
@@ -8449,6 +8450,9 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                     .text_color(theme::sidebar_text_secondary),
                                 ),
                         )
+                        // The update trigger, shown only when a newer release is
+                        // known, directly to the left of Settings.
+                        .child(update::drawer_button())
                         // The way into settings, as the round block the
                         // page's own controls wear: the icon alone.
                         .child(
