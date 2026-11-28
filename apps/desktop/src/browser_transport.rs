@@ -152,6 +152,12 @@ pub trait BrowserTransport: Send + Sync + 'static {
         false
     }
 
+    /// Whether this transport delivers live browser frames and accepts
+    /// interactive toolbar/viewport commands.
+    fn supports_live_panel(&self) -> bool {
+        true
+    }
+
     fn list_sessions(&self) -> BrowserTransportFuture<'_, Vec<BrowserSession>>;
 
     fn session_snapshot(
@@ -789,6 +795,10 @@ impl BrowserTransport for RemoteBrowserTransport {
         self
     }
 
+    fn supports_live_panel(&self) -> bool {
+        false
+    }
+
     fn availability(&self) -> BrowserTransportFuture<'_, BrowserAvailability> {
         Box::pin(async move {
             Ok(BrowserAvailability::unavailable(
@@ -915,7 +925,7 @@ impl BrowserTransport for RemoteBrowserTransport {
         Box::pin(async {
             Err(BrowserTransportError::new(
                 "remote_browser_unavailable",
-                "The paired runtime is remote; element-to-source mapping needs the live panel                  transport, which is not implemented yet.",
+                "The paired runtime is remote; element-to-source mapping needs the live panel transport, which is not implemented yet.",
             ))
         })
     }

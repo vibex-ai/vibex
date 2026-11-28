@@ -6320,6 +6320,8 @@ enum RuntimeUiSignal {
     /// the transport keeps retrying, so the drain loop stays alive and the UI
     /// only shows a reconnect note.
     RemoteReconnecting,
+    /// The remote event stream resumed delivering live events after a drop.
+    RemoteReconnected,
     /// The runtime this shell drives published a new name.
     RuntimeRenamed(String),
     /// The authority invalidated the sidebar projection a remote client draws.
@@ -15195,6 +15197,23 @@ impl VibexWorkbench {
         let (Some(runtime), Some(tokio)) =
             (self.computer_runtime.clone(), self.computer_tokio.clone())
         else {
+            if self.remote_client.is_some()
+                && let Some(handle) = self.window_handle
+            {
+                let message = locale::text(
+                    "Computer use is unavailable while connected to a remote runtime.",
+                    "连接远程运行时时无法使用电脑操作面板。",
+                    "連接遠端執行階段時無法使用電腦操作面板。",
+                )
+                .to_string();
+                let _ = handle.update(cx, |_, window, cx| {
+                    hint_layer::push(
+                        window,
+                        hint_notification(NotificationType::Info, message.clone()),
+                        cx,
+                    );
+                });
+            }
             return;
         };
         let existing = self.computer_panel_window.take();
@@ -19586,7 +19605,10 @@ impl VibexWorkbench {
         // it instead of waiting for frames that never arrive.
         let remote_browser_transport =
             crate::code_workbench::remote_browser_surface_transport(facade.browser().clone());
+        self.new_session_workspace
+            .clear(RequestId::new().to_string(), PathBuf::new());
         self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_local_authority(false, cx);
             workbench.set_backend(facade.clone(), cx);
             workbench.set_terminal_transport(Some(remote_terminal_transport), cx);
             workbench.set_browser_transport(
@@ -20601,6 +20623,7 @@ impl VibexWorkbench {
             .update(cx, |usage, cx| usage.set_backend(facade.clone(), cx));
         let terminal_manager = runtime.terminals().manager();
         self.code_workbench.update(cx, |workbench, cx| {
+            workbench.set_local_authority(true, cx);
             workbench.set_backend(facade.clone(), cx);
             // A local authority renders terminals from its in-process manager;
             // a remote authority serves the same surface from Remote v2.
@@ -20610,12 +20633,6 @@ impl VibexWorkbench {
                 )),
                 cx,
             );
-            // The computer panel renders the desktop of this machine. It is a
-            // local-only authority: a paired client cannot see these frames
-            // yet, which the panel says out loud rather than showing an empty
-            // stage.
-            self.computer_runtime = Some(runtime.computer());
-            self.computer_tokio = Some(gpui_tokio::Tokio::handle(cx));
             // The browser panel renders frames the runtime encodes; the local
             // authority serves them from the in-process service. The panel
             // polls that service from GPUI's executor, so the transport needs
@@ -20773,6 +20790,7 @@ impl VibexWorkbench {
             .update(cx, |management, cx| management.clear_runtime(cx));
         self.usage_view
             .update(cx, |usage, cx| usage.clear_backend(cx));
+        self.reset_authority_state(cx);
     }
 
     /// The embedded runtime, but only while it is the authority on screen.
@@ -20796,8 +20814,17 @@ impl VibexWorkbench {
     fn activate_local_runtime(&mut self, cx: &mut Context<Self>) {
         if self.remote_client.take().is_some() {
             self.event_task = None;
+            self.agent_poll_task = None;
+            self.runtime_heartbeat_task = None;
+            self.agent_load_task = None;
+            self.agent_projection_task = None;
+            self.code_workbench
+                .update(cx, |workbench, cx| workbench.clear_backend(cx));
             self.management_view
                 .update(cx, |management, cx| management.clear_runtime(cx));
+            self.usage_view
+                .update(cx, |usage, cx| usage.clear_backend(cx));
+            self.reset_authority_state(cx);
         }
         self.activate_sidebar_authority(SidebarUiState::LOCAL_AUTHORITY, cx);
         self.mark_runtime_active(LOCAL_RUNTIME_ID, cx);
@@ -20805,6 +20832,77 @@ impl VibexWorkbench {
             Some(runtime) => self.install_local_runtime(runtime, cx),
             None => self.boot_local_runtime(cx),
         }
+    }
+
+    /// Clears authority-scoped UI caches so switching between local and remote
+    /// runtimes never mixes sessions, workspaces, catalogs, or local-only
+    /// computer state across authorities.
+    fn reset_authority_state(&mut self, cx: &mut Context<Self>) {
+        self.computer_runtime = None;
+        self.computer_tokio = None;
+        if let Some(handle) = self.computer_panel_window.take() {
+            let _ = handle.update(cx, |_, window, _| window.remove_window());
+        }
+        self.computer_panel_open_mode = None;
+        self.sessions.clear();
+        self.workspaces.clear();
+        self.sessions_loaded = false;
+        self.selected_session_id = None;
+        self.pending_new_session = None;
+        self.new_session_eligibility_error = None;
+        self.new_session_workspace.clear(
+            RequestId::new().to_string(),
+            if self.remote_client.is_some() {
+                PathBuf::new()
+            } else {
+                self.config
+                    .as_ref()
+                    .map(|config| config.home_dir.clone())
+                    .unwrap_or_default()
+            },
+        );
+        self.workspace_contexts.clear();
+        self.runtime_catalog = None;
+        self.runtime_cascade_projection.clear();
+        self.runtime_provider_profiles.clear();
+        self.optimistic_runtime_selections.clear();
+        self.deleted_session_ids.clear();
+        self.optimistically_removed_session_ids.clear();
+        self.optimistically_archived_session_ids.clear();
+        self.pending_session_deletion_ids.clear();
+        self.pending_session_archive_ids.clear();
+        self.pending_session_restore_ids.clear();
+        self.archived_sessions = None;
+        self.archived_sessions_loading = false;
+        self.archived_sessions_error = None;
+        self.pending_agent_turn_session_ids.clear();
+        self.pending_agent_turn_revisions.clear();
+        self.unread_agent_completion_session_ids.clear();
+        self.unread_completion_watermarks.clear();
+        self.pending_user_request_ids.clear();
+        self.notified_timeline_sequences.clear();
+        self.optimistic_user_messages.clear();
+        self.turn_stall_watches.clear();
+        self.session_views.clear();
+        self.session_view_lru.clear();
+        self.view_session_id = None;
+        let composer_input = self.view.composer_input.clone();
+        let mut fresh_view = SessionView::new(self.ui_state.session.content_width);
+        fresh_view.composer_input = composer_input;
+        self.view = fresh_view;
+        self.session_terminal_surfaces.clear();
+        self.active_session_terminal_ids.clear();
+        self.session_terminal_view = None;
+        self.session_terminal_error = None;
+        self.session_group_pane_views.clear();
+        self.composer_views.clear();
+        self.timeline_surface_views.clear();
+        self.child_agent_timelines.clear();
+        self.child_agent_tabs.clear();
+        self.child_agent_active_tab = None;
+        self.agent_snapshots.clear();
+        self.sidebar_projection_cache = None;
+        self.sidebar_projection_revision = self.sidebar_projection_revision.wrapping_add(1);
     }
 
     /// The single entry point for changing the authoritative runtime. Every
@@ -22502,76 +22600,98 @@ impl VibexWorkbench {
                 let _ = signal_tx.send(RuntimeUiSignal::RemoteReconnecting).await;
                 return;
             };
+            let mut disconnected = false;
             loop {
                 match subscription.next().await {
                     Ok(Some(BackendEvent::Disconnected)) => {
-                        if signal_tx
-                            .send(RuntimeUiSignal::RemoteReconnecting)
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(Some(BackendEvent::Notification(_))) => {
-                        // Desktop notifications surface from the authoritative
-                        // timeline events; no separate push intent is needed.
-                    }
-                    Ok(Some(BackendEvent::RuntimeRenamed(renamed))) => {
-                        // The authority published a new name for the runtime
-                        // this shell is driving, so the runtime list follows it
-                        // without a reconnect.
-                        if signal_tx
-                            .send(RuntimeUiSignal::RuntimeRenamed(renamed.display_name))
-                            .await
-                            .is_err()
-                        {
-                            return;
-                        }
-                    }
-                    Ok(Some(BackendEvent::DeviceRenamed(_))) => {
-                        // A device rename names the device, not the runtime.
-                        // This shell's own device name is not a runtime-list
-                        // fact, so there is nothing to re-render here.
-                    }
-                    Ok(Some(event)) => {
-                        // A remote authority announces a session another client
-                        // created as a sidebar invalidation, never as a session
-                        // snapshot. This shell is a remote client when it drives
-                        // one, so the same news has to reload the list it draws
-                        // — a notification raised from the timeline that follows
-                        // is not a row.
-                        if backend_event_invalidates_sidebar(&event)
-                            && signal_tx
-                                .send(RuntimeUiSignal::SidebarInvalidated)
+                        if !disconnected {
+                            disconnected = true;
+                            if signal_tx
+                                .send(RuntimeUiSignal::RemoteReconnecting)
                                 .await
                                 .is_err()
-                        {
-                            return;
+                            {
+                                return;
+                            }
                         }
-                        let Some(desktop_event) = map_backend_event(event) else {
-                            continue;
-                        };
-                        if !agent_streaming_surface_visible.load(Ordering::Acquire)
-                            && matches!(&desktop_event, DesktopEvent::Timeline(event) if timeline_live_event_is_streaming_only(event))
-                        {
-                            continue;
+                        tokio::time::sleep(REMOTE_EVENT_RETRY_DELAY).await;
+                    }
+                    Ok(Some(event)) => {
+                        if disconnected {
+                            disconnected = false;
+                            if signal_tx
+                                .send(RuntimeUiSignal::RemoteReconnected)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
-                        if signal_tx
-                            .send(RuntimeUiSignal::Event(Box::new(desktop_event)))
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        match event {
+                            BackendEvent::Notification(_) => {
+                                // Desktop notifications surface from the authoritative
+                                // timeline events; no separate push intent is needed.
+                            }
+                            BackendEvent::RuntimeRenamed(renamed) => {
+                                // The authority published a new name for the runtime
+                                // this shell is driving, so the runtime list follows it
+                                // without a reconnect.
+                                if signal_tx
+                                    .send(RuntimeUiSignal::RuntimeRenamed(renamed.display_name))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
+                            BackendEvent::DeviceRenamed(_) => {
+                                // A device rename names the device, not the runtime.
+                                // This shell's own device name is not a runtime-list
+                                // fact, so there is nothing to re-render here.
+                            }
+                            event => {
+                                // A remote authority announces a session another client
+                                // created as a sidebar invalidation, never as a session
+                                // snapshot. This shell is a remote client when it drives
+                                // one, so the same news has to reload the list it draws
+                                // — a notification raised from the timeline that follows
+                                // is not a row.
+                                if backend_event_invalidates_sidebar(&event)
+                                    && signal_tx
+                                        .send(RuntimeUiSignal::SidebarInvalidated)
+                                        .await
+                                        .is_err()
+                                {
+                                    return;
+                                }
+                                let Some(desktop_event) = map_backend_event(event) else {
+                                    continue;
+                                };
+                                if !agent_streaming_surface_visible.load(Ordering::Acquire)
+                                    && matches!(&desktop_event, DesktopEvent::Timeline(event) if timeline_live_event_is_streaming_only(event))
+                                {
+                                    continue;
+                                }
+                                if signal_tx
+                                    .send(RuntimeUiSignal::Event(Box::new(desktop_event)))
+                                    .await
+                                    .is_err()
+                                {
+                                    return;
+                                }
+                            }
                         }
                     }
                     Ok(None) | Err(_) => {
-                        if signal_tx
-                            .send(RuntimeUiSignal::RemoteReconnecting)
-                            .await
-                            .is_err()
-                        {
-                            return;
+                        if !disconnected {
+                            disconnected = true;
+                            if signal_tx
+                                .send(RuntimeUiSignal::RemoteReconnecting)
+                                .await
+                                .is_err()
+                            {
+                                return;
+                            }
                         }
                         tokio::time::sleep(REMOTE_EVENT_RETRY_DELAY).await;
                     }
@@ -22703,8 +22823,36 @@ impl VibexWorkbench {
                             ),
                         );
                     }
-                    self.runtime_note =
-                        Some("Remote runtime connection lost; reconnecting…".to_string());
+                    self.runtime_note = Some(
+                        locale::text(
+                            "Remote runtime connection lost; reconnecting…",
+                            "远程运行时连接已断开，正在重连…",
+                            "遠端執行階段連線已中斷，正在重新連線…",
+                        )
+                        .to_string(),
+                    );
+                    self.sync_connections_live_status(cx);
+                    repaint.merge(RuntimeUiRepaint::shell());
+                }
+                RuntimeUiSignal::RemoteReconnected => {
+                    if !timeline_events.is_empty() {
+                        repaint.merge(
+                            self.apply_live_timeline_batch(
+                                std::mem::take(&mut timeline_events),
+                                cx,
+                            ),
+                        );
+                    }
+                    self.runtime_note = Some(
+                        locale::text(
+                            "Driving a remote runtime",
+                            "正在驱动远程运行时",
+                            "正在驅動遠端執行階段",
+                        )
+                        .to_string(),
+                    );
+                    self.sync_connections_live_status(cx);
+                    self.load_agent_overview(cx);
                     repaint.merge(RuntimeUiRepaint::shell());
                 }
                 RuntimeUiSignal::RuntimeRenamed(display_name) => {
@@ -42891,6 +43039,21 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        if self.remote_client.is_some() {
+            hint_layer::push(
+                window,
+                hint_notification(
+                    NotificationType::Info,
+                    locale::text(
+                        "Importing local CLI history is only available when connected to the local runtime.",
+                        "仅在连接本机运行时时支持导入本地历史会话。",
+                        "僅在連接本機執行階段時支援匯入本機歷史工作階段。",
+                    ),
+                ),
+                cx,
+            );
+            return;
+        }
         if window.has_active_dialog(cx) {
             return;
         }
@@ -42899,7 +43062,7 @@ impl VibexWorkbench {
         let workbench = cx.weak_entity();
         let dialog_view: Entity<LocalHistoryImportDialog> = cx.new(|cx| {
             LocalHistoryImportDialog::new(
-                self.runtime.clone(),
+                self.local_authority(),
                 workbench.clone(),
                 focus_workspace.clone(),
                 initial_search.clone(),
@@ -50744,7 +50907,7 @@ impl VibexWorkbench {
         });
 
         if self.ui_state.workbench.active_tab == "management" {
-            if let Some(runtime) = self.runtime.clone() {
+            if let Some(runtime) = self.local_authority() {
                 self.management_view.update(cx, |management, cx| {
                     management.set_runtime(runtime.clone(), cx)
                 });
@@ -52105,7 +52268,7 @@ impl VibexWorkbench {
         self.ui_state.workbench.active_tab = "management".to_string();
         self.sync_agent_streaming_surface_visibility();
         self.queue_ui_state();
-        if let Some(runtime) = self.runtime.clone() {
+        if let Some(runtime) = self.local_authority() {
             self.management_view.update(cx, |management, cx| {
                 management.set_runtime(runtime.clone(), cx)
             });
@@ -52678,7 +52841,7 @@ impl VibexWorkbench {
     }
 
     fn sync_timeline_display_settings_to_runtime(&self) {
-        let Some(runtime) = self.runtime.as_ref() else {
+        let Some(runtime) = self.local_authority() else {
             return;
         };
         runtime.set_timeline_display_settings(AgentTimelineDisplaySettings {
@@ -53198,7 +53361,7 @@ impl VibexWorkbench {
             .agent_tools
             .set_enabled(&agent_id, tool, enabled);
         self.queue_ui_state();
-        if let Some(runtime) = self.runtime.clone() {
+        if let Some(runtime) = self.local_authority() {
             runtime
                 .agent()
                 .manager()
@@ -53492,7 +53655,7 @@ impl VibexWorkbench {
     /// and persist the answers.
     fn apply_agent_tool_preferences(&mut self, cx: &mut Context<Self>) {
         let preferences: AgentToolPreferences = self.ui_state.agent_tools.clone();
-        if let Some(runtime) = self.runtime.clone() {
+        if let Some(runtime) = self.local_authority() {
             runtime
                 .agent()
                 .manager()
@@ -54215,7 +54378,21 @@ impl VibexWorkbench {
     }
 
     fn open_pairing(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let Some(runtime) = self.runtime.clone() else {
+        let Some(runtime) = self.local_authority() else {
+            if self.remote_client.is_some() {
+                hint_layer::push(
+                    window,
+                    hint_notification(
+                        NotificationType::Info,
+                        locale::text(
+                            "Device pairing applies to this machine's local runtime. Switch to Local to pair.",
+                            "设备配对仅适用于本机运行时，请先切换到本机后再配对。",
+                            "裝置配對僅適用於本機執行階段，請先切換到本機後再配對。",
+                        ),
+                    ),
+                    cx,
+                );
+            }
             return;
         };
         open_remote_access_pairing(runtime, window, cx);

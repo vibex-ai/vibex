@@ -925,6 +925,9 @@ impl BrowserSurface {
         let (Some(transport), Some(tab_id)) = (self.transport.clone(), self.tab_id.clone()) else {
             return;
         };
+        if !transport.supports_live_panel() {
+            return;
+        }
         self.requested_viewport = Some(key);
         self.viewport_task = Some(cx.spawn(async move |this, cx| {
             cx.background_executor().timer(VIEWPORT_DEBOUNCE).await;
@@ -1947,6 +1950,9 @@ impl BrowserSurface {
 
     /// Opens the runtime's download directory in the system file manager.
     fn open_downloads_folder(&mut self, directory: std::path::PathBuf, cx: &mut Context<Self>) {
+        if self.local_browser().is_none() {
+            return;
+        }
         // The directory is created on demand: a reader whose every download was
         // refused has none yet, and asking to see it is asking for it to exist.
         let opened = std::fs::create_dir_all(&directory)
@@ -2307,9 +2313,13 @@ impl BrowserSurface {
 
     fn render_toolbar(&mut self, cx: &mut Context<Self>) -> AnyElement {
         // Chrome's three buttons: back and forward follow the tab's own history,
-        // reload is always available.
-        let can_go_back = self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
-        let can_go_forward = self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
+        // reload is available while a local interactive transport is attached.
+        let interactive = self
+            .transport
+            .as_ref()
+            .is_some_and(|transport| transport.supports_live_panel());
+        let can_go_back = interactive && self.tab.as_ref().is_some_and(|tab| tab.can_go_back);
+        let can_go_forward = interactive && self.tab.as_ref().is_some_and(|tab| tab.can_go_forward);
         h_flex()
             .id("browser-toolbar")
             .flex_none()
@@ -2345,20 +2355,23 @@ impl BrowserSurface {
                     .icon(Icon::new(IconName::RotateCw))
                     .ghost()
                     .xsmall()
+                    .disabled(!interactive)
                     .tooltip(locale::text("Reload", "重新加载", "重新載入"))
                     .on_click(cx.listener(|this, _, _, cx| this.reload(cx))),
             )
             .child(
-                div()
-                    .flex_1()
-                    .min_w_0()
-                    .child(Input::new(&self.address_input).small()),
+                div().flex_1().min_w_0().child(
+                    Input::new(&self.address_input)
+                        .small()
+                        .disabled(!interactive),
+                ),
             )
             .child(
                 Button::new("browser-activity")
                     .icon(Icon::new(IconName::LayoutDashboard))
                     .ghost()
                     .xsmall()
+                    .disabled(!interactive)
                     .tooltip(locale::text(
                         "Show what the Agent did in this tab",
                         "查看 Agent 在此标签页的操作记录",
@@ -2376,6 +2389,7 @@ impl BrowserSurface {
                     .label(if high { "HD" } else { "SD" })
                     .ghost()
                     .xsmall()
+                    .disabled(!interactive)
                     .toggled(high)
                     .tooltip(if high {
                         locale::text(

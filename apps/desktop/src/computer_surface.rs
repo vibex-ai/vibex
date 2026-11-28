@@ -71,6 +71,7 @@ pub enum ComputerSurfaceEvent {
 enum SurfacePhase {
     Connecting,
     Live,
+    Paused,
     Unavailable,
     Failed,
 }
@@ -92,6 +93,7 @@ pub struct ComputerSurface {
     /// to reach live.
     agent_session_id: Option<VibexSessionId>,
     session_id: Option<ComputerSessionId>,
+    watched_session_id: Option<ComputerSessionId>,
     session: Option<ComputerSession>,
     availability: Option<ComputerAvailability>,
     ledger: Vec<ComputerActionRecord>,
@@ -104,6 +106,7 @@ pub struct ComputerSurface {
     frame_task: Option<Task<()>>,
     heartbeat_task: Option<Task<()>>,
     refresh_task: Option<Task<()>>,
+    refresh_inflight_task: Option<Task<()>>,
     stopped_reason: Option<String>,
     _subscriptions: Vec<Subscription>,
 }
@@ -137,6 +140,7 @@ impl ComputerSurface {
             mode,
             agent_session_id,
             session_id: None,
+            watched_session_id: None,
             session: None,
             availability: None,
             ledger: Vec::new(),
@@ -147,6 +151,7 @@ impl ComputerSurface {
             frame_task: None,
             heartbeat_task: None,
             refresh_task: None,
+            refresh_inflight_task: None,
             stopped_reason: None,
             _subscriptions: Vec::new(),
         };
@@ -198,72 +203,116 @@ impl ComputerSurface {
         }));
     }
 
-    /// Reloads availability, the session and the ledger.
+    /// Reloads availability, the session and the ledger off the UI thread.
     pub fn refresh(&mut self, cx: &mut Context<Self>) {
-        let availability = self.run(self.runtime.availability());
-        // When this panel was raised for an Agent, the Agent's session is the
-        // one worth rendering: its ledger, its target and its state are what
-        // the reader came to see and what the stop has to reach. A panel the
-        // reader opened by hand keeps its own viewer session until an Agent
-        // starts driving, at which point showing that Agent beats an empty
-        // viewer.
-        //
-        // The pinned Agent is a preference, not a lock: a session that has gone
-        // away falls back to whichever Agent started last, so a panel left open
-        // across Agent sessions never keeps rendering a finished one.
-        let agent_session = self
-            .agent_session_id
-            .clone()
-            .and_then(|agent_session_id| {
-                self.run(self.runtime.session_for_agent(&agent_session_id))
-            })
-            .or_else(|| self.run(self.runtime.latest_agent_session()));
-        let (session_id, frames) = match agent_session {
-            Some(session_id) => {
-                let frames = self.run(self.runtime.subscribe_session_frames(&session_id));
-                (Some(session_id), Some(frames))
-            }
-            None => match self.run(
-                self.runtime
-                    .subscribe_frames(None, computer_tier_for_panel()),
-            ) {
-                Some(pair) => (Some(pair.0), Some(pair.1)),
-                None => (None, None),
-            },
-        };
-        self.session_id = session_id.clone();
-        if let Some(session_id) = &session_id {
-            let snapshot = self.run(self.runtime.service().session_snapshot(session_id));
-            if let Some(snapshot) = snapshot {
-                self.session = Some(snapshot.session);
-                self.ledger = snapshot.ledger;
-            }
-        }
-        let open = self
-            .session
-            .as_ref()
-            .map(|session| !session.state.accepts_actions())
-            .unwrap_or(false);
-        self.stopped_reason = self
-            .session
-            .as_ref()
-            .and_then(|session| session.paused_reason.clone());
-        self.availability = Some(availability.clone());
-        self.phase = if !availability.is_usable() {
-            SurfacePhase::Unavailable
-        } else if self.session.is_none() {
-            // Usable but unreachable: the endpoint exists and the session does
-            // not, which is a failure rather than a slow start.
-            SurfacePhase::Failed
-        } else if open {
-            SurfacePhase::Connecting
-        } else {
-            SurfacePhase::Live
-        };
-        if let Some(frames) = frames {
-            self.watch_frames(frames, cx);
-        }
-        cx.notify();
+        let runtime = self.runtime.clone();
+        let tokio = self.tokio.clone();
+        let agent_session_id = self.agent_session_id.clone();
+        let current_watched = self.watched_session_id.clone();
+        let has_frame_task = self.frame_task.is_some();
+        self.refresh_inflight_task = Some(cx.spawn(async move |this, cx| {
+            let outcome = tokio
+                .spawn(async move {
+                    let availability = runtime.availability().await;
+                    let agent_session = match agent_session_id {
+                        Some(agent_id) => match runtime.session_for_agent(&agent_id).await {
+                            Some(session_id) => Some(session_id),
+                            None => runtime.latest_agent_session().await,
+                        },
+                        None => runtime.latest_agent_session().await,
+                    };
+                    let (session_id, frames) = match agent_session {
+                        Some(session_id) => {
+                            let frames = if !has_frame_task
+                                || current_watched.as_ref() != Some(&session_id)
+                            {
+                                Some(runtime.subscribe_session_frames(&session_id).await)
+                            } else {
+                                None
+                            };
+                            (Some(session_id), frames)
+                        }
+                        None => {
+                            let reusable = match current_watched.as_ref() {
+                                Some(existing_id)
+                                    if has_frame_task
+                                        && runtime
+                                            .service()
+                                            .session_snapshot(existing_id)
+                                            .await
+                                            .is_some() =>
+                                {
+                                    Some(existing_id.clone())
+                                }
+                                _ => None,
+                            };
+                            if let Some(existing_id) = reusable {
+                                (Some(existing_id), None)
+                            } else {
+                                match runtime
+                                    .subscribe_frames(None, computer_tier_for_panel())
+                                    .await
+                                {
+                                    Some((id, rx)) => (Some(id), Some(rx)),
+                                    None => (None, None),
+                                }
+                            }
+                        }
+                    };
+                    let snapshot = match &session_id {
+                        Some(id) => runtime.service().session_snapshot(id).await,
+                        None => None,
+                    };
+                    (availability, session_id, frames, snapshot)
+                })
+                .await;
+            let Ok((availability, session_id, frames, snapshot)) = outcome else {
+                return;
+            };
+            let _ = this.update(cx, |surface, cx| {
+                surface.refresh_inflight_task = None;
+                surface.session_id = session_id.clone();
+                if let Some(snapshot) = snapshot {
+                    surface.session = Some(snapshot.session);
+                    surface.ledger = snapshot.ledger;
+                } else {
+                    surface.session = None;
+                    surface.ledger.clear();
+                    if session_id.is_none() {
+                        surface.watched_session_id = None;
+                        surface.frame_task = None;
+                    }
+                }
+                let paused_or_stopped = surface
+                    .session
+                    .as_ref()
+                    .map(|session| !session.state.accepts_actions())
+                    .unwrap_or(false);
+                surface.stopped_reason = surface
+                    .session
+                    .as_ref()
+                    .and_then(|session| session.paused_reason.clone());
+                surface.availability = Some(availability.clone());
+                surface.phase = if !availability.is_usable() {
+                    SurfacePhase::Unavailable
+                } else if surface.session.is_none() {
+                    // Usable but unreachable: the endpoint exists and the session does
+                    // not, which is a failure rather than a slow start.
+                    SurfacePhase::Failed
+                } else if paused_or_stopped {
+                    SurfacePhase::Paused
+                } else if surface.frame_image.is_some() {
+                    SurfacePhase::Live
+                } else {
+                    SurfacePhase::Connecting
+                };
+                if let Some(frames) = frames {
+                    surface.watched_session_id = session_id;
+                    surface.watch_frames(frames, cx);
+                }
+                cx.notify();
+            });
+        }));
     }
 
     fn watch_frames(
@@ -304,7 +353,9 @@ impl ComputerSurface {
             self.pending_drop.push(previous);
         }
         self.frame_image = Some(Arc::new(RenderImage::new(vec![Frame::new(decoded.image)])));
-        self.phase = SurfacePhase::Live;
+        if self.phase == SurfacePhase::Connecting {
+            self.phase = SurfacePhase::Live;
+        }
     }
 
     /// The emergency stop. One press reaches the terminal state.
@@ -645,6 +696,16 @@ impl ComputerSurface {
                     )
                     .to_string(),
                 ),
+                SurfacePhase::Paused => self.stopped_reason.clone().or_else(|| {
+                    Some(
+                        locale::text(
+                            "Computer use is paused or stopped.",
+                            "电脑操作已暂停或已停止。",
+                            "電腦操作已暫停或已停止。",
+                        )
+                        .to_string(),
+                    )
+                }),
                 _ => None,
             })
             .unwrap_or_else(|| {

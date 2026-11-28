@@ -1490,6 +1490,10 @@ pub struct CodeWorkbench {
     /// takes this path.
     local_previews: crate::local_preview::LocalPreviews,
     workspace: Option<WorkbenchWorkspace>,
+    /// Whether the currently installed backend authority runs locally on this
+    /// machine. When false (paired remote runtime), `local_workspace_root` must
+    /// stay `None` even if an identical path happens to exist on local disk.
+    is_local_authority: bool,
     /// The project directory when it lives on this machine, which is what the
     /// preview panel's file browser starts from. A workspace on a paired
     /// runtime has no local directory, so the browser is not offered there.
@@ -1784,6 +1788,7 @@ impl CodeWorkbench {
             browser_events_task: None,
             local_previews: crate::local_preview::LocalPreviews::default(),
             workspace: None,
+            is_local_authority: true,
             local_workspace_root: None,
             pending_workspace: None,
             workspace_generation: 0,
@@ -3290,19 +3295,43 @@ impl CodeWorkbench {
         self.terminal_transport.clone()
     }
 
+    pub(crate) fn set_local_authority(&mut self, is_local: bool, cx: &mut Context<Self>) {
+        if self.is_local_authority == is_local {
+            return;
+        }
+        self.is_local_authority = is_local;
+        if !is_local {
+            self.local_workspace_root = None;
+            self.file_watch = None;
+            self.file_watch_task = None;
+            self.file_watch_reads.clear();
+        } else if let Some(workspace) = self.workspace.as_ref() {
+            self.local_workspace_root = workspace.root.is_dir().then(|| {
+                workspace
+                    .root
+                    .canonicalize()
+                    .unwrap_or_else(|_| workspace.root.clone())
+            });
+        }
+        cx.notify();
+    }
+
     pub(crate) fn set_terminal_transport(
         &mut self,
         transport: Option<TerminalSurfaceTransport>,
         cx: &mut Context<Self>,
     ) {
+        let had_transport = self.terminal_transport.is_some();
         self.terminal_transport = transport;
-        if self.terminal_transport.is_none() {
+        if had_transport || self.terminal_transport.is_none() {
             self.terminal_surfaces.clear();
             self.active_terminal_surface_ids.clear();
-            self.retire_browser_surfaces(cx);
-            self.active_browser_surface_ids.clear();
-            self.browser_restores.clear();
-            self.local_previews.clear();
+            if self.terminal_transport.is_none() {
+                self.retire_browser_surfaces(cx);
+                self.active_browser_surface_ids.clear();
+                self.browser_restores.clear();
+                self.local_previews.clear();
+            }
         }
         cx.notify();
     }
@@ -3328,6 +3357,17 @@ impl CodeWorkbench {
         transport: Option<std::sync::Arc<dyn crate::browser_transport::BrowserTransport>>,
         cx: &mut Context<Self>,
     ) {
+        let had_transport = self.browser_transport.is_some();
+        if had_transport || transport.is_none() {
+            self.retire_browser_surfaces(cx);
+            self.active_browser_surface_ids.clear();
+            self.browser_bindings.clear();
+            self.browser_tab_labels.clear();
+            self.browser_surface_subscriptions.clear();
+            self.browser_restores.clear();
+            self.browser_events_task = None;
+            self.local_previews.clear();
+        }
         self.browser_transport = transport;
         // The policy lives on the runtime's browser, not on a panel: applying
         // it here means a reader who allowed downloads keeps that across a
@@ -3339,17 +3379,6 @@ impl CodeWorkbench {
                     let _ = transport.set_downloads_enabled(enabled).await;
                 })
                 .detach();
-        }
-        if self.browser_transport.is_none() {
-            self.retire_browser_surfaces(cx);
-            self.active_browser_surface_ids.clear();
-            self.browser_bindings.clear();
-            self.browser_tab_labels.clear();
-            self.browser_surface_subscriptions.clear();
-            self.browser_restores.clear();
-            self.browser_events_task = None;
-            self.local_previews.clear();
-        } else {
             // The layout is restored before the runtime is installed, so a
             // transport that arrives later still has to reopen the browser tabs
             // the previous run left open.
@@ -3444,6 +3473,10 @@ impl CodeWorkbench {
     pub(crate) fn clear_backend(&mut self, cx: &mut Context<Self>) {
         self.backend = None;
         self.terminal_transport = None;
+        self.terminal_surfaces.clear();
+        self.active_terminal_surface_ids.clear();
+        self.set_browser_transport(None, cx);
+        self.local_workspace_root = None;
         // The watcher describes files on *this* machine. Once the panel is
         // driven by a paired runtime, those reads come from the other side, so
         // a local watch would only produce conflicts with content this client
@@ -3527,8 +3560,7 @@ impl CodeWorkbench {
         // this machine leaves it unavailable rather than pointing it at a path
         // the local filesystem does not have. The root is canonical so the
         // paths the browser reports can be measured against it.
-        self.local_workspace_root = root
-            .is_dir()
+        self.local_workspace_root = (self.is_local_authority && root.is_dir())
             .then(|| root.canonicalize().unwrap_or_else(|_| root.clone()));
         self.workspace = Some(WorkbenchWorkspace {
             id: workspace_id.clone(),

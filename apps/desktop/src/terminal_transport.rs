@@ -18,7 +18,8 @@ use std::{
 
 use gpui::{BackgroundExecutor, Task};
 use vibex_backend::{
-    BackendError, MutationRequest, TerminalBackend, TerminalFrame, TerminalFrameBatch,
+    BackendError, BackendErrorKind, MutationRequest, TerminalBackend, TerminalFrame,
+    TerminalFrameBatch,
 };
 use vibex_content::TERMINAL_RAW_BUFFER_BYTES;
 use vibex_core::{
@@ -301,10 +302,14 @@ impl TerminalTransport for RemoteTerminalTransport {
         Box::pin(async move {
             let requested_id = session.id.clone();
             let restored = match backend.terminal_snapshot(requested_id.clone()).await {
-                Ok(snapshot) => snapshot.session,
-                // A closed terminal leaves the authority's registry, so a
-                // restart re-creates it from the persisted session parameters.
-                Err(_) => {
+                Ok(snapshot) if snapshot.session.status == TerminalStatus::Running => {
+                    snapshot.session
+                }
+                // A closed or missing terminal leaves the authority's active
+                // set, so a restart re-creates it from the persisted parameters.
+                // Transient transport errors propagate rather than spawning
+                // duplicate terminals on the remote host.
+                Ok(_) => {
                     backend
                         .create_terminal(MutationRequest::new(TerminalCreateRequest {
                             workspace_id: session.workspace_id.clone(),
@@ -316,6 +321,19 @@ impl TerminalTransport for RemoteTerminalTransport {
                         }))
                         .await?
                 }
+                Err(error) if error.code == "terminal_not_found" => {
+                    backend
+                        .create_terminal(MutationRequest::new(TerminalCreateRequest {
+                            workspace_id: session.workspace_id.clone(),
+                            title: Some(session.title.clone()),
+                            shell: Some(session.shell.clone()),
+                            cwd: Some(session.cwd.clone()),
+                            rows: session.rows,
+                            cols: session.cols,
+                        }))
+                        .await?
+                }
+                Err(error) => return Err(error.into()),
             };
             let mut terminals = lock_unpoisoned(&terminals);
             terminals.remove(requested_id.as_str());
@@ -467,15 +485,19 @@ impl TerminalTransport for RemoteTerminalTransport {
                         terminal
                     }
                     Err(error) => {
-                        // Remember the refusal so a stale surface cannot turn
-                        // every poll into another round trip.
-                        let terminal = Arc::new(RemoteTerminal::unavailable(
-                            terminal_id.clone(),
-                            error.into(),
-                        ));
-                        lock_unpoisoned(&terminals)
-                            .insert(terminal_id.as_str().to_string(), terminal.clone());
-                        terminal
+                        // Only cache permanent refusals; transient disconnects
+                        // must not poison the terminal entry once the link recovers.
+                        if is_permanent_terminal_error(&error) {
+                            let terminal = Arc::new(RemoteTerminal::unavailable(
+                                terminal_id.clone(),
+                                error.into(),
+                            ));
+                            lock_unpoisoned(&terminals)
+                                .insert(terminal_id.as_str().to_string(), terminal.clone());
+                            terminal
+                        } else {
+                            return Err(error.into());
+                        }
                     }
                 },
             };
@@ -489,6 +511,14 @@ fn lock_unpoisoned<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
     mutex
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn is_permanent_terminal_error(error: &BackendError) -> bool {
+    error.code == "terminal_not_found"
+        || matches!(
+            error.kind,
+            BackendErrorKind::Permission | BackendErrorKind::Unsupported
+        )
 }
 
 fn missing_session_error() -> TerminalTransportError {
@@ -511,6 +541,7 @@ struct RemoteTerminalState {
     frames: VecDeque<TerminalFrame>,
     retained_bytes: usize,
     dropped_frames: u64,
+    pending_reset: bool,
     pump: Option<Task<()>>,
 }
 
@@ -524,6 +555,7 @@ impl RemoteTerminal {
                 frames: VecDeque::new(),
                 retained_bytes: 0,
                 dropped_frames: 0,
+                pending_reset: false,
                 pump: None,
             }),
         }
@@ -538,6 +570,7 @@ impl RemoteTerminal {
                 frames: VecDeque::new(),
                 retained_bytes: 0,
                 dropped_frames: 0,
+                pending_reset: false,
                 pump: None,
             }),
         }
@@ -581,7 +614,11 @@ impl RemoteTerminal {
             loop {
                 match subscription.next().await {
                     Ok(Some(batch)) => {
-                        cursor = batch.next_sequence.max(cursor);
+                        cursor = if batch.reset_required {
+                            batch.next_sequence.max(1)
+                        } else {
+                            batch.next_sequence.max(cursor)
+                        };
                         let Some(terminal) = terminal.upgrade() else {
                             break;
                         };
@@ -592,18 +629,25 @@ impl RemoteTerminal {
                             break;
                         };
                         // A stream can end because the socket dropped while the
-                        // terminal keeps running; only a finished session stops
-                        // the pump for good.
+                        // terminal keeps running; only a finished session or
+                        // permanent refusal stops the pump for good.
                         if !terminal.refresh_after_stream_end(&backend).await {
                             break;
                         }
                         timer_executor.timer(REMOTE_TERMINAL_REATTACH_DELAY).await;
                         match backend.subscribe_terminal(terminal.terminal_id.clone(), cursor) {
                             Ok(next) => subscription = next,
-                            Err(_) => break,
+                            Err(error) if is_permanent_terminal_error(&error) => {
+                                terminal.state().error = Some(error.into());
+                                break;
+                            }
+                            Err(_) => continue,
                         }
                     }
                 }
+            }
+            if let Some(terminal) = terminal.upgrade() {
+                terminal.state().pump = None;
             }
         }));
         Ok(())
@@ -618,15 +662,25 @@ impl RemoteTerminal {
                 self.set_session(snapshot.session);
                 running
             }
-            Err(_) => true,
+            Err(error) => {
+                if is_permanent_terminal_error(&error) {
+                    let mut state = self.state();
+                    state.error = Some(error.into());
+                    false
+                } else {
+                    true
+                }
+            }
         }
     }
 
     fn push_batch(&self, batch: TerminalFrameBatch) {
         let mut state = self.state();
-        // `reset_required` needs no separate handling: the parser rebuilds when
-        // the sequence cursor moves backwards or leaves a gap, and the authority
-        // sets the flag from that same condition on the frames it replays.
+        if batch.reset_required {
+            state.frames.clear();
+            state.retained_bytes = 0;
+            state.pending_reset = true;
+        }
         state.dropped_frames = state.dropped_frames.max(batch.dropped_frames);
         for frame in batch.frames {
             state.retained_bytes = state.retained_bytes.saturating_add(frame.bytes.len());
@@ -678,12 +732,19 @@ impl RemoteTerminalState {
     /// frames beyond it are handed over on the next poll, once the parser has
     /// rebuilt to this run's end.
     fn drain(&mut self, next_sequence: i64) -> Vec<TerminalFrame> {
-        while self
-            .frames
-            .front()
-            .is_some_and(|frame| frame.sequence < next_sequence)
-        {
-            self.drop_front();
+        if next_sequence == i64::MAX {
+            return Vec::new();
+        }
+        if self.pending_reset {
+            self.pending_reset = false;
+        } else {
+            while self
+                .frames
+                .front()
+                .is_some_and(|frame| frame.sequence < next_sequence)
+            {
+                self.drop_front();
+            }
         }
         let mut frames: Vec<TerminalFrame> = Vec::new();
         while let Some(next) = self.frames.front().map(|frame| frame.sequence) {
@@ -840,6 +901,35 @@ mod tests {
             .expect_err("unavailable terminal should keep reporting its error");
         assert_eq!(error.code, "terminal_not_found");
         assert_eq!(error.message, "terminal session was not found");
+    }
+
+    #[test]
+    fn remote_poll_preserves_reset_batch_even_when_sequence_restarts_below_cursor() {
+        let terminal_id = TerminalId::new();
+        let terminal = RemoteTerminal::new(session(terminal_id.clone()));
+        terminal.push_batch(batch(&terminal_id, &[(8, b"old")], 9, 0));
+        let mut reset_batch = batch(&terminal_id, &[(1, b"fresh"), (2, b"line")], 3, 1);
+        reset_batch.reset_required = true;
+        terminal.push_batch(reset_batch);
+
+        // Status-only metadata poll (`i64::MAX`) must not discard buffered frames.
+        let meta = terminal
+            .poll_snapshot(i64::MAX)
+            .expect("meta poll should succeed");
+        assert!(meta.chunks.is_empty());
+
+        let snapshot = terminal
+            .poll_snapshot(10)
+            .expect("reset poll should succeed");
+        assert_eq!(snapshot.next_sequence, 3);
+        assert_eq!(
+            snapshot
+                .chunks
+                .iter()
+                .map(|c| (c.sequence, c.data.clone()))
+                .collect::<Vec<_>>(),
+            vec![(1, b"fresh".to_vec()), (2, b"line".to_vec())]
+        );
     }
 
     #[test]
