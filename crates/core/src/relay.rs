@@ -75,11 +75,17 @@ pub enum RelayErrorCode {
     QueueLimit,
     RateLimit,
     BandwidthLimit,
+    TrafficLimitExceeded,
     PeerNotFound,
     SessionRevoked,
     PushAuthenticationRequired,
     PushProviderUnavailable,
 }
+
+/// Error code emitted by clients when the built-in official relay has reached
+/// its configured traffic quota.
+pub const OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE: &str =
+    "official_relay_traffic_limit_exceeded";
 
 impl RelayErrorCode {
     pub const fn as_str(self) -> &'static str {
@@ -96,12 +102,40 @@ impl RelayErrorCode {
             Self::QueueLimit => "relay_queue_limit",
             Self::RateLimit => "relay_rate_limit",
             Self::BandwidthLimit => "relay_bandwidth_limit",
+            Self::TrafficLimitExceeded => "relay_traffic_limit_exceeded",
             Self::PeerNotFound => "relay_peer_not_found",
             Self::SessionRevoked => "relay_session_revoked",
             Self::PushAuthenticationRequired => "relay_push_authentication_required",
             Self::PushProviderUnavailable => "relay_push_provider_unavailable",
         }
     }
+}
+
+/// How a Relay server accumulates traffic when a traffic quota is enabled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RelayTrafficLimitMode {
+    Total,
+    #[default]
+    Monthly,
+}
+
+/// Public quota snapshot reported by a Relay server on `/api/info` and `/health`.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RelayTrafficQuotaStatus {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<RelayTrafficLimitMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit_bytes: Option<u64>,
+    #[serde(default)]
+    pub used_bytes: u64,
+    #[serde(default)]
+    pub exceeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub period: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -596,5 +630,37 @@ mod tests {
         let encoded = serde_json::to_value(&message).unwrap();
         let decoded: RelayPeerMessage = serde_json::from_value(encoded).unwrap();
         assert_eq!(decoded, message);
+    }
+
+    #[test]
+    fn traffic_quota_status_defaults_when_missing_from_older_relay_info() {
+        let decoded: RelayTrafficQuotaStatus = serde_json::from_str("{}").unwrap();
+        assert_eq!(decoded, RelayTrafficQuotaStatus::default());
+        assert!(!decoded.enabled);
+        assert!(!decoded.exceeded);
+
+        let full = RelayTrafficQuotaStatus {
+            enabled: true,
+            mode: Some(RelayTrafficLimitMode::Monthly),
+            limit_bytes: Some(1_000_000),
+            used_bytes: 1_000_000,
+            exceeded: true,
+            period: Some("2026-11".to_string()),
+        };
+        let encoded = serde_json::to_value(&full).unwrap();
+        assert_eq!(encoded["enabled"], true);
+        assert_eq!(encoded["mode"], "monthly");
+        assert_eq!(encoded["limitBytes"], 1_000_000);
+        assert_eq!(encoded["usedBytes"], 1_000_000);
+        assert_eq!(encoded["exceeded"], true);
+        assert_eq!(encoded["period"], "2026-11");
+        assert_eq!(
+            serde_json::from_value::<RelayTrafficQuotaStatus>(encoded).unwrap(),
+            full
+        );
+        assert_eq!(
+            RelayErrorCode::TrafficLimitExceeded.as_str(),
+            "relay_traffic_limit_exceeded"
+        );
     }
 }

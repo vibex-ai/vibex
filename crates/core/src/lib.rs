@@ -342,11 +342,13 @@ pub use provider_presets::*;
 pub use provider_projection::*;
 pub use recovery::*;
 pub use relay::{
-    RelayBridgeMessage, RelayControlMessage, RelayDeepLink, RelayEncryptedFrame, RelayError,
-    RelayErrorCode, RelayFrameKind, RelayHandshakeHello, RelayHandshakeReady, RelayHeartbeat,
-    RelayHeartbeatAck, RelayNotificationProviderKind, RelayOpaqueNotification, RelayPeerMessage,
-    RelayPeerRole, RelayPlaintextEnvelope, RelayProtocolVersion, RelayPushDispatchResult,
-    RelayPushRegistration, RelayRemoteHandshakeContext, RelayTransportMode,
+    OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE, RelayBridgeMessage, RelayControlMessage,
+    RelayDeepLink, RelayEncryptedFrame, RelayError, RelayErrorCode, RelayFrameKind,
+    RelayHandshakeHello, RelayHandshakeReady, RelayHeartbeat, RelayHeartbeatAck,
+    RelayNotificationProviderKind, RelayOpaqueNotification, RelayPeerMessage, RelayPeerRole,
+    RelayPlaintextEnvelope, RelayProtocolVersion, RelayPushDispatchResult, RelayPushRegistration,
+    RelayRemoteHandshakeContext, RelayTrafficLimitMode, RelayTrafficQuotaStatus,
+    RelayTransportMode,
 };
 pub use remote::{
     ManagementSnapshotPayload, RemoteAcpProfileConfigEntry, RemoteActionClass,

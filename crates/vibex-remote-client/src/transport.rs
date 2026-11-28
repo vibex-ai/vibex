@@ -492,6 +492,8 @@ pub struct RelayEndpointInfo {
     pub protocol_version: vibex_core::RelayProtocolVersion,
     pub features: RelayEndpointFeatures,
     pub limits: RelayEndpointLimits,
+    #[serde(default)]
+    pub traffic_quota: vibex_core::RelayTrafficQuotaStatus,
 }
 
 impl RelayEndpointInfo {
@@ -504,6 +506,12 @@ impl RelayEndpointInfo {
             return Err(BackendError::unsupported(
                 "relay_transport_unavailable",
                 "self-hosted Relay does not expose the required mobile transport surface",
+            ));
+        }
+        if self.traffic_quota.exceeded {
+            return Err(BackendError::offline(
+                RelayErrorCode::TrafficLimitExceeded.as_str(),
+                "relay traffic limit has been reached",
             ));
         }
         Ok(())
@@ -1047,10 +1055,13 @@ pub fn claim_pairing_offer_via_relay(
                 .post(endpoint_url(&base, &pair_path)?)
                 .json(&RelayControlMessage::Hello(hello)),
         )
-        .await?;
+        .await
+        .map_err(|error| upgrade_relay_error_for_url(&relay_url, error))?;
         let ready = match ready_message {
             RelayControlMessage::Ready(ready) => ready,
-            RelayControlMessage::Error(error) => return Err(map_relay_error(error)),
+            RelayControlMessage::Error(error) => {
+                return Err(map_relay_error_for_url(&relay_url, error));
+            }
             _ => {
                 return Err(BackendError::failed(
                     "relay_pairing_ready_invalid",
@@ -1163,10 +1174,13 @@ pub fn claim_pairing_offer_via_relay(
                 .post(endpoint_url(&base, &command_path)?)
                 .json(&frame),
         )
-        .await?;
+        .await
+        .map_err(|error| upgrade_relay_error_for_url(&relay_url, error))?;
         let response = match response {
             RelayControlMessage::Encrypted(frame) => frame,
-            RelayControlMessage::Error(error) => return Err(map_relay_error(error)),
+            RelayControlMessage::Error(error) => {
+                return Err(map_relay_error_for_url(&relay_url, error));
+            }
             _ => {
                 return Err(BackendError::failed(
                     "relay_pairing_response_invalid",
@@ -2425,6 +2439,14 @@ impl RelayE2eeTransport {
                             );
                             return Err(error);
                         }
+                        if is_relay_traffic_limit_code(error.code.as_str()) {
+                            set_state(
+                                &self.inner.state,
+                                RemoteConnectionState::Offline,
+                                Some(&error),
+                            );
+                            return Err(error);
+                        }
                         last_error = Some(error);
                     }
                 }
@@ -2456,6 +2478,9 @@ impl RelayE2eeTransport {
                 "relay_websocket_transport_unavailable",
                 "self-hosted Relay does not support full-duplex device WebSocket frames",
             ));
+        }
+        if info.traffic_quota.exceeded {
+            return Err(relay_traffic_limit_error(&self.config.relay_url));
         }
         Ok(info)
     }
@@ -2543,8 +2568,9 @@ impl RelayE2eeTransport {
             .event_queue_capacity
             .saturating_add(self.config.remote.binary_queue_capacity)
             .max(1);
-        let (mut socket_writer, mut raw_reader) =
-            open_socket(&ws_url, "", queue_capacity, None).await?;
+        let (mut socket_writer, mut raw_reader) = open_socket(&ws_url, "", queue_capacity, None)
+            .await
+            .map_err(|error| upgrade_relay_error_for_url(&self.config.relay_url, error))?;
         let registration = serde_json::to_string(&RelayControlMessage::Hello(hello.clone()))
             .map_err(|_| {
                 BackendError::failed(
@@ -2674,6 +2700,7 @@ impl RelayE2eeTransport {
         let session = Shared::new(AsyncMutex::new(session));
         let relay_reader = RelayReader {
             inner: raw_reader,
+            relay_url: self.config.relay_url.clone(),
             room_id: self.config.room_id.clone(),
             local_peer_id: self.config.local_peer_id.clone(),
             remote_peer_id: self.config.pc_peer_id.clone(),
@@ -2873,14 +2900,16 @@ where
                             }
                             return Ok(RelayControlMessage::Ready(ready));
                         }
-                        RelayControlMessage::Error(error) => return Err(map_relay_error(error)),
+                        RelayControlMessage::Error(error) => {
+                            return Err(map_relay_error_for_url(&config.relay_url, error));
+                        }
                         _ => continue,
                     }
                 }
                 if let Ok(RelayControlMessage::Error(error)) =
                     serde_json::from_str::<RelayControlMessage>(&text)
                 {
-                    return Err(map_relay_error(error));
+                    return Err(map_relay_error_for_url(&config.relay_url, error));
                 }
             }
             Some(WireMessage::Closed) | None => {
@@ -3620,6 +3649,12 @@ fn map_http_error(status: u16, body: Option<JsonValue>) -> BackendError {
         }
         return error;
     }
+    if let Some(relay_error) = body
+        .as_ref()
+        .and_then(|body| serde_json::from_value::<RelayError>(body.clone()).ok())
+    {
+        return map_relay_error(relay_error);
+    }
     BackendError::new(
         response_kind,
         format!("remote_http_status_{status}"),
@@ -3862,6 +3897,7 @@ impl WireReader for BrowserReader {
 
 struct RelayReader<R> {
     inner: R,
+    relay_url: String,
     room_id: RelayRoomId,
     local_peer_id: RelayPeerId,
     remote_peer_id: RelayPeerId,
@@ -3880,12 +3916,20 @@ where
                         if text.is_empty() {
                             continue;
                         }
-                        let peer: RelayPeerMessage = serde_json::from_str(&text).map_err(|_| {
-                            BackendError::failed(
-                                "relay_peer_frame_invalid",
-                                "relay peer frame was invalid",
-                            )
-                        })?;
+                        let peer: RelayPeerMessage = match serde_json::from_str(&text) {
+                            Ok(peer) => peer,
+                            Err(_) => {
+                                if let Ok(RelayControlMessage::Error(error)) =
+                                    serde_json::from_str::<RelayControlMessage>(&text)
+                                {
+                                    return Err(map_relay_error_for_url(&self.relay_url, error));
+                                }
+                                return Err(BackendError::failed(
+                                    "relay_peer_frame_invalid",
+                                    "relay peer frame was invalid",
+                                ));
+                            }
+                        };
                         if peer.room_id != self.room_id
                             || peer.sender_peer_id != self.remote_peer_id
                             || peer.recipient_peer_id != self.local_peer_id
@@ -3918,7 +3962,7 @@ where
                                 return Ok(Some(WireMessage::Text(text)));
                             }
                             RelayControlMessage::Error(error) => {
-                                return Err(map_relay_error(error));
+                                return Err(map_relay_error_for_url(&self.relay_url, error));
                             }
                             RelayControlMessage::Heartbeat(_)
                             | RelayControlMessage::HeartbeatAck(_)
@@ -4156,6 +4200,12 @@ async fn open_socket(
     let socket_result =
         tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector).await;
     let (stream, _) = socket_result.map_err(|error| {
+        if let tokio_tungstenite::tungstenite::Error::Http(response) = &error
+            && let Some(body) = response.body().as_ref()
+            && let Ok(relay_error) = serde_json::from_slice::<RelayError>(body)
+        {
+            return map_relay_error(relay_error);
+        }
         BackendError::offline(
             "remote_ws_connect_failed",
             format!("remote WebSocket connection failed: {error}"),
@@ -4412,6 +4462,44 @@ fn relay_correlation_for_json(message: &RemoteJsonMessageV2) -> Option<Correlati
     }
 }
 
+fn is_relay_traffic_limit_code(code: &str) -> bool {
+    code == RelayErrorCode::TrafficLimitExceeded.as_str()
+        || code == vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE
+}
+
+fn relay_traffic_limit_error(relay_url: &str) -> BackendError {
+    if vibex_core::is_official_relay_origin(relay_url) {
+        BackendError::offline(
+            vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE,
+            "official relay traffic limit has been reached",
+        )
+    } else {
+        BackendError::offline(
+            RelayErrorCode::TrafficLimitExceeded.as_str(),
+            "relay traffic limit has been reached",
+        )
+    }
+}
+
+fn map_relay_error_for_url(relay_url: &str, error: RelayError) -> BackendError {
+    if error.code == RelayErrorCode::TrafficLimitExceeded {
+        let mut mapped = relay_traffic_limit_error(relay_url);
+        mapped.correlation_id = error.correlation_id;
+        return mapped;
+    }
+    map_relay_error(error)
+}
+
+fn upgrade_relay_error_for_url(relay_url: &str, mut error: BackendError) -> BackendError {
+    if error.code == RelayErrorCode::TrafficLimitExceeded.as_str()
+        && vibex_core::is_official_relay_origin(relay_url)
+    {
+        error.code = vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE.to_string();
+        error.message = "official relay traffic limit has been reached".to_string();
+    }
+    error
+}
+
 fn map_relay_error(error: RelayError) -> BackendError {
     let mut mapped = match error.code {
         RelayErrorCode::UnsupportedProtocol => BackendError::unsupported(
@@ -4420,6 +4508,9 @@ fn map_relay_error(error: RelayError) -> BackendError {
         ),
         RelayErrorCode::SessionRevoked => {
             BackendError::permission(error.code.as_str(), "relay session was revoked")
+        }
+        RelayErrorCode::TrafficLimitExceeded => {
+            BackendError::offline(error.code.as_str(), "relay traffic limit has been reached")
         }
         RelayErrorCode::RateLimit
         | RelayErrorCode::BandwidthLimit
@@ -5417,6 +5508,8 @@ impl AutoRemoteTransport {
                         Some(RemoteConnectionState::Revoked)
                     } else if error.code.contains("protocol") {
                         Some(RemoteConnectionState::Incompatible)
+                    } else if is_relay_traffic_limit_code(error.code.as_str()) {
+                        Some(RemoteConnectionState::Offline)
                     } else {
                         None
                     };
@@ -6302,13 +6395,56 @@ mod tests {
                 max_queue_bytes_per_connection: 1024,
                 max_bandwidth_bytes_per_window: 1024,
             },
+            traffic_quota: vibex_core::RelayTrafficQuotaStatus::default(),
         };
         info.validate_transport_capabilities().unwrap();
+
+        info.traffic_quota.exceeded = true;
+        assert_eq!(
+            info.validate_transport_capabilities().unwrap_err().code,
+            RelayErrorCode::TrafficLimitExceeded.as_str()
+        );
+        info.traffic_quota.exceeded = false;
 
         info.features.websocket_frames = false;
         assert_eq!(
             info.validate_transport_capabilities().unwrap_err().code,
             "relay_transport_unavailable"
+        );
+    }
+
+    #[test]
+    fn relay_traffic_limit_error_distinguishes_official_and_self_hosted_origins() {
+        let official = relay_traffic_limit_error(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN);
+        assert_eq!(
+            official.code,
+            vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE
+        );
+        assert_eq!(official.kind, BackendErrorKind::Offline);
+
+        let self_hosted = relay_traffic_limit_error("https://relay.example.com");
+        assert_eq!(
+            self_hosted.code,
+            RelayErrorCode::TrafficLimitExceeded.as_str()
+        );
+        assert_eq!(self_hosted.kind, BackendErrorKind::Offline);
+
+        let http_err = map_http_error(
+            503,
+            Some(
+                serde_json::to_value(RelayError::new(
+                    RelayErrorCode::TrafficLimitExceeded,
+                    "Relay traffic limit has been reached",
+                ))
+                .unwrap(),
+            ),
+        );
+        assert_eq!(http_err.code, RelayErrorCode::TrafficLimitExceeded.as_str());
+        let upgraded =
+            upgrade_relay_error_for_url(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN, http_err);
+        assert_eq!(
+            upgraded.code,
+            vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE
         );
     }
 }

@@ -26,11 +26,12 @@ use tokio::sync::{Mutex, MutexGuard, RwLock};
 use tokio::time::timeout;
 use url::{Host, Url};
 use vibex_core::{
-    ErrorCategory, RelayPeerId, RelayProtocolVersion, RelayRoomId, RemoteCancelPairingOfferRequest,
-    RemoteCreatePairingOfferRequest, RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel,
-    RemoteLanPairingWindowSnapshot, RemotePairingCandidate, RemotePairingOfferSummary,
-    RemotePairingTransport, RemoteProtocolVersionRange, RemoteZeroConfigLanPairingAdvertisement,
-    RequestId, VibexError, VibexResult, unix_timestamp_ms,
+    ErrorCategory, RelayErrorCode, RelayPeerId, RelayProtocolVersion, RelayRoomId,
+    RelayTrafficQuotaStatus, RemoteCancelPairingOfferRequest, RemoteCreatePairingOfferRequest,
+    RemoteCreatePairingOfferResponse, RemoteDevicePermissionLevel, RemoteLanPairingWindowSnapshot,
+    RemotePairingCandidate, RemotePairingOfferSummary, RemotePairingTransport,
+    RemoteProtocolVersionRange, RemoteZeroConfigLanPairingAdvertisement, RequestId, VibexError,
+    VibexResult, unix_timestamp_ms,
 };
 use vibex_remote::{
     RemoteGateway, RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
@@ -889,6 +890,8 @@ fn gateway_authority_allowlists(network_origins: Vec<String>) -> (Vec<String>, V
 pub struct RelayPublicationInfo {
     pub protocol_version: RelayProtocolVersion,
     pub features: RelayPublicationFeatures,
+    #[serde(default)]
+    pub traffic_quota: RelayTrafficQuotaStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -916,6 +919,12 @@ impl RelayPublicationInfo {
             return Err(VibexError::capability(
                 "relay_transport_unavailable",
                 "the self-hosted Relay does not expose the required mobile transport surface",
+            ));
+        }
+        if self.traffic_quota.exceeded {
+            return Err(VibexError::process(
+                RelayErrorCode::TrafficLimitExceeded.as_str(),
+                "the Relay traffic limit has been reached",
             ));
         }
         Ok(())
@@ -1929,29 +1938,49 @@ impl RemoteConnectivityController {
         let gateway_status = self.inner.gateway.status();
         let local_lan_info = self.inner.gateway.local_lan_gateway_info();
         let relay_status = self.inner.relay.get_status().await;
+        let relay_quota_exhausted = relay_status.state == crate::RelayClientConnectionState::Error
+            && relay_status.last_error_code.as_deref()
+                == Some(RelayErrorCode::TrafficLimitExceeded.as_str());
         let methods = RemoteConnectivityMethod::ALL
             .into_iter()
             .map(|method| {
                 let runtime = state.methods.get(&method).expect("all methods initialized");
                 let desired_enabled = desired_for(&state.settings, method);
+                let is_exhausted_relay = method == RemoteConnectivityMethod::SelfHostedRelay
+                    && desired_enabled
+                    && relay_quota_exhausted;
                 RemoteMethodSnapshot {
                     method,
                     desired_enabled,
-                    state: if state.initial_error.is_some() && desired_enabled {
+                    state: if is_exhausted_relay {
+                        RemoteMethodState::Error
+                    } else if state.initial_error.is_some() && desired_enabled {
                         RemoteMethodState::RepairRequired
                     } else {
                         runtime.state
                     },
                     origin: runtime.origin.clone(),
                     https_port: runtime.https_port,
-                    candidate_available: runtime.candidate.is_some(),
+                    candidate_available: if is_exhausted_relay {
+                        false
+                    } else {
+                        runtime.candidate.is_some()
+                    },
                     last_validated_at_ms: runtime.last_validated_at_ms,
                     ownership: runtime.ownership,
-                    error_code: runtime
-                        .error_code
-                        .clone()
-                        .or_else(|| state.initial_error.clone()),
-                    recovery_action: runtime.recovery_action,
+                    error_code: if is_exhausted_relay {
+                        Some(RelayErrorCode::TrafficLimitExceeded.as_str().to_string())
+                    } else {
+                        runtime
+                            .error_code
+                            .clone()
+                            .or_else(|| state.initial_error.clone())
+                    },
+                    recovery_action: if is_exhausted_relay {
+                        RemoteRecoveryAction::None
+                    } else {
+                        runtime.recovery_action
+                    },
                 }
             })
             .collect::<Vec<_>>();
@@ -2514,6 +2543,38 @@ impl RemoteConnectivityController {
         Ok(self.snapshot().await)
     }
 
+    pub async fn probe_relay_info(&self, origin: &str) -> VibexResult<RelayPublicationInfo> {
+        let normalized = normalize_https_origin(origin)?;
+        let info = self.inner.relay_probe.probe(&normalized).await?;
+        if info.traffic_quota.exceeded {
+            let matches_active_relay = {
+                let state = self.inner.state.lock().await;
+                state.settings.relay.desired_enabled
+                    && (state.settings.relay.origin.as_deref() == Some(normalized.as_str())
+                        || state
+                            .methods
+                            .get(&RemoteConnectivityMethod::SelfHostedRelay)
+                            .and_then(|runtime| runtime.origin.as_deref())
+                            == Some(normalized.as_str()))
+            };
+            if matches_active_relay {
+                let error = VibexError::process(
+                    RelayErrorCode::TrafficLimitExceeded.as_str(),
+                    "the Relay traffic limit has been reached",
+                );
+                self.record_method_error(
+                    RemoteConnectivityMethod::SelfHostedRelay,
+                    &error,
+                    RemoteRecoveryAction::None,
+                )
+                .await;
+                let _ = self.inner.relay.stop().await;
+                let _ = self.apply_routes().await;
+            }
+        }
+        Ok(info)
+    }
+
     pub async fn enable_relay(
         &self,
         origin: impl AsRef<str>,
@@ -2547,12 +2608,14 @@ impl RemoteConnectivityController {
         }
         let publication = self.inner.relay_probe.probe(&origin).await;
         if let Err(error) = publication.and_then(|info| info.validate_transport_capabilities()) {
-            self.record_method_error(
-                RemoteConnectivityMethod::SelfHostedRelay,
-                &error,
-                RemoteRecoveryAction::RepairRoute,
-            )
-            .await;
+            let recovery = if error.code == RelayErrorCode::TrafficLimitExceeded.as_str() {
+                RemoteRecoveryAction::None
+            } else {
+                RemoteRecoveryAction::RepairRoute
+            };
+            self.record_method_error(RemoteConnectivityMethod::SelfHostedRelay, &error, recovery)
+                .await;
+            let _ = self.apply_routes().await;
             return Err(error);
         }
         let relay_settings = self.inner.state.lock().await.settings.relay.clone();
@@ -2588,12 +2651,18 @@ impl RemoteConnectivityController {
         let status = match self.wait_for_relay_connected().await {
             Ok(status) => status,
             Err(error) => {
+                let recovery = if error.code == RelayErrorCode::TrafficLimitExceeded.as_str() {
+                    RemoteRecoveryAction::None
+                } else {
+                    RemoteRecoveryAction::Retry
+                };
                 self.record_method_error(
                     RemoteConnectivityMethod::SelfHostedRelay,
                     &error,
-                    RemoteRecoveryAction::Retry,
+                    recovery,
                 )
                 .await;
+                let _ = self.apply_routes().await;
                 return Err(error);
             }
         };
@@ -3504,12 +3573,13 @@ impl RemoteConnectivityController {
         };
         let publication = self.inner.relay_probe.probe(&origin).await;
         if let Err(error) = publication.and_then(|info| info.validate_transport_capabilities()) {
-            self.record_method_error(
-                RemoteConnectivityMethod::SelfHostedRelay,
-                &error,
-                RemoteRecoveryAction::RepairRoute,
-            )
-            .await;
+            let recovery = if error.code == RelayErrorCode::TrafficLimitExceeded.as_str() {
+                RemoteRecoveryAction::None
+            } else {
+                RemoteRecoveryAction::RepairRoute
+            };
+            self.record_method_error(RemoteConnectivityMethod::SelfHostedRelay, &error, recovery)
+                .await;
             return;
         }
         let update = self
@@ -3560,10 +3630,15 @@ impl RemoteConnectivityController {
                     );
                 }
                 Err(error) => {
+                    let recovery = if error.code == RelayErrorCode::TrafficLimitExceeded.as_str() {
+                        RemoteRecoveryAction::None
+                    } else {
+                        RemoteRecoveryAction::Retry
+                    };
                     self.record_method_error(
                         RemoteConnectivityMethod::SelfHostedRelay,
                         &error,
-                        RemoteRecoveryAction::Retry,
+                        recovery,
                     )
                     .await
                 }
@@ -3586,6 +3661,14 @@ impl RemoteConnectivityController {
                 match status.state {
                     crate::RelayClientConnectionState::Connected => return Ok(status),
                     crate::RelayClientConnectionState::Error => {
+                        if status.last_error_code.as_deref()
+                            == Some(RelayErrorCode::TrafficLimitExceeded.as_str())
+                        {
+                            return Err(VibexError::process(
+                                RelayErrorCode::TrafficLimitExceeded.as_str(),
+                                "the Relay traffic limit has been reached",
+                            ));
+                        }
                         return Err(VibexError::process(
                             "relay_connection_failed",
                             "the self-hosted Relay connection failed",
@@ -4052,16 +4135,19 @@ mod tests {
     #[derive(Default)]
     struct FakeRelayProbe {
         calls: AtomicUsize,
+        info: StdMutex<Option<RelayPublicationInfo>>,
     }
 
     #[async_trait]
     impl RelayPublicationProbe for FakeRelayProbe {
         async fn probe(&self, _origin: &str) -> VibexResult<RelayPublicationInfo> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            Err(VibexError::process(
-                "fake_relay_probe_unconfigured",
-                "fake Relay probe is unconfigured",
-            ))
+            self.info.lock().unwrap().clone().ok_or_else(|| {
+                VibexError::process(
+                    "fake_relay_probe_unconfigured",
+                    "fake Relay probe is unconfigured",
+                )
+            })
         }
     }
 
@@ -5320,13 +5406,71 @@ mod tests {
                 websocket_frames: true,
                 http_pair_bridge: true,
             },
+            traffic_quota: RelayTrafficQuotaStatus::default(),
         };
         info.validate_transport_capabilities().unwrap();
+        info.traffic_quota.exceeded = true;
+        assert_eq!(
+            info.validate_transport_capabilities().unwrap_err().code,
+            RelayErrorCode::TrafficLimitExceeded.as_str()
+        );
+        info.traffic_quota.exceeded = false;
         info.features.websocket_frames = false;
         assert_eq!(
             info.validate_transport_capabilities().unwrap_err().code,
             "relay_transport_unavailable"
         );
+    }
+
+    #[tokio::test]
+    async fn enable_relay_rejects_exhausted_traffic_quota_and_probe_reports_it() {
+        let _guard = CONTROLLER_TEST_LOCK.lock().await;
+        let directory = tempdir().unwrap();
+        let tailscale = Arc::new(FakeTailscale::default());
+        let direct = Arc::new(FakeDirectProbe::default());
+        let relay = Arc::new(FakeRelayProbe::default());
+        *relay.info.lock().unwrap() = Some(RelayPublicationInfo {
+            protocol_version: RelayProtocolVersion::foundation(),
+            features: RelayPublicationFeatures {
+                pc_websocket: true,
+                device_websocket: true,
+                websocket_frames: true,
+                http_pair_bridge: true,
+            },
+            traffic_quota: RelayTrafficQuotaStatus {
+                enabled: true,
+                mode: Some(vibex_core::RelayTrafficLimitMode::Monthly),
+                limit_bytes: Some(1_000),
+                used_bytes: 1_000,
+                exceeded: true,
+                period: Some("2026-11".to_string()),
+            },
+        });
+        let (controller, _gateway) =
+            test_controller(directory.path(), tailscale, direct, relay).await;
+
+        let probed = controller
+            .probe_relay_info("https://relay.peatboy.com")
+            .await
+            .unwrap();
+        assert!(probed.traffic_quota.exceeded);
+
+        let err = controller
+            .enable_relay("https://relay.peatboy.com")
+            .await
+            .unwrap_err();
+        assert_eq!(err.code, RelayErrorCode::TrafficLimitExceeded.as_str());
+
+        let snapshot = controller.snapshot().await;
+        let method = snapshot
+            .method(RemoteConnectivityMethod::SelfHostedRelay)
+            .unwrap();
+        assert_eq!(method.state, RemoteMethodState::Error);
+        assert_eq!(
+            method.error_code.as_deref(),
+            Some(RelayErrorCode::TrafficLimitExceeded.as_str())
+        );
+        assert!(!method.candidate_available);
     }
 
     #[tokio::test]

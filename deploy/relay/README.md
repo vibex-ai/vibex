@@ -103,6 +103,9 @@ All hard limits are configurable and the effective values are reported by
 | `VIBEX_RELAY_MAX_REQUESTS_PER_WINDOW_PER_ROOM` | `120` | `maxRequestsPerWindowPerRoom` |
 | `VIBEX_RELAY_MAX_QUEUE_BYTES_PER_CONNECTION` | `4194304` | `maxQueueBytesPerConnection` |
 | `VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW` | `16777216` | `maxBandwidthBytesPerWindow` |
+| `VIBEX_RELAY_MAX_TRAFFIC_BYTES` | *(disabled)* | `limits.maxTrafficBytes` / `trafficQuota.limitBytes` |
+| `VIBEX_RELAY_TRAFFIC_LIMIT_MODE` | `monthly` | `limits.trafficLimitMode` / `trafficQuota.mode` |
+| `VIBEX_RELAY_TRAFFIC_STATE_PATH` | *(in-memory)* | *(not exposed)* |
 | `VIBEX_RELAY_MAX_CONNECTIONS_PER_IP` | `32` | `maxConnectionsPerIp` |
 | `VIBEX_RELAY_MAX_CONNECTION_ATTEMPTS_PER_IP_PER_WINDOW` | `120` | `maxConnectionAttemptsPerIpPerWindow` |
 | `VIBEX_RELAY_MAX_ROOM_CREATES_PER_IP_PER_WINDOW` | `20` | `maxRoomCreatesPerIpPerWindow` |
@@ -116,6 +119,34 @@ All hard limits are configurable and the effective values are reported by
 owns a room, while `VIBEX_RELAY_MAX_DEVICES_PER_ROOM` bounds concurrent paired
 device routes. All numeric values must be positive; the push adapter timeout is
 also capped at 60 seconds.
+
+### Optional cumulative traffic quota
+
+Cumulative traffic limiting is **disabled by default** (`VIBEX_RELAY_MAX_TRAFFIC_BYTES`
+unset or empty). Both the official relay and self-hosted relays can enable it to
+cap total relayed bytes across all rooms and connections:
+
+```bash
+VIBEX_RELAY_MAX_TRAFFIC_BYTES=100GiB       # raw bytes or B/KB/MB/GB/TB/KiB/MiB/GiB/TiB
+VIBEX_RELAY_TRAFFIC_LIMIT_MODE=monthly     # monthly (UTC calendar month) or total
+VIBEX_RELAY_TRAFFIC_STATE_PATH=/var/lib/vibex-relay/traffic-quota.json
+```
+
+- `monthly` resets usage automatically at the start of each UTC calendar month
+  (`YYYY-MM`, reported in `trafficQuota.period`).
+- `total` accumulates across the lifetime of the relay until the operator raises
+  the limit or resets the state file.
+- `VIBEX_RELAY_TRAFFIC_STATE_PATH` is optional. When configured, usage is
+  persisted atomically as JSON so the counter survives container restarts (mount
+  a persistent volume for its parent directory).
+- Once `usedBytes >= limitBytes`, the relay stops serving everyone:
+  - Active WebSocket connections receive a `traffic_limit_exceeded` error frame
+    and are disconnected.
+  - New `/ws`, HTTP bridge (`/api/rooms/:room_id/*`), and push requests fail
+    with HTTP `503` and `code: "traffic_limit_exceeded"`.
+  - `/health` and `/api/info` remain `200 OK` with `trafficQuota.exceeded: true`
+    so container healthchecks stay green and Desktop / Mobile clients immediately
+    surface the quota-exhausted state.
 
 ### Per-client-address admission
 

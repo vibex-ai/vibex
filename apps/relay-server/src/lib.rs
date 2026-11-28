@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::net::{IpAddr, SocketAddr};
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::path::{Path as FsPath, PathBuf};
+use std::sync::atomic::{AtomicI64, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use axum::extract::rejection::JsonRejection;
@@ -22,7 +23,7 @@ use vibex_core::{
     RelayError, RelayErrorCode, RelayFrameKind, RelayHandshakeHello, RelayHeartbeatAck,
     RelayNotificationProviderKind, RelayOpaqueNotification, RelayPeerId, RelayPeerMessage,
     RelayPeerRole, RelayProtocolVersion, RelayPushDispatchResult, RelayPushRegistration,
-    RelayRoomId, unix_timestamp_ms,
+    RelayRoomId, RelayTrafficLimitMode, RelayTrafficQuotaStatus, unix_timestamp_ms,
 };
 
 pub type RelayServerRouter = Router;
@@ -65,6 +66,12 @@ pub struct RelayServerConfig {
     pub push_auth_token: Option<String>,
     pub push_adapter_url: Option<String>,
     pub push_adapter_auth_token: Option<String>,
+    /// Optional cumulative traffic limit in bytes. Disabled (`None`) by default.
+    pub max_traffic_bytes: Option<u64>,
+    /// Accumulation window when `max_traffic_bytes` is enabled (`total` or `monthly`).
+    pub traffic_limit_mode: RelayTrafficLimitMode,
+    /// Optional path to persist traffic usage across restarts.
+    pub traffic_state_path: Option<PathBuf>,
 }
 
 impl std::fmt::Debug for RelayServerConfig {
@@ -118,6 +125,9 @@ impl std::fmt::Debug for RelayServerConfig {
                 "has_push_adapter_auth_token",
                 &self.push_adapter_auth_token.is_some(),
             )
+            .field("max_traffic_bytes", &self.max_traffic_bytes)
+            .field("traffic_limit_mode", &self.traffic_limit_mode)
+            .field("has_traffic_state_path", &self.traffic_state_path.is_some())
             .finish()
     }
 }
@@ -231,6 +241,24 @@ impl RelayServerConfig {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+        config.max_traffic_bytes = std::env::var("VIBEX_RELAY_MAX_TRAFFIC_BYTES")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| parse_traffic_limit_bytes(&value))
+            .transpose()?;
+        if let Some(mode) = std::env::var("VIBEX_RELAY_TRAFFIC_LIMIT_MODE")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+        {
+            config.traffic_limit_mode = parse_traffic_limit_mode(&mode)?;
+        }
+        config.traffic_state_path = std::env::var("VIBEX_RELAY_TRAFFIC_STATE_PATH")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from);
         config.validate()?;
         Ok(config)
     }
@@ -261,6 +289,9 @@ impl RelayServerConfig {
             || self.push_adapter_timeout_ms > 60_000
         {
             return Err("Relay limits must be positive".into());
+        }
+        if self.max_traffic_bytes == Some(0) {
+            return Err("Relay traffic limit must be positive".into());
         }
         if self.max_connections_per_room != 1 {
             return Err("Relay supports exactly one authoritative PC per room".into());
@@ -356,6 +387,61 @@ fn apply_env_i64(target: &mut i64, name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
+pub fn parse_traffic_limit_bytes(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("VIBEX_RELAY_MAX_TRAFFIC_BYTES must not be empty".into());
+    }
+    let split_idx = trimmed
+        .find(|ch: char| !ch.is_ascii_digit() && ch != '_')
+        .unwrap_or(trimmed.len());
+    let number_part: String = trimmed[..split_idx]
+        .chars()
+        .filter(|ch| *ch != '_')
+        .collect();
+    if number_part.is_empty() {
+        return Err("VIBEX_RELAY_MAX_TRAFFIC_BYTES must start with a positive integer".into());
+    }
+    let base: u64 = number_part
+        .parse()
+        .map_err(|_| "VIBEX_RELAY_MAX_TRAFFIC_BYTES is not a valid byte count")?;
+    let unit = trimmed[split_idx..].trim().to_ascii_lowercase();
+    let multiplier: u64 = match unit.as_str() {
+        "" | "b" => 1,
+        "k" | "kb" => 1_000,
+        "m" | "mb" => 1_000_000,
+        "g" | "gb" => 1_000_000_000,
+        "t" | "tb" => 1_000_000_000_000,
+        "ki" | "kib" => 1_024,
+        "mi" | "mib" => 1_024 * 1_024,
+        "gi" | "gib" => 1_024 * 1_024 * 1_024,
+        "ti" | "tib" => 1_024 * 1_024 * 1_024 * 1_024,
+        _ => {
+            return Err(
+                "VIBEX_RELAY_MAX_TRAFFIC_BYTES unit must be B, KB/MB/GB/TB, or KiB/MiB/GiB/TiB"
+                    .into(),
+            );
+        }
+    };
+    let bytes = base
+        .checked_mul(multiplier)
+        .ok_or("VIBEX_RELAY_MAX_TRAFFIC_BYTES overflowed u64")?;
+    if bytes == 0 {
+        return Err("VIBEX_RELAY_MAX_TRAFFIC_BYTES must be positive".into());
+    }
+    Ok(bytes)
+}
+
+fn parse_traffic_limit_mode(
+    value: &str,
+) -> Result<RelayTrafficLimitMode, Box<dyn std::error::Error>> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "total" => Ok(RelayTrafficLimitMode::Total),
+        "monthly" => Ok(RelayTrafficLimitMode::Monthly),
+        _ => Err("VIBEX_RELAY_TRAFFIC_LIMIT_MODE must be total or monthly".into()),
+    }
+}
+
 impl Default for RelayServerConfig {
     fn default() -> Self {
         Self {
@@ -396,6 +482,9 @@ impl Default for RelayServerConfig {
             push_auth_token: None,
             push_adapter_url: None,
             push_adapter_auth_token: None,
+            max_traffic_bytes: None,
+            traffic_limit_mode: RelayTrafficLimitMode::Monthly,
+            traffic_state_path: None,
         }
     }
 }
@@ -409,6 +498,8 @@ pub struct RelayHealthStatus {
     pub active_rooms: usize,
     pub active_connections: usize,
     pub pending_bridge_requests: usize,
+    #[serde(default)]
+    pub traffic_quota: RelayTrafficQuotaStatus,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -425,6 +516,8 @@ pub struct RelayServerInfo {
     pub protocol_version: RelayProtocolVersion,
     pub features: RelayServerFeatures,
     pub limits: RelayServerLimits,
+    #[serde(default)]
+    pub traffic_quota: RelayTrafficQuotaStatus,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -465,6 +558,10 @@ pub struct RelayServerLimits {
     pub max_push_installations: usize,
     pub max_push_dedup_entries: usize,
     pub push_adapter_timeout_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_traffic_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub traffic_limit_mode: Option<RelayTrafficLimitMode>,
 }
 
 #[derive(Clone)]
@@ -537,6 +634,194 @@ impl ClientIpLimitEntry {
     }
 }
 
+const TRAFFIC_PERSIST_MIN_BYTES: u64 = 1024 * 1024;
+const TRAFFIC_PERSIST_INTERVAL_MS: i64 = 5_000;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct PersistedTrafficQuotaState {
+    version: u32,
+    mode: RelayTrafficLimitMode,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    period: Option<String>,
+    used_bytes: u64,
+    updated_at_ms: i64,
+}
+
+struct TrafficQuotaTracker {
+    limit_bytes: Option<u64>,
+    mode: RelayTrafficLimitMode,
+    state_path: Option<PathBuf>,
+    used_bytes: u64,
+    period: Option<String>,
+    last_persisted_bytes: u64,
+    last_persisted_at_ms: i64,
+}
+
+impl TrafficQuotaTracker {
+    fn new(config: &RelayServerConfig, now_ms: i64) -> Self {
+        let current_period = match config.traffic_limit_mode {
+            RelayTrafficLimitMode::Monthly => Some(utc_year_month(now_ms)),
+            RelayTrafficLimitMode::Total => None,
+        };
+        let mut tracker = Self {
+            limit_bytes: config.max_traffic_bytes,
+            mode: config.traffic_limit_mode,
+            state_path: config.traffic_state_path.clone(),
+            used_bytes: 0,
+            period: current_period.clone(),
+            last_persisted_bytes: 0,
+            last_persisted_at_ms: now_ms,
+        };
+        if let Some(path) = config.traffic_state_path.as_deref()
+            && let Some(loaded) = load_traffic_state(path)
+            && loaded.mode == config.traffic_limit_mode
+        {
+            let period_matches = match config.traffic_limit_mode {
+                RelayTrafficLimitMode::Total => true,
+                RelayTrafficLimitMode::Monthly => loaded.period == current_period,
+            };
+            if period_matches {
+                tracker.used_bytes = loaded.used_bytes;
+                tracker.last_persisted_bytes = loaded.used_bytes;
+                tracker.last_persisted_at_ms = loaded.updated_at_ms;
+            }
+        }
+        tracker
+    }
+
+    /// Advances the monthly period if UTC calendar month rolled over.
+    /// Returns `(rolled_over, snapshot_to_persist)`.
+    fn refresh_period(
+        &mut self,
+        now_ms: i64,
+    ) -> (bool, Option<(PathBuf, PersistedTrafficQuotaState)>) {
+        if self.mode != RelayTrafficLimitMode::Monthly {
+            return (false, None);
+        }
+        let current_period = utc_year_month(now_ms);
+        if self.period.as_deref() == Some(current_period.as_str()) {
+            return (false, None);
+        }
+        self.period = Some(current_period);
+        self.used_bytes = 0;
+        self.last_persisted_bytes = 0;
+        self.last_persisted_at_ms = now_ms;
+        let persist = self.snapshot_for_persist(now_ms);
+        (true, persist)
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.limit_bytes
+            .is_some_and(|limit| self.used_bytes >= limit)
+    }
+
+    fn status(&self) -> RelayTrafficQuotaStatus {
+        let Some(limit) = self.limit_bytes else {
+            return RelayTrafficQuotaStatus::default();
+        };
+        RelayTrafficQuotaStatus {
+            enabled: true,
+            mode: Some(self.mode),
+            limit_bytes: Some(limit),
+            used_bytes: self.used_bytes,
+            exceeded: self.used_bytes >= limit,
+            period: self.period.clone(),
+        }
+    }
+
+    fn snapshot_for_persist(&self, now_ms: i64) -> Option<(PathBuf, PersistedTrafficQuotaState)> {
+        let path = self.state_path.clone()?;
+        Some((
+            path,
+            PersistedTrafficQuotaState {
+                version: 1,
+                mode: self.mode,
+                period: self.period.clone(),
+                used_bytes: self.used_bytes,
+                updated_at_ms: now_ms,
+            },
+        ))
+    }
+
+    fn maybe_snapshot_for_persist(
+        &mut self,
+        now_ms: i64,
+        force: bool,
+    ) -> Option<(PathBuf, PersistedTrafficQuotaState)> {
+        self.state_path.as_ref()?;
+        let delta_bytes = self.used_bytes.saturating_sub(self.last_persisted_bytes);
+        let delta_ms = now_ms.saturating_sub(self.last_persisted_at_ms);
+        if !force
+            && delta_bytes < TRAFFIC_PERSIST_MIN_BYTES
+            && (delta_bytes == 0 || delta_ms < TRAFFIC_PERSIST_INTERVAL_MS)
+        {
+            return None;
+        }
+        self.last_persisted_bytes = self.used_bytes;
+        self.last_persisted_at_ms = now_ms;
+        self.snapshot_for_persist(now_ms)
+    }
+}
+
+fn load_traffic_state(path: &FsPath) -> Option<PersistedTrafficQuotaState> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(err) => {
+            warn!(error = %err, "relay traffic state file could not be read");
+            return None;
+        }
+    };
+    match serde_json::from_slice::<PersistedTrafficQuotaState>(&bytes) {
+        Ok(state) => Some(state),
+        Err(err) => {
+            warn!(error = %err, "relay traffic state file was invalid JSON; starting fresh");
+            None
+        }
+    }
+}
+
+fn persist_traffic_state(path: &FsPath, state: &PersistedTrafficQuotaState) {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty()
+        && let Err(err) = std::fs::create_dir_all(parent)
+    {
+        warn!(error = %err, "relay traffic state directory could not be created");
+        return;
+    }
+    let Ok(payload) = serde_json::to_vec_pretty(state) else {
+        return;
+    };
+    let tmp_path = path.with_extension("json.tmp");
+    if let Err(err) = std::fs::write(&tmp_path, payload) {
+        warn!(error = %err, "relay traffic state temp file could not be written");
+        return;
+    }
+    if let Err(err) = std::fs::rename(&tmp_path, path) {
+        let _ = std::fs::remove_file(&tmp_path);
+        warn!(error = %err, "relay traffic state file could not be updated");
+    }
+}
+
+/// Computes the UTC calendar month string (`YYYY-MM`) for a Unix timestamp in ms.
+fn utc_year_month(timestamp_ms: i64) -> String {
+    let secs = timestamp_ms.div_euclid(1000);
+    let days = secs.div_euclid(86_400);
+    let z = days + 719_468;
+    let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
+    let doe = (z - era * 146_097) as u64;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let mut year = (yoe as i64) + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let month = if mp < 10 { mp + 3 } else { mp - 9 };
+    if month <= 2 {
+        year += 1;
+    }
+    format!("{year:04}-{month:02}")
+}
+
 struct RelayServerInner {
     config: RelayServerConfig,
     started_at_ms: i64,
@@ -545,6 +830,13 @@ struct RelayServerInner {
     /// Per-client-address admission state. Kept separate from `rooms` so a
     /// rejected connection never has to take the room lock.
     client_ip_limits: std::sync::Mutex<ClientIpLimits>,
+    /// Cumulative traffic quota state (disabled by default).
+    traffic_quota: std::sync::Mutex<TrafficQuotaTracker>,
+    /// Broadcasts `true` as soon as the configured traffic quota is exceeded,
+    /// allowing active sockets to terminate immediately.
+    traffic_exhausted_tx: watch::Sender<bool>,
+    /// Optional clock offset used only by tests to simulate monthly rollovers.
+    clock_offset_ms: AtomicI64,
     push: Mutex<PushState>,
     push_client: reqwest::Client,
 }
@@ -660,13 +952,20 @@ async fn cors(request: axum::extract::Request, next: Next) -> Response {
 
 impl RelayServerState {
     pub fn new(config: RelayServerConfig) -> Self {
+        let now_ms = unix_timestamp_ms();
+        let tracker = TrafficQuotaTracker::new(&config, now_ms);
+        let initially_exceeded = tracker.is_exceeded();
+        let (traffic_exhausted_tx, _) = watch::channel(initially_exceeded);
         Self {
             inner: std::sync::Arc::new(RelayServerInner {
                 config,
-                started_at_ms: unix_timestamp_ms(),
+                started_at_ms: now_ms,
                 active_connections: AtomicUsize::new(0),
                 rooms: Mutex::new(HashMap::new()),
                 client_ip_limits: std::sync::Mutex::new(ClientIpLimits::default()),
+                traffic_quota: std::sync::Mutex::new(tracker),
+                traffic_exhausted_tx,
+                clock_offset_ms: AtomicI64::new(0),
                 push: Mutex::new(PushState::default()),
                 push_client: reqwest::Client::builder()
                     .redirect(reqwest::redirect::Policy::none())
@@ -676,8 +975,102 @@ impl RelayServerState {
         }
     }
 
+    fn now_ms(&self) -> i64 {
+        unix_timestamp_ms().saturating_add(self.inner.clock_offset_ms.load(Ordering::Acquire))
+    }
+
     fn config(&self) -> &RelayServerConfig {
         &self.inner.config
+    }
+
+    fn traffic_quota_locked(&self) -> std::sync::MutexGuard<'_, TrafficQuotaTracker> {
+        self.inner
+            .traffic_quota
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    fn subscribe_traffic_exhausted(&self) -> watch::Receiver<bool> {
+        self.inner.traffic_exhausted_tx.subscribe()
+    }
+
+    fn traffic_quota_status(&self) -> RelayTrafficQuotaStatus {
+        if self.config().max_traffic_bytes.is_none() {
+            return RelayTrafficQuotaStatus::default();
+        }
+        let now_ms = self.now_ms();
+        let (status, persist, exhausted) = {
+            let mut tracker = self.traffic_quota_locked();
+            let (_, persist) = tracker.refresh_period(now_ms);
+            (tracker.status(), persist, tracker.is_exceeded())
+        };
+        self.sync_traffic_exhausted_signal(exhausted);
+        if let Some((path, snapshot)) = persist {
+            persist_traffic_state(&path, &snapshot);
+        }
+        status
+    }
+
+    fn ensure_traffic_available(&self) -> Result<(), RelayServerError> {
+        if self.config().max_traffic_bytes.is_none() {
+            return Ok(());
+        }
+        let now_ms = self.now_ms();
+        let (exceeded, persist) = {
+            let mut tracker = self.traffic_quota_locked();
+            let (_, persist) = tracker.refresh_period(now_ms);
+            (tracker.is_exceeded(), persist)
+        };
+        self.sync_traffic_exhausted_signal(exceeded);
+        if let Some((path, snapshot)) = persist {
+            persist_traffic_state(&path, &snapshot);
+        }
+        if exceeded {
+            return Err(traffic_limit_exceeded_error());
+        }
+        Ok(())
+    }
+
+    /// Charges `bytes` to the global traffic quota when configured.
+    /// Returns `true` when traffic may continue, or `false` once the limit has
+    /// been reached or exceeded.
+    fn record_traffic_bytes(&self, bytes: usize) -> bool {
+        if self.config().max_traffic_bytes.is_none() {
+            return true;
+        }
+        let now_ms = self.now_ms();
+        let (allowed, newly_exceeded, exceeded, persist) = {
+            let mut tracker = self.traffic_quota_locked();
+            let (_, rollover_persist) = tracker.refresh_period(now_ms);
+            if tracker.is_exceeded() {
+                (false, false, true, rollover_persist)
+            } else {
+                tracker.used_bytes = tracker.used_bytes.saturating_add(bytes as u64);
+                let exceeded_now = tracker.is_exceeded();
+                let persist = tracker
+                    .maybe_snapshot_for_persist(now_ms, exceeded_now)
+                    .or(rollover_persist);
+                (!exceeded_now, exceeded_now, exceeded_now, persist)
+            }
+        };
+        if let Some((path, snapshot)) = persist {
+            persist_traffic_state(&path, &snapshot);
+        }
+        self.sync_traffic_exhausted_signal(exceeded);
+        if newly_exceeded {
+            warn!(
+                limit_bytes = self.config().max_traffic_bytes,
+                mode = ?self.config().traffic_limit_mode,
+                "relay traffic limit reached; refusing further service"
+            );
+        }
+        allowed
+    }
+
+    fn sync_traffic_exhausted_signal(&self, exhausted: bool) {
+        if *self.inner.traffic_exhausted_tx.borrow() != exhausted {
+            self.inner.traffic_exhausted_tx.send_replace(exhausted);
+        }
     }
 
     fn reserve_connection(&self) -> Result<WebSocketConnectionGuard, RelayServerError> {
@@ -834,6 +1227,7 @@ impl RelayServerState {
     async fn health(&self) -> RelayHealthStatus {
         let mut rooms = self.inner.rooms.lock().await;
         self.prune_locked(&mut rooms, unix_timestamp_ms());
+        let traffic_quota = self.traffic_quota_status();
         RelayHealthStatus {
             status: RelayServerStatus::Ok,
             protocol_version: RelayProtocolVersion::foundation(),
@@ -841,6 +1235,7 @@ impl RelayServerState {
             active_rooms: rooms.len(),
             active_connections: self.inner.active_connections.load(Ordering::Acquire),
             pending_bridge_requests: rooms.values().map(|room| room.pending.len()).sum(),
+            traffic_quota,
         }
     }
 
@@ -884,7 +1279,10 @@ impl RelayServerState {
                 max_push_installations: config.max_push_installations,
                 max_push_dedup_entries: config.max_push_dedup_entries,
                 push_adapter_timeout_ms: config.push_adapter_timeout_ms,
+                max_traffic_bytes: config.max_traffic_bytes,
+                traffic_limit_mode: config.max_traffic_bytes.map(|_| config.traffic_limit_mode),
             },
+            traffic_quota: self.traffic_quota_status(),
         }
     }
 
@@ -1026,6 +1424,7 @@ impl RelayServerState {
     }
 
     async fn route_peer_message(&self, message: RelayPeerMessage) -> Result<(), RelayServerError> {
+        self.ensure_traffic_available()?;
         let encoded = serde_json::to_string(&message).map_err(|_| {
             RelayServerError::new(
                 StatusCode::BAD_REQUEST,
@@ -1208,6 +1607,7 @@ impl RelayServerState {
         kind: RelayFrameKind,
         message: RelayControlMessage,
     ) -> Result<RelayControlMessage, RelayServerError> {
+        self.ensure_traffic_available()?;
         let (response_rx, timeout_ms) = {
             let now = unix_timestamp_ms();
             let mut rooms = self.inner.rooms.lock().await;
@@ -1503,6 +1903,26 @@ impl IntoResponse for RelayServerError {
     }
 }
 
+const fn traffic_limit_exceeded_error() -> RelayServerError {
+    RelayServerError::new(
+        StatusCode::SERVICE_UNAVAILABLE,
+        RelayErrorCode::TrafficLimitExceeded,
+        "relay traffic limit has been reached",
+    )
+}
+
+async fn wait_until_traffic_exhausted(rx: &mut watch::Receiver<bool>) {
+    if *rx.borrow() {
+        return;
+    }
+    while rx.changed().await.is_ok() {
+        if *rx.borrow() {
+            return;
+        }
+    }
+    std::future::pending::<()>().await;
+}
+
 async fn health(State(state): State<RelayServerState>) -> Json<RelayHealthStatus> {
     Json(state.health().await)
 }
@@ -1516,6 +1936,9 @@ async fn register_push(
     headers: HeaderMap,
     body: Result<Json<RelayPushRegistration>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
     if let Err(error) = require_push_provider_and_auth(&state, &headers) {
         return error.into_response();
     }
@@ -1573,6 +1996,9 @@ async fn dispatch_push(
     headers: HeaderMap,
     body: Result<Json<RelayOpaqueNotification>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
     if let Err(error) = require_push_provider_and_auth(&state, &headers) {
         return error.into_response();
     }
@@ -1821,6 +2247,9 @@ async fn ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
+    if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
     let client_ip = client_ip_from_request(peer, &headers);
     let guard = match state.reserve_connection() {
         Ok(guard) => guard,
@@ -1847,6 +2276,9 @@ async fn pair(
     Path(room_id): Path<String>,
     body: Result<Json<RelayControlMessage>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
     let room_id = match parse_room_path(room_id) {
         Ok(room_id) => room_id,
         Err(err) => return err.into_response(),
@@ -1880,6 +2312,10 @@ async fn pair(
         .into_response();
     }
 
+    let request_bytes = serde_json::to_vec(&hello).map(|v| v.len()).unwrap_or(0);
+    if !state.record_traffic_bytes(request_bytes) {
+        return traffic_limit_exceeded_error().into_response();
+    }
     let bridge_correlation_id = CorrelationId::new();
     match state
         .bridge(
@@ -1890,7 +2326,13 @@ async fn pair(
         )
         .await
     {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            let response_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+            if !state.record_traffic_bytes(response_bytes) {
+                return traffic_limit_exceeded_error().into_response();
+            }
+            Json(response).into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -1900,6 +2342,9 @@ async fn command(
     Path(room_id): Path<String>,
     body: Result<Json<RelayEncryptedFrame>, JsonRejection>,
 ) -> Response {
+    if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
     let room_id = match parse_room_path(room_id) {
         Ok(room_id) => room_id,
         Err(err) => return err.into_response(),
@@ -1947,6 +2392,10 @@ async fn command(
         .into_response();
     }
 
+    let request_bytes = serde_json::to_vec(&frame).map(|v| v.len()).unwrap_or(0);
+    if !state.record_traffic_bytes(request_bytes) {
+        return traffic_limit_exceeded_error().into_response();
+    }
     match state
         .bridge(
             room_id,
@@ -1956,7 +2405,13 @@ async fn command(
         )
         .await
     {
-        Ok(response) => Json(response).into_response(),
+        Ok(response) => {
+            let response_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+            if !state.record_traffic_bytes(response_bytes) {
+                return traffic_limit_exceeded_error().into_response();
+            }
+            Json(response).into_response()
+        }
         Err(err) => err.into_response(),
     }
 }
@@ -1991,6 +2446,10 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
             return;
         }
     };
+    if !state.record_traffic_bytes(first_text.len()) {
+        send_error_and_close(&mut ws_sender, traffic_limit_exceeded_error()).await;
+        return;
+    }
     let registration = match parse_registration(&first_text) {
         Ok(registration) => registration,
         Err(err) => {
@@ -2022,49 +2481,94 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
         }
     };
 
+    let writer_state = state.clone();
+    let mut writer_exhausted = state.subscribe_traffic_exhausted();
     let writer = tokio::spawn(async move {
-        while let Some(encoded) = outbound_rx.recv().await {
-            let bytes = encoded.len();
-            if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
-                // The frame was reserved but never written. Release it, and
-                // release everything still queued behind it: a leaked
-                // reservation is never reclaimed and eventually pins the
-                // counter at the limit, which makes the room reject every
-                // later frame with relay_queue_limit.
-                release_queue_bytes(&queued_bytes, bytes);
-                outbound_rx.close();
-                while let Ok(pending) = outbound_rx.try_recv() {
-                    release_queue_bytes(&queued_bytes, pending.len());
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_until_traffic_exhausted(&mut writer_exhausted) => {
+                    outbound_rx.close();
+                    while let Ok(pending) = outbound_rx.try_recv() {
+                        release_queue_bytes(&queued_bytes, pending.len());
+                    }
+                    send_error_and_close(&mut ws_sender, traffic_limit_exceeded_error()).await;
+                    break;
                 }
-                break;
+                maybe_encoded = outbound_rx.recv() => {
+                    let Some(encoded) = maybe_encoded else {
+                        break;
+                    };
+                    let bytes = encoded.len();
+                    if !writer_state.record_traffic_bytes(bytes) {
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        send_error_and_close(&mut ws_sender, traffic_limit_exceeded_error()).await;
+                        break;
+                    }
+                    if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
+                        // The frame was reserved but never written. Release it, and
+                        // release everything still queued behind it: a leaked
+                        // reservation is never reclaimed and eventually pins the
+                        // counter at the limit, which makes the room reject every
+                        // later frame with relay_queue_limit.
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        break;
+                    }
+                    release_queue_bytes(&queued_bytes, bytes);
+                }
             }
-            release_queue_bytes(&queued_bytes, bytes);
         }
     });
 
-    while let Some(frame) = ws_receiver.next().await {
-        match frame {
-            Ok(Message::Close(_)) => break,
-            Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
-            Ok(frame) => {
-                if let Ok(text) = frame_text(frame) {
-                    handle_pc_text(
-                        &state,
-                        &room_id,
-                        &connection_id,
-                        &outbound_tx,
-                        text.as_str(),
-                    )
-                    .await;
+    let mut reader_exhausted = state.subscribe_traffic_exhausted();
+    loop {
+        tokio::select! {
+            biased;
+            _ = wait_until_traffic_exhausted(&mut reader_exhausted) => break,
+            frame = ws_receiver.next() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                match frame {
+                    Ok(Message::Close(_)) => break,
+                    Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
+                    Ok(frame) => {
+                        if let Ok(text) = frame_text(frame) {
+                            if !state.record_traffic_bytes(text.len()) {
+                                break;
+                            }
+                            handle_pc_text(
+                                &state,
+                                &room_id,
+                                &connection_id,
+                                &outbound_tx,
+                                text.as_str(),
+                            )
+                            .await;
+                        }
+                    }
+                    Err(_) => break,
                 }
             }
-            Err(_) => break,
         }
     }
 
     state.unregister_room(&room_id, &connection_id).await;
     drop(outbound_tx);
-    writer.abort();
+    if timeout(Duration::from_millis(200), writer).await.is_err() {
+        debug!(
+            room_id = room_id.as_str(),
+            "relay PC writer timed out while closing"
+        );
+    }
 }
 
 async fn handle_device_socket_parts(
@@ -2092,49 +2596,96 @@ async fn handle_device_socket_parts(
             return;
         }
     };
-    let writer = tokio::spawn(async move {
-        while let Some(encoded) = outbound_rx.recv().await {
-            let bytes = encoded.len();
-            if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
-                // The frame was reserved but never written. Release it, and
-                // release everything still queued behind it: a leaked
-                // reservation is never reclaimed and eventually pins the
-                // counter at the limit, which makes the room reject every
-                // later frame with relay_queue_limit.
-                release_queue_bytes(&queued_bytes, bytes);
-                outbound_rx.close();
-                while let Ok(pending) = outbound_rx.try_recv() {
-                    release_queue_bytes(&queued_bytes, pending.len());
-                }
-                break;
-            }
-            release_queue_bytes(&queued_bytes, bytes);
-        }
-    });
-    // Forward the registration as an opaque peer message; the PC owns the
-    // actual pairing/session decision and returns Ready over this same route.
     let Some(pc_peer_id) = pc_peer_for_room(&state, &room_id).await else {
-        writer.abort();
         state
             .unregister_device(&room_id, &peer_id, &connection_id)
             .await;
         return;
     };
+    let writer_state = state.clone();
+    let mut writer_exhausted = state.subscribe_traffic_exhausted();
+    let writer_room_id = room_id.clone();
+    let writer_pc_peer_id = pc_peer_id.clone();
+    let writer_peer_id = peer_id.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                biased;
+                _ = wait_until_traffic_exhausted(&mut writer_exhausted) => {
+                    outbound_rx.close();
+                    while let Ok(pending) = outbound_rx.try_recv() {
+                        release_queue_bytes(&queued_bytes, pending.len());
+                    }
+                    send_peer_error_and_close(
+                        &mut ws_sender,
+                        writer_room_id.clone(),
+                        writer_pc_peer_id.clone(),
+                        writer_peer_id.clone(),
+                        traffic_limit_exceeded_error(),
+                    )
+                    .await;
+                    break;
+                }
+                maybe_encoded = outbound_rx.recv() => {
+                    let Some(encoded) = maybe_encoded else {
+                        break;
+                    };
+                    let bytes = encoded.len();
+                    if !writer_state.record_traffic_bytes(bytes) {
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        send_peer_error_and_close(
+                            &mut ws_sender,
+                            writer_room_id.clone(),
+                            writer_pc_peer_id.clone(),
+                            writer_peer_id.clone(),
+                            traffic_limit_exceeded_error(),
+                        )
+                        .await;
+                        break;
+                    }
+                    if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
+                        // The frame was reserved but never written. Release it, and
+                        // release everything still queued behind it: a leaked
+                        // reservation is never reclaimed and eventually pins the
+                        // counter at the limit, which makes the room reject every
+                        // later frame with relay_queue_limit.
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        break;
+                    }
+                    release_queue_bytes(&queued_bytes, bytes);
+                }
+            }
+        }
+    });
+    // Forward the registration as an opaque peer message; the PC owns the
+    // actual pairing/session decision and returns Ready over this same route.
     let registration = RelayPeerMessage {
         room_id: room_id.clone(),
         sender_peer_id: peer_id.clone(),
-        recipient_peer_id: pc_peer_id,
+        recipient_peer_id: pc_peer_id.clone(),
         message: RelayControlMessage::Hello(hello),
     };
     if state.route_peer_message(registration).await.is_err() {
-        writer.abort();
+        drop(outbound_tx);
+        let _ = timeout(Duration::from_millis(200), writer).await;
         state
             .unregister_device(&room_id, &peer_id, &connection_id)
             .await;
         return;
     }
+    let mut reader_exhausted = state.subscribe_traffic_exhausted();
     loop {
         tokio::select! {
+            biased;
+            _ = wait_until_traffic_exhausted(&mut reader_exhausted) => break,
             _ = room_disconnect.changed() => break,
             frame = ws_receiver.next() => {
                 let Some(frame) = frame else {
@@ -2142,6 +2693,9 @@ async fn handle_device_socket_parts(
                 };
                 match frame {
                     Ok(Message::Text(text)) => {
+                        if !state.record_traffic_bytes(text.len()) {
+                            break;
+                        }
                         if let Ok(message) = serde_json::from_str::<RelayPeerMessage>(text.as_str())
                             && message.room_id == room_id
                             && message.sender_peer_id == peer_id
@@ -2166,7 +2720,9 @@ async fn handle_device_socket_parts(
                         }
                     }
                     Ok(Message::Binary(bytes)) => {
-                        if bytes.len() > state.config().max_body_bytes {
+                        if bytes.len() > state.config().max_body_bytes
+                            || !state.record_traffic_bytes(bytes.len())
+                        {
                             break;
                         }
                     }
@@ -2177,7 +2733,13 @@ async fn handle_device_socket_parts(
             }
         }
     }
-    writer.abort();
+    drop(outbound_tx);
+    if timeout(Duration::from_millis(200), writer).await.is_err() {
+        debug!(
+            room_id = room_id.as_str(),
+            "relay device writer timed out while closing"
+        );
+    }
     state
         .unregister_device(&room_id, &peer_id, &connection_id)
         .await;
@@ -2274,6 +2836,25 @@ async fn send_error_and_close(
     err: RelayServerError,
 ) {
     let message = RelayControlMessage::Error(err.relay_error());
+    if let Ok(encoded) = serde_json::to_string(&message) {
+        let _ = ws_sender.send(Message::Text(encoded.into())).await;
+    }
+    let _ = ws_sender.send(Message::Close(None)).await;
+}
+
+async fn send_peer_error_and_close(
+    ws_sender: &mut futures_util::stream::SplitSink<WebSocket, Message>,
+    room_id: RelayRoomId,
+    sender_peer_id: RelayPeerId,
+    recipient_peer_id: RelayPeerId,
+    err: RelayServerError,
+) {
+    let message = RelayPeerMessage {
+        room_id,
+        sender_peer_id,
+        recipient_peer_id,
+        message: RelayControlMessage::Error(err.relay_error()),
+    };
     if let Ok(encoded) = serde_json::to_string(&message) {
         let _ = ws_sender.send(Message::Text(encoded.into())).await;
     }
@@ -3559,5 +4140,172 @@ mod tests {
         // A different forwarded address still gets its own budget.
         let (mut other, _) = connect_forwarded(&url, "203.0.113.8").await.unwrap();
         register_pc(&mut other, RelayRoomId::new()).await;
+    }
+
+    #[test]
+    fn traffic_limit_parser_supports_bytes_and_units_and_rejects_zero() {
+        assert_eq!(parse_traffic_limit_bytes("1024").unwrap(), 1024);
+        assert_eq!(parse_traffic_limit_bytes("10_000").unwrap(), 10_000);
+        assert_eq!(parse_traffic_limit_bytes("5KB").unwrap(), 5_000);
+        assert_eq!(parse_traffic_limit_bytes("5KiB").unwrap(), 5 * 1024);
+        assert_eq!(parse_traffic_limit_bytes("2 MB").unwrap(), 2_000_000);
+        assert_eq!(parse_traffic_limit_bytes("2MiB").unwrap(), 2 * 1024 * 1024);
+        assert_eq!(parse_traffic_limit_bytes("100GB").unwrap(), 100_000_000_000);
+        assert_eq!(
+            parse_traffic_limit_bytes("100GiB").unwrap(),
+            100 * 1024 * 1024 * 1024
+        );
+        assert_eq!(parse_traffic_limit_bytes("1TB").unwrap(), 1_000_000_000_000);
+        assert!(parse_traffic_limit_bytes("0").is_err());
+        assert!(parse_traffic_limit_bytes("0GB").is_err());
+        assert!(parse_traffic_limit_bytes("-10").is_err());
+        assert!(parse_traffic_limit_bytes("10XB").is_err());
+        assert!(parse_traffic_limit_bytes("").is_err());
+    }
+
+    #[test]
+    fn utc_year_month_handles_epoch_leap_year_and_rollover() {
+        assert_eq!(utc_year_month(0), "1970-01");
+        // 2024-02-29T23:59:59Z
+        assert_eq!(utc_year_month(1_709_251_199_000), "2024-02");
+        // 2024-03-01T00:00:00Z
+        assert_eq!(utc_year_month(1_709_251_200_000), "2024-03");
+        // 2026-12-31T23:59:59Z
+        assert_eq!(utc_year_month(1_798_761_599_000), "2026-12");
+        // 2027-01-01T00:00:00Z
+        assert_eq!(utc_year_month(1_798_761_600_000), "2027-01");
+    }
+
+    #[tokio::test]
+    async fn traffic_quota_disabled_by_default_reports_disabled_in_info() {
+        let config = RelayServerConfig::default();
+        assert_eq!(config.max_traffic_bytes, None);
+        let router = build_router(config);
+
+        let info_response = router
+            .oneshot(Request::get("/api/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info_response.status(), StatusCode::OK);
+        let info: RelayServerInfo = json_body(info_response).await;
+        assert!(!info.traffic_quota.enabled);
+        assert!(!info.traffic_quota.exceeded);
+        assert_eq!(info.limits.max_traffic_bytes, None);
+        assert_eq!(info.limits.traffic_limit_mode, None);
+    }
+
+    #[tokio::test]
+    async fn total_traffic_quota_blocks_ws_and_http_bridge_and_persists_across_restart() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("traffic-state.json");
+
+        let mut config = test_config();
+        config.max_traffic_bytes = Some(1_000);
+        config.traffic_limit_mode = RelayTrafficLimitMode::Total;
+        config.traffic_state_path = Some(state_path.clone());
+
+        let state = RelayServerState::new(config.clone());
+        let router = build_router_with_state(state.clone());
+        let url = spawn_ws_server(router.clone()).await;
+
+        let (mut pc, _) = connect_async(url.clone()).await.unwrap();
+        let room_id = RelayRoomId::new();
+        register_pc(&mut pc, room_id.clone()).await;
+
+        // Exhaust the remaining quota.
+        assert!(!state.record_traffic_bytes(2_000));
+
+        // Active PC socket receives a TrafficLimitExceeded error and closes.
+        let frame = timeout(Duration::from_secs(2), pc.next())
+            .await
+            .expect("pc socket must be notified when quota is reached")
+            .unwrap()
+            .unwrap();
+        let ClientMessage::Text(text) = frame else {
+            panic!("expected error text frame before close");
+        };
+        let control: RelayControlMessage = serde_json::from_str(text.as_str()).unwrap();
+        let RelayControlMessage::Error(error) = control else {
+            panic!("expected RelayControlMessage::Error");
+        };
+        assert_eq!(error.code, RelayErrorCode::TrafficLimitExceeded);
+
+        // /api/info and /health stay 200 OK and report exceeded = true.
+        let info_response = router
+            .clone()
+            .oneshot(Request::get("/api/info").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(info_response.status(), StatusCode::OK);
+        let info: RelayServerInfo = json_body(info_response).await;
+        assert!(info.traffic_quota.enabled);
+        assert_eq!(info.traffic_quota.mode, Some(RelayTrafficLimitMode::Total));
+        assert_eq!(info.traffic_quota.limit_bytes, Some(1_000));
+        assert!(info.traffic_quota.exceeded);
+        assert_eq!(info.traffic_quota.period, None);
+
+        // New WebSocket connections are rejected with HTTP 503.
+        let ws_err = connect_async(url).await.unwrap_err();
+        let tokio_tungstenite::tungstenite::Error::Http(resp) = ws_err else {
+            panic!("expected HTTP rejection on /ws when quota exceeded, got {ws_err:?}");
+        };
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body_bytes = resp.body().as_deref().unwrap_or_default();
+        let ws_relay_error: RelayError = serde_json::from_slice(body_bytes).unwrap();
+        assert_eq!(ws_relay_error.code, RelayErrorCode::TrafficLimitExceeded);
+
+        // HTTP pair bridge is also rejected with HTTP 503 TrafficLimitExceeded.
+        let pair_req = RelayControlMessage::Hello(RelayHandshakeHello::new(
+            room_id.clone(),
+            RelayPeerId::new(),
+            "device-pub",
+        ));
+        let pair_response = router
+            .oneshot(
+                Request::post(format!("/api/rooms/{}/pair", room_id.as_str()))
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(serde_json::to_vec(&pair_req).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(pair_response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let pair_error: RelayError = json_body(pair_response).await;
+        assert_eq!(pair_error.code, RelayErrorCode::TrafficLimitExceeded);
+
+        // Restarting with the same state file preserves exhausted state.
+        let restarted = RelayServerState::new(config);
+        let restarted_status = restarted.traffic_quota_status();
+        assert!(restarted_status.exceeded);
+        assert!(restarted.ensure_traffic_available().is_err());
+    }
+
+    #[tokio::test]
+    async fn monthly_traffic_quota_resets_automatically_on_new_utc_month() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("monthly-traffic.json");
+
+        let mut config = test_config();
+        config.max_traffic_bytes = Some(500);
+        config.traffic_limit_mode = RelayTrafficLimitMode::Monthly;
+        config.traffic_state_path = Some(state_path.clone());
+
+        let state = RelayServerState::new(config);
+        let initial_period = state.traffic_quota_status().period.clone().unwrap();
+        assert!(!state.record_traffic_bytes(600));
+        assert!(state.traffic_quota_status().exceeded);
+        assert!(state.ensure_traffic_available().is_err());
+
+        // Advance clock by 35 days into the next UTC calendar month.
+        state
+            .inner
+            .clock_offset_ms
+            .store(35 * 24 * 60 * 60 * 1000, Ordering::Release);
+        let rolled = state.traffic_quota_status();
+        assert!(rolled.enabled);
+        assert!(!rolled.exceeded);
+        assert_eq!(rolled.used_bytes, 0);
+        assert_ne!(rolled.period.as_deref(), Some(initial_period.as_str()));
+        assert!(state.ensure_traffic_available().is_ok());
     }
 }

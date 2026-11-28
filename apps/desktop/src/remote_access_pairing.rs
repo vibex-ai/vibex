@@ -384,6 +384,8 @@ struct PairingViewState {
     /// Whether the operator folded-out "Other ways" section is open. It starts
     /// closed so the dialog leads with the two ways that need no setup.
     advanced_methods_expanded: bool,
+    /// True when the built-in official relay reports its traffic quota is exhausted.
+    official_relay_limit_exceeded: bool,
     permission: RemoteDevicePermissionLevel,
     zero_config_permission: RemoteDevicePermissionLevel,
     active_offer: Option<ActivePairingOffer>,
@@ -453,6 +455,7 @@ impl Default for PairingViewState {
             selected_method: RemoteConnectivityMethod::SelfHostedRelay,
             selected_entry: RemoteAccessEntry::OfficialRelay,
             advanced_methods_expanded: false,
+            official_relay_limit_exceeded: false,
             permission: RemoteDevicePermissionLevel::ReadOnly,
             zero_config_permission: RemoteDevicePermissionLevel::ReadOnly,
             active_offer: None,
@@ -478,7 +481,117 @@ impl Default for PairingViewState {
 
 impl PairingViewState {
     fn apply_connectivity(&mut self, snapshot: RemoteConnectivitySnapshot) {
+        let official_snapshot = snapshot
+            .method(RemoteConnectivityMethod::SelfHostedRelay)
+            .filter(|method| {
+                entry_owns_relay_snapshot(
+                    RemoteAccessEntry::OfficialRelay,
+                    method.origin.as_deref(),
+                )
+            });
+        let official_exhausted = official_snapshot.is_some_and(|method| {
+            method.error_code.as_deref()
+                == Some(vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str())
+        });
+        let official_online =
+            official_snapshot.is_some_and(|method| method.state == RemoteMethodState::Online);
         self.connectivity = Some(snapshot);
+        if official_exhausted {
+            self.set_official_relay_limit_exceeded(true);
+        } else if official_online {
+            self.set_official_relay_limit_exceeded(false);
+        }
+    }
+
+    fn is_connection_entry_selectable(&self, entry: RemoteAccessEntry) -> bool {
+        !(entry == RemoteAccessEntry::OfficialRelay && self.official_relay_limit_exceeded)
+    }
+
+    fn fallback_connection_entry(&self) -> RemoteAccessEntry {
+        if let Some(connectivity) = self.connectivity.as_ref() {
+            if connectivity
+                .method(RemoteConnectivityMethod::TailscaleServe)
+                .is_some_and(|method| method.state == RemoteMethodState::Online)
+            {
+                return RemoteAccessEntry::TailscaleServe;
+            }
+            if connectivity
+                .method(RemoteConnectivityMethod::Direct)
+                .is_some_and(|method| method.state == RemoteMethodState::Online)
+            {
+                return RemoteAccessEntry::Direct;
+            }
+            if connectivity
+                .method(RemoteConnectivityMethod::SelfHostedRelay)
+                .is_some_and(|method| {
+                    method.state == RemoteMethodState::Online
+                        && entry_owns_relay_snapshot(
+                            RemoteAccessEntry::SelfHostedRelay,
+                            method.origin.as_deref(),
+                        )
+                })
+            {
+                return RemoteAccessEntry::SelfHostedRelay;
+            }
+        }
+        RemoteAccessEntry::LocalNetwork
+    }
+
+    fn set_official_relay_limit_exceeded(&mut self, exceeded: bool) {
+        self.official_relay_limit_exceeded = exceeded;
+        if exceeded && self.selected_entry == RemoteAccessEntry::OfficialRelay {
+            let fallback = self.fallback_connection_entry();
+            if ADVANCED_CONNECTION_ENTRIES.contains(&fallback) {
+                self.advanced_methods_expanded = true;
+            }
+            self.select_connection_entry(fallback);
+        }
+    }
+
+    fn connection_entry_status(&self, entry: RemoteAccessEntry) -> (&'static str, ColorName) {
+        if entry == RemoteAccessEntry::LocalNetwork {
+            if self.active_zero_config_window.is_some() {
+                return (
+                    locale::text("Discovering", "发现中", "發現中"),
+                    ColorName::Green,
+                );
+            }
+            return (
+                locale::text("On demand", "按需开启", "按需開啟"),
+                ColorName::Neutral,
+            );
+        }
+        if entry == RemoteAccessEntry::OfficialRelay && self.official_relay_limit_exceeded {
+            return (relay_traffic_limit_exceeded_pill_label(), ColorName::Red);
+        }
+        let Some(method) = entry.remote_method() else {
+            return (
+                method_state_label(RemoteMethodState::Disabled),
+                ColorName::Neutral,
+            );
+        };
+        let snapshot = self
+            .connectivity
+            .as_ref()
+            .and_then(|connectivity| connectivity.method(method));
+        // The relay method backs two rows, so a row only reports a relay that is
+        // its own: the official row reports the built-in origin, and the
+        // self-hosted row reports an operator address. Otherwise enabling the
+        // built-in relay would light up the self-hosted row too.
+        let owns_snapshot =
+            entry_owns_relay_snapshot(entry, snapshot.and_then(|s| s.origin.as_deref()));
+        if owns_snapshot
+            && snapshot.and_then(|s| s.error_code.as_deref())
+                == Some(vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str())
+        {
+            return (relay_traffic_limit_exceeded_pill_label(), ColorName::Red);
+        }
+        let state = if owns_snapshot {
+            snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
+        } else {
+            RemoteMethodState::Disabled
+        };
+        (method_state_label(state), method_state_color(state))
     }
 
     fn show_setup(&mut self) {
@@ -530,6 +643,9 @@ impl PairingViewState {
     }
 
     fn select_connection_entry(&mut self, entry: RemoteAccessEntry) {
+        if !self.is_connection_entry_selectable(entry) {
+            return;
+        }
         if let Some(method) = entry.remote_method() {
             self.selected_method = method;
         }
@@ -668,6 +784,7 @@ pub(crate) struct RemoteAccessPairing {
     direct_origin: Entity<InputState>,
     relay_origin: Entity<InputState>,
     refresh_task: Option<Task<()>>,
+    official_relay_probe_task: Option<Task<()>>,
     devices_task: Option<Task<()>>,
     revoke_task: Option<Task<()>>,
     restore_task: Option<Task<()>>,
@@ -726,6 +843,7 @@ impl RemoteAccessPairing {
             direct_origin,
             relay_origin,
             refresh_task: None,
+            official_relay_probe_task: None,
             devices_task: None,
             revoke_task: None,
             restore_task: None,
@@ -774,6 +892,9 @@ impl RemoteAccessPairing {
                 display_name,
             } => self.rename_device(device_id, display_name, cx),
             RemoteAccessAction::SelectConnectionEntry(entry) => {
+                if !self.state.is_connection_entry_selectable(entry) {
+                    return;
+                }
                 // Selecting a folded entry means the user wants to see it, so
                 // the section opens rather than hiding the selection again.
                 if ADVANCED_CONNECTION_ENTRIES.contains(&entry) {
@@ -821,6 +942,7 @@ impl RemoteAccessPairing {
 
     fn refresh(&mut self, cx: &mut Context<Self>) {
         self.refresh_devices(cx);
+        self.refresh_official_relay_quota(cx);
         let controller = self.controller.clone();
         let runner = gpui_tokio::Tokio::spawn(cx, async move { controller.snapshot().await });
         self.refresh_task = Some(cx.spawn(
@@ -836,6 +958,39 @@ impl RemoteAccessPairing {
                         }
                     }
                     cx.notify();
+                });
+            },
+        ));
+    }
+
+    /// Probes the built-in official relay to check whether its cumulative traffic
+    /// quota has been reached so the setup row can be disabled immediately when
+    /// the dialog opens.
+    fn refresh_official_relay_quota(&mut self, cx: &mut Context<Self>) {
+        let controller = self.controller.clone();
+        let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let info = controller
+                .probe_relay_info(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN)
+                .await?;
+            let snapshot = if info.traffic_quota.exceeded {
+                Some(controller.snapshot().await)
+            } else {
+                None
+            };
+            Ok::<_, VibexError>((info.traffic_quota.exceeded, snapshot))
+        });
+        self.official_relay_probe_task = Some(cx.spawn(
+            async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                let outcome = runner.await;
+                let _ = entity.update(cx, |this, cx| {
+                    this.official_relay_probe_task = None;
+                    if let Ok(Ok((exceeded, snapshot))) = outcome {
+                        if let Some(snapshot) = snapshot {
+                            this.state.apply_connectivity(snapshot);
+                        }
+                        this.state.set_official_relay_limit_exceeded(exceeded);
+                        cx.notify();
+                    }
                 });
             },
         ));
@@ -1528,7 +1683,16 @@ impl RemoteAccessPairing {
                                 "區域網路配對已停止",
                             )));
                         }
-                        Ok(Err(error)) => this.state.error_code = Some(error.code),
+                        Ok(Err(error)) => {
+                            if error.code
+                                == vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str()
+                                && this.state.selected_entry == RemoteAccessEntry::OfficialRelay
+                            {
+                                this.state.set_official_relay_limit_exceeded(true);
+                                this.refresh(cx);
+                            }
+                            this.state.error_code = Some(error.code);
+                        }
                         Err(_) => {
                             this.state.error_code = Some("remote_access_task_failed".to_string())
                         }
@@ -1571,6 +1735,17 @@ impl RemoteAccessPairing {
                 // The built-in entry is the built-in origin, full stop. It has no
                 // editor on screen, so letting the self-hosted field decide what
                 // it enables would make an invisible input the real setting.
+                if self.state.selected_entry.uses_builtin_relay_origin()
+                    && self.state.official_relay_limit_exceeded
+                {
+                    self.state.error_code = Some(
+                        vibex_core::RelayErrorCode::TrafficLimitExceeded
+                            .as_str()
+                            .to_string(),
+                    );
+                    cx.notify();
+                    return;
+                }
                 let origin = if self.state.selected_entry.uses_builtin_relay_origin() {
                     Ok(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string())
                 } else {
@@ -2934,8 +3109,9 @@ impl RemoteAccessPairing {
         entry: RemoteAccessEntry,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        let selected = self.state.selected_entry == entry;
-        let disabled = self.has_active_pairing();
+        let entry_disabled = !self.state.is_connection_entry_selectable(entry);
+        let selected = !entry_disabled && self.state.selected_entry == entry;
+        let disabled = self.has_active_pairing() || entry_disabled;
         let entity = cx.weak_entity();
         let keyboard_entity = entity.clone();
         let action = RemoteAccessAction::SelectConnectionEntry(entry);
@@ -2968,17 +3144,18 @@ impl RemoteAccessPairing {
             })
             .px_3()
             .py_2()
-            .cursor_pointer()
             .focusable()
             .tab_stop(!disabled)
             .role(Role::Button)
             .aria_label(accessibility_label)
             .aria_selected(selected)
-            .hover(|style| {
-                style.bg(if selected {
-                    cx.theme().primary.opacity(0.10)
-                } else {
-                    cx.theme().accent
+            .when(!disabled, |row| {
+                row.cursor_pointer().hover(|style| {
+                    style.bg(if selected {
+                        cx.theme().primary.opacity(0.10)
+                    } else {
+                        cx.theme().accent
+                    })
                 })
             })
             .focus_visible(|style| {
@@ -3080,41 +3257,7 @@ impl RemoteAccessPairing {
     }
 
     fn connection_entry_status(&self, entry: RemoteAccessEntry) -> (&'static str, ColorName) {
-        if entry == RemoteAccessEntry::LocalNetwork {
-            if self.state.active_zero_config_window.is_some() {
-                return (
-                    locale::text("Discovering", "发现中", "發現中"),
-                    ColorName::Green,
-                );
-            }
-            return (
-                locale::text("On demand", "按需开启", "按需開啟"),
-                ColorName::Neutral,
-            );
-        }
-        let Some(method) = entry.remote_method() else {
-            return (
-                method_state_label(RemoteMethodState::Disabled),
-                ColorName::Neutral,
-            );
-        };
-        let snapshot = self
-            .state
-            .connectivity
-            .as_ref()
-            .and_then(|connectivity| connectivity.method(method));
-        // The relay method backs two rows, so a row only reports a relay that is
-        // its own: the official row reports the built-in origin, and the
-        // self-hosted row reports an operator address. Otherwise enabling the
-        // built-in relay would light up the self-hosted row too.
-        let owns_snapshot =
-            entry_owns_relay_snapshot(entry, snapshot.and_then(|s| s.origin.as_deref()));
-        let state = if owns_snapshot {
-            snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
-        } else {
-            RemoteMethodState::Disabled
-        };
-        (method_state_label(state), method_state_color(state))
+        self.state.connection_entry_status(entry)
     }
 
     fn render_connection_detail_panel(
@@ -3147,12 +3290,7 @@ impl RemoteAccessPairing {
         );
         let desired_enabled =
             snapshot.is_some_and(|snapshot| snapshot.desired_enabled) && owns_snapshot;
-        let state = if owns_snapshot {
-            snapshot.map_or(RemoteMethodState::Disabled, |snapshot| snapshot.state)
-        } else {
-            RemoteMethodState::Disabled
-        };
-        let status_color = method_state_color(state);
+        let (status_label, status_color) = self.connection_entry_status(entry);
         let recovery = snapshot.map_or(RemoteRecoveryAction::None, |snapshot| {
             snapshot.recovery_action
         });
@@ -3199,7 +3337,7 @@ impl RemoteAccessPairing {
                                     .font_semibold()
                                     .child(connection_entry_name(entry)),
                             )
-                            .child(status_pill(method_state_label(state), status_color)),
+                            .child(status_pill(status_label, status_color)),
                     )
                     .child(
                         div()
@@ -5121,6 +5259,14 @@ fn device_list_empty_state(cx: &App) -> AnyElement {
         .into_any_element()
 }
 
+fn relay_traffic_limit_exceeded_pill_label() -> &'static str {
+    locale::text(
+        "Unavailable: limit reached",
+        "不可用：已达最大限额",
+        "不可用：已達最大限額",
+    )
+}
+
 fn method_state_label(state: RemoteMethodState) -> &'static str {
     match state {
         RemoteMethodState::Disabled => locale::text("Off", "未启用", "未啟用"),
@@ -5178,6 +5324,11 @@ fn remote_error_label(code: &str) -> &'static str {
             "Enter a valid HTTPS origin",
             "请输入有效的 HTTPS 地址",
             "請輸入有效的 HTTPS 位址",
+        ),
+        "relay_traffic_limit_exceeded" | "official_relay_traffic_limit_exceeded" => locale::text(
+            "Relay unavailable: traffic limit reached",
+            "中继服务不可用：已达最大限额",
+            "中繼服務不可用：已達最大限額",
         ),
         "tailscale_not_found" | "tailscale_daemon_offline" | "tailscale_dns_unavailable" => {
             locale::text(
@@ -5716,6 +5867,83 @@ mod tests {
         assert_eq!(state.page, RemoteAccessPage::Pairing);
         state.show_setup();
         assert_eq!(state.page, RemoteAccessPage::Setup);
+    }
+
+    #[test]
+    fn official_relay_traffic_limit_disables_row_and_falls_back_selection() {
+        let mut state = PairingViewState::default();
+        assert_eq!(state.selected_entry, RemoteAccessEntry::OfficialRelay);
+        assert!(state.is_connection_entry_selectable(RemoteAccessEntry::OfficialRelay));
+
+        state.set_official_relay_limit_exceeded(true);
+        assert!(!state.is_connection_entry_selectable(RemoteAccessEntry::OfficialRelay));
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+
+        // Attempting to re-select the exhausted official relay is ignored.
+        state.select_connection_entry(RemoteAccessEntry::OfficialRelay);
+        assert_eq!(state.selected_entry, RemoteAccessEntry::LocalNetwork);
+
+        let (pill_label, pill_color) =
+            state.connection_entry_status(RemoteAccessEntry::OfficialRelay);
+        assert_eq!(pill_label, relay_traffic_limit_exceeded_pill_label());
+        assert_eq!(pill_color, ColorName::Red);
+
+        // When another route (such as Tailscale) is online, fallback prefers it.
+        let mut state_with_tailscale = PairingViewState::default();
+        let mut snapshot = connectivity(None);
+        for method in &mut snapshot.methods {
+            if method.method == RemoteConnectivityMethod::TailscaleServe {
+                method.desired_enabled = true;
+                method.state = RemoteMethodState::Online;
+                method.candidate_available = true;
+            }
+            if method.method == RemoteConnectivityMethod::SelfHostedRelay {
+                method.desired_enabled = true;
+                method.state = RemoteMethodState::Error;
+                method.origin = Some(vibex_core::REMOTE_OFFICIAL_RELAY_ORIGIN.to_string());
+                method.error_code = Some(
+                    vibex_core::RelayErrorCode::TrafficLimitExceeded
+                        .as_str()
+                        .to_string(),
+                );
+            }
+        }
+        state_with_tailscale.apply_connectivity(snapshot);
+        assert!(state_with_tailscale.official_relay_limit_exceeded);
+        assert_eq!(
+            state_with_tailscale.selected_entry,
+            RemoteAccessEntry::TailscaleServe
+        );
+        let (pill_label, pill_color) =
+            state_with_tailscale.connection_entry_status(RemoteAccessEntry::OfficialRelay);
+        assert_eq!(pill_label, relay_traffic_limit_exceeded_pill_label());
+        assert_eq!(pill_color, ColorName::Red);
+
+        // A self-hosted relay that hits its own limit also reports the limit pill
+        // while staying selectable so the operator can edit the URL or disable it.
+        let mut self_hosted_state = PairingViewState::default();
+        let mut self_hosted_snapshot = connectivity(None);
+        for method in &mut self_hosted_snapshot.methods {
+            if method.method == RemoteConnectivityMethod::SelfHostedRelay {
+                method.desired_enabled = true;
+                method.state = RemoteMethodState::Error;
+                method.origin = Some("https://relay.example.com".to_string());
+                method.error_code = Some(
+                    vibex_core::RelayErrorCode::TrafficLimitExceeded
+                        .as_str()
+                        .to_string(),
+                );
+            }
+        }
+        self_hosted_state.apply_connectivity(self_hosted_snapshot);
+        assert!(!self_hosted_state.official_relay_limit_exceeded);
+        assert!(
+            self_hosted_state.is_connection_entry_selectable(RemoteAccessEntry::SelfHostedRelay)
+        );
+        let (self_pill, self_color) =
+            self_hosted_state.connection_entry_status(RemoteAccessEntry::SelfHostedRelay);
+        assert_eq!(self_pill, relay_traffic_limit_exceeded_pill_label());
+        assert_eq!(self_color, ColorName::Red);
     }
 
     #[test]

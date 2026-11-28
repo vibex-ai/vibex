@@ -87,6 +87,8 @@ pub struct RelayClientStatus {
     pub last_heartbeat_ack_ms: Option<i64>,
     pub reconnect_attempt: u32,
     pub next_retry_at_ms: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_error_code: Option<String>,
     pub last_error: Option<String>,
     pub pc_public_key: String,
 }
@@ -102,6 +104,7 @@ impl RelayClientStatus {
             last_heartbeat_ack_ms: None,
             reconnect_attempt: 0,
             next_retry_at_ms: None,
+            last_error_code: None,
             last_error: None,
             pc_public_key: String::new(),
         }
@@ -114,6 +117,24 @@ impl RelayClientStatus {
         next_retry_at_ms: Option<i64>,
         last_error: Option<String>,
     ) -> Self {
+        Self::with_error(
+            settings,
+            state,
+            reconnect_attempt,
+            next_retry_at_ms,
+            None,
+            last_error,
+        )
+    }
+
+    fn with_error(
+        settings: &RelayClientSettings,
+        state: RelayClientConnectionState,
+        reconnect_attempt: u32,
+        next_retry_at_ms: Option<i64>,
+        last_error_code: Option<String>,
+        last_error: Option<String>,
+    ) -> Self {
         Self {
             state,
             room_id: settings.room_id.clone(),
@@ -124,6 +145,7 @@ impl RelayClientStatus {
             last_heartbeat_ack_ms: None,
             reconnect_attempt,
             next_retry_at_ms,
+            last_error_code,
             last_error,
             pc_public_key: String::new(),
         }
@@ -408,6 +430,19 @@ impl RelayClientRuntime {
                 .await;
             match exit {
                 RelayLoopExit::Stopped => return,
+                RelayLoopExit::Fatal { code, message } => {
+                    eprintln!("vibex relay: stopped with fatal error ({code}): {message}");
+                    self.set_status(RelayClientStatus::with_error(
+                        &settings,
+                        RelayClientConnectionState::Error,
+                        reconnect_attempt,
+                        None,
+                        Some(code),
+                        Some(message),
+                    ))
+                    .await;
+                    return;
+                }
                 RelayLoopExit::Disconnected(reason) => {
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     let delay_ms = reconnect_delay_ms(&settings, reconnect_attempt);
@@ -459,7 +494,17 @@ impl RelayClientRuntime {
         };
         let (ws_stream, _) = match connect_result {
             Ok(connected) => connected,
-            Err(err) => return RelayLoopExit::Disconnected(redact_error(err.to_string())),
+            Err(err) => {
+                if let Some(relay_error) = parse_ws_handshake_relay_error(&err)
+                    && relay_error.code == RelayErrorCode::TrafficLimitExceeded
+                {
+                    return RelayLoopExit::Fatal {
+                        code: relay_error.code.as_str().to_string(),
+                        message: redact_error(relay_error.message),
+                    };
+                }
+                return RelayLoopExit::Disconnected(redact_error(err.to_string()));
+            }
         };
         let (mut writer, mut reader) = ws_stream.split();
         let hello = RelayControlMessage::Hello(RelayHandshakeHello::new(
@@ -588,12 +633,21 @@ impl RelayClientRuntime {
                         }
                         continue;
                     }
-                    if let Ok(RelayControlMessage::HeartbeatAck(ack)) =
-                        serde_json::from_str::<RelayControlMessage>(&message)
-                    {
-                        let mut status = self.inner.status.lock().await;
-                        status.last_heartbeat_ack_ms = Some(ack.acknowledged_at_ms);
-                        status.state = RelayClientConnectionState::Connected;
+                    match serde_json::from_str::<RelayControlMessage>(&message) {
+                        Ok(RelayControlMessage::HeartbeatAck(ack)) => {
+                            let mut status = self.inner.status.lock().await;
+                            status.last_heartbeat_ack_ms = Some(ack.acknowledged_at_ms);
+                            status.state = RelayClientConnectionState::Connected;
+                        }
+                        Ok(RelayControlMessage::Error(err))
+                            if err.code == RelayErrorCode::TrafficLimitExceeded =>
+                        {
+                            return RelayLoopExit::Fatal {
+                                code: err.code.as_str().to_string(),
+                                message: redact_error(err.message),
+                            };
+                        }
+                        _ => {}
                     }
                 }
             }
@@ -1328,6 +1382,17 @@ impl RelayClientRuntime {
 enum RelayLoopExit {
     Stopped,
     Disconnected(String),
+    Fatal { code: String, message: String },
+}
+
+fn parse_ws_handshake_relay_error(
+    err: &tokio_tungstenite::tungstenite::Error,
+) -> Option<RelayError> {
+    let tokio_tungstenite::tungstenite::Error::Http(response) = err else {
+        return None;
+    };
+    let body = response.body().as_ref()?;
+    serde_json::from_slice::<RelayError>(body).ok()
 }
 
 fn normalize_optional_url(value: Option<String>) -> VibexResult<Option<String>> {
@@ -1946,6 +2011,64 @@ mod tests {
                 .crypto
                 .compress_outbound()
         );
+    }
+
+    #[tokio::test]
+    async fn ws_handshake_traffic_limit_exceeded_stops_with_error_code() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut buf = [0_u8; 1024];
+            let _ = stream.read(&mut buf).await;
+            let body = serde_json::to_string(&RelayError::new(
+                RelayErrorCode::TrafficLimitExceeded,
+                "Relay traffic limit has been reached",
+            ))
+            .unwrap();
+            let response = format!(
+                "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+
+        let runtime = RelayClientRuntime::new(RemoteDispatcher::new(
+            RemoteServiceConfig::loopback_disabled(),
+        ));
+        runtime
+            .update_settings(RelayClientSettingsUpdate {
+                enabled: Some(true),
+                relay_url: Some(Some(format!("http://{addr}"))),
+                reconnect_initial_ms: Some(50),
+                reconnect_max_ms: Some(100),
+                ..RelayClientSettingsUpdate::default()
+            })
+            .await
+            .unwrap();
+        runtime.start().await.unwrap();
+
+        let status = tokio::time::timeout(Duration::from_secs(3), async {
+            loop {
+                let status = runtime.get_status().await;
+                if status.state == RelayClientConnectionState::Error {
+                    return status;
+                }
+                tokio::time::sleep(Duration::from_millis(15)).await;
+            }
+        })
+        .await
+        .unwrap();
+
+        assert_eq!(status.state, RelayClientConnectionState::Error);
+        assert_eq!(
+            status.last_error_code.as_deref(),
+            Some(RelayErrorCode::TrafficLimitExceeded.as_str())
+        );
+        let _ = server.await;
+        let _ = runtime.stop().await;
     }
 
     fn cleanup_db(path: std::path::PathBuf) {

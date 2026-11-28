@@ -1935,6 +1935,16 @@ pub(crate) fn error_text(error: &BackendError) -> SharedString {
             "保存的凭据与这台手机不匹配。",
             "儲存的憑證與這台手機不相符。",
         ),
+        code if code == vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE => copy::text(
+            "Official relay unavailable: traffic limit reached",
+            "官方中继不可用：已达最大限额",
+            "官方中繼不可用：已達最大限額",
+        ),
+        code if code == vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str() => copy::text(
+            "Relay unavailable: traffic limit reached",
+            "中继服务不可用：已达最大限额",
+            "中繼服務不可用：已達最大限額",
+        ),
         _ if error.kind == vibex_backend::BackendErrorKind::Offline => copy::text(
             "The runtime could not be reached.",
             "无法连接到运行时。",
@@ -2243,5 +2253,48 @@ mod tests {
                 option.key
             );
         }
+    }
+
+    #[component]
+    fn RelayTrafficLimitErrorTextProbe() -> impl IntoElement {
+        let official = BackendError::offline(
+            vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE,
+            "relay traffic limit reached",
+        );
+        let official_text = error_text(&official);
+        assert!(
+            matches!(
+                official_text.as_ref(),
+                "Official relay unavailable: traffic limit reached"
+                    | "官方中继不可用：已达最大限额"
+                    | "官方中繼不可用：已達最大限額"
+            ),
+            "unexpected official relay error text: {official_text}"
+        );
+
+        let self_hosted = BackendError::offline(
+            vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str(),
+            "relay traffic limit reached",
+        );
+        let self_hosted_text = error_text(&self_hosted);
+        assert!(
+            matches!(
+                self_hosted_text.as_ref(),
+                "Relay unavailable: traffic limit reached"
+                    | "中继服务不可用：已达最大限额"
+                    | "中繼服務不可用：已達最大限額"
+            ),
+            "unexpected self-hosted relay error text: {self_hosted_text}"
+        );
+        text("relay-traffic-limit-error-text-ok")
+    }
+
+    #[test]
+    fn error_text_formats_relay_traffic_limit_codes() {
+        let config = nsh_engine::EngineConfig::new(nsh_engine::Root::of::<
+            RelayTrafficLimitErrorTextProbe,
+        >());
+        let mut app = nsh_testing::Headless::start(config).unwrap();
+        app.wait_for("relay-traffic-limit-error-text-ok").unwrap();
     }
 }

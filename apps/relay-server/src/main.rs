@@ -10,6 +10,11 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!("vibex-relay-server");
         println!("  VIBEX_RELAY_BIND_ADDR=127.0.0.1:9700");
         println!("  RELAY_PORT=9700");
+        println!(
+            "  VIBEX_RELAY_MAX_TRAFFIC_BYTES=<bytes|KB|MB|GB|TB> (optional, disabled by default)"
+        );
+        println!("  VIBEX_RELAY_TRAFFIC_LIMIT_MODE=monthly|total (default: monthly)");
+        println!("  VIBEX_RELAY_TRAFFIC_STATE_PATH=<path> (optional JSON state file)");
         return Ok(());
     }
 
@@ -18,7 +23,8 @@ async fn main() -> Result<(), Box<dyn Error>> {
     // its desktop, and they were all dropped: the crate emits `tracing` events
     // but installs no subscriber. Default to warnings on stderr, overridable
     // with VIBEX_RELAY_LOG.
-    let filter = std::env::var("VIBEX_RELAY_LOG").unwrap_or_else(|_| "vibex_relay_server=info,warn".to_string());
+    let filter = std::env::var("VIBEX_RELAY_LOG")
+        .unwrap_or_else(|_| "vibex_relay_server=info,warn".to_string());
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_writer(std::io::stderr)

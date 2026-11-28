@@ -1978,24 +1978,28 @@ impl SessionService {
                     (self.on_runtime_renamed)(name);
                 }
             }
-            let failed = match &connected {
-                Ok(Ok(_)) => false,
+            let (failed, wait_for_manual_retry) = match &connected {
+                Ok(Ok(_)) => (false, false),
                 Ok(Err(error)) => {
                     self.connection.set(ConnectionState::Offline);
                     self.connection_error.set(Some(error_text(error)));
-                    true
+                    (true, Self::is_relay_traffic_limit_error(error))
                 }
                 Err(error) => {
                     self.connection.set(ConnectionState::Offline);
                     self.connection_error.set(Some(
                         format!("connecting to the runtime did not finish: {error}").into(),
                     ));
-                    true
+                    (true, false)
                 }
             };
             if failed {
-                delay = (delay * 2).min(RECONNECT_MAX_MS);
-                self.wait_before_retry(delay).await;
+                if wait_for_manual_retry {
+                    self.wait_for_retry_request().await;
+                } else {
+                    delay = (delay * 2).min(RECONNECT_MAX_MS);
+                    self.wait_before_retry(delay).await;
+                }
                 continue;
             }
             let subscription = match self.backend.subscribe() {
@@ -2092,6 +2096,18 @@ impl SessionService {
                 break;
             }
         }
+    }
+
+    /// Waits until the user explicitly triggers a retry or the service stops.
+    async fn wait_for_retry_request(&self) {
+        while self.alive.get() && !self.retry_now.get() {
+            timer(Duration::from_millis(500)).await;
+        }
+    }
+
+    fn is_relay_traffic_limit_error(error: &BackendError) -> bool {
+        error.code == vibex_core::OFFICIAL_RELAY_TRAFFIC_LIMIT_EXCEEDED_CODE
+            || error.code == vibex_core::RelayErrorCode::TrafficLimitExceeded.as_str()
     }
 
     /// Lists the runtime's sessions, workspaces, and sidebar layout.
