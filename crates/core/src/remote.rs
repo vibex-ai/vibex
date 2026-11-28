@@ -546,6 +546,7 @@ pub enum RemoteAgentOperationKind {
     ArchiveSession,
     UnarchiveSession,
     DeleteSession,
+    RestartTerminalSession,
     ForkSession,
     FetchTimeline,
     FetchTimelineItem,
@@ -709,6 +710,12 @@ pub struct RemoteAgentSessionActionResponse {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct RemoteAgentUnarchiveSessionResponse {
+    pub session: AgentSession,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteAgentRestartTerminalSessionResponse {
     pub session: AgentSession,
 }
 
@@ -1476,6 +1483,7 @@ pub enum RemoteAgentRequest {
     ArchiveSession(RemoteAgentSessionActionRequest),
     UnarchiveSession(RemoteAgentSessionActionRequest),
     DeleteSession(RemoteAgentSessionActionRequest),
+    RestartTerminalSession(RemoteAgentSessionActionRequest),
     FetchTimeline(RemoteAgentTimelineFetchRequest),
     FetchTimelineItem(RemoteAgentTimelineItemFetchRequest),
     FetchTurnIndex(RemoteAgentTurnIndexFetchRequest),
@@ -1545,6 +1553,7 @@ impl RemoteAgentRequest {
             Self::ArchiveSession(_) => RemoteAgentOperationKind::ArchiveSession,
             Self::UnarchiveSession(_) => RemoteAgentOperationKind::UnarchiveSession,
             Self::DeleteSession(_) => RemoteAgentOperationKind::DeleteSession,
+            Self::RestartTerminalSession(_) => RemoteAgentOperationKind::RestartTerminalSession,
             Self::FetchTimeline(_) => RemoteAgentOperationKind::FetchTimeline,
             Self::FetchTimelineItem(_) => RemoteAgentOperationKind::FetchTimelineItem,
             Self::FetchTurnIndex(_) => RemoteAgentOperationKind::FetchTurnIndex,
@@ -5927,11 +5936,19 @@ mod tests {
             ),
             (
                 RemoteAgentRequest::DeleteSession(RemoteAgentSessionActionRequest {
-                    auth,
-                    session_id,
+                    auth: auth.clone(),
+                    session_id: session_id.clone(),
                 }),
                 RemoteAgentOperationKind::DeleteSession,
                 "delete_session",
+            ),
+            (
+                RemoteAgentRequest::RestartTerminalSession(RemoteAgentSessionActionRequest {
+                    auth,
+                    session_id,
+                }),
+                RemoteAgentOperationKind::RestartTerminalSession,
+                "restart_terminal_session",
             ),
         ];
 

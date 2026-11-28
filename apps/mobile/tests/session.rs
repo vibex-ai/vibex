@@ -23,12 +23,13 @@ use vibex_mobile_ui::screens::session::{
     PendingQuestion, PermissionChoice, PermissionOption, PlanStepState, PlanStepView, PlanView,
     QuestionField, QuestionFieldKind, QueuedMessageView, RuntimeChoiceView, RuntimeOptionView,
     RuntimePickerHost, RuntimeSummaryView, SessionHost, SessionState, SessionSummary,
-    SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView, SidebarTree,
-    TimelineEntry, TokenUsageView, TurnFileChange,
+    SessionTerminalHost, SidebarRowKind, SidebarRowView, SidebarSectionKind, SidebarSectionView,
+    SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
 };
 use vibex_mobile_ui::screens::team::TeamTaskView;
-use vibex_mobile_ui::screens::terminal::TerminalChoice;
-use vibex_mobile_ui::screens::terminal::{Terminal, TerminalApi};
+use vibex_mobile_ui::screens::terminal::{
+    Terminal, TerminalApi, TerminalChoice, TerminalSessionStopped,
+};
 use vibex_mobile_ui::theme;
 
 const COMPOSER: &str = "text:/ commands @files & refs $skills";
@@ -1494,6 +1495,22 @@ fn host_with(pending: Option<PendingPermission>, question: Option<PendingQuestio
         on_toggle_detail: Rc::new(|_, _| {}),
         on_fork: Rc::new(|_| {}),
         on_load_older: Rc::new(|| {}),
+        session_terminal: SessionTerminalHost {
+            visible: signal(false),
+            title: signal(Some("Agent terminal".into())),
+            error: signal(None),
+            term_ref: component_ref::<Terminal>(),
+            active: signal(Some("session-term-1".to_owned())),
+            busy: signal(false),
+            output_revision: signal(0),
+            stopped: signal(None),
+            restarting: signal(false),
+            on_data: Rc::new(|_| {}),
+            on_resize: Rc::new(|_, _| {}),
+            on_title: Rc::new(|_| {}),
+            on_retry: Rc::new(|| {}),
+            on_restart: Rc::new(|| {}),
+        },
         terminal_open,
         terminal_visible: signal(false),
         terminal_title,
@@ -3126,6 +3143,24 @@ fn AgentTerminalShell() -> impl IntoElement {
 }
 
 #[component]
+fn StoppedAgentTerminalShell() -> impl IntoElement {
+    let mut host = host_with(None, None);
+    host.sessions.update(|sessions| sessions[0].terminal = true);
+    host.timeline.set(Vec::new());
+    host.session_terminal.active.set(None);
+    host.session_terminal
+        .stopped
+        .set(Some(TerminalSessionStopped::Exited));
+    let stopped = host.session_terminal.stopped;
+    let active = host.session_terminal.active;
+    host.session_terminal.on_restart = Rc::new(move || {
+        stopped.set(None);
+        active.set(Some("session-term-restarted".to_owned()));
+    });
+    session::session(host)
+}
+
+#[component]
 fn FailedConversationShell() -> impl IntoElement {
     let mut host = host_with(None, None);
     host.timeline.set(Vec::new());
@@ -3303,14 +3338,44 @@ fn back_closes_the_drawer_menu_before_the_drawer() {
 }
 
 #[test]
-fn a_terminal_session_opens_the_rail_without_an_acp_composer() {
+fn a_terminal_session_renders_in_main_view_with_independent_workbench() {
     let mut app = Headless::start(EngineConfig::new(Root::of::<AgentTerminalShell>())).unwrap();
-    app.wait_for("role:button[Changes]").unwrap();
+    app.wait_for("id:session-terminal-panel").unwrap();
     app.wait_for("role:button[Find in terminal]").unwrap();
-    assert!(!app.screen().matches("role:button[Terminals]").unwrap());
-    app.press("role:button[Close]").unwrap();
-    app.wait_for("role:button[Open terminal]").unwrap();
+    assert!(
+        !app.screen().matches("role:button[Changes]").unwrap(),
+        "a native terminal session must stay on the main view instead of auto-opening the workbench"
+    );
+    assert!(
+        !app.screen().matches(COMPOSER).unwrap(),
+        "a native terminal session must not show the ACP message composer"
+    );
+    assert!(
+        !app.screen().matches("role:button[New terminal]").unwrap(),
+        "the main session terminal must not show workspace shell creation"
+    );
+    // The right-screen workbench still exposes Files, Changes, and an independent
+    // workspace Terminal surface.
+    app.press("role:button[Files, Git, and terminal]").unwrap();
+    app.wait_for("role:button[Files]").unwrap();
+    app.wait_for("role:button[Changes]").unwrap();
+    app.wait_for("role:button[Terminal]").unwrap();
+    app.press("role:button[Terminal]").unwrap();
+    app.wait_for("id:terminal-panel").unwrap();
+    app.wait_for("role:button[New terminal]").unwrap();
+}
+
+#[test]
+fn a_stopped_terminal_session_offers_restart_agent() {
+    let mut app =
+        Headless::start(EngineConfig::new(Root::of::<StoppedAgentTerminalShell>())).unwrap();
+    app.wait_for("The Agent has exited.").unwrap();
+    app.wait_for("role:button[Restart Agent]").unwrap();
     assert!(!app.screen().matches(COMPOSER).unwrap());
+    app.press("role:button[Restart Agent]").unwrap();
+    app.wait_for_gone("The Agent has exited.", std::time::Duration::from_secs(3))
+        .unwrap();
+    app.wait_for("id:session-terminal-panel").unwrap();
 }
 
 #[test]

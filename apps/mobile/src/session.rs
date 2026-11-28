@@ -63,7 +63,7 @@ use vibex_desktop_model::{
     SidebarProjectLogoColor, TimelineConversationTurn, TimelineModel, TimelineRow, TimelineRowKind,
 };
 use vibex_mobile_pairing::MobileCredentialBundle;
-use vibex_mobile_ui::screens::terminal::{Terminal, TerminalApi};
+use vibex_mobile_ui::screens::terminal::{Terminal, TerminalApi, TerminalSessionStopped};
 use vibex_mobile_ui::{
     copy,
     screens::connecting::ConnectionState,
@@ -82,8 +82,9 @@ use vibex_mobile_ui::{
         PlanStepState, PlanStepView, PlanView, QuestionAnswer, QuestionField, QuestionFieldKind,
         QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimePickerHost, RuntimeSummaryView, ScheduledSendView, SessionHost,
-        SessionState, SessionSummary, SidebarRowKind, SidebarRowView, SidebarSectionKind,
-        SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
+        SessionState, SessionSummary, SessionTerminalHost, SidebarRowKind, SidebarRowView,
+        SidebarSectionKind, SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
+        TurnFileChange,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -341,6 +342,21 @@ pub struct SessionService {
     armed_mentions: Rc<RefCell<Vec<(String, VibexUseMention)>>>,
     new_armed_command: Rc<RefCell<Option<AgentCommandEntry>>>,
     new_armed_mentions: Rc<RefCell<Vec<(String, VibexUseMention)>>>,
+    session_terminal_visible: Signal<bool>,
+    session_terminal_title: Signal<Option<SharedString>>,
+    session_terminal_error: Signal<Option<SharedString>>,
+    session_terminal_ref: ComponentRef<Terminal>,
+    session_terminal_id: Signal<Option<String>>,
+    session_terminal_busy: Signal<bool>,
+    session_terminal_output_revision: Signal<u64>,
+    session_terminal_stopped: Signal<Option<TerminalSessionStopped>>,
+    session_terminal_restarting: Signal<bool>,
+    session_terminal_size: Rc<Cell<Option<(u16, u16)>>>,
+    session_terminal_tx: Rc<RefCell<Option<mpsc::Sender<TerminalCommand>>>>,
+    session_terminal_stream: Rc<RefCell<Option<AbortHandle>>>,
+    session_terminal_writer: Rc<RefCell<Option<AbortHandle>>>,
+    session_terminal_generation: Rc<Cell<u64>>,
+    session_terminal_session_id: Rc<RefCell<Option<String>>>,
     terminal_open: Signal<bool>,
     terminal_visible: Signal<bool>,
     terminal_title: Signal<Option<SharedString>>,
@@ -695,6 +711,21 @@ impl SessionService {
             armed_mentions: Rc::new(RefCell::new(Vec::new())),
             new_armed_command: Rc::new(RefCell::new(None)),
             new_armed_mentions: Rc::new(RefCell::new(Vec::new())),
+            session_terminal_visible: signal(false),
+            session_terminal_title: signal(None),
+            session_terminal_error: signal(None),
+            session_terminal_ref: component_ref::<Terminal>(),
+            session_terminal_id: signal(None),
+            session_terminal_busy: signal(false),
+            session_terminal_output_revision: signal(0),
+            session_terminal_stopped: signal(None),
+            session_terminal_restarting: signal(false),
+            session_terminal_size: Rc::new(Cell::new(None)),
+            session_terminal_tx: Rc::new(RefCell::new(None)),
+            session_terminal_stream: Rc::new(RefCell::new(None)),
+            session_terminal_writer: Rc::new(RefCell::new(None)),
+            session_terminal_generation: Rc::new(Cell::new(0)),
+            session_terminal_session_id: Rc::new(RefCell::new(None)),
             terminal_open: signal(false),
             terminal_visible: signal(false),
             terminal_title: signal(None),
@@ -885,6 +916,7 @@ impl SessionService {
         self.notification_generation
             .set(self.notification_generation.get().wrapping_add(1));
         crate::host::set_keep_screen_on(false);
+        self.stop_session_terminal_tasks();
         self.stop_terminal_tasks();
         self.stash_active_session();
         self.stash_draft();
@@ -1049,6 +1081,43 @@ impl SessionService {
             on_arm_entry: {
                 let service = self.clone();
                 Rc::new(move |id: &str| service.arm_entry(id))
+            },
+            session_terminal: SessionTerminalHost {
+                visible: self.session_terminal_visible,
+                title: self.session_terminal_title,
+                error: self.session_terminal_error,
+                term_ref: self.session_terminal_ref,
+                active: self.session_terminal_id,
+                busy: self.session_terminal_busy,
+                output_revision: self.session_terminal_output_revision,
+                stopped: self.session_terminal_stopped,
+                restarting: self.session_terminal_restarting,
+                on_data: {
+                    let service = self.clone();
+                    Rc::new(move |data: &str| service.session_terminal_input(data))
+                },
+                on_resize: {
+                    let service = self.clone();
+                    Rc::new(move |cols: u32, rows: u32| service.session_terminal_resize(cols, rows))
+                },
+                on_title: {
+                    let service = self.clone();
+                    Rc::new(move |title: &str| {
+                        if !title.trim().is_empty() {
+                            service
+                                .session_terminal_title
+                                .set(Some(title.to_owned().into()));
+                        }
+                    })
+                },
+                on_retry: {
+                    let service = self.clone();
+                    Rc::new(move || service.retry_session_terminal())
+                },
+                on_restart: {
+                    let service = self.clone();
+                    Rc::new(move || service.restart_session_terminal())
+                },
             },
             terminal_open: self.terminal_open,
             terminal_visible: self.terminal_visible,
@@ -2130,11 +2199,23 @@ impl SessionService {
                     } else {
                         self.clear_active_session();
                     }
-                } else if self.runtime_state.borrow().is_none()
-                    && let Some(active) = self.active.get_untracked()
-                    && let Ok(session_id) = VibexSessionId::parse(active)
+                } else if let Some(active) = self.active.get_untracked()
+                    && let Ok(session_id) = VibexSessionId::parse(&active)
                 {
-                    self.refresh_runtime(&session_id);
+                    if let Some(active_session) =
+                        sessions.iter().find(|session| session.id == session_id)
+                        && active_session.is_terminal()
+                    {
+                        if self.session_terminal_session_id.borrow().as_deref()
+                            != Some(active_session.id.as_str())
+                        {
+                            self.open_session_terminal(&session_id);
+                        } else {
+                            self.apply_session_terminal_snapshot(active_session);
+                        }
+                    } else if self.runtime_state.borrow().is_none() {
+                        self.refresh_runtime(&session_id);
+                    }
                 }
                 self.connection.set(ConnectionState::Online);
                 self.connection_error.set(None);
@@ -2185,7 +2266,9 @@ impl SessionService {
                         .any(|session| session.state == SessionState::Running)
                 });
                 let awake = crate::settings::keep_screen_on()
-                    && (running || service.terminal_visible.get_untracked());
+                    && (running
+                        || service.terminal_visible.get_untracked()
+                        || service.session_terminal_visible.get_untracked());
                 crate::host::set_keep_screen_on(awake);
             }
         });
@@ -2361,33 +2444,27 @@ impl SessionService {
                 if self.active.get_untracked().as_deref() == Some(session.id.as_str())
                     && let Ok(session_id) = VibexSessionId::parse(session.id.as_str())
                 {
-                    if live_state {
-                        self.sending.set(false);
-                    }
-                    if session.is_terminal()
-                        && self.terminal_visible.get_untracked()
-                        && let Some(id) = session
-                            .terminal
+                    if session.is_terminal() {
+                        self.apply_session_terminal_snapshot(&session);
+                    } else {
+                        if live_state {
+                            self.sending.set(false);
+                        }
+                        self.publish();
+                        if !live_state || self.token_usage.get_untracked().is_none() {
+                            self.refresh_token_usage(&session_id);
+                        }
+                        let needs_runtime_refresh = self
+                            .runtime_state
+                            .borrow()
                             .as_ref()
-                            .and_then(|facts| facts.terminal_id.clone())
-                        && self.terminal_id.get_untracked().as_deref() != Some(id.as_str())
-                    {
-                        self.attach_terminal(id, session.title.clone());
-                    }
-                    self.publish();
-                    if !live_state || self.token_usage.get_untracked().is_none() {
-                        self.refresh_token_usage(&session_id);
-                    }
-                    let needs_runtime_refresh = self
-                        .runtime_state
-                        .borrow()
-                        .as_ref()
-                        .is_none_or(|state| state.desired.agent_id != session.agent_id);
-                    if needs_runtime_refresh {
-                        self.refresh_runtime_forced(&session_id, true);
-                    }
-                    if !live_state {
-                        self.flush_queue();
+                            .is_none_or(|state| state.desired.agent_id != session.agent_id);
+                        if needs_runtime_refresh {
+                            self.refresh_runtime_forced(&session_id, true);
+                        }
+                        if !live_state {
+                            self.flush_queue();
+                        }
                     }
                 } else {
                     self.note_background_session_updated(&session);
@@ -2429,14 +2506,18 @@ impl SessionService {
             BackendEvent::Lagged { refetch, .. } => {
                 self.connection.set(ConnectionState::Connecting);
                 self.mark_caches_stale_after_lag();
-                if let Some(session_id) = refetch.session_id.clone() {
-                    self.reload(&session_id);
-                    self.refresh_runtime_forced(&session_id, true);
-                } else if let Some(active) = self.active.get_untracked()
-                    && let Ok(session_id) = VibexSessionId::parse(active)
-                {
-                    self.reload(&session_id);
-                    self.refresh_runtime_forced(&session_id, true);
+                let target_session = refetch.session_id.clone().or_else(|| {
+                    self.active
+                        .get_untracked()
+                        .and_then(|active| VibexSessionId::parse(active).ok())
+                });
+                if let Some(session_id) = target_session {
+                    if self.is_terminal_session(session_id.as_str()) {
+                        self.open_session_terminal(&session_id);
+                    } else {
+                        self.reload(&session_id);
+                        self.refresh_runtime_forced(&session_id, true);
+                    }
                 }
                 self.refresh();
             }
@@ -2594,8 +2675,14 @@ impl SessionService {
             }
         }
 
+        self.reset_session_terminal();
         self.active.set(Some(session_id.as_str().to_owned()));
         self.clear_active_session_chrome();
+        if self.is_terminal_session(session_id.as_str()) {
+            self.conversation.set(ConversationState::Ready);
+            self.open_session_terminal(&session_id);
+            return;
+        }
         let restored = self.restore_cached_session(&session_id);
         let has_cached_items = !self.model.borrow().items.is_empty();
         if has_cached_items {
@@ -2622,6 +2709,7 @@ impl SessionService {
     /// Clears the active session pointer and all session-scoped composer,
     /// transcript, and sheet state.
     fn clear_active_session(&self) {
+        self.reset_session_terminal();
         self.active.set(None);
         self.draft.set(String::new());
         self.attachments.set(Vec::new());
@@ -8263,7 +8351,522 @@ impl SessionService {
         });
     }
 
-    /// Opens the workspace's terminal full-screen over the shell.
+    fn is_terminal_session(&self, session_id: &str) -> bool {
+        self.session_records
+            .with_untracked(|records| {
+                records
+                    .iter()
+                    .find(|session| session.id.as_str() == session_id)
+                    .map(AgentSession::is_terminal)
+            })
+            .unwrap_or_else(|| {
+                self.sessions.with_untracked(|sessions| {
+                    sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .is_some_and(|session| session.terminal)
+                })
+            })
+    }
+
+    fn update_session_snapshot(&self, session: &AgentSession) {
+        self.session_states
+            .borrow_mut()
+            .insert(session.id.as_str().to_owned(), session.state);
+        self.session_records.update(|records| {
+            if let Some(existing) = records
+                .iter_mut()
+                .find(|existing| existing.id == session.id)
+            {
+                *existing = session.clone();
+            } else {
+                records.insert(0, session.clone());
+            }
+        });
+        let row = self
+            .workspace_records
+            .with_untracked(|workspaces| summary(session, workspaces));
+        self.sessions.update(|sessions| {
+            if let Some(existing) = sessions.iter_mut().find(|existing| existing.id == row.id) {
+                *existing = row;
+            } else {
+                sessions.insert(0, row);
+            }
+        });
+    }
+
+    /// Loads the authoritative session snapshot and attaches the main-screen
+    /// native terminal Agent PTY (or shows its stopped/restart state).
+    fn open_session_terminal(&self, session_id: &VibexSessionId) {
+        self.stop_session_terminal_tasks();
+        *self.session_terminal_session_id.borrow_mut() = Some(session_id.as_str().to_owned());
+        self.session_terminal_busy.set(true);
+        self.session_terminal_error.set(None);
+        self.session_terminal_stopped.set(None);
+        self.session_terminal_restarting.set(false);
+        self.session_terminal_id.set(None);
+        let initial_title = self
+            .session_records
+            .with_untracked(|records| {
+                records
+                    .iter()
+                    .find(|session| session.id == *session_id)
+                    .map(|session| session.title.clone())
+            })
+            .or_else(|| {
+                self.sessions.with_untracked(|sessions| {
+                    sessions
+                        .iter()
+                        .find(|session| session.id == session_id.as_str())
+                        .map(|session| session.title.clone())
+                })
+            })
+            .unwrap_or_else(|| copy::text("Terminal", "终端", "終端").to_owned());
+        self.session_terminal_title.set(Some(initial_title.into()));
+        let generation = self.session_terminal_generation.get();
+        let target_id = session_id.clone();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        detach(async move {
+            let fetch_id = target_id.clone();
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.open_session(fetch_id).await })
+                .await;
+            if !service.alive.get()
+                || service.session_terminal_generation.get() != generation
+                || service.active.get_untracked().as_deref() != Some(target_id.as_str())
+            {
+                return;
+            }
+            service.session_terminal_busy.set(false);
+            match result {
+                Ok(Ok(session)) => {
+                    service.update_session_snapshot(&session);
+                    service.apply_session_terminal_snapshot(&session);
+                }
+                Ok(Err(error)) => {
+                    service.session_terminal_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.session_terminal_error.set(Some(
+                        format!("the session terminal did not open: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn apply_session_terminal_snapshot(&self, session: &AgentSession) {
+        if !session.is_terminal()
+            || self.active.get_untracked().as_deref() != Some(session.id.as_str())
+        {
+            return;
+        }
+        *self.session_terminal_session_id.borrow_mut() = Some(session.id.as_str().to_owned());
+        if self.session_terminal_title.with_untracked(Option::is_none) {
+            self.session_terminal_title
+                .set(Some(session.title.clone().into()));
+        }
+        match session.state {
+            AgentSessionState::Closed => {
+                self.set_session_terminal_stopped(TerminalSessionStopped::Exited, None);
+            }
+            AgentSessionState::Error => {
+                self.set_session_terminal_stopped(TerminalSessionStopped::Failed, None);
+            }
+            _ => {
+                let terminal_id = session
+                    .terminal
+                    .as_ref()
+                    .and_then(|facts| facts.terminal_id.clone());
+                if let Some(terminal_id) = terminal_id {
+                    self.session_terminal_stopped.set(None);
+                    self.session_terminal_restarting.set(false);
+                    let already_attached = self.session_terminal_id.get_untracked().as_deref()
+                        == Some(terminal_id.as_str())
+                        && self.session_terminal_error.with_untracked(Option::is_none)
+                        && self.session_terminal_stream.borrow().is_some();
+                    if !already_attached {
+                        self.attach_session_terminal(
+                            session.id.clone(),
+                            terminal_id,
+                            session.title.clone(),
+                        );
+                    }
+                } else {
+                    self.set_session_terminal_stopped(TerminalSessionStopped::NotRunning, None);
+                }
+            }
+        }
+    }
+
+    fn set_session_terminal_stopped(
+        &self,
+        reason: TerminalSessionStopped,
+        detail: Option<SharedString>,
+    ) {
+        self.stop_session_terminal_tasks();
+        self.session_terminal_busy.set(false);
+        self.session_terminal_restarting.set(false);
+        self.session_terminal_id.set(None);
+        self.session_terminal_error.set(detail);
+        self.session_terminal_stopped.set(Some(reason));
+    }
+
+    /// Attaches the main-screen session terminal to its Agent PTY stream.
+    fn attach_session_terminal(&self, session_id: VibexSessionId, id: TerminalId, title: String) {
+        self.stop_session_terminal_tasks();
+        let generation = self.session_terminal_generation.get();
+        self.reset_session_terminal_output();
+        *self.session_terminal_session_id.borrow_mut() = Some(session_id.as_str().to_owned());
+        self.session_terminal_id.set(Some(id.as_str().to_owned()));
+        self.session_terminal_title.set(Some(title.into()));
+        self.session_terminal_error.set(None);
+        self.session_terminal_stopped.set(None);
+        self.session_terminal_restarting.set(false);
+        self.session_terminal_busy.set(false);
+        let service = self.clone();
+        let backend = self.terminal_backend.clone();
+        let stream_id = id.clone();
+        let (output, mut receive) = mpsc::channel(32);
+        let stream =
+            spawn_terminal_stream(move || backend.subscribe_terminal(stream_id, 1), output);
+        self.session_terminal_stream
+            .replace(Some(stream.abort_handle()));
+        let (sender, mut commands) = mpsc::channel(128);
+        let backend = self.terminal_backend.clone();
+        let writer_id = id.clone();
+        let (errors, mut command_errors) = mpsc::channel(8);
+        let writer = crate::runtime::handle().spawn(async move {
+            while let Some(command) = commands.recv().await {
+                let result = match command {
+                    TerminalCommand::Input(data) => {
+                        backend
+                            .write_terminal(MutationRequest::new(TerminalWriteRequest {
+                                terminal_id: writer_id.clone(),
+                                data,
+                            }))
+                            .await
+                    }
+                    TerminalCommand::Resize(cols, rows) => backend
+                        .resize_terminal(MutationRequest::new(TerminalResizeRequest {
+                            terminal_id: writer_id.clone(),
+                            cols,
+                            rows,
+                        }))
+                        .await
+                        .map(|_| ()),
+                };
+                if let Err(error) = result
+                    && errors.send(error).await.is_err()
+                {
+                    break;
+                }
+            }
+        });
+        self.session_terminal_writer
+            .replace(Some(writer.abort_handle()));
+        self.session_terminal_tx.replace(Some(sender));
+        if let Some((cols, rows)) = self.session_terminal_size.get() {
+            self.queue_session_terminal_command(TerminalCommand::Resize(cols, rows));
+        }
+        detach({
+            let service = self.clone();
+            let session_id = session_id.clone();
+            let id = id.clone();
+            async move {
+                while let Some(error) = command_errors.recv().await {
+                    if !service.alive.get()
+                        || service.session_terminal_generation.get() != generation
+                    {
+                        break;
+                    }
+                    if error.code == "terminal_not_found" {
+                        service.handle_session_terminal_missing(
+                            session_id.clone(),
+                            id.clone(),
+                            generation,
+                            true,
+                        );
+                        break;
+                    }
+                    service.session_terminal_error.set(Some(error_text(&error)));
+                }
+            }
+        });
+        detach(async move {
+            while let Some(batch) = receive.recv().await {
+                if !service.alive.get() || service.session_terminal_generation.get() != generation {
+                    return;
+                }
+                while service.session_terminal_ref.api::<TerminalApi>().is_none() {
+                    timer(Duration::from_millis(16)).await;
+                    if !service.alive.get()
+                        || service.session_terminal_generation.get() != generation
+                    {
+                        return;
+                    }
+                }
+                if batch.reset_required {
+                    service.reset_session_terminal_output();
+                }
+                for frame in batch.frames {
+                    service.write_session_terminal_output(&frame.bytes);
+                }
+                service
+                    .session_terminal_output_revision
+                    .update(|revision| *revision = revision.wrapping_add(1));
+            }
+            let result = stream.await;
+            if service.alive.get() && service.session_terminal_generation.get() == generation {
+                match result {
+                    Ok(Err(error)) if error.code == "terminal_not_found" => {
+                        service.handle_session_terminal_missing(session_id, id, generation, true);
+                    }
+                    Ok(Ok(())) => {
+                        service.handle_session_terminal_missing(session_id, id, generation, false);
+                    }
+                    Ok(Err(error)) => {
+                        service.session_terminal_error.set(Some(error_text(&error)));
+                    }
+                    Err(error) => {
+                        service.session_terminal_error.set(Some(
+                            format!("reading the terminal did not finish: {error}").into(),
+                        ));
+                    }
+                }
+            }
+        });
+    }
+
+    /// Reconciles a missing or ended session PTY against the authoritative
+    /// session record so a stale `terminal_id` never strands a raw
+    /// `terminal_not_found` error.
+    fn handle_session_terminal_missing(
+        &self,
+        session_id: VibexSessionId,
+        failed_terminal_id: TerminalId,
+        generation: u64,
+        missing_pty: bool,
+    ) {
+        if !self.alive.get()
+            || self.session_terminal_generation.get() != generation
+            || self.active.get_untracked().as_deref() != Some(session_id.as_str())
+        {
+            return;
+        }
+        self.stop_session_terminal_tasks();
+        let next_generation = self.session_terminal_generation.get();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        detach(async move {
+            let fetch_id = session_id.clone();
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.open_session(fetch_id).await })
+                .await;
+            if !service.alive.get()
+                || service.session_terminal_generation.get() != next_generation
+                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            {
+                return;
+            }
+            match result {
+                Ok(Ok(session)) => {
+                    service.update_session_snapshot(&session);
+                    match session.state {
+                        AgentSessionState::Closed => {
+                            service
+                                .set_session_terminal_stopped(TerminalSessionStopped::Exited, None);
+                        }
+                        AgentSessionState::Error => {
+                            service
+                                .set_session_terminal_stopped(TerminalSessionStopped::Failed, None);
+                        }
+                        _ => {
+                            let latest_id = session
+                                .terminal
+                                .as_ref()
+                                .and_then(|facts| facts.terminal_id.clone());
+                            match latest_id {
+                                Some(new_id) if new_id != failed_terminal_id => {
+                                    service.attach_session_terminal(
+                                        session.id,
+                                        new_id,
+                                        session.title,
+                                    );
+                                }
+                                Some(_) if missing_pty => {
+                                    service.set_session_terminal_stopped(
+                                        TerminalSessionStopped::NotRunning,
+                                        None,
+                                    );
+                                }
+                                Some(_) => {
+                                    service.session_terminal_error.set(Some(
+                                        copy::text(
+                                            "Terminal disconnected",
+                                            "终端连接已断开",
+                                            "終端機已中斷連線",
+                                        )
+                                        .into(),
+                                    ));
+                                }
+                                None => {
+                                    service.set_session_terminal_stopped(
+                                        TerminalSessionStopped::NotRunning,
+                                        None,
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Ok(Err(error)) => {
+                    if missing_pty {
+                        service.set_session_terminal_stopped(
+                            TerminalSessionStopped::NotRunning,
+                            Some(error_text(&error)),
+                        );
+                    } else {
+                        service.session_terminal_error.set(Some(error_text(&error)));
+                    }
+                }
+                Err(error) => {
+                    let message: SharedString =
+                        format!("checking the terminal session did not finish: {error}").into();
+                    if missing_pty {
+                        service.set_session_terminal_stopped(
+                            TerminalSessionStopped::NotRunning,
+                            Some(message),
+                        );
+                    } else {
+                        service.session_terminal_error.set(Some(message));
+                    }
+                }
+            }
+        });
+    }
+
+    fn restart_session_terminal(&self) {
+        if self.session_terminal_restarting.get_untracked() {
+            return;
+        }
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        let Ok(session_id) = VibexSessionId::parse(active.as_str()) else {
+            return;
+        };
+        self.session_terminal_restarting.set(true);
+        self.session_terminal_error.set(None);
+        let generation = self.session_terminal_generation.get();
+        let service = self.clone();
+        let backend = self.backend.clone();
+        detach(async move {
+            let target_id = session_id.clone();
+            let result = crate::runtime::handle()
+                .spawn(async move { backend.restart_terminal_session(target_id).await })
+                .await;
+            if !service.alive.get()
+                || service.session_terminal_generation.get() != generation
+                || service.active.get_untracked().as_deref() != Some(session_id.as_str())
+            {
+                return;
+            }
+            service.session_terminal_restarting.set(false);
+            match result {
+                Ok(Ok(session)) => {
+                    service.update_session_snapshot(&session);
+                    service.apply_session_terminal_snapshot(&session);
+                }
+                Ok(Err(error)) => {
+                    service.session_terminal_error.set(Some(error_text(&error)));
+                }
+                Err(error) => {
+                    service.session_terminal_error.set(Some(
+                        format!("restarting the terminal session did not finish: {error}").into(),
+                    ));
+                }
+            }
+        });
+    }
+
+    fn retry_session_terminal(&self) {
+        let Some(active) = self.active.get_untracked() else {
+            return;
+        };
+        if let Ok(session_id) = VibexSessionId::parse(active.as_str()) {
+            self.open_session_terminal(&session_id);
+        }
+    }
+
+    fn reset_session_terminal(&self) {
+        self.stop_session_terminal_tasks();
+        self.session_terminal_session_id.replace(None);
+        self.session_terminal_id.set(None);
+        self.session_terminal_title.set(None);
+        self.session_terminal_error.set(None);
+        self.session_terminal_busy.set(false);
+        self.session_terminal_stopped.set(None);
+        self.session_terminal_restarting.set(false);
+        self.reset_session_terminal_output();
+    }
+
+    fn stop_session_terminal_tasks(&self) {
+        self.session_terminal_generation
+            .set(self.session_terminal_generation.get().wrapping_add(1));
+        self.session_terminal_tx.take();
+        for task in [&self.session_terminal_stream, &self.session_terminal_writer] {
+            if let Some(task) = task.take() {
+                task.abort();
+            }
+        }
+    }
+
+    fn session_terminal_input(&self, data: &str) {
+        if !data.is_empty() {
+            self.queue_session_terminal_command(TerminalCommand::Input(data.to_owned()));
+        }
+    }
+
+    fn queue_session_terminal_command(&self, command: TerminalCommand) {
+        if let Some(sender) = self.session_terminal_tx.borrow().as_ref()
+            && sender.try_send(command).is_err()
+        {
+            self.session_terminal_error.set(Some(
+                copy::text("Terminal input is busy", "终端输入繁忙", "終端機輸入忙碌").into(),
+            ));
+        }
+    }
+
+    fn write_session_terminal_output(&self, bytes: &[u8]) {
+        if let Some(api) = self.session_terminal_ref.api::<TerminalApi>() {
+            api.write_bytes(bytes);
+        }
+    }
+
+    fn reset_session_terminal_output(&self) {
+        if let Some(api) = self.session_terminal_ref.api::<TerminalApi>() {
+            api.reset();
+        }
+        self.session_terminal_output_revision
+            .update(|revision| *revision = revision.wrapping_add(1));
+    }
+
+    fn session_terminal_resize(&self, cols: u32, rows: u32) {
+        if cols <= 1 || rows <= 1 {
+            return;
+        }
+        let size = (
+            cols.min(u32::from(u16::MAX)) as u16,
+            rows.min(u32::from(u16::MAX)) as u16,
+        );
+        if self.session_terminal_size.replace(Some(size)) != Some(size) {
+            self.queue_session_terminal_command(TerminalCommand::Resize(size.0, size.1));
+        }
+    }
+
+    /// Opens the workspace's independent terminal tab on the workbench.
     fn open_terminal(&self) {
         if self.terminal_open.get_untracked() {
             return;
@@ -8293,11 +8896,7 @@ impl SessionService {
             let result = crate::runtime::handle()
                 .spawn(async move {
                     let session = backend.open_session(active_id).await?;
-                    let terminals = if session.is_terminal() {
-                        Vec::new()
-                    } else {
-                        opening.list_terminals(session.workspace_id.clone()).await?
-                    };
+                    let terminals = opening.list_terminals(session.workspace_id.clone()).await?;
                     Ok::<_, BackendError>((session, terminals))
                 })
                 .await;
@@ -8318,21 +8917,6 @@ impl SessionService {
                     return;
                 }
             };
-            if session.is_terminal() {
-                if let Some(id) = session.terminal.and_then(|facts| facts.terminal_id) {
-                    service.attach_terminal(id, session.title);
-                } else {
-                    service.terminal_error.set(Some(
-                        copy::text(
-                            "Waiting for the session's terminal…",
-                            "正在等待会话终端…",
-                            "正在等待工作階段的終端機…",
-                        )
-                        .into(),
-                    ));
-                }
-                return;
-            }
             service.set_terminal_choices(&terminals);
             // Coming back to the terminal surface returns to the shell that is
             // already open. Opening it must not start another one: that is
@@ -13918,7 +14502,7 @@ mod optimistic_send_tests {
 
 #[cfg(test)]
 mod terminal_lifecycle_tests {
-    use std::collections::BTreeMap;
+    use std::collections::{BTreeMap, BTreeSet};
     use std::rc::Rc;
     use std::sync::{Arc, Mutex};
     use std::time::Duration;
@@ -13928,23 +14512,30 @@ mod terminal_lifecycle_tests {
     use nsh_testing::Headless;
     use tokio::sync::mpsc;
     use vibex_backend::{
-        BackendError, BackendEvent, BackendFuture, BackendProjection, BackendResult,
+        AgentBackend, BackendError, BackendEvent, BackendFuture, BackendProjection, BackendResult,
         MutationRequest, TerminalBackend, TerminalFrame, TerminalFrameBatch,
         TerminalFrameSubscription,
     };
     use vibex_core::{
-        DeviceId, RemoteAuthProof, RemoteClientType, TerminalCreateRequest, TerminalId,
+        AgentId, AgentSession, AgentSessionRuntimeSelectionState, AgentSessionState,
+        ContinueAgentTurnRequest, CreateAgentSessionRequest, DeviceId, FetchTimelineRequest,
+        RemoteAuthProof, RemoteClientType, RenameAgentSessionRequest, ResolveElicitationRequest,
+        ResolvePermissionRequest, SendAgentMessageRequest, SessionRuntimeOptionCatalog,
+        SetDesiredAgentSessionRuntimeRequest, TerminalCreateRequest, TerminalId,
         TerminalResizeRequest, TerminalSession, TerminalSnapshot, TerminalStatus,
-        TerminalWriteRequest, WorkspaceId,
+        TerminalWriteRequest, TimelinePage, VibexSessionId, WorkspaceId,
     };
     use vibex_mobile_pairing::{
         MOBILE_CREDENTIAL_SCHEMA_VERSION, MobileCredentialBundle, MobileRemoteRouteBundle,
     };
+    use vibex_mobile_ui::screens::connecting::ConnectionState;
     use vibex_mobile_ui::screens::files::FilePreviewKindView;
-    use vibex_mobile_ui::screens::terminal::{TerminalHost, terminal};
+    use vibex_mobile_ui::screens::terminal::{
+        TerminalApi, TerminalHost, TerminalMode, TerminalSessionStopped, terminal,
+    };
     use vibex_remote_client::{ClientDeviceIdentity, RemoteCredentialRecord};
 
-    use super::{SessionService, copy, terminal_choice};
+    use super::{SessionService, copy, summary, terminal_choice};
 
     struct FakeTerminalState {
         sessions: Vec<TerminalSession>,
@@ -13952,6 +14543,10 @@ mod terminal_lifecycle_tests {
         subscribers: BTreeMap<String, Vec<mpsc::UnboundedSender<Vec<u8>>>>,
         /// Initial banner delivered when subscribing to each terminal.
         banners: BTreeMap<String, Vec<u8>>,
+        /// Terminal IDs that fail `subscribe_terminal` with `terminal_not_found`.
+        missing: BTreeSet<String>,
+        /// Terminal IDs that received a `subscribe_terminal` attempt.
+        subscribe_calls: Vec<String>,
         next_index: usize,
     }
 
@@ -13991,10 +14586,29 @@ mod terminal_lifecycle_tests {
                     sessions: sessions.clone(),
                     subscribers: BTreeMap::new(),
                     banners,
+                    missing: BTreeSet::new(),
+                    subscribe_calls: Vec::new(),
                     next_index: initial_count + 1,
                 })),
             };
             (backend, workspace_id, sessions)
+        }
+
+        fn register_session_pty(&self, id: &TerminalId, banner: &str) {
+            let mut guard = self.state.lock().unwrap();
+            guard.missing.remove(id.as_str());
+            guard
+                .banners
+                .insert(id.as_str().to_owned(), banner.as_bytes().to_vec());
+        }
+
+        fn mark_missing(&self, id: &TerminalId) {
+            let mut guard = self.state.lock().unwrap();
+            guard.missing.insert(id.as_str().to_owned());
+        }
+
+        fn subscribe_calls(&self) -> Vec<String> {
+            self.state.lock().unwrap().subscribe_calls.clone()
         }
     }
 
@@ -14085,8 +14699,15 @@ mod terminal_lifecycle_tests {
             terminal_id: TerminalId,
             _next_sequence: i64,
         ) -> BackendResult<Box<dyn TerminalFrameSubscription>> {
-            let (tx, rx) = mpsc::unbounded_channel();
             let mut guard = self.state.lock().unwrap();
+            guard.subscribe_calls.push(terminal_id.as_str().to_owned());
+            if guard.missing.contains(terminal_id.as_str()) {
+                return Err(BackendError::failed(
+                    "terminal_not_found",
+                    "terminal session was not found",
+                ));
+            }
+            let (tx, rx) = mpsc::unbounded_channel();
             if let Some(banner) = guard.banners.get(terminal_id.as_str()).cloned() {
                 let _ = tx.send(banner);
             }
@@ -14127,14 +14748,33 @@ mod terminal_lifecycle_tests {
             let state = self.state.clone();
             Box::pin(async move {
                 let guard = state.lock().unwrap();
-                guard
+                if let Some(session) = guard
                     .sessions
                     .iter()
                     .find(|session| session.id == request.payload.terminal_id)
-                    .cloned()
-                    .ok_or_else(|| {
-                        BackendError::failed("terminal_not_found", "terminal was not found")
-                    })
+                {
+                    return Ok(session.clone());
+                }
+                let id = request.payload.terminal_id.as_str();
+                if !guard.missing.contains(id) && guard.banners.contains_key(id) {
+                    return Ok(TerminalSession {
+                        id: request.payload.terminal_id,
+                        workspace_id: WorkspaceId::new(),
+                        title: "Session Terminal".to_owned(),
+                        shell: "/bin/sh".to_owned(),
+                        cwd: "/work".to_owned(),
+                        rows: request.payload.rows,
+                        cols: request.payload.cols,
+                        status: TerminalStatus::Running,
+                        created_at_ms: 1,
+                        updated_at_ms: 1,
+                        closed_at_ms: None,
+                    });
+                }
+                Err(BackendError::failed(
+                    "terminal_not_found",
+                    "terminal was not found",
+                ))
             })
         }
 
@@ -14232,7 +14872,21 @@ mod terminal_lifecycle_tests {
     fn terminal_view(service: SessionService) -> impl IntoElement {
         let find_open = signal(false);
         let host = TerminalHost {
-            session_terminal: computed(|| None),
+            mode: TerminalMode::Workspace {
+                terminals: service.terminal_choices,
+                on_kill: {
+                    let service = service.clone();
+                    Rc::new(move |id: &str| service.kill_terminal(id))
+                },
+                on_select_terminal: {
+                    let service = service.clone();
+                    Rc::new(move |id: &str| service.select_terminal(id))
+                },
+                on_new_terminal: {
+                    let service = service.clone();
+                    Rc::new(move || service.new_terminal())
+                },
+            },
             title: service.terminal_title,
             error: service.terminal_error,
             term_ref: service.terminal_ref,
@@ -14246,7 +14900,6 @@ mod terminal_lifecycle_tests {
                 Rc::new(move |cols: u32, rows: u32| service.terminal_resize(cols, rows))
             },
             on_title: Rc::new(|_| {}),
-            terminals: service.terminal_choices,
             active: service.terminal_id,
             busy: service.terminal_busy,
             output_revision: service.terminal_output_revision,
@@ -14254,18 +14907,6 @@ mod terminal_lifecycle_tests {
             on_retry: {
                 let service = service.clone();
                 Rc::new(move || service.retry_terminal())
-            },
-            on_kill: {
-                let service = service.clone();
-                Rc::new(move |id: &str| service.kill_terminal(id))
-            },
-            on_select_terminal: {
-                let service = service.clone();
-                Rc::new(move |id: &str| service.select_terminal(id))
-            },
-            on_new_terminal: {
-                let service = service.clone();
-                Rc::new(move || service.new_terminal())
             },
         };
         view().size_full().child(terminal(host))
@@ -16228,5 +16869,460 @@ mod terminal_lifecycle_tests {
         let config = EngineConfig::new(Root::of::<NewSessionReopensCheckView>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("new-session-reopens-ok").unwrap();
+    }
+
+    struct FakeTerminalAgentState {
+        session: AgentSession,
+        open_calls: usize,
+        second_open_session: Option<AgentSession>,
+        restarted_terminal_id: TerminalId,
+        restart_calls: usize,
+        terminal_backend: FakeTerminalBackend,
+    }
+
+    #[derive(Clone)]
+    struct FakeTerminalAgentBackend {
+        state: Arc<Mutex<FakeTerminalAgentState>>,
+    }
+
+    struct PendingEventsSubscription;
+
+    impl vibex_backend::BackendEventSubscription for PendingEventsSubscription {
+        fn next(&mut self) -> BackendFuture<'_, Option<BackendEvent>> {
+            Box::pin(std::future::pending())
+        }
+    }
+
+    impl FakeTerminalAgentBackend {
+        fn new(
+            session: AgentSession,
+            restarted_terminal_id: TerminalId,
+            terminal_backend: FakeTerminalBackend,
+        ) -> Self {
+            Self {
+                state: Arc::new(Mutex::new(FakeTerminalAgentState {
+                    session,
+                    open_calls: 0,
+                    second_open_session: None,
+                    restarted_terminal_id,
+                    restart_calls: 0,
+                    terminal_backend,
+                })),
+            }
+        }
+
+        fn set_second_open_session(&self, next: AgentSession) {
+            self.state.lock().unwrap().second_open_session = Some(next);
+        }
+    }
+
+    fn make_terminal_agent_session(
+        workspace_id: WorkspaceId,
+        state: AgentSessionState,
+        terminal_id: Option<TerminalId>,
+    ) -> AgentSession {
+        AgentSession {
+            id: VibexSessionId::new(),
+            title: "Native Codex".to_owned(),
+            project_id: vibex_core::ProjectId::new(),
+            workspace_id,
+            workspace_root: "/workspace".to_owned(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            last_message_at_ms: 1_000,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: vibex_core::SessionToolSettings::default(),
+            transport: vibex_core::SessionTransport::Terminal,
+            terminal: Some(Box::new(vibex_core::TerminalSessionFacts {
+                terminal_id,
+                ..Default::default()
+            })),
+        }
+    }
+
+    impl AgentBackend for FakeTerminalAgentBackend {
+        fn subscribe(&self) -> BackendResult<Box<dyn vibex_backend::BackendEventSubscription>> {
+            Ok(Box::new(PendingEventsSubscription))
+        }
+
+        fn list_sessions(&self, _include_archived: bool) -> BackendFuture<'_, Vec<AgentSession>> {
+            let state = self.state.clone();
+            Box::pin(async move { Ok(vec![state.lock().unwrap().session.clone()]) })
+        }
+
+        fn open_session(&self, _session_id: VibexSessionId) -> BackendFuture<'_, AgentSession> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let mut guard = state.lock().unwrap();
+                guard.open_calls += 1;
+                if guard.open_calls >= 2
+                    && let Some(next) = guard.second_open_session.take()
+                {
+                    guard.session = next.clone();
+                    return Ok(next);
+                }
+                Ok(guard.session.clone())
+            })
+        }
+
+        fn create_session(
+            &self,
+            _request: MutationRequest<CreateAgentSessionRequest>,
+        ) -> BackendFuture<'_, AgentSession> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn restart_terminal_session(
+            &self,
+            _session_id: VibexSessionId,
+        ) -> BackendFuture<'_, AgentSession> {
+            let state = self.state.clone();
+            Box::pin(async move {
+                let mut guard = state.lock().unwrap();
+                guard.restart_calls += 1;
+                let new_id = guard.restarted_terminal_id.clone();
+                guard
+                    .terminal_backend
+                    .register_session_pty(&new_id, "restarted-agent-output\r\n");
+                guard.session.state = AgentSessionState::Running;
+                if let Some(facts) = guard.session.terminal.as_mut() {
+                    facts.terminal_id = Some(new_id);
+                }
+                Ok(guard.session.clone())
+            })
+        }
+
+        fn fetch_timeline(
+            &self,
+            _request: FetchTimelineRequest,
+        ) -> BackendFuture<'_, TimelinePage> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn send_message(
+            &self,
+            _request: MutationRequest<SendAgentMessageRequest>,
+        ) -> BackendFuture<'_, Vec<vibex_core::TimelineItem>> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn continue_turn(
+            &self,
+            _request: MutationRequest<ContinueAgentTurnRequest>,
+        ) -> BackendFuture<'_, Vec<vibex_core::TimelineItem>> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn interrupt(&self, _request: MutationRequest<VibexSessionId>) -> BackendFuture<'_, bool> {
+            Box::pin(async { Ok(false) })
+        }
+
+        fn resolve_permission(
+            &self,
+            _request: MutationRequest<ResolvePermissionRequest>,
+        ) -> BackendFuture<'_, vibex_core::TimelineItem> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn resolve_elicitation(
+            &self,
+            _request: MutationRequest<ResolveElicitationRequest>,
+        ) -> BackendFuture<'_, vibex_core::TimelineItem> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn replace_user_message(
+            &self,
+            _request: MutationRequest<vibex_core::ReplaceUserMessagePayload>,
+        ) -> BackendFuture<'_, Vec<vibex_core::TimelineItem>> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn rename_session(
+            &self,
+            _request: MutationRequest<RenameAgentSessionRequest>,
+        ) -> BackendFuture<'_, AgentSession> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn archive_session(
+            &self,
+            _request: MutationRequest<VibexSessionId>,
+        ) -> BackendFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn unarchive_session(
+            &self,
+            _request: MutationRequest<VibexSessionId>,
+        ) -> BackendFuture<'_, AgentSession> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn delete_session(
+            &self,
+            _request: MutationRequest<VibexSessionId>,
+        ) -> BackendFuture<'_, ()> {
+            Box::pin(async { Ok(()) })
+        }
+
+        fn list_runtime_options(&self) -> BackendFuture<'_, SessionRuntimeOptionCatalog> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn probe_agent_runtime_options(
+            &self,
+            _request: MutationRequest<vibex_core::AgentRuntimeOptionProbeRequest>,
+        ) -> BackendFuture<'_, vibex_core::AgentRuntimeOptionProbeResult> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn runtime_selection(
+            &self,
+            _session_id: VibexSessionId,
+        ) -> BackendFuture<'_, AgentSessionRuntimeSelectionState> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn set_desired_runtime(
+            &self,
+            _request: MutationRequest<SetDesiredAgentSessionRuntimeRequest>,
+        ) -> BackendFuture<'_, AgentSessionRuntimeSelectionState> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn cancel_runtime_switch(
+            &self,
+            _request: MutationRequest<vibex_core::CancelAgentSessionRuntimeSwitchRequest>,
+        ) -> BackendFuture<'_, AgentSessionRuntimeSelectionState> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn ensure_default_agent_auth_context(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, vibex_core::AgentAuthContext> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+
+        fn refresh_agent_auth_methods(
+            &self,
+            _request: MutationRequest<AgentId>,
+        ) -> BackendFuture<'_, vibex_core::AgentAuthCatalog> {
+            Box::pin(async { Err(BackendError::unsupported("unsupported", "unused")) })
+        }
+    }
+
+    fn build_native_terminal_session_service(
+        initial_state: AgentSessionState,
+        missing_initial_pty: bool,
+        swap_to_fresh_pty_on_refetch: bool,
+    ) -> (
+        SessionService,
+        FakeTerminalBackend,
+        FakeTerminalAgentBackend,
+    ) {
+        let (fake_terminal, workspace_id, _) = FakeTerminalBackend::new(1);
+        let session_pty = TerminalId::new();
+        let restarted_pty = TerminalId::new();
+        if missing_initial_pty {
+            fake_terminal.mark_missing(&session_pty);
+        } else {
+            fake_terminal.register_session_pty(&session_pty, "agent-live-banner\r\n");
+        }
+        let session =
+            make_terminal_agent_session(workspace_id.clone(), initial_state, Some(session_pty));
+        let fake_agent =
+            FakeTerminalAgentBackend::new(session.clone(), restarted_pty, fake_terminal.clone());
+        if swap_to_fresh_pty_on_refetch {
+            let fresh_pty = TerminalId::new();
+            fake_terminal.register_session_pty(&fresh_pty, "recovered-agent-banner\r\n");
+            let mut next_session = session.clone();
+            next_session.state = AgentSessionState::Running;
+            if let Some(facts) = next_session.terminal.as_mut() {
+                facts.terminal_id = Some(fresh_pty);
+            }
+            fake_agent.set_second_open_session(next_session);
+        }
+        let mut service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        service.backend = Arc::new(fake_agent.clone());
+        service.terminal_backend = Arc::new(fake_terminal.clone());
+        service.connection.set(ConnectionState::Online);
+        service.session_records.set(vec![session.clone()]);
+        service.sessions.set(vec![summary(&session, &[])]);
+        service.open(session.id.as_str());
+        (service, fake_terminal, fake_agent)
+    }
+
+    #[component]
+    fn LiveNativeTerminalSessionView() -> impl IntoElement {
+        let (service, _, _) =
+            build_native_terminal_session_service(AgentSessionState::Running, false, false);
+        let screen_text = computed(move || {
+            service.session_terminal_output_revision.get();
+            service
+                .session_terminal_ref
+                .api::<TerminalApi>()
+                .map(|api| api.text())
+                .unwrap_or_default()
+        });
+        let wb_text = computed(move || {
+            service.terminal_output_revision.get();
+            service
+                .terminal_ref
+                .api::<TerminalApi>()
+                .map(|api| api.text())
+                .unwrap_or_default()
+        });
+        view()
+            .size_full()
+            .child(vibex_mobile_ui::screens::session::session(service.host()))
+            .child(text(move || {
+                if screen_text.get().contains("agent-live-banner") {
+                    "session-pty-ready"
+                } else {
+                    "session-pty-waiting"
+                }
+            }))
+            .child(text(move || {
+                if wb_text.get().contains("hello from shell 1") {
+                    "workbench-pty-ready"
+                } else {
+                    "workbench-pty-waiting"
+                }
+            }))
+    }
+
+    #[test]
+    fn live_native_terminal_session_renders_on_main_view_independently_of_workbench_terminal() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<LiveNativeTerminalSessionView>(),
+        ))
+        .unwrap();
+        app.wait_for("id:session-terminal-panel").unwrap();
+        app.wait_for("session-pty-ready").unwrap();
+        assert!(
+            !app.screen().matches("role:button[Changes]").unwrap(),
+            "native terminal session must not auto-open the workbench"
+        );
+        // Open the right-screen workbench and switch to its independent Terminal tab.
+        app.press("role:button[Files, Git, and terminal]").unwrap();
+        app.wait_for("role:button[Files]").unwrap();
+        app.wait_for("role:button[Changes]").unwrap();
+        app.wait_for("role:button[Terminal]").unwrap();
+        app.press("role:button[Terminal]").unwrap();
+        app.wait_for("id:terminal-panel").unwrap();
+        app.wait_for("workbench-pty-ready").unwrap();
+        app.wait_for("Shell 1").unwrap();
+        // Returning to the main view still shows the live Agent session terminal.
+        app.press("role:button[Close]").unwrap();
+        app.wait_for("id:session-terminal-panel").unwrap();
+        app.wait_for("session-pty-ready").unwrap();
+    }
+
+    #[component]
+    fn ClosedNativeTerminalSessionView() -> impl IntoElement {
+        let (service, fake_terminal, _) =
+            build_native_terminal_session_service(AgentSessionState::Closed, true, false);
+        let screen_text = computed(move || {
+            service.session_terminal_output_revision.get();
+            service
+                .session_terminal_ref
+                .api::<TerminalApi>()
+                .map(|api| api.text())
+                .unwrap_or_default()
+        });
+        view()
+            .size_full()
+            .child(vibex_mobile_ui::screens::session::session(service.host()))
+            .child(text(move || {
+                if service.session_terminal_stopped.get() == Some(TerminalSessionStopped::Exited)
+                    && fake_terminal.subscribe_calls().is_empty()
+                {
+                    "closed-without-stale-subscribe"
+                } else if screen_text.get().contains("restarted-agent-output") {
+                    "restarted-pty-ready"
+                } else {
+                    "transitioning"
+                }
+            }))
+    }
+
+    #[test]
+    fn closed_native_terminal_session_avoids_not_found_and_can_restart() {
+        let mut app = Headless::start(EngineConfig::new(
+            Root::of::<ClosedNativeTerminalSessionView>(),
+        ))
+        .unwrap();
+        app.wait_for("The Agent has exited.").unwrap();
+        app.wait_for("closed-without-stale-subscribe").unwrap();
+        assert!(!app.screen().shows("terminal session was not found"));
+        app.press("role:button[Restart Agent]").unwrap();
+        app.wait_for("restarted-pty-ready").unwrap();
+    }
+
+    #[component]
+    fn MissingPtyFallbackView() -> impl IntoElement {
+        let (service, _, _) =
+            build_native_terminal_session_service(AgentSessionState::Running, true, false);
+        view()
+            .size_full()
+            .child(vibex_mobile_ui::screens::session::session(service.host()))
+    }
+
+    #[test]
+    fn missing_session_pty_falls_back_to_not_running_placeholder() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<MissingPtyFallbackView>())).unwrap();
+        app.wait_for("This session's terminal is not running.")
+            .unwrap();
+        app.wait_for("role:button[Restart Agent]").unwrap();
+        assert!(!app.screen().shows("terminal session was not found"));
+    }
+
+    #[component]
+    fn StalePtyAutoRecoveryView() -> impl IntoElement {
+        let (service, _, _) =
+            build_native_terminal_session_service(AgentSessionState::Running, true, true);
+        let screen_text = computed(move || {
+            service.session_terminal_output_revision.get();
+            service
+                .session_terminal_ref
+                .api::<TerminalApi>()
+                .map(|api| api.text())
+                .unwrap_or_default()
+        });
+        view()
+            .size_full()
+            .child(vibex_mobile_ui::screens::session::session(service.host()))
+            .child(text(move || {
+                if screen_text.get().contains("recovered-agent-banner") {
+                    "recovered-pty-ready"
+                } else {
+                    "recovering"
+                }
+            }))
+    }
+
+    #[test]
+    fn stale_session_pty_auto_recovers_when_open_session_returns_fresh_terminal_id() {
+        let mut app =
+            Headless::start(EngineConfig::new(Root::of::<StalePtyAutoRecoveryView>())).unwrap();
+        app.wait_for("recovered-pty-ready").unwrap();
+        assert!(!app.screen().shows("terminal session was not found"));
     }
 }

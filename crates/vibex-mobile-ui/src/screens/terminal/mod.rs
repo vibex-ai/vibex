@@ -34,8 +34,39 @@ type SubmitHandle = Rc<RefCell<Option<Rc<dyn Fn()>>>>;
 /// The air between the grid's cells and the panel's edge.
 const TERMINAL_INSET: f32 = 10.0;
 
-/// The terminal panel, for the tests that check it is drawn as one.
+/// The workspace terminal panel, for the tests that check it is drawn as one.
 const TERMINAL_PANEL_ID: &str = "terminal-panel";
+
+/// The native terminal Agent session panel rendered on the session page.
+const SESSION_TERMINAL_PANEL_ID: &str = "session-terminal-panel";
+
+/// Why a native terminal Agent session has no live PTY to draw.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TerminalSessionStopped {
+    /// The Agent process exited cleanly (`AgentSessionState::Closed`).
+    Exited,
+    /// The Agent process failed to start or crashed (`AgentSessionState::Error`).
+    Failed,
+    /// The session has no running PTY attached on the runtime.
+    NotRunning,
+}
+
+/// Whether a terminal view manages workspace shells on the workbench or renders
+/// a native terminal Agent session directly on the session page.
+#[derive(Clone)]
+pub enum TerminalMode {
+    Workspace {
+        terminals: Signal<Vec<TerminalChoice>>,
+        on_kill: TerminalAction,
+        on_select_terminal: TerminalAction,
+        on_new_terminal: Rc<dyn Fn()>,
+    },
+    Session {
+        stopped: Signal<Option<TerminalSessionStopped>>,
+        restarting: Signal<bool>,
+        on_restart: Rc<dyn Fn()>,
+    },
+}
 
 /// The height of the row of keys the software keyboard lacks.
 const TERMINAL_KEY_ROW_HEIGHT: f32 = 50.0;
@@ -75,7 +106,7 @@ fn cursor_style(style: StyleRefinement) -> StyleRefinement {
 
 #[derive(Clone)]
 pub struct TerminalHost {
-    pub session_terminal: Memo<Option<crate::screens::session::SessionSummary>>,
+    pub mode: TerminalMode,
     pub title: Signal<Option<SharedString>>,
     pub error: Signal<Option<SharedString>>,
     pub term_ref: ComponentRef<Terminal>,
@@ -83,15 +114,11 @@ pub struct TerminalHost {
     pub on_data: TerminalAction,
     pub on_resize: Rc<dyn Fn(u32, u32)>,
     pub on_title: TerminalAction,
-    pub terminals: Signal<Vec<TerminalChoice>>,
     pub active: Signal<Option<String>>,
     pub busy: Signal<bool>,
     pub output_revision: Signal<u64>,
     pub find_open: Signal<bool>,
     pub on_retry: Rc<dyn Fn()>,
-    pub on_kill: TerminalAction,
-    pub on_select_terminal: TerminalAction,
-    pub on_new_terminal: Rc<dyn Fn()>,
 }
 
 pub fn terminal(host: TerminalHost) -> impl IntoElement {
@@ -109,15 +136,27 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
     let confirm = signal(None::<String>);
     let error = host.error;
     let output = host.output_revision;
-    let selected = move || active.with(Option::is_some);
-    let attached_session = move || {
-        host.session_terminal
-            .with(|session| session.as_ref().is_some_and(|session| session.terminal))
+    let mode = host.mode.clone();
+    let panel_id = match mode {
+        TerminalMode::Workspace { .. } => TERMINAL_PANEL_ID,
+        TerminalMode::Session { .. } => SESSION_TERMINAL_PANEL_ID,
     };
+    let stopped_signal = match &mode {
+        TerminalMode::Session { stopped, .. } => Some(*stopped),
+        TerminalMode::Workspace { .. } => None,
+    };
+    let restarting_signal = match &mode {
+        TerminalMode::Session { restarting, .. } => Some(*restarting),
+        TerminalMode::Workspace { .. } => None,
+    };
+    let selected = move || active.with(Option::is_some);
+    let is_stopped = move || stopped_signal.is_some_and(|stopped| stopped.with(Option::is_some));
+    let is_restarting = move || restarting_signal.is_some_and(|restarting| restarting.get());
+    let interactive = move || selected() && !is_stopped() && !is_restarting();
     let on_data: TerminalAction = Rc::new({
         let send = host.on_data.clone();
         move |text| {
-            if !text.is_empty() && selected() && !busy.get_untracked() {
+            if !text.is_empty() && interactive() && !busy.get_untracked() {
                 send(text);
             }
         }
@@ -136,7 +175,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         }
     });
     let focus_keyboard = Rc::new(move || {
-        if visible.get_untracked() && selected() && !busy.get_untracked() {
+        if visible.get_untracked() && interactive() && !busy.get_untracked() {
             keyboard.focus();
         }
     });
@@ -155,10 +194,11 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         composing_text.set(None);
     });
     effect(move || {
-        if !visible.get() {
+        if !visible.get() || is_stopped() {
             control.set(false);
             alt.set(false);
             confirm.set(None);
+            find_open.set(false);
             composing_text.set(None);
         }
     });
@@ -189,6 +229,131 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
         }
     });
 
+    let header_leading = match &mode {
+        TerminalMode::Session { .. } => {
+            let title = host.title;
+            view()
+                .flex_1()
+                .min_w(px(0.0))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_SM))
+                .child(
+                    svg(icon!("square-terminal"))
+                        .size(px(theme::ICON_SM))
+                        .flex_shrink_0()
+                        .text_color(theme::terminal_key_label()),
+                )
+                .child(
+                    text(move || title.get().unwrap_or_default())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .font_family(theme::TERMINAL_FONT_FAMILY)
+                        .text_size(px(theme::font_caption()))
+                        .font_weight(FontWeight::MEDIUM)
+                        .text_color(theme::terminal_key_label()),
+                )
+                .into_element()
+        }
+        TerminalMode::Workspace {
+            terminals,
+            on_select_terminal,
+            ..
+        } => terminal_tabs(
+            *terminals,
+            active,
+            busy,
+            confirm,
+            on_select_terminal.clone(),
+        )
+        .into_element(),
+    };
+
+    let header_new_terminal = match &mode {
+        TerminalMode::Workspace {
+            on_new_terminal, ..
+        } => {
+            let create = on_new_terminal.clone();
+            surface::ghost_button(
+                icon!("plus"),
+                copy::text("New terminal", "新建终端", "新增終端"),
+                move || create(),
+            )
+            .disabled(move || busy.get())
+            .into_element()
+        }
+        TerminalMode::Session { .. } => view().into_element(),
+    };
+
+    let close_confirm = match &mode {
+        TerminalMode::Workspace { on_kill, .. } => {
+            let kill = on_kill.clone();
+            when(
+                move || confirm.with(Option::is_some),
+                move || {
+                    let kill = kill.clone();
+                    // Closing a terminal ends what runs in it, so it is asked for
+                    // twice: once on the tab, once here.
+                    view()
+                        .flex_shrink_0()
+                        .px(px(theme::SPACING_MD))
+                        .pt(px(theme::SPACING_SM))
+                        .child(
+                            surface::card()
+                                .p(px(surface::ROW_INSET))
+                                .gap(px(theme::SPACING_MD))
+                                .child(
+                                    text(copy::text(
+                                        "Close this terminal and stop its running process?",
+                                        "关闭此终端并停止正在运行的进程？",
+                                        "關閉此終端機並停止正在執行的程序？",
+                                    ))
+                                    .text_size(px(theme::font_detail()))
+                                    .line_height(theme::line_height_for(theme::font_detail()))
+                                    .text_color(theme::foreground),
+                                )
+                                .child(
+                                    view()
+                                        .flex_row()
+                                        .gap(px(theme::SPACING_SM))
+                                        .child(
+                                            action::tonal(
+                                                copy::text("Cancel", "取消", "取消"),
+                                                move || confirm.set(None),
+                                            )
+                                            .flex_1()
+                                            .min_w(px(0.0)),
+                                        )
+                                        .child(
+                                            action::tonal_danger(
+                                                copy::text(
+                                                    "Close terminal",
+                                                    "关闭终端",
+                                                    "關閉終端機",
+                                                ),
+                                                move || {
+                                                    if let Some(id) = confirm.get_untracked() {
+                                                        confirm.set(None);
+                                                        kill(&id);
+                                                    }
+                                                },
+                                            )
+                                            .flex_1()
+                                            .min_w(px(0.0)),
+                                        ),
+                                ),
+                        )
+                },
+            )
+            .into_element()
+        }
+        TerminalMode::Session { .. } => view().into_element(),
+    };
+
+    let overlay_mode = mode.clone();
+    let overlay_retry = host.on_retry.clone();
+
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -209,37 +374,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 .bg(theme::terminal_chrome())
                 .border_b_1()
                 .border_color(theme::terminal_hairline())
-                .child(
-                    when(attached_session, move || {
-                        view()
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .flex_row()
-                            .items_center()
-                            .gap(px(theme::SPACING_SM))
-                            .child(
-                                svg(icon!("square-terminal"))
-                                    .size(px(theme::ICON_SM))
-                                    .flex_shrink_0()
-                                    .text_color(theme::terminal_key_label()),
-                            )
-                            .child(
-                                text(move || host.title.get().unwrap_or_default())
-                                    .flex_1()
-                                    .min_w(px(0.0))
-                                    .truncate()
-                                    .font_family(theme::TERMINAL_FONT_FAMILY)
-                                    .text_size(px(theme::font_caption()))
-                                    .font_weight(FontWeight::MEDIUM)
-                                    .text_color(theme::terminal_key_label()),
-                            )
-                    })
-                    .otherwise({
-                        let select = host.on_select_terminal.clone();
-                        let terminals = host.terminals;
-                        move || terminal_tabs(terminals, active, busy, confirm, select.clone())
-                    }),
-                )
+                .child(header_leading)
                 .child({
                     let focus = focus_keyboard.clone();
                     surface::ghost_button(
@@ -247,7 +382,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                         copy::text("Keyboard", "键盘", "鍵盤"),
                         move || focus(),
                     )
-                    .disabled(move || !selected() || busy.get())
+                    .disabled(move || !interactive() || busy.get())
                 })
                 .child(
                     surface::ghost_button(
@@ -260,20 +395,9 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                             }
                         },
                     )
-                    .disabled(move || !selected()),
+                    .disabled(move || !interactive()),
                 )
-                .child(when(move || !attached_session(), {
-                    let create = host.on_new_terminal.clone();
-                    move || {
-                        let create = create.clone();
-                        surface::ghost_button(
-                            icon!("plus"),
-                            copy::text("New terminal", "新建终端", "新增終端"),
-                            move || create(),
-                        )
-                        .disabled(move || busy.get())
-                    }
-                })),
+                .child(header_new_terminal),
         )
         .child(when(
             move || find_open.get(),
@@ -331,90 +455,41 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                     ))
             },
         ))
-        .child(when(move || confirm.with(Option::is_some), {
-            let kill = host.on_kill.clone();
-            move || {
-                let kill = kill.clone();
-                // Closing a terminal ends what runs in it, so it is asked for
-                // twice: once on the tab, once here.
-                view()
-                    .flex_shrink_0()
-                    .px(px(theme::SPACING_MD))
-                    .pt(px(theme::SPACING_SM))
-                    .child(
-                        surface::card()
-                            .p(px(surface::ROW_INSET))
-                            .gap(px(theme::SPACING_MD))
-                            .child(
-                                text(copy::text(
-                                    "Close this terminal and stop its running process?",
-                                    "关闭此终端并停止正在运行的进程？",
-                                    "關閉此終端機並停止正在執行的程序？",
-                                ))
-                                .text_size(px(theme::font_detail()))
-                                .line_height(theme::line_height_for(theme::font_detail()))
-                                .text_color(theme::foreground),
-                            )
-                            .child(
-                                view()
-                                    .flex_row()
-                                    .gap(px(theme::SPACING_SM))
-                                    .child(
-                                        action::tonal(
-                                            copy::text("Cancel", "取消", "取消"),
-                                            move || confirm.set(None),
-                                        )
-                                        .flex_1()
-                                        .min_w(px(0.0)),
-                                    )
-                                    .child(
-                                        action::tonal_danger(
-                                            copy::text("Close terminal", "关闭终端", "關閉終端機"),
-                                            move || {
-                                                if let Some(id) = confirm.get_untracked() {
-                                                    confirm.set(None);
-                                                    kill(&id);
-                                                }
-                                            },
-                                        )
-                                        .flex_1()
-                                        .min_w(px(0.0)),
-                                    ),
-                            ),
-                    )
-            }
-        }))
-        .child(when(move || error.with(Option::is_some), {
-            let retry = host.on_retry.clone();
-            move || {
-                let retry = retry.clone();
-                view()
-                    .flex_shrink_0()
-                    .mx(px(theme::SPACING_MD))
-                    .mt(px(theme::SPACING_SM))
-                    .pl(px(theme::SPACING_MD))
-                    .pr(px(theme::SPACING_XS))
-                    .min_h(px(theme::ROUND_CONTROL))
-                    .flex_row()
-                    .items_center()
-                    .gap(px(theme::SPACING_SM))
-                    .rounded(px(theme::RADIUS_CHIP))
-                    .bg(move || theme::tint(theme::accent_red()))
-                    .child(
-                        text(move || error.get().unwrap_or_default())
-                            .flex_1()
-                            .min_w(px(0.0))
-                            .py(px(theme::SPACING_SM))
-                            .text_size(px(theme::font_caption()))
-                            .text_color(theme::accent_red),
-                    )
-                    .child(surface::ghost_button(
-                        icon!("refresh"),
-                        copy::text("Reconnect terminal", "重连终端", "重新連接終端機"),
-                        move || retry(),
-                    ))
-            }
-        }))
+        .child(close_confirm)
+        .child(when(
+            move || error.with(Option::is_some) && !is_stopped(),
+            {
+                let retry = host.on_retry.clone();
+                move || {
+                    let retry = retry.clone();
+                    view()
+                        .flex_shrink_0()
+                        .mx(px(theme::SPACING_MD))
+                        .mt(px(theme::SPACING_SM))
+                        .pl(px(theme::SPACING_MD))
+                        .pr(px(theme::SPACING_XS))
+                        .min_h(px(theme::ROUND_CONTROL))
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_SM))
+                        .rounded(px(theme::RADIUS_CHIP))
+                        .bg(move || theme::tint(theme::accent_red()))
+                        .child(
+                            text(move || error.get().unwrap_or_default())
+                                .flex_1()
+                                .min_w(px(0.0))
+                                .py(px(theme::SPACING_SM))
+                                .text_size(px(theme::font_caption()))
+                                .text_color(theme::accent_red),
+                        )
+                        .child(surface::ghost_button(
+                            icon!("refresh"),
+                            copy::text("Reconnect terminal", "重连终端", "重新連接終端機"),
+                            move || retry(),
+                        ))
+                }
+            },
+        ))
         .child({
             let panel_focus = focus_keyboard.clone();
             let grid_focus = focus_keyboard.clone();
@@ -431,7 +506,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 // and it fills the whole width so a long line has room before
                 // it wraps.
                 .bg(theme::terminal_surface())
-                .test_id(TERMINAL_PANEL_ID)
+                .test_id(panel_id)
                 .px(px(TERMINAL_INSET))
                 .py(px(TERMINAL_INSET))
                 .on_press(move || panel_focus())
@@ -462,7 +537,7 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                 // unmounts it (releasing Android's InputConnection and hiding the
                 // soft keyboard), and returning mounts a clean InputBox with
                 // fresh native geometry and edit count.
-                .child(when(move || visible.get() && selected(), {
+                .child(when(move || visible.get() && interactive(), {
                     let submit_keyboard = submit_keyboard.clone();
                     move || {
                         terminal_keyboard(
@@ -476,39 +551,18 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
                     }
                 }))
                 .child(when(
-                    move || !selected(),
+                    move || !selected() || is_stopped(),
                     move || {
-                        view()
-                            .absolute()
-                            .inset(px(0.0))
-                            .bg(theme::terminal_surface())
-                            .child(surface::empty_state(
-                                icon!("square-terminal"),
-                                move || {
-                                    SharedString::from(if busy.get() {
-                                        copy::text(
-                                            "Connecting to terminal…",
-                                            "正在连接终端…",
-                                            "正在連接終端機…",
-                                        )
-                                    } else {
-                                        copy::text(
-                                            "Select or create a terminal",
-                                            "选择或新建终端",
-                                            "選擇或新增終端機",
-                                        )
-                                    })
-                                },
-                                copy::text(
-                                    "A terminal runs in the session's workspace on the desktop.",
-                                    "终端运行在桌面端该会话的工作区中。",
-                                    "終端機在桌面端該工作階段的工作區中執行。",
-                                ),
-                            ))
+                        terminal_placeholder(
+                            overlay_mode.clone(),
+                            busy,
+                            error,
+                            overlay_retry.clone(),
+                        )
                     },
                 ))
         })
-        .child(when(selected, move || {
+        .child(when(interactive, move || {
             terminal_keys(
                 control,
                 alt,
@@ -521,6 +575,134 @@ pub fn terminal(host: TerminalHost) -> impl IntoElement {
             move || keyboard_height().0 == 0.0,
             || view().h(safe_area().bottom),
         ))
+}
+
+fn terminal_placeholder(
+    mode: TerminalMode,
+    busy: Signal<bool>,
+    error: Signal<Option<SharedString>>,
+    on_retry: Rc<dyn Fn()>,
+) -> impl IntoElement {
+    view()
+        .absolute()
+        .inset(px(0.0))
+        .bg(theme::terminal_surface())
+        .child(match mode {
+            TerminalMode::Workspace { .. } => surface::empty_state(
+                icon!("square-terminal"),
+                move || {
+                    SharedString::from(if busy.get() {
+                        copy::text(
+                            "Connecting to terminal…",
+                            "正在连接终端…",
+                            "正在連接終端機…",
+                        )
+                    } else {
+                        copy::text(
+                            "Select or create a terminal",
+                            "选择或新建终端",
+                            "選擇或新增終端機",
+                        )
+                    })
+                },
+                copy::text(
+                    "A terminal runs in the session's workspace on the desktop.",
+                    "终端运行在桌面端该会话的工作区中。",
+                    "終端機在桌面端該工作階段的工作區中執行。",
+                ),
+            )
+            .into_element(),
+            TerminalMode::Session {
+                stopped,
+                restarting,
+                on_restart,
+            } => dynamic(move || {
+                if let Some(reason) = stopped.get() {
+                    let restart = on_restart.clone();
+                    let icon_src = match reason {
+                        TerminalSessionStopped::Failed => icon!("triangle-alert"),
+                        TerminalSessionStopped::Exited | TerminalSessionStopped::NotRunning => {
+                            icon!("square-terminal")
+                        }
+                    };
+                    let title = match reason {
+                        TerminalSessionStopped::Exited => {
+                            copy::text("The Agent has exited.", "Agent 已退出。", "Agent 已退出。")
+                        }
+                        TerminalSessionStopped::Failed => copy::text(
+                            "The Agent did not start in this session's terminal.",
+                            "该会话的终端未能启动 Agent。",
+                            "該工作階段的終端機未能啟動 Agent。",
+                        ),
+                        TerminalSessionStopped::NotRunning => copy::text(
+                            "This session's terminal is not running.",
+                            "该会话的终端未运行。",
+                            "該工作階段的終端機未執行。",
+                        ),
+                    };
+                    surface::empty_state(icon_src, title, move || {
+                        error.get().unwrap_or_else(|| {
+                            copy::text(
+                                "Restart the Agent to continue working in this terminal session.",
+                                "重新启动 Agent 以继续在此终端会话中工作。",
+                                "重新啟動 Agent 以繼續在此終端機工作階段中工作。",
+                            )
+                            .into()
+                        })
+                    })
+                    .child(
+                        action::solid(
+                            move || {
+                                SharedString::from(if restarting.get() {
+                                    copy::text("Restarting…", "正在重启…", "正在重啟…")
+                                } else {
+                                    copy::text("Restart Agent", "重新启动 Agent", "重新啟動 Agent")
+                                })
+                            },
+                            move || restart(),
+                        )
+                        .disabled(move || restarting.get())
+                        .mt(px(theme::SPACING_SM)),
+                    )
+                    .into_element()
+                } else {
+                    let retry = on_retry.clone();
+                    surface::empty_state(
+                        icon!("square-terminal"),
+                        move || {
+                            SharedString::from(if busy.get() {
+                                copy::text(
+                                    "Connecting to terminal…",
+                                    "正在连接终端…",
+                                    "正在連接終端機…",
+                                )
+                            } else {
+                                copy::text(
+                                    "Waiting for the session's terminal…",
+                                    "正在等待会话终端…",
+                                    "正在等待工作階段的終端機…",
+                                )
+                            })
+                        },
+                        copy::text(
+                            "This session runs an Agent in a native terminal on the desktop.",
+                            "此会话在桌面端的原生终端中运行 Agent。",
+                            "此工作階段在桌面端的原生終端機中執行 Agent。",
+                        ),
+                    )
+                    .child(when(
+                        move || !busy.get(),
+                        move || {
+                            let retry = retry.clone();
+                            action::tonal(copy::text("Retry", "重试", "重試"), move || retry())
+                                .mt(px(theme::SPACING_SM))
+                        },
+                    ))
+                    .into_element()
+                }
+            })
+            .into_element(),
+        })
 }
 
 fn terminal_tabs(

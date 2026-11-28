@@ -27,20 +27,20 @@ use vibex_core::{
     RemoteAgentProjectionPreviewResponse, RemoteAgentRenameSessionResponse,
     RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
     RemoteAgentResolveElicitationResponse, RemoteAgentResolvePermissionResponse,
-    RemoteAgentRuntimeEventsResponse, RemoteAgentRuntimeOptionsResponse,
-    RemoteAgentRuntimeProbeCancelResponse, RemoteAgentRuntimeProbeGetResponse,
-    RemoteAgentRuntimeProbeListResponse, RemoteAgentRuntimeProbeStartResponse,
-    RemoteAgentRuntimeProcessSnapshotResponse, RemoteAgentRuntimeSelectionResponse,
-    RemoteAgentRuntimeSnapshotResponse, RemoteAgentSendMessageResponse,
-    RemoteAgentSessionActionResponse, RemoteAgentSessionDetailResponse,
-    RemoteAgentSessionListResponse, RemoteAgentSessionTokenUsageResponse,
-    RemoteAgentSetDesiredRuntimeResponse, RemoteAgentTimelineCursor,
-    RemoteAgentTimelineDisplaySettingsResponse, RemoteAgentTimelineFetchResponse,
-    RemoteAgentTimelineItemFetchResponse, RemoteAgentTurnIndexFetchResponse,
-    RemoteAgentUnarchiveSessionResponse, RemoteAgentUsageStatisticsResponse, RemoteAuditAction,
-    RemoteAuditOutcome, RemoteAuditRecord, RemoteAuditTargetKind, RemoteAuthContext,
-    RemoteAuthProof, RemoteCapabilitySummary, RemoteClaimPairingCodeRequest,
-    RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
+    RemoteAgentRestartTerminalSessionResponse, RemoteAgentRuntimeEventsResponse,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeProbeCancelResponse,
+    RemoteAgentRuntimeProbeGetResponse, RemoteAgentRuntimeProbeListResponse,
+    RemoteAgentRuntimeProbeStartResponse, RemoteAgentRuntimeProcessSnapshotResponse,
+    RemoteAgentRuntimeSelectionResponse, RemoteAgentRuntimeSnapshotResponse,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionActionResponse,
+    RemoteAgentSessionDetailResponse, RemoteAgentSessionListResponse,
+    RemoteAgentSessionTokenUsageResponse, RemoteAgentSetDesiredRuntimeResponse,
+    RemoteAgentTimelineCursor, RemoteAgentTimelineDisplaySettingsResponse,
+    RemoteAgentTimelineFetchResponse, RemoteAgentTimelineItemFetchResponse,
+    RemoteAgentTurnIndexFetchResponse, RemoteAgentUnarchiveSessionResponse,
+    RemoteAgentUsageStatisticsResponse, RemoteAuditAction, RemoteAuditOutcome, RemoteAuditRecord,
+    RemoteAuditTargetKind, RemoteAuthContext, RemoteAuthProof, RemoteCapabilitySummary,
+    RemoteClaimPairingCodeRequest, RemoteClaimPairingCodeResponse, RemoteCreatePairingCodeRequest,
     RemoteCreatePairingCodeResponse, RemoteDeepLinkResolution, RemoteDeepLinkResolutionStatus,
     RemoteDeleteDeviceRequest, RemoteDeviceDetail, RemoteDevicePermissionLevel, RemoteDeviceStatus,
     RemoteFileCopyResponse, RemoteFileCreateDirectoryResponse, RemoteFileDeleteResponse,
@@ -5355,6 +5355,30 @@ async fn dispatch_agent_request(
             serde_json::to_value(RemoteAgentUnarchiveSessionResponse { session })
                 .map_err(remote_payload_encode_error)
         }
+        RemoteAgentRequest::RestartTerminalSession(request) => {
+            let target_id = request.session_id.as_str().to_string();
+            let auth = authorize_agent_action(
+                &manager,
+                request.auth,
+                RemoteActionClass::MutateAgentSession,
+                Some(request_id.clone()),
+                correlation_id.clone(),
+            )?;
+            let result = manager.restart_terminal_session(&request.session_id).await;
+            audit_agent_mutation(
+                &manager,
+                Some(auth.device_id),
+                RemoteAuditTargetKind::AgentSession,
+                target_id,
+                "Agent terminal session restart",
+                result.is_ok(),
+                Some(request_id),
+                correlation_id,
+            )?;
+            let session = result?;
+            serde_json::to_value(RemoteAgentRestartTerminalSessionResponse { session })
+                .map_err(remote_payload_encode_error)
+        }
         RemoteAgentRequest::ArchiveSession(request) => {
             let target_id = request.session_id.as_str().to_string();
             let auth = authorize_agent_action(
@@ -9997,6 +10021,62 @@ mod tests {
             record.target_id.as_deref() == Some(root.id.as_str())
                 && record.redacted_summary == "Agent session unarchive"
                 && record.outcome == RemoteAuditOutcome::Allowed
+        }));
+        cleanup_db(db_path);
+    }
+
+    #[tokio::test]
+    async fn remote_restart_terminal_session_requires_control_and_audits_dispatch() {
+        let (db_path, manager) = test_agent_manager("restart-terminal");
+        let session = create_mock_session(&manager, "Not a terminal").await;
+        let reader = pair_device(&db_path, RemoteDevicePermissionLevel::ReadOnly, "Reader");
+        let controller = pair_device(
+            &db_path,
+            RemoteDevicePermissionLevel::FullControl,
+            "Controller",
+        );
+        let router =
+            build_router_with_agent(RemoteServiceConfig::loopback_disabled(), manager.clone());
+
+        let denied = post_agent(
+            router.clone(),
+            RemoteAgentRequest::RestartTerminalSession(
+                vibex_core::RemoteAgentSessionActionRequest {
+                    auth: reader,
+                    session_id: session.id.clone(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(denied.error.unwrap().code, "remote_permission_denied");
+
+        let unsupported = post_agent(
+            router,
+            RemoteAgentRequest::RestartTerminalSession(
+                vibex_core::RemoteAgentSessionActionRequest {
+                    auth: controller.clone(),
+                    session_id: session.id.clone(),
+                },
+            ),
+        )
+        .await;
+        assert_eq!(
+            unsupported.error.unwrap().code,
+            "terminal_session_unsupported"
+        );
+
+        let audits = RemoteAuditRepository::list(
+            &open_database(&db_path).unwrap(),
+            &RemoteAuditListRequest {
+                device_id: Some(controller.device_id),
+                limit: Some(20),
+            },
+        )
+        .unwrap();
+        assert!(audits.iter().any(|record| {
+            record.target_id.as_deref() == Some(session.id.as_str())
+                && record.redacted_summary == "Agent terminal session restart"
+                && record.outcome == RemoteAuditOutcome::Failed
         }));
         cleanup_db(db_path);
     }

@@ -82,9 +82,10 @@ use vibex_core::{
     RemoteAgentReplaceUserMessageResponse, RemoteAgentRequest,
     RemoteAgentResolveElicitationRequest, RemoteAgentResolveElicitationResponse,
     RemoteAgentResolvePermissionRequest, RemoteAgentResolvePermissionResponse,
-    RemoteAgentRuntimeOptionsRequest, RemoteAgentRuntimeOptionsResponse,
-    RemoteAgentRuntimeSelectionRequest, RemoteAgentRuntimeSelectionResponse,
-    RemoteAgentSendMessageRequest, RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
+    RemoteAgentRestartTerminalSessionResponse, RemoteAgentRuntimeOptionsRequest,
+    RemoteAgentRuntimeOptionsResponse, RemoteAgentRuntimeSelectionRequest,
+    RemoteAgentRuntimeSelectionResponse, RemoteAgentSendMessageRequest,
+    RemoteAgentSendMessageResponse, RemoteAgentSessionActionRequest,
     RemoteAgentSessionActionResponse, RemoteAgentSessionDetailRequest,
     RemoteAgentSessionDetailResponse, RemoteAgentSessionListRequest,
     RemoteAgentSessionListResponse, RemoteAgentSetDesiredRuntimeRequest,
@@ -1234,6 +1235,30 @@ impl AgentBackend for WebRemoteBackend {
                 )
                 .await?;
             Ok(decode::<RemoteAgentCreateSessionResponse>(value)?.session)
+        })
+    }
+
+    fn restart_terminal_session(
+        &self,
+        session_id: VibexSessionId,
+    ) -> BackendFuture<'_, AgentSession> {
+        let this = self.clone();
+        Box::pin(async move {
+            let payload =
+                RemoteAgentRequest::RestartTerminalSession(RemoteAgentSessionActionRequest {
+                    auth: this.auth(),
+                    session_id,
+                });
+            let value = this
+                .rpc(
+                    RemoteOperationKind::AgentSession,
+                    payload,
+                    None,
+                    None,
+                    vibex_core::RemoteTimeoutClass::LongRunning,
+                )
+                .await?;
+            Ok(decode::<RemoteAgentRestartTerminalSessionResponse>(value)?.session)
         })
     }
 

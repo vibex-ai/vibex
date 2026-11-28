@@ -613,6 +613,26 @@ pub(crate) enum PaletteKind {
     Skill,
 }
 
+/// State and callbacks for a native terminal Agent session rendered directly
+/// on the main session page.
+#[derive(Clone)]
+pub struct SessionTerminalHost {
+    pub visible: Signal<bool>,
+    pub title: Signal<Option<SharedString>>,
+    pub error: Signal<Option<SharedString>>,
+    pub term_ref: ComponentRef<crate::screens::terminal::Terminal>,
+    pub active: Signal<Option<String>>,
+    pub busy: Signal<bool>,
+    pub output_revision: Signal<u64>,
+    pub stopped: Signal<Option<crate::screens::terminal::TerminalSessionStopped>>,
+    pub restarting: Signal<bool>,
+    pub on_data: TerminalInput,
+    pub on_resize: Rc<dyn Fn(u32, u32)>,
+    pub on_title: Rc<dyn Fn(&str)>,
+    pub on_retry: Action,
+    pub on_restart: Action,
+}
+
 /// What the shell may do, and the state it shows.
 #[derive(Clone)]
 pub struct SessionHost {
@@ -778,7 +798,9 @@ pub struct SessionHost {
     pub on_load_older: Action,
     /// Forks the conversation through a row's sequence.
     pub on_fork: Rc<dyn Fn(i64)>,
-    /// The terminal surface, when it is open over the shell.
+    /// Native terminal Agent session shown directly on the main session page.
+    pub session_terminal: SessionTerminalHost,
+    /// The workbench terminal surface, managing independent workspace shells.
     pub terminal_open: Signal<bool>,
     pub terminal_visible: Signal<bool>,
     pub terminal_title: Signal<Option<SharedString>>,
@@ -992,6 +1014,7 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
     };
     let tab = signal(initial_tab.unwrap_or_default());
     let terminal_find = signal(false);
+    let session_terminal_find = signal(false);
     if initial_tab.is_some() {
         pager.show_initial(ShellPage::Workbench);
     }
@@ -1022,6 +1045,11 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
                 }
                 true
             }
+            ShellPage::Home if session_terminal_find.get_untracked() => {
+                session_terminal_find.set(false);
+                dismiss_keyboard();
+                true
+            }
             ShellPage::Home if host.find_open.get_untracked() => {
                 (host.on_toggle_find)();
                 true
@@ -1038,18 +1066,26 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
     });
     let active = host.active;
     let session = active_session(&host);
-    let previous = stored(None::<(String, bool)>);
+    let session_terminal_visible = host.session_terminal.visible;
+    cleanup(move || {
+        session_terminal_visible.try_set(false);
+    });
     effect(move || {
-        let id = active.get();
-        let terminal =
+        let is_terminal =
             session.with(|session| session.as_ref().is_some_and(|session| session.terminal));
-        let current = id.map(|id| (id, terminal));
+        let open = pager.page() == ShellPage::Home && !creating.get() && is_terminal;
+        session_terminal_visible.set(open);
+        if !open {
+            session_terminal_find.set(false);
+        }
+    });
+    let previous = stored(None::<String>);
+    effect(move || {
+        let current = active.get();
         let prior = previous.replace(current.clone());
         if prior != current {
-            if terminal {
-                tab.set(WorkbenchTab::Terminal);
-                pager.open(ShellPage::Workbench);
-            } else if prior.is_some() && pager.page_untracked() != ShellPage::Home {
+            session_terminal_find.set(false);
+            if prior.is_some() && pager.page_untracked() != ShellPage::Home {
                 pager.close();
             }
         }
@@ -1061,7 +1097,7 @@ fn surfaces(host: SessionHost) -> impl IntoElement {
         .relative()
         .child(pager::pager(
             pager,
-            shell(host.clone(), pager, tab, overlays),
+            shell(host.clone(), pager, tab, overlays, session_terminal_find),
             drawer(drawer_host, pager, overlays),
             move || {
                 workbench::workbench(pager, tab, terminal_find, rail_host.clone()).into_element()
@@ -1106,7 +1142,12 @@ fn workbench_surfaces(
     terminal_find: Signal<bool>,
 ) -> impl IntoElement {
     let terminal = crate::screens::terminal::TerminalHost {
-        session_terminal: active_session(&host),
+        mode: crate::screens::terminal::TerminalMode::Workspace {
+            terminals: host.terminal_choices,
+            on_kill: host.on_kill_terminal.clone(),
+            on_select_terminal: host.on_select_terminal.clone(),
+            on_new_terminal: host.on_new_terminal.clone(),
+        },
         title: host.terminal_title,
         error: host.terminal_error,
         term_ref: host.terminal_ref,
@@ -1114,15 +1155,11 @@ fn workbench_surfaces(
         on_data: host.on_terminal_data.clone(),
         on_resize: host.on_terminal_resize.clone(),
         on_title: host.on_terminal_title.clone(),
-        terminals: host.terminal_choices,
         active: host.terminal_id,
         busy: host.terminal_busy,
         output_revision: host.terminal_output_revision,
         find_open: terminal_find,
         on_retry: host.on_retry_terminal.clone(),
-        on_kill: host.on_kill_terminal.clone(),
-        on_select_terminal: host.on_select_terminal.clone(),
-        on_new_terminal: host.on_new_terminal.clone(),
     };
     let files = crate::screens::files::FilesHost {
         entries: host.files_entries,
@@ -1234,11 +1271,14 @@ fn shell(
     pager: Pager,
     tab: Signal<WorkbenchTab>,
     overlays: Overlays,
+    session_terminal_find: Signal<bool>,
 ) -> impl IntoElement {
     let connection = host.connection;
     let connection_error = host.connection_error;
     let on_retry = host.on_retry.clone();
     let terminal = active_session(&host);
+    let is_terminal =
+        move || terminal.with(|session| session.as_ref().is_some_and(|session| session.terminal));
     let composer_host = host.clone();
     let composer_input = element_ref();
     let jump_to_message = signal(None::<i64>);
@@ -1249,6 +1289,9 @@ fn shell(
     // connection strip below them uses the same answer, so the two never both
     // inset for the bar.
     let tabs_above_for_banner = group_tabs_visible(&host);
+    let sibling_strip_above = computed(move || {
+        tabs_above_for_banner.get() || connection.get() != ConnectionState::Online
+    });
     let create_host = NewSessionHost {
         workspaces: host.new_workspaces,
         workspace: host.new_workspace,
@@ -1284,7 +1327,7 @@ fn shell(
         .bg(theme::block_page_adaptive())
         .flex_col()
         .test_id("conversation-page")
-        .child(header(host.clone(), pager, overlays))
+        .child(header(host.clone(), pager, overlays, session_terminal_find))
         .child(when(
             move || creating.get(),
             move || new_session_page(create_host.clone()),
@@ -1301,7 +1344,9 @@ fn shell(
                 // rather than on the page so that it and the group tabs are
                 // siblings: the tabs clear it by `z_index`, which only orders
                 // siblings, and the band must not blur the controls on it.
-                .child(top_glass())
+                // Native terminal sessions sit below the floating bar instead
+                // of scrolling behind it, so they omit the glass band.
+                .child(when(move || !is_terminal(), top_glass))
                 // The bar floats over the page and the transcript runs beneath
                 // it: the list starts at the page's top edge, and the space the
                 // bar takes is the list's own content padding (see
@@ -1338,13 +1383,57 @@ fn shell(
                         .relative()
                         .flex_1()
                         .min_h(px(0.0))
-                        .child(timeline_view(
-                            host.clone(),
-                            jump_to_message,
-                            scroll_to_end_rev,
-                            pager,
-                            tab,
-                        ))
+                        .flex_col()
+                        .child(
+                            when(is_terminal, {
+                                let session_term = host.session_terminal.clone();
+                                move || {
+                                    let term_host = crate::screens::terminal::TerminalHost {
+                                        mode: crate::screens::terminal::TerminalMode::Session {
+                                            stopped: session_term.stopped,
+                                            restarting: session_term.restarting,
+                                            on_restart: session_term.on_restart.clone(),
+                                        },
+                                        title: session_term.title,
+                                        error: session_term.error,
+                                        term_ref: session_term.term_ref,
+                                        visible: session_term.visible,
+                                        on_data: session_term.on_data.clone(),
+                                        on_resize: session_term.on_resize.clone(),
+                                        on_title: session_term.on_title.clone(),
+                                        active: session_term.active,
+                                        busy: session_term.busy,
+                                        output_revision: session_term.output_revision,
+                                        find_open: session_terminal_find,
+                                        on_retry: session_term.on_retry.clone(),
+                                    };
+                                    view()
+                                        .flex_1()
+                                        .min_h(px(0.0))
+                                        .flex_col()
+                                        .pt(move || {
+                                            if sibling_strip_above.get() {
+                                                px(0.0)
+                                            } else {
+                                                px(top_bar_inset())
+                                            }
+                                        })
+                                        .child(crate::screens::terminal::terminal(term_host))
+                                }
+                            })
+                            .otherwise({
+                                let host = host.clone();
+                                move || {
+                                    timeline_view(
+                                        host.clone(),
+                                        jump_to_message,
+                                        scroll_to_end_rev,
+                                        pager,
+                                        tab,
+                                    )
+                                }
+                            }),
+                        )
                         // A failure floats here and leaves on its own. Drawn
                         // into the page it had no way out: it outlived the
                         // condition it described, and the reader had to leave
@@ -1358,25 +1447,36 @@ fn shell(
                             )
                         }),
                 )
-                .child(composer_palettes(
-                    host.draft,
-                    host.commands,
-                    host.mentions,
-                    host.skills,
-                    host.on_arm_entry.clone(),
+                .child(when(move || !is_terminal(), {
+                    let host = host.clone();
+                    move || {
+                        composer_palettes(
+                            host.draft,
+                            host.commands,
+                            host.mentions,
+                            host.skills,
+                            host.on_arm_entry.clone(),
+                        )
+                    }
+                }))
+                .child(when(
+                    move || !is_terminal() && host.pending.get().is_some(),
+                    {
+                        let pending = host.pending;
+                        let resolving = host.resolving;
+                        let on_permission = host.on_permission.clone();
+                        move || permission_card(pending, resolving, on_permission.clone())
+                    },
                 ))
-                .child(when(move || host.pending.get().is_some(), {
-                    let pending = host.pending;
-                    let resolving = host.resolving;
-                    let on_permission = host.on_permission.clone();
-                    move || permission_card(pending, resolving, on_permission.clone())
-                }))
-                .child(when(move || host.question.get().is_some(), {
-                    let question = host.question;
-                    let resolving = host.resolving;
-                    let on_question = host.on_question.clone();
-                    move || question_card(question, resolving, on_question.clone())
-                }))
+                .child(when(
+                    move || !is_terminal() && host.question.get().is_some(),
+                    {
+                        let question = host.question;
+                        let resolving = host.resolving;
+                        let on_question = host.on_question.clone();
+                        move || question_card(question, resolving, on_question.clone())
+                    },
+                ))
                 .child(when(
                     move || {
                         terminal.with(|session| {
@@ -1418,7 +1518,12 @@ fn shell(
 /// The conversation's top bar: three objects on the page rather than a strip
 /// across it. The way to the sessions, the session's own title and menu, and
 /// the two ways out of it: a new session, and the workbench.
-fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoElement {
+fn header(
+    host: SessionHost,
+    pager: Pager,
+    overlays: Overlays,
+    session_terminal_find: Signal<bool>,
+) -> impl IntoElement {
     let creating = host.new_session_open;
     let terminal_choices = host.terminal_choices;
     let terminal_running = move || {
@@ -1454,7 +1559,21 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
             crate::motion::tick();
             dismiss_keyboard();
             let mut lead = Vec::new();
-            if !host.find_open.get_untracked() {
+            if current.terminal {
+                let interactive = host.session_terminal.active.with_untracked(Option::is_some)
+                    && host
+                        .session_terminal
+                        .stopped
+                        .with_untracked(Option::is_none)
+                    && !host.session_terminal.restarting.get_untracked();
+                if interactive && !session_terminal_find.get_untracked() {
+                    lead.push(MenuEntry::new(
+                        icon!("search"),
+                        copy::text("Find in terminal", "在终端中查找", "在終端中尋找"),
+                        move || session_terminal_find.set(true),
+                    ));
+                }
+            } else if !host.find_open.get_untracked() {
                 let find = host.on_toggle_find.clone();
                 lead.push(MenuEntry::new(
                     icon!("search"),
@@ -1462,7 +1581,8 @@ fn header(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                     move || find(),
                 ));
             }
-            let recallable = !host.sending.get_untracked()
+            let recallable = !current.terminal
+                && !host.sending.get_untracked()
                 && host.timeline.with_untracked(|entries| {
                     entries.iter().any(|entry| entry.kind == EntryKind::User)
                 });
@@ -1901,10 +2021,6 @@ fn timeline_view(
     pager: Pager,
     tab: Signal<WorkbenchTab>,
 ) -> impl IntoElement {
-    let on_terminal = move || {
-        tab.set(WorkbenchTab::Terminal);
-        pager.open(ShellPage::Workbench);
-    };
     // The strips above take the bar's room when one of them is shown; the list
     // takes it only when none is (see its `content_padding_top`).
     let tabs_above = group_tabs_visible(&host);
@@ -1940,7 +2056,6 @@ fn timeline_view(
     let status = host.conversation;
     let on_refresh = host.on_refresh.clone();
     let on_new = host.on_new_session.clone();
-    let terminal = active_session(&host);
     let find_query = signal(String::new());
     let find_cursor = signal(0usize);
     let find_matches = computed(move || {
@@ -2224,80 +2339,47 @@ fn timeline_view(
         ))
         .child(when(
             move || active.get().is_some() && visible.with(Vec::is_empty),
-            {
-                let on_terminal = Rc::new(on_terminal);
-                move || {
-                    dynamic({
-                        let on_terminal = on_terminal.clone();
-                        let on_refresh = on_refresh.clone();
-                        move || {
-                            if terminal.with(|session| {
-                                session.as_ref().is_some_and(|session| session.terminal)
-                            }) {
-                                let on_terminal = on_terminal.clone();
-                                return surface::empty_state(
-                                    icon!("square-terminal"),
-                                    copy::text(
-                                        "This session runs in a terminal",
-                                        "这个会话运行在终端中",
-                                        "這個工作階段在終端機中執行",
-                                    ),
-                                    copy::text(
-                                        "Its screen is on the workbench.",
-                                        "它的画面在工作台里。",
-                                        "它的畫面在工作台裡。",
-                                    ),
-                                )
-                                .child(
-                                    action::tonal(
-                                        copy::text("Open terminal", "打开终端", "開啟終端機"),
-                                        move || on_terminal(),
-                                    )
-                                    .mt(px(theme::SPACING_SM)),
-                                )
-                                .into_element();
-                            }
-                            match status.get() {
-                                ConversationState::Loading => empty_hint(copy::text(
-                                    "Loading conversation…",
-                                    "正在加载会话…",
-                                    "正在載入工作階段…",
-                                ))
-                                .into_element(),
-                                ConversationState::Ready => surface::empty_state(
-                                    icon!("message-square"),
-                                    copy::text("No messages yet", "还没有消息", "還沒有訊息"),
-                                    copy::text(
-                                        "Write the first one below.",
-                                        "在下方写下第一条消息。",
-                                        "在下方寫下第一則訊息。",
-                                    ),
-                                )
-                                .into_element(),
-                                ConversationState::Failed(error) => {
-                                    let on_refresh = on_refresh.clone();
-                                    surface::empty_state(
-                                        icon!("triangle-alert"),
-                                        error,
-                                        copy::text(
-                                            "The conversation could not be read.",
-                                            "无法读取这个会话。",
-                                            "無法讀取這個工作階段。",
-                                        ),
-                                    )
-                                    .child(
-                                        action::tonal(
-                                            copy::text("Retry", "重试", "重試"),
-                                            move || on_refresh(),
-                                        )
-                                        .mt(px(theme::SPACING_SM)),
-                                    )
-                                    .into_element()
-                                }
-                            }
+            move || {
+                dynamic({
+                    let on_refresh = on_refresh.clone();
+                    move || match status.get() {
+                        ConversationState::Loading => empty_hint(copy::text(
+                            "Loading conversation…",
+                            "正在加载会话…",
+                            "正在載入工作階段…",
+                        ))
+                        .into_element(),
+                        ConversationState::Ready => surface::empty_state(
+                            icon!("message-square"),
+                            copy::text("No messages yet", "还没有消息", "還沒有訊息"),
+                            copy::text(
+                                "Write the first one below.",
+                                "在下方写下第一条消息。",
+                                "在下方寫下第一則訊息。",
+                            ),
+                        )
+                        .into_element(),
+                        ConversationState::Failed(error) => {
+                            let on_refresh = on_refresh.clone();
+                            surface::empty_state(
+                                icon!("triangle-alert"),
+                                error,
+                                copy::text(
+                                    "The conversation could not be read.",
+                                    "无法读取这个会话。",
+                                    "無法讀取這個工作階段。",
+                                ),
+                            )
+                            .child(
+                                action::tonal(copy::text("Retry", "重试", "重試"), move || {
+                                    on_refresh()
+                                })
+                                .mt(px(theme::SPACING_SM)),
+                            )
+                            .into_element()
                         }
-                    })
-                }
+                    }
+                })
             },
         ))
         .child(when(
