@@ -46,7 +46,7 @@ pub use config::{
     discover_default_hosts, discover_hosts, resolve_effective, resolve_effective_default,
 };
 pub use dev_artifact::DevArtifactError;
-pub use effects::SshProvisioningEffects;
+pub use effects::{SshProvisioningEffects, UploadProgressTracker};
 pub use environment::{
     EnvironmentError, EnvironmentWarning, GlibcVersion, MIN_FREE_KB, MIN_GLIBC, PortState,
     RemoteArch, RemoteEnvironment, parse_probe_output, probe, probe_script,

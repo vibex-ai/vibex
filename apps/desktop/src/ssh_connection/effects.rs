@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use vibex_backend::BackendError;
@@ -23,6 +24,32 @@ use super::supervisor::{self, ServerStatus, SupervisorError};
 use super::tunnel::{TunnelError, TunnelProcess, TunnelSpec};
 use crate::remote_client::{DesktopRemoteCredential, DesktopRuntimeRegistryStore};
 
+/// Thread-safe byte counter updated by `install_artifact` while streaming the
+/// server archive over SSH so the UI can paint live upload progress.
+#[derive(Debug, Clone, Default)]
+pub struct UploadProgressTracker {
+    sent: Arc<AtomicU64>,
+    total: Arc<AtomicU64>,
+}
+
+impl UploadProgressTracker {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn record(&self, sent: u64, total: u64) {
+        self.total.store(total, Ordering::Relaxed);
+        self.sent.store(sent, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> (u64, u64) {
+        (
+            self.sent.load(Ordering::Relaxed),
+            self.total.load(Ordering::Relaxed),
+        )
+    }
+}
+
 pub struct SshProvisioningEffects {
     command: SshCommand,
     launch: LaunchConfig,
@@ -38,6 +65,7 @@ pub struct SshProvisioningEffects {
     backend: Option<Arc<WebRemoteBackend>>,
     runtime_id: Option<String>,
     tunnel_ready_timeout: Duration,
+    upload_progress: Option<UploadProgressTracker>,
 }
 
 impl SshProvisioningEffects {
@@ -81,7 +109,13 @@ impl SshProvisioningEffects {
             backend: None,
             runtime_id: None,
             tunnel_ready_timeout: Duration::from_secs(10),
+            upload_progress: None,
         })
+    }
+
+    pub fn with_upload_progress(mut self, tracker: UploadProgressTracker) -> Self {
+        self.upload_progress = Some(tracker);
+        self
     }
 
     pub fn environment(&self) -> Option<&RemoteEnvironment> {
@@ -142,11 +176,16 @@ impl ProvisioningEffects for SshProvisioningEffects {
     }
 
     async fn install(&mut self) -> Result<(), ProvisioningEffectError> {
+        let tracker = self.upload_progress.clone();
         let outcome = install::install_artifact(
             &self.command,
             &self.artifact,
             &self.launch.remote_install_root,
-            |_, _| {},
+            move |sent, total| {
+                if let Some(tracker) = tracker.as_ref() {
+                    tracker.record(sent, total);
+                }
+            },
         )
         .map_err(map_install)?;
         self.installed = Some(outcome);
@@ -404,5 +443,16 @@ mod tests {
             Err(error) => error,
         };
         assert_eq!(error.code, "ssh_effects_local_port_invalid");
+    }
+
+    #[test]
+    fn upload_progress_tracker_records_sent_and_total_bytes() {
+        let tracker = UploadProgressTracker::new();
+        assert_eq!(tracker.snapshot(), (0, 0));
+        let writer = tracker.clone();
+        writer.record(512, 2048);
+        assert_eq!(tracker.snapshot(), (512, 2048));
+        writer.record(2048, 2048);
+        assert_eq!(tracker.snapshot(), (2048, 2048));
     }
 }

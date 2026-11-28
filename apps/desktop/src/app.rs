@@ -272,9 +272,9 @@ use crate::ssh_connection::{
     ProvisioningServiceEvent, ProvisioningSnapshot, ProvisioningStatus, ProvisioningStep,
     SshCommand, SshConnectionProfile, SshDestination, SshHostEntry, SshMacOsLifecycle,
     SshProfileStore, SshProvisioningEffects, SshRuntimeChannel, SshUpgradePolicy, TunnelProcess,
-    TunnelSpec, default_ssh_config_path, discover_default_hosts, download_server_artifact_for_os,
-    normalized_server_os, probe, resolve_effective_default, select_local_port,
-    select_server_artifact_for_os, supervisor,
+    TunnelSpec, UploadProgressTracker, default_ssh_config_path, discover_default_hosts,
+    download_server_artifact_for_os, normalized_server_os, probe, resolve_effective_default,
+    select_local_port, select_server_artifact_for_os, supervisor,
     wsl::WslCommand,
     wsl_profile::{WslConnectionProfile, WslProfileStore},
     wsl_provision::{WslProvisionStage, WslProvisioner},
@@ -12424,6 +12424,7 @@ pub struct VibexWorkbench {
     /// workbench itself. It publishes the stage it is in here and the poller
     /// below turns that into the snapshot the dialog renders.
     ssh_provisioning_preparing: Option<Arc<std::sync::Mutex<PreparingStage>>>,
+    ssh_provisioning_upload_progress: Option<UploadProgressTracker>,
     #[allow(dead_code)]
     ssh_provisioning_preparing_task: Option<Task<()>>,
     /// Whether a start task (probe → manifest → download) is resolving.
@@ -12443,11 +12444,10 @@ pub struct VibexWorkbench {
     #[allow(dead_code)]
     ssh_upgrade_task: Option<Task<()>>,
     ssh_upgrade_running: bool,
-    #[allow(dead_code)]
     ssh_upgrade_error: Option<String>,
     #[allow(dead_code)]
     ssh_uninstall_task: Option<Task<()>>,
-    #[allow(dead_code)]
+    ssh_uninstall_running: bool,
     ssh_uninstall_error: Option<String>,
     #[allow(dead_code)]
     wsl_task: Option<Task<()>>,
@@ -14612,6 +14612,7 @@ impl VibexWorkbench {
             ssh_provisioning_start_task: None,
             ssh_provisioning_resolving: None,
             ssh_provisioning_preparing: None,
+            ssh_provisioning_upload_progress: None,
             ssh_provisioning_preparing_task: None,
             ssh_provisioning_starting: false,
             ssh_provisioning_pending: VecDeque::new(),
@@ -14619,6 +14620,7 @@ impl VibexWorkbench {
             ssh_upgrade_running: false,
             ssh_upgrade_error: None,
             ssh_uninstall_task: None,
+            ssh_uninstall_running: false,
             ssh_uninstall_error: None,
             wsl_task: None,
             wsl_port_check_task: None,
@@ -17389,14 +17391,29 @@ impl VibexWorkbench {
         cx.notify();
     }
 
+    /// Drops every transient inline form or confirmation owned by the detail
+    /// stage so switching modes, stepping back, or closing the popover never
+    /// leaves two editors stacked or a stale scan running.
+    fn clear_runtime_detail_modes(&mut self) {
+        self.runtime_rename_active = false;
+        self.runtime_remove_pending = None;
+        self.runtime_upgrade_pending = None;
+        self.runtime_uninstall_pending = None;
+        self.runtime_edit_pending = None;
+        self.runtime_edit_error = None;
+        self.runtime_edit_homes.clear();
+        self.runtime_edit_homes_error = None;
+        self.runtime_edit_homes_scanning = false;
+        self.runtime_edit_homes_task = None;
+    }
+
     /// Closes the panel and drops every transient stage it owns, so reopening
     /// never lands in a half-finished rename or a stale removal confirmation.
     fn close_runtime_manager(&mut self, cx: &mut Context<Self>) {
         self.runtime_manager_open = false;
         self.runtime_manager_stage = RuntimeManagerStage::List;
         self.runtime_manager_target = None;
-        self.runtime_rename_active = false;
-        self.runtime_remove_pending = None;
+        self.clear_runtime_detail_modes();
         self.runtime_manager_list_scroll
             .set_offset(point(px(0.0), px(0.0)));
         self.runtime_manager_detail_scroll
@@ -17406,8 +17423,7 @@ impl VibexWorkbench {
 
     fn open_runtime_detail(&mut self, id: String, cx: &mut Context<Self>) {
         self.runtime_manager_stage = RuntimeManagerStage::Detail;
-        self.runtime_rename_active = false;
-        self.runtime_remove_pending = None;
+        self.clear_runtime_detail_modes();
         self.runtime_manager_target = Some(id);
         // A detail always opens at its top; the previous runtime's offset would
         // otherwise land in the middle of an unrelated reading.
@@ -17427,13 +17443,17 @@ impl VibexWorkbench {
     /// Escape walks back one stage at a time: an editor or a confirmation
     /// closes first, then a detail stage, and only then the panel.
     fn runtime_manager_dismiss_one_level(&mut self, cx: &mut Context<Self>) {
-        if self.runtime_rename_active {
-            self.runtime_rename_active = false;
-        } else if self.runtime_remove_pending.is_some() {
-            self.runtime_remove_pending = None;
+        if self.runtime_rename_active
+            || self.runtime_remove_pending.is_some()
+            || self.runtime_upgrade_pending.is_some()
+            || self.runtime_uninstall_pending.is_some()
+            || self.runtime_edit_pending.is_some()
+        {
+            self.clear_runtime_detail_modes();
         } else if self.runtime_manager_stage != RuntimeManagerStage::List {
             self.runtime_manager_stage = RuntimeManagerStage::List;
             self.runtime_manager_target = None;
+            self.clear_runtime_detail_modes();
         } else {
             self.runtime_manager_open = false;
         }
@@ -17452,9 +17472,9 @@ impl VibexWorkbench {
             };
             runtime.display_label()
         };
+        self.clear_runtime_detail_modes();
         self.runtime_manager_target = Some(id);
         self.runtime_rename_active = true;
-        self.runtime_remove_pending = None;
         self.runtime_rename_input.update(cx, |input, cx| {
             input.set_value(name.clone(), window, cx);
             input.set_selected_range(0..name.len(), cx);
@@ -17469,11 +17489,8 @@ impl VibexWorkbench {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
+        self.clear_runtime_detail_modes();
         self.runtime_edit_pending = Some(profile.id.clone());
-        self.runtime_edit_error = None;
-        self.runtime_rename_active = false;
-        self.runtime_remove_pending = None;
-        self.runtime_uninstall_pending = None;
         let values = [
             (&self.runtime_edit_name_input, profile.display_name.clone()),
             (
@@ -17505,9 +17522,6 @@ impl VibexWorkbench {
                 profile.runtime_home.clone().unwrap_or_default(),
             ),
         ];
-        self.runtime_edit_homes.clear();
-        self.runtime_edit_homes_error = None;
-        self.runtime_edit_homes_scanning = false;
         for (input, value) in values {
             input.update(cx, |input, cx| input.set_value(value, window, cx));
         }
@@ -17529,8 +17543,14 @@ impl VibexWorkbench {
             return;
         };
         if self.config.is_none() {
-            self.runtime_edit_homes_error =
-                Some("the runtime configuration is unavailable".to_string());
+            self.runtime_edit_homes_error = Some(
+                locale::text(
+                    "The runtime configuration is unavailable.",
+                    "运行时配置不可用。",
+                    "執行階段設定無法使用。",
+                )
+                .to_string(),
+            );
             cx.notify();
             return;
         }
@@ -17875,6 +17895,7 @@ impl VibexWorkbench {
     /// The removal confirmation is the one destructive decision in the panel,
     /// so it names the runtime and states what survives on the server.
     fn confirm_remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        self.clear_runtime_detail_modes();
         self.runtime_remove_pending = Some(id);
         cx.notify();
     }
@@ -18450,18 +18471,27 @@ impl VibexWorkbench {
 
     #[allow(dead_code)]
     fn start_ssh_runtime_upgrade(&mut self, profile_id: String, cx: &mut Context<Self>) {
-        if self.ssh_upgrade_running || self.ssh_provisioning.is_some() {
+        if self.ssh_upgrade_running || self.ssh_uninstall_running || self.ssh_provisioning.is_some()
+        {
             return;
         }
         let Some(config) = self.config.clone() else {
-            self.ssh_upgrade_error = Some("the runtime configuration is unavailable".to_string());
+            let error = locale::text(
+                "The runtime configuration is unavailable.",
+                "运行时配置不可用。",
+                "執行階段設定無法使用。",
+            )
+            .to_string();
+            self.ssh_upgrade_error = Some(error.clone());
+            self.runtime_note_error = Some(error);
             cx.notify();
             return;
         };
         let app_update = match self.app_update_service(&config) {
             Ok(service) => service,
             Err(error) => {
-                self.ssh_upgrade_error = Some(error);
+                self.ssh_upgrade_error = Some(error.clone());
+                self.runtime_note_error = Some(error);
                 cx.notify();
                 return;
             }
@@ -18473,13 +18503,28 @@ impl VibexWorkbench {
             .find(|profile| profile.id == profile_id)
             .cloned()
         else {
-            self.ssh_upgrade_error = Some("the SSH profile was not found".to_string());
+            let error = locale::text(
+                "The SSH profile was not found.",
+                "未找到对应的 SSH 连接配置。",
+                "找不到對應的 SSH 連線設定。",
+            )
+            .to_string();
+            self.ssh_upgrade_error = Some(error.clone());
+            self.runtime_note_error = Some(error);
             cx.notify();
             return;
         };
         let home = config.home_dir.clone();
         self.ssh_upgrade_running = true;
         self.ssh_upgrade_error = None;
+        self.runtime_note = Some(
+            locale::text(
+                "Upgrading SSH runtime…",
+                "正在升级 SSH 运行时…",
+                "正在升級 SSH 執行階段…",
+            )
+            .to_string(),
+        );
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let destination = profile.ssh_destination();
             let program = profile
@@ -18563,12 +18608,19 @@ impl VibexWorkbench {
                             this.reconnect_after_ssh_upgrade(&profile_id, cx);
                         }
                         Ok(Err(error)) => {
-                            this.ssh_upgrade_error = Some(error);
+                            this.ssh_upgrade_error = Some(error.clone());
+                            this.runtime_note_error = Some(error);
                             this.reconnect_after_ssh_upgrade(&profile_id, cx);
                         }
                         Err(_) => {
-                            this.ssh_upgrade_error =
-                                Some("the SSH upgrade task stopped unexpectedly".to_string());
+                            let error = locale::text(
+                                "The SSH upgrade task stopped unexpectedly.",
+                                "SSH 升级任务意外中止。",
+                                "SSH 升級任務意外中止。",
+                            )
+                            .to_string();
+                            this.ssh_upgrade_error = Some(error.clone());
+                            this.runtime_note_error = Some(error);
                             this.reconnect_after_ssh_upgrade(&profile_id, cx);
                         }
                     }
@@ -18629,6 +18681,9 @@ impl VibexWorkbench {
         remove_home: bool,
         cx: &mut Context<Self>,
     ) {
+        if self.ssh_uninstall_running || self.ssh_upgrade_running {
+            return;
+        }
         self.reload_ssh_profiles();
         let Some(profile) = self
             .ssh_profiles
@@ -18636,6 +18691,15 @@ impl VibexWorkbench {
             .find(|profile| profile.id == profile_id)
             .cloned()
         else {
+            let error = locale::text(
+                "The SSH profile was not found.",
+                "未找到对应的 SSH 连接配置。",
+                "找不到對應的 SSH 連線設定。",
+            )
+            .to_string();
+            self.ssh_uninstall_error = Some(error.clone());
+            self.runtime_note_error = Some(error);
+            cx.notify();
             return;
         };
         let program = profile
@@ -18650,7 +18714,9 @@ impl VibexWorkbench {
         ) {
             Ok(command) => command,
             Err(error) => {
-                self.ssh_uninstall_error = Some(format!("{}: {}", error.code, error.message));
+                let message = format!("{}: {}", error.code, error.message);
+                self.ssh_uninstall_error = Some(message.clone());
+                self.runtime_note_error = Some(message);
                 cx.notify();
                 return;
             }
@@ -18667,7 +18733,9 @@ impl VibexWorkbench {
                 )),
             Ok(launch) => launch,
             Err(error) => {
-                self.ssh_uninstall_error = Some(format!("{}: {}", error.code, error.message));
+                let message = format!("{}: {}", error.code, error.message);
+                self.ssh_uninstall_error = Some(message.clone());
+                self.runtime_note_error = Some(message);
                 cx.notify();
                 return;
             }
@@ -18678,7 +18746,16 @@ impl VibexWorkbench {
         let runtime_id = profile.registered_runtime_id.clone();
         let profile_for_teardown = profile.clone();
         let profile_id = profile.id;
+        self.ssh_uninstall_running = true;
         self.ssh_uninstall_error = None;
+        self.runtime_note = Some(
+            locale::text(
+                "Uninstalling SSH runtime…",
+                "正在卸载 SSH 运行时…",
+                "正在解除安裝 SSH 執行階段…",
+            )
+            .to_string(),
+        );
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             tokio::task::spawn_blocking(move || {
                 crate::ssh_connection::uninstall::uninstall_runtime(&command, &launch, remove_home)
@@ -18691,6 +18768,7 @@ impl VibexWorkbench {
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
+                    this.ssh_uninstall_running = false;
                     match result {
                         Ok(Ok(_)) => {
                             this.runtime_note = Some(
@@ -18733,11 +18811,18 @@ impl VibexWorkbench {
                             });
                         }
                         Ok(Err(error)) => {
-                            this.ssh_uninstall_error = Some(error);
+                            this.ssh_uninstall_error = Some(error.clone());
+                            this.runtime_note_error = Some(error);
                         }
                         Err(_) => {
-                            this.ssh_uninstall_error =
-                                Some("the SSH uninstall task stopped unexpectedly".to_string());
+                            let error = locale::text(
+                                "The SSH uninstall task stopped unexpectedly.",
+                                "SSH 卸载任务意外中止。",
+                                "SSH 解除安裝任務意外中止。",
+                            )
+                            .to_string();
+                            this.ssh_uninstall_error = Some(error.clone());
+                            this.runtime_note_error = Some(error);
                         }
                     }
                     cx.notify();
@@ -18794,6 +18879,7 @@ impl VibexWorkbench {
             return;
         };
         service.cancel();
+        self.ssh_provisioning_upload_progress = None;
         self.ssh_provisioning_error = Some(
             locale::text(
                 "Cancelling SSH provisioning…",
@@ -18803,6 +18889,41 @@ impl VibexWorkbench {
             .to_string(),
         );
         self.sync_ssh_provisioning_settings(cx);
+        cx.notify();
+    }
+
+    /// Cancels an in-flight runtime switch (SSH restore, WSL restore, or direct
+    /// connect) without disturbing the already-active authority.
+    fn cancel_remote_runtime_switch(&mut self, runtime_id: &str, cx: &mut Context<Self>) {
+        if self.runtime_switch_pending.as_deref() != Some(runtime_id) {
+            return;
+        }
+        self.boot_task = None;
+        self.runtime_switch_pending = None;
+        self.runtime_note = None;
+        if self.runtime_registry.active_runtime_id() != runtime_id {
+            if let Some(profile) = self.ssh_profile_for_runtime(runtime_id)
+                && self
+                    .ssh_tunnel_spec
+                    .as_ref()
+                    .is_some_and(|spec| ssh_tunnel_spec_matches_profile(spec, &profile))
+            {
+                self.ssh_tunnel = None;
+                self.ssh_tunnel_spec = None;
+                self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+                self.ssh_tunnel_task = None;
+            }
+            if self.wsl_keepalive_runtime_id.as_deref() == Some(runtime_id) {
+                self.wsl_keepalive = None;
+                self.wsl_keepalive_runtime_id = None;
+                self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
+                self.wsl_watch_task = None;
+            }
+        }
+        if self.runtime.is_some() && matches!(self.runtime_status, RuntimeStatus::Starting) {
+            self.runtime_status = RuntimeStatus::Ready;
+        }
+        self.sync_connections_live_status(cx);
         cx.notify();
     }
 
@@ -18945,12 +19066,13 @@ impl VibexWorkbench {
                             ReleaseArtifactStage::Downloading { done, total } => {
                                 let detail = if total > 0 {
                                     format!(
-                                        "{} {done}/{total}",
+                                        "{} {}",
                                         locale::text(
                                             "Downloading the runtime for this host…",
                                             "正在下载适用于该主机的运行时…",
                                             "正在下載適用於該主機的執行階段…",
-                                        )
+                                        ),
+                                        format_transfer_progress(done, total),
                                     )
                                 } else {
                                     locale::text(
@@ -18985,6 +19107,7 @@ impl VibexWorkbench {
             } else {
                 launch
             };
+            let upload_progress = UploadProgressTracker::new();
             let effects = SshProvisioningEffects::new(
                 command,
                 destination,
@@ -18995,16 +19118,22 @@ impl VibexWorkbench {
                 profile.local_tunnel_port,
                 unix_timestamp_ms(),
             )
-            .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            Ok::<(SshProvisioningEffects, String), String>((effects, profile.id))
+            .map_err(|error| format!("{}: {}", error.code, error.message))?
+            .with_upload_progress(upload_progress.clone());
+            Ok::<(SshProvisioningEffects, String, UploadProgressTracker), String>((
+                effects,
+                profile.id,
+                upload_progress,
+            ))
         });
         self.ssh_provisioning_start_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok((effects, profile_id))) => {
+                        Ok(Ok((effects, profile_id, upload_progress))) => {
                             this.end_ssh_provisioning_preparing();
+                            this.ssh_provisioning_upload_progress = Some(upload_progress);
                             this.start_ssh_provisioning(effects, profile_id, cx);
                         }
                         Ok(Err(error)) => {
@@ -19012,8 +19141,12 @@ impl VibexWorkbench {
                         }
                         Err(_) => {
                             this.fail_ssh_provisioning_start(
-                                "the SSH provisioning download task stopped unexpectedly"
-                                    .to_string(),
+                                locale::text(
+                                    "The SSH provisioning download task stopped unexpectedly.",
+                                    "SSH 运行时下载任务意外中止。",
+                                    "SSH 執行階段下載任務意外中止。",
+                                )
+                                .to_string(),
                                 cx,
                             );
                         }
@@ -19201,13 +19334,17 @@ impl VibexWorkbench {
                         | Ok(Some(Err(std::sync::mpsc::TryRecvError::Disconnected)))
                         | Err(_) => break,
                         Ok(Some(Err(std::sync::mpsc::TryRecvError::Empty))) => {
+                            let _ = entity.update(cx, |this, cx| {
+                                this.poll_ssh_upload_progress(cx);
+                            });
                             cx.background_executor()
-                                .timer(Duration::from_millis(40))
+                                .timer(Duration::from_millis(80))
                                 .await;
                         }
                         Ok(Some(Ok(ProvisioningServiceEvent::Update(snapshot)))) => {
                             let _ = entity.update(cx, |this, cx| {
                                 this.ssh_provisioning_snapshot = Some(snapshot);
+                                this.poll_ssh_upload_progress(cx);
                                 this.sync_ssh_provisioning_settings(cx);
                                 cx.notify();
                             });
@@ -19222,6 +19359,52 @@ impl VibexWorkbench {
                 }
             },
         ));
+        cx.notify();
+    }
+
+    fn poll_ssh_upload_progress(&mut self, cx: &mut Context<Self>) {
+        let Some(tracker) = self.ssh_provisioning_upload_progress.as_ref() else {
+            return;
+        };
+        let (sent, total) = tracker.snapshot();
+        if total == 0 {
+            return;
+        }
+        let Some(snapshot) = self.ssh_provisioning_snapshot.as_mut() else {
+            return;
+        };
+        if snapshot.status.is_terminal()
+            || !matches!(
+                snapshot.step,
+                ProvisioningStep::UploadingRuntime | ProvisioningStep::InstallingRuntime
+            )
+        {
+            return;
+        }
+        let detail = if sent >= total {
+            locale::text(
+                "Upload complete — verifying and extracting runtime on the remote host…",
+                "上传完成，正在远端校验并解压运行时…",
+                "上傳完成，正在遠端驗證並解壓執行階段…",
+            )
+            .to_string()
+        } else {
+            format!(
+                "{} {}",
+                locale::text(
+                    "Uploading runtime to the remote host…",
+                    "正在上传运行时到远端主机…",
+                    "正在上傳執行階段到遠端主機…",
+                ),
+                format_transfer_progress(sent, total),
+            )
+        };
+        if snapshot.detail.as_deref() == Some(detail.as_str()) {
+            return;
+        }
+        snapshot.detail = Some(detail);
+        snapshot.updated_at_ms = unix_timestamp_ms();
+        self.sync_ssh_provisioning_settings(cx);
         cx.notify();
     }
 
@@ -19559,6 +19742,7 @@ impl VibexWorkbench {
     ) {
         self.ssh_provisioning = None;
         self.ssh_provisioning_starting = false;
+        self.ssh_provisioning_upload_progress = None;
         self.finish_ssh_provisioning_outcome(outcome, effects, cx);
         // This run no longer owns the slot, so the next queued host starts
         // here rather than waiting for another add to nudge it.
@@ -21315,39 +21499,97 @@ impl VibexWorkbench {
         self.park_local_runtime(cx);
     }
 
-    /// The title-bar entry point. An icon-only button carries the active
-    /// runtime's state as a dot plus a tooltip that names it, because a switch
-    /// rebinds every session, Agent and terminal to another machine.
+    /// The title-bar entry point. In local mode it stays a quiet icon with a
+    /// status dot; whenever a remote instance is active or being connected, it
+    /// expands into a tinted pill naming that remote machine and surfacing any
+    /// degraded/reconnecting/offline state so the operator never forgets which
+    /// host their sessions and terminals are bound to.
     fn render_runtime_manager_trigger(&mut self, cx: &mut Context<Self>) -> AnyElement {
         let (state, label) = self.active_runtime_presentation(cx);
         let tooltip = format!("{}: {label}", locale::text("Runtime", "运行时", "執行階段"));
         let dot = runtime_state_color(state, cx);
         let open = self.runtime_manager_open;
+        let active_remote_name = self.active_or_pending_remote_label();
         // No `on_click`: `Popover` toggles the panel on mouse-down and applies
         // its own selected state, so a second toggle here would close the panel
         // again on mouse-up. `on_open_change` below is what records the state.
-        let trigger = Button::new("open-runtime-manager")
-            .small()
-            .ghost()
-            .compact()
-            .size(px(32.0))
-            .px_0()
-            .tooltip(tooltip)
-            .child(
-                div()
-                    .relative()
-                    .flex_none()
-                    .child(Icon::default().path(RUNTIME_MANAGER_ICON).size(px(18.0)))
-                    .child(
-                        div()
-                            .absolute()
-                            .right(px(0.0))
-                            .bottom(px(0.0))
-                            .size(px(6.0))
-                            .rounded_full()
-                            .bg(dot),
-                    ),
-            );
+        let trigger = if let Some(remote_name) = active_remote_name {
+            let accent = match state {
+                RuntimeStatePresentation::Ready => cx.theme().primary,
+                RuntimeStatePresentation::Connecting
+                | RuntimeStatePresentation::Reconnecting
+                | RuntimeStatePresentation::Degraded => cx.theme().warning,
+                RuntimeStatePresentation::Offline
+                | RuntimeStatePresentation::Revoked
+                | RuntimeStatePresentation::Failed
+                | RuntimeStatePresentation::Incompatible => cx.theme().danger,
+                RuntimeStatePresentation::Stopped => cx.theme().muted_foreground,
+            };
+            let pill_surface = ButtonCustomVariant::new(cx)
+                .color(accent.opacity(0.10))
+                .foreground(cx.theme().foreground)
+                .hover(accent.opacity(0.16))
+                .active(accent.opacity(0.22));
+            let state_cue =
+                (state != RuntimeStatePresentation::Ready).then(|| runtime_state_label(state));
+            Button::new("open-runtime-manager")
+                .small()
+                .custom(pill_surface)
+                .h(px(28.0))
+                .px_2()
+                .rounded_full()
+                .border_1()
+                .border_color(accent.opacity(0.30))
+                .tooltip(tooltip)
+                .child(
+                    h_flex()
+                        .items_center()
+                        .gap_1p5()
+                        .min_w_0()
+                        .child(div().flex_none().size(px(7.0)).rounded_full().bg(dot))
+                        .child(Icon::default().path(RUNTIME_MANAGER_ICON).size(px(14.0)))
+                        .child(
+                            div()
+                                .max_w(px(140.0))
+                                .truncate()
+                                .text_xs()
+                                .font_medium()
+                                .child(remote_name),
+                        )
+                        .when_some(state_cue, |this, cue| {
+                            this.child(
+                                div()
+                                    .flex_none()
+                                    .text_xs()
+                                    .text_color(runtime_state_text_color(state, cx))
+                                    .child(format!("· {cue}")),
+                            )
+                        }),
+                )
+        } else {
+            Button::new("open-runtime-manager")
+                .small()
+                .ghost()
+                .compact()
+                .size(px(32.0))
+                .px_0()
+                .tooltip(tooltip)
+                .child(
+                    div()
+                        .relative()
+                        .flex_none()
+                        .child(Icon::default().path(RUNTIME_MANAGER_ICON).size(px(18.0)))
+                        .child(
+                            div()
+                                .absolute()
+                                .right(px(0.0))
+                                .bottom(px(0.0))
+                                .size(px(6.0))
+                                .rounded_full()
+                                .bg(dot),
+                        ),
+                )
+        };
         let panel = self.render_runtime_manager_panel(cx);
         div()
             .flex_none()
@@ -21807,6 +22049,126 @@ impl VibexWorkbench {
                     cx,
                 ));
             }
+            if upgrade_profile.is_some() {
+                if self.ssh_upgrade_running {
+                    rows.push(runtime_detail_row(
+                        locale::text("Upgrade", "升级", "升級"),
+                        locale::text("Upgrading runtime…", "正在升级运行时…", "正在升級執行階段…")
+                            .to_string(),
+                        cx,
+                    ));
+                }
+                if self.ssh_uninstall_running {
+                    rows.push(runtime_detail_row(
+                        locale::text("Uninstall", "卸载", "解除安裝"),
+                        locale::text(
+                            "Uninstalling runtime…",
+                            "正在卸载运行时…",
+                            "正在解除安裝執行階段…",
+                        )
+                        .to_string(),
+                        cx,
+                    ));
+                }
+                if let Some(error) = self.ssh_upgrade_error.clone() {
+                    rows.push(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().danger.opacity(0.4))
+                            .bg(cx.theme().danger.opacity(0.08))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .text_color(cx.theme().danger)
+                                            .child(locale::text(
+                                                "Upgrade failed",
+                                                "升级失败",
+                                                "升級失敗",
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("runtime-upgrade-error-dismiss")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text("Dismiss", "关闭", "關閉"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.ssh_upgrade_error = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(error),
+                            )
+                            .into_any_element(),
+                    );
+                }
+                if let Some(error) = self.ssh_uninstall_error.clone() {
+                    rows.push(
+                        v_flex()
+                            .w_full()
+                            .gap_1()
+                            .px_2()
+                            .py_1()
+                            .rounded(cx.theme().radius)
+                            .border_1()
+                            .border_color(cx.theme().danger.opacity(0.4))
+                            .bg(cx.theme().danger.opacity(0.08))
+                            .child(
+                                h_flex()
+                                    .w_full()
+                                    .items_center()
+                                    .justify_between()
+                                    .gap_2()
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .font_medium()
+                                            .text_color(cx.theme().danger)
+                                            .child(locale::text(
+                                                "Uninstall failed",
+                                                "卸载失败",
+                                                "解除安裝失敗",
+                                            )),
+                                    )
+                                    .child(
+                                        Button::new("runtime-uninstall-error-dismiss")
+                                            .small()
+                                            .ghost()
+                                            .label(locale::text("Dismiss", "关闭", "關閉"))
+                                            .on_click(cx.listener(|this, _, _, cx| {
+                                                this.ssh_uninstall_error = None;
+                                                cx.notify();
+                                            })),
+                                    ),
+                            )
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .whitespace_normal()
+                                    .text_color(cx.theme().muted_foreground)
+                                    .child(error),
+                            )
+                            .into_any_element(),
+                    );
+                }
+            }
             rows.push(runtime_detail_row(
                 locale::text("Last connected", "最近连接", "最近連線"),
                 runtime
@@ -21817,11 +22179,23 @@ impl VibexWorkbench {
             ));
         }
 
-        let mut actions = h_flex().w_full().gap_1().flex_none().pt_1();
-        actions = actions.child(
+        let ssh_busy = self.ssh_upgrade_running || self.ssh_uninstall_running;
+        let primary_action = if is_active && !is_local {
             Button::new("runtime-detail-connect")
+                .w_full()
                 .small()
                 .outline()
+                .label(locale::text("Switch to Local", "切换到本机", "切換到本機"))
+                .disabled(switching)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.switch_to_runtime(LOCAL_RUNTIME_ID.to_string(), cx)
+                }))
+        } else {
+            Button::new("runtime-detail-connect")
+                .w_full()
+                .small()
+                .when(!is_active, |button| button.primary())
+                .when(is_active, |button| button.outline())
                 .label(if is_active {
                     locale::text("In use", "正在使用", "正在使用")
                 } else {
@@ -21835,8 +22209,10 @@ impl VibexWorkbench {
                 .on_click(cx.listener({
                     let id = id.clone();
                     move |this, _, _, cx| this.switch_to_runtime(id.clone(), cx)
-                })),
-        );
+                }))
+        };
+
+        let mut secondary_actions = h_flex().w_full().flex_wrap().items_center().gap_1();
         if let (Some(profile), Some(report)) = (upgrade_profile.as_ref(), compatibility.as_ref())
             && profile.upgrade_policy != SshUpgradePolicy::Pinned
             && matches!(
@@ -21846,13 +22222,14 @@ impl VibexWorkbench {
             )
         {
             let profile_id = profile.id.clone();
-            actions = actions.child(
+            secondary_actions = secondary_actions.child(
                 Button::new("runtime-detail-update")
                     .small()
                     .outline()
                     .label(locale::text("Update runtime", "更新运行时", "更新執行階段"))
-                    .disabled(switching || self.ssh_upgrade_running)
+                    .disabled(switching || ssh_busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_runtime_detail_modes();
                         this.runtime_upgrade_pending = Some(profile_id.clone());
                         cx.notify();
                     })),
@@ -21864,7 +22241,7 @@ impl VibexWorkbench {
             report.state
                 == crate::ssh_connection::compat::RuntimeCompatibility::DesktopUpdateRequired
         }) {
-            actions = actions.child(
+            secondary_actions = secondary_actions.child(
                 Button::new("runtime-detail-update-vibex")
                     .small()
                     .outline()
@@ -21879,7 +22256,7 @@ impl VibexWorkbench {
         // Renaming is offered for the embedded runtime as well: it is the
         // runtime its paired clients see, and the name is published to all of
         // them.
-        actions = actions.child(
+        secondary_actions = secondary_actions.child(
             Button::new("runtime-detail-rename")
                 .small()
                 .ghost()
@@ -21890,10 +22267,9 @@ impl VibexWorkbench {
                     move |this, _, window, cx| this.begin_runtime_rename(id.clone(), window, cx)
                 })),
         );
-        actions = actions.child(div().flex_1());
         if let Some(profile) = upgrade_profile.as_ref() {
             let edit_profile = profile.clone();
-            actions = actions.child(
+            secondary_actions = secondary_actions.child(
                 Button::new("runtime-detail-edit")
                     .small()
                     .ghost()
@@ -21904,7 +22280,7 @@ impl VibexWorkbench {
                     })),
             );
             let profile_id = profile.id.clone();
-            actions = actions.child(
+            secondary_actions = secondary_actions.child(
                 Button::new("runtime-detail-uninstall")
                     .small()
                     .ghost()
@@ -21913,8 +22289,9 @@ impl VibexWorkbench {
                         "卸载运行时",
                         "解除安裝執行階段",
                     ))
-                    .disabled(switching || self.ssh_upgrade_running)
+                    .disabled(switching || ssh_busy)
                     .on_click(cx.listener(move |this, _, _, cx| {
+                        this.clear_runtime_detail_modes();
                         this.runtime_uninstall_pending = Some(profile_id.clone());
                         this.runtime_uninstall_remove_home = false;
                         cx.notify();
@@ -21922,19 +22299,26 @@ impl VibexWorkbench {
             );
         }
         if runtime.is_some() {
-            actions = actions.child(
+            secondary_actions = secondary_actions.child(
                 Button::new("runtime-detail-remove")
                     .small()
                     .ghost()
                     .danger()
                     .label(locale::text("Remove", "移除", "移除"))
-                    .disabled(switching)
+                    .disabled(switching || ssh_busy)
                     .on_click(cx.listener({
                         let id = id.clone();
                         move |this, _, _, cx| this.confirm_remove_runtime(id.clone(), cx)
                     })),
             );
         }
+        let actions = v_flex()
+            .w_full()
+            .gap_1p5()
+            .flex_none()
+            .pt_1()
+            .child(primary_action)
+            .child(secondary_actions);
 
         if self.runtime_remove_pending.as_deref() == Some(id.as_str()) {
             rows.push(self.render_runtime_remove_confirmation(&label, cx));
@@ -22005,10 +22389,7 @@ impl VibexWorkbench {
                             .on_click(cx.listener(|this, _, _, cx| {
                                 this.runtime_manager_stage = RuntimeManagerStage::List;
                                 this.runtime_manager_target = None;
-                                this.runtime_rename_active = false;
-                                this.runtime_remove_pending = None;
-                                this.runtime_upgrade_pending = None;
-                                this.runtime_uninstall_pending = None;
+                                this.clear_runtime_detail_modes();
                                 cx.notify();
                             })),
                     )
@@ -22641,9 +23022,43 @@ impl VibexWorkbench {
         address
     }
 
+    /// Returns the display name of the remote instance that is either active
+    /// right now or being switched to, so the title bar immediately shifts into
+    /// its remote pill when a connection starts.
+    fn active_or_pending_remote_label(&self) -> Option<String> {
+        if let Some(pending_id) = self.runtime_switch_pending.as_deref()
+            && pending_id != LOCAL_RUNTIME_ID
+        {
+            return self
+                .runtime_registry
+                .remote(pending_id)
+                .map(RegisteredRuntime::display_label)
+                .or_else(|| Some(pending_id.to_string()));
+        }
+        if self.runtime_registry.is_local_active() {
+            return None;
+        }
+        let id = self.runtime_registry.active_runtime_id();
+        self.runtime_registry
+            .remote(id)
+            .map(RegisteredRuntime::display_label)
+            .or_else(|| Some(id.to_string()))
+    }
+
     /// The active runtime's user-visible state, with a label that never relies
     /// on the dot's color alone.
     fn active_runtime_presentation(&self, _cx: &App) -> (RuntimeStatePresentation, String) {
+        if let Some(pending_id) = self.runtime_switch_pending.as_deref()
+            && pending_id != LOCAL_RUNTIME_ID
+        {
+            let state = self.runtime_state(RuntimeTarget::Remote(pending_id));
+            let label = self
+                .runtime_registry
+                .remote(pending_id)
+                .map(RegisteredRuntime::display_label)
+                .unwrap_or_else(|| pending_id.to_string());
+            return (state, format!("{label} · {}", runtime_state_label(state)));
+        }
         if self.runtime_registry.is_local_active() {
             let state = self.runtime_state(RuntimeTarget::Local);
             return (
@@ -22677,12 +23092,12 @@ impl VibexWorkbench {
                 }
             }
             RuntimeTarget::Remote(id) => {
+                if self.runtime_switch_pending.as_deref() == Some(id) {
+                    return RuntimeStatePresentation::Connecting;
+                }
                 let is_active = self.runtime_registry.active_runtime_id() == id;
                 if !is_active {
                     return RuntimeStatePresentation::Stopped;
-                }
-                if self.runtime_switch_pending.as_deref() == Some(id) {
-                    return RuntimeStatePresentation::Connecting;
                 }
                 match self.remote_client.as_ref() {
                     Some(client) => match client.backend.connection_state().state {
@@ -94537,6 +94952,8 @@ struct ConnectionDisplayRow {
     /// The row's primary action needs a fact only the page holds: whether the
     /// WSL deployment for this distro is still running.
     wsl_provisioning: bool,
+    /// The registered runtime id bound to this connection, when paired.
+    registered_runtime_id: Option<String>,
 }
 
 #[derive(Clone)]
@@ -96115,6 +96532,127 @@ fn parse_wsl_runtime_port(value: &str) -> Result<u16, String> {
     Ok(port)
 }
 
+/// Formats byte progress for download and SSH upload status lines.
+fn format_transfer_progress(done: u64, total: u64) -> String {
+    fn format_bytes(bytes: u64) -> String {
+        const MB: f64 = 1024.0 * 1024.0;
+        const KB: f64 = 1024.0;
+        if bytes >= 1024 * 1024 {
+            format!("{:.1} MB", bytes as f64 / MB)
+        } else if bytes >= 1024 {
+            format!("{:.0} KB", bytes as f64 / KB)
+        } else {
+            format!("{bytes} B")
+        }
+    }
+
+    if total > 0 {
+        let clamped = done.min(total);
+        let pct = ((clamped as u128 * 100) / total as u128) as u64;
+        format!(
+            "{} / {} ({pct}%)",
+            format_bytes(clamped),
+            format_bytes(total)
+        )
+    } else {
+        format_bytes(done)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ParsedManualSshTarget {
+    host: String,
+    user: Option<String>,
+    port: Option<u16>,
+}
+
+/// Parses a manually entered SSH target such as `user@host`, `user@host:2222`,
+/// `host:2222`, `[::1]:2222`, or `host`.
+fn parse_manual_ssh_target(raw: &str) -> Result<ParsedManualSshTarget, String> {
+    let invalid_target = || {
+        locale::text(
+            "Enter a valid SSH target such as user@host or host:2222.",
+            "请输入有效的 SSH 目标，例如 user@host 或 host:2222。",
+            "請輸入有效的 SSH 目標，例如 user@host 或 host:2222。",
+        )
+        .to_string()
+    };
+    let invalid_port = || {
+        locale::text(
+            "Enter a port number between 1 and 65535.",
+            "请输入 1 到 65535 之间的端口号。",
+            "請輸入 1 到 65535 之間的連接埠號。",
+        )
+        .to_string()
+    };
+
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed
+            .chars()
+            .any(|ch| ch.is_whitespace() || ch.is_control())
+    {
+        return Err(invalid_target());
+    }
+
+    let (user, host_port) = if let Some((user_part, rest)) = trimmed.split_once('@') {
+        if user_part.is_empty()
+            || user_part.len() > 64
+            || user_part.starts_with('-')
+            || rest.is_empty()
+            || rest.contains('@')
+            || !user_part
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '.' | '_' | '-' | '$'))
+        {
+            return Err(invalid_target());
+        }
+        (Some(user_part.to_string()), rest)
+    } else {
+        (None, trimmed)
+    };
+
+    let (host, port) = if let Some(rest) = host_port.strip_prefix('[') {
+        let Some((ipv6, after)) = rest.split_once(']') else {
+            return Err(invalid_target());
+        };
+        if ipv6.is_empty() {
+            return Err(invalid_target());
+        }
+        let port = if after.is_empty() {
+            None
+        } else if let Some(port_str) = after.strip_prefix(':') {
+            let parsed = port_str.parse::<u16>().map_err(|_| invalid_port())?;
+            if parsed == 0 {
+                return Err(invalid_port());
+            }
+            Some(parsed)
+        } else {
+            return Err(invalid_target());
+        };
+        (format!("[{ipv6}]"), port)
+    } else if let Some((host_part, port_str)) = host_port.rsplit_once(':') {
+        if host_part.contains(':') {
+            // Bare IPv6 literal without brackets (e.g. `::1`).
+            (format!("[{host_port}]"), None)
+        } else {
+            let parsed = port_str.parse::<u16>().map_err(|_| invalid_port())?;
+            if parsed == 0 {
+                return Err(invalid_port());
+            }
+            (host_part.to_string(), Some(parsed))
+        }
+    } else {
+        (host_port.to_string(), None)
+    };
+
+    if !crate::ssh_connection::command::host_is_valid(&host) {
+        return Err(invalid_target());
+    }
+
+    Ok(ParsedManualSshTarget { host, user, port })
+}
+
 /// True when the pairing entry carries its own address, so the separate server
 /// field is unnecessary.
 ///
@@ -97221,6 +97759,7 @@ struct FoundationSettings {
     connections_hosts: Vec<SshHostEntry>,
     connections_host_warnings: Vec<String>,
     connections_selected_host: Option<String>,
+    connections_manual_host_input: Entity<InputState>,
     connections_probe_state: ConnectionsProbeState,
     connections_probe_task: Option<Task<()>>,
     connections_log_view: Option<SshLogView>,
@@ -97448,6 +97987,15 @@ impl FoundationSettings {
             InputState::new(window, cx)
                 .default_value("8765")
                 .placeholder("8765")
+                .submit_on_enter(true)
+        });
+        let connections_manual_host_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder(locale::text(
+                    "user@host or host:22",
+                    "user@host 或 host:22",
+                    "user@host 或 host:22",
+                ))
                 .submit_on_enter(true)
         });
         let connections_pairing_entry_input = cx.new(|cx| {
@@ -97778,6 +98326,7 @@ impl FoundationSettings {
                 connections_hosts: Vec::new(),
                 connections_host_warnings: Vec::new(),
                 connections_selected_host: None,
+                connections_manual_host_input,
                 connections_probe_state: ConnectionsProbeState::Idle,
                 connections_probe_task: None,
                 connections_log_view: None,
@@ -97834,7 +98383,6 @@ impl FoundationSettings {
         }
         if section == SettingsSection::Connections {
             self.reload_connections_profiles();
-            self.resume_unprovisioned_connections(cx);
         }
         if section == SettingsSection::Channels {
             self.im_channels_view
@@ -101710,28 +102258,88 @@ impl FoundationSettings {
         ) {
             return;
         }
+        let target = alias.trim().to_string();
+        if target.is_empty() {
+            return;
+        }
         let Some(home_dir) = self.home_dir.clone() else {
             self.connections_probe_state = ConnectionsProbeState::Idle;
-            self.report_connections_failure("the desktop home is unavailable".to_string(), cx);
+            self.report_connections_failure(
+                locale::text(
+                    "The desktop home directory is unavailable.",
+                    "桌面端数据目录不可用。",
+                    "桌面端資料目錄無法使用。",
+                )
+                .to_string(),
+                cx,
+            );
             return;
         };
-        self.connections_probe_state = ConnectionsProbeState::Probing(alias.clone());
+        let is_config_alias = self
+            .connections_hosts
+            .iter()
+            .any(|entry| entry.alias == target);
+        self.connections_probe_state = ConnectionsProbeState::Probing(target.clone());
         let config_path = default_ssh_config_path();
         let now = unix_timestamp_ms();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let effective = resolve_effective_default(config_path.as_deref(), &alias)
-                .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            let resolved_host = effective.hostname.clone().unwrap_or_else(|| alias.clone());
-            let target_host = if crate::ssh_connection::command::host_is_valid(&alias) {
-                alias.clone()
-            } else {
-                resolved_host.clone()
-            };
-            let destination = SshDestination {
-                host: target_host,
-                user: effective.user.clone(),
-                port: effective.port.unwrap_or(22),
-            };
+            let (destination, ssh_alias, resolved_host, identity_file, proxy_jump) =
+                if !is_config_alias && (target.contains('@') || target.contains(':')) {
+                    let parsed = parse_manual_ssh_target(&target)
+                        .map_err(|error| format!("ssh_target_invalid: {error}"))?;
+                    let effective =
+                        resolve_effective_default(config_path.as_deref(), &parsed.host).ok();
+                    let resolved_host = effective
+                        .as_ref()
+                        .and_then(|e| e.hostname.clone())
+                        .unwrap_or_else(|| parsed.host.clone());
+                    let user = parsed
+                        .user
+                        .or_else(|| effective.as_ref().and_then(|e| e.user.clone()));
+                    let port = parsed
+                        .port
+                        .or_else(|| effective.as_ref().and_then(|e| e.port))
+                        .unwrap_or(22);
+                    let destination = SshDestination {
+                        host: resolved_host.clone(),
+                        user,
+                        port,
+                    };
+                    (
+                        destination,
+                        String::new(),
+                        resolved_host,
+                        effective.as_ref().and_then(|e| e.identity_file.clone()),
+                        effective.as_ref().and_then(|e| e.proxy_jump.clone()),
+                    )
+                } else {
+                    let effective = resolve_effective_default(config_path.as_deref(), &target)
+                        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+                    let resolved_host =
+                        effective.hostname.clone().unwrap_or_else(|| target.clone());
+                    let target_host = if crate::ssh_connection::command::host_is_valid(&target) {
+                        target.clone()
+                    } else {
+                        resolved_host.clone()
+                    };
+                    let destination = SshDestination {
+                        host: target_host,
+                        user: effective.user.clone(),
+                        port: effective.port.unwrap_or(22),
+                    };
+                    let stored_alias = if is_config_alias {
+                        target.clone()
+                    } else {
+                        String::new()
+                    };
+                    (
+                        destination,
+                        stored_alias,
+                        resolved_host,
+                        effective.identity_file,
+                        effective.proxy_jump,
+                    )
+                };
             let command = SshCommand::for_destination("ssh", &destination, config_path.as_deref())
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let mut remote_port = 8765u16;
@@ -101752,16 +102360,16 @@ impl FoundationSettings {
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
             let remote_install_root = format!("{}/.local/share/vibex/server", environment.home);
             let profile = SshConnectionProfile {
-                id: connections_profile_id(&alias, now),
-                display_name: alias.clone(),
-                ssh_alias: alias.clone(),
+                id: connections_profile_id(&target, now),
+                display_name: target.clone(),
+                ssh_alias,
                 host: resolved_host,
                 user: destination.user.clone(),
                 port: destination.port,
                 ssh_client_path: None,
                 ssh_config_path: config_path.clone(),
-                identity_file: effective.identity_file,
-                proxy_jump: effective.proxy_jump,
+                identity_file,
+                proxy_jump,
                 remote_install_root,
                 remote_home: environment.home.clone(),
                 runtime_home: None,
@@ -101784,22 +102392,33 @@ impl FoundationSettings {
             let mut profiles = store
                 .load()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let matches_existing = |existing: &SshConnectionProfile| -> bool {
+                if existing.id == profile.id {
+                    return true;
+                }
+                if !profile.ssh_alias.is_empty() {
+                    existing.ssh_alias == profile.ssh_alias
+                } else {
+                    existing.ssh_alias.is_empty()
+                        && existing.host == profile.host
+                        && existing.port == profile.port
+                        && existing.user == profile.user
+                }
+            };
             let replaced: Vec<SshConnectionProfile> = profiles
                 .iter()
-                .filter(|existing| {
-                    existing.id == profile.id || existing.ssh_alias == profile.ssh_alias
-                })
+                .filter(|existing| matches_existing(existing))
                 .cloned()
                 .collect();
-            profiles.retain(|existing| {
-                existing.id != profile.id && existing.ssh_alias != profile.ssh_alias
-            });
+            profiles.retain(|existing| !matches_existing(existing));
             let profile_id = profile.id.clone();
             profiles.push(profile);
             store
                 .save(&profiles)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            Ok::<(String, String, Vec<SshConnectionProfile>), String>((alias, profile_id, replaced))
+            Ok::<(String, String, Vec<SshConnectionProfile>), String>((
+                target, profile_id, replaced,
+            ))
         });
         self.connections_probe_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -101828,7 +102447,12 @@ impl FoundationSettings {
                         Err(_) => {
                             this.connections_probe_state = ConnectionsProbeState::Idle;
                             this.report_connections_failure(
-                                "the SSH probe task stopped unexpectedly".to_string(),
+                                locale::text(
+                                    "The SSH probe task stopped unexpectedly.",
+                                    "SSH 主机探测任务意外中止。",
+                                    "SSH 主機探測任務意外中止。",
+                                )
+                                .to_string(),
                                 cx,
                             );
                         }
@@ -101838,6 +102462,74 @@ impl FoundationSettings {
             },
         ));
         cx.notify();
+    }
+
+    /// Asks before uninstalling the remote Vibex server binary on an SSH host
+    /// from the Settings page. Preserves remote runtime data by default.
+    fn confirm_uninstall_ssh_connection(
+        &mut self,
+        profile_id: String,
+        profile_name: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let workbench = self.workbench.clone();
+        window.open_dialog(cx, move |dialog, _, _| {
+            let workbench = workbench.clone();
+            let profile_id = profile_id.clone();
+            let profile_name = profile_name.clone();
+            let title = locale::text(
+                "Uninstall remote runtime?",
+                "卸载远端运行时？",
+                "解除安裝遠端執行階段？",
+            );
+            let description = match locale::current_locale() {
+                locale::ResolvedLocale::ZhCn => format!(
+                    "将停止并移除“{profile_name}”上的 Vibex 服务端程序与配置。你的工作区文件和会话数据会保留。"
+                ),
+                locale::ResolvedLocale::ZhTw => format!(
+                    "將停止並移除「{profile_name}」上的 Vibex 伺服器程式與設定。你的工作區檔案與工作階段資料會保留。"
+                ),
+                locale::ResolvedLocale::En => format!(
+                    "Stops and removes the Vibex server binary on \u{201c}{profile_name}\u{201d}. Your workspace files and session data are preserved."
+                ),
+                locale => vibex_ui::locale_copy::fill(
+                    locale.shared(),
+                    "Stops and removes the Vibex server binary on \u{201c}{profile_name}\u{201d}. Your workspace files and session data are preserved.",
+                    &[("profile_name", profile_name.clone())],
+                ),
+            };
+            dialog
+                .title(title)
+                .child(div().whitespace_normal().child(description))
+                .footer(
+                    DialogFooter::new()
+                        .child(DialogClose::new().child(
+                            Button::new("connections-uninstall-cancel")
+                                .outline()
+                                .label(locale::text("Cancel", "取消", "取消")),
+                        ))
+                        .child(DialogAction::new().child(
+                            Button::new("connections-uninstall-confirm")
+                                .danger()
+                                .label(locale::text(
+                                    "Uninstall runtime",
+                                    "卸载运行时",
+                                    "解除安裝執行階段",
+                                )),
+                        )),
+                )
+                .on_ok(move |_, _, cx| {
+                    let profile_id = profile_id.clone();
+                    let workbench = workbench.clone();
+                    cx.defer(move |cx| {
+                        let _ = workbench.update(cx, |workbench, cx| {
+                            workbench.uninstall_ssh_runtime(profile_id, false, cx)
+                        });
+                    });
+                    true
+                })
+        });
     }
 
     fn generate_bootstrap_command(&mut self, cx: &mut Context<Self>) {
@@ -101974,11 +102666,16 @@ impl FoundationSettings {
     fn open_connections_add_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.connections_selected_host = None;
         self.connections_probe_state = ConnectionsProbeState::Idle;
+        let manual_input = self.connections_manual_host_input.clone();
+        manual_input.update(cx, |input, cx| input.set_value("", window, cx));
         self.load_connections_discovery(cx);
         let entity = cx.weak_entity();
         window.open_dialog(cx, move |dialog, _, cx| {
             let entity = entity.clone();
             let entity_for_footer = entity.clone();
+            let manual_input = manual_input.clone();
+            let manual_input_for_ok = manual_input.clone();
+            let manual_value = manual_input.read(cx).value().trim().to_string();
             let (hosts, warnings, selected, probe) = entity
                 .update(cx, |this, _| {
                     (
@@ -101992,6 +102689,7 @@ impl FoundationSettings {
                     (Vec::new(), Vec::new(), None, ConnectionsProbeState::Idle)
                 });
             let probing = matches!(probe, ConnectionsProbeState::Probing(_));
+            let has_target = !manual_value.is_empty() || selected.is_some();
             let mut body = v_flex().w_full().min_w_0().gap_2();
             body = body.child(
                 div()
@@ -101999,27 +102697,54 @@ impl FoundationSettings {
                     .text_color(cx.theme().muted_foreground)
                     .whitespace_normal()
                     .child(locale::text(
-                        "Pick a host from ~/.ssh/config. Probing checks it, saves the connection, and starts provisioning.",
-                        "从 ~/.ssh/config 选择主机。探测会先检查该主机、保存连接，然后开始配置。",
-                        "從 ~/.ssh/config 選擇主機。探測會先檢查該主機、儲存連線，然後開始設定。",
+                        "Enter a host directly or pick one from ~/.ssh/config. Probing checks it, saves the connection, and starts provisioning.",
+                        "直接输入主机地址，或从 ~/.ssh/config 选择主机。探测会先检查该主机、保存连接，然后开始配置。",
+                        "直接輸入主機位址，或從 ~/.ssh/config 選擇主機。探測會先檢查該主機、儲存連線，然後開始設定。",
                     )),
+            );
+            body = body.child(
+                v_flex()
+                    .w_full()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(cx.theme().muted_foreground)
+                            .child(locale::text(
+                                "SSH destination (optional when choosing from config)",
+                                "SSH 目标地址（从下方配置列表选择时可留空）",
+                                "SSH 目標位址（從下方設定清單選擇時可留空）",
+                            )),
+                    )
+                    .child(Input::new(&manual_input).small().h(px(30.0))),
             );
             if hosts.is_empty() {
                 body = body.child(
                     div()
-                        .text_sm()
+                        .text_xs()
                         .text_color(cx.theme().muted_foreground)
                         .child(locale::text(
-                            "No concrete hosts were found in your OpenSSH config.",
-                            "OpenSSH 配置中没有找到具体主机。",
-                            "OpenSSH 設定中沒有找到具體主機。",
+                            "No concrete hosts were found in ~/.ssh/config — enter user@host or host:port above.",
+                            "~/.ssh/config 中没有找到具体主机，可在上方直接输入 user@host 或 host:port。",
+                            "~/.ssh/config 中沒有找到具體主機，可在上方直接輸入 user@host 或 host:port。",
                         )),
                 );
             } else {
+                body = body.child(
+                    div()
+                        .text_xs()
+                        .text_color(cx.theme().muted_foreground)
+                        .pt_1()
+                        .child(locale::text(
+                            "Hosts from ~/.ssh/config",
+                            "~/.ssh/config 中的主机",
+                            "~/.ssh/config 中的主機",
+                        )),
+                );
                 let mut list = v_flex()
                     .id("connections-add-host-list")
                     .w_full()
-                    .max_h(px(300.0))
+                    .max_h(px(240.0))
                     .overflow_y_scroll()
                     .gap_px()
                     .p_1()
@@ -102029,8 +102754,10 @@ impl FoundationSettings {
                     .bg(cx.theme().secondary.opacity(0.35));
                 for (index, host) in hosts.iter().take(200).enumerate() {
                     let alias = host.alias.clone();
-                    let chosen = selected.as_deref() == Some(alias.as_str());
+                    let chosen = manual_value.is_empty()
+                        && selected.as_deref() == Some(alias.as_str());
                     let row_entity = entity.clone();
+                    let row_manual_input = manual_input.clone();
                     let value = alias.clone();
                     list = list.child(
                         h_flex()
@@ -102045,7 +102772,10 @@ impl FoundationSettings {
                             .rounded(cx.theme().radius)
                             .when(chosen, |this| this.bg(cx.theme().primary.opacity(0.14)))
                             .hover(|this| this.bg(cx.theme().muted.opacity(0.5)))
-                            .on_click(move |_, _, cx| {
+                            .on_click(move |_, window, cx| {
+                                row_manual_input.update(cx, |input, cx| {
+                                    input.set_value("", window, cx);
+                                });
                                 let _ = row_entity.update(cx, |this, cx| {
                                     this.connections_selected_host = Some(value.clone());
                                     cx.notify();
@@ -102115,13 +102845,19 @@ impl FoundationSettings {
                                     "探测并添加",
                                     "探測並新增",
                                 ))
-                                .disabled(selected.is_none() || probing)
+                                .disabled(!has_target || probing)
                                 .loading(probing),
                         )),
                 )
                 .on_ok(move |_, _, cx| {
+                    let typed = manual_input_for_ok.read(cx).value().trim().to_string();
                     let _ = entity_for_footer.update(cx, |this, cx| {
-                        if let Some(alias) = this.connections_selected_host.clone() {
+                        let target = if !typed.is_empty() {
+                            Some(typed)
+                        } else {
+                            this.connections_selected_host.clone()
+                        };
+                        if let Some(alias) = target {
                             this.probe_connections_host(alias, cx);
                         }
                     });
@@ -103388,10 +104124,11 @@ impl FoundationSettings {
         if let Some(detail) = detail {
             body = body.child(
                 div()
+                    .id("connections-progress-detail")
                     .w_full()
                     .min_w_0()
                     .max_h(px(180.0))
-                    .overflow_hidden()
+                    .overflow_y_scroll()
                     .text_xs()
                     .whitespace_normal()
                     .text_color(if error.is_some() { danger } else { muted })
@@ -103462,6 +104199,7 @@ impl FoundationSettings {
                     .child(
                         h_flex()
                             .w_full()
+                            .flex_wrap()
                             .justify_end()
                             .gap_2()
                             .child(
@@ -103584,9 +104322,10 @@ impl FoundationSettings {
                     )
                     .child(
                         div()
+                            .id("connections-progress-log-scroll")
                             .w_full()
                             .max_h(px(180.0))
-                            .overflow_hidden()
+                            .overflow_y_scroll()
                             .text_xs()
                             .whitespace_normal()
                             .text_color(muted)
@@ -103700,6 +104439,14 @@ impl FoundationSettings {
                 "添加 WSL 运行时",
                 "新增 WSL 執行階段",
             ))
+            .disabled(!cfg!(target_os = "windows"))
+            .when(!cfg!(target_os = "windows"), |button| {
+                button.tooltip(locale::text(
+                    "WSL2 is only available on Windows",
+                    "WSL2 仅在 Windows 上可用",
+                    "WSL2 僅在 Windows 上可用",
+                ))
+            })
             .on_click(cx.listener(|this, _, window, cx| {
                 this.open_connections_wsl_dialog(window, cx);
             }));
@@ -103746,6 +104493,50 @@ impl FoundationSettings {
                     cx,
                 )],
             ));
+        } else {
+            let pending_count = self
+                .connections_profiles
+                .iter()
+                .filter(|profile| {
+                    profile.registered_runtime_id.is_none() && profile.runtime_version.is_none()
+                })
+                .count();
+            if pending_count > 0 {
+                let summary = match locale::current_locale() {
+                    locale::ResolvedLocale::ZhCn => {
+                        format!("{pending_count} 个已添加的 SSH 主机尚未完成安装和配对。")
+                    }
+                    locale::ResolvedLocale::ZhTw => {
+                        format!("{pending_count} 個已新增的 SSH 主機尚未完成安裝與配對。")
+                    }
+                    _ if pending_count == 1 => {
+                        "1 added SSH host has not finished installing and pairing yet.".to_string()
+                    }
+                    _ => format!(
+                        "{pending_count} added SSH hosts have not finished installing and pairing yet."
+                    ),
+                };
+                groups.push(SettingsGroup::new(
+                    locale::text("Pending setup", "待完成配置", "待完成設定"),
+                    vec![setting_row(
+                        locale::text(
+                            "Unfinished SSH connections",
+                            "未完成的 SSH 连接",
+                            "未完成的 SSH 連線",
+                        ),
+                        div().text_xs().whitespace_normal().child(summary),
+                        Button::new("connections-resume-unprovisioned")
+                            .small()
+                            .outline()
+                            .label(locale::text("Resume setup", "继续配置", "繼續設定"))
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.resume_unprovisioned_connections(cx);
+                            })),
+                        stacked,
+                        cx,
+                    )],
+                ));
+            }
         }
         // WSL deployments do not pass through the SSH coordinator, so they get
         // their own entry point. A failure stays visible here after the dialog
@@ -103912,6 +104703,14 @@ impl FoundationSettings {
                                 "添加 WSL 运行时",
                                 "新增 WSL 執行階段",
                             ))
+                            .disabled(!cfg!(target_os = "windows"))
+                            .when(!cfg!(target_os = "windows"), |button| {
+                                button.tooltip(locale::text(
+                                    "WSL2 is only available on Windows",
+                                    "WSL2 仅在 Windows 上可用",
+                                    "WSL2 僅在 Windows 上可用",
+                                ))
+                            })
                             .on_click(cx.listener(|this, _, window, cx| {
                                 this.open_connections_wsl_dialog(window, cx);
                             })),
@@ -103935,6 +104734,7 @@ impl FoundationSettings {
                 status: self.connection_row_status(profile),
                 transport: ConnectionTransport::Ssh,
                 wsl_provisioning: false,
+                registered_runtime_id: profile.registered_runtime_id.clone(),
             })
             .collect::<Vec<_>>();
         rows.extend(self.connections_wsl_profiles.iter().map(|profile| {
@@ -103956,6 +104756,7 @@ impl FoundationSettings {
                     .is_some_and(|snapshot| {
                         snapshot.distro == profile.distro && !snapshot.status.is_terminal()
                     }),
+                registered_runtime_id: profile.registered_runtime_id.clone(),
             }
         }));
         // A direct pairing produces a registry entry without an SSH or WSL
@@ -103994,6 +104795,7 @@ impl FoundationSettings {
                         .unwrap_or(ConnectionRowStatus::Offline),
                     transport: ConnectionTransport::Direct,
                     wsl_provisioning: false,
+                    registered_runtime_id: Some(runtime.id.clone()),
                 }),
         );
         rows
@@ -104231,9 +105033,9 @@ impl FoundationSettings {
                 },
             });
         // The row's primary action is the way back from every state a
-        // connection can be stuck in: an unpaired profile retries
-        // provisioning, a running one cancels, and a paired one reconnects to
-        // the runtime it kept.
+        // connection can be stuck in: an active remote disconnects back to
+        // Local, an in-flight provisioning or switch cancels cleanly, and an
+        // offline or failed connection reconnects or provisions.
         let primary_label = Self::connection_primary_label(row);
         let primary_id = row.id.clone();
         let primary_settings = settings.clone();
@@ -104245,12 +105047,6 @@ impl FoundationSettings {
         .outline()
         .label(primary_label)
         .tooltip(Self::connection_primary_hint(row))
-        // A direct runtime has no cancellable provisioning run; while its
-        // handshake is in flight the only honest action is to wait.
-        .disabled(
-            row.transport == ConnectionTransport::Direct
-                && row.status == ConnectionRowStatus::Connecting,
-        )
         .on_click(move |_, window, cx| {
             let profile_id = primary_id.clone();
             let _ = primary_settings.update(cx, |this, cx| {
@@ -104262,8 +105058,10 @@ impl FoundationSettings {
         let remove_settings = settings.clone();
         let wsl_menu = row.transport == ConnectionTransport::Wsl;
         let direct_menu = row.transport == ConnectionTransport::Direct;
-        let direct_in_flight = direct_menu && row.status == ConnectionRowStatus::Connecting;
+        let row_connecting = row.status == ConnectionRowStatus::Connecting;
+        let direct_in_flight = direct_menu && row_connecting;
         let wsl_in_flight = row.wsl_provisioning;
+        let ssh_has_runtime = row.registered_runtime_id.is_some();
         let menu = Button::new(SharedString::from(format!("connections-{}-menu", row.id)))
             .small()
             .ghost()
@@ -104277,78 +105075,117 @@ impl FoundationSettings {
                 let remove_name = remove_name.clone();
                 let remove_settings = remove_settings.clone();
                 if direct_menu {
+                    if direct_in_flight {
+                        let cancel_id = remove_id.clone();
+                        let cancel_settings = remove_settings.clone();
+                        // Removing a runtime mid-handshake would let the
+                        // connect task re-register the credential it is still
+                        // holding, so keep Remove out until the attempt ends.
+                        return menu.item(
+                            PopupMenuItem::new(locale::text("Cancel", "取消", "取消")).on_click(
+                                move |_, window, cx| {
+                                    let runtime_id = cancel_id.clone();
+                                    let _ = cancel_settings.update(cx, |this, cx| {
+                                        this.run_connection_primary_action(runtime_id, window, cx)
+                                    });
+                                },
+                            ),
+                        );
+                    }
                     let reconnect_id = remove_id.clone();
                     let reconnect_settings = remove_settings.clone();
-                    let menu = menu.item(
-                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
-                            .on_click(move |_, window, cx| {
-                                let runtime_id = reconnect_id.clone();
-                                let _ = reconnect_settings.update(cx, |this, cx| {
-                                    this.run_connection_primary_action(runtime_id, window, cx)
-                                });
-                            }),
-                    );
-                    // Removing a runtime mid-handshake would let the connect
-                    // task re-register the credential it is still holding, so
-                    // the row would come back. Keep the destructive action out
-                    // until the attempt is terminal.
-                    if direct_in_flight {
-                        return menu;
-                    }
-                    return menu.separator().item(
-                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
-                            move |_, window, cx| {
-                                let _ = remove_settings.update(cx, |this, cx| {
-                                    this.confirm_remove_paired_runtime(
-                                        remove_id.clone(),
-                                        remove_name.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            },
-                        ),
-                    );
+                    return menu
+                        .item(
+                            PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                                .on_click(move |_, window, cx| {
+                                    let runtime_id = reconnect_id.clone();
+                                    let _ = reconnect_settings.update(cx, |this, cx| {
+                                        this.reconnect_connection_row(runtime_id, window, cx)
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                                move |_, window, cx| {
+                                    let _ = remove_settings.update(cx, |this, cx| {
+                                        this.confirm_remove_paired_runtime(
+                                            remove_id.clone(),
+                                            remove_name.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                },
+                            ),
+                        );
                 }
                 if wsl_menu {
-                    let reconnect_id = remove_id.clone();
-                    let reconnect_settings = remove_settings.clone();
-                    let menu = menu.item(
-                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                    if wsl_in_flight {
+                        let progress_id = remove_id.clone();
+                        let progress_settings = remove_settings.clone();
+                        // An in-flight deployment has no cancellable
+                        // coordinator; removing its profile would let the
+                        // worker save it again when it finishes.
+                        return menu.item(
+                            PopupMenuItem::new(locale::text(
+                                "Show progress",
+                                "查看进度",
+                                "檢視進度",
+                            ))
                             .on_click(move |_, window, cx| {
-                                let profile_id = reconnect_id.clone();
-                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                let profile_id = progress_id.clone();
+                                let _ = progress_settings.update(cx, |this, cx| {
                                     this.run_connection_primary_action(profile_id, window, cx)
                                 });
                             }),
-                    );
-                    // An in-flight deployment has no cancellable coordinator;
-                    // removing its profile would let the worker save it again
-                    // when it finishes. Keep the destructive item out until
-                    // the attempt is terminal.
-                    if wsl_in_flight {
-                        return menu;
+                        );
                     }
-                    return menu.separator().item(
-                        PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
-                            move |_, window, cx| {
-                                let _ = remove_settings.update(cx, |this, cx| {
-                                    this.confirm_remove_wsl_connection(
-                                        remove_id.clone(),
-                                        remove_name.clone(),
-                                        window,
-                                        cx,
-                                    )
-                                });
-                            },
-                        ),
-                    );
+                    if row_connecting {
+                        let cancel_id = remove_id.clone();
+                        let cancel_settings = remove_settings.clone();
+                        return menu.item(
+                            PopupMenuItem::new(locale::text("Cancel", "取消", "取消")).on_click(
+                                move |_, window, cx| {
+                                    let profile_id = cancel_id.clone();
+                                    let _ = cancel_settings.update(cx, |this, cx| {
+                                        this.run_connection_primary_action(profile_id, window, cx)
+                                    });
+                                },
+                            ),
+                        );
+                    }
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    return menu
+                        .item(
+                            PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                                .on_click(move |_, window, cx| {
+                                    let profile_id = reconnect_id.clone();
+                                    let _ = reconnect_settings.update(cx, |this, cx| {
+                                        this.reconnect_connection_row(profile_id, window, cx)
+                                    });
+                                }),
+                        )
+                        .separator()
+                        .item(
+                            PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
+                                move |_, window, cx| {
+                                    let _ = remove_settings.update(cx, |this, cx| {
+                                        this.confirm_remove_wsl_connection(
+                                            remove_id.clone(),
+                                            remove_name.clone(),
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                },
+                            ),
+                        );
                 }
                 let edit_id = remove_id.clone();
                 let edit_settings = remove_settings.clone();
-                let reconnect_id = remove_id.clone();
-                let reconnect_settings = remove_settings.clone();
-                menu.item(
+                let mut menu = menu.item(
                     PopupMenuItem::new(locale::text("Edit", "编辑", "編輯")).on_click(
                         move |_, window, cx| {
                             let profile_id = edit_id.clone();
@@ -104357,23 +105194,70 @@ impl FoundationSettings {
                             });
                         },
                     ),
-                )
-                .item(
-                    // Reconnect used to need a paired runtime, so an unpaired
-                    // profile had no action here at all. It now re-runs
-                    // provisioning for one, and restores the tunnel and client
-                    // for a profile that has paired before.
-                    PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線")).on_click(
-                        move |_, window, cx| {
-                            let profile_id = reconnect_id.clone();
-                            let _ = reconnect_settings.update(cx, |this, cx| {
-                                this.run_connection_primary_action(profile_id, window, cx)
-                            });
-                        },
-                    ),
-                )
-                .separator()
-                .item(
+                );
+                if !row_connecting {
+                    let reconnect_id = remove_id.clone();
+                    let reconnect_settings = remove_settings.clone();
+                    menu = menu.item(
+                        // Reconnect used to need a paired runtime, so an unpaired
+                        // profile had no action here at all. It now re-runs
+                        // provisioning for one, and restores the tunnel and client
+                        // for a profile that has paired before.
+                        PopupMenuItem::new(locale::text("Reconnect", "重新连接", "重新連線"))
+                            .on_click(move |_, window, cx| {
+                                let profile_id = reconnect_id.clone();
+                                let _ = reconnect_settings.update(cx, |this, cx| {
+                                    this.reconnect_connection_row(profile_id, window, cx)
+                                });
+                            }),
+                    );
+                    if ssh_has_runtime {
+                        let upgrade_id = remove_id.clone();
+                        let upgrade_settings = remove_settings.clone();
+                        let uninstall_id = remove_id.clone();
+                        let uninstall_name = remove_name.clone();
+                        let uninstall_settings = remove_settings.clone();
+                        menu = menu
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Update runtime",
+                                    "更新运行时",
+                                    "更新執行階段",
+                                ))
+                                .on_click(move |_, _, cx| {
+                                    let profile_id = upgrade_id.clone();
+                                    let _ = upgrade_settings.update(cx, |this, cx| {
+                                        let workbench = this.workbench.clone();
+                                        cx.defer(move |cx| {
+                                            let _ = workbench.update(cx, |workbench, cx| {
+                                                workbench.start_ssh_runtime_upgrade(profile_id, cx)
+                                            });
+                                        });
+                                    });
+                                }),
+                            )
+                            .item(
+                                PopupMenuItem::new(locale::text(
+                                    "Uninstall runtime",
+                                    "卸载运行时",
+                                    "解除安裝執行階段",
+                                ))
+                                .on_click(move |_, window, cx| {
+                                    let profile_id = uninstall_id.clone();
+                                    let profile_name = uninstall_name.clone();
+                                    let _ = uninstall_settings.update(cx, |this, cx| {
+                                        this.confirm_uninstall_ssh_connection(
+                                            profile_id,
+                                            profile_name,
+                                            window,
+                                            cx,
+                                        )
+                                    });
+                                }),
+                            );
+                    }
+                }
+                menu.separator().item(
                     PopupMenuItem::new(locale::text("Remove", "移除", "移除")).on_click(
                         move |_, window, cx| {
                             let _ = remove_settings.update(cx, |this, cx| {
@@ -104464,15 +105348,15 @@ impl FoundationSettings {
     }
 
     fn connection_primary_label(row: &ConnectionDisplayRow) -> &'static str {
+        if row.status == ConnectionRowStatus::Connected {
+            return locale::text("Disconnect", "断开连接", "中斷連線");
+        }
         if row.transport == ConnectionTransport::Direct {
             return match row.status {
-                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
-                ConnectionRowStatus::Connecting => {
-                    locale::text("Connecting…", "连接中…", "連線中…")
-                }
-                ConnectionRowStatus::Offline | ConnectionRowStatus::NeedsAttention => {
-                    locale::text("Connect", "连接", "連線")
-                }
+                ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
+                ConnectionRowStatus::Offline
+                | ConnectionRowStatus::NeedsAttention
+                | ConnectionRowStatus::Connected => locale::text("Connect", "连接", "連線"),
             };
         }
         if row.transport == ConnectionTransport::Wsl {
@@ -104480,30 +105364,33 @@ impl FoundationSettings {
                 return locale::text("Show progress", "查看进度", "檢視進度");
             }
             return match row.status {
-                ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
+                ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
                 ConnectionRowStatus::NeedsAttention => locale::text("Retry", "重试", "重試"),
-                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => {
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connected => {
                     locale::text("Connect", "连接", "連線")
                 }
             };
         }
         match row.status {
-            ConnectionRowStatus::Connected => locale::text("Reconnect", "重新连接", "重新連線"),
-            ConnectionRowStatus::Offline => locale::text("Connect", "连接", "連線"),
+            ConnectionRowStatus::Offline | ConnectionRowStatus::Connected => {
+                locale::text("Connect", "连接", "連線")
+            }
             ConnectionRowStatus::NeedsAttention => locale::text("Fix", "修复", "修復"),
             ConnectionRowStatus::Connecting => locale::text("Cancel", "取消", "取消"),
         }
     }
 
     fn connection_primary_hint(row: &ConnectionDisplayRow) -> &'static str {
+        if row.status == ConnectionRowStatus::Connected {
+            return locale::text(
+                "Switch back to this device's local runtime.",
+                "切换回本机运行时。",
+                "切換回本機執行階段。",
+            );
+        }
         if row.transport == ConnectionTransport::Direct {
             return match row.status {
-                ConnectionRowStatus::Connected => locale::text(
-                    "Reconnect and make this runtime authoritative.",
-                    "重新连接并使该运行时成为当前运行时。",
-                    "重新連線並使該執行階段成為目前執行階段。",
-                ),
-                ConnectionRowStatus::Offline => locale::text(
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connected => locale::text(
                     "Connect to the runtime this pairing added.",
                     "连接此配对添加的运行时。",
                     "連線此配對新增的執行階段。",
@@ -104514,9 +105401,9 @@ impl FoundationSettings {
                     "重試連線該已配對執行階段。",
                 ),
                 ConnectionRowStatus::Connecting => locale::text(
-                    "This runtime is already connecting.",
-                    "该运行时正在连接中。",
-                    "該執行階段正在連線中。",
+                    "Cancel this connection attempt.",
+                    "取消此次连接。",
+                    "取消此次連線。",
                 ),
             };
         }
@@ -104529,17 +105416,17 @@ impl FoundationSettings {
                 );
             }
             return match row.status {
-                ConnectionRowStatus::Connected => locale::text(
-                    "Restore this WSL runtime and make it authoritative.",
-                    "恢复该 WSL 运行时并使其成为当前运行时。",
-                    "恢復該 WSL 執行階段並使其成為目前執行階段。",
+                ConnectionRowStatus::Connecting => locale::text(
+                    "Cancel this connection attempt.",
+                    "取消此次连接。",
+                    "取消此次連線。",
                 ),
                 ConnectionRowStatus::NeedsAttention => locale::text(
                     "Retry the WSL runtime setup.",
                     "重试 WSL 运行时配置。",
                     "重試 WSL 執行階段設定。",
                 ),
-                ConnectionRowStatus::Offline | ConnectionRowStatus::Connecting => locale::text(
+                ConnectionRowStatus::Offline | ConnectionRowStatus::Connected => locale::text(
                     "Start this WSL runtime and connect to it.",
                     "启动该 WSL 运行时并连接。",
                     "啟動該 WSL 執行階段並連線。",
@@ -104547,12 +105434,7 @@ impl FoundationSettings {
             };
         }
         match row.status {
-            ConnectionRowStatus::Connected => locale::text(
-                "Reconnect and make this runtime authoritative.",
-                "重新连接并使该运行时成为当前运行时。",
-                "重新連線並使該執行階段成為目前執行階段。",
-            ),
-            ConnectionRowStatus::Offline => locale::text(
+            ConnectionRowStatus::Offline | ConnectionRowStatus::Connected => locale::text(
                 "Install, start, and pair the runtime on this host.",
                 "在该主机上安装、启动并配对运行时。",
                 "在該主機上安裝、啟動並配對執行階段。",
@@ -104563,21 +105445,101 @@ impl FoundationSettings {
                 "重試連線該主機。",
             ),
             ConnectionRowStatus::Connecting => locale::text(
-                "Stop this provisioning run.",
-                "停止当前的配置。",
-                "停止目前的設定。",
+                "Cancel this provisioning or connection attempt.",
+                "取消此次配置或连接。",
+                "取消此次設定或連線。",
             ),
         }
     }
 
     /// Runs a row's primary action for the state the row is in.
     ///
-    /// A running SSH run cancels; every other state reconnects. The button is
-    /// the connection's own action now, not a way into the provisioning dialog:
-    /// a paired profile restores its tunnel and client, and an unpaired one
-    /// provisions from the start. A WSL deployment in flight opens its progress
-    /// instead, because WSL has no cancellable coordinator to hand the click to.
+    /// A connected row switches back to the local runtime; an in-flight
+    /// provisioning run or runtime switch cancels cleanly; every other state
+    /// connects or retries. A WSL deployment in flight opens its progress
+    /// because WSL provisioning does not yet expose a cancellable coordinator.
     fn run_connection_primary_action(
+        &mut self,
+        profile_id: String,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let row = self
+            .connections_rows()
+            .into_iter()
+            .find(|row| row.id == profile_id);
+        let Some(row) = row else {
+            return;
+        };
+        if row.status == ConnectionRowStatus::Connected {
+            let workbench = self.workbench.clone();
+            cx.defer(move |cx| {
+                let _ = workbench.update(cx, |workbench, cx| {
+                    workbench.switch_to_runtime(LOCAL_RUNTIME_ID.to_string(), cx)
+                });
+            });
+            cx.notify();
+            return;
+        }
+        if row.status == ConnectionRowStatus::Connecting {
+            if row.transport == ConnectionTransport::Direct {
+                let runtime_id = profile_id.clone();
+                let workbench = self.workbench.clone();
+                cx.defer(move |cx| {
+                    let _ = workbench.update(cx, |workbench, cx| {
+                        workbench.cancel_remote_runtime_switch(&runtime_id, cx)
+                    });
+                });
+                cx.notify();
+                return;
+            }
+            if row.transport == ConnectionTransport::Wsl {
+                if row.wsl_provisioning {
+                    self.open_connections_wsl_progress_dialog(window, cx);
+                    return;
+                }
+                if let Some(runtime_id) = row.registered_runtime_id.clone() {
+                    let workbench = self.workbench.clone();
+                    cx.defer(move |cx| {
+                        let _ = workbench.update(cx, |workbench, cx| {
+                            workbench.cancel_remote_runtime_switch(&runtime_id, cx)
+                        });
+                    });
+                    cx.notify();
+                }
+                return;
+            }
+            let provisioning_in_flight =
+                self.connections_snapshot.as_ref().is_some_and(|snapshot| {
+                    snapshot.profile_id == profile_id && !snapshot.status.is_terminal()
+                });
+            let workbench = self.workbench.clone();
+            if provisioning_in_flight {
+                cx.defer(move |cx| {
+                    let _ =
+                        workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
+                });
+            } else if let Some(runtime_id) = row.registered_runtime_id.clone() {
+                cx.defer(move |cx| {
+                    let _ = workbench.update(cx, |workbench, cx| {
+                        workbench.cancel_remote_runtime_switch(&runtime_id, cx)
+                    });
+                });
+            } else {
+                cx.defer(move |cx| {
+                    let _ =
+                        workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
+                });
+            }
+            cx.notify();
+            return;
+        }
+        self.reconnect_connection_row(profile_id, window, cx);
+    }
+
+    /// Reconnects or retries provisioning for a connection row regardless of
+    /// whether it is currently active.
+    fn reconnect_connection_row(
         &mut self,
         profile_id: String,
         window: &mut Window,
@@ -104614,14 +105576,6 @@ impl FoundationSettings {
                 let _ = workbench.update(cx, |workbench, cx| {
                     workbench.connect_wsl_connection(pending, cx)
                 });
-            });
-            cx.notify();
-            return;
-        }
-        if row.status == ConnectionRowStatus::Connecting {
-            let workbench = self.workbench.clone();
-            cx.defer(move |cx| {
-                let _ = workbench.update(cx, |workbench, cx| workbench.cancel_ssh_provisioning(cx));
             });
             cx.notify();
             return;
@@ -135361,6 +136315,145 @@ mod tests {
             .map(|(body, _)| body)
             .expect("the macOS lifecycle row should remain inspectable");
         assert!(lifecycle.contains("caffeinate -i"));
+    }
+
+    #[test]
+    fn format_transfer_progress_formats_bytes_kb_mb_and_percentages() {
+        assert_eq!(format_transfer_progress(512, 1024), "512 B / 1 KB (50%)");
+        assert_eq!(
+            format_transfer_progress(512 * 1024, 1024 * 1024),
+            "512 KB / 1.0 MB (50%)"
+        );
+        assert_eq!(
+            format_transfer_progress(12 * 1024 * 1024, 48 * 1024 * 1024),
+            "12.0 MB / 48.0 MB (25%)"
+        );
+        assert_eq!(
+            format_transfer_progress(60 * 1024 * 1024, 48 * 1024 * 1024),
+            "48.0 MB / 48.0 MB (100%)"
+        );
+        assert_eq!(format_transfer_progress(2048, 0), "2 KB");
+    }
+
+    #[test]
+    fn parse_manual_ssh_target_handles_hosts_users_ports_and_ipv6() {
+        assert_eq!(
+            parse_manual_ssh_target("alice@dev.example.com:2222"),
+            Ok(ParsedManualSshTarget {
+                host: "dev.example.com".to_string(),
+                user: Some("alice".to_string()),
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            parse_manual_ssh_target("  alice@10.0.0.5  "),
+            Ok(ParsedManualSshTarget {
+                host: "10.0.0.5".to_string(),
+                user: Some("alice".to_string()),
+                port: None,
+            })
+        );
+        assert_eq!(
+            parse_manual_ssh_target("box.local:2200"),
+            Ok(ParsedManualSshTarget {
+                host: "box.local".to_string(),
+                user: None,
+                port: Some(2200),
+            })
+        );
+        assert_eq!(
+            parse_manual_ssh_target("alice@[::1]:2222"),
+            Ok(ParsedManualSshTarget {
+                host: "[::1]".to_string(),
+                user: Some("alice".to_string()),
+                port: Some(2222),
+            })
+        );
+        assert_eq!(
+            parse_manual_ssh_target("::1"),
+            Ok(ParsedManualSshTarget {
+                host: "[::1]".to_string(),
+                user: None,
+                port: None,
+            })
+        );
+        for invalid in [
+            "",
+            "   ",
+            "alice@host name",
+            "@example.com",
+            "alice@",
+            "a@b@c",
+            "example.com:0",
+            "example.com:99999",
+            "-oProxyCommand=bad",
+            "example.com;rm -rf /",
+            "[::1",
+        ] {
+            assert!(
+                parse_manual_ssh_target(invalid).is_err(),
+                "expected {invalid:?} to be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn connection_primary_label_offers_disconnect_and_cancel_states() {
+        let make_row = |transport, status, wsl_provisioning| ConnectionDisplayRow {
+            id: "r1".to_string(),
+            name: "Dev Box".to_string(),
+            alias: String::new(),
+            user: "alice".to_string(),
+            host: "10.0.0.2".to_string(),
+            port: 22,
+            version: Some("0.1.10".to_string()),
+            status,
+            transport,
+            wsl_provisioning,
+            registered_runtime_id: Some("rt-1".to_string()),
+        };
+
+        for transport in [
+            ConnectionTransport::Ssh,
+            ConnectionTransport::Wsl,
+            ConnectionTransport::Direct,
+        ] {
+            let connected = make_row(transport, ConnectionRowStatus::Connected, false);
+            assert_eq!(
+                FoundationSettings::connection_primary_label(&connected),
+                locale::text("Disconnect", "断开连接", "中斷連線")
+            );
+        }
+
+        let direct_connecting = make_row(
+            ConnectionTransport::Direct,
+            ConnectionRowStatus::Connecting,
+            false,
+        );
+        assert_eq!(
+            FoundationSettings::connection_primary_label(&direct_connecting),
+            locale::text("Cancel", "取消", "取消")
+        );
+
+        let wsl_connecting = make_row(
+            ConnectionTransport::Wsl,
+            ConnectionRowStatus::Connecting,
+            false,
+        );
+        assert_eq!(
+            FoundationSettings::connection_primary_label(&wsl_connecting),
+            locale::text("Cancel", "取消", "取消")
+        );
+
+        let wsl_provisioning = make_row(
+            ConnectionTransport::Wsl,
+            ConnectionRowStatus::Connecting,
+            true,
+        );
+        assert_eq!(
+            FoundationSettings::connection_primary_label(&wsl_provisioning),
+            locale::text("Show progress", "查看进度", "檢視進度")
+        );
     }
 
     #[test]
