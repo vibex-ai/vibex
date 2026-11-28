@@ -33,9 +33,10 @@ use vibex_core::{
     RemoteWsTicketRequest, RemoteWsTicketResponse, RequestId, VibexError, unix_timestamp_ms,
 };
 use vibex_relay::{
-    RELAY_CRYPTO_SUITE_V2, RelayCryptoSuite, RelayKeypair, RelaySession, RelaySessionConfig,
-    relay_handshake_authentication_tag, relay_handshake_transcript,
-    relay_transcript_hash_with_ephemeral, verify_relay_handshake_authentication_tag,
+    RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1, RELAY_CRYPTO_SUITE_V2, RelayCryptoSuite, RelayKeypair,
+    RelaySession, RelaySessionConfig, relay_handshake_authentication_tag,
+    relay_handshake_transcript, relay_transcript_hash_with_ephemeral,
+    verify_relay_handshake_authentication_tag,
 };
 use x25519_dalek::{PublicKey, StaticSecret};
 
@@ -2074,6 +2075,19 @@ impl DirectWebSocketTransport {
                 "remote idempotency key must be non-empty and at most 128 bytes",
             ));
         }
+        struct PendingRequestGuard {
+            pending: Shared<
+                Mutex<BTreeMap<String, oneshot::Sender<BackendResult<RemoteRpcResponseV2>>>>,
+            >,
+            key: String,
+        }
+        impl Drop for PendingRequestGuard {
+            fn drop(&mut self) {
+                if let Ok(mut pending) = self.pending.lock() {
+                    pending.remove(&self.key);
+                }
+            }
+        }
         let (sender, receiver) = oneshot::channel();
         {
             let mut pending = self.inner.pending.lock().map_err(|_| {
@@ -2090,6 +2104,10 @@ impl DirectWebSocketTransport {
             }
             pending.insert(key.clone(), sender);
         }
+        let _pending_guard = PendingRequestGuard {
+            pending: self.inner.pending.clone(),
+            key: key.clone(),
+        };
         if let Some(mutation) = request.mutation.as_ref() {
             self.inner
                 .pending_mutations
@@ -2490,6 +2508,7 @@ impl RelayE2eeTransport {
             "remote_v2".to_string(),
             "server_events".to_string(),
             "remote_binary".to_string(),
+            RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1.to_string(),
         ];
         hello.crypto_suite = Some(RELAY_CRYPTO_SUITE_V2.to_string());
         hello.remote_device_id = Some(identity.device_id().clone());

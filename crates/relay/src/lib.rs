@@ -1,9 +1,13 @@
 use std::fmt;
+use std::io::{Read, Write};
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as BASE64;
 use chacha20poly1305::aead::{Aead, Payload};
 use chacha20poly1305::{KeyInit, XChaCha20Poly1305, XNonce};
+use flate2::Compression;
+use flate2::read::DeflateDecoder;
+use flate2::write::DeflateEncoder;
 use hkdf::Hkdf;
 use hmac::{Hmac, Mac};
 #[cfg(not(target_family = "wasm"))]
@@ -23,6 +27,19 @@ const NONCE_SIZE: usize = 24;
 
 pub const RELAY_CRYPTO_SUITE_V1: &str = "x25519-hkdf-sha256-xchacha20poly1305-v1";
 pub const RELAY_CRYPTO_SUITE_V2: &str = "x25519-hkdf-sha256-xchacha20poly1305-v2";
+/// Handshake capability advertised by peers whose [`RelaySession::open_json`]
+/// can inflate raw-deflate compressed plaintext envelopes prefixed with
+/// [`PLAINTEXT_DEFLATE_MAGIC`].
+pub const RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1: &str = "plaintext_deflate_v1";
+
+/// Leading marker byte distinguishing a raw-deflate compressed plaintext
+/// envelope from an uncompressed JSON object (which always starts with `{`).
+const PLAINTEXT_DEFLATE_MAGIC: u8 = 0x01;
+/// Skip compression on small control/heartbeat/auth frames where deflate adds
+/// overhead without meaningful wire savings.
+const PLAINTEXT_DEFLATE_MIN_BYTES: usize = 512;
+/// Hard ceiling on decompressed plaintext size to reject zip-bomb frames.
+const MAX_DECOMPRESSED_PLAINTEXT_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RelayCryptoSuite {
@@ -138,6 +155,7 @@ pub struct RelaySession {
     receive_key: [u8; KEY_SIZE],
     next_send_counter: u64,
     next_receive_counter: u64,
+    compress_outbound: bool,
 }
 
 impl RelaySession {
@@ -147,6 +165,17 @@ impl RelaySession {
 
     pub fn remote_peer_id(&self) -> &RelayPeerId {
         &self.config.remote_peer_id
+    }
+
+    /// Enables or disables raw-deflate compression for outbound E2EE
+    /// plaintexts. Callers should enable this only after confirming the peer
+    /// advertised [`RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1`].
+    pub fn set_compress_outbound(&mut self, enabled: bool) {
+        self.compress_outbound = enabled;
+    }
+
+    pub fn compress_outbound(&self) -> bool {
+        self.compress_outbound
     }
 
     pub fn establish(
@@ -235,6 +264,7 @@ impl RelaySession {
             receive_key,
             next_send_counter: 1,
             next_receive_counter: 1,
+            compress_outbound: false,
         })
     }
 
@@ -291,6 +321,7 @@ impl RelaySession {
             receive_key,
             next_send_counter: 1,
             next_receive_counter: 1,
+            compress_outbound: false,
         })
     }
 
@@ -322,6 +353,7 @@ impl RelaySession {
                 "failed to serialize relay plaintext envelope",
             )
         })?;
+        let plaintext_bytes = encode_plaintext_bytes(plaintext_bytes, self.compress_outbound);
 
         let nonce_bytes = match self.suite {
             RelayCryptoSuite::LegacyV1 => random_nonce()?,
@@ -426,8 +458,9 @@ impl RelaySession {
                 ));
             }
         }
+        let plaintext_json = decode_plaintext_bytes(&plaintext_bytes)?;
         let plaintext: RelayPlaintextEnvelope =
-            serde_json::from_slice(&plaintext_bytes).map_err(|_| {
+            serde_json::from_slice(&plaintext_json).map_err(|_| {
                 relay_error(
                     RelayErrorCode::InvalidFrame,
                     "relay plaintext envelope was not valid JSON",
@@ -928,6 +961,42 @@ fn decode_ciphertext(value: &str) -> VibexResult<Vec<u8>> {
     })
 }
 
+fn encode_plaintext_bytes(json_bytes: Vec<u8>, compress: bool) -> Vec<u8> {
+    if !compress || json_bytes.len() < PLAINTEXT_DEFLATE_MIN_BYTES {
+        return json_bytes;
+    }
+    let mut encoder = DeflateEncoder::new(vec![PLAINTEXT_DEFLATE_MAGIC], Compression::fast());
+    if encoder.write_all(&json_bytes).is_err() {
+        return json_bytes;
+    }
+    match encoder.finish() {
+        Ok(compressed) if compressed.len() < json_bytes.len() => compressed,
+        _ => json_bytes,
+    }
+}
+
+fn decode_plaintext_bytes(raw: &[u8]) -> VibexResult<Vec<u8>> {
+    if raw.first() != Some(&PLAINTEXT_DEFLATE_MAGIC) {
+        return Ok(raw.to_vec());
+    }
+    let decoder = DeflateDecoder::new(&raw[1..]);
+    let mut limited = decoder.take((MAX_DECOMPRESSED_PLAINTEXT_BYTES + 1) as u64);
+    let mut inflated = Vec::new();
+    limited.read_to_end(&mut inflated).map_err(|_| {
+        relay_error(
+            RelayErrorCode::InvalidFrame,
+            "compressed relay plaintext envelope could not be decoded",
+        )
+    })?;
+    if inflated.len() > MAX_DECOMPRESSED_PLAINTEXT_BYTES {
+        return Err(relay_error(
+            RelayErrorCode::InvalidFrame,
+            "decompressed relay plaintext envelope exceeded size limit",
+        ));
+    }
+    Ok(inflated)
+}
+
 fn associated_data(metadata: &RelayVisibleFrameMetadata) -> VibexResult<Vec<u8>> {
     serde_json::to_vec(metadata).map_err(|_| {
         relay_error(
@@ -1242,5 +1311,58 @@ mod tests {
         assert!(!format!("{keypair:?}").contains(&private_key_marker));
         assert!(!format!("{pc:?}").contains("XChaCha20Poly1305"));
         assert!(format!("{pc:?}").contains("<redacted>"));
+    }
+
+    #[test]
+    fn compresses_large_plaintexts_when_enabled_and_stays_backwards_compatible() {
+        let (mut pc_plain, mut phone_plain) = session_pair();
+        let (mut pc_compressed, mut phone_compressed) = session_pair();
+        pc_compressed.set_compress_outbound(true);
+
+        let large_payload = serde_json::json!({
+            "kind": "timeline_page",
+            "items": (0..64).map(|i| serde_json::json!({
+                "sequence": i,
+                "kind": "tool_call",
+                "summary": "Read file crates/desktop-runtime/src/relay.rs",
+                "text": "repeated timeline reasoning text ".repeat(16),
+            })).collect::<Vec<_>>(),
+        });
+
+        let uncompressed_frame = pc_plain
+            .seal_json(RelayFrameKind::Response, None, large_payload.clone())
+            .unwrap();
+        let compressed_frame = pc_compressed
+            .seal_json(RelayFrameKind::Response, None, large_payload.clone())
+            .unwrap();
+
+        assert!(
+            compressed_frame.ciphertext.len() * 4 < uncompressed_frame.ciphertext.len(),
+            "expected deflate compression to shrink repetitive JSON by >4x: compressed={} uncompressed={}",
+            compressed_frame.ciphertext.len(),
+            uncompressed_frame.ciphertext.len()
+        );
+
+        let opened_plain = phone_plain.open_json(&uncompressed_frame).unwrap();
+        let opened_compressed = phone_compressed.open_json(&compressed_frame).unwrap();
+        assert_eq!(opened_plain.business_payload_json, large_payload);
+        assert_eq!(opened_compressed.business_payload_json, large_payload);
+    }
+
+    #[test]
+    fn skips_compression_for_small_frames_and_rejects_oversized_deflate_payloads() {
+        let small = serde_json::to_vec(&serde_json::json!({"ok": true})).unwrap();
+        let encoded = encode_plaintext_bytes(small.clone(), true);
+        assert_eq!(encoded, small);
+
+        // Build a zip-bomb payload that expands past MAX_DECOMPRESSED_PLAINTEXT_BYTES.
+        let mut encoder = DeflateEncoder::new(vec![PLAINTEXT_DEFLATE_MAGIC], Compression::best());
+        let zeros = vec![b'a'; 64 * 1024];
+        for _ in 0..=(MAX_DECOMPRESSED_PLAINTEXT_BYTES / zeros.len()) {
+            encoder.write_all(&zeros).unwrap();
+        }
+        let bomb = encoder.finish().unwrap();
+        let err = decode_plaintext_bytes(&bomb).unwrap_err();
+        assert_eq!(err.code, RelayErrorCode::InvalidFrame.as_str());
     }
 }

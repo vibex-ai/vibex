@@ -19,9 +19,10 @@ use vibex_core::{
     unix_timestamp_ms,
 };
 use vibex_relay::{
-    RELAY_CRYPTO_SUITE_V2, RelayCryptoSuite, RelayKeypair, RelaySession, RelaySessionConfig,
-    relay_handshake_authentication_tag, relay_handshake_transcript,
-    relay_transcript_hash_with_ephemeral, verify_relay_handshake_authentication_tag,
+    RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1, RELAY_CRYPTO_SUITE_V2, RelayCryptoSuite, RelayKeypair,
+    RelaySession, RelaySessionConfig, relay_handshake_authentication_tag,
+    relay_handshake_transcript, relay_transcript_hash_with_ephemeral,
+    verify_relay_handshake_authentication_tag,
 };
 use vibex_remote::{RelayAttachmentTasks, RelayRemoteOutbound, RemoteDispatcher};
 
@@ -1097,7 +1098,7 @@ impl RelayClientRuntime {
             remote_peer_id: hello.peer_id.clone(),
         };
         let mut pc_ephemeral = None;
-        let session = match if suite == RelayCryptoSuite::DirectionalV2 {
+        let mut session = match if suite == RelayCryptoSuite::DirectionalV2 {
             let device_ephemeral = hello.ephemeral_public_key.as_deref().ok_or_else(|| {
                 VibexError::validation(
                     "relay_ephemeral_key_required",
@@ -1164,6 +1165,11 @@ impl RelayClientRuntime {
                 );
             }
         };
+        let supports_deflate = hello
+            .capabilities
+            .iter()
+            .any(|capability| capability == RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1);
+        session.set_compress_outbound(supports_deflate);
         sessions.insert(
             session_id.clone(),
             ActiveRelaySession {
@@ -1872,6 +1878,74 @@ mod tests {
             .unwrap();
         RemoteDeviceRepository::revoke(&conn, &stored.detail.device_id, unix_timestamp_ms())
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn handle_pair_enables_plaintext_deflate_only_when_peer_advertises_it() {
+        let dispatcher = RemoteDispatcher::new(RemoteServiceConfig::loopback_disabled());
+        let runtime = RelayClientRuntime::new(dispatcher);
+        let settings = runtime.get_settings().await;
+        let room_id = settings.room_id.clone();
+
+        let make_hello = |peer_id: RelayPeerId, keypair: &RelayKeypair, caps: Vec<String>| {
+            let mut hello =
+                RelayHandshakeHello::new(room_id.clone(), peer_id, keypair.public_key_base64());
+            hello.role = RelayPeerRole::Device;
+            hello.capabilities = caps;
+            hello
+        };
+
+        let mut sessions = HashMap::new();
+        let legacy_key = RelayKeypair::generate();
+        let legacy_ready = runtime
+            .handle_bridge_message(
+                RelayBridgeMessage {
+                    correlation_id: CorrelationId::new(),
+                    room_id: room_id.clone(),
+                    message: RelayControlMessage::Hello(make_hello(
+                        RelayPeerId::new(),
+                        &legacy_key,
+                        vec!["remote_v2".to_string()],
+                    )),
+                },
+                &mut sessions,
+            )
+            .await;
+        let RelayControlMessage::Ready(legacy_ready) = legacy_ready.message else {
+            panic!("expected Ready for legacy peer");
+        };
+        assert!(
+            !sessions[&legacy_ready.session_id]
+                .crypto
+                .compress_outbound()
+        );
+
+        let modern_key = RelayKeypair::generate();
+        let modern_ready = runtime
+            .handle_bridge_message(
+                RelayBridgeMessage {
+                    correlation_id: CorrelationId::new(),
+                    room_id: room_id.clone(),
+                    message: RelayControlMessage::Hello(make_hello(
+                        RelayPeerId::new(),
+                        &modern_key,
+                        vec![
+                            "remote_v2".to_string(),
+                            RELAY_CAPABILITY_PLAINTEXT_DEFLATE_V1.to_string(),
+                        ],
+                    )),
+                },
+                &mut sessions,
+            )
+            .await;
+        let RelayControlMessage::Ready(modern_ready) = modern_ready.message else {
+            panic!("expected Ready for compression-capable peer");
+        };
+        assert!(
+            sessions[&modern_ready.session_id]
+                .crypto
+                .compress_outbound()
+        );
     }
 
     fn cleanup_db(path: std::path::PathBuf) {

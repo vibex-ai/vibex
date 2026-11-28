@@ -42,12 +42,13 @@ pub const REMOTE_DISPLAY_NAME_MAX_CHARS: usize = 64;
 /// The largest timeline page a paired client may be sent.
 ///
 /// The page is JSON, sealed in an E2EE envelope, and base64 encoded before it
-/// becomes one Relay WebSocket message, so the wire frame is roughly a third
-/// larger than the page. A page budget at the Relay's frame limit therefore
-/// produces an oversized frame; the Relay closes the PC socket, and the phone
-/// retries into a room that no longer has an authority. This leaves enough
-/// headroom for the envelope while still holding several screens of history.
-pub const REMOTE_TIMELINE_PAGE_MAX_BYTES: u32 = 512 * 1024;
+/// becomes one Relay WebSocket message, so an uncompressed wire frame is
+/// roughly a third larger than the page. Keeping each page at 256 KiB ensures
+/// that even legacy peers without E2EE plaintext compression transfer a single
+/// page well inside mobile's open timeout over constrained Relay links, while
+/// compressed peers receive it in ~50–65 KiB on the wire and still hold several
+/// screens of history.
+pub const REMOTE_TIMELINE_PAGE_MAX_BYTES: u32 = 256 * 1024;
 
 /// Normalizes an operator-supplied runtime or device name.
 ///

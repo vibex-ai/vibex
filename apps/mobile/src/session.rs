@@ -115,7 +115,10 @@ const MOBILE_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS: usize = 4_000;
 /// A remote runtime behind a link that stopped answering leaves the fetch
 /// pending forever; without a bound the page keeps its loading hint up and the
 /// reader has no way back but to leave the session.
-const OPEN_TIMEOUT: Duration = Duration::from_secs(20);
+// Slightly longer than `RemoteTimeoutClass::Standard` (30s) so an in-flight
+// timeline download over a constrained Relay link finishes or reports the
+// transport's own timeout cleanly instead of being aborted mid-transfer.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(35);
 
 /// How long one folder in the project picker may take to list.
 ///
@@ -2607,11 +2610,13 @@ impl SessionService {
         {
             self.publish();
         }
+        // Queue the transcript read first so it does not sit behind metadata
+        // RPCs on the single Relay WebSocket stream.
+        self.reload(&session_id);
         self.refresh_runtime(&session_id);
         if !restored && self.token_usage.get_untracked().is_none() {
             self.refresh_token_usage(&session_id);
         }
-        self.reload(&session_id);
     }
 
     /// Clears the active session pointer and all session-scoped composer,
@@ -10742,6 +10747,7 @@ impl SessionService {
                     return;
                 }
                 let has_visible_items = !service.model.borrow().items.is_empty();
+                let retry_queued = service.reload_dirty.get();
                 match fetched {
                     Ok(Ok(Ok(outcome))) => {
                         let (items, has_older) = match &outcome {
@@ -10765,7 +10771,12 @@ impl SessionService {
                             error.code,
                             error.message
                         );
-                        if has_visible_items && pass_mode == TimelineReloadMode::Incremental {
+                        if retry_queued {
+                            if !has_visible_items {
+                                service.conversation.set(ConversationState::Loading);
+                            }
+                        } else if has_visible_items && pass_mode == TimelineReloadMode::Incremental
+                        {
                             service.conversation.set(ConversationState::Ready);
                         } else {
                             service
@@ -10774,7 +10785,7 @@ impl SessionService {
                         }
                     }
                     Ok(Err(_elapsed)) => {
-                        // A timeout here is the page's own 20s bound, not a
+                        // A timeout here is the page's own bound, not a
                         // transport error: log it with the mode so a stuck
                         // window is distinguishable from a broken link.
                         log::warn!(
@@ -10783,7 +10794,12 @@ impl SessionService {
                             pass_mode,
                             OPEN_TIMEOUT
                         );
-                        if has_visible_items && pass_mode == TimelineReloadMode::Incremental {
+                        if retry_queued {
+                            if !has_visible_items {
+                                service.conversation.set(ConversationState::Loading);
+                            }
+                        } else if has_visible_items && pass_mode == TimelineReloadMode::Incremental
+                        {
                             service.conversation.set(ConversationState::Ready);
                         } else {
                             service.conversation.set(ConversationState::Failed(
@@ -10797,7 +10813,12 @@ impl SessionService {
                         }
                     }
                     Err(error) => {
-                        if has_visible_items && pass_mode == TimelineReloadMode::Incremental {
+                        if retry_queued {
+                            if !has_visible_items {
+                                service.conversation.set(ConversationState::Loading);
+                            }
+                        } else if has_visible_items && pass_mode == TimelineReloadMode::Incremental
+                        {
                             service.conversation.set(ConversationState::Ready);
                         } else {
                             service.conversation.set(ConversationState::Failed(
