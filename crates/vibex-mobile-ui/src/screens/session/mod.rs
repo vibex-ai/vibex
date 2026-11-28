@@ -169,6 +169,10 @@ pub struct TurnFileChange {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct TimelineEntry {
     pub id: String,
+    /// Stable `virtual_list` cell identity when it should survive an optimistic
+    /// -> authoritative row ID handoff without tearing down and remounting the
+    /// cell. Falls back to `id` when `None`.
+    pub render_key: Option<String>,
     pub kind: EntryKind,
     /// A tool's name, the Agent's name, a row's heading.
     pub title: String,
@@ -2464,7 +2468,13 @@ fn timeline_view(
                                             indices
                                                 .iter()
                                                 .filter_map(|&index| {
-                                                    entries.get(index).map(|entry| entry.id.clone())
+                                                    entries.get(index).map(|entry| {
+                                                        entry
+                                                            .render_key
+                                                            .as_deref()
+                                                            .unwrap_or(entry.id.as_str())
+                                                            .to_owned()
+                                                    })
                                                 })
                                                 .collect::<Vec<_>>()
                                         })

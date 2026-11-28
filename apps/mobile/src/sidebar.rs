@@ -8,6 +8,8 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
+use nsh_core::storage::Storage;
+use serde::{Deserialize, Serialize};
 use vibex_core::{AgentSession, AgentSessionState, VibexSessionId, WorkspaceMode};
 use vibex_desktop_model::{
     SidebarHierarchyMode, SidebarOrganizationItem, SidebarOrganizationState,
@@ -21,6 +23,101 @@ use vibex_mobile_ui::{copy, theme};
 /// Folders may nest, but a runaway parent chain must not build an unbounded
 /// row list; the Desktop applies the same ceiling when it renders.
 const MAX_FOLDER_DEPTH: usize = 32;
+
+/// Storage key for per-host mobile-local sidebar collapse state.
+///
+/// Collapse/expand state on mobile is intentionally kept local instead of
+/// syncing with the Desktop left sidebar: syncing costs pairing traffic on
+/// every tap and makes expanding/collapsing rows laggy on slow links.
+const SIDEBAR_COLLAPSE_KEY: &str = "vibex.mobile.sidebar_collapse.v1";
+
+/// Per-host expand/collapse state owned locally by the mobile sidebar.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct LocalSidebarCollapseState {
+    #[serde(default)]
+    pub projects: BTreeSet<String>,
+    #[serde(default)]
+    pub workspaces: BTreeSet<String>,
+    #[serde(default)]
+    pub folders: BTreeSet<String>,
+    #[serde(default)]
+    pub groups: BTreeSet<String>,
+}
+
+impl LocalSidebarCollapseState {
+    /// Loads the saved local collapse state for `host_id` from device storage.
+    pub fn load_for_host(host_id: &str) -> Self {
+        Storage::get_item(SIDEBAR_COLLAPSE_KEY)
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, Self>>(&raw).ok())
+            .and_then(|mut map| map.remove(host_id))
+            .unwrap_or_default()
+    }
+
+    /// Saves this host's local collapse state to device storage, preserving
+    /// other paired hosts.
+    pub fn save_for_host(&self, host_id: &str) {
+        let mut map = Storage::get_item(SIDEBAR_COLLAPSE_KEY)
+            .and_then(|raw| serde_json::from_str::<BTreeMap<String, Self>>(&raw).ok())
+            .unwrap_or_default();
+        map.insert(host_id.to_owned(), self.clone());
+        if let Ok(text) = serde_json::to_string(&map) {
+            let _ = Storage::set_item(SIDEBAR_COLLAPSE_KEY, text);
+        }
+    }
+
+    /// Sets whether a collapsible row is collapsed locally. Returns `true`
+    /// when the stored set actually changed.
+    pub fn set_collapsed(&mut self, kind: SidebarRowKind, id: &str, collapsed: bool) -> bool {
+        let set = match kind {
+            SidebarRowKind::Project => &mut self.projects,
+            SidebarRowKind::Workspace => &mut self.workspaces,
+            SidebarRowKind::Folder => &mut self.folders,
+            SidebarRowKind::Group => &mut self.groups,
+            SidebarRowKind::EmptyWorkspace | SidebarRowKind::Session => return false,
+        };
+        if collapsed {
+            set.insert(id.to_owned())
+        } else {
+            set.remove(id)
+        }
+    }
+
+    /// Replaces `view`'s synced collapse sets with the mobile-local ones so
+    /// Desktop left-sidebar expand/collapse never overrides the phone's tree.
+    pub fn apply_to_view(&self, view: &mut SidebarOrganizationView) {
+        view.collapsed_project_ids = self.projects.clone();
+        view.collapsed_workspace_ids = self.workspaces.clone();
+        view.organization.collapsed_folder_ids = self.folders.clone();
+        view.organization.collapsed_group_ids = self.groups.clone();
+    }
+
+    /// Collapses all `project_ids` when any is currently expanded, or expands
+    /// all of them when every project is already collapsed. Returns `true`
+    /// when the stored state changed.
+    pub fn toggle_all_projects(&mut self, project_ids: &[String]) -> bool {
+        let collapse = project_ids.iter().any(|id| !self.projects.contains(id));
+        let mut changed = false;
+        for id in project_ids {
+            if collapse {
+                changed |= self.projects.insert(id.clone());
+            } else {
+                changed |= self.projects.remove(id);
+            }
+        }
+        changed
+    }
+
+    /// Expands every collapsed ancestor in `ancestors`. Returns `true` when
+    /// any ancestor was collapsed and changed.
+    pub fn expand_ancestors(&mut self, ancestors: &[(SidebarRowKind, String)]) -> bool {
+        let mut changed = false;
+        for (kind, id) in ancestors {
+            changed |= self.set_collapsed(*kind, id, false);
+        }
+        changed
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SidebarRowKind {
@@ -2500,5 +2597,78 @@ mod tests {
             row(SidebarRowKind::EmptyWorkspace, "empty", 1),
         ];
         assert_eq!(drop_target(&rows, 0, 1.5), None);
+    }
+
+    #[test]
+    fn local_collapse_state_overrides_desktop_snapshot_sets() {
+        let mut view = SidebarOrganizationView::default();
+        view.collapsed_project_ids.insert("proj-desktop".into());
+        view.collapsed_workspace_ids.insert("ws-desktop".into());
+        view.organization
+            .collapsed_folder_ids
+            .insert("folder-desktop".into());
+        view.organization
+            .collapsed_group_ids
+            .insert("group-desktop".into());
+
+        let mut local = LocalSidebarCollapseState::default();
+        assert!(local.set_collapsed(SidebarRowKind::Project, "proj-mobile", true));
+        assert!(!local.set_collapsed(SidebarRowKind::Project, "proj-mobile", true));
+        assert!(local.set_collapsed(SidebarRowKind::Workspace, "ws-mobile", true));
+        assert!(local.set_collapsed(SidebarRowKind::Folder, "folder-mobile", true));
+        assert!(local.set_collapsed(SidebarRowKind::Group, "group-mobile", true));
+        assert!(!local.set_collapsed(SidebarRowKind::Session, "sess-1", true));
+        assert!(!local.set_collapsed(SidebarRowKind::EmptyWorkspace, "empty-1", true));
+
+        local.apply_to_view(&mut view);
+        assert_eq!(
+            view.collapsed_project_ids,
+            BTreeSet::from(["proj-mobile".to_owned()])
+        );
+        assert_eq!(
+            view.collapsed_workspace_ids,
+            BTreeSet::from(["ws-mobile".to_owned()])
+        );
+        assert_eq!(
+            view.organization.collapsed_folder_ids,
+            BTreeSet::from(["folder-mobile".to_owned()])
+        );
+        assert_eq!(
+            view.organization.collapsed_group_ids,
+            BTreeSet::from(["group-mobile".to_owned()])
+        );
+    }
+
+    #[test]
+    fn local_collapse_state_toggles_all_projects_and_expands_ancestors() {
+        let mut local = LocalSidebarCollapseState::default();
+        let projects = vec!["p1".to_owned(), "p2".to_owned()];
+
+        assert!(local.toggle_all_projects(&projects));
+        assert_eq!(
+            local.projects,
+            BTreeSet::from(["p1".to_owned(), "p2".to_owned()])
+        );
+
+        assert!(local.toggle_all_projects(&projects));
+        assert!(local.projects.is_empty());
+
+        local.set_collapsed(SidebarRowKind::Project, "p1", true);
+        local.set_collapsed(SidebarRowKind::Workspace, "w1", true);
+        local.set_collapsed(SidebarRowKind::Folder, "f1", true);
+        local.set_collapsed(SidebarRowKind::Group, "g1", true);
+
+        let ancestors = vec![
+            (SidebarRowKind::Project, "p1".to_owned()),
+            (SidebarRowKind::Workspace, "w1".to_owned()),
+            (SidebarRowKind::Folder, "f1".to_owned()),
+            (SidebarRowKind::Group, "g1".to_owned()),
+        ];
+        assert!(local.expand_ancestors(&ancestors));
+        assert!(local.projects.is_empty());
+        assert!(local.workspaces.is_empty());
+        assert!(local.folders.is_empty());
+        assert!(local.groups.is_empty());
+        assert!(!local.expand_ancestors(&ancestors));
     }
 }

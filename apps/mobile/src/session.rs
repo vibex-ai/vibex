@@ -296,6 +296,7 @@ pub struct SessionService {
     sidebar_backend: Arc<dyn SidebarBackend>,
     sidebar_sync: Rc<futures_util::lock::Mutex<()>>,
     sidebar_snapshot: Rc<RefCell<RemoteSidebarOrganizationSnapshot>>,
+    sidebar_collapsed: Rc<RefCell<sidebar::LocalSidebarCollapseState>>,
     sidebar_view: Signal<SidebarOrganizationView>,
     sidebar_detailed: Signal<bool>,
     sidebar_mode_pending: Rc<Cell<Option<bool>>>,
@@ -435,6 +436,13 @@ pub struct SessionService {
     /// header over it, and the runtime's own rows replace it when they arrive.
     pending_turn: Signal<Option<PendingTurn>>,
     pending_turn_seq: Rc<Cell<u64>>,
+    /// Synthetic drawer row for a newly created session while `create_session`
+    /// is still in flight, so a background `reload_sessions` cannot drop it or
+    /// switch the active page away before the desktop answers.
+    pending_created_session: Rc<RefCell<Option<SessionSummary>>>,
+    /// Per-turn `virtual_list` render keys adopted from optimistic pending turns
+    /// for the active session, cleared when switching sessions.
+    adopted_turn_keys: Rc<RefCell<BTreeMap<String, AdoptedTurnKeys>>>,
     new_workspaces: Signal<Vec<WorkspaceChoice>>,
     new_runtime_options: Rc<RefCell<Vec<SessionRuntimeOption>>>,
     new_runtime_selection: Rc<RefCell<Option<SessionRuntimeSelection>>>,
@@ -658,6 +666,7 @@ impl SessionService {
         let runtime = bundle.host_label();
         let host_id = bundle.host_id().to_owned();
         let runtime_prefs = RuntimePreferences::load_for_host(&host_id);
+        let sidebar_collapsed = sidebar::LocalSidebarCollapseState::load_for_host(&host_id);
         let service = Self {
             bundle_host_id: Rc::new(host_id),
             web,
@@ -669,6 +678,7 @@ impl SessionService {
             sidebar_backend,
             sidebar_sync: Rc::new(futures_util::lock::Mutex::new(())),
             sidebar_snapshot: Rc::new(RefCell::new(Default::default())),
+            sidebar_collapsed: Rc::new(RefCell::new(sidebar_collapsed)),
             sidebar_view: signal(SidebarOrganizationView::default()),
             sidebar_detailed: signal(false),
             sidebar_mode_pending: Rc::new(Cell::new(None)),
@@ -791,6 +801,8 @@ impl SessionService {
             new_session_open: signal(false),
             pending_turn: signal(None),
             pending_turn_seq: Rc::new(Cell::new(0)),
+            pending_created_session: Rc::new(RefCell::new(None)),
+            adopted_turn_keys: Rc::new(RefCell::new(BTreeMap::new())),
             new_workspaces: signal(Vec::new()),
             new_runtime_options: Rc::new(RefCell::new(Vec::new())),
             new_runtime_selection: Rc::new(RefCell::new(None)),
@@ -2168,24 +2180,39 @@ impl SessionService {
                 };
                 self.reconcile_cached_sessions_from_listing(&sessions);
                 let pending = self.pending_turn.get_untracked();
+                let pending_created = self.pending_created_session.borrow().clone();
                 let mut rows = sessions
                     .iter()
-                    .map(|session| summary(session, &spaces))
+                    .map(|session| {
+                        let mut row = summary(session, &spaces);
+                        if let Some(pending) = pending.as_ref()
+                            && pending.session_id == session.id.as_str()
+                        {
+                            if session.title.trim().is_empty() && !pending.title.trim().is_empty() {
+                                row.title = pending.title.clone();
+                            }
+                            if !self
+                                .has_response_after(&pending.session_id, pending.baseline_sequence)
+                            {
+                                row.state = SessionState::Running;
+                            }
+                        }
+                        row
+                    })
                     .collect::<Vec<_>>();
-                if let Some(pending) = pending.as_ref()
-                    && !self.has_authoritative_turn_after(
-                        &pending.session_id,
-                        pending.baseline_sequence,
-                    )
-                    && let Some(row) = rows.iter_mut().find(|row| row.id == pending.session_id)
+                if let Some(created) = pending_created.as_ref()
+                    && !rows.iter().any(|row| row.id == created.id)
                 {
-                    row.state = SessionState::Running;
+                    rows.insert(0, created.clone());
                 }
                 let active_exists = self.active.get_untracked().is_some_and(|active| {
                     sessions.iter().any(|session| session.id.as_str() == active)
                         || pending
                             .as_ref()
                             .is_some_and(|pending| pending.session_id == active)
+                        || pending_created
+                            .as_ref()
+                            .is_some_and(|created| created.id == active)
                 });
                 self.sessions.set(rows);
                 {
@@ -2437,16 +2464,17 @@ impl SessionService {
                     session.state,
                     AgentSessionState::Running | AgentSessionState::Initializing
                 );
-                if !live_state
-                    && self.pending_turn.get_untracked().is_some_and(|pending| {
-                        pending.session_id == session.id.as_str()
-                            && !self.has_authoritative_turn_after(
-                                &pending.session_id,
-                                pending.baseline_sequence,
-                            )
-                    })
+                if let Some(pending) = self.pending_turn.get_untracked()
+                    && pending.session_id == session.id.as_str()
                 {
-                    row.state = SessionState::Running;
+                    if session.title.trim().is_empty() && !pending.title.trim().is_empty() {
+                        row.title = pending.title.clone();
+                    }
+                    if !live_state
+                        && !self.has_response_after(&pending.session_id, pending.baseline_sequence)
+                    {
+                        row.state = SessionState::Running;
+                    }
                 }
                 self.sessions.update(|sessions| {
                     if let Some(existing) =
@@ -2608,6 +2636,17 @@ impl SessionService {
 
     /// Opens `id`: its transcript replaces what is shown.
     fn open(&self, id: &str) {
+        self.open_session(id, true);
+    }
+
+    /// Switches the active session locally without firing immediate backend
+    /// fetches (used for an in-flight newly created session before `create_session`
+    /// completes or while its first prompt is about to be sent).
+    fn open_local_session(&self, id: &str) {
+        self.open_session(id, false);
+    }
+
+    fn open_session(&self, id: &str, fetch_from_backend: bool) {
         let Ok(session_id) = VibexSessionId::parse(id) else {
             self.fail(&BackendError::failed(
                 "session_id_invalid",
@@ -2699,6 +2738,21 @@ impl SessionService {
             self.open_session_terminal(&session_id);
             return;
         }
+        if !fetch_from_backend {
+            // Prime the empty model with `session_id` so live WS timeline events
+            // arriving right after `create_session` are applied immediately instead
+            // of being dropped while `model.session_id` is `None`.
+            self.model.borrow_mut().session_id = Some(session_id.clone());
+            self.conversation.set(ConversationState::Ready);
+            if self
+                .pending_turn
+                .get_untracked()
+                .is_some_and(|pending| pending.session_id == session_id.as_str())
+            {
+                self.publish();
+            }
+            return;
+        }
         let restored = self.restore_cached_session(&session_id);
         let has_cached_items = !self.model.borrow().items.is_empty();
         if has_cached_items {
@@ -2740,6 +2794,7 @@ impl SessionService {
             .set(self.row_detail_generation.get().wrapping_add(1));
         self.active_has_live_gap.set(false);
         *self.model.borrow_mut() = TimelineModel::default();
+        self.adopted_turn_keys.borrow_mut().clear();
         self.turn_disclosures.borrow_mut().clear();
         self.expanded_rows.borrow_mut().clear();
         self.row_details.borrow_mut().clear();
@@ -4218,6 +4273,17 @@ impl SessionService {
         mentions: Vec<VibexUseMention>,
         from_composer: bool,
     ) {
+        self.deliver_with_selection(text, attachments, mentions, from_composer, None);
+    }
+
+    fn deliver_with_selection(
+        &self,
+        text: String,
+        attachments: Vec<AttachmentItem>,
+        mentions: Vec<VibexUseMention>,
+        from_composer: bool,
+        selection_override: Option<SessionRuntimeSelection>,
+    ) {
         let Some(active) = self.active.get_untracked() else {
             return;
         };
@@ -4237,11 +4303,12 @@ impl SessionService {
         } else {
             self.existing_or_new_pending_turn(&session_id, &text, &attachments)
         };
-        let cached_selection = self
-            .runtime_state
-            .borrow()
-            .as_ref()
-            .map(|state| state.desired.clone());
+        let cached_selection = selection_override.or_else(|| {
+            self.runtime_state
+                .borrow()
+                .as_ref()
+                .map(|state| state.desired.clone())
+        });
         let after_sequence = {
             let model = self.model.borrow();
             if model.session_id.as_ref() == Some(&session_id)
@@ -4281,18 +4348,30 @@ impl SessionService {
                     after_sequence,
                 ))
                 .await;
+            if !service.alive.get() {
+                return;
+            }
             if service.active.get_untracked().as_deref() == Some(session_id.as_str()) {
                 service.sending.set(false);
             }
-            service.finish_pending_turn(pending_token);
             match result {
                 Ok(Ok(outcome)) => {
+                    // Apply the authoritative timeline BEFORE settling `pending_turn`
+                    // so `publish()` adopts the optimistic rows' render keys and keeps
+                    // the live working header steady until `SessionUpdated(Running)`
+                    // or an authoritative response arrives.
                     service.apply_timeline_outcome(&session_id, outcome);
+                    if !service.has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
+                    {
+                        service.finish_pending_turn(pending_token);
+                        service.publish();
+                    }
                     crate::settings::haptic(nsh_core::Haptic::Notification(
                         nsh_core::HapticNotification::Success,
                     ));
                 }
                 Ok(Err(error)) => {
+                    service.finish_pending_turn(pending_token);
                     if let Some((raw_draft, raw_attachments)) = composer_snapshot
                         && !service
                             .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
@@ -4307,6 +4386,7 @@ impl SessionService {
                     service.fail(&error);
                 }
                 Err(error) => {
+                    service.finish_pending_turn(pending_token);
                     if let Some((raw_draft, raw_attachments)) = composer_snapshot
                         && !service
                             .has_authoritative_turn_after(session_id.as_str(), baseline_sequence)
@@ -4409,12 +4489,21 @@ impl SessionService {
     }
 
     fn session_workspace_id(&self, session_id: &str) -> Option<WorkspaceId> {
-        self.session_records.with_untracked(|sessions| {
-            sessions
-                .iter()
-                .find(|session| session.id.as_str() == session_id)
-                .map(|session| session.workspace_id.clone())
-        })
+        self.session_records
+            .with_untracked(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == session_id)
+                    .map(|session| session.workspace_id.clone())
+            })
+            .or_else(|| {
+                self.sessions.with_untracked(|sessions| {
+                    sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .and_then(|session| WorkspaceId::parse(session.workspace_id.as_str()).ok())
+                })
+            })
     }
 
     fn current_workspace_id(&self) -> Option<WorkspaceId> {
@@ -5024,9 +5113,23 @@ impl SessionService {
         } else {
             state
         };
+        // While `pending_for_active` has not yet produced an authoritative row
+        // in `model.items`, mobile appends its own optimistic placeholder rows
+        // below. Avoid asking `conversation_turns_with_reasoning_mode` to
+        // synthesize a second placeholder turn above the optimistic user bubble
+        // (which would otherwise jump out of the transcript on handoff).
+        let show_optimistic_placeholder =
+            pending_for_active.is_some() && !pending_has_authoritative;
+        let turns_state = if show_optimistic_placeholder {
+            if model.items.is_empty() { None } else { state }
+        } else {
+            effective_state
+        };
+        let turns_pending_active =
+            !show_optimistic_placeholder && effective_state == Some(AgentSessionState::Running);
         let turns = model.conversation_turns_with_reasoning_mode(
-            effective_state,
-            effective_state == Some(AgentSessionState::Running),
+            turns_state,
+            turns_pending_active,
             ReasoningDisplayMode::LatestAtBottom,
         );
         let mut entries = Vec::new();
@@ -5041,15 +5144,49 @@ impl SessionService {
             .as_deref()
             .map(|active| self.session_agent_id(active))
             .unwrap_or_default();
+        if let Some(pending) = pending_for_active.as_ref()
+            && pending_has_authoritative
+        {
+            let matched_turn = turns
+                .iter()
+                .find(|turn| {
+                    turn.user_row.as_ref().is_some_and(|row| {
+                        pending
+                            .baseline_sequence
+                            .is_none_or(|baseline| row.last_sequence > baseline)
+                    })
+                })
+                .or_else(|| turns.last());
+            if let Some(turn) = matched_turn {
+                self.adopted_turn_keys
+                    .borrow_mut()
+                    .entry(turn.id.clone())
+                    .or_insert_with(|| AdoptedTurnKeys {
+                        user_key: format!("pending-turn:{}:{}", pending.session_id, pending.token),
+                        header_key: format!(
+                            "pending-header:{}:{}",
+                            pending.session_id, pending.token
+                        ),
+                        live_key: format!("pending-live:{}:{}", pending.session_id, pending.token),
+                        started_at_ms: pending.started_at_ms,
+                    });
+            }
+        }
+        let adopted_keys = self.adopted_turn_keys.borrow();
         let disclosures = self.turn_disclosures.borrow();
         for turn in &turns {
+            let adopted = adopted_keys.get(&turn.id);
             let finished = activity::turn_finished(turn);
             let answered = turn
                 .conclusion_row
                 .as_ref()
                 .is_some_and(|row| !row.body.trim().is_empty());
             if let Some(row) = turn.user_row.as_ref() {
-                entries.push(self.entry_from_row(row, turn, &model.items));
+                let mut user = self.entry_from_row(row, turn, &model.items);
+                if let Some(adopted) = adopted {
+                    user.render_key = Some(adopted.user_key.clone());
+                }
+                entries.push(user);
             }
             let mut parent = None;
             let has_visible_process_rows = turn
@@ -5065,6 +5202,12 @@ impl SessionService {
                         .map_or("", |pending| pending.agent_id.as_str())
                 };
                 let mut header = process_header(turn, header_agent);
+                if let Some(adopted) = adopted {
+                    header.render_key = Some(adopted.header_key.clone());
+                    if !finished {
+                        header.started_at_ms = adopted.started_at_ms;
+                    }
+                }
                 // A finished turn's work folds, whether or not it ended on a
                 // written conclusion: the desktop's rule is the same one, and
                 // its header carries the chevron for a turn that simply
@@ -5153,7 +5296,11 @@ impl SessionService {
                         ..TimelineEntry::default()
                     });
                 } else if self.show_generation_status.get_untracked() {
-                    entries.push(live_turn_entry(turn));
+                    let mut live = live_turn_entry(turn);
+                    if let Some(adopted) = adopted {
+                        live.render_key = Some(adopted.live_key.clone());
+                    }
+                    entries.push(live);
                 }
             }
             if !files.is_empty() {
@@ -5165,6 +5312,7 @@ impl SessionService {
             }
         }
         drop(disclosures);
+        drop(adopted_keys);
         // The reader's own turn while the runtime has not yet emitted its
         // authoritative rows (for both a newly created session and a follow-up
         // message in an existing one): render their bubble, the working header,
@@ -5234,7 +5382,9 @@ impl SessionService {
             })
             .unwrap_or(0);
         drop(model);
-        self.timeline.set(entries);
+        if self.timeline.with_untracked(|current| *current != entries) {
+            self.timeline.set(entries);
+        }
         // The runtime's rows have arrived, so the placeholder turn steps aside.
         // It is dropped after the real ones are in place, never before: the
         // page must not be empty in between.
@@ -5296,6 +5446,7 @@ impl SessionService {
             });
         TimelineEntry {
             id: row.id.clone(),
+            render_key: None,
             kind,
             title: shared.as_ref().map_or_else(
                 || row.title.clone(),
@@ -6350,7 +6501,7 @@ impl SessionService {
                 }
             };
             let request = CreateAgentSessionRequest {
-                runtime: selection,
+                runtime: selection.clone(),
                 workspace_root: worktree.workspace.root_path,
                 workspace_mode: worktree.workspace.mode,
                 title: draft.title.clone(),
@@ -6369,7 +6520,7 @@ impl SessionService {
             service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
-                    service.finish_new_session(session, draft);
+                    service.finish_new_session(session, draft, Some(selection));
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -6647,6 +6798,7 @@ impl SessionService {
             return;
         }
         let mut view = SidebarOrganizationView::from_remote(&snapshot);
+        self.sidebar_collapsed.borrow().apply_to_view(&mut view);
         let detailed = self
             .sidebar_mode_pending
             .get()
@@ -6728,6 +6880,7 @@ impl SessionService {
                     .push(placement.item.id.clone());
             }
         }
+        let local_collapsed = self.sidebar_collapsed.borrow();
         for folder in &snapshot.folders {
             sections.push(SidebarSectionView {
                 kind: SidebarSectionKind::Folder,
@@ -6737,7 +6890,7 @@ impl SessionService {
                 workspace_id: folder.workspace_id.clone(),
                 parent_id: folder_parents.get(&folder.id).cloned(),
                 depth: folder_depth(&folder.id),
-                collapsed: snapshot.collapsed_folder_ids.contains(&folder.id),
+                collapsed: local_collapsed.folders.contains(&folder.id),
                 name: folder.name.clone(),
                 session_ids: folder_members.remove(&folder.id).unwrap_or_default(),
                 auto_archive_after_days: folder.auto_archive_after_days,
@@ -6753,13 +6906,14 @@ impl SessionService {
                 workspace_id: Some(group.workspace_id.clone()),
                 parent_id: folder_parents.get(&group.id).cloned(),
                 depth: 0,
-                collapsed: snapshot.collapsed_group_ids.contains(&group.id),
+                collapsed: local_collapsed.groups.contains(&group.id),
                 name: group.name.clone(),
                 session_ids: group.member_session_ids.clone(),
                 auto_archive_after_days: None,
                 auto_continue: group_auto_continue.get(&group.id).copied().unwrap_or(false),
             });
         }
+        drop(local_collapsed);
         self.sidebar_sections.set(sections);
         *self.sidebar_snapshot.borrow_mut() = snapshot;
         self.sync_queue();
@@ -6777,14 +6931,20 @@ impl SessionService {
         session_id: &VibexSessionId,
         workspace: &WorkspaceSummary,
         title: &str,
+        agent_id: &str,
+        running: bool,
     ) {
         let id = session_id.as_str().to_owned();
         let row = SessionSummary {
             id: id.clone(),
             title: title.to_owned(),
-            agent: String::new(),
+            agent: agent_id.to_owned(),
             meta: age(unix_timestamp_ms()),
-            state: SessionState::Running,
+            state: if running {
+                SessionState::Running
+            } else {
+                SessionState::Idle
+            },
             terminal: false,
             project_id: workspace.project.id.as_str().to_owned(),
             project_name: workspace.project.name.clone(),
@@ -6795,6 +6955,7 @@ impl SessionService {
                 .filter(|branch| !branch.trim().is_empty())
                 .unwrap_or_default(),
         };
+        *self.pending_created_session.borrow_mut() = Some(row.clone());
         self.sessions.update(|sessions| {
             if let Some(existing) = sessions.iter_mut().find(|existing| existing.id == id) {
                 *existing = row;
@@ -6802,6 +6963,29 @@ impl SessionService {
                 sessions.insert(0, row);
             }
         });
+    }
+
+    fn clear_pending_created_session(&self, session_id: &str) {
+        let mut pending = self.pending_created_session.borrow_mut();
+        if pending
+            .as_ref()
+            .is_some_and(|created| created.id == session_id)
+        {
+            pending.take();
+        }
+        drop(pending);
+        self.sessions
+            .update(|sessions| sessions.retain(|row| row.id != session_id));
+        if self.active.get_untracked().as_deref() == Some(session_id) {
+            let fallback = self
+                .session_records
+                .with_untracked(|records| records.first().map(|s| s.id.as_str().to_owned()));
+            if let Some(fallback) = fallback {
+                self.open(&fallback);
+            } else {
+                self.clear_active_session();
+            }
+        }
     }
 
     fn record_sidebar_session(&self, session: &AgentSession) {
@@ -6831,10 +7015,7 @@ impl SessionService {
             on_toggle_row: {
                 let service = self.clone();
                 Rc::new(move |row| {
-                    if let Some(operation) = collapse_sidebar_row(row.kind, &row.id, !row.collapsed)
-                    {
-                        service.sidebar_mutation(operation);
-                    }
+                    service.set_sidebar_row_collapsed(row.kind, &row.id, !row.collapsed);
                 })
             },
             on_reveal_active: {
@@ -7059,27 +7240,54 @@ impl SessionService {
         })
     }
 
+    fn sync_local_sidebar_collapse(&self) {
+        let local = self.sidebar_collapsed.borrow();
+        self.sidebar_view.update(|view| local.apply_to_view(view));
+        self.sidebar_sections.update(|sections| {
+            for section in sections.iter_mut() {
+                section.collapsed = match section.kind {
+                    SidebarSectionKind::Folder => local.folders.contains(&section.id),
+                    SidebarSectionKind::Group => local.groups.contains(&section.id),
+                };
+            }
+        });
+    }
+
+    fn set_sidebar_row_collapsed(&self, kind: SidebarRowKind, id: &str, collapsed: bool) {
+        let Some(local_kind) = local_sidebar_kind(kind) else {
+            return;
+        };
+        let changed = self
+            .sidebar_collapsed
+            .borrow_mut()
+            .set_collapsed(local_kind, id, collapsed);
+        if changed {
+            self.sidebar_collapsed
+                .borrow()
+                .save_for_host(&self.bundle_host_id);
+            self.sync_local_sidebar_collapse();
+        }
+    }
+
     fn collapse_sidebar_projects(&self) {
-        let projects = self.workspace_records.with(|workspaces| {
-            self.session_records
-                .with(|sessions| sidebar::projects(workspaces, sessions))
+        let project_ids = self.workspace_records.with(|workspaces| {
+            self.session_records.with(|sessions| {
+                sidebar::projects(workspaces, sessions)
+                    .into_iter()
+                    .map(|project| project.id)
+                    .collect::<Vec<_>>()
+            })
         });
-        let operations = self.sidebar_view.with(|view| {
-            let collapsed = projects
-                .iter()
-                .any(|project| !view.collapsed_project_ids.contains(&project.id));
-            projects
-                .into_iter()
-                .filter(|project| view.collapsed_project_ids.contains(&project.id) != collapsed)
-                .map(
-                    |project| RemoteSidebarOrganizationMutation::SetProjectCollapsed {
-                        project_id: project.id,
-                        collapsed,
-                    },
-                )
-                .collect::<Vec<_>>()
-        });
-        self.sidebar_mutations(operations);
+        let changed = self
+            .sidebar_collapsed
+            .borrow_mut()
+            .toggle_all_projects(&project_ids);
+        if changed {
+            self.sidebar_collapsed
+                .borrow()
+                .save_for_host(&self.bundle_host_id);
+            self.sync_local_sidebar_collapse();
+        }
     }
 
     fn reveal_sidebar_session(&self) {
@@ -7100,27 +7308,24 @@ impl SessionService {
             return;
         };
         let mut depth = rows[index].depth;
-        let mut operations = Vec::new();
+        let mut ancestors = Vec::new();
         for row in rows[..index].iter().rev() {
             if row.depth >= depth {
                 continue;
             }
             depth = row.depth;
-            let id = row.id();
-            let kind = sidebar_kind(row.kind);
-            let collapsed = match kind {
-                SidebarRowKind::Project => view.collapsed_project_ids.contains(id),
-                SidebarRowKind::Workspace => view.collapsed_workspace_ids.contains(id),
-                SidebarRowKind::Folder => view.organization.collapsed_folder_ids.contains(id),
-                SidebarRowKind::Group => view.organization.collapsed_group_ids.contains(id),
-                _ => false,
-            };
-            if collapsed && let Some(operation) = collapse_sidebar_row(kind, id, false) {
-                operations.push(operation);
-            }
+            ancestors.push((row.kind, row.id().to_owned()));
         }
-        operations.reverse();
-        self.sidebar_mutations(operations);
+        let changed = self
+            .sidebar_collapsed
+            .borrow_mut()
+            .expand_ancestors(&ancestors);
+        if changed {
+            self.sidebar_collapsed
+                .borrow()
+                .save_for_host(&self.bundle_host_id);
+            self.sync_local_sidebar_collapse();
+        }
     }
 
     fn move_sidebar_row(&self, moved: &SidebarRowView, delta: f32) {
@@ -7253,28 +7458,6 @@ impl SessionService {
             position,
             project_id: row.project_id.clone(),
         });
-    }
-
-    fn sidebar_mutations(&self, mut operations: Vec<RemoteSidebarOrganizationMutation>) {
-        operations.reverse();
-        self.next_sidebar_mutation(Rc::new(RefCell::new(operations)));
-    }
-
-    fn next_sidebar_mutation(
-        &self,
-        remaining: Rc<RefCell<Vec<RemoteSidebarOrganizationMutation>>>,
-    ) {
-        let operation = remaining.borrow_mut().pop();
-        if let Some(operation) = operation {
-            let service = self.clone();
-            self.sidebar_mutation_attempt(
-                operation,
-                1,
-                Some(Rc::new(move || {
-                    service.next_sidebar_mutation(remaining.clone())
-                })),
-            );
-        }
     }
 
     fn persist_pins(&self) {
@@ -7776,7 +7959,7 @@ impl SessionService {
         // the session would never be made at all.
         detach(async move {
             let request = CreateAgentSessionRequest {
-                runtime: selection,
+                runtime: selection.clone(),
                 workspace_root: workspace.workspace.root_path.clone(),
                 workspace_mode: workspace.workspace.mode,
                 title: draft.title.clone(),
@@ -7792,7 +7975,7 @@ impl SessionService {
             service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
-                    service.finish_new_session(session, draft);
+                    service.finish_new_session(session, draft, Some(selection));
                 }
                 Ok(Err(error)) => {
                     // Nothing was made, so nothing may keep showing a turn the
@@ -7800,6 +7983,7 @@ impl SessionService {
                     if let Some(token) = pending_token {
                         service.finish_pending_turn(token);
                     }
+                    service.clear_pending_created_session(session_id.as_str());
                     if service.new_prompt.get_untracked().trim().is_empty()
                         && !raw_new_prompt.trim().is_empty()
                     {
@@ -7817,6 +8001,7 @@ impl SessionService {
                     if let Some(token) = pending_token {
                         service.finish_pending_turn(token);
                     }
+                    service.clear_pending_created_session(session_id.as_str());
                     if service.new_prompt.get_untracked().trim().is_empty()
                         && !raw_new_prompt.trim().is_empty()
                     {
@@ -7850,6 +8035,17 @@ impl SessionService {
         self.model.borrow().items.iter().any(|item| {
             item.session_id.as_str() == session_id
                 && baseline_sequence.is_none_or(|baseline| item.sequence > baseline)
+        })
+    }
+
+    fn has_response_after(&self, session_id: &str, baseline_sequence: Option<i64>) -> bool {
+        self.model.borrow().items.iter().any(|item| {
+            item.session_id.as_str() == session_id
+                && baseline_sequence.is_none_or(|baseline| item.sequence > baseline)
+                && matches!(
+                    item.payload,
+                    TimelinePayload::AgentMessage(_) | TimelinePayload::Error(_)
+                )
         })
     }
 
@@ -8026,6 +8222,8 @@ impl SessionService {
             .clone()
             .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.trim().to_owned()))
             .unwrap_or_else(|| copy::text("New session", "新建会话", "新增工作階段").to_owned());
+        let has_prompt =
+            draft.command.is_some() || !draft.text.is_empty() || !draft.attachments.is_empty();
         self.new_runtime_open.set(false);
         self.new_session_open.set(false);
         self.new_session_folder.set(None);
@@ -8037,8 +8235,14 @@ impl SessionService {
         self.reset_palettes();
         // A row of its own in the drawer, so the session the reader is on is
         // where they expect it, under the words they just wrote.
-        self.record_pending_session(session_id, workspace, &title);
-        let token = (!draft.text.is_empty() || !draft.attachments.is_empty()).then(|| {
+        self.record_pending_session(
+            session_id,
+            workspace,
+            &title,
+            selection.agent_id.as_str(),
+            has_prompt,
+        );
+        let token = has_prompt.then(|| {
             let token = self.next_pending_turn_token();
             self.pending_turn.set(Some(PendingTurn {
                 token,
@@ -8053,13 +8257,14 @@ impl SessionService {
             }));
             token
         });
-        self.open(session_id.as_str());
+        // Open locally without firing premature backend reads: the session does
+        // not exist on the desktop until `create_session` resolves, so fetching
+        // now would only race a failing reload against the optimistic view.
+        self.open_local_session(session_id.as_str());
         // Seed the composer chip with the selection just submitted so it does
         // not sit on the "Model" placeholder while the runtime creates the session.
         let options = self.new_runtime_options.borrow().clone();
         self.rebuild_runtime_summary(selection, &options);
-        // `open` clears the transcript and reads nothing back yet, so the
-        // placeholder turn is what puts the reader's own message on the page.
         self.publish();
         token
     }
@@ -8075,20 +8280,42 @@ impl SessionService {
             attachments: self.new_attachments.get_untracked(),
             command,
             mentions,
+            folder: self.new_session_folder.get_untracked(),
         }
     }
 
-    fn finish_new_session(&self, session: AgentSession, draft: NewSessionDraft) {
+    fn finish_new_session(
+        &self,
+        session: AgentSession,
+        draft: NewSessionDraft,
+        selection: Option<SessionRuntimeSelection>,
+    ) {
         if !self.alive.get() {
             return;
         }
+        {
+            let mut pending = self.pending_created_session.borrow_mut();
+            if pending
+                .as_ref()
+                .is_some_and(|created| created.id == session.id.as_str())
+            {
+                pending.take();
+            }
+        }
         self.new_session_open.set(false);
         self.record_sidebar_session(&session);
-        if let Some(folder) = self.new_session_folder.get_untracked()
+        self.session_states
+            .borrow_mut()
+            .entry(session.id.as_str().to_owned())
+            .or_insert(session.state);
+        let has_prompt =
+            draft.command.is_some() || !draft.text.is_empty() || !draft.attachments.is_empty();
+        let already_active = self.active.get_untracked().as_deref() == Some(session.id.as_str());
+        if let Some(folder) = draft.folder.as_ref()
             && self.sidebar_sections.with(|sections| {
                 sections.iter().any(|section| {
                     section.kind == SidebarSectionKind::Folder
-                        && section.id == folder
+                        && &section.id == folder
                         && section
                             .project_id
                             .as_deref()
@@ -8107,32 +8334,105 @@ impl SessionService {
                 }],
                 anchor: Some(vibex_core::RemoteSidebarItemRef {
                     kind: RemoteSidebarItemKind::Folder,
-                    id: folder,
+                    id: folder.clone(),
                 }),
                 position: vibex_core::RemoteSidebarDropPosition::Into,
                 project_id: Some(session.project_id.as_str().to_owned()),
             });
         }
         self.new_session_folder.set(None);
-        self.refresh();
-        // The placeholder turn stays up through the handover. `open` clears the
-        // transcript, and the message it carries is only on its way: dropping
-        // it here would leave the page blank at the exact moment the reader is
-        // watching for their words to appear.
-        self.pending_turn.update(|pending| {
-            if let Some(pending) = pending.as_mut() {
-                pending.session_id = session.id.as_str().to_owned();
-                pending.agent_id = session.agent_id.as_str().to_owned();
-            }
-        });
         self.new_armed_command.borrow_mut().take();
         self.new_armed_mentions.borrow_mut().clear();
-        self.open(session.id.as_str());
-        self.publish();
+
+        // Keep or seed the placeholder turn through the handover so the
+        // transcript never blanks or remounts while the first message is sent.
+        let pending_title = draft
+            .title
+            .clone()
+            .or_else(|| (!draft.text.trim().is_empty()).then(|| draft.text.trim().to_owned()))
+            .unwrap_or_else(|| copy::text("New session", "新建会话", "新增工作階段").to_owned());
+        let has_matching_pending = self
+            .pending_turn
+            .get_untracked()
+            .is_some_and(|pending| pending.session_id == session.id.as_str());
+        if has_matching_pending {
+            self.pending_turn.update(|pending| {
+                if let Some(pending) = pending.as_mut() {
+                    pending.session_id = session.id.as_str().to_owned();
+                    pending.agent_id = session.agent_id.as_str().to_owned();
+                }
+            });
+        } else if has_prompt {
+            let token = self.next_pending_turn_token();
+            self.pending_turn.set(Some(PendingTurn {
+                token,
+                session_id: session.id.as_str().to_owned(),
+                text: draft.text.clone(),
+                attachments: draft.attachments.clone(),
+                title: pending_title.clone(),
+                agent_id: session.agent_id.as_str().to_owned(),
+                baseline_sequence: None,
+                previous_state: None,
+                started_at_ms: unix_timestamp_ms(),
+            }));
+        }
+
+        // Update the drawer/header summary in place, keeping the reader's prompt
+        // title until the runtime generates one and keeping the row running while
+        // the first turn is still being dispatched.
+        let mut row = self
+            .workspace_records
+            .with(|workspaces| summary(&session, workspaces));
+        if session.title.trim().is_empty() && !pending_title.trim().is_empty() {
+            row.title = pending_title;
+        }
+        if has_prompt {
+            row.state = SessionState::Running;
+        }
+        self.sessions.update(|sessions| {
+            if let Some(existing) = sessions.iter_mut().find(|existing| existing.id == row.id) {
+                *existing = row;
+            } else {
+                sessions.insert(0, row);
+            }
+        });
+
+        // If `begin_pending_turn` already opened this exact session id, stay in
+        // place: calling `open()` here would clear `timeline` and `runtime_summary`
+        // and fire a racing empty `reload()`, causing a visible flash/jump.
+        if already_active {
+            self.conversation.set(ConversationState::Ready);
+            if self.runtime_summary.get_untracked().is_none()
+                && let Some(selection) = selection.as_ref()
+            {
+                let options = self.new_runtime_options.borrow().clone();
+                self.rebuild_runtime_summary(selection, &options);
+            }
+            self.refresh_runtime(&session.id);
+            self.refresh();
+            self.publish();
+        } else {
+            self.open_local_session(session.id.as_str());
+            if let Some(selection) = selection.as_ref() {
+                let options = self.new_runtime_options.borrow().clone();
+                self.rebuild_runtime_summary(selection, &options);
+            }
+            self.refresh_runtime(&session.id);
+            self.refresh();
+            if !has_prompt {
+                self.reload(&session.id);
+            }
+        }
         if let Some(command) = draft.command {
             self.execute_command(command, draft.text, draft.attachments, false);
         } else if !draft.text.is_empty() || !draft.attachments.is_empty() {
-            self.deliver(draft.text, draft.attachments, draft.mentions, false);
+            self.deliver_with_selection(
+                draft.text,
+                draft.attachments,
+                draft.mentions,
+                false,
+                selection,
+            );
         }
     }
 
@@ -8148,7 +8448,7 @@ impl SessionService {
         if !self.has_authoritative_turn_after(&pending.session_id, pending.baseline_sequence) {
             return;
         }
-        let live_state = self
+        let settled_state = self
             .session_states
             .borrow()
             .get(&pending.session_id)
@@ -8156,20 +8456,15 @@ impl SessionService {
             .is_some_and(|state| {
                 matches!(
                     state,
-                    AgentSessionState::Running | AgentSessionState::Initializing
+                    AgentSessionState::Running
+                        | AgentSessionState::Initializing
+                        | AgentSessionState::NeedsInput
+                        | AgentSessionState::Error
+                        | AgentSessionState::Closed
                 )
             });
-        let has_response = self.model.borrow().items.iter().any(|item| {
-            item.session_id.as_str() == pending.session_id
-                && pending
-                    .baseline_sequence
-                    .is_none_or(|baseline| item.sequence > baseline)
-                && matches!(
-                    item.payload,
-                    TimelinePayload::AgentMessage(_) | TimelinePayload::Error(_)
-                )
-        });
-        if live_state || has_response {
+        let has_response = self.has_response_after(&pending.session_id, pending.baseline_sequence);
+        if settled_state || has_response {
             self.pending_turn.set(None);
         }
     }
@@ -8341,7 +8636,7 @@ impl SessionService {
                 }
             };
             let request = CreateAgentSessionRequest {
-                runtime: selection,
+                runtime: selection.clone(),
                 workspace_root: root,
                 workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
                 title: draft.title.clone(),
@@ -8357,7 +8652,7 @@ impl SessionService {
             service.refresh_new_busy();
             match result {
                 Ok(Ok(session)) => {
-                    service.finish_new_session(session, draft);
+                    service.finish_new_session(session, draft, Some(selection));
                 }
                 Ok(Err(error)) => service.new_error.set(Some(error_text(&error))),
                 Err(error) => service.new_error.set(Some(
@@ -11953,30 +12248,13 @@ fn sidebar_kind(kind: sidebar::SidebarRowKind) -> SidebarRowKind {
     }
 }
 
-fn collapse_sidebar_row(
-    kind: SidebarRowKind,
-    id: &str,
-    collapsed: bool,
-) -> Option<RemoteSidebarOrganizationMutation> {
-    let id = id.to_owned();
+fn local_sidebar_kind(kind: SidebarRowKind) -> Option<sidebar::SidebarRowKind> {
     Some(match kind {
-        SidebarRowKind::Project => RemoteSidebarOrganizationMutation::SetProjectCollapsed {
-            project_id: id,
-            collapsed,
-        },
-        SidebarRowKind::Workspace => RemoteSidebarOrganizationMutation::SetWorkspaceCollapsed {
-            workspace_id: id,
-            collapsed,
-        },
-        SidebarRowKind::Folder => RemoteSidebarOrganizationMutation::SetFolderCollapsed {
-            folder_id: id,
-            collapsed,
-        },
-        SidebarRowKind::Group => RemoteSidebarOrganizationMutation::SetGroupCollapsed {
-            group_id: id,
-            collapsed,
-        },
-        _ => return None,
+        SidebarRowKind::Project => sidebar::SidebarRowKind::Project,
+        SidebarRowKind::Workspace => sidebar::SidebarRowKind::Workspace,
+        SidebarRowKind::Folder => sidebar::SidebarRowKind::Folder,
+        SidebarRowKind::Group => sidebar::SidebarRowKind::Group,
+        SidebarRowKind::EmptyWorkspace | SidebarRowKind::Session => return None,
     })
 }
 
@@ -12117,6 +12395,17 @@ struct NewSessionDraft {
     attachments: Vec<AttachmentItem>,
     command: Option<AgentCommandEntry>,
     mentions: Vec<VibexUseMention>,
+    folder: Option<String>,
+}
+
+/// Stable `virtual_list` render keys adopted from a `PendingTurn` when the
+/// runtime's authoritative turn replaces the optimistic placeholder rows.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct AdoptedTurnKeys {
+    user_key: String,
+    header_key: String,
+    live_key: String,
+    started_at_ms: i64,
 }
 
 /// A turn the page draws before the runtime has answered for it.
@@ -14215,6 +14504,425 @@ mod optimistic_send_tests {
         let config = EngineConfig::new(Root::of::<OptimisticSendFlowProbe>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("optimistic-send-ok").unwrap();
+    }
+
+    fn render_keys(entries: &[TimelineEntry]) -> Vec<String> {
+        entries
+            .iter()
+            .map(|entry| {
+                entry
+                    .render_key
+                    .as_deref()
+                    .unwrap_or(entry.id.as_str())
+                    .to_owned()
+            })
+            .collect()
+    }
+
+    #[component]
+    fn NewSessionOptimisticHandoffProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let project_id = ProjectId::new();
+        let workspace_id = WorkspaceId::new();
+        let workspace = WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: project_id.clone(),
+                name: "vibex".to_owned(),
+                root_path: "/work".to_owned(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: workspace_id.clone(),
+                project_id: project_id.clone(),
+                root_path: "/work".to_owned(),
+                mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            },
+            git_branch: Some("main".to_owned()),
+        };
+        service.workspace_records.set(vec![workspace.clone()]);
+
+        let selection = SessionRuntimeSelection {
+            agent_id: AgentId::parse("codex").unwrap(),
+            auth_source: vibex_core::RuntimeAuthSource::ProviderProfile {
+                provider_profile_id: vibex_core::ProviderProfileId::new(),
+            },
+            model: vibex_core::RuntimeModelSelection::Explicit {
+                model_id: "gpt-5.4".to_owned(),
+            },
+            reasoning_effort: None,
+            mode_id: None,
+            config_values: BTreeMap::new(),
+        };
+        *service.new_runtime_options.borrow_mut() = vec![vibex_core::SessionRuntimeOption {
+            selection: selection.clone(),
+            agent_label: "Codex".to_owned(),
+            auth_source_label: "Default".to_owned(),
+            model_label: "GPT-5.4".to_owned(),
+            availability: vibex_core::RuntimeOptionAvailability::Available,
+            member_count: 1,
+            auto_routes: false,
+            reasoning_efforts: Vec::new(),
+            modes: Vec::new(),
+            features: Vec::new(),
+        }];
+
+        let session_id = VibexSessionId::new();
+        let draft = NewSessionDraft {
+            title: None,
+            text: "Inspect build".to_owned(),
+            attachments: Vec::new(),
+            command: None,
+            mentions: Vec::new(),
+            folder: None,
+        };
+
+        let token = service.begin_pending_turn(&session_id, &workspace, &draft, &selection);
+        assert!(token.is_some());
+        assert_eq!(
+            service.active.get_untracked().as_deref(),
+            Some(session_id.as_str())
+        );
+        assert_eq!(
+            service.conversation.get_untracked(),
+            ConversationState::Ready
+        );
+        assert!(service.runtime_summary.get_untracked().is_some());
+
+        let optimistic_entries = service.timeline.get_untracked();
+        assert_eq!(optimistic_entries.len(), 3);
+        let initial_keys = render_keys(&optimistic_entries);
+        let initial_started_at_ms = optimistic_entries[1].started_at_ms;
+
+        // Track that the timeline never transiently clears during handoff.
+        let saw_empty_timeline = Rc::new(Cell::new(false));
+        {
+            let timeline = service.timeline;
+            let saw_empty = saw_empty_timeline.clone();
+            effect(move || {
+                if timeline.with(Vec::is_empty) {
+                    saw_empty.set(true);
+                }
+            });
+        }
+
+        // Desktop broadcasts SessionUpdated(Idle) with empty title on create.
+        let mut created = AgentSession {
+            id: session_id.clone(),
+            project_id,
+            workspace_id,
+            agent_id: AgentId::parse("codex").unwrap(),
+            title: String::new(),
+            state: AgentSessionState::Idle,
+            safety: vibex_core::AgentSessionSafety::workspace_write_ask_on_risk(),
+            workspace_root: "/work".to_owned(),
+            workspace_mode: vibex_core::WorkspaceMode::CurrentCheckout,
+            created_at_ms: initial_started_at_ms + 50_000,
+            updated_at_ms: initial_started_at_ms + 50_000,
+            last_message_at_ms: initial_started_at_ms + 50_000,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: Default::default(),
+            terminal: None,
+        };
+        service.apply_event(BackendEvent::SessionUpdated(created.clone()));
+        assert_eq!(
+            service.sessions.with_untracked(|rows| {
+                rows.iter()
+                    .find(|row| row.id == session_id.as_str())
+                    .map(|row| (row.title.clone(), row.state))
+            }),
+            Some(("Inspect build".to_owned(), SessionState::Running))
+        );
+
+        // `finish_new_session` must hand off in place without clearing timeline
+        // or runtime_summary or changing any virtual_list key.
+        service.finish_new_session(created.clone(), draft, Some(selection));
+        assert!(!saw_empty_timeline.get());
+        assert_eq!(
+            service.conversation.get_untracked(),
+            ConversationState::Ready
+        );
+        assert!(service.runtime_summary.get_untracked().is_some());
+        assert_eq!(render_keys(&service.timeline.get_untracked()), initial_keys);
+
+        // Authoritative UserMessage arrives (with simulated desktop clock skew):
+        // IDs become authoritative, while virtual_list render keys and live
+        // ProcessHeader start time stay identical.
+        let user_item = make_timeline_item(
+            &session_id,
+            1,
+            initial_started_at_ms + 50_000,
+            vibex_core::TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "Inspect build".to_owned(),
+                ..UserMessagePayload::default()
+            }),
+        );
+        service.apply_event(BackendEvent::Timeline(vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 1,
+            item: user_item,
+        }));
+        let handed_off = service.timeline.get_untracked();
+        assert!(!saw_empty_timeline.get());
+        assert_eq!(handed_off.len(), 3);
+        assert!(
+            handed_off
+                .iter()
+                .all(|entry| !entry.id.starts_with("pending-"))
+        );
+        assert_eq!(render_keys(&handed_off), initial_keys);
+        assert_eq!(handed_off[1].kind, EntryKind::ProcessHeader);
+        assert_eq!(handed_off[1].started_at_ms, initial_started_at_ms);
+        assert!(!handed_off[1].complete);
+        assert_eq!(handed_off[2].kind, EntryKind::Generating);
+
+        // SessionUpdated(Running) settles pending_turn while keeping render keys.
+        created.state = AgentSessionState::Running;
+        service.apply_event(BackendEvent::SessionUpdated(created.clone()));
+        assert!(service.pending_turn.get_untracked().is_none());
+        assert_eq!(render_keys(&service.timeline.get_untracked()), initial_keys);
+
+        // Process step + final answer arrive and turn completes cleanly while
+        // preserving the adopted User and ProcessHeader render keys.
+        let tool_item = make_timeline_item(
+            &session_id,
+            2,
+            initial_started_at_ms + 52_000,
+            vibex_core::TimelineSource::Agent,
+            TimelinePayload::Command(vibex_core::CommandPayload {
+                command: "cargo check".to_owned(),
+                cwd: Some("/work".to_owned()),
+                status: vibex_core::CommandStatus::Completed,
+                exit_code: Some(0),
+                output_summary: None,
+                raw_extension: None,
+            }),
+        );
+        service.apply_event(BackendEvent::Timeline(vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 2,
+            item: tool_item,
+        }));
+        let answer_item = make_timeline_item(
+            &session_id,
+            3,
+            initial_started_at_ms + 54_000,
+            vibex_core::TimelineSource::Agent,
+            TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                text: "Build is green.".to_owned(),
+                is_final: true,
+            }),
+        );
+        service.apply_event(BackendEvent::Timeline(vibex_core::TimelineLiveEvent {
+            session_id: session_id.clone(),
+            sequence: 3,
+            item: answer_item,
+        }));
+        created.state = AgentSessionState::Idle;
+        service.apply_event(BackendEvent::SessionUpdated(created));
+        let finished = service.timeline.get_untracked();
+        assert!(!saw_empty_timeline.get());
+        assert_eq!(render_keys(&finished)[0], initial_keys[0]);
+        assert_eq!(render_keys(&finished)[1], initial_keys[1]);
+        assert_eq!(finished[1].kind, EntryKind::ProcessHeader);
+        assert!(finished[1].complete);
+
+        service.alive.set(false);
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "new-session-handoff-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn new_session_optimistic_handoff_keeps_timeline_and_render_keys_stable() {
+        let config = EngineConfig::new(Root::of::<NewSessionOptimisticHandoffProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("new-session-handoff-ok").unwrap();
+    }
+
+    #[component]
+    fn LocalSidebarCollapseProbe() -> impl IntoElement {
+        let done = signal(false);
+        let mut bundle = test_bundle();
+        bundle.expected_server_id = format!("sidebar-local-{}", VibexSessionId::new().as_str());
+        let service = SessionService::build_unstarted(
+            &bundle,
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let (session_id, session) = seed_existing_session(&service);
+        let project_id = session.project_id.as_str().to_owned();
+        let workspace_id = session.workspace_id.as_str().to_owned();
+        let workspace = WorkspaceSummary {
+            project: vibex_core::ProjectRecord {
+                id: session.project_id.clone(),
+                name: "vibex".to_owned(),
+                root_path: "/work".to_owned(),
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            },
+            workspace: vibex_core::WorkspaceRecord {
+                id: session.workspace_id.clone(),
+                project_id: session.project_id.clone(),
+                root_path: "/work".to_owned(),
+                mode: vibex_core::WorkspaceMode::CurrentCheckout,
+                created_at_ms: 1_000,
+                updated_at_ms: 1_000,
+            },
+            git_branch: Some("main".to_owned()),
+        };
+        service.workspace_records.set(vec![workspace]);
+
+        let folder_id = "folder-local-test".to_owned();
+        let group_id = "group-local-test".to_owned();
+        let desktop_snapshot = RemoteSidebarOrganizationSnapshot {
+            hierarchy_mode: RemoteSidebarHierarchyMode::Detailed,
+            folders: vec![vibex_core::RemoteSidebarFolder {
+                id: folder_id.clone(),
+                name: "Inbox".to_owned(),
+                project_id: Some(project_id.clone()),
+                workspace_id: Some(workspace_id.clone()),
+                auto_archive_after_days: None,
+            }],
+            groups: vec![vibex_core::RemoteSessionGroup {
+                id: group_id.clone(),
+                name: "Agents".to_owned(),
+                project_id: project_id.clone(),
+                workspace_id: workspace_id.clone(),
+                member_session_ids: vec![session_id.as_str().to_owned()],
+                pinned: false,
+                auto_continue: None,
+            }],
+            placements: vec![
+                vibex_core::RemoteSidebarPlacement {
+                    item: vibex_core::RemoteSidebarItemRef {
+                        kind: RemoteSidebarItemKind::Folder,
+                        id: folder_id.clone(),
+                    },
+                    parent_folder_id: None,
+                },
+                vibex_core::RemoteSidebarPlacement {
+                    item: vibex_core::RemoteSidebarItemRef {
+                        kind: RemoteSidebarItemKind::Group,
+                        id: group_id.clone(),
+                    },
+                    parent_folder_id: Some(folder_id.clone()),
+                },
+            ],
+            collapsed_project_ids: vec![project_id.clone()],
+            collapsed_workspace_ids: vec![workspace_id.clone()],
+            collapsed_folder_ids: vec![folder_id.clone()],
+            collapsed_group_ids: vec![group_id.clone()],
+            ..Default::default()
+        };
+
+        // 1. Desktop's collapsed sets must NOT collapse mobile's sidebar rows.
+        service.apply_sidebar(desktop_snapshot.clone());
+        service.sidebar_view.with_untracked(|view| {
+            assert!(view.collapsed_project_ids.is_empty());
+            assert!(view.collapsed_workspace_ids.is_empty());
+            assert!(view.organization.collapsed_folder_ids.is_empty());
+            assert!(view.organization.collapsed_group_ids.is_empty());
+        });
+        service.sidebar_sections.with_untracked(|sections| {
+            assert!(sections.iter().all(|section| !section.collapsed));
+        });
+
+        // 2. Local collapse updates immediately with zero backend dependency.
+        service.set_sidebar_row_collapsed(SidebarRowKind::Project, &project_id, true);
+        service.set_sidebar_row_collapsed(SidebarRowKind::Workspace, &workspace_id, true);
+        service.set_sidebar_row_collapsed(SidebarRowKind::Folder, &folder_id, true);
+        service.set_sidebar_row_collapsed(SidebarRowKind::Group, &group_id, true);
+        service.sidebar_view.with_untracked(|view| {
+            assert!(view.collapsed_project_ids.contains(&project_id));
+            assert!(view.collapsed_workspace_ids.contains(&workspace_id));
+            assert!(view.organization.collapsed_folder_ids.contains(&folder_id));
+            assert!(view.organization.collapsed_group_ids.contains(&group_id));
+        });
+        service.sidebar_sections.with_untracked(|sections| {
+            assert!(sections.iter().all(|section| section.collapsed));
+        });
+
+        // 3. A subsequent desktop snapshot with empty collapse sets must keep
+        //    mobile's own collapsed rows intact.
+        let mut desktop_expanded = desktop_snapshot;
+        desktop_expanded.collapsed_project_ids.clear();
+        desktop_expanded.collapsed_workspace_ids.clear();
+        desktop_expanded.collapsed_folder_ids.clear();
+        desktop_expanded.collapsed_group_ids.clear();
+        service.apply_sidebar(desktop_expanded);
+        service.sidebar_view.with_untracked(|view| {
+            assert!(view.collapsed_project_ids.contains(&project_id));
+            assert!(view.collapsed_workspace_ids.contains(&workspace_id));
+            assert!(view.organization.collapsed_folder_ids.contains(&folder_id));
+            assert!(view.organization.collapsed_group_ids.contains(&group_id));
+        });
+
+        // 4. Reveal active expands all local ancestors without any remote RPC.
+        service.reveal_sidebar_session();
+        service.sidebar_view.with_untracked(|view| {
+            assert!(!view.collapsed_project_ids.contains(&project_id));
+            assert!(!view.collapsed_workspace_ids.contains(&workspace_id));
+            assert!(!view.organization.collapsed_folder_ids.contains(&folder_id));
+            assert!(!view.organization.collapsed_group_ids.contains(&group_id));
+        });
+
+        // 5. Collapse-all projects toggles locally.
+        service.collapse_sidebar_projects();
+        assert!(
+            service
+                .sidebar_view
+                .with_untracked(|view| view.collapsed_project_ids.contains(&project_id))
+        );
+        service.collapse_sidebar_projects();
+        assert!(
+            service
+                .sidebar_view
+                .with_untracked(|view| !view.collapsed_project_ids.contains(&project_id))
+        );
+
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "local-sidebar-collapse-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn mobile_sidebar_collapse_stays_local_and_ignores_desktop_snapshot() {
+        let config = EngineConfig::new(Root::of::<LocalSidebarCollapseProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("local-sidebar-collapse-ok").unwrap();
     }
 
     fn make_timeline_page(
