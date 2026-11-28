@@ -128,10 +128,14 @@ cap total relayed bytes across all rooms and connections:
 
 ```bash
 VIBEX_RELAY_MAX_TRAFFIC_BYTES=100GiB       # raw bytes or B/KB/MB/GB/TB/KiB/MiB/GiB/TiB
-VIBEX_RELAY_TRAFFIC_LIMIT_MODE=monthly     # monthly (UTC calendar month) or total
+VIBEX_RELAY_TRAFFIC_LIMIT_MODE=monthly     # daily, weekly, monthly, or total
 VIBEX_RELAY_TRAFFIC_STATE_PATH=/var/lib/vibex-relay/traffic-quota.json
 ```
 
+- `daily` resets usage automatically at the start of each UTC calendar day
+  (`YYYY-MM-DD`, reported in `trafficQuota.period`).
+- `weekly` resets usage automatically at the start of each ISO-8601 UTC week
+  (Monday `00:00:00Z`, `YYYY-Www`, reported in `trafficQuota.period`).
 - `monthly` resets usage automatically at the start of each UTC calendar month
   (`YYYY-MM`, reported in `trafficQuota.period`).
 - `total` accumulates across the lifetime of the relay until the operator raises

@@ -13,7 +13,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
         println!(
             "  VIBEX_RELAY_MAX_TRAFFIC_BYTES=<bytes|KB|MB|GB|TB> (optional, disabled by default)"
         );
-        println!("  VIBEX_RELAY_TRAFFIC_LIMIT_MODE=monthly|total (default: monthly)");
+        println!("  VIBEX_RELAY_TRAFFIC_LIMIT_MODE=daily|weekly|monthly|total (default: monthly)");
         println!("  VIBEX_RELAY_TRAFFIC_STATE_PATH=<path> (optional JSON state file)");
         return Ok(());
     }

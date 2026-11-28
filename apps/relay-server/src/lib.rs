@@ -437,8 +437,10 @@ fn parse_traffic_limit_mode(
 ) -> Result<RelayTrafficLimitMode, Box<dyn std::error::Error>> {
     match value.trim().to_ascii_lowercase().as_str() {
         "total" => Ok(RelayTrafficLimitMode::Total),
+        "daily" => Ok(RelayTrafficLimitMode::Daily),
+        "weekly" => Ok(RelayTrafficLimitMode::Weekly),
         "monthly" => Ok(RelayTrafficLimitMode::Monthly),
-        _ => Err("VIBEX_RELAY_TRAFFIC_LIMIT_MODE must be total or monthly".into()),
+        _ => Err("VIBEX_RELAY_TRAFFIC_LIMIT_MODE must be total, daily, weekly, or monthly".into()),
     }
 }
 
@@ -660,10 +662,7 @@ struct TrafficQuotaTracker {
 
 impl TrafficQuotaTracker {
     fn new(config: &RelayServerConfig, now_ms: i64) -> Self {
-        let current_period = match config.traffic_limit_mode {
-            RelayTrafficLimitMode::Monthly => Some(utc_year_month(now_ms)),
-            RelayTrafficLimitMode::Total => None,
-        };
+        let current_period = traffic_period_key(config.traffic_limit_mode, now_ms);
         let mut tracker = Self {
             limit_bytes: config.max_traffic_bytes,
             mode: config.traffic_limit_mode,
@@ -676,30 +675,24 @@ impl TrafficQuotaTracker {
         if let Some(path) = config.traffic_state_path.as_deref()
             && let Some(loaded) = load_traffic_state(path)
             && loaded.mode == config.traffic_limit_mode
+            && loaded.period == current_period
         {
-            let period_matches = match config.traffic_limit_mode {
-                RelayTrafficLimitMode::Total => true,
-                RelayTrafficLimitMode::Monthly => loaded.period == current_period,
-            };
-            if period_matches {
-                tracker.used_bytes = loaded.used_bytes;
-                tracker.last_persisted_bytes = loaded.used_bytes;
-                tracker.last_persisted_at_ms = loaded.updated_at_ms;
-            }
+            tracker.used_bytes = loaded.used_bytes;
+            tracker.last_persisted_bytes = loaded.used_bytes;
+            tracker.last_persisted_at_ms = loaded.updated_at_ms;
         }
         tracker
     }
 
-    /// Advances the monthly period if UTC calendar month rolled over.
+    /// Advances the active period when a daily/weekly/monthly UTC boundary rolls over.
     /// Returns `(rolled_over, snapshot_to_persist)`.
     fn refresh_period(
         &mut self,
         now_ms: i64,
     ) -> (bool, Option<(PathBuf, PersistedTrafficQuotaState)>) {
-        if self.mode != RelayTrafficLimitMode::Monthly {
+        let Some(current_period) = traffic_period_key(self.mode, now_ms) else {
             return (false, None);
-        }
-        let current_period = utc_year_month(now_ms);
+        };
         if self.period.as_deref() == Some(current_period.as_str()) {
             return (false, None);
         }
@@ -804,10 +797,21 @@ fn persist_traffic_state(path: &FsPath, state: &PersistedTrafficQuotaState) {
     }
 }
 
-/// Computes the UTC calendar month string (`YYYY-MM`) for a Unix timestamp in ms.
-fn utc_year_month(timestamp_ms: i64) -> String {
+fn traffic_period_key(mode: RelayTrafficLimitMode, timestamp_ms: i64) -> Option<String> {
+    match mode {
+        RelayTrafficLimitMode::Total => None,
+        RelayTrafficLimitMode::Daily => Some(utc_year_month_day(timestamp_ms)),
+        RelayTrafficLimitMode::Weekly => Some(utc_iso_week(timestamp_ms)),
+        RelayTrafficLimitMode::Monthly => Some(utc_year_month(timestamp_ms)),
+    }
+}
+
+fn utc_days_since_epoch(timestamp_ms: i64) -> i64 {
     let secs = timestamp_ms.div_euclid(1000);
-    let days = secs.div_euclid(86_400);
+    secs.div_euclid(86_400)
+}
+
+fn utc_civil_date_from_days(days: i64) -> (i64, u32, u32) {
     let z = days + 719_468;
     let era = if z >= 0 { z } else { z - 146_096 } / 146_097;
     let doe = (z - era * 146_097) as u64;
@@ -815,10 +819,46 @@ fn utc_year_month(timestamp_ms: i64) -> String {
     let mut year = (yoe as i64) + era * 400;
     let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
     let mp = (5 * doy + 2) / 153;
+    let day = doy - (153 * mp + 2) / 5 + 1;
     let month = if mp < 10 { mp + 3 } else { mp - 9 };
     if month <= 2 {
         year += 1;
     }
+    (year, month as u32, day as u32)
+}
+
+fn days_from_utc_civil_date(year: i64, month: u32, day: u32) -> i64 {
+    let y = year - i64::from(month <= 2);
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u64;
+    let m = month as u64;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + (day as u64) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + (doe as i64) - 719_468
+}
+
+/// Computes the UTC calendar day string (`YYYY-MM-DD`) for a Unix timestamp in ms.
+fn utc_year_month_day(timestamp_ms: i64) -> String {
+    let (year, month, day) = utc_civil_date_from_days(utc_days_since_epoch(timestamp_ms));
+    format!("{year:04}-{month:02}-{day:02}")
+}
+
+/// Computes the ISO-8601 UTC calendar week string (`YYYY-Www`, Monday start)
+/// for a Unix timestamp in ms.
+fn utc_iso_week(timestamp_ms: i64) -> String {
+    let days = utc_days_since_epoch(timestamp_ms);
+    // 1970-01-01 was a Thursday (weekday 3 where Monday = 0, Sunday = 6).
+    let weekday = (days + 3).rem_euclid(7);
+    let thursday_days = days + (3 - weekday);
+    let (iso_year, _, _) = utc_civil_date_from_days(thursday_days);
+    let jan1_days = days_from_utc_civil_date(iso_year, 1, 1);
+    let week = (thursday_days - jan1_days) / 7 + 1;
+    format!("{iso_year:04}-W{week:02}")
+}
+
+/// Computes the UTC calendar month string (`YYYY-MM`) for a Unix timestamp in ms.
+fn utc_year_month(timestamp_ms: i64) -> String {
+    let (year, month, _) = utc_civil_date_from_days(utc_days_since_epoch(timestamp_ms));
     format!("{year:04}-{month:02}")
 }
 
@@ -4164,16 +4204,52 @@ mod tests {
     }
 
     #[test]
-    fn utc_year_month_handles_epoch_leap_year_and_rollover() {
+    fn traffic_limit_mode_parser_supports_daily_weekly_monthly_and_total() {
+        assert_eq!(
+            parse_traffic_limit_mode("total").unwrap(),
+            RelayTrafficLimitMode::Total
+        );
+        assert_eq!(
+            parse_traffic_limit_mode("DAILY").unwrap(),
+            RelayTrafficLimitMode::Daily
+        );
+        assert_eq!(
+            parse_traffic_limit_mode(" weekly ").unwrap(),
+            RelayTrafficLimitMode::Weekly
+        );
+        assert_eq!(
+            parse_traffic_limit_mode("Monthly").unwrap(),
+            RelayTrafficLimitMode::Monthly
+        );
+        assert!(parse_traffic_limit_mode("yearly").is_err());
+        assert!(parse_traffic_limit_mode("").is_err());
+    }
+
+    #[test]
+    fn utc_period_helpers_handle_epoch_leap_year_and_iso_week_boundaries() {
         assert_eq!(utc_year_month(0), "1970-01");
-        // 2024-02-29T23:59:59Z
+        assert_eq!(utc_year_month_day(0), "1970-01-01");
+        assert_eq!(utc_iso_week(0), "1970-W01");
+        // 2024-02-29T23:59:59Z -> 2024-03-01T00:00:00Z
         assert_eq!(utc_year_month(1_709_251_199_000), "2024-02");
-        // 2024-03-01T00:00:00Z
+        assert_eq!(utc_year_month_day(1_709_251_199_000), "2024-02-29");
         assert_eq!(utc_year_month(1_709_251_200_000), "2024-03");
-        // 2026-12-31T23:59:59Z
+        assert_eq!(utc_year_month_day(1_709_251_200_000), "2024-03-01");
+        // 2026-12-31T23:59:59Z -> 2027-01-01T00:00:00Z
         assert_eq!(utc_year_month(1_798_761_599_000), "2026-12");
-        // 2027-01-01T00:00:00Z
         assert_eq!(utc_year_month(1_798_761_600_000), "2027-01");
+        // ISO-8601 week-year boundary checks:
+        // 2019-12-30 (Monday) belongs to 2020-W01
+        let ms = |y, m, d| days_from_utc_civil_date(y, m, d) * 86_400 * 1000;
+        assert_eq!(utc_iso_week(ms(2019, 12, 29)), "2019-W52");
+        assert_eq!(utc_iso_week(ms(2019, 12, 30)), "2020-W01");
+        // 2020 has 53 ISO weeks; 2021-01-03 (Sunday) is still 2020-W53, 2021-01-04 (Monday) is 2021-W01
+        assert_eq!(utc_iso_week(ms(2020, 12, 31)), "2020-W53");
+        assert_eq!(utc_iso_week(ms(2021, 1, 3)), "2020-W53");
+        assert_eq!(utc_iso_week(ms(2021, 1, 4)), "2021-W01");
+        // Sunday -> Monday rollover in 2026
+        assert_eq!(utc_iso_week(ms(2026, 11, 29)), "2026-W48");
+        assert_eq!(utc_iso_week(ms(2026, 11, 30)), "2026-W49");
     }
 
     #[tokio::test]
@@ -4307,5 +4383,58 @@ mod tests {
         assert_eq!(rolled.used_bytes, 0);
         assert_ne!(rolled.period.as_deref(), Some(initial_period.as_str()));
         assert!(state.ensure_traffic_available().is_ok());
+    }
+
+    #[tokio::test]
+    async fn daily_and_weekly_traffic_quotas_reset_automatically_on_rollover() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Daily mode resets on the next UTC day.
+        let mut daily_config = test_config();
+        daily_config.max_traffic_bytes = Some(400);
+        daily_config.traffic_limit_mode = RelayTrafficLimitMode::Daily;
+        daily_config.traffic_state_path = Some(dir.path().join("daily-traffic.json"));
+
+        let daily_state = RelayServerState::new(daily_config);
+        let initial_day = daily_state.traffic_quota_status().period.clone().unwrap();
+        assert_eq!(initial_day.len(), 10);
+        assert!(!daily_state.record_traffic_bytes(500));
+        assert!(daily_state.traffic_quota_status().exceeded);
+        assert!(daily_state.ensure_traffic_available().is_err());
+
+        daily_state
+            .inner
+            .clock_offset_ms
+            .store(24 * 60 * 60 * 1000, Ordering::Release);
+        let rolled_day = daily_state.traffic_quota_status();
+        assert_eq!(rolled_day.mode, Some(RelayTrafficLimitMode::Daily));
+        assert!(!rolled_day.exceeded);
+        assert_eq!(rolled_day.used_bytes, 0);
+        assert_ne!(rolled_day.period.as_deref(), Some(initial_day.as_str()));
+        assert!(daily_state.ensure_traffic_available().is_ok());
+
+        // Weekly mode resets on the next ISO-8601 UTC week.
+        let mut weekly_config = test_config();
+        weekly_config.max_traffic_bytes = Some(400);
+        weekly_config.traffic_limit_mode = RelayTrafficLimitMode::Weekly;
+        weekly_config.traffic_state_path = Some(dir.path().join("weekly-traffic.json"));
+
+        let weekly_state = RelayServerState::new(weekly_config);
+        let initial_week = weekly_state.traffic_quota_status().period.clone().unwrap();
+        assert!(initial_week.contains("-W"));
+        assert!(!weekly_state.record_traffic_bytes(500));
+        assert!(weekly_state.traffic_quota_status().exceeded);
+        assert!(weekly_state.ensure_traffic_available().is_err());
+
+        weekly_state
+            .inner
+            .clock_offset_ms
+            .store(7 * 24 * 60 * 60 * 1000, Ordering::Release);
+        let rolled_week = weekly_state.traffic_quota_status();
+        assert_eq!(rolled_week.mode, Some(RelayTrafficLimitMode::Weekly));
+        assert!(!rolled_week.exceeded);
+        assert_eq!(rolled_week.used_bytes, 0);
+        assert_ne!(rolled_week.period.as_deref(), Some(initial_week.as_str()));
+        assert!(weekly_state.ensure_traffic_available().is_ok());
     }
 }

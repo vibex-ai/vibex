@@ -116,6 +116,8 @@ impl RelayErrorCode {
 #[serde(rename_all = "snake_case")]
 pub enum RelayTrafficLimitMode {
     Total,
+    Daily,
+    Weekly,
     #[default]
     Monthly,
 }
@@ -658,6 +660,19 @@ mod tests {
             serde_json::from_value::<RelayTrafficQuotaStatus>(encoded).unwrap(),
             full
         );
+        for (mode, expected) in [
+            (RelayTrafficLimitMode::Total, "total"),
+            (RelayTrafficLimitMode::Daily, "daily"),
+            (RelayTrafficLimitMode::Weekly, "weekly"),
+            (RelayTrafficLimitMode::Monthly, "monthly"),
+        ] {
+            let encoded_mode = serde_json::to_value(mode).unwrap();
+            assert_eq!(encoded_mode, expected);
+            assert_eq!(
+                serde_json::from_value::<RelayTrafficLimitMode>(encoded_mode).unwrap(),
+                mode
+            );
+        }
         assert_eq!(
             RelayErrorCode::TrafficLimitExceeded.as_str(),
             "relay_traffic_limit_exceeded"
