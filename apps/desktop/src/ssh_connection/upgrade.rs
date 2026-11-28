@@ -152,16 +152,12 @@ pub fn upgrade_runtime(
             )
         })?;
 
-    if let Err(error) = supervisor::stop(command, launch) {
+    if let Err(error) = ensure_stopped(command, launch) {
         return Err(rollback(
             command,
             launch,
             None,
-            UpgradeError::new(
-                "ssh_upgrade_stop_failed",
-                UpgradePhase::Stopping,
-                supervisor_message(error),
-            ),
+            UpgradeError::new("ssh_upgrade_stop_failed", UpgradePhase::Stopping, error),
         ));
     }
 
@@ -199,27 +195,48 @@ fn rollback(
     mut error: UpgradeError,
 ) -> UpgradeError {
     let mut steps = Vec::new();
-    match supervisor::stop(command, launch) {
-        Ok(_) => steps.push("stopped"),
-        Err(_) => steps.push("stop_failed"),
-    }
-    if let Some(snapshot) = snapshot {
-        match restore_database(command, &launch.runtime_home, snapshot) {
-            Ok(()) => steps.push("db_restored"),
-            Err(_) => steps.push("db_restore_failed"),
+    let stopped_ok = match ensure_stopped(command, launch) {
+        Ok(()) => {
+            steps.push("stopped");
+            true
         }
-    }
+        Err(_) => {
+            steps.push("stop_failed");
+            false
+        }
+    };
     match switch_to_previous(command, &launch.remote_install_root) {
         Ok(()) => steps.push("current_previous"),
         Err(_) => steps.push("switch_failed"),
+    }
+    if let Some(snapshot) = snapshot {
+        if stopped_ok {
+            match restore_database(command, &launch.runtime_home, snapshot) {
+                Ok(()) => steps.push("db_restored"),
+                Err(_) => steps.push("db_restore_failed"),
+            }
+        } else {
+            // Never overwrite vibex.db while a live runtime may still be
+            // writing to it.
+            steps.push("db_restore_skipped_running");
+        }
     }
     match ensure_started(command, launch) {
         Ok(_) => steps.push("old_started"),
         Err(_) => steps.push("old_start_failed"),
     }
-    error.phase = UpgradePhase::RollingBack;
     error.rollback = Some(steps.join(","));
     error
+}
+
+fn ensure_stopped(command: &SshCommand, launch: &LaunchConfig) -> Result<(), String> {
+    if let Some(label) = launch.launch_agent_label.as_deref() {
+        launchd::stop(command, label)
+            .map_err(|error| format!("{}: {}", error.code, error.message))?;
+    }
+    supervisor::ensure_stopped(command, launch)
+        .map(|_| ())
+        .map_err(supervisor_message)
 }
 
 fn ensure_started(command: &SshCommand, launch: &LaunchConfig) -> Result<(), String> {

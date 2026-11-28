@@ -5,16 +5,20 @@
 
 use std::ffi::OsString;
 use std::fmt;
+use std::io::Read as _;
 use std::net::{Ipv4Addr, TcpListener};
 use std::path::PathBuf;
 use std::process::{Child, Stdio};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use super::command::{SshCommand, SshDestination};
 use super::console::hidden_command;
 
 const MAX_LOCAL_PORT_ATTEMPTS: u16 = 20;
 const MAX_BACKOFF_EXPONENT: u32 = 5;
+const MAX_STDERR_TAIL_BYTES: usize = 4096;
+const DEFAULT_STABILITY_WINDOW: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TunnelSpec {
@@ -62,6 +66,14 @@ impl TunnelSpec {
             self.config_path.as_deref(),
         )
         .map_err(|error| TunnelError::new("ssh_tunnel_command_invalid", error.to_string()))?;
+        // `for_destination` disables config forwardings for non-tunnel SSH
+        // commands. A tunnel explicitly requires `-L`, so switch that flag off
+        // before splicing `-L`.
+        for arg in &mut command.args {
+            if arg == "ClearAllForwardings=yes" {
+                *arg = OsString::from("ClearAllForwardings=no");
+            }
+        }
         let target_index = command
             .args
             .iter()
@@ -121,6 +133,7 @@ impl std::error::Error for TunnelError {}
 pub struct TunnelProcess {
     child: Child,
     local_port: u16,
+    stderr_tail: Arc<Mutex<Vec<u8>>>,
 }
 
 impl TunnelProcess {
@@ -128,11 +141,11 @@ impl TunnelProcess {
         #[cfg(test)]
         let _process_guard = crate::ssh_connection::test_support::process_guard();
         let command = spec.command()?;
-        let child = hidden_command(&command.program)
+        let mut child = hidden_command(&command.program)
             .args(&command.args)
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stderr(Stdio::piped())
             .spawn()
             .map_err(|error| {
                 if error.kind() == std::io::ErrorKind::NotFound {
@@ -147,9 +160,29 @@ impl TunnelProcess {
                     )
                 }
             })?;
+        let stderr_tail = Arc::new(Mutex::new(Vec::new()));
+        if let Some(mut stderr) = child.stderr.take() {
+            let buffer = stderr_tail.clone();
+            std::thread::spawn(move || {
+                let mut chunk = [0u8; 512];
+                while let Ok(read) = stderr.read(&mut chunk) {
+                    if read == 0 {
+                        break;
+                    }
+                    if let Ok(mut tail) = buffer.lock() {
+                        tail.extend_from_slice(&chunk[..read]);
+                        if tail.len() > MAX_STDERR_TAIL_BYTES {
+                            let excess = tail.len() - MAX_STDERR_TAIL_BYTES;
+                            tail.drain(..excess);
+                        }
+                    }
+                }
+            });
+        }
         Ok(Self {
             child,
             local_port: spec.local_port,
+            stderr_tail,
         })
     }
 
@@ -159,6 +192,13 @@ impl TunnelProcess {
 
     pub fn local_port(&self) -> u16 {
         self.local_port
+    }
+
+    pub fn stderr_tail(&self) -> String {
+        self.stderr_tail
+            .lock()
+            .map(|bytes| String::from_utf8_lossy(&bytes).trim().to_string())
+            .unwrap_or_default()
     }
 
     pub fn try_wait(&mut self) -> Result<Option<std::process::ExitStatus>, TunnelError> {
@@ -244,6 +284,8 @@ pub struct TunnelSupervisor {
     spec: TunnelSpec,
     process: Option<TunnelProcess>,
     backoff: TunnelBackoff,
+    started_at: Option<Instant>,
+    stability_window: Duration,
 }
 
 impl TunnelSupervisor {
@@ -252,6 +294,8 @@ impl TunnelSupervisor {
             spec,
             process: None,
             backoff,
+            started_at: None,
+            stability_window: DEFAULT_STABILITY_WINDOW,
         }
     }
 
@@ -259,18 +303,26 @@ impl TunnelSupervisor {
         if let Some(process) = self.process.as_mut() {
             if process.try_wait()?.is_some() {
                 self.process = None;
+                self.started_at = None;
                 return Ok(TunnelState::Exited {
                     restart_in: self.backoff.next_delay(),
                 });
             }
+            if self
+                .started_at
+                .is_some_and(|started| started.elapsed() >= self.stability_window)
+            {
+                self.backoff.reset();
+            }
             return Ok(TunnelState::Running);
         }
         self.process = Some(TunnelProcess::spawn(&self.spec)?);
-        self.backoff.reset();
+        self.started_at = Some(Instant::now());
         Ok(TunnelState::Started)
     }
 
     pub fn stop(&mut self) -> Result<(), TunnelError> {
+        self.started_at = None;
         if let Some(mut process) = self.process.take() {
             process.stop()?;
         }
@@ -424,5 +476,48 @@ mod tests {
         assert!(supervisor.process_id().is_some());
         supervisor.stop().unwrap();
         assert!(supervisor.process_id().is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tunnel_captures_stderr_and_supervisor_backs_off_on_rapid_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = crate::ssh_connection::test_support::unique_path(dir.path(), "failing-ssh");
+        crate::ssh_connection::test_support::write_executable(
+            &ssh,
+            "#!/bin/sh\nprintf 'bind: Address already in use\\n' >&2\nexit 255\n",
+        );
+        let mut proc = TunnelProcess::spawn(&spec(ssh.clone())).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while proc.try_wait().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        std::thread::sleep(Duration::from_millis(30));
+        assert!(
+            proc.stderr_tail().contains("Address already in use"),
+            "stderr_tail={:?}",
+            proc.stderr_tail()
+        );
+
+        let mut supervisor = TunnelSupervisor::new(
+            spec(ssh),
+            TunnelBackoff::new(Duration::from_millis(10), Duration::from_millis(100)).unwrap(),
+        );
+        assert_eq!(supervisor.ensure_started().unwrap(), TunnelState::Started);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            supervisor.ensure_started().unwrap(),
+            TunnelState::Exited {
+                restart_in: Duration::from_millis(10)
+            }
+        );
+        assert_eq!(supervisor.ensure_started().unwrap(), TunnelState::Started);
+        std::thread::sleep(Duration::from_millis(80));
+        assert_eq!(
+            supervisor.ensure_started().unwrap(),
+            TunnelState::Exited {
+                restart_in: Duration::from_millis(20)
+            }
+        );
     }
 }

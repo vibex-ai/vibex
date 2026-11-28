@@ -100,8 +100,9 @@ impl LaunchConfig {
     /// relative and `..` paths before a launch sees them.
     pub fn with_runtime_home(mut self, runtime_home: impl Into<String>) -> Self {
         let runtime_home = runtime_home.into();
-        if !runtime_home.trim().is_empty() {
-            self.runtime_home = runtime_home;
+        let trimmed = runtime_home.trim();
+        if !trimmed.is_empty() {
+            self.runtime_home = expand_remote_home(trimmed, &self.remote_home);
         }
         self
     }
@@ -123,12 +124,16 @@ impl LaunchConfig {
         ];
         // The reader's proxy is a desktop preference, so it does not reach the
         // remote host on its own: SSH forwards no environment, and the
-        // launcher's own process variables die with the session. Publishing it
-        // in the env file is what lets the remote runtime — and the managed
-        // Agent installs it runs — take the same route the local one does.
-        pairs.extend(vibex_desktop_runtime::network_proxy::environment_pairs(
-            &self.network_proxy,
-        ));
+        // launcher's own process variables die with the session. Publishing a
+        // routable proxy in the env file lets the remote runtime — and managed
+        // Agent installs — take the same route. Loopback custom proxies
+        // (127.0.0.1 / localhost / ::1) point at a proxy running on the desktop
+        // machine itself and are unreachable on the remote host, so skip them.
+        if !is_loopback_custom_proxy(&self.network_proxy) {
+            pairs.extend(vibex_desktop_runtime::network_proxy::environment_pairs(
+                &self.network_proxy,
+            ));
+        }
         pairs
     }
 
@@ -256,9 +261,11 @@ file=$1
 shift
 umask 077
 mkdir -p "$(dirname "$file")"
-: > "$file"
-chmod 600 "$file"
-printf '%s\n' "$@" > "$file"
+tmp="$file.tmp.$$"
+rm -f "$tmp"
+printf '%s\n' "$@" > "$tmp"
+chmod 600 "$tmp"
+mv -f "$tmp" "$file"
 echo env=ok
 "#;
 
@@ -294,8 +301,13 @@ fi
 if [ -f "$pidfile" ]; then
   pid=$(cat "$pidfile" 2>/dev/null || true)
   if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
-    echo "launch=pid_alive pid=$pid"
-    exit 0
+    cmd=$(ps -p "$pid" -o args= 2>/dev/null || ps -p "$pid" -o comm= 2>/dev/null || true)
+    case "$cmd" in
+      *vibex-server*)
+        echo "launch=pid_alive pid=$pid"
+        exit 0
+        ;;
+    esac
   fi
   rm -f "$pidfile"
 fi
@@ -339,6 +351,43 @@ fn parse_start_output(stdout: &str) -> Result<StartOutcome, LaunchError> {
         "ssh_launch_unexpected",
         "the remote runtime did not report a start result",
     ))
+}
+
+fn expand_remote_home(path: &str, remote_home: &str) -> String {
+    let base = remote_home.trim_end_matches('/');
+    if path == "~" || path == "$HOME" {
+        return remote_home.to_string();
+    }
+    if let Some(rest) = path.strip_prefix("~/") {
+        return format!("{base}/{rest}");
+    }
+    if let Some(rest) = path.strip_prefix("$HOME/") {
+        return format!("{base}/{rest}");
+    }
+    path.to_string()
+}
+
+fn is_loopback_custom_proxy(proxy: &NetworkProxyUiState) -> bool {
+    if proxy.mode != vibex_desktop_model::NetworkProxyMode::Custom {
+        return false;
+    }
+    let Some(raw) = proxy.proxy_url.as_deref() else {
+        return false;
+    };
+    let candidate = if raw.contains("://") {
+        raw.to_string()
+    } else {
+        format!("http://{raw}")
+    };
+    let Ok(url) = url::Url::parse(&candidate) else {
+        return false;
+    };
+    match url.host() {
+        Some(url::Host::Domain(domain)) => domain.eq_ignore_ascii_case("localhost"),
+        Some(url::Host::Ipv4(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        Some(url::Host::Ipv6(ip)) => ip.is_loopback() || ip.is_unspecified(),
+        None => false,
+    }
 }
 
 fn validate_remote_path(label: &'static str, value: &str) -> Result<(), LaunchError> {
@@ -434,7 +483,7 @@ mod tests {
         let mut config = config(8765);
         config.network_proxy = NetworkProxyUiState {
             mode: vibex_desktop_model::NetworkProxyMode::Custom,
-            proxy_url: Some("socks5://127.0.0.1:1080".to_string()),
+            proxy_url: Some("socks5://proxy.internal:1080".to_string()),
             bypass: "localhost,127.0.0.1".to_string(),
         };
         let env = config.env_pairs();
@@ -444,12 +493,37 @@ mod tests {
         )));
         assert!(env.contains(&(
             vibex_desktop_runtime::network_proxy::PROXY_URL_ENV,
-            "socks5://127.0.0.1:1080".to_string()
+            "socks5://proxy.internal:1080".to_string()
         )));
         assert!(env.contains(&(
             vibex_desktop_runtime::network_proxy::PROXY_BYPASS_ENV,
             "localhost,127.0.0.1".to_string()
         )));
+    }
+
+    #[test]
+    fn the_remote_env_file_skips_loopback_custom_proxy_and_expands_runtime_home() {
+        let mut config = config(8765).with_runtime_home("~/.vibex/desktop-stable");
+        assert_eq!(config.runtime_home, "/home/dev/.vibex/desktop-stable");
+        let home_env_config = config.clone().with_runtime_home("$HOME/.vibex/alt");
+        assert_eq!(home_env_config.runtime_home, "/home/dev/.vibex/alt");
+        for url in [
+            "http://127.0.0.1:7890",
+            "socks5://localhost:1080",
+            "http://[::1]:8080",
+        ] {
+            config.network_proxy = NetworkProxyUiState {
+                mode: vibex_desktop_model::NetworkProxyMode::Custom,
+                proxy_url: Some(url.to_string()),
+                bypass: String::new(),
+            };
+            let env = config.env_pairs();
+            assert!(
+                !env.iter()
+                    .any(|(key, _)| *key == vibex_desktop_runtime::network_proxy::PROXY_URL_ENV),
+                "loopback proxy {url} must not be forwarded to remote host"
+            );
+        }
     }
 
     #[test]

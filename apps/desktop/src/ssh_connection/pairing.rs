@@ -202,7 +202,7 @@ pub fn parse_pairing_payload(json: &str, now_ms: i64) -> Result<PairingPayload, 
             "the remote runtime pairing expiry is invalid",
         ));
     }
-    if payload.expires_at_ms <= now_ms {
+    if now_ms > 0 && payload.expires_at_ms <= now_ms {
         return Err(PairingError::retryable(
             "ssh_pairing_code_expired",
             "the remote pairing code has expired",
@@ -232,9 +232,10 @@ pub async fn claim_payload_and_register(
     credential.pinned_tls_certificate_der = payload.tls_certificate_der.clone();
     credential.validate().map_err(PairingError::from_register)?;
 
+    let registered_at_ms = vibex_core::unix_timestamp_ms().max(now_ms);
     let store = DesktopRuntimeRegistryStore::new(home_dir);
     let mut registry = store.load_or_migrate();
-    let runtime_id = registry.upsert(credential.clone(), now_ms);
+    let runtime_id = registry.upsert(credential.clone(), registered_at_ms);
     store.save(&registry).map_err(PairingError::from_register)?;
     Ok(PairingOutcome {
         runtime_id,
@@ -253,13 +254,16 @@ pub async fn claim_and_register(
     allow_insecure_local_dev: bool,
     now_ms: i64,
 ) -> Result<PairingOutcome, PairingError> {
-    let mut payload = fetch_fresh_pairing_code(command, config, now_ms)?;
+    // Do not reject the freshly minted code against the desktop's local clock:
+    // clock skew between desktop and remote host would falsely fail valid codes.
+    // The remote server enforces expiry during `claim_once`, which retries once.
+    let mut payload = fetch_fresh_pairing_code(command, config, 0)?;
     let local_endpoint = payload.local_endpoint(local_port)?;
     let mut credential = match claim_once(&payload, &local_endpoint, allow_insecure_local_dev).await
     {
         Ok(credential) => credential,
         Err(error) if error.code == "remote_pairing_code_expired" => {
-            payload = fetch_fresh_pairing_code(command, config, now_ms)?;
+            payload = fetch_fresh_pairing_code(command, config, 0)?;
             let local_endpoint = payload.local_endpoint(local_port)?;
             claim_once(&payload, &local_endpoint, allow_insecure_local_dev).await?
         }
@@ -276,9 +280,10 @@ pub async fn claim_and_register(
     credential.pinned_tls_certificate_der = payload.tls_certificate_der.clone();
     credential.validate().map_err(PairingError::from_register)?;
 
+    let registered_at_ms = vibex_core::unix_timestamp_ms().max(now_ms);
     let store = DesktopRuntimeRegistryStore::new(home_dir);
     let mut registry = store.load_or_migrate();
-    let runtime_id = registry.upsert(credential.clone(), now_ms);
+    let runtime_id = registry.upsert(credential.clone(), registered_at_ms);
     store.save(&registry).map_err(PairingError::from_register)?;
     Ok(PairingOutcome {
         runtime_id,

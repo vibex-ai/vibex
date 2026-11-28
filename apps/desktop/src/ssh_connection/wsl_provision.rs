@@ -24,6 +24,9 @@ use crate::remote_client::{DesktopRemoteCredential, DesktopRuntimeRegistryStore}
 use vibex_remote_client::WebRemoteBackend;
 
 const START_TIMEOUT: Duration = Duration::from_secs(20);
+const STOP_DEADLINE: Duration = Duration::from_secs(10);
+const UPLOAD_TIMEOUT: Duration = Duration::from_secs(300);
+const INSTALL_TIMEOUT: Duration = Duration::from_secs(120);
 const FORWARDING_DEADLINE: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -145,16 +148,18 @@ impl WslProvisioner {
             ));
         }
         let incoming = format!(
-            "{}/.incoming-{}.tar.gz",
-            self.launch.remote_install_root, artifact.version
+            "{}/.incoming-{}-{}.tar.gz",
+            self.launch.remote_install_root,
+            artifact.version,
+            vibex_core::RequestId::new().as_str()
         );
         let mut upload = self.command();
         upload
-            .upload(&incoming, &bytes)
+            .upload_with_timeout(&incoming, &bytes, UPLOAD_TIMEOUT)
             .map_err(WslProvisionError::from_wsl)?;
         let mut install = self.command();
         install
-            .run_script(
+            .run_script_with_timeout(
                 INSTALL_SCRIPT,
                 &[
                     incoming,
@@ -162,6 +167,7 @@ impl WslProvisioner {
                     artifact.version.clone(),
                     artifact.sha256.clone(),
                 ],
+                INSTALL_TIMEOUT,
             )
             .map_err(WslProvisionError::from_wsl)?;
         Ok(())
@@ -173,7 +179,7 @@ impl WslProvisioner {
             self.launch
                 .env_pairs()
                 .into_iter()
-                .map(|(key, value)| format!("{key}={value}")),
+                .map(|(key, value)| format!("{key}={}", shell_quote(&value))),
         );
         self.command()
             .run_script(ENV_SCRIPT, &args)
@@ -245,25 +251,51 @@ impl WslProvisioner {
         }
     }
 
+    fn ensure_stopped(&self) -> Result<(), WslProvisionError> {
+        self.stop()?;
+        let deadline = Instant::now() + STOP_DEADLINE;
+        while Instant::now() < deadline {
+            if let Ok(current) = self.status()
+                && !current.running
+            {
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(200));
+        }
+        Ok(())
+    }
+
     /// Starts the runtime as a foreground child of a held `wsl.exe` and waits
     /// for health. The returned keepalive must stay alive for the runtime.
     pub fn start_foreground(&self) -> Result<(WslKeepalive, ServerStatus), WslProvisionError> {
+        // Stop any running server first so the foreground keepalive cleanly
+        // owns the runtime instead of spawning a duplicate that hits the home
+        // lock and immediately exits.
         if let Ok(current) = self.status()
-            && current.is_healthy()
-            && !current.is_healthy_on(self.launch.remote_port)
+            && current.running
         {
-            self.stop()?;
+            self.ensure_stopped()?;
         }
         self.write_env()?;
-        let keepalive = WslKeepalive::spawn_runtime(
+        let mut keepalive = WslKeepalive::spawn_runtime(
             &self.program,
             &self.distro,
             &self.launch.env_file,
             &self.launch.binary,
+            &self.launch.log_file,
         )
         .map_err(WslProvisionError::from_wsl)?;
         let deadline = Instant::now() + START_TIMEOUT;
         loop {
+            if let Ok(Some(exit)) = keepalive.try_wait() {
+                return Err(WslProvisionError::retryable(
+                    "wsl_runtime_exited",
+                    format!(
+                        "the WSL runtime exited before becoming healthy (exit {})",
+                        exit.code().unwrap_or(-1)
+                    ),
+                ));
+            }
             if let Ok(status) = self.status()
                 && status.is_healthy_on(self.launch.remote_port)
             {
@@ -287,7 +319,9 @@ impl WslProvisioner {
                 &[self.launch.env_file.clone(), self.launch.binary.clone()],
             )
             .map_err(WslProvisionError::from_wsl)?;
-        let payload: PairingPayload = parse_pairing_payload(&output.stdout_lossy(), now_ms)
+        // Pass 0 for `now_ms` so clock skew between Windows and WSL does not
+        // falsely reject a freshly minted pairing code.
+        let payload: PairingPayload = parse_pairing_payload(&output.stdout_lossy(), 0)
             .map_err(|error| WslProvisionError::new("wsl_pairing_invalid", error.message))?;
         claim_payload_and_register(
             payload,
@@ -371,6 +405,10 @@ impl WslProvisioner {
             keepalive,
         })
     }
+}
+
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
 }
 
 /// Accessor used by callers that only need the pinned credential.

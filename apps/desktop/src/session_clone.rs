@@ -63,8 +63,8 @@ use crate::locale;
 use crate::remote_client::{DesktopRemoteCredential, LOCAL_RUNTIME_ID, RegisteredRuntime};
 use crate::spinner::Spinner;
 use crate::ssh_connection::{
-    LaunchConfig, SshCommand, SshConnectionProfile, SshDestination, SshMacOsLifecycle,
-    TunnelProcess, TunnelSpec, select_local_port, supervisor,
+    LaunchConfig, SshCommand, SshConnectionProfile, SshMacOsLifecycle, TunnelProcess, TunnelSpec,
+    select_local_port, supervisor,
 };
 use crate::theme;
 
@@ -1323,11 +1323,7 @@ async fn connect_target_instance(
                     .ssh_client_path
                     .clone()
                     .unwrap_or_else(|| PathBuf::from("ssh"));
-                let destination = SshDestination {
-                    host: profile.host.clone(),
-                    user: profile.user.clone(),
-                    port: profile.port,
-                };
+                let destination = profile.ssh_destination();
                 let command = SshCommand::for_destination(
                     program,
                     &destination,

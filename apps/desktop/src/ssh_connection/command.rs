@@ -8,6 +8,7 @@ use std::ffi::OsString;
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -104,7 +105,7 @@ impl SshCommand {
         let mut args = Vec::new();
         if let Some(path) = config_path {
             args.push(OsString::from("-F"));
-            args.push(path.as_os_str().to_owned());
+            args.push(super::config::expand_tilde_path(path).into_os_string());
         }
         for option in [
             "BatchMode=yes".to_string(),
@@ -112,6 +113,9 @@ impl SshCommand {
             format!("ServerAliveInterval={ALIVE_INTERVAL_SECONDS}"),
             format!("ServerAliveCountMax={ALIVE_COUNT_MAX}"),
             "StrictHostKeyChecking=yes".to_string(),
+            "ControlMaster=no".to_string(),
+            "ControlPath=none".to_string(),
+            "ClearAllForwardings=yes".to_string(),
         ] {
             args.push(OsString::from("-o"));
             args.push(OsString::from(option));
@@ -119,9 +123,14 @@ impl SshCommand {
         args.push(OsString::from("-p"));
         args.push(OsString::from(destination.port.to_string()));
         args.push(OsString::from("--"));
+        let bare_host = destination
+            .host
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+            .unwrap_or(&destination.host);
         let target = match &destination.user {
-            Some(user) => format!("{user}@{}", destination.host),
-            None => destination.host.clone(),
+            Some(user) => format!("{user}@{bare_host}"),
+            None => bare_host.to_string(),
         };
         args.push(OsString::from(target));
         Ok(Self {
@@ -219,8 +228,14 @@ impl SshCommand {
             let _ = child.wait();
             return Err(SshFailure::spawn("the SSH stderr pipe is unavailable"));
         };
-        let stdout_reader = thread::spawn(move || read_all(stdout));
-        let stderr_reader = thread::spawn(move || read_all(stderr));
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = stdout_tx.send(read_all(stdout));
+        });
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = stderr_tx.send(read_all(stderr));
+        });
 
         let started = Instant::now();
         let mut timed_out = false;
@@ -243,13 +258,16 @@ impl SshCommand {
             thread::sleep(Duration::from_millis(25));
         };
 
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
+        if timed_out {
+            let stderr = stderr_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            return Err(SshFailure::timeout(&String::from_utf8_lossy(&stderr)));
+        }
+        let stdout = stdout_rx.recv().unwrap_or_default();
+        let stderr = stderr_rx.recv().unwrap_or_default();
         if let Some(handle) = stdin_thread {
             let _ = handle.join();
-        }
-        if timed_out {
-            return Err(SshFailure::timeout(&String::from_utf8_lossy(&stderr)));
         }
         let Some(status) = status else {
             return Err(SshFailure::spawn("the SSH process status is unavailable"));
@@ -331,8 +349,14 @@ impl SshCommand {
             let _ = child.wait();
             return Err(SshFailure::spawn("the SSH stderr pipe is unavailable"));
         };
-        let stdout_reader = thread::spawn(move || read_all(stdout));
-        let stderr_reader = thread::spawn(move || read_all(stderr));
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = stdout_tx.send(read_all(stdout));
+        });
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        thread::spawn(move || {
+            let _ = stderr_tx.send(read_all(stderr));
+        });
 
         let started = Instant::now();
         let mut timed_out = false;
@@ -355,13 +379,16 @@ impl SshCommand {
             thread::sleep(Duration::from_millis(25));
         };
 
-        let stdout = stdout_reader.join().unwrap_or_default();
-        let stderr = stderr_reader.join().unwrap_or_default();
+        if timed_out {
+            let stderr = stderr_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            return Err(SshFailure::timeout(&String::from_utf8_lossy(&stderr)));
+        }
+        let stdout = stdout_rx.recv().unwrap_or_default();
+        let stderr = stderr_rx.recv().unwrap_or_default();
         if let Some(handle) = stdin_thread {
             let _ = handle.join();
-        }
-        if timed_out {
-            return Err(SshFailure::timeout(&String::from_utf8_lossy(&stderr)));
         }
         let Some(status) = status else {
             return Err(SshFailure::spawn("the SSH process status is unavailable"));
@@ -668,5 +695,46 @@ mod tests {
             .run_with_timeout(Duration::from_millis(100))
             .unwrap_err();
         assert_eq!(failure.kind, SshFailureKind::ClientMissing);
+    }
+
+    #[test]
+    fn strips_ipv6_brackets_and_disables_control_master_and_config_forwardings() {
+        let command = SshCommand::for_destination(
+            Path::new("ssh"),
+            &destination("[2001:db8::1]"),
+            Some(Path::new("~/.ssh/config")),
+        )
+        .unwrap();
+        let args = command
+            .args
+            .iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(has_pair(&args, "-o", "ControlMaster=no"));
+        assert!(has_pair(&args, "-o", "ControlPath=none"));
+        assert!(has_pair(&args, "-o", "ClearAllForwardings=yes"));
+        assert!(args.contains(&"dev@2001:db8::1".to_string()));
+        assert!(!args.contains(&"dev@[2001:db8::1]".to_string()));
+        if std::env::var_os("HOME").is_some() {
+            assert_eq!(args[0], "-F");
+            assert!(
+                !args[1].starts_with("~/"),
+                "config path must expand tilde: {}",
+                args[1]
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timeout_returns_promptly_even_when_grandchild_holds_pipes() {
+        let dir = tempfile::tempdir().unwrap();
+        let ssh = fake_ssh(dir.path(), "sleep 5 &\nwait");
+        let started = Instant::now();
+        let failure = SshCommand::new(&ssh)
+            .run_with_timeout(Duration::from_millis(120))
+            .unwrap_err();
+        assert_eq!(failure.kind, SshFailureKind::Timeout);
+        assert!(started.elapsed() < Duration::from_secs(2));
     }
 }

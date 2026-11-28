@@ -29,10 +29,17 @@ pub struct GlibcVersion {
 
 impl GlibcVersion {
     pub fn parse(value: &str) -> Option<Self> {
-        let (major, minor) = value.trim().split_once('.')?;
+        let (major, rest) = value.trim().split_once('.')?;
+        let minor_digits: String = rest
+            .chars()
+            .take_while(|character| character.is_ascii_digit())
+            .collect();
+        if minor_digits.is_empty() {
+            return None;
+        }
         Some(Self {
             major: major.parse().ok()?,
-            minor: minor.parse().ok()?,
+            minor: minor_digits.parse().ok()?,
         })
     }
 }
@@ -183,10 +190,10 @@ impl EnvironmentError {
     pub fn message(&self) -> String {
         match self {
             Self::UnsupportedOs { found } => {
-                format!("the SSH host must run Linux; found {found}")
+                format!("the SSH host must run Linux or macOS; found {found}")
             }
             Self::UnsupportedArch { found } => {
-                format!("Linux architecture {found} is not supported; expected x86_64 or aarch64")
+                format!("architecture {found} is not supported; expected x86_64 or aarch64")
             }
             Self::MissingGlibc => {
                 "the host does not expose a glibc version; musl-only hosts are not supported"

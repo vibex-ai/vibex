@@ -6,6 +6,7 @@
 
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use vibex_backend::BackendError;
 use vibex_remote_client::WebRemoteBackend;
@@ -36,6 +37,7 @@ pub struct SshProvisioningEffects {
     pairing: Option<PairingOutcome>,
     backend: Option<Arc<WebRemoteBackend>>,
     runtime_id: Option<String>,
+    tunnel_ready_timeout: Duration,
 }
 
 impl SshProvisioningEffects {
@@ -78,6 +80,7 @@ impl SshProvisioningEffects {
             pairing: None,
             backend: None,
             runtime_id: None,
+            tunnel_ready_timeout: Duration::from_secs(10),
         })
     }
 
@@ -161,7 +164,33 @@ impl ProvisioningEffects for SshProvisioningEffects {
     }
 
     async fn open_tunnel(&mut self) -> Result<(), ProvisioningEffectError> {
-        let process = TunnelProcess::spawn(&self.tunnel_spec).map_err(map_tunnel)?;
+        // Drop any previous tunnel before spawning a replacement so retries do
+        // not collide on the same local port.
+        self.tunnel = None;
+        let mut process = TunnelProcess::spawn(&self.tunnel_spec).map_err(map_tunnel)?;
+        let deadline = Instant::now() + self.tunnel_ready_timeout;
+        while !super::wsl::localhost_forwarded(self.tunnel_spec.local_port) {
+            if let Ok(Some(status)) = process.try_wait() {
+                // Give the stderr reader thread a brief moment to flush.
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                let stderr = process.stderr_tail();
+                let detail = if stderr.is_empty() {
+                    format!(
+                        "the SSH tunnel exited before listening (status {})",
+                        status.code().unwrap_or(-1)
+                    )
+                } else {
+                    format!("the SSH tunnel exited before listening: {stderr}")
+                };
+                return Err(
+                    ProvisioningEffectError::new("ssh_tunnel_exited", detail).retryable(true)
+                );
+            }
+            if Instant::now() >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
         self.tunnel = Some(process);
         Ok(())
     }
@@ -343,6 +372,7 @@ mod tests {
             0,
         )
         .unwrap();
+        effects.tunnel_ready_timeout = Duration::from_millis(50);
         effects.open_tunnel().await.unwrap();
         assert!(effects.tunnel_process().is_some());
         assert_eq!(

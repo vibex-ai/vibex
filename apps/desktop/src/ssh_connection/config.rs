@@ -7,7 +7,12 @@
 use std::collections::HashSet;
 use std::env;
 use std::fs;
+use std::io::Read as _;
 use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use vibex_core::{VibexError, VibexResult};
 
@@ -16,6 +21,7 @@ use super::console::hidden_command;
 const MAX_INCLUDE_DEPTH: usize = 8;
 const MAX_WARNINGS: usize = 32;
 const MAX_ALIAS_LEN: usize = 255;
+const RESOLVE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// A concrete alias found in one config file.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -80,6 +86,15 @@ pub fn resolve_effective(
     config_path: Option<&Path>,
     alias: &str,
 ) -> VibexResult<SshEffectiveConfig> {
+    resolve_effective_with_timeout(ssh_binary, config_path, alias, RESOLVE_TIMEOUT)
+}
+
+fn resolve_effective_with_timeout(
+    ssh_binary: &Path,
+    config_path: Option<&Path>,
+    alias: &str,
+    timeout: Duration,
+) -> VibexResult<SshEffectiveConfig> {
     validate_alias(alias)?;
     let mut command = hidden_command(ssh_binary);
     if let Some(path) = config_path {
@@ -87,21 +102,76 @@ pub fn resolve_effective(
     }
     command.arg("-G").arg(alias);
     command.env("LC_ALL", "C");
-    let output = command.output().map_err(|error| {
+    command.stdin(Stdio::null());
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::piped());
+    let mut child = command.spawn().map_err(|error| {
         VibexError::process("ssh_g_spawn_failed", "the SSH client could not be started")
             .with_diagnostic("error", error.to_string())
     })?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+    let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+    if let Some(mut stdout) = child.stdout.take() {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stdout.read_to_end(&mut buffer);
+            let _ = stdout_tx.send(buffer);
+        });
+    } else {
+        let _ = stdout_tx.send(Vec::new());
+    }
+    let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+    if let Some(mut stderr) = child.stderr.take() {
+        thread::spawn(move || {
+            let mut buffer = Vec::new();
+            let _ = stderr.read_to_end(&mut buffer);
+            let _ = stderr_tx.send(buffer);
+        });
+    } else {
+        let _ = stderr_tx.send(Vec::new());
+    }
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Some(status),
+            Ok(None) => {}
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(VibexError::process(
+                    "ssh_g_failed",
+                    "the SSH client status could not be read",
+                )
+                .with_diagnostic("error", error.to_string()));
+            }
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            break None;
+        }
+        thread::sleep(Duration::from_millis(20));
+    };
+    let Some(status) = status else {
+        let stderr = stderr_rx
+            .recv_timeout(Duration::from_millis(200))
+            .unwrap_or_default();
+        return Err(VibexError::process(
+            "ssh_g_timeout",
+            "the SSH client timed out while resolving the host",
+        )
+        .with_diagnostic("stderr", truncate(&String::from_utf8_lossy(&stderr), 512)));
+    };
+    let stdout = stdout_rx.recv().unwrap_or_default();
+    let stderr = stderr_rx.recv().unwrap_or_default();
+    if !status.success() {
+        let stderr = String::from_utf8_lossy(&stderr);
         return Err(VibexError::process(
             "ssh_g_failed",
             "the SSH client could not resolve the host",
         )
         .with_diagnostic("stderr", truncate(&stderr, 512)));
     }
-    Ok(SshEffectiveConfig::parse(&String::from_utf8_lossy(
-        &output.stdout,
-    )))
+    Ok(SshEffectiveConfig::parse(&String::from_utf8_lossy(&stdout)))
 }
 
 pub fn resolve_effective_default(
@@ -398,7 +468,9 @@ fn expand_tilde(value: &str) -> PathBuf {
     {
         return home;
     }
-    if let Some(rest) = value.strip_prefix("~/")
+    if let Some(rest) = value
+        .strip_prefix("~/")
+        .or_else(|| value.strip_prefix("~\\"))
         && let Some(home) = home_dir()
     {
         return home.join(rest);
@@ -406,7 +478,7 @@ fn expand_tilde(value: &str) -> PathBuf {
     PathBuf::from(value)
 }
 
-fn expand_tilde_path(path: &Path) -> PathBuf {
+pub(crate) fn expand_tilde_path(path: &Path) -> PathBuf {
     expand_tilde(&path.to_string_lossy())
 }
 
@@ -594,5 +666,21 @@ mod tests {
     fn rejects_option_like_aliases_before_spawning() {
         let error = resolve_effective(Path::new("ssh"), None, "-oProxyCommand=id").unwrap_err();
         assert_eq!(error.code, "ssh_alias_invalid");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_effective_times_out_a_hung_client() {
+        let dir = tempfile::tempdir().unwrap();
+        let script = crate::ssh_connection::test_support::unique_path(dir.path(), "hung-ssh");
+        crate::ssh_connection::test_support::write_executable(
+            &script,
+            "#!/bin/sh\nexec sleep 30\n",
+        );
+        let _guard = crate::ssh_connection::test_support::process_guard();
+        let error =
+            resolve_effective_with_timeout(&script, None, "build-box", Duration::from_millis(120))
+                .unwrap_err();
+        assert_eq!(error.code, "ssh_g_timeout");
     }
 }

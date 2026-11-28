@@ -118,15 +118,16 @@ pub fn ensure_started(
     reload
         .remote_script(RELOAD_SCRIPT)
         .map_err(|error| LaunchdError::new("ssh_launchd_script_invalid", error.to_string()))?;
-    reload
-        .args
-        .extend(["gui".into(), label.into(), path.clone().into()]);
-    let output = reload.run_with_timeout(STATUS_TIMEOUT).map_err(|error| {
-        LaunchdError::new(
-            "ssh_launchd_bootstrap_failed",
-            format!("{}: {}", error.code(), error.message),
-        )
-    })?;
+    reload.args.extend([
+        "gui".into(),
+        label.into(),
+        path.clone().into(),
+        config.runtime_home.clone().into(),
+        config.log_file.clone().into(),
+    ]);
+    let output = reload
+        .run_with_timeout(STATUS_TIMEOUT)
+        .map_err(|error| map_ssh_failure("ssh_launchd_bootstrap_failed", error))?;
     if !output.status.success() {
         return Err(LaunchdError::new(
             "ssh_launchd_bootstrap_failed",
@@ -165,12 +166,9 @@ pub fn remove(
         .remote_script("rm -f \"$1\"")
         .map_err(|error| LaunchdError::new("ssh_launchd_script_invalid", error.to_string()))?;
     remove.args.push(plist_path(config, label).into());
-    remove.run_with_timeout(STATUS_TIMEOUT).map_err(|error| {
-        LaunchdError::new(
-            "ssh_launchd_remove_failed",
-            format!("{}: {}", error.code(), error.message),
-        )
-    })?;
+    remove
+        .run_with_timeout(STATUS_TIMEOUT)
+        .map_err(|error| map_ssh_failure("ssh_launchd_remove_failed", error))?;
     Ok(())
 }
 
@@ -182,12 +180,9 @@ pub fn stop(command: &SshCommand, label: &str) -> Result<(), LaunchdError> {
         .remote_script(BOOTOUT_SCRIPT)
         .map_err(|error| LaunchdError::new("ssh_launchd_script_invalid", error.to_string()))?;
     bootout.args.extend(["gui".into(), label.into()]);
-    bootout.run_with_timeout(STATUS_TIMEOUT).map_err(|error| {
-        LaunchdError::new(
-            "ssh_launchd_bootout_failed",
-            format!("{}: {}", error.code(), error.message),
-        )
-    })?;
+    bootout
+        .run_with_timeout(STATUS_TIMEOUT)
+        .map_err(|error| map_ssh_failure("ssh_launchd_bootout_failed", error))?;
     Ok(())
 }
 
@@ -201,12 +196,9 @@ fn upload_plist(command: &SshCommand, path: &str, contents: &str) -> Result<(), 
         shell_quote(path).into(),
     ]);
     upload.stdin = Some(contents.as_bytes().to_vec());
-    upload.run_with_timeout(STATUS_TIMEOUT).map_err(|error| {
-        LaunchdError::new(
-            "ssh_launchd_upload_failed",
-            format!("{}: {}", error.code(), error.message),
-        )
-    })?;
+    upload
+        .run_with_timeout(STATUS_TIMEOUT)
+        .map_err(|error| map_ssh_failure("ssh_launchd_upload_failed", error))?;
     Ok(())
 }
 
@@ -280,6 +272,19 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
+fn map_ssh_failure(code: &'static str, error: super::error::SshFailure) -> LaunchdError {
+    let message = if error.stderr_tail.is_empty() {
+        format!("{}: {}", error.code(), error.message)
+    } else {
+        format!("{}: {}: {}", error.code(), error.message, error.stderr_tail)
+    };
+    if error.is_retryable() {
+        LaunchdError::retryable(code, message)
+    } else {
+        LaunchdError::new(code, message)
+    }
+}
+
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\\''"))
 }
@@ -290,10 +295,31 @@ const RELOAD_SCRIPT: &str = r#"set -eu
 domain=$1
 label=$2
 plist=$3
+runtime_home=$4
+log_file=$5
 uid=$(id -u)
-launchctl bootout "$domain/$uid/$label" >/dev/null 2>&1 || true
-launchctl bootstrap "$domain/$uid" "$plist"
-launchctl kickstart -k "$domain/$uid/$label"
+mkdir -p "$runtime_home" "$(dirname "$log_file")"
+target="$domain/$uid"
+launchctl bootout "$target/$label" >/dev/null 2>&1 || true
+launchctl bootout "user/$uid/$label" >/dev/null 2>&1 || true
+attempt=0
+bootstrapped=0
+while [ "$attempt" -lt 3 ]; do
+  if launchctl bootstrap "$target" "$plist" 2>/dev/null; then
+    bootstrapped=1
+    break
+  fi
+  attempt=$((attempt + 1))
+  sleep 1
+done
+if [ "$bootstrapped" -ne 1 ]; then
+  if [ "$domain" = "gui" ] && launchctl bootstrap "user/$uid" "$plist"; then
+    target="user/$uid"
+  else
+    launchctl bootstrap "$target" "$plist"
+  fi
+fi
+launchctl kickstart -k "$target/$label"
 "#;
 
 const BOOTOUT_SCRIPT: &str = r#"set -eu
@@ -301,6 +327,7 @@ domain=$1
 label=$2
 uid=$(id -u)
 launchctl bootout "$domain/$uid/$label" >/dev/null 2>&1 || true
+launchctl bootout "user/$uid/$label" >/dev/null 2>&1 || true
 "#;
 
 #[cfg(test)]

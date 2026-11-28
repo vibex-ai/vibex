@@ -16,6 +16,7 @@ use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use super::console::hidden_command;
@@ -128,16 +129,37 @@ impl WslCommand {
 
     /// Runs a fixed script with exact positional arguments.
     pub fn run_script(&mut self, script: &str, args: &[String]) -> Result<WslOutput, WslError> {
+        self.run_script_with_timeout(script, args, DEFAULT_TIMEOUT)
+    }
+
+    /// Runs a fixed script with an explicit deadline.
+    pub fn run_script_with_timeout(
+        &mut self,
+        script: &str,
+        args: &[String],
+        timeout: Duration,
+    ) -> Result<WslOutput, WslError> {
         self.remote_script(script)?;
         for arg in args {
             self.arg(arg.clone());
         }
-        self.run()
+        self.run_with_timeout(timeout)
     }
 
     /// Uploads bytes to a destination inside the distro without a shell
     /// reparse of the path.
     pub fn upload(&mut self, destination: &str, contents: &[u8]) -> Result<WslOutput, WslError> {
+        self.upload_with_timeout(destination, contents, DEFAULT_TIMEOUT)
+    }
+
+    /// Uploads bytes with an explicit deadline (large server tarballs need
+    /// more than the default 30s timeout).
+    pub fn upload_with_timeout(
+        &mut self,
+        destination: &str,
+        contents: &[u8],
+        timeout: Duration,
+    ) -> Result<WslOutput, WslError> {
         self.args = self.enter_distro_args();
         self.args.extend([
             "--exec".into(),
@@ -148,7 +170,7 @@ impl WslCommand {
             destination.into(),
         ]);
         self.stdin = Some(contents.to_vec());
-        self.run()
+        self.run_with_timeout(timeout)
     }
 
     pub fn run(&self) -> Result<WslOutput, WslError> {
@@ -182,16 +204,35 @@ impl WslCommand {
                 )
             }
         })?;
-        if let Some(input) = &self.stdin
-            && let Some(mut stdin) = child.stdin.take()
-            && stdin.write_all(input).is_err()
-        {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(WslError::new(
-                "wsl_stdin_failed",
-                "the WSL stdin pipe closed early",
-            ));
+        // Drain stdout/stderr and feed stdin on dedicated threads so large
+        // uploads (>64 KiB pipe buffer) or verbose errors never deadlock, and
+        // an early BrokenPipe still surfaces the child's exit diagnostics.
+        let stdin_thread = self.stdin.as_ref().and_then(|input| {
+            let mut stdin = child.stdin.take()?;
+            let input = input.clone();
+            Some(std::thread::spawn(move || {
+                let _ = stdin.write_all(&input);
+            }))
+        });
+        let (stdout_tx, stdout_rx) = mpsc::sync_channel(1);
+        if let Some(mut output) = child.stdout.take() {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = output.read_to_end(&mut buffer);
+                let _ = stdout_tx.send(buffer);
+            });
+        } else {
+            let _ = stdout_tx.send(Vec::new());
+        }
+        let (stderr_tx, stderr_rx) = mpsc::sync_channel(1);
+        if let Some(mut error) = child.stderr.take() {
+            std::thread::spawn(move || {
+                let mut buffer = Vec::new();
+                let _ = error.read_to_end(&mut buffer);
+                let _ = stderr_tx.send(buffer);
+            });
+        } else {
+            let _ = stderr_tx.send(Vec::new());
         }
         let started = Instant::now();
         let mut timed_out = false;
@@ -216,13 +257,25 @@ impl WslCommand {
             }
             std::thread::sleep(Duration::from_millis(25));
         };
-        let mut stdout = Vec::new();
-        let mut stderr = Vec::new();
-        if let Some(mut output) = child.stdout.take() {
-            let _ = output.read_to_end(&mut stdout);
+        if timed_out {
+            let stdout = stdout_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            let stderr = stderr_rx
+                .recv_timeout(Duration::from_millis(200))
+                .unwrap_or_default();
+            let detail = child_detail(&stdout, &stderr);
+            let message = if detail.is_empty() {
+                "the WSL command timed out".to_string()
+            } else {
+                format!("the WSL command timed out: {detail}")
+            };
+            return Err(WslError::retryable("wsl_timeout", message));
         }
-        if let Some(mut error) = child.stderr.take() {
-            let _ = error.read_to_end(&mut stderr);
+        let stdout = stdout_rx.recv().unwrap_or_default();
+        let stderr = stderr_rx.recv().unwrap_or_default();
+        if let Some(handle) = stdin_thread {
+            let _ = handle.join();
         }
         let Some(status) = status else {
             return Err(WslError::retryable(
@@ -320,6 +373,7 @@ impl WslKeepalive {
         distro: &str,
         env_file: &str,
         binary: &str,
+        log_file: &str,
     ) -> Result<Self, WslError> {
         let child = hidden_command(program)
             .args([
@@ -330,10 +384,11 @@ impl WslKeepalive {
                 "--exec",
                 "/bin/sh",
                 "-c",
-                "set -a; . \"$1\"; set +a; exec \"$2\" serve --no-pairing",
+                "set -a; . \"$1\"; set +a; mkdir -p \"$(dirname \"$3\")\"; exec \"$2\" serve --no-pairing >> \"$3\" 2>&1",
                 "sh",
                 env_file,
                 binary,
+                log_file,
             ])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -491,7 +546,7 @@ fn list_distros_with_timeout(program: &Path, timeout: Duration) -> Result<Vec<St
         ));
     };
     if !status.success() {
-        let detail = stderr_detail(&stderr);
+        let detail = child_detail(&stdout, &stderr);
         let exit = status.code().unwrap_or(-1);
         let message = if detail.is_empty() {
             format!("wsl.exe could not list distros (exit {exit})")
@@ -530,11 +585,6 @@ fn child_detail(stdout: &[u8], stderr: &[u8]) -> String {
     joined.chars().take(MAX_DETAIL_CHARS).collect()
 }
 
-/// [`child_detail`] for a caller that only captures stderr.
-fn stderr_detail(stderr: &[u8]) -> String {
-    child_detail(&[], stderr)
-}
-
 pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
     decode_wsl_text(bytes)
         .lines()
@@ -552,17 +602,16 @@ pub fn parse_distro_output(bytes: &[u8]) -> Vec<String> {
 /// therefore decoded as UTF-16LE; anything else is read as UTF-8, lossily,
 /// because a decode failure must not turn into an empty list.
 fn decode_wsl_text(bytes: &[u8]) -> String {
-    if bytes.contains(&0) {
-        bytes
-            .as_chunks::<2>()
-            .0
-            .iter()
+    let decoded = if bytes.contains(&0) {
+        let units: Vec<u16> = bytes
+            .chunks_exact(2)
             .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
-            .filter_map(|unit| char::from_u32(u32::from(unit)))
-            .collect::<String>()
+            .collect();
+        String::from_utf16_lossy(&units)
     } else {
         String::from_utf8_lossy(bytes).into_owned()
-    }
+    };
+    decoded.trim_start_matches('\u{feff}').to_string()
 }
 
 /// Probes the Linux environment inside a distro using the same fixed script as

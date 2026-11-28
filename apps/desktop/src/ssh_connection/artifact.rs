@@ -178,8 +178,10 @@ async fn download_server_artifact_with_read_timeout(
         let _ = fs::remove_file(&path);
     }
 
-    let part = cache_dir.join(format!("{file_name}.part"));
-    let _ = fs::remove_file(&part);
+    let part = cache_dir.join(format!(
+        "{file_name}.{}.part",
+        vibex_core::RequestId::new().as_str()
+    ));
     let client = reqwest::Client::builder()
         .connect_timeout(DOWNLOAD_CONNECT_TIMEOUT)
         .read_timeout(read_timeout)
@@ -232,6 +234,7 @@ async fn download_server_artifact_with_read_timeout(
             Ok(Some(chunk)) => chunk,
             Ok(None) => break,
             Err(error) => {
+                drop(file);
                 let _ = fs::remove_file(&part);
                 return Err(ArtifactError::retryable(
                     "ssh_artifact_download_failed",
@@ -241,6 +244,7 @@ async fn download_server_artifact_with_read_timeout(
         };
         downloaded = downloaded.saturating_add(chunk.len() as u64);
         if downloaded > artifact.size {
+            drop(file);
             let _ = fs::remove_file(&part);
             return Err(ArtifactError::new(
                 "ssh_artifact_size_mismatch",
@@ -249,6 +253,7 @@ async fn download_server_artifact_with_read_timeout(
         }
         hasher.update(&chunk);
         if file.write_all(&chunk).is_err() {
+            drop(file);
             let _ = fs::remove_file(&part);
             return Err(ArtifactError::new(
                 "ssh_artifact_io_failed",
@@ -257,13 +262,17 @@ async fn download_server_artifact_with_read_timeout(
         }
         progress(downloaded, artifact.size);
     }
-    if file.flush().is_err() {
+    if file.flush().is_err() || file.sync_all().is_err() {
+        drop(file);
         let _ = fs::remove_file(&part);
         return Err(ArtifactError::new(
             "ssh_artifact_io_failed",
             "the server artifact cache file could not be flushed",
         ));
     }
+    // Close the handle before removing or renaming so Windows never fails with
+    // a sharing violation.
+    drop(file);
     if downloaded != artifact.size {
         let _ = fs::remove_file(&part);
         return Err(ArtifactError::new(

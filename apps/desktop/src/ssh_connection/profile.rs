@@ -102,6 +102,26 @@ impl SshConnectionProfile {
     /// The managed default mirrors what the launcher derives from the install
     /// root, so "the default" and "an adopted directory" are the same kind of
     /// answer everywhere the profile is read.
+    /// Destination passed to `ssh`.
+    ///
+    /// When the profile came from an `~/.ssh/config` `Host` alias, pass that
+    /// alias so OpenSSH evaluates the full `Host <alias>` stanza (`ProxyJump`,
+    /// `ProxyCommand`, `IdentityFile`, `CertificateFile`, `IdentitiesOnly`,
+    /// `HostKeyAlias`). For manual hosts (`ssh_alias.is_empty()`), target
+    /// `self.host` directly.
+    pub fn ssh_destination(&self) -> super::command::SshDestination {
+        let host = if !self.ssh_alias.is_empty() && super::command::host_is_valid(&self.ssh_alias) {
+            self.ssh_alias.clone()
+        } else {
+            self.host.clone()
+        };
+        super::command::SshDestination {
+            host,
+            user: self.user.clone(),
+            port: self.port,
+        }
+    }
+
     pub fn runtime_home_path(&self) -> String {
         self.runtime_home
             .clone()

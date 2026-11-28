@@ -17499,11 +17499,7 @@ impl VibexWorkbench {
                 .ssh_client_path
                 .clone()
                 .unwrap_or_else(|| PathBuf::from("ssh"));
-            let destination = SshDestination {
-                host: profile.host.clone(),
-                user: profile.user.clone(),
-                port: profile.port,
-            };
+            let destination = profile.ssh_destination();
             let command = SshCommand::for_destination(
                 program,
                 &destination,
@@ -18405,11 +18401,7 @@ impl VibexWorkbench {
         self.ssh_upgrade_running = true;
         self.ssh_upgrade_error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let destination = SshDestination {
-                host: profile.host.clone(),
-                user: profile.user.clone(),
-                port: profile.port,
-            };
+            let destination = profile.ssh_destination();
             let program = profile
                 .ssh_client_path
                 .clone()
@@ -18444,6 +18436,13 @@ impl VibexWorkbench {
             )
             .map_err(|error| format!("{}: {}", error.code, error.message))?
             .with_runtime_home(profile.runtime_home_path());
+            let launch = if profile.macos_lifecycle == SshMacOsLifecycle::LaunchAgent {
+                launch.with_launch_agent(crate::ssh_connection::launchd::label_for_profile(
+                    &profile.id,
+                ))
+            } else {
+                launch
+            };
             let channel = profile
                 .runtime_version
                 .as_deref()
@@ -18532,7 +18531,7 @@ impl VibexWorkbench {
         else {
             return;
         };
-        let Some(runtime_id) = profile.registered_runtime_id else {
+        let Some(runtime_id) = profile.registered_runtime_id.clone() else {
             return;
         };
         if self.runtime_registry.active_runtime_id() != runtime_id {
@@ -18541,7 +18540,7 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime_registry.remote(&runtime_id).cloned() else {
             return;
         };
-        self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
+        self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
     }
 
     #[allow(dead_code)]
@@ -18567,11 +18566,7 @@ impl VibexWorkbench {
             .ssh_client_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("ssh"));
-        let destination = SshDestination {
-            host: profile.host.clone(),
-            user: profile.user.clone(),
-            port: profile.port,
-        };
+        let destination = profile.ssh_destination();
         let command = match SshCommand::for_destination(
             program,
             &destination,
@@ -18793,13 +18788,13 @@ impl VibexWorkbench {
         let stage = Arc::new(std::sync::Mutex::new(PreparingStage::default()));
         self.begin_ssh_provisioning_preparing(profile_id.clone(), stage.clone(), cx);
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            let destination = SshDestination {
-                host: profile.host.clone(),
-                user: profile.user.clone(),
-                port: profile.port,
-            };
+            let destination = profile.ssh_destination();
+            let program = profile
+                .ssh_client_path
+                .clone()
+                .unwrap_or_else(|| PathBuf::from("ssh"));
             let command = SshCommand::for_destination(
-                "ssh",
+                program,
                 &destination,
                 profile.ssh_config_path.as_deref(),
             )
@@ -19475,6 +19470,7 @@ impl VibexWorkbench {
                     (tunnel, _) => self.ssh_tunnel = tunnel,
                 }
                 self.ssh_provisioning_snapshot = Some(snapshot);
+                self.bind_ssh_profile_runtime(&profile_id, &runtime_id, version);
                 self.install_remote_client(
                     DesktopRemoteClient {
                         runtime_id: runtime_id.clone(),
@@ -19484,7 +19480,6 @@ impl VibexWorkbench {
                     cx,
                 );
                 self.mark_runtime_active(&runtime_id, cx);
-                self.bind_ssh_profile_runtime(&profile_id, &runtime_id, version);
                 self.sync_ssh_profile_display_name(&runtime_id, cx);
                 self.sync_ssh_provisioning_settings(cx);
                 cx.notify();
@@ -19773,27 +19768,29 @@ impl VibexWorkbench {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let mut last_error = String::new();
             for attempt in 0..3 {
+                let mut attempt_error: Option<String> = None;
                 match provisioner.start_foreground() {
                     Ok((keepalive, _)) => {
                         let deadline = std::time::Instant::now() + Duration::from_secs(15);
                         while !crate::ssh_connection::wsl::localhost_forwarded(port) {
                             if std::time::Instant::now() >= deadline {
-                                last_error = "WSL2 localhost forwarding is unavailable".to_string();
+                                attempt_error =
+                                    Some("WSL2 localhost forwarding is unavailable".to_string());
                                 break;
                             }
                             tokio::time::sleep(Duration::from_millis(300)).await;
                         }
-                        if last_error.is_empty() {
+                        if attempt_error.is_none() {
                             return Ok(keepalive);
                         }
                     }
                     Err(error) => {
-                        last_error = format!("{}: {}", error.code, error.message);
-                        eprintln!(
-                            "vibex-wsl: restore attempt {} failed: {last_error}",
-                            attempt + 1
-                        );
+                        attempt_error = Some(format!("{}: {}", error.code, error.message));
                     }
+                }
+                if let Some(err) = attempt_error {
+                    eprintln!("vibex-wsl: restore attempt {} failed: {err}", attempt + 1);
+                    last_error = err;
                 }
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
@@ -19899,9 +19896,7 @@ impl VibexWorkbench {
         self.ssh_tunnel_spec.as_ref().is_some_and(|spec| {
             spec.local_port == profile.local_tunnel_port
                 && spec.remote_port == profile.remote_port
-                && spec.destination.host == profile.host
-                && spec.destination.port == profile.port
-                && spec.destination.user == profile.user
+                && spec.destination == profile.ssh_destination()
         })
     }
 
@@ -19916,11 +19911,7 @@ impl VibexWorkbench {
             .ssh_client_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("ssh"));
-        let destination = SshDestination {
-            host: profile.host.clone(),
-            user: profile.user.clone(),
-            port: profile.port,
-        };
+        let destination = profile.ssh_destination();
         let command =
             SshCommand::for_destination(program, &destination, profile.ssh_config_path.as_deref())
                 .ok()?;
@@ -19949,62 +19940,139 @@ impl VibexWorkbench {
         let generation = self.ssh_tunnel_generation;
         let task = cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
+                const STABILITY_WINDOW: Duration = Duration::from_secs(30);
+                const MAX_RAPID_RESTARTS: u32 = 5;
+                let mut backoff = crate::ssh_connection::TunnelBackoff::new(
+                    Duration::from_secs(1),
+                    Duration::from_secs(30),
+                )
+                .ok();
+                let mut started_at = std::time::Instant::now();
+                let mut rapid_exits: u32 = 0;
                 loop {
                     cx.background_executor()
                         .timer(Duration::from_millis(500))
                         .await;
-                    let exited = entity.update(cx, |this, _| {
+                    let check = entity.update(cx, |this, _| {
                         if this.ssh_tunnel_generation != generation {
                             return None;
                         }
-                        Some(
-                            this.ssh_tunnel
-                                .as_mut()
-                                .is_none_or(|tunnel| tunnel.try_wait().ok().flatten().is_some()),
-                        )
-                    });
-                    match exited {
-                        Ok(Some(false)) => continue,
-                        Ok(Some(true)) => {
-                            let restarted = entity.update(cx, |this, cx| {
-                                if this.ssh_tunnel_generation != generation {
-                                    return None;
+                        match this.ssh_tunnel.as_mut() {
+                            Some(tunnel) => {
+                                if tunnel.try_wait().ok().flatten().is_some() {
+                                    let stderr = tunnel.stderr_tail();
+                                    let spec = this.ssh_tunnel_spec.clone();
+                                    this.ssh_tunnel = None;
+                                    Some(Some((spec, stderr)))
+                                } else {
+                                    Some(None)
                                 }
-                                let Some(spec) = this.ssh_tunnel_spec.clone() else {
-                                    return Some(false);
-                                };
-                                match TunnelProcess::spawn(&spec) {
-                                    Ok(tunnel) => {
-                                        this.ssh_tunnel = Some(tunnel);
-                                        this.runtime_note = Some(
-                                            locale::text(
-                                                "SSH tunnel restarted",
-                                                "SSH 隧道已重启",
-                                                "SSH 通道已重新啟動",
-                                            )
-                                            .to_string(),
-                                        );
-                                        cx.notify();
-                                        Some(true)
-                                    }
-                                    Err(error) => {
-                                        let message = format!("{}: {}", error.code, error.message);
-                                        let active =
-                                            this.runtime_registry.active_runtime_id().to_string();
-                                        if active != LOCAL_RUNTIME_ID {
-                                            this.runtime_connect_errors
-                                                .insert(active, message.clone());
-                                        }
-                                        this.runtime_note_error = Some(message);
-                                        cx.notify();
-                                        Some(false)
-                                    }
-                                }
-                            });
-                            match restarted {
-                                Ok(Some(true)) => continue,
-                                _ => break,
                             }
+                            None => Some(Some((this.ssh_tunnel_spec.clone(), String::new()))),
+                        }
+                    });
+                    let Some((maybe_spec, stderr_tail)) = (match check {
+                        Ok(Some(None)) => {
+                            if started_at.elapsed() >= STABILITY_WINDOW {
+                                rapid_exits = 0;
+                                if let Some(backoff) = backoff.as_mut() {
+                                    backoff.reset();
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(Some(Some(exit))) => Some(exit),
+                        _ => None,
+                    }) else {
+                        break;
+                    };
+                    let Some(spec) = maybe_spec else {
+                        break;
+                    };
+                    rapid_exits = rapid_exits.saturating_add(1);
+                    if rapid_exits > MAX_RAPID_RESTARTS {
+                        let _ = entity.update(cx, |this, cx| {
+                            if this.ssh_tunnel_generation != generation {
+                                return;
+                            }
+                            let message = if stderr_tail.is_empty() {
+                                locale::text(
+                                    "SSH tunnel exited repeatedly; reconnect manually.",
+                                    "SSH 隧道反复断开，请手动重新连接。",
+                                    "SSH 通道反覆中斷，請手動重新連線。",
+                                )
+                                .to_string()
+                            } else {
+                                format!(
+                                    "{}: {stderr_tail}",
+                                    locale::text(
+                                        "SSH tunnel exited repeatedly",
+                                        "SSH 隧道反复断开",
+                                        "SSH 通道反覆中斷",
+                                    )
+                                )
+                            };
+                            let active = this.runtime_registry.active_runtime_id().to_string();
+                            if active != LOCAL_RUNTIME_ID {
+                                this.runtime_connect_errors.insert(active, message.clone());
+                            }
+                            this.runtime_note_error = Some(message);
+                            this.sync_connections_live_status(cx);
+                            cx.notify();
+                        });
+                        break;
+                    }
+                    let delay = backoff
+                        .as_mut()
+                        .map(|backoff| backoff.next_delay())
+                        .unwrap_or_else(|| Duration::from_secs(1));
+                    cx.background_executor().timer(delay).await;
+                    let still_active = entity
+                        .update(cx, |this, _| this.ssh_tunnel_generation == generation)
+                        .unwrap_or(false);
+                    if !still_active {
+                        break;
+                    }
+                    let spawn_spec = spec.clone();
+                    let spawn_result = cx
+                        .background_executor()
+                        .spawn(async move { TunnelProcess::spawn(&spawn_spec) })
+                        .await;
+                    let restarted = entity.update(cx, |this, cx| {
+                        if this.ssh_tunnel_generation != generation {
+                            return None;
+                        }
+                        match spawn_result {
+                            Ok(tunnel) => {
+                                this.ssh_tunnel = Some(tunnel);
+                                this.runtime_note = Some(
+                                    locale::text(
+                                        "SSH tunnel restarted",
+                                        "SSH 隧道已重启",
+                                        "SSH 通道已重新啟動",
+                                    )
+                                    .to_string(),
+                                );
+                                cx.notify();
+                                Some(true)
+                            }
+                            Err(error) => {
+                                let message = format!("{}: {}", error.code, error.message);
+                                let active = this.runtime_registry.active_runtime_id().to_string();
+                                if active != LOCAL_RUNTIME_ID {
+                                    this.runtime_connect_errors.insert(active, message.clone());
+                                }
+                                this.runtime_note_error = Some(message);
+                                this.sync_connections_live_status(cx);
+                                cx.notify();
+                                Some(false)
+                            }
+                        }
+                    });
+                    match restarted {
+                        Ok(Some(true)) => {
+                            started_at = std::time::Instant::now();
+                            continue;
                         }
                         _ => break,
                     }
@@ -20103,11 +20171,7 @@ impl VibexWorkbench {
             .ssh_client_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("ssh"));
-        let destination = SshDestination {
-            host: profile.host.clone(),
-            user: profile.user.clone(),
-            port: profile.port,
-        };
+        let destination = profile.ssh_destination();
         let config_path = profile.ssh_config_path.clone();
         let command =
             match SshCommand::for_destination(program, &destination, config_path.as_deref()) {
@@ -20766,7 +20830,9 @@ impl VibexWorkbench {
         let Some(runtime) = self.runtime_registry.remote(&id).cloned() else {
             return;
         };
-        if let Some(profile) = self.ssh_profile_for_runtime(&id) {
+        if let Some(profile) = self.wsl_profile_for_runtime(&id) {
+            self.begin_wsl_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
+        } else if let Some(profile) = self.ssh_profile_for_runtime(&id) {
             self.begin_ssh_restore(runtime, profile, RuntimeConnectOrigin::Switch, cx);
         } else {
             self.begin_remote_connect(runtime, RuntimeConnectOrigin::Switch, cx);
@@ -101352,8 +101418,14 @@ impl FoundationSettings {
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
             let effective = resolve_effective_default(config_path.as_deref(), &alias)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let resolved_host = effective.hostname.clone().unwrap_or_else(|| alias.clone());
+            let target_host = if crate::ssh_connection::command::host_is_valid(&alias) {
+                alias.clone()
+            } else {
+                resolved_host.clone()
+            };
             let destination = SshDestination {
-                host: effective.hostname.clone().unwrap_or_else(|| alias.clone()),
+                host: target_host,
                 user: effective.user.clone(),
                 port: effective.port.unwrap_or(22),
             };
@@ -101380,7 +101452,7 @@ impl FoundationSettings {
                 id: connections_profile_id(&alias, now),
                 display_name: alias.clone(),
                 ssh_alias: alias.clone(),
-                host: destination.host.clone(),
+                host: resolved_host,
                 user: destination.user.clone(),
                 port: destination.port,
                 ssh_client_path: None,
@@ -103672,11 +103744,7 @@ impl FoundationSettings {
             .ssh_client_path
             .clone()
             .unwrap_or_else(|| PathBuf::from("ssh"));
-        let destination = SshDestination {
-            host: profile.host.clone(),
-            user: profile.user.clone(),
-            port: profile.port,
-        };
+        let destination = profile.ssh_destination();
         let command = match SshCommand::for_destination(
             program,
             &destination,

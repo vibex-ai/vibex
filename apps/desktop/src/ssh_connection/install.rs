@@ -139,18 +139,18 @@ elif command -v shasum >/dev/null 2>&1; then
   actual=$(shasum -a 256 "$incoming" | awk '{print $1}')
 else
   rm -f "$incoming"
-  echo "install=sha_tool_missing"
+  echo "install=sha_tool_missing" >&2
   exit 2
 fi
 if [ "$actual" != "$expected" ]; then
   rm -f "$incoming"
-  echo "install=hash_mismatch"
+  echo "install=hash_mismatch" >&2
   exit 2
 fi
 listing=$(tar -tzf "$incoming")
 if [ "$listing" != "vibex-server" ]; then
   rm -f "$incoming"
-  echo "install=manifest_invalid"
+  echo "install=manifest_invalid" >&2
   exit 3
 fi
 work="$root/.install-$$"
@@ -166,9 +166,9 @@ old=""
 if [ -L "$root/current" ]; then
   old=$(readlink "$root/current")
 fi
-if [ -n "$old" ]; then
+if [ -n "$old" ] && [ "$old" != "$version" ]; then
   ln -sfn "$old" "$root/previous"
-else
+elif [ -z "$old" ]; then
   rm -f "$root/previous"
 fi
 rm -f "$root/.current.tmp"
@@ -195,7 +195,10 @@ fn shell_quote(value: &str) -> String {
 }
 
 fn incoming_path(remote_root: &str, version: &str) -> String {
-    format!("{remote_root}/.incoming-{version}.tar.gz")
+    format!(
+        "{remote_root}/.incoming-{version}-{}.tar.gz",
+        vibex_core::RequestId::new().as_str()
+    )
 }
 
 fn validate_remote_root(root: &str) -> Result<(), InstallError> {

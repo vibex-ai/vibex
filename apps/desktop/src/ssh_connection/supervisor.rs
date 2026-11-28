@@ -128,8 +128,7 @@ pub fn parse_status(stdout: &str) -> Result<ServerStatus, SupervisorError> {
     Ok(status)
 }
 
-/// Runs the server's idempotent stop and confirms it is down.
-pub fn stop(command: &SshCommand, config: &LaunchConfig) -> Result<StopOutcome, SupervisorError> {
+fn send_stop(command: &SshCommand, config: &LaunchConfig) -> Result<StopOutcome, SupervisorError> {
     let output = run_script(
         command,
         STOP_SCRIPT,
@@ -145,14 +144,26 @@ pub fn stop(command: &SshCommand, config: &LaunchConfig) -> Result<StopOutcome, 
             "the remote runtime did not confirm the stop",
         ));
     }
-    let current = status(command, config)?;
-    if current.running {
-        return Err(SupervisorError::new(
-            "ssh_runtime_still_running",
-            "the remote runtime is still running after stop",
-        ));
-    }
     Ok(StopOutcome { already_stopped })
+}
+
+/// Runs the server's idempotent stop and waits up to `STOP_DEADLINE` for it to exit.
+pub fn stop(command: &SshCommand, config: &LaunchConfig) -> Result<StopOutcome, SupervisorError> {
+    let outcome = send_stop(command, config)?;
+    let deadline = Instant::now() + STOP_DEADLINE;
+    loop {
+        let current = status(command, config)?;
+        if !current.running {
+            return Ok(outcome);
+        }
+        if Instant::now() >= deadline {
+            return Err(SupervisorError::retryable(
+                "ssh_runtime_still_running",
+                "the remote runtime is still running after stop",
+            ));
+        }
+        thread::sleep(STATUS_POLL);
+    }
 }
 
 /// Picks the first port in `preferred..preferred+10` that `ss` reports free.
@@ -259,7 +270,7 @@ pub fn ensure_stopped(
             already_stopped: true,
         });
     }
-    let outcome = stop(command, config)?;
+    let outcome = send_stop(command, config)?;
     let deadline = Instant::now() + STOP_DEADLINE;
     loop {
         let current = status(command, config)?;
@@ -298,6 +309,12 @@ pub const PORT_SCRIPT: &str = r#"set -eu
 port=$1
 if command -v ss >/dev/null 2>&1; then
   if [ "$(ss -ltn "sport = :$port" 2>/dev/null | wc -l)" -gt 1 ]; then
+    echo busy
+  else
+    echo free
+  fi
+elif command -v lsof >/dev/null 2>&1; then
+  if lsof -nP -iTCP:$port -sTCP:LISTEN >/dev/null 2>&1; then
     echo busy
   else
     echo free
