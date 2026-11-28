@@ -4816,6 +4816,33 @@ impl AgentManager {
         if let Some(running) = self.client_session_snapshot(&conn, &session.id)? {
             self.publish_root_session_update(&conn, running);
         }
+        // A new prompt supersedes whatever the previous turn left unanswered:
+        // the reader typed past the card, so it can no longer be the session's
+        // live question. The desktop projection already stops counting it from
+        // the new user message onwards, but the durable row and the timeline
+        // item stayed `Pending` — so a client that loads the session fresh (a
+        // phone opening an old conversation, for instance) found the abandoned
+        // form, drew it as the thing the session was waiting on, and got
+        // `acp_elicitation_process_missing` for every press. Answering the
+        // rows here makes "typed past the card" mean the same thing to the
+        // authority as it already means to the projection.
+        //
+        // A steer is excluded by the caller (`UserMessageDelivery::Steer`
+        // joins the turn that is already running), and a turn that is not
+        // being claimed from a settled session has nothing to supersede. The
+        // resolution is best effort: a failure to write it must not refuse the
+        // prompt the reader just typed.
+        if request.delivery != UserMessageDelivery::Steer
+            && let Err(error) =
+                self.cancel_pending_user_input_requests(&mut conn, &session.id, "superseded")
+        {
+            tracing::warn!(
+                target: "vibex_agent",
+                session_id = %session.id,
+                error_code = %error.code,
+                "an abandoned user-input request could not be resolved before a new prompt"
+            );
+        }
 
         let user_item = if display.display_user_message {
             let appended_user = match self.append_timeline_item(
@@ -5806,7 +5833,7 @@ impl AgentManager {
         .with_diagnostic("sessionId", session_id.as_str()))
     }
 
-    /// Answers every user-input request a cancelled turn left open.
+    /// Answers every user-input request a stopped or failed turn left open.
     ///
     /// An interrupt cancels the Agent's native callbacks, but that only
     /// silences the child process: the durable request rows stay `Pending`.
@@ -5816,6 +5843,15 @@ impl AgentManager {
     /// Recording the abandoned resolutions here — and publishing them as
     /// timeline items — lets each surface drop the request from the same event
     /// that cancelled it.
+    ///
+    /// A turn that ends abnormally needs the same treatment for the same
+    /// reason, and it arrives here through the error finalizer instead of
+    /// [`Self::interrupt`]: a timeout, a provider crash, or a stop reason that
+    /// is not a completed reply takes the attachment's turn guard with it,
+    /// which drains the native callbacks. Nothing can answer the durable rows
+    /// afterwards, so leaving them pending is what kept a finished session
+    /// asking a mobile client for a form whose submission toasts
+    /// `acp_elicitation_process_missing`.
     ///
     /// A request the reader answered concurrently is left alone: it already has
     /// a resolution, and the interrupt must not overwrite it or fail over a
@@ -7096,6 +7132,30 @@ impl AgentManager {
             err,
             execution_attribution,
         );
+        // A turn that dies on a timeout, a provider crash or an abnormal stop
+        // reason takes the attachment's turn guard with it, and the guard
+        // drains the native callbacks the cards were raised from. The durable
+        // rows are the only record left, so they must not stay `Pending`: no
+        // client can answer a callback that no longer exists, and a client
+        // that reloads the session later paints the abandoned form forever
+        // (`acp_elicitation_process_missing` on every press). Answering them
+        // here — before the state lands in `Error` — is what makes the failure
+        // final for every surface.
+        //
+        // No native drain is needed: the callbacks this turn owned are already
+        // gone, which is exactly why the rows had to be answered. A resolution
+        // that loses to a concurrent answer is skipped by the pending-only
+        // compare-and-set, and a sweep failure must never replace the provider
+        // error the reader needs to see — it is logged instead.
+        if let Err(error) = self.cancel_pending_user_input_requests(conn, session_id, "turn_failed")
+        {
+            tracing::warn!(
+                target: "vibex_agent",
+                session_id = %session_id,
+                error_code = %error.code,
+                "abandoned user-input requests could not be resolved after a turn failure"
+            );
+        }
         SessionRepository::update_state(conn, session_id, AgentSessionState::Error)?;
         if let Some(session) = SessionRepository::get(conn, session_id)? {
             self.publish_root_session_update(conn, session);
@@ -12498,6 +12558,125 @@ mod tests {
         );
 
         drop(conn);
+        cleanup_db(&db_path);
+        let _ = fs::remove_dir_all(workspace_root);
+    }
+
+    /// A turn that fails must answer the cards it was parked on.
+    ///
+    /// The reported bug: a session asked a question, the reader ignored it,
+    /// and the turn then died on `acp_request_timeout`. The ACP turn guard
+    /// drained the native callback on its way out, but the durable row stayed
+    /// `Pending`, so the session kept advertising a question. Opening the
+    /// finished conversation on a phone drew that form again, and every press
+    /// failed with `acp_elicitation_process_missing` — there was no process
+    /// left to answer. The failure path must record the abandoned resolution
+    /// the same way an interrupt does, so the row and the timeline agree with
+    /// the runtime that the card is gone.
+    #[test]
+    fn a_failed_turn_resolves_the_requests_it_abandoned() {
+        let db_path = temp_db_path("failed-turn-abandoned-card");
+        let workspace_root = temp_workspace_path("failed-turn-abandoned-card");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let manager = AgentManager::new(&db_path).unwrap();
+        let mut conn = manager.open_migrated().unwrap();
+        let (project, workspace) =
+            WorkspaceRepository::ensure(&conn, &workspace_root, WorkspaceMode::CurrentCheckout)
+                .unwrap();
+        let session = insert_session(
+            &conn,
+            "failed turn abandoned card",
+            &project.id,
+            &workspace.id,
+            &workspace.root_path,
+            AgentId::parse("failed-turn-card-agent").unwrap(),
+            AgentSessionState::Running,
+        );
+        let now = unix_timestamp_ms();
+        let permission = PermissionRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            project_id: Some(project.id.clone()),
+            workspace_id: Some(workspace.id.clone()),
+            provider_request_id: Some("acp-permission-failed-turn".to_string()),
+            risk_category: PermissionRiskCategory::Command,
+            title: "Run the migration?".to_string(),
+            details: Vec::new(),
+            allowed_responses: vec![
+                PermissionResponseKind::Approve,
+                PermissionResponseKind::Deny,
+            ],
+            response_options: Vec::new(),
+            status: PermissionRequestStatus::Pending,
+            requested_at_ms: now,
+            expires_at_ms: None,
+        };
+        let elicitation = ElicitationRequest {
+            id: vibex_core::RequestId::new(),
+            session_id: session.id.clone(),
+            provider_request_id: Some("acp-elicitation-failed-turn".to_string()),
+            tool_call_id: None,
+            message: "Which branch should I use?".to_string(),
+            title: Some("Branch".to_string()),
+            description: None,
+            fields: Vec::new(),
+            status: vibex_core::ElicitationRequestStatus::Pending,
+            requested_at_ms: now,
+        };
+        PermissionRepository::insert_request(&conn, &permission).unwrap();
+        ElicitationRepository::insert_request(&conn, &elicitation).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::NeedsInput).unwrap();
+
+        manager
+            .finish_turn_with_error_on_conn(
+                &mut conn,
+                &session.id,
+                &VibexError::provider("acp_request_timeout", "the Agent did not answer in time"),
+            )
+            .unwrap();
+
+        assert_eq!(
+            SessionRepository::get(&conn, &session.id)
+                .unwrap()
+                .unwrap()
+                .state,
+            AgentSessionState::Error
+        );
+        assert!(
+            PermissionRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty(),
+            "a failed turn cannot leave an answerable permission card behind"
+        );
+        assert!(
+            ElicitationRepository::pending_for_session(&conn, &session.id)
+                .unwrap()
+                .is_empty(),
+            "a failed turn cannot leave an answerable question behind"
+        );
+        let last = TimelineRepository::latest_sequence(&conn, &session.id).unwrap();
+        let timeline = TimelineRepository::fetch_range(&conn, &session.id, 1, last).unwrap();
+        assert!(
+            timeline.iter().any(|item| matches!(
+                &item.payload,
+                TimelinePayload::PermissionResolution(resolution)
+                    if resolution.request_id == permission.id
+                        && resolution.note.as_deref() == Some("turn_failed")
+            )),
+            "the abandoned permission needs a resolution every client can drop it by"
+        );
+        assert!(
+            timeline.iter().any(|item| matches!(
+                &item.payload,
+                TimelinePayload::ElicitationResolution(resolution)
+                    if resolution.request_id == elicitation.id
+                        && resolution.action
+                            == vibex_core::ElicitationResolutionAction::Cancel
+            )),
+            "the abandoned question needs a resolution every client can drop it by"
+        );
+        drop(conn);
+
         cleanup_db(&db_path);
         let _ = fs::remove_dir_all(workspace_root);
     }

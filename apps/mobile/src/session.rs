@@ -5433,6 +5433,16 @@ impl SessionService {
     ///
     /// The newest pending request wins: a runtime blocks on one at a time per
     /// session, and an older one still marked pending cannot be answered.
+    ///
+    /// The search is scoped to the live turn, exactly as the desktop
+    /// projection scopes it. A request an earlier turn left behind is not news
+    /// once a later prompt has claimed the session: an interrupt, a failed
+    /// turn or a reader who simply typed past the card cancels the native
+    /// callback without rewriting the request's own row, so the item stays
+    /// `Pending` in the transcript forever. Counting it from the whole
+    /// timeline is what made a phone opening a finished conversation draw a
+    /// form nothing could answer — and every press toasted
+    /// `acp_elicitation_process_missing`.
     fn refresh_pending(&self) {
         let Some(active) = self.active.get_untracked() else {
             self.pending.set(None);
@@ -5451,12 +5461,17 @@ impl SessionService {
             // it was projected from. Read the resolutions first, or this phone
             // keeps drawing a form the runtime has already taken.
             let answered = answered_requests(&model.items);
+            // The requests the live turn is still waiting on, from the shared
+            // projection. Anything older belongs to a turn the session has
+            // already moved past.
+            let live = vibex_desktop_model::live_turn_pending_permission_ids(&model.items);
             for item in model.items.iter().rev() {
                 match &item.payload {
                     TimelinePayload::PermissionRequest(request)
                         if pending.is_none()
                             && request.status == PermissionRequestStatus::Pending
                             && request.session_id.as_str() == active
+                            && live.contains(request.id.as_str())
                             && !answered.contains(request.id.as_str()) =>
                     {
                         pending = Some(permission_pending(request));
@@ -5465,6 +5480,7 @@ impl SessionService {
                         if question.is_none()
                             && request.status == ElicitationRequestStatus::Pending
                             && request.session_id.as_str() == active
+                            && live.contains(request.id.as_str())
                             && !answered.contains(request.id.as_str()) =>
                     {
                         question = Some(pending_question(request));
@@ -5614,7 +5630,25 @@ impl SessionService {
                     service.reload(&session_id);
                     crate::settings::haptic(nsh_core::Haptic::Selection);
                 }
-                Ok(Err(error)) => service.fail(&error),
+                Ok(Err(error)) => {
+                    // A card the runtime no longer holds can never be
+                    // answered: the request was settled elsewhere (another
+                    // device, an interrupt, the expiry sweep) or its provider
+                    // process is gone. Retrying it just repeats the same
+                    // failure under the reader's finger, so the card is
+                    // retired here and the transcript is re-read for the
+                    // authoritative state.
+                    if card_is_gone(&error) {
+                        if is_active {
+                            service.question.set(None);
+                            *service.question_request.borrow_mut() = None;
+                        }
+                        service.error.set(None);
+                        service.reload(&session_id);
+                    } else {
+                        service.fail(&error);
+                    }
+                }
                 Err(error) => service.fail(&BackendError::failed(
                     "session_task_failed",
                     format!("resolving the question did not finish: {error}"),
@@ -12317,6 +12351,27 @@ fn runtime_source_label(source: &vibex_core::RuntimeAuthSource, raw_label: &str)
     }
 }
 
+/// Whether a failed card submission can never succeed on a retry.
+///
+/// A card outlives its provider callback: the request row is durable, the
+/// callback is not. Once the process that raised it is gone — the turn failed,
+/// the runtime was replaced, another device answered it first — the runtime
+/// answers every press with one of these codes. Retrying only repeats the
+/// failure, so the card is retired and the transcript re-read instead.
+fn card_is_gone(error: &BackendError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "acp_elicitation_process_missing"
+            | "acp_permission_process_missing"
+            | "acp_elicitation_attachment_mismatch"
+            | "elicitation_request_not_pending"
+            | "permission_request_not_pending"
+            | "agent_elicitation_not_pending"
+            | "elicitation_request_not_found"
+            | "permission_request_not_found"
+    )
+}
+
 /// The requests the transcript already carries an answer for.
 ///
 /// Answering appends a resolution row rather than rewriting the request's own,
@@ -13332,6 +13387,174 @@ mod optimistic_send_tests {
         }))
     }
 
+    /// A question an earlier turn left behind must not become the phone's
+    /// live card again.
+    ///
+    /// The reported bug: a session asked a form, the reader ignored it, the
+    /// turn then failed, and the conversation was finished. Opening it on a
+    /// phone drew the form anyway — the request's own row is still `Pending`
+    /// in the transcript, because a cancelled callback never rewrites it — and
+    /// pressing either button failed, so the form could never be dismissed.
+    /// The card is scoped to the live turn, which is what the desktop
+    /// projection already does: a later prompt claims the session, and the
+    /// abandoned request stops being its question.
+    #[component]
+    fn EarlierTurnQuestionProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+        let (session_id, _) = seed_existing_session(&service);
+        let abandoned = RequestId::new();
+        let question = |id: &RequestId| {
+            TimelinePayload::ElicitationRequest(vibex_core::ElicitationRequest {
+                id: id.clone(),
+                session_id: session_id.clone(),
+                provider_request_id: Some("acp-elicitation-abandoned".to_owned()),
+                tool_call_id: None,
+                message: "Which branch should I use?".to_owned(),
+                title: Some("Branch".to_owned()),
+                description: None,
+                fields: Vec::new(),
+                status: vibex_core::ElicitationRequestStatus::Pending,
+                requested_at_ms: 1_000,
+            })
+        };
+        let prompt = |text: &str| {
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: text.to_owned(),
+                ..UserMessagePayload::default()
+            })
+        };
+        // The first turn asked and was abandoned; a second prompt then claimed
+        // the session and the conversation finished.
+        service.apply_page(
+            &session_id,
+            make_timeline_page(
+                &session_id,
+                vec![
+                    make_timeline_item(
+                        &session_id,
+                        1,
+                        1_000,
+                        vibex_core::TimelineSource::User,
+                        prompt("first"),
+                    ),
+                    make_timeline_item(
+                        &session_id,
+                        2,
+                        1_100,
+                        vibex_core::TimelineSource::Provider,
+                        question(&abandoned),
+                    ),
+                    make_timeline_item(
+                        &session_id,
+                        3,
+                        1_200,
+                        vibex_core::TimelineSource::User,
+                        prompt("second"),
+                    ),
+                    make_timeline_item(
+                        &session_id,
+                        4,
+                        1_300,
+                        vibex_core::TimelineSource::Agent,
+                        TimelinePayload::AgentMessage(vibex_core::AgentMessagePayload {
+                            text: "done".to_owned(),
+                            is_final: true,
+                        }),
+                    ),
+                ],
+            ),
+        );
+        assert!(
+            service.question.get_untracked().is_none(),
+            "a question the live turn did not ask must not open a form"
+        );
+        assert!(service.pending.get_untracked().is_none());
+
+        // The same request inside the live turn is the live question.
+        let current = RequestId::new();
+        service.apply_page(
+            &session_id,
+            make_timeline_page(
+                &session_id,
+                vec![
+                    make_timeline_item(
+                        &session_id,
+                        1,
+                        2_000,
+                        vibex_core::TimelineSource::User,
+                        prompt("third"),
+                    ),
+                    make_timeline_item(
+                        &session_id,
+                        2,
+                        2_100,
+                        vibex_core::TimelineSource::Provider,
+                        question(&current),
+                    ),
+                ],
+            ),
+        );
+        assert_eq!(
+            service
+                .question
+                .get_untracked()
+                .as_ref()
+                .map(|question| question.request_id.as_str()),
+            Some(current.as_str()),
+            "the live turn's question is the one the card must show"
+        );
+
+        service.shutdown();
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "earlier-turn-question-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn an_earlier_turns_question_is_not_the_live_card() {
+        let config = EngineConfig::new(Root::of::<EarlierTurnQuestionProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("earlier-turn-question-ok").unwrap();
+    }
+
+    #[test]
+    fn a_dead_card_is_recognized_as_unanswerable() {
+        for code in [
+            "acp_elicitation_process_missing",
+            "acp_permission_process_missing",
+            "acp_elicitation_attachment_mismatch",
+            "elicitation_request_not_pending",
+            "permission_request_not_pending",
+            "elicitation_request_not_found",
+        ] {
+            assert!(
+                card_is_gone(&BackendError::failed(code, "gone")),
+                "{code} means the card cannot be answered any more"
+            );
+        }
+        assert!(
+            !card_is_gone(&BackendError::failed(
+                "remote_rpc_timeout",
+                "the request may still succeed"
+            )),
+            "a transient failure must leave the card up for a retry"
+        );
+    }
     #[test]
     fn existing_session_optimistic_send_handoff_and_rollback() {
         let config = EngineConfig::new(Root::of::<OptimisticSendFlowProbe>());
