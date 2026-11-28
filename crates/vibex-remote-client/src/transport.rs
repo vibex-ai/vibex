@@ -1064,6 +1064,11 @@ pub fn claim_pairing_offer_via_relay(
                 "Relay pairing Ready omitted the PC ephemeral key",
             )
         })?;
+        // The PC binds the Ready transcript and its authentication proof to the
+        // permission context it resolved for this device, so the pairing claim
+        // must hash the same value. Passing `None` here made every first pairing
+        // fail the transcript check as soon as the PC knew the device.
+        let permission_context = ready.permission_context_hash.as_deref();
         let expected_hash = relay_transcript_hash_with_ephemeral(
             ready.protocol_version,
             &endpoint,
@@ -1075,7 +1080,7 @@ pub fn claim_pairing_offer_via_relay(
             &ready.peer_id,
             &ready.public_key,
             &pc_ephemeral_public_key,
-            None,
+            permission_context,
             RelayCryptoSuite::DirectionalV2,
         )
         .map_err(BackendError::from)?;
@@ -1096,7 +1101,7 @@ pub fn claim_pairing_offer_via_relay(
             &ready.peer_id,
             &ready.public_key,
             &pc_ephemeral_public_key,
-            None,
+            permission_context,
             RelayCryptoSuite::DirectionalV2,
         )
         .map_err(BackendError::from)?;
