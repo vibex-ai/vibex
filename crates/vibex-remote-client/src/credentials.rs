@@ -495,6 +495,13 @@ impl ClientDeviceIdentity {
         &self.device_id
     }
 
+    pub fn with_device_id(&self, device_id: DeviceId) -> Self {
+        Self {
+            device_id,
+            private_key: self.private_key,
+        }
+    }
+
     pub fn public_key_base64(&self) -> String {
         URL_SAFE_NO_PAD.encode(PublicKey::from(&StaticSecret::from(self.private_key)).as_bytes())
     }

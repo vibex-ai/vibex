@@ -64,7 +64,9 @@ const MAX_EVENT_QUEUE_CAPACITY: usize = 8192;
 const MAX_BINARY_QUEUE_CAPACITY: usize = 4096;
 const MAX_HTTP_JSON_BYTES: usize = 64 * 1024;
 const MAX_PINNED_TLS_CERTIFICATE_BYTES: usize = 8 * 1024;
-const PROJECTION_INVALIDATION_CHANNEL_COUNT: usize = 4;
+const PROJECTION_INVALIDATION_CHANNEL_COUNT: usize = 7;
+const SOCKET_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+const HANDSHAKE_STEP_TIMEOUT: Duration = Duration::from_secs(15);
 const RELAY_REMOTE_JSON_KIND: RelayFrameKind = RelayFrameKind::Command;
 
 #[cfg(target_os = "android")]
@@ -1366,6 +1368,7 @@ pub trait RemoteTransport: BackendBound {
     fn cursors(&self) -> Vec<RemoteStreamCursor>;
     fn seed_cursors(&self, _cursors: Vec<RemoteStreamCursor>) {}
     fn clear_unknown_mutation(&self, _request_id: &RequestId) {}
+    fn acknowledge_domain_resync(&self, _domain: &str, _generation: u64, _sequence: u64) {}
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1494,6 +1497,8 @@ impl TransportInner {
             "provider",
             "device",
             "runtime",
+            "scheduled",
+            "automation",
         ]);
         sync.register_ephemeral_domain("agent_notification");
         Self {
@@ -2012,6 +2017,7 @@ impl DirectWebSocketTransport {
         let cursors = self.cursors();
         if let Ok(mut sync) = self.inner.sync.lock() {
             sync.rewind_connection_channel("agent_session");
+            sync.rewind_connection_channel("agent_notification");
         }
         let subscription = self
             .subscribe(RemoteSubscribeRequestV2 {
@@ -2026,6 +2032,8 @@ impl DirectWebSocketTransport {
                     "provider".to_string(),
                     "device".to_string(),
                     "runtime".to_string(),
+                    "scheduled".to_string(),
+                    "automation".to_string(),
                 ],
                 session_ids: None,
                 cursors,
@@ -2155,11 +2163,17 @@ impl DirectWebSocketTransport {
         let result = timeout_future(timeout_duration(timeout_class), receiver).await;
         match result {
             Some(Ok(result)) => {
-                let _ = self
-                    .inner
-                    .pending_mutations
-                    .lock()
-                    .map(|mut pending| pending.remove(&key));
+                let result_unknown = matches!(
+                    &result,
+                    Err(error) if error.code == "remote_rpc_result_unknown"
+                );
+                if !result_unknown {
+                    let _ = self
+                        .inner
+                        .pending_mutations
+                        .lock()
+                        .map(|mut pending| pending.remove(&key));
+                }
                 result
             }
             Some(Err(_)) => {
@@ -2813,6 +2827,7 @@ impl RelayE2eeTransport {
         let cursors = self.cursors();
         if let Ok(mut sync) = self.inner.sync.lock() {
             sync.rewind_connection_channel("agent_session");
+            sync.rewind_connection_channel("agent_notification");
         }
         let subscription = self
             .subscribe(RemoteSubscribeRequestV2 {
@@ -2827,6 +2842,8 @@ impl RelayE2eeTransport {
                     "provider".to_string(),
                     "device".to_string(),
                     "runtime".to_string(),
+                    "scheduled".to_string(),
+                    "automation".to_string(),
                 ],
                 session_ids: None,
                 cursors,
@@ -2877,7 +2894,9 @@ where
     R: WireReader,
 {
     loop {
-        match reader.next_wire().await? {
+        match next_wire_with_timeout(reader, HANDSHAKE_STEP_TIMEOUT, "relay_handshake_timeout")
+            .await?
+        {
             Some(WireMessage::Text(text)) => {
                 if let Ok(peer) = serde_json::from_str::<RelayPeerMessage>(&text) {
                     if peer.room_id != config.room_id
@@ -3199,6 +3218,12 @@ impl RemoteTransport for DirectWebSocketTransport {
             pending.remove(request_id.as_str());
         }
     }
+
+    fn acknowledge_domain_resync(&self, domain: &str, generation: u64, sequence: u64) {
+        if let Ok(mut sync) = self.inner.sync.lock() {
+            sync.acknowledge_resync(domain, generation, sequence);
+        }
+    }
 }
 
 impl RemoteTransport for RelayE2eeTransport {
@@ -3265,11 +3290,31 @@ impl RemoteTransport for RelayE2eeTransport {
     }
 
     fn request(&self, request: RemoteRpcRequestV2) -> BackendFuture<'_, RemoteRpcResponseV2> {
-        let direct = DirectWebSocketTransport {
-            config: self.config.remote.clone(),
-            inner: self.inner.clone(),
-        };
-        Box::pin(async move { direct.request_inner(request).await })
+        Box::pin(async move {
+            if self.state().state != RemoteConnectionState::Online {
+                match self.state().state {
+                    RemoteConnectionState::Revoked => {
+                        return Err(BackendError::permission(
+                            "remote_device_revoked",
+                            "remote device access has been revoked",
+                        ));
+                    }
+                    RemoteConnectionState::Incompatible => {
+                        return Err(BackendError::unsupported(
+                            "remote_protocol_incompatible",
+                            "remote protocol version is incompatible",
+                        ));
+                    }
+                    _ => {}
+                }
+                self.connect().await?;
+            }
+            let direct = DirectWebSocketTransport {
+                config: self.config.remote.clone(),
+                inner: self.inner.clone(),
+            };
+            direct.request_inner(request).await
+        })
     }
 
     fn subscribe(
@@ -3485,6 +3530,12 @@ impl RemoteTransport for RelayE2eeTransport {
     fn clear_unknown_mutation(&self, request_id: &RequestId) {
         if let Ok(mut pending) = self.inner.pending_mutations.lock() {
             pending.remove(request_id.as_str());
+        }
+    }
+
+    fn acknowledge_domain_resync(&self, domain: &str, generation: u64, sequence: u64) {
+        if let Ok(mut sync) = self.inner.sync.lock() {
+            sync.acknowledge_resync(domain, generation, sequence);
         }
     }
 }
@@ -3803,12 +3854,39 @@ fn verify_session_confirmation(
     })
 }
 
+async fn next_wire_with_timeout<R>(
+    reader: &mut R,
+    duration: Duration,
+    timeout_code: &'static str,
+) -> BackendResult<Option<WireMessage>>
+where
+    R: WireReader,
+{
+    #[cfg(not(target_family = "wasm"))]
+    {
+        match tokio::time::timeout(duration, reader.next_wire()).await {
+            Ok(result) => result,
+            Err(_) => Err(BackendError::offline(
+                timeout_code,
+                "remote handshake timed out waiting for peer response",
+            )),
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    {
+        let _ = (duration, timeout_code);
+        reader.next_wire().await
+    }
+}
+
 async fn next_server_info<R>(reader: &mut R) -> BackendResult<RemoteServerInfoV2>
 where
     R: WireReader,
 {
     loop {
-        match reader.next_wire().await? {
+        match next_wire_with_timeout(reader, HANDSHAKE_STEP_TIMEOUT, "remote_handshake_timeout")
+            .await?
+        {
             Some(WireMessage::Text(text)) => {
                 let message: RemoteJsonMessageV2 = serde_json::from_str(&text).map_err(|_| {
                     BackendError::failed(
@@ -4197,8 +4275,17 @@ async fn open_socket(
             None
         }
     };
-    let socket_result =
-        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector).await;
+    let socket_result = tokio::time::timeout(
+        SOCKET_CONNECT_TIMEOUT,
+        tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector),
+    )
+    .await
+    .map_err(|_| {
+        BackendError::offline(
+            "remote_ws_connect_timeout",
+            "remote WebSocket connection timed out",
+        )
+    })?;
     let (stream, _) = socket_result.map_err(|error| {
         if let tokio_tungstenite::tungstenite::Error::Http(response) = &error
             && let Some(body) = response.body().as_ref()
@@ -4713,7 +4800,10 @@ fn dispatch_text(inner: &Shared<TransportInner>, text: &str) {
 }
 
 fn is_projection_invalidation_channel(channel: &str) -> bool {
-    matches!(channel, "file" | "git" | "provider" | "device" | "sidebar")
+    matches!(
+        channel,
+        "file" | "git" | "provider" | "device" | "sidebar" | "scheduled" | "automation"
+    )
 }
 
 fn projection_invalidation_channel(event: &RemoteTransportEvent) -> Option<&str> {
@@ -4754,20 +4844,27 @@ fn push_domain_event(inner: &Shared<TransportInner>, event: RemoteTransportEvent
                 | RemoteTransportEvent::Closed
         ) {
             queue.clear();
-            if !waiters.is_empty() {
-                for waiter in waiters.drain(..) {
-                    let _ = waiter.send(Some(event.clone()));
+            let mut delivered = false;
+            for waiter in waiters.drain(..) {
+                if waiter.send(Some(event.clone())).is_ok() {
+                    delivered = true;
                 }
-            } else {
+            }
+            if !delivered {
                 queue.push_back(event);
             }
             return;
         }
         if !waiters.is_empty() {
+            let mut delivered = false;
             for waiter in waiters.drain(..) {
-                let _ = waiter.send(Some(event.clone()));
+                if waiter.send(Some(event.clone())).is_ok() {
+                    delivered = true;
+                }
             }
-            return;
+            if delivered {
+                return;
+            }
         }
         if let Some(channel) = projection_invalidation_channel(&event) {
             if let Some(index) = queue
@@ -4800,7 +4897,7 @@ fn push_domain_event(inner: &Shared<TransportInner>, event: RemoteTransportEvent
             // business-stream recovery marker.
             if let RemoteTransportEvent::Event(inbound) = &event {
                 if let Ok(mut sync) = inner.sync.lock() {
-                    sync.pause_for_resync();
+                    sync.pause_domain(&inbound.event.channel);
                 }
                 let projections = queue
                     .iter()
@@ -4840,8 +4937,9 @@ fn push_binary_event(inner: &Shared<TransportInner>, event: RemoteTransportEvent
             let mut remaining = VecDeque::with_capacity(waiters.len());
             for waiter in waiters.drain(..) {
                 if binary_event_matches(waiter.stream_id.as_deref(), &event) {
-                    let _ = waiter.sender.send(Some(event.clone()));
-                    delivered = true;
+                    if waiter.sender.send(Some(event.clone())).is_ok() {
+                        delivered = true;
+                    }
                 } else {
                     remaining.push_back(waiter);
                 }
@@ -5637,7 +5735,17 @@ impl RemoteTransport for AutoRemoteTransport {
             match self.connect_inner().await {
                 Ok(info) => Ok(info),
                 Err(error) => {
-                    set_state(&self.state, RemoteConnectionState::Offline, Some(&error));
+                    let state = if matches!(
+                        error.code.as_str(),
+                        "remote_device_revoked" | "relay_session_revoked"
+                    ) {
+                        RemoteConnectionState::Revoked
+                    } else if error.code.contains("protocol") {
+                        RemoteConnectionState::Incompatible
+                    } else {
+                        RemoteConnectionState::Offline
+                    };
+                    set_state(&self.state, state, Some(&error));
                     Err(error)
                 }
             }
@@ -5906,6 +6014,16 @@ impl RemoteTransport for AutoRemoteTransport {
         spawn_background(async move {
             if let Ok(selected) = transport.selected().await {
                 selected.clear_unknown_mutation(&request_id);
+            }
+        });
+    }
+
+    fn acknowledge_domain_resync(&self, domain: &str, generation: u64, sequence: u64) {
+        let transport = self.clone();
+        let domain = domain.to_string();
+        spawn_background(async move {
+            if let Ok(selected) = transport.selected().await {
+                selected.acknowledge_domain_resync(&domain, generation, sequence);
             }
         });
     }

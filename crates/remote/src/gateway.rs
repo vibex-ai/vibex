@@ -4322,7 +4322,7 @@ fn subscription_topic_permitted(
             RemoteActionClass::ReadAgentSession
         }
         "terminal" | "file" | "git" => RemoteActionClass::ReadProject,
-        "provider" => RemoteActionClass::ReadProviderSettings,
+        "provider" | "scheduled" | "automation" => RemoteActionClass::ReadProviderSettings,
         "device" => RemoteActionClass::ReadDeviceManagement,
         _ => return false,
     };
@@ -4333,7 +4333,7 @@ fn domain_event_permitted(permission_level: RemoteDevicePermissionLevel, channel
     let action = match channel {
         "file" | "git" => RemoteActionClass::ReadProject,
         "sidebar" => RemoteActionClass::ReadAgentSession,
-        "provider" => RemoteActionClass::ReadProviderSettings,
+        "provider" | "scheduled" | "automation" => RemoteActionClass::ReadProviderSettings,
         "device" => RemoteActionClass::ReadDeviceManagement,
         _ => return false,
     };
@@ -4357,8 +4357,31 @@ fn spawn_terminal_stream(
             let requested = i64::try_from(next_sequence).unwrap_or(i64::MAX);
             let snapshot = match manager.raw_snapshot_from(&terminal_id, requested) {
                 Ok(snapshot) => snapshot,
-                Err(_) => break,
+                Err(_) => {
+                    let eof = RemoteBinaryFrame {
+                        header: RemoteBinaryFrameHeader {
+                            protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                            kind: RemoteBinaryFrameKind::TerminalOutput,
+                            stream_id: stream_id.clone(),
+                            request_id: None,
+                            generation,
+                            sequence: next_sequence,
+                            offset: 0,
+                            total_size: None,
+                            snapshot: false,
+                            end_of_stream: true,
+                            checksum_sha256: None,
+                            payload_length: 0,
+                        },
+                        payload: Vec::new(),
+                    };
+                    if let Ok(encoded) = eof.encode() {
+                        let _ = outbound.send(OutboundFrame::Binary(encoded)).await;
+                    }
+                    break;
+                }
             };
+            let is_running = snapshot.session.status == vibex_core::TerminalStatus::Running;
             let first_sequence = snapshot
                 .chunks
                 .first()
@@ -4396,6 +4419,29 @@ fn spawn_terminal_stream(
                 }
                 next_sequence = sequence.saturating_add(1);
             }
+            if !is_running {
+                let eof = RemoteBinaryFrame {
+                    header: RemoteBinaryFrameHeader {
+                        protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                        kind: RemoteBinaryFrameKind::TerminalOutput,
+                        stream_id: stream_id.clone(),
+                        request_id: None,
+                        generation,
+                        sequence: next_sequence,
+                        offset: 0,
+                        total_size: None,
+                        snapshot: false,
+                        end_of_stream: true,
+                        checksum_sha256: None,
+                        payload_length: 0,
+                    },
+                    payload: Vec::new(),
+                };
+                if let Ok(encoded) = eof.encode() {
+                    let _ = outbound.send(OutboundFrame::Binary(encoded)).await;
+                }
+                break;
+            }
         }
     })
 }
@@ -4417,8 +4463,31 @@ fn spawn_relay_terminal_stream(
             let requested = i64::try_from(next_sequence).unwrap_or(i64::MAX);
             let snapshot = match manager.raw_snapshot_from(&terminal_id, requested) {
                 Ok(snapshot) => snapshot,
-                Err(_) => break,
+                Err(_) => {
+                    let eof = RemoteBinaryFrame {
+                        header: RemoteBinaryFrameHeader {
+                            protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                            kind: RemoteBinaryFrameKind::TerminalOutput,
+                            stream_id: stream_id.clone(),
+                            request_id: None,
+                            generation,
+                            sequence: next_sequence,
+                            offset: 0,
+                            total_size: None,
+                            snapshot: false,
+                            end_of_stream: true,
+                            checksum_sha256: None,
+                            payload_length: 0,
+                        },
+                        payload: Vec::new(),
+                    };
+                    if let Ok(encoded) = eof.encode() {
+                        let _ = outbound.send(RelayRemoteOutbound::Binary(encoded)).await;
+                    }
+                    break;
+                }
             };
+            let is_running = snapshot.session.status == vibex_core::TerminalStatus::Running;
             let first_sequence = snapshot
                 .chunks
                 .first()
@@ -4459,6 +4528,29 @@ fn spawn_relay_terminal_stream(
                     return;
                 }
                 next_sequence = sequence.saturating_add(1);
+            }
+            if !is_running {
+                let eof = RemoteBinaryFrame {
+                    header: RemoteBinaryFrameHeader {
+                        protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                        kind: RemoteBinaryFrameKind::TerminalOutput,
+                        stream_id: stream_id.clone(),
+                        request_id: None,
+                        generation,
+                        sequence: next_sequence,
+                        offset: 0,
+                        total_size: None,
+                        snapshot: false,
+                        end_of_stream: true,
+                        checksum_sha256: None,
+                        payload_length: 0,
+                    },
+                    payload: Vec::new(),
+                };
+                if let Ok(encoded) = eof.encode() {
+                    let _ = outbound.send(RelayRemoteOutbound::Binary(encoded)).await;
+                }
+                break;
             }
         }
     })
@@ -6188,7 +6280,7 @@ fn gateway_features(state: &GatewayState) -> Vec<String> {
     features
 }
 
-fn gateway_topics() -> [&'static str; 9] {
+fn gateway_topics() -> [&'static str; 11] {
     [
         "agent_session",
         "agent_notification",
@@ -6199,6 +6291,8 @@ fn gateway_topics() -> [&'static str; 9] {
         "provider",
         "device",
         "runtime",
+        "scheduled",
+        "automation",
     ]
 }
 

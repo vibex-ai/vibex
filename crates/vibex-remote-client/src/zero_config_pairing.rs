@@ -323,10 +323,13 @@ impl ZeroConfigLanPairingSession {
                 "zero-config LAN pairing claim response was invalid",
             ));
         }
+        let identity = self
+            .identity
+            .with_device_id(response.device.device_id.clone());
         Ok(ZeroConfigLanPairingClaim {
             offer,
             response,
-            identity: self.identity.clone(),
+            identity,
             local_network_url: self.local_network_url.clone(),
             lan_gateway_tls_certificate: self.lan_gateway_tls_certificate.clone(),
         })

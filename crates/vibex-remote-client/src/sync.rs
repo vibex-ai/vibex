@@ -84,7 +84,7 @@ pub struct DomainSyncEngine {
     pending_events: VecDeque<RemoteEventV2>,
     max_pending_events: usize,
     dropped_events: u64,
-    paused: bool,
+    paused_domains: BTreeSet<String>,
 }
 
 impl Default for DomainSyncEngine {
@@ -101,7 +101,7 @@ impl DomainSyncEngine {
             pending_events: VecDeque::new(),
             max_pending_events: max_pending_events.max(1),
             dropped_events: 0,
-            paused: false,
+            paused_domains: BTreeSet::new(),
         }
     }
 
@@ -170,12 +170,29 @@ impl DomainSyncEngine {
     }
 
     pub fn is_paused(&self) -> bool {
-        self.paused
+        !self.paused_domains.is_empty()
+    }
+
+    pub fn is_domain_paused(&self, domain: &str) -> bool {
+        self.paused_domains.contains(domain)
     }
 
     pub fn resume_after_refetch(&mut self) {
-        self.paused = false;
+        self.paused_domains.clear();
         self.pending_events.clear();
+    }
+
+    pub fn acknowledge_resync(&mut self, domain: &str, generation: u64, sequence: u64) {
+        self.paused_domains.remove(domain);
+        self.pending_events.retain(|event| event.channel != domain);
+        if let Some(cursor) = self.domains.get_mut(domain)
+            && (generation > cursor.generation
+                || (generation == cursor.generation && sequence > cursor.cursor))
+        {
+            cursor.generation = generation;
+            cursor.cursor = sequence;
+            cursor.snapshot_version = None;
+        }
     }
 
     /// A server/session epoch change invalidates every domain cursor.  The
@@ -188,7 +205,7 @@ impl DomainSyncEngine {
             cursor.cursor = 0;
             cursor.snapshot_version = None;
         }
-        self.paused = false;
+        self.paused_domains.clear();
         self.pending_events.clear();
     }
 
@@ -204,7 +221,7 @@ impl DomainSyncEngine {
                 cursor.snapshot_version = None;
             }
         }
-        self.paused = false;
+        self.paused_domains.clear();
         self.pending_events.clear();
     }
 
@@ -237,13 +254,19 @@ impl DomainSyncEngine {
         // A gap on the channel being rewound is about to be answered by the
         // resync the server sends for it; the queue that held the events
         // around that gap is meaningless across the connection boundary.
-        if self.paused {
-            self.resume_after_refetch();
+        if self.paused_domains.remove(domain) {
+            self.pending_events.retain(|event| event.channel != domain);
         }
     }
 
+    pub fn pause_domain(&mut self, domain: impl Into<String>) {
+        self.paused_domains.insert(domain.into());
+    }
+
     pub fn pause_for_resync(&mut self) {
-        self.paused = true;
+        for domain in self.domains.keys() {
+            self.paused_domains.insert(domain.clone());
+        }
     }
 
     /// Observe a v2 live event and return the action required by the owner.
@@ -263,7 +286,7 @@ impl DomainSyncEngine {
             };
         };
 
-        if self.paused {
+        if self.paused_domains.contains(&domain) {
             self.enqueue(event);
             return SyncDecision::Resync {
                 domain: domain.clone(),
@@ -275,7 +298,7 @@ impl DomainSyncEngine {
 
         if cursor_generation == 0 && cursor_cursor == 0 {
             if event.sequence != 1 {
-                self.pause_for_resync();
+                self.pause_domain(domain.clone());
                 let generation = event.generation;
                 self.enqueue(event);
                 return SyncDecision::CatchUp {
@@ -299,7 +322,7 @@ impl DomainSyncEngine {
         }
 
         if event.generation > cursor_generation {
-            self.pause_for_resync();
+            self.pause_domain(domain.clone());
             self.enqueue(event.clone());
             return SyncDecision::Resync {
                 domain: domain.clone(),
@@ -315,7 +338,7 @@ impl DomainSyncEngine {
 
         let expected = cursor_cursor.saturating_add(1);
         if event.sequence != expected {
-            self.pause_for_resync();
+            self.pause_domain(domain.clone());
             self.enqueue(event);
             return SyncDecision::CatchUp {
                 domain: cursor_domain,
@@ -400,7 +423,7 @@ impl DomainSyncEngine {
                 continue;
             }
             if event.sequence != current_cursor.saturating_add(1) {
-                self.pause_for_resync();
+                self.pause_domain(domain);
                 return Ok(applied);
             }
             let cursor = self.domains.get_mut(domain).expect("domain was registered");
@@ -409,9 +432,10 @@ impl DomainSyncEngine {
             applied += 1;
         }
         if compacted {
-            self.pause_for_resync();
+            self.pause_domain(domain);
         } else {
-            self.resume_after_refetch();
+            self.paused_domains.remove(domain);
+            self.pending_events.retain(|event| event.channel != domain);
         }
         Ok(applied)
     }
@@ -441,7 +465,8 @@ impl DomainSyncEngine {
         state.generation = generation;
         state.cursor = cursor;
         state.snapshot_version = snapshot_version;
-        self.resume_after_refetch();
+        self.paused_domains.remove(domain);
+        self.pending_events.retain(|event| event.channel != domain);
         Ok(())
     }
 
@@ -735,5 +760,27 @@ mod tests {
             engine.observe(event("agent_session", 0, 1)),
             SyncDecision::Apply
         );
+    }
+
+    #[test]
+    fn pausing_one_domain_does_not_block_other_domains_and_acknowledge_resync_resumes() {
+        let mut engine = DomainSyncEngine::new(8);
+        engine.register_domains(["agent_session", "runtime"]);
+        engine.apply_snapshot("runtime", 2, 1, None).unwrap();
+
+        assert!(matches!(
+            engine.observe(event("runtime", 2, 5)),
+            SyncDecision::CatchUp { .. }
+        ));
+        assert!(engine.is_domain_paused("runtime"));
+        assert!(!engine.is_domain_paused("agent_session"));
+        assert_eq!(
+            engine.observe(event("agent_session", 2, 1)),
+            SyncDecision::Apply
+        );
+
+        engine.acknowledge_resync("runtime", 2, 5);
+        assert!(!engine.is_domain_paused("runtime"));
+        assert_eq!(engine.observe(event("runtime", 2, 6)), SyncDecision::Apply);
     }
 }

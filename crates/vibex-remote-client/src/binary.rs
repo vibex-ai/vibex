@@ -348,6 +348,7 @@ impl TerminalBinaryBuffer {
     pub fn require_reset(&mut self, next_sequence: i64) {
         self.frames.clear();
         self.next_sequence = next_sequence.max(1);
+        self.generation = None;
         self.reset_required = true;
     }
 }
@@ -496,5 +497,55 @@ mod tests {
             })
             .unwrap_err();
         assert_eq!(error, FileChunkError::StreamMismatch);
+    }
+
+    #[test]
+    fn require_reset_clears_generation_so_new_generation_is_accepted() {
+        let terminal_id = TerminalId::new();
+        let mut buffer = TerminalBinaryBuffer::new(terminal_id.clone(), 4, 1);
+        buffer
+            .push_frame(&RemoteBinaryFrame {
+                header: RemoteBinaryFrameHeader {
+                    protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                    kind: RemoteBinaryFrameKind::TerminalOutput,
+                    stream_id: terminal_id.as_str().to_string(),
+                    request_id: None,
+                    generation: 1,
+                    sequence: 1,
+                    offset: 0,
+                    total_size: None,
+                    snapshot: false,
+                    end_of_stream: false,
+                    checksum_sha256: None,
+                    payload_length: 0,
+                },
+                payload: b"old".to_vec(),
+            })
+            .unwrap();
+        let _ = buffer.take_batch();
+
+        buffer.require_reset(1);
+        buffer
+            .push_frame(&RemoteBinaryFrame {
+                header: RemoteBinaryFrameHeader {
+                    protocol_version: RemoteProtocolVersion { major: 2, minor: 0 },
+                    kind: RemoteBinaryFrameKind::TerminalOutput,
+                    stream_id: terminal_id.as_str().to_string(),
+                    request_id: None,
+                    generation: 2,
+                    sequence: 1,
+                    offset: 0,
+                    total_size: None,
+                    snapshot: false,
+                    end_of_stream: false,
+                    checksum_sha256: None,
+                    payload_length: 0,
+                },
+                payload: b"new".to_vec(),
+            })
+            .unwrap();
+        let batch = buffer.take_batch().unwrap();
+        assert!(batch.reset_required);
+        assert_eq!(batch.frames[0].bytes, b"new");
     }
 }

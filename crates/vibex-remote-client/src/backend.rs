@@ -328,11 +328,25 @@ impl WebRemoteBackend {
                 BackendError::failed("remote_file_receiver_invalid", format!("{error:?}"))
             })?;
             loop {
-                match self
+                #[cfg(not(target_family = "wasm"))]
+                let next_event = tokio::time::timeout(
+                    std::time::Duration::from_secs(30),
+                    self.transport
+                        .next_binary_event_for(Some(attachment_id.clone())),
+                )
+                .await
+                .map_err(|_| {
+                    BackendError::offline(
+                        "remote_file_transfer_timeout",
+                        "timed out waiting for the next remote file transfer chunk",
+                    )
+                })??;
+                #[cfg(target_family = "wasm")]
+                let next_event = self
                     .transport
                     .next_binary_event_for(Some(attachment_id.clone()))
-                    .await?
-                {
+                    .await?;
+                match next_event {
                     Some(RemoteTransportEvent::Binary(frame)) => {
                         if frame.header.generation != accepted.generation {
                             return Err(BackendError::conflict(
@@ -775,8 +789,17 @@ impl BackendEventSubscription for RemoteEventSubscription {
                             // the authoritative cursor.  Never expose a replay
                             // as a second UI event.
                         }
-                        SyncDecision::CatchUp { domain, .. }
-                        | SyncDecision::Resync { domain, .. } => {
+                        SyncDecision::CatchUp {
+                            domain, generation, ..
+                        }
+                        | SyncDecision::Resync {
+                            domain, generation, ..
+                        } => {
+                            transport.acknowledge_domain_resync(
+                                &domain,
+                                generation,
+                                event.event.sequence,
+                            );
                             if let Some(projection) = projection_for_domain(&domain) {
                                 return Ok(Some(BackendEvent::ProjectionInvalidated(projection)));
                             }
@@ -787,6 +810,13 @@ impl BackendEventSubscription for RemoteEventSubscription {
                         vibex_core::RemoteControlMessageV2::ResyncRequired(resync),
                     )) => return Ok(Some(lagged_for_domain(&resync.domain, 0, false))),
                     Some(RemoteTransportEvent::Closed) | None => {
+                        if matches!(
+                            transport.state().state,
+                            crate::transport::RemoteConnectionState::Revoked
+                                | crate::transport::RemoteConnectionState::Incompatible
+                        ) {
+                            return Ok(None);
+                        }
                         return Ok(Some(BackendEvent::Disconnected));
                     }
                     Some(RemoteTransportEvent::Binary(_))
@@ -863,7 +893,7 @@ fn projection_for_domain(domain: &str) -> Option<vibex_backend::BackendProjectio
         "file" => Some(BackendProjection::Files),
         "git" => Some(BackendProjection::Git),
         "sidebar" => Some(BackendProjection::Sidebar),
-        "provider" | "device" => Some(BackendProjection::Management),
+        "provider" | "device" | "scheduled" | "automation" => Some(BackendProjection::Management),
         _ => None,
     }
 }
@@ -3458,13 +3488,32 @@ struct RemoteTerminalSubscription {
     next_sequence: i64,
     attachment_id: String,
     attached: bool,
+    ended: bool,
     buffer: TerminalBinaryBuffer,
+}
+
+impl Drop for RemoteTerminalSubscription {
+    fn drop(&mut self) {
+        if self.attached {
+            let transport = self.backend.transport.clone();
+            let attachment_id = self.attachment_id.clone();
+            #[cfg(not(target_family = "wasm"))]
+            if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                handle.spawn(async move {
+                    let _ = transport.detach(attachment_id).await;
+                });
+            }
+        }
+    }
 }
 
 impl TerminalFrameSubscription for RemoteTerminalSubscription {
     fn next(&mut self) -> BackendFuture<'_, Option<TerminalFrameBatch>> {
         let backend = self.backend.clone();
         Box::pin(async move {
+            if self.ended {
+                return Ok(None);
+            }
             if !self.attached {
                 let snapshot = backend.terminal_snapshot(self.terminal_id.clone()).await?;
                 let requested_sequence = self.next_sequence.max(1) as u64;
@@ -3495,19 +3544,33 @@ impl TerminalFrameSubscription for RemoteTerminalSubscription {
                     Some(RemoteTransportEvent::Binary(frame))
                         if frame.header.stream_id == self.terminal_id.as_str() =>
                     {
-                        if self.buffer.push_frame(&frame).is_err() {
-                            // A gap/rebuild is represented by a reset batch;
-                            // never append bytes across an unknown cursor.  A
-                            // fresh buffer starts at the received frame so the
-                            // caller gets the first rebuild byte instead of
-                            // silently dropping it.
-                            let sequence = i64::try_from(frame.header.sequence)
-                                .unwrap_or(i64::MAX)
-                                .max(1);
-                            self.buffer =
-                                TerminalBinaryBuffer::new(self.terminal_id.clone(), 128, sequence);
-                            self.buffer.require_reset(sequence);
-                            let _ = self.buffer.push_frame(&frame);
+                        let eof = frame.header.end_of_stream;
+                        if !eof || !frame.payload.is_empty() || frame.header.snapshot {
+                            if self.buffer.push_frame(&frame).is_err() {
+                                // A gap/rebuild is represented by a reset batch;
+                                // never append bytes across an unknown cursor.  A
+                                // fresh buffer starts at the received frame so the
+                                // caller gets the first rebuild byte instead of
+                                // silently dropping it.
+                                let sequence = i64::try_from(frame.header.sequence)
+                                    .unwrap_or(i64::MAX)
+                                    .max(1);
+                                self.buffer = TerminalBinaryBuffer::new(
+                                    self.terminal_id.clone(),
+                                    128,
+                                    sequence,
+                                );
+                                self.buffer.require_reset(sequence);
+                                let _ = self.buffer.push_frame(&frame);
+                            }
+                        }
+                        if eof {
+                            self.ended = true;
+                            if let Some(batch) = self.buffer.take_batch() {
+                                self.next_sequence = batch.next_sequence;
+                                return Ok(Some(batch));
+                            }
+                            return Ok(None);
                         }
                         if let Some(batch) = self.buffer.take_batch() {
                             self.next_sequence = batch.next_sequence;
@@ -3724,8 +3787,13 @@ impl TerminalBackend for WebRemoteBackend {
             backend,
             terminal_id: terminal_id.clone(),
             next_sequence,
-            attachment_id: format!("terminal-attachment-{}", terminal_id.as_str()),
+            attachment_id: format!(
+                "terminal-attachment-{}-{}",
+                terminal_id.as_str(),
+                vibex_core::RequestId::new()
+            ),
             attached: false,
+            ended: false,
             buffer: TerminalBinaryBuffer::new(terminal_id, 128, next_sequence),
         }))
     }
@@ -8124,6 +8192,14 @@ fn remote_capabilities_for_grant(
                 (
                     BackendOperation::FileCopy,
                     permits(RemoteActionClass::MutateFile),
+                ),
+                (
+                    BackendOperation::FileMove,
+                    info.is_some() && permits(RemoteActionClass::MutateFile),
+                ),
+                (
+                    BackendOperation::FileDelete,
+                    info.is_some() && permits(RemoteActionClass::MutateFile),
                 ),
             ])
         } else {
