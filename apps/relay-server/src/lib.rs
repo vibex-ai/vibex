@@ -1060,6 +1060,16 @@ impl RelayServerState {
             ));
         }
         let now = unix_timestamp_ms();
+        tracing::debug!(
+            target: "vibex_relay_server::route",
+            room_id = message.room_id.as_str(),
+            sender = message.sender_peer_id.as_str(),
+            recipient = message.recipient_peer_id.as_str(),
+            pc = room.pc_peer_id.as_str(),
+            peers = room.peers.len(),
+            bytes = encoded.len(),
+            "routing peer frame"
+        );
         if message.sender_peer_id == room.pc_peer_id {
             let route = room
                 .peers
@@ -1122,6 +1132,12 @@ impl RelayServerState {
                 size,
                 self.config().max_queue_bytes_per_connection,
             ) {
+                tracing::warn!(
+                    target: "vibex_relay_server::route",
+                    room_id = message.room_id.as_str(),
+                    bytes = size,
+                    "relay PC queue limit exceeded; frame dropped"
+                );
                 return Err(RelayServerError::new(
                     StatusCode::TOO_MANY_REQUESTS,
                     RelayErrorCode::QueueLimit,
@@ -1130,6 +1146,11 @@ impl RelayServerState {
             }
             if room.pc_sender.try_send(encoded).is_err() {
                 release_queue_bytes(&room.pc_queued_bytes, size);
+                tracing::warn!(
+                    target: "vibex_relay_server::route",
+                    room_id = message.room_id.as_str(),
+                    "relay PC queue is full; frame dropped"
+                );
                 return Err(RelayServerError::new(
                     StatusCode::TOO_MANY_REQUESTS,
                     RelayErrorCode::QueueLimit,
@@ -2005,6 +2026,16 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
         while let Some(encoded) = outbound_rx.recv().await {
             let bytes = encoded.len();
             if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
+                // The frame was reserved but never written. Release it, and
+                // release everything still queued behind it: a leaked
+                // reservation is never reclaimed and eventually pins the
+                // counter at the limit, which makes the room reject every
+                // later frame with relay_queue_limit.
+                release_queue_bytes(&queued_bytes, bytes);
+                outbound_rx.close();
+                while let Ok(pending) = outbound_rx.try_recv() {
+                    release_queue_bytes(&queued_bytes, pending.len());
+                }
                 break;
             }
             release_queue_bytes(&queued_bytes, bytes);
@@ -2065,6 +2096,16 @@ async fn handle_device_socket_parts(
         while let Some(encoded) = outbound_rx.recv().await {
             let bytes = encoded.len();
             if ws_sender.send(Message::Text(encoded.into())).await.is_err() {
+                // The frame was reserved but never written. Release it, and
+                // release everything still queued behind it: a leaked
+                // reservation is never reclaimed and eventually pins the
+                // counter at the limit, which makes the room reject every
+                // later frame with relay_queue_limit.
+                release_queue_bytes(&queued_bytes, bytes);
+                outbound_rx.close();
+                while let Ok(pending) = outbound_rx.try_recv() {
+                    release_queue_bytes(&queued_bytes, pending.len());
+                }
                 break;
             }
             release_queue_bytes(&queued_bytes, bytes);

@@ -47,6 +47,16 @@ const REMOTE_V2_SUBPROTOCOL: &str = "vibex-v2";
 #[cfg(target_family = "wasm")]
 const REMOTE_V2_TICKET_PREFIX: &str = "vibex-ticket.";
 const DEFAULT_EVENT_QUEUE_CAPACITY: usize = 256;
+
+/// How long one heartbeat may wait for its pong.
+///
+/// A heartbeat shares the transport with RPC traffic, and an RPC that reaches
+/// the runtime while the session is busy can take tens of seconds. Ten seconds
+/// was shorter than the RPC budget, so a heartbeat queued behind a slow RPC
+/// expired every time: the client reported `remote_heartbeat_timeout`, tore the
+/// connection down and reconnected, which reads as the app spinning. Wait
+/// longer than an RPC may take instead of treating queueing as a dead peer.
+const HEARTBEAT_TIMEOUT: Duration = Duration::from_secs(45);
 const DEFAULT_BINARY_QUEUE_CAPACITY: usize = 128;
 const MAX_DIRECT_CANDIDATES: usize = 16;
 const MAX_EVENT_QUEUE_CAPACITY: usize = 8192;
@@ -3049,7 +3059,7 @@ impl RemoteTransport for DirectWebSocketTransport {
             };
             let ping_nonce = ping.nonce;
             let transport = self.clone();
-            match timeout_future(Duration::from_secs(10), async move {
+            match timeout_future(HEARTBEAT_TIMEOUT, async move {
                 transport
                     .send_and_wait_control(
                         ControlWaitKind::Heartbeat(ping_nonce),
@@ -3349,7 +3359,7 @@ impl RemoteTransport for RelayE2eeTransport {
             let nonce = RequestId::new().as_str().bytes().fold(0u64, |value, byte| {
                 value.wrapping_mul(31).wrapping_add(u64::from(byte))
             });
-            match timeout_future(Duration::from_secs(10), async move {
+            match timeout_future(HEARTBEAT_TIMEOUT, async move {
                 direct
                     .send_and_wait_control(
                         ControlWaitKind::Heartbeat(nonce),

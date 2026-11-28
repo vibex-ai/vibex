@@ -410,6 +410,15 @@ impl RelayClientRuntime {
                 RelayLoopExit::Disconnected(reason) => {
                     reconnect_attempt = reconnect_attempt.saturating_add(1);
                     let delay_ms = reconnect_delay_ms(&settings, reconnect_attempt);
+                    // The Relay link is the only path a phone has to this
+                    // desktop, and a reconnect loop here looks exactly like
+                    // "the room does not exist" from the device side. Nothing
+                    // recorded why the loop reconnected, and the desktop
+                    // installs no tracing subscriber, so report it on stderr
+                    // where a run from a terminal can see it.
+                    eprintln!(
+                        "vibex relay: disconnected (attempt {reconnect_attempt}, retry in {delay_ms}ms): {reason}"
+                    );
                     let next_retry_at_ms = unix_timestamp_ms() + delay_ms as i64;
                     self.set_status(RelayClientStatus::with_state(
                         &settings,

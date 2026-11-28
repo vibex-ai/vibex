@@ -9724,6 +9724,28 @@ impl TimelineRepository {
         // for: its caller is sampling the tail, not opening a conversation.
         if read_backward && turn_window.is_some() && items.len() > 1 {
             cut = align_backward_page_to_turn_start(conn, session_id, &items, cut, budget)?;
+            // A turn boundary is the preferred cut, not an unlimited licence:
+            // one turn can be tens of MB (a long tool-driven turn is thousands
+            // of rows), and finishing it whole puts a page on the wire that no
+            // transport can carry in one frame. Fall back to the byte budget
+            // for such a turn so the page stays deliverable; the reader lands
+            // mid-turn and the remaining rows come from the next older page.
+            if let Some(budget) = budget {
+                let hard_max = budget
+                    .saturating_mul(2)
+                    .min(TIMELINE_TURN_ALIGNED_PAGE_HARD_MAX_BYTES);
+                let mut spent = 0_usize;
+                let mut kept = 0_usize;
+                for item in &items {
+                    let cost = page_payload_cost(item);
+                    if kept > 0 && spent.saturating_add(cost) > hard_max {
+                        break;
+                    }
+                    spent = spent.saturating_add(cost);
+                    kept += 1;
+                }
+                cut = cut.min(kept.max(1));
+            }
         }
         items.truncate(cut.max(1).min(items.len()));
 
@@ -18181,7 +18203,16 @@ const TIMELINE_TURN_WINDOW_ITEM_CEILING: i64 = 20_000;
 /// allowance is what keeps a single turn from carrying an unbounded page. A turn
 /// whose remaining rows cost more than this is left out of the page instead, and
 /// the read that opens on it finishes it the same way.
+/// How much a page may spend beyond its own byte budget to finish the turn it
+/// opens in.
 const TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES: usize = 4 * 1024 * 1024;
+
+/// The largest page a turn-aligned read may ever return, whatever its budget.
+///
+/// One page travels as one Relay frame, and the Relay drops a frame that does
+/// not fit the per-connection queue. Staying under the 3 MiB frame limit keeps
+/// a legal page from being unforwardable.
+const TIMELINE_TURN_ALIGNED_PAGE_HARD_MAX_BYTES: usize = 3 * 1024 * 1024;
 
 /// What a page may spend on the newest rows of a turn that is still in flight.
 ///
@@ -18501,9 +18532,21 @@ fn align_backward_page_to_turn_start(
         return Ok(cut);
     };
     let starts = timeline_turn_starts(conn, session_id, oldest.saturating_sub(1), anchored)?;
+    // The ceiling is what a turn may cost *on top of* the page's own budget
+    // while the page finishes the turn it opens in. Taking the larger of the
+    // two made it an absolute 4 MiB regardless of what the reader asked for,
+    // so a reader with a 512 KiB budget could be handed a 2.6 MiB page. The
+    // Relay forwards one page as one WebSocket frame, and a page that size
+    // fills the per-connection queue and is then dropped with
+    // `relay_queue_limit`. Add the allowance instead of replacing the budget,
+    // and never let a page exceed the hard maximum on its own.
     let ceiling = budget
-        .unwrap_or(usize::MAX)
-        .max(TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES);
+        .map(|budget| {
+            budget
+                .saturating_mul(2)
+                .min(TIMELINE_TURN_ALIGNED_PAGE_HARD_MAX_BYTES)
+        })
+        .unwrap_or(TIMELINE_TURN_ALIGNED_PAGE_MAX_BYTES);
     Ok(
         match aligned_backward_page_cut(items, cut, &starts, ceiling) {
             BackwardPageCut::KeepBudget => cut,
@@ -23927,6 +23970,123 @@ mod tests {
     /// session onto the tail of a turn: the work and the conclusion are there
     /// but the question that produced them is above the cut.
     #[test]
+    #[test]
+    fn a_turn_window_respects_the_byte_budget_on_a_huge_turn() {
+        let temp = temp_db_path("turn-window-huge-turn-budget");
+        let mut conn = open_database(&temp).unwrap();
+        apply_migrations(&mut conn).unwrap();
+        let (_project, workspace) = WorkspaceRepository::ensure(
+            &conn,
+            "/tmp/vibex-db-huge-turn-budget",
+            WorkspaceMode::CurrentCheckout,
+        )
+        .unwrap();
+        let now = unix_timestamp_ms();
+        let session = AgentSession {
+            id: VibexSessionId::new(),
+            title: "Huge turn".to_string(),
+            project_id: workspace.project_id.clone(),
+            workspace_id: workspace.id.clone(),
+            workspace_root: workspace.root_path.clone(),
+            workspace_mode: workspace.mode,
+            agent_id: AgentId::parse("codex").unwrap(),
+            state: AgentSessionState::Initializing,
+            safety: AgentSessionSafety::workspace_write_ask_on_risk(),
+            created_at_ms: now,
+            updated_at_ms: now,
+            last_message_at_ms: now,
+            archived_at_ms: None,
+            deleted_at_ms: None,
+            tools: Default::default(),
+            transport: vibex_core::SessionTransport::Acp,
+            terminal: None,
+        };
+        SessionRepository::insert(&conn, &session).unwrap();
+        SessionRepository::update_state(&conn, &session.id, AgentSessionState::Idle).unwrap();
+
+        // A long turn made of many large streamed rows, with no turn boundary
+        // near the newest end. A budget cut therefore lands mid-turn, which is
+        // exactly where alignment used to extend the page past what the reader
+        // asked for.
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "one long turn".to_string(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        // The newest turn is the huge one. Its first row is inside the span a
+        // backward scan reads, so alignment can see the turn start and is
+        // tempted to finish the turn in one page.
+        TimelineRepository::append(
+            &mut conn,
+            &session.id,
+            TimelineSource::User,
+            TimelinePayload::UserMessage(UserMessagePayload {
+                text: "the newest and longest turn".to_string(),
+                attachments: Vec::new(),
+                ..Default::default()
+            }),
+            None,
+            None,
+            TimelineRedactionState::None,
+        )
+        .unwrap();
+        let filler = "y".repeat(2 * 1024);
+        for row in 0..626 {
+            TimelineRepository::append(
+                &mut conn,
+                &session.id,
+                TimelineSource::Agent,
+                TimelinePayload::AgentMessageDelta(AgentMessageDeltaPayload {
+                    text_delta: format!("{row}{filler}"),
+                    chunk_index: row,
+                    phase: None,
+                }),
+                None,
+                Some("huge-turn"),
+                TimelineRedactionState::None,
+            )
+            .unwrap();
+        }
+
+        let budget: u32 = 512 * 1024;
+        let page = TimelineRepository::fetch_window(
+            &conn,
+            &session.id,
+            None,
+            None,
+            200,
+            Some(8),
+            Some(budget),
+            TimelinePayloadDepth::Summary,
+        )
+        .unwrap();
+        let bytes = page
+            .items
+            .iter()
+            .map(page_payload_cost)
+            .fold(0_usize, usize::saturating_add);
+        // One page travels as one Relay frame. A page several times the budget
+        // fills the Relay's per-connection queue and is dropped, and the client
+        // waits until it times out instead of reading a session.
+        assert!(
+            bytes <= budget as usize * 2,
+            "a page must stay near the byte budget it was asked for, got {bytes} bytes for a {budget} byte budget"
+        );
+        assert!(
+            page.has_older,
+            "the rows above the cut are still reachable by an older read"
+        );
+    }
+
     fn a_turn_window_carries_the_question_however_many_rows_the_turn_has() {
         let temp = temp_db_path("turn-window-question");
         let mut conn = open_database(&temp).unwrap();

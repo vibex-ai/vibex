@@ -10743,8 +10743,28 @@ impl SessionService {
                 }
                 let has_visible_items = !service.model.borrow().items.is_empty();
                 match fetched {
-                    Ok(Ok(Ok(outcome))) => service.apply_timeline_outcome(&session_id, outcome),
+                    Ok(Ok(Ok(outcome))) => {
+                        let (items, has_older) = match &outcome {
+                            TimelineFetchOutcome::Full(page) => (page.items.len(), page.has_older),
+                            TimelineFetchOutcome::Delta { items, .. } => (items.len(), false),
+                        };
+                        log::info!(
+                            "timeline load: session={} mode={:?} items={} has_older={}",
+                            session_id.as_str(),
+                            pass_mode,
+                            items,
+                            has_older
+                        );
+                        service.apply_timeline_outcome(&session_id, outcome)
+                    }
                     Ok(Ok(Err(error))) => {
+                        log::warn!(
+                            "timeline load failed: session={} mode={:?} {} ({})",
+                            session_id.as_str(),
+                            pass_mode,
+                            error.code,
+                            error.message
+                        );
                         if has_visible_items && pass_mode == TimelineReloadMode::Incremental {
                             service.conversation.set(ConversationState::Ready);
                         } else {
@@ -10754,6 +10774,15 @@ impl SessionService {
                         }
                     }
                     Ok(Err(_elapsed)) => {
+                        // A timeout here is the page's own 20s bound, not a
+                        // transport error: log it with the mode so a stuck
+                        // window is distinguishable from a broken link.
+                        log::warn!(
+                            "timeline load timed out: session={} mode={:?} after {:?}",
+                            session_id.as_str(),
+                            pass_mode,
+                            OPEN_TIMEOUT
+                        );
                         if has_visible_items && pass_mode == TimelineReloadMode::Incremental {
                             service.conversation.set(ConversationState::Ready);
                         } else {
@@ -11127,10 +11156,15 @@ async fn fetch_page(
     let page = backend
         .fetch_timeline(initial_timeline_request(session_id.clone()))
         .await?;
-    Ok(align_timeline_window_to_turn_start(page, 2, |cursor| {
-        fetch_timeline_before_raw(backend.clone(), session_id.clone(), cursor)
-    })
-    .await)
+    // The runtime already answers a turn-windowed read: `initial_timeline_request`
+    // asks for `MOBILE_TIMELINE_TURN_WINDOW` turns and the database lands the
+    // page on a turn boundary, reporting it in `starts_at_turn_start`. Walking
+    // further back here duplicated that work, and on a session whose newest
+    // turn alone exceeds the byte budget the walk could never satisfy
+    // `min_turns`, so it spent all its pages and the open timed out before the
+    // conversation appeared. Take the runtime's window as it is; older turns
+    // stay reachable through the page's own `has_older` cursor.
+    Ok(page)
 }
 
 /// Sends `text` (and any attachments) and reads back only the incremental

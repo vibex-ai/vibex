@@ -13,6 +13,17 @@ async fn main() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
+    // The server's own diagnostics (`warn!` on a rejected frame, an expired
+    // room, a failed route) are the only way to see why a device cannot reach
+    // its desktop, and they were all dropped: the crate emits `tracing` events
+    // but installs no subscriber. Default to warnings on stderr, overridable
+    // with VIBEX_RELAY_LOG.
+    let filter = std::env::var("VIBEX_RELAY_LOG").unwrap_or_else(|_| "vibex_relay_server=info,warn".to_string());
+    let _ = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_writer(std::io::stderr)
+        .try_init();
+
     let config = RelayServerConfig::from_env()?;
     let bind_addr = config.bind_addr;
     let router = build_router(config);
