@@ -1935,6 +1935,32 @@ fn older_history_loads_itself_as_the_reader_scrolls_to_the_top() {
     // Scrolling up is what asks for them.
     app.scroll("id:transcript", px(-2000.0)).unwrap();
     app.wait_for("Loading earlier...").unwrap();
+    app.wait_for("id:transcript-loading-older-spinner").unwrap();
+
+    // The loading row must sit below the floating header bar (not hidden under
+    // the status bar/header at y = 0) and directly above the first loaded message.
+    let loader_bounds = app
+        .screen()
+        .layout("id:transcript-loading-older")
+        .unwrap()
+        .expect("older history loader row")
+        .bounds;
+    let first_row_bounds = app
+        .screen()
+        .layout(
+            "id:transcript >> text:A paragraph of history, number 0, long enough to take a row or two of the transcript.",
+        )
+        .unwrap()
+        .expect("first loaded history row")
+        .bounds;
+    assert!(
+        loader_bounds.origin.y.0 >= theme::HEADER_HEIGHT - 1.0,
+        "older loader should clear the floating header bar: loader={loader_bounds:?}"
+    );
+    assert!(
+        loader_bounds.origin.y.0 + loader_bounds.size.height.0 <= first_row_bounds.origin.y.0 + 1.0,
+        "older loader should sit above the first history row: loader={loader_bounds:?}, first={first_row_bounds:?}"
+    );
 }
 
 #[test]

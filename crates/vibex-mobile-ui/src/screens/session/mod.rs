@@ -2087,6 +2087,10 @@ fn timeline_view(
                 .cloned()
         })
     });
+    let has_older = host.has_older;
+    let loading_older = host.loading_older;
+    let on_load_older = host.on_load_older.clone();
+    let show_older_row = computed(move || has_older.get() || loading_older.get());
     let row_actions = TranscriptActions {
         find: FindMarking {
             query: find_query,
@@ -2101,6 +2105,8 @@ fn timeline_view(
         jump: jump_to_message,
         entries: source,
         visible,
+        show_older_row,
+        loading_older,
         reveal: reveal_row.clone(),
         clock: crate::ui::activity::ActivityClock::start(),
         open_file: {
@@ -2142,8 +2148,9 @@ fn timeline_view(
                     let row_height = 72.0;
                     let view = window().height.0;
                     let offset = -(aim * row_height - view * 0.25).max(0.0);
+                    let list_index = index + usize::from(show_older_row.get_untracked());
                     list_ref.scroll_to_index(
-                        index as u32,
+                        list_index as u32,
                         Percentage(0.5),
                         px(offset),
                         !crate::motion::reduce_motion(),
@@ -2157,8 +2164,9 @@ fn timeline_view(
             if let Some(index) = position_for(&|entry| {
                 entry.kind == EntryKind::User && entry.last_sequence == sequence
             }) {
+                let list_index = index + usize::from(show_older_row.get_untracked());
                 list_ref.scroll_to_index(
-                    index as u32,
+                    list_index as u32,
                     Percentage(0.0),
                     px(0.0),
                     !crate::motion::reduce_motion(),
@@ -2210,9 +2218,6 @@ fn timeline_view(
         });
         reveal_row(id, open_detail);
     });
-    let has_older = host.has_older;
-    let loading_older = host.loading_older;
-    let on_load_older = host.on_load_older.clone();
     // A bottom-aligned transcript whose rendered rows fit inside the viewport
     // has zero scroll range (`content_size.height <= size.height`), so swiping
     // never fires `on_scroll` and `has_older` would be unreachable. Watch the
@@ -2317,8 +2322,6 @@ fn timeline_view(
             });
         });
     }
-    // The ring the "earlier messages" strip turns while a page is on its way.
-    let older_clock = crate::ui::activity::ActivityClock::start();
     view()
         .flex_1()
         .min_h(px(0.0))
@@ -2422,38 +2425,11 @@ fn timeline_view(
                         }
                     }))
                     // The older messages come by themselves: scrolling near the
-                    // top of what is loaded asks for the next page, and the
-                    // strip above the transcript says it is on its way. A
-                    // button would have made the reader stop and press it at
-                    // the one moment they were already reading backwards.
-                    .child(when(
-                        move || loading_older.get(),
-                        move || {
-                            view()
-                                .w_full()
-                                .items_center()
-                                .py(px(theme::SPACING_XS))
-                                .child(
-                                    view()
-                                        .flex_row()
-                                        .items_center()
-                                        .gap(px(theme::SPACING_SM))
-                                        .child(crate::ui::activity::activity_ring(
-                                            older_clock,
-                                            theme::primary,
-                                        ))
-                                        .child(
-                                            text(copy::text(
-                                                "Loading earlier...",
-                                                "正在加载更早的消息…",
-                                                "正在載入更早的訊息…",
-                                            ))
-                                            .text_size(px(theme::font_micro()))
-                                            .text_color(theme::text_muted),
-                                        ),
-                                )
-                        },
-                    ))
+                    // top of what is loaded asks for the next page, and row 0
+                    // inside the transcript list holds the loading animation
+                    // directly below `content_padding_top` so it stays clear of
+                    // the status bar and floating header without shifting the
+                    // scroll viewport.
                     .child({
                         let actions = row_actions.clone();
                         view()
@@ -2462,24 +2438,31 @@ fn timeline_view(
                             .min_h(px(0.0))
                             .child(
                                 virtual_list(
-                                    move || visible.with(Vec::len),
+                                    move || {
+                                        visible.with(Vec::len) + usize::from(show_older_row.get())
+                                    },
                                     move |at: Position| entry_row(at, actions.clone()),
                                 )
                                 .keys(move || {
+                                    let has_loader = show_older_row.get();
                                     visible.with(|indices| {
                                         source.with(|entries| {
-                                            indices
-                                                .iter()
-                                                .filter_map(|&index| {
-                                                    entries.get(index).map(|entry| {
-                                                        entry
-                                                            .render_key
-                                                            .as_deref()
-                                                            .unwrap_or(entry.id.as_str())
-                                                            .to_owned()
-                                                    })
+                                            let mut keys = Vec::with_capacity(
+                                                indices.len() + usize::from(has_loader),
+                                            );
+                                            if has_loader {
+                                                keys.push(OLDER_LOADER_ROW_KEY.to_owned());
+                                            }
+                                            keys.extend(indices.iter().filter_map(|&index| {
+                                                entries.get(index).map(|entry| {
+                                                    entry
+                                                        .render_key
+                                                        .as_deref()
+                                                        .unwrap_or(entry.id.as_str())
+                                                        .to_owned()
                                                 })
-                                                .collect::<Vec<_>>()
+                                            }));
+                                            keys
                                         })
                                     })
                                 })
@@ -2768,6 +2751,8 @@ struct TranscriptActions {
     jump: Signal<Option<i64>>,
     entries: Signal<Vec<TimelineEntry>>,
     visible: Memo<Vec<usize>>,
+    show_older_row: Memo<bool>,
+    loading_older: Signal<bool>,
     reveal: RevealRow,
     open_file: Rc<dyn Fn(&str)>,
     /// The clock every working mark in the transcript turns by.
@@ -2791,6 +2776,9 @@ struct FindMarking {
 /// messages are asked for. A few rows of lead, so the page is already there by
 /// the time the finger reaches the first one.
 const OLDER_TRIGGER: f32 = 240.0;
+/// Key for the leading virtual-list row that hosts the older-history loading
+/// indicator at the top of the transcript.
+const OLDER_LOADER_ROW_KEY: &str = "__transcript_older_loader__";
 
 const STEP_HEIGHT: f32 = 38.0;
 /// The column a turn's rail and its nodes take.
@@ -3067,13 +3055,52 @@ fn notice_row(body: Memo<String>, query: Signal<String>, active: Memo<bool>) -> 
     )
 }
 
+fn older_history_row(loading_older: Signal<bool>) -> impl IntoElement {
+    view()
+        .test_id("transcript-loading-older")
+        .w_full()
+        .min_h(px(44.0))
+        .px(px(theme::SPACING_LG))
+        .pt(px(theme::SPACING_MD))
+        .pb(px(theme::SPACING_SM))
+        .items_center()
+        .justify_center()
+        .child(when(
+            move || loading_older.get(),
+            move || {
+                view()
+                    .flex_row()
+                    .items_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        crate::ui::activity::spinner(16.0, theme::primary)
+                            .test_id("transcript-loading-older-spinner"),
+                    )
+                    .child(
+                        text(copy::text(
+                            "Loading earlier...",
+                            "正在加载更早的消息…",
+                            "正在載入更早的訊息…",
+                        ))
+                        .text_size(px(theme::font_micro()))
+                        .text_color(theme::text_muted),
+                    )
+            },
+        ))
+}
+
 fn entry_row(at: Position, actions: TranscriptActions) -> impl IntoElement {
+    let show_older_row = actions.show_older_row;
+    let loading_older = actions.loading_older;
+    let is_older_row = computed(move || show_older_row.get() && at.index() == 0);
+    let visible_index = computed(move || at.index().checked_sub(usize::from(show_older_row.get())));
     let entries = actions.entries;
     let visible = actions.visible;
     let entry = computed(move || {
+        let row = visible_index.get()?;
         visible.with(|indices| {
             indices
-                .get(at.index())
+                .get(row)
                 .and_then(|&index| entries.with(|entries| entries.get(index).cloned()))
         })
     });
@@ -3093,17 +3120,31 @@ fn entry_row(at: Position, actions: TranscriptActions) -> impl IntoElement {
         })
     };
     let rail = Rail {
-        above: computed(move || step_row(at.index().saturating_sub(1)) && step_row(at.index())),
-        below: computed(move || step_row(at.index()) && step_row(at.index() + 1)),
+        above: computed(move || {
+            visible_index
+                .get()
+                .is_some_and(|row| row > 0 && step_row(row - 1) && step_row(row))
+        }),
+        below: computed(move || {
+            visible_index
+                .get()
+                .is_some_and(|row| step_row(row) && step_row(row + 1))
+        }),
     };
-    view()
-        .w_full()
-        .px(px(theme::SPACING_LG))
-        // No row-level tint: what a find marks is the word, not the message
-        // around it. A whole row painted made the reader hunt for their own
-        // query inside a highlighted paragraph, which is the opposite of what
-        // a find is for. `entry_element` marks the matched text instead.
-        .child(entry_element(entry, rail, actions))
+    when(
+        move || is_older_row.get(),
+        move || older_history_row(loading_older),
+    )
+    .otherwise(move || {
+        view()
+            .w_full()
+            .px(px(theme::SPACING_LG))
+            // No row-level tint: what a find marks is the word, not the message
+            // around it. A whole row painted made the reader hunt for their own
+            // query inside a highlighted paragraph, which is the opposite of what
+            // a find is for. `entry_element` marks the matched text instead.
+            .child(entry_element(entry, rail, actions.clone()))
+    })
 }
 
 fn entry_element(
