@@ -12189,16 +12189,35 @@ enum ReleaseArtifactStage {
 /// [`development_server_artifact`] instead. The caller keeps its own stage
 /// publishing so each surface — the SSH progress dialog and the WSL dialog —
 /// can word the same two steps for its own reader.
+fn update_channel_for_mode(mode: DesktopRuntimeMode) -> vibex_app_update::UpdateChannel {
+    match mode {
+        DesktopRuntimeMode::Stable | DesktopRuntimeMode::ReleaseStable => {
+            vibex_app_update::UpdateChannel::Stable
+        }
+        DesktopRuntimeMode::ReleaseCandidate => vibex_app_update::UpdateChannel::Rc,
+        DesktopRuntimeMode::Preview | DesktopRuntimeMode::Headless => {
+            vibex_app_update::UpdateChannel::Preview
+        }
+    }
+}
+
+fn ssh_tunnel_spec_matches_profile(spec: &TunnelSpec, profile: &SshConnectionProfile) -> bool {
+    spec.local_port == profile.local_tunnel_port
+        && (spec.destination == profile.ssh_destination()
+            || (spec.destination.host == profile.host
+                && spec.destination.port == profile.port
+                && spec.destination.user == profile.user))
+}
+
 async fn release_server_artifact(
-    runtime: &Arc<vibex_desktop_runtime::DesktopRuntime>,
+    app_update: &vibex_app_update::AppUpdateService,
     artifact_os: &str,
     arch: crate::ssh_connection::environment::RemoteArch,
     cache_dir: &Path,
     mut on_stage: impl FnMut(ReleaseArtifactStage),
 ) -> Result<ResolvedServerArtifact, String> {
     on_stage(ReleaseArtifactStage::FetchingManifest);
-    let verified = runtime
-        .app_update()
+    let verified = app_update
         .latest_verified_manifest()
         .await
         .map_err(|error| format!("{}: {}", error.code, error.message))?
@@ -12445,6 +12464,7 @@ pub struct VibexWorkbench {
     wsl_provisioning_attempt: u64,
     wsl_provisioning_poll_task: Option<Task<()>>,
     wsl_keepalive: Option<crate::ssh_connection::wsl::WslKeepalive>,
+    wsl_keepalive_runtime_id: Option<String>,
     wsl_watch_generation: u64,
     wsl_watch_task: Option<Task<()>>,
     #[allow(dead_code)]
@@ -12466,6 +12486,8 @@ pub struct VibexWorkbench {
     runtime_registry_store: Option<Arc<DesktopRuntimeRegistryStore>>,
     /// Last compatibility report per remote runtime id, captured on connect.
     runtime_compatibility: BTreeMap<String, crate::ssh_connection::compat::CompatibilityReport>,
+    /// Persisted SSH profiles cached in memory to avoid disk reads on render.
+    ssh_profiles: Vec<SshConnectionProfile>,
     /// Persisted WSL profiles and the runtime labels derived from them.
     wsl_profiles: Vec<crate::ssh_connection::wsl_profile::WslConnectionProfile>,
     wsl_runtime_labels: BTreeMap<String, String>,
@@ -12509,6 +12531,7 @@ pub struct VibexWorkbench {
     /// A pairing link or code is being claimed; blocks a second claim while
     /// the first is still talking to the server.
     remote_pairing_pending: bool,
+    remote_pairing_task: Option<Task<()>>,
     /// The runtime a removal is confirming.
     runtime_remove_pending: Option<String>,
     /// The SSH profile whose upgrade is waiting for confirmation.
@@ -14493,6 +14516,14 @@ impl VibexWorkbench {
         // holding a stale one that would swallow the next open.
         let computer_panel_closed_subscription = observe_computer_panel_close(cx.weak_entity(), cx);
         let window_handle = Some(window.window_handle());
+        let ssh_profiles = config
+            .as_ref()
+            .map(|config| {
+                SshProfileStore::at_home(&config.home_dir)
+                    .load()
+                    .unwrap_or_default()
+            })
+            .unwrap_or_default();
         let wsl_profiles = config
             .as_ref()
             .map(|config| {
@@ -14597,6 +14628,7 @@ impl VibexWorkbench {
             wsl_provisioning_attempt: 0,
             wsl_provisioning_poll_task: None,
             wsl_keepalive: None,
+            wsl_keepalive_runtime_id: None,
             wsl_watch_generation: 0,
             wsl_watch_task: None,
             ssh_provisioning_task: None,
@@ -14609,6 +14641,7 @@ impl VibexWorkbench {
             runtime_registry,
             runtime_registry_store,
             runtime_compatibility: BTreeMap::new(),
+            ssh_profiles,
             wsl_profiles,
             wsl_runtime_labels,
             runtime_manager_open: false,
@@ -14634,6 +14667,7 @@ impl VibexWorkbench {
             runtime_edit_homes_task: None,
             runtime_switch_pending: None,
             remote_pairing_pending: false,
+            remote_pairing_task: None,
             runtime_remove_pending: None,
             runtime_upgrade_pending: None,
             runtime_uninstall_pending: None,
@@ -17494,18 +17528,18 @@ impl VibexWorkbench {
         let Some(profile_id) = self.runtime_edit_pending.clone() else {
             return;
         };
-        let Some(config) = self.config.as_ref() else {
+        if self.config.is_none() {
             self.runtime_edit_homes_error =
                 Some("the runtime configuration is unavailable".to_string());
             cx.notify();
             return;
-        };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
-        let Some(profile) = profiles
-            .into_iter()
+        }
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             self.runtime_edit_homes_error = Some("the SSH profile was not found".to_string());
             cx.notify();
@@ -17653,15 +17687,18 @@ impl VibexWorkbench {
         // directory is another server. Dropping the binding makes the next
         // connect provision against the adopted home and pair again instead of
         // failing against a pinned identity that no longer answers.
+        let mut disconnect_previous_active: Option<(String, SshConnectionProfile)> = None;
         if adopted_home_changed && runtime_id.is_some() {
+            let profile_snapshot = profile.clone();
             profile.registered_runtime_id = None;
-            if let Some(previous) = runtime_id.as_deref()
-                && self.runtime_registry.active_runtime_id() != previous
-            {
-                self.runtime_registry
-                    .runtimes
-                    .retain(|runtime| runtime.id != previous);
-                self.persist_runtime_registry(cx);
+            if let Some(previous) = runtime_id.as_deref() {
+                if self.runtime_registry.active_runtime_id() == previous {
+                    disconnect_previous_active = Some((previous.to_string(), profile_snapshot));
+                } else {
+                    self.runtime_registry.remove(previous);
+                    self.runtime_compatibility.remove(previous);
+                    self.persist_runtime_registry(cx);
+                }
             }
         }
         let active = profile.registered_runtime_id.as_deref()
@@ -17670,6 +17707,24 @@ impl VibexWorkbench {
             self.runtime_edit_error = Some(format!("{}: {}", error.code, error.message));
             cx.notify();
             return;
+        }
+        self.ssh_profiles = profiles;
+        if let Some((previous, profile_snapshot)) = disconnect_previous_active {
+            if self
+                .ssh_tunnel_spec
+                .as_ref()
+                .is_some_and(|spec| ssh_tunnel_spec_matches_profile(spec, &profile_snapshot))
+            {
+                self.ssh_tunnel = None;
+                self.ssh_tunnel_spec = None;
+                self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+                self.ssh_tunnel_task = None;
+            }
+            self.remote_client = None;
+            self.runtime_registry.remove(&previous);
+            self.runtime_compatibility.remove(&previous);
+            self.persist_runtime_registry(cx);
+            self.activate_local_runtime(cx);
         }
         // The runtime row shows this connection's name while the operator has
         // not renamed the runtime itself. Keep that derived label in step with
@@ -17962,12 +18017,14 @@ impl VibexWorkbench {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
-            let error = "the local runtime is unavailable".to_string();
-            self.wsl_error = Some(error.clone());
-            self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
-            cx.notify();
-            return;
+        let app_update = match self.app_update_service(&config) {
+            Ok(service) => service,
+            Err(error) => {
+                self.wsl_error = Some(error.clone());
+                self.queue_settings_operation_notice(SettingsOperationNotice::error(error), cx);
+                cx.notify();
+                return;
+            }
         };
         let desktop_home = config.home_dir.clone();
         self.wsl_error = None;
@@ -18050,7 +18107,7 @@ impl VibexWorkbench {
                 Some(resolved) => resolved,
                 None => {
                     release_server_artifact(
-                        &runtime,
+                        &app_update,
                         "linux",
                         environment.arch,
                         &desktop_home.join("ssh-artifacts"),
@@ -18195,6 +18252,7 @@ impl VibexWorkbench {
                     match result {
                         Ok(Ok((runtime_id, distro, credential, backend, keepalive, profile))) => {
                             this.wsl_keepalive = Some(keepalive);
+                            this.wsl_keepalive_runtime_id = Some(runtime_id.clone());
                             this.arm_wsl_watchdog(runtime_id.clone(), cx);
                             this.wsl_profiles
                                 .retain(|existing| existing.id != profile.id);
@@ -18400,17 +18458,20 @@ impl VibexWorkbench {
             cx.notify();
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
-            self.ssh_upgrade_error = Some("the local runtime is unavailable".to_string());
-            cx.notify();
-            return;
+        let app_update = match self.app_update_service(&config) {
+            Ok(service) => service,
+            Err(error) => {
+                self.ssh_upgrade_error = Some(error);
+                cx.notify();
+                return;
+            }
         };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
-        let Some(profile) = profiles
-            .into_iter()
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             self.ssh_upgrade_error = Some("the SSH profile was not found".to_string());
             cx.notify();
@@ -18438,7 +18499,7 @@ impl VibexWorkbench {
                 Some(resolved) => resolved,
                 None => {
                     release_server_artifact(
-                        &runtime,
+                        &app_update,
                         artifact_os,
                         environment.arch,
                         &home.join("ssh-artifacts"),
@@ -18518,7 +18579,7 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn update_profile_runtime_version(&self, profile_id: &str, version: &str) {
+    fn update_profile_runtime_version(&mut self, profile_id: &str, version: &str) {
         let Some(config) = self.config.as_ref() else {
             return;
         };
@@ -18534,19 +18595,18 @@ impl VibexWorkbench {
             profile.channel = channel;
         }
         profile.last_connected_at_ms = Some(unix_timestamp_ms());
-        let _ = store.save(&profiles);
+        if store.save(&profiles).is_ok() {
+            self.ssh_profiles = profiles;
+        }
     }
 
     fn reconnect_after_ssh_upgrade(&mut self, profile_id: &str, cx: &mut Context<Self>) {
-        let Some(config) = self.config.as_ref() else {
-            return;
-        };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
-        let Some(profile) = profiles
-            .into_iter()
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             return;
         };
@@ -18569,15 +18629,12 @@ impl VibexWorkbench {
         remove_home: bool,
         cx: &mut Context<Self>,
     ) {
-        let Some(config) = self.config.as_ref() else {
-            return;
-        };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
-        let Some(profile) = profiles
-            .into_iter()
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             return;
         };
@@ -18619,11 +18676,16 @@ impl VibexWorkbench {
         // remove-everything uninstall cannot reach the reader's own data.
         let launch = launch.with_runtime_home(profile.runtime_home_path());
         let runtime_id = profile.registered_runtime_id.clone();
+        let profile_for_teardown = profile.clone();
         let profile_id = profile.id;
         self.ssh_uninstall_error = None;
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
-            crate::ssh_connection::uninstall::uninstall_runtime(&command, &launch, remove_home)
-                .map_err(|error| format!("{}: {}", error.code, error.message))
+            tokio::task::spawn_blocking(move || {
+                crate::ssh_connection::uninstall::uninstall_runtime(&command, &launch, remove_home)
+                    .map_err(|error| format!("{}: {}", error.code, error.message))
+            })
+            .await
+            .map_err(|error| format!("ssh_uninstall_task_failed: {error}"))?
         });
         self.ssh_uninstall_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
@@ -18640,14 +18702,35 @@ impl VibexWorkbench {
                                 .to_string(),
                             );
                             this.clear_ssh_profile_binding(&profile_id);
-                            if let Some(runtime_id) = runtime_id.as_deref()
-                                && this.runtime_registry.active_runtime_id() == runtime_id
-                            {
-                                this.remote_client = None;
-                                this.runtime_registry.remove(runtime_id);
-                                this.persist_runtime_registry(cx);
-                                this.activate_local_runtime(cx);
+                            if this.ssh_tunnel_spec.as_ref().is_some_and(|spec| {
+                                ssh_tunnel_spec_matches_profile(spec, &profile_for_teardown)
+                            }) {
+                                this.ssh_tunnel = None;
+                                this.ssh_tunnel_spec = None;
+                                this.ssh_tunnel_generation =
+                                    this.ssh_tunnel_generation.wrapping_add(1);
+                                this.ssh_tunnel_task = None;
                             }
+                            if let Some(runtime_id) = runtime_id.as_deref() {
+                                let was_active = this.runtime_registry.active_runtime_id()
+                                    == runtime_id
+                                    || this
+                                        .remote_client
+                                        .as_ref()
+                                        .is_some_and(|client| client.runtime_id == runtime_id);
+                                this.runtime_compatibility.remove(runtime_id);
+                                if this.runtime_registry.remove(runtime_id) {
+                                    this.persist_runtime_registry(cx);
+                                }
+                                if was_active {
+                                    this.remote_client = None;
+                                    this.activate_local_runtime(cx);
+                                }
+                            }
+                            this.settings_view.update(cx, |settings, cx| {
+                                settings.reload_connections_profiles();
+                                cx.notify();
+                            });
                         }
                         Ok(Err(error)) => {
                             this.ssh_uninstall_error = Some(error);
@@ -18664,7 +18747,7 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn clear_ssh_profile_binding(&self, profile_id: &str) {
+    fn clear_ssh_profile_binding(&mut self, profile_id: &str) {
         let Some(config) = self.config.as_ref() else {
             return;
         };
@@ -18677,7 +18760,9 @@ impl VibexWorkbench {
         };
         profile.registered_runtime_id = None;
         profile.runtime_version = None;
-        let _ = store.save(&profiles);
+        if store.save(&profiles).is_ok() {
+            self.ssh_profiles = profiles;
+        }
     }
 
     fn cancel_ssh_provisioning(&mut self, cx: &mut Context<Self>) {
@@ -18787,16 +18872,19 @@ impl VibexWorkbench {
             );
             return;
         };
-        let Some(runtime) = self.runtime.clone() else {
-            self.fail_ssh_provisioning_start("the local runtime is unavailable".to_string(), cx);
-            return;
+        let app_update = match self.app_update_service(&config) {
+            Ok(service) => service,
+            Err(error) => {
+                self.fail_ssh_provisioning_start(error, cx);
+                return;
+            }
         };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
-        let Some(profile) = profiles
-            .into_iter()
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             self.fail_ssh_provisioning_start("the SSH profile was not found".to_string(), cx);
             return;
@@ -18836,7 +18924,7 @@ impl VibexWorkbench {
                 Some(resolved) => resolved,
                 None => {
                     release_server_artifact(
-                        &runtime,
+                        &app_update,
                         artifact_os,
                         environment.arch,
                         &home.join("ssh-artifacts"),
@@ -19137,8 +19225,44 @@ impl VibexWorkbench {
         cx.notify();
     }
 
-    fn bind_ssh_profile_runtime(
+    fn app_update_service(
         &self,
+        config: &DesktopRuntimeConfig,
+    ) -> Result<vibex_app_update::AppUpdateService, String> {
+        if let Some(runtime) = self.runtime.as_ref() {
+            return Ok(runtime.app_update());
+        }
+        let app_update_config = vibex_app_update::AppUpdateConfig::for_current_build(
+            env!("CARGO_PKG_VERSION"),
+            update_channel_for_mode(config.mode),
+            &config.home_dir,
+        )
+        .map_err(|error| format!("{}: {}", error.code, error.message))?;
+        vibex_app_update::AppUpdateService::new(app_update_config)
+            .map_err(|error| format!("{}: {}", error.code, error.message))
+    }
+
+    fn reload_ssh_profiles(&mut self) {
+        if let Some(config) = self.config.as_ref() {
+            self.ssh_profiles = SshProfileStore::at_home(&config.home_dir)
+                .load()
+                .unwrap_or_default();
+        }
+    }
+
+    fn cleanup_replaced_ssh_profiles(
+        &mut self,
+        replaced: Vec<SshConnectionProfile>,
+        cx: &mut Context<Self>,
+    ) {
+        self.reload_ssh_profiles();
+        for profile in replaced {
+            self.remove_ssh_connection_runtime(profile, cx);
+        }
+    }
+
+    fn bind_ssh_profile_runtime(
+        &mut self,
         profile_id: &str,
         runtime_id: &str,
         version: Option<String>,
@@ -19162,7 +19286,9 @@ impl VibexWorkbench {
             }
             profile.runtime_version = Some(version);
         }
-        let _ = store.save(&profiles);
+        if store.save(&profiles).is_ok() {
+            self.ssh_profiles = profiles;
+        }
     }
 
     /// Copies the operator's SSH connection name onto its runtime row.
@@ -19173,14 +19299,9 @@ impl VibexWorkbench {
     /// what the row should read. An explicit runtime rename always wins:
     /// `display_name` is only filled while it is still empty.
     fn sync_ssh_profile_display_name(&mut self, runtime_id: &str, cx: &mut Context<Self>) {
-        let Some(config) = self.config.as_ref() else {
-            return;
-        };
-        let Ok(profiles) = SshProfileStore::at_home(&config.home_dir).load() else {
-            return;
-        };
-        let Some(name) = profiles
-            .into_iter()
+        let Some(name) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
             .map(|profile| profile.display_name.trim().to_string())
             .filter(|name| !name.is_empty())
@@ -19203,15 +19324,10 @@ impl VibexWorkbench {
     ///
     /// The Connections page renders inside the workbench's own update, so it
     /// cannot read the runtime registry or the live remote client itself.
-    /// Recomputing is cheap — one profile-store read — and happens only when
+    /// Recomputing reads the cached profile list and happens only when
     /// the registry, the client or a pending switch changes.
     fn sync_connections_live_status(&self, cx: &mut Context<Self>) {
-        let Some(config) = self.config.as_ref() else {
-            return;
-        };
-        let profiles = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .unwrap_or_default();
+        let profiles = &self.ssh_profiles;
         let bound_runtime_ids = profiles
             .iter()
             .filter_map(|profile| profile.registered_runtime_id.clone())
@@ -19260,7 +19376,7 @@ impl VibexWorkbench {
                 }
                 None => ConnectionRowStatus::Offline,
             };
-            live.insert(profile.id, status);
+            live.insert(profile.id.clone(), status);
         }
         // WSL connections are local and carry their own store, but their
         // liveness is the same registry/client fact as an SSH profile's. A WSL
@@ -19712,6 +19828,7 @@ impl VibexWorkbench {
                         }
                         eprintln!("vibex-wsl: keepalive exited");
                         this.wsl_keepalive = None;
+                        this.wsl_keepalive_runtime_id = None;
                         let runtime = this
                             .runtime_registry
                             .runtimes
@@ -19825,6 +19942,7 @@ impl VibexWorkbench {
                     match outcome {
                         Ok(Ok(keepalive)) => {
                             this.wsl_keepalive = Some(keepalive);
+                            this.wsl_keepalive_runtime_id = Some(runtime.id.clone());
                             this.arm_wsl_watchdog(runtime.id.clone(), cx);
                             this.runtime_switch_pending = None;
                             this.begin_remote_connect(runtime, origin, cx);
@@ -19862,11 +19980,9 @@ impl VibexWorkbench {
         &self,
         profile_id: &str,
     ) -> Option<crate::ssh_connection::compat::CompatibilityReport> {
-        let config = self.config.as_ref()?;
-        let profile = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .ok()?
-            .into_iter()
+        let profile = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)?;
         let runtime_id = profile.registered_runtime_id.as_deref()?;
         if let Some(report) = self.runtime_compatibility.get(runtime_id) {
@@ -19892,12 +20008,10 @@ impl VibexWorkbench {
     }
 
     fn ssh_profile_for_runtime(&self, runtime_id: &str) -> Option<SshConnectionProfile> {
-        let config = self.config.as_ref()?;
-        SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .ok()?
-            .into_iter()
+        self.ssh_profiles
+            .iter()
             .find(|profile| profile.registered_runtime_id.as_deref() == Some(runtime_id))
+            .cloned()
     }
 
     /// Whether the SSH tunnel this shell already holds still forwards the
@@ -19923,11 +20037,9 @@ impl VibexWorkbench {
     }
 
     fn ssh_tunnel_spec_for_profile(&self, profile_id: &str) -> Option<TunnelSpec> {
-        let config = self.config.as_ref()?;
-        let profile = SshProfileStore::at_home(&config.home_dir)
-            .load()
-            .ok()?
-            .into_iter()
+        let profile = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)?;
         let program = profile
             .ssh_client_path
@@ -20123,15 +20235,12 @@ impl VibexWorkbench {
         if in_flight {
             return;
         }
-        let Some(config) = self.config.as_ref() else {
-            return;
-        };
-        let Ok(profiles) = SshProfileStore::at_home(&config.home_dir).load() else {
-            return;
-        };
-        let Some(profile) = profiles
-            .into_iter()
+        self.reload_ssh_profiles();
+        let Some(profile) = self
+            .ssh_profiles
+            .iter()
             .find(|profile| profile.id == profile_id)
+            .cloned()
         else {
             return;
         };
@@ -20399,7 +20508,7 @@ impl VibexWorkbench {
                 .map_err(|error| (error.code, error.message))?;
             Ok::<(String, DesktopRemoteCredential), (String, String)>((runtime_id, credential))
         });
-        self.boot_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
+        self.remote_pairing_task = Some(cx.spawn(async move |entity: WeakEntity<Self>, cx| {
             let outcome = runner.await;
             let _ = entity.update(cx, |this, cx| {
                 this.remote_pairing_pending = false;
@@ -20982,7 +21091,7 @@ impl VibexWorkbench {
 
     /// Removes a runtime and its stored grant. Removing the active runtime
     /// returns the workbench to the embedded authority.
-    fn remove_ssh_profile_for_runtime(&self, runtime_id: &str) {
+    fn remove_ssh_profile_for_runtime(&mut self, runtime_id: &str) {
         let Some(config) = self.config.as_ref() else {
             return;
         };
@@ -20995,6 +21104,7 @@ impl VibexWorkbench {
         if profiles.len() != before {
             let _ = store.save(&profiles);
         }
+        self.ssh_profiles = profiles;
     }
 
     /// Removes the WSL store entry bound to a runtime.
@@ -21020,11 +21130,14 @@ impl VibexWorkbench {
     }
 
     fn remove_runtime(&mut self, id: String, cx: &mut Context<Self>) {
+        let matched_ssh_profile = self.ssh_profile_for_runtime(&id);
         let was_wsl = self
             .wsl_profiles
             .iter()
             .any(|profile| profile.registered_runtime_id.as_deref() == Some(id.as_str()));
         let was_active_wsl = was_wsl && self.runtime_registry.active_runtime_id() == id;
+        let owns_wsl_keepalive =
+            was_active_wsl || self.wsl_keepalive_runtime_id.as_deref() == Some(id.as_str());
         if !self.runtime_registry.remove(&id) {
             return;
         }
@@ -21032,11 +21145,23 @@ impl VibexWorkbench {
         self.remove_ssh_profile_for_runtime(&id);
         self.remove_wsl_profile_for_runtime(&id);
         self.wsl_runtime_labels.remove(&id);
-        if was_active_wsl {
+        if let Some(profile) = matched_ssh_profile.as_ref()
+            && self
+                .ssh_tunnel_spec
+                .as_ref()
+                .is_some_and(|spec| ssh_tunnel_spec_matches_profile(spec, profile))
+        {
+            self.ssh_tunnel = None;
+            self.ssh_tunnel_spec = None;
+            self.ssh_tunnel_generation = self.ssh_tunnel_generation.wrapping_add(1);
+            self.ssh_tunnel_task = None;
+        }
+        if owns_wsl_keepalive {
             // The foreground child is the only thing keeping this distro's
-            // server alive. Dropping it is this shell's uninstall; an inactive
-            // WSL runtime shares no keepalive with the active one.
+            // server alive. Dropping it is this shell's uninstall, including
+            // when the user switched back to Local before deleting the WSL row.
             self.wsl_keepalive = None;
+            self.wsl_keepalive_runtime_id = None;
             self.wsl_watch_generation = self.wsl_watch_generation.wrapping_add(1);
             self.wsl_watch_task = None;
         }
@@ -21098,12 +21223,11 @@ impl VibexWorkbench {
             self.ssh_provisioning_error = None;
             self.sync_ssh_provisioning_settings(cx);
         }
-        let tunnel_matches = self.ssh_tunnel_spec.as_ref().is_some_and(|spec| {
-            spec.local_port == profile.local_tunnel_port
-                && spec.destination.host == profile.host
-                && spec.destination.port == profile.port
-                && spec.destination.user == profile.user
-        });
+        self.reload_ssh_profiles();
+        let tunnel_matches = self
+            .ssh_tunnel_spec
+            .as_ref()
+            .is_some_and(|spec| ssh_tunnel_spec_matches_profile(spec, &profile));
         if tunnel_matches {
             // Dropping the process closes the forward; bumping the generation
             // stops the monitor task from rebuilding it for a deleted profile.
@@ -21936,6 +22060,7 @@ impl VibexWorkbench {
         }
         profile.upgrade_policy = policy;
         if store.save(&profiles).is_ok() {
+            self.ssh_profiles = profiles;
             cx.notify();
         }
     }
@@ -21961,6 +22086,7 @@ impl VibexWorkbench {
         }
         profile.macos_lifecycle = lifecycle;
         if store.save(&profiles).is_ok() {
+            self.ssh_profiles = profiles;
             cx.notify();
         }
     }
@@ -101658,6 +101784,13 @@ impl FoundationSettings {
             let mut profiles = store
                 .load()
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
+            let replaced: Vec<SshConnectionProfile> = profiles
+                .iter()
+                .filter(|existing| {
+                    existing.id == profile.id || existing.ssh_alias == profile.ssh_alias
+                })
+                .cloned()
+                .collect();
             profiles.retain(|existing| {
                 existing.id != profile.id && existing.ssh_alias != profile.ssh_alias
             });
@@ -101666,20 +101799,21 @@ impl FoundationSettings {
             store
                 .save(&profiles)
                 .map_err(|error| format!("{}: {}", error.code, error.message))?;
-            Ok::<(String, String), String>((alias, profile_id))
+            Ok::<(String, String, Vec<SshConnectionProfile>), String>((alias, profile_id, replaced))
         });
         self.connections_probe_task = Some(cx.spawn(
             async move |entity: WeakEntity<Self>, cx: &mut gpui::AsyncApp| {
                 let result = runner.await;
                 let _ = entity.update(cx, |this, cx| {
                     match result {
-                        Ok(Ok((alias, profile_id))) => {
+                        Ok(Ok((alias, profile_id, replaced))) => {
                             this.reload_connections_profiles();
                             this.connections_probe_state = ConnectionsProbeState::Added(alias);
                             this.connections_selected_host = None;
                             let workbench = this.workbench.clone();
                             cx.defer(move |cx| {
                                 let _ = workbench.update(cx, |workbench, cx| {
+                                    workbench.cleanup_replaced_ssh_profiles(replaced, cx);
                                     workbench.start_ssh_profile_provisioning(profile_id, cx)
                                 });
                             });
@@ -102124,10 +102258,10 @@ impl FoundationSettings {
                                     // The SSH form is the next step, so hand
                                     // over in this same frame: closing first
                                     // would leave the reader with nothing open.
+                                    window.close_dialog(cx);
                                     let _ = entity.update(cx, |this, cx| {
                                         this.load_connections_discovery(cx);
                                         this.open_connections_add_dialog(window, cx);
-                                        window.close_dialog(cx);
                                     });
                                 })
                         })
@@ -103265,13 +103399,41 @@ impl FoundationSettings {
             );
         }
         if let Some(failure) = snapshot.failure.as_ref() {
+            let matched_profile = settings
+                .read_with(cx, |this, _| {
+                    this.connections_profiles
+                        .iter()
+                        .find(|profile| profile.id == profile_id)
+                        .cloned()
+                })
+                .ok()
+                .flatten();
+            let host_alias = matched_profile
+                .as_ref()
+                .map(|profile| {
+                    if !profile.ssh_alias.is_empty() {
+                        profile.ssh_alias.as_str()
+                    } else {
+                        profile.host.as_str()
+                    }
+                })
+                .or(Some(profile_id.as_str()));
+            let log_path = matched_profile.as_ref().map(|profile| {
+                format!(
+                    "{}/.local/state/vibex/server/server.log",
+                    profile.remote_home.trim_end_matches('/')
+                )
+            });
+            let remote_os = matched_profile
+                .as_ref()
+                .and_then(|profile| profile.remote_os.as_deref());
             let diagnostic = crate::ssh_connection::diagnostics::diagnose_with_platform(
                 &failure.code,
                 &failure.message,
                 &failure.log_tail,
-                Some(profile_id.as_str()),
-                None,
-                None,
+                host_alias,
+                log_path.as_deref(),
+                remote_os,
             );
             let diagnostic_text = diagnostic.diagnostics.clone();
             let log_text = format!("{}\n{}", failure.message, failure.log_tail);

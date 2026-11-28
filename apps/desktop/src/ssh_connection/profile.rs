@@ -382,14 +382,27 @@ impl SshProfileStore {
     }
 
     fn backup_corrupt(&self) -> Option<PathBuf> {
-        let backup = self.path.with_extension(format!(
-            "json.corrupt-{}",
-            vibex_core::RequestId::new().as_str()
-        ));
+        let raw = fs::read(&self.path).ok()?;
+        let hash = corrupt_content_hash(&raw);
+        let backup = self
+            .path
+            .with_extension(format!("json.corrupt-{hash:016x}"));
+        if backup.exists() {
+            return Some(backup);
+        }
         fs::copy(&self.path, &backup).ok()?;
         let _ = set_private_permissions(&backup);
         Some(backup)
     }
+}
+
+fn corrupt_content_hash(bytes: &[u8]) -> u64 {
+    let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
+    for &byte in bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -853,5 +866,17 @@ mod tests {
             "ssh_profile_invalid"
         );
         assert_eq!(fs::read(store.path()).unwrap(), before);
+    }
+
+    #[test]
+    fn repeated_loads_of_same_corrupt_file_do_not_spam_backups() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = SshProfileStore::at_home(dir.path());
+        fs::write(store.path(), b"{not valid json").unwrap();
+
+        assert!(store.load().unwrap().is_empty());
+        assert!(store.load().unwrap().is_empty());
+        assert!(store.load().unwrap().is_empty());
+        assert_eq!(backups(dir.path()).len(), 1);
     }
 }

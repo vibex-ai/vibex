@@ -53,14 +53,24 @@ pub fn uninstall_runtime(
     if let Some(label) = config.launch_agent_label.as_deref() {
         let _ = launchd::remove(command, config, label);
     }
-    let _ = supervisor::stop(command, config);
-    if let Ok(status) = supervisor::status(command, config)
-        && status.running
-    {
-        return Err(UninstallError::new(
-            "ssh_uninstall_runtime_running",
-            "the remote runtime is still running",
-        ));
+    if let Err(stop_error) = supervisor::ensure_stopped(command, config) {
+        if stop_error.code == "ssh_runtime_stop_timeout" {
+            return Err(UninstallError::new(
+                "ssh_uninstall_runtime_running",
+                format!("{}: {}", stop_error.code, stop_error.message),
+            ));
+        }
+        if let Ok(status) = supervisor::status(command, config)
+            && status.running
+        {
+            return Err(UninstallError::new(
+                "ssh_uninstall_runtime_running",
+                format!(
+                    "the remote runtime is still running ({}: {})",
+                    stop_error.code, stop_error.message
+                ),
+            ));
+        }
     }
 
     let mut remove = command.clone();
@@ -70,25 +80,39 @@ pub fn uninstall_runtime(
     remove.args.extend([
         config.remote_install_root.clone().into(),
         if remove_home { "no" } else { "yes" }.into(),
+        config.env_file.clone().into(),
+        config.pid_file.clone().into(),
+        config.log_file.clone().into(),
     ]);
     let output = remove
         .run_with_timeout(std::time::Duration::from_secs(60))
         .map_err(|error| {
-            UninstallError::new(
-                "ssh_uninstall_failed",
-                format!("{}: {}", error.code(), error.message),
-            )
+            let detail = if error.stderr_tail.trim().is_empty() {
+                format!("{}: {}", error.code(), error.message)
+            } else {
+                format!(
+                    "{}: {} ({})",
+                    error.code(),
+                    error.message,
+                    error.stderr_tail.trim()
+                )
+            };
+            UninstallError::new("ssh_uninstall_failed", detail)
         })?;
-    if !output.stdout_lossy().contains("uninstall=ok") {
-        return Err(UninstallError::new(
-            "ssh_uninstall_unconfirmed",
-            "the remote uninstall did not confirm",
-        ));
+    let stdout = output.stdout_lossy();
+    if !stdout.contains("uninstall=ok") {
+        let stderr = output.stderr_lossy();
+        let detail = if stderr.trim().is_empty() {
+            "the remote uninstall did not confirm".to_string()
+        } else {
+            format!("the remote uninstall did not confirm: {}", stderr.trim())
+        };
+        return Err(UninstallError::new("ssh_uninstall_unconfirmed", detail));
     }
     Ok(UninstallOutcome {
         install_root: config.remote_install_root.clone(),
         runtime_home: config.runtime_home.clone(),
-        home_preserved: !remove_home,
+        home_preserved: stdout.contains("home_preserved=yes"),
     })
 }
 
@@ -114,6 +138,9 @@ fn validate_root(root: &str, remote_home: &str) -> Result<(), UninstallError> {
 pub const UNINSTALL_SCRIPT: &str = r#"set -eu
 root=$1
 keep_home=$2
+env_file=${3:-}
+pid_file=${4:-}
+log_file=${5:-}
 if [ "$keep_home" = yes ]; then
   for entry in "$root"/* "$root"/.[!.]*; do
     if [ ! -e "$entry" ] && [ ! -L "$entry" ]; then
@@ -128,6 +155,11 @@ if [ "$keep_home" = yes ]; then
 else
   rm -rf "$root"
 fi
+for state_file in "$env_file" "$pid_file" "$log_file"; do
+  if [ -n "$state_file" ] && [ -e "$state_file" ]; then
+    rm -f "$state_file"
+  fi
+done
 echo "uninstall=ok"
 "#;
 
@@ -160,6 +192,7 @@ mod tests {
         assert!(UNINSTALL_SCRIPT.contains("$root/home"));
         assert!(UNINSTALL_SCRIPT.contains("uninstall=ok"));
         assert!(UNINSTALL_SCRIPT.contains("home_preserved=yes"));
+        assert!(UNINSTALL_SCRIPT.contains("state_file"));
         assert!(!UNINSTALL_SCRIPT.contains("/home/dev/src"));
         let config = config();
         assert!(validate_root(&config.remote_install_root, &config.remote_home).is_ok());

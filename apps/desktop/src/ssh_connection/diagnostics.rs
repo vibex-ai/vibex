@@ -224,6 +224,11 @@ pub fn diagnose_with_platform(
             "释放运行时端口，或重试以自动选择下一个空闲端口。",
             "釋放執行階段連接埠，或重試以自動選擇下一個空閒連接埠。",
         )),
+        SshDiagnosticKind::Glibc => Some(locale::text(
+            "The remote host's glibc is too old or missing for this server binary. Upgrade the remote OS/glibc or install a compatible Vibex server build.",
+            "远端主机的 glibc 版本过低或缺失，无法运行当前服务端二进制。请升级远端系统/glibc，或使用兼容的 Vibex 服务端构建。",
+            "遠端主機的 glibc 版本過舊或缺失，無法執行目前伺服器二進位檔。請升級遠端系統/glibc，或使用相容的 Vibex 伺服器建置。",
+        )),
         SshDiagnosticKind::Wsl => Some(locale::text(
             "Vibex reaches WSL through `wsl.exe`, not SSH, so an sshd or a key is not the problem. Run `wsl --update` and `wsl -l -v` in a terminal: no distro listed means WSL itself is not installed or registered yet. Then retry; if the distro list works but the runtime does not start, reopen the dialog.",
             "Vibex 通过 `wsl.exe` 访问 WSL，不走 SSH，因此问题不在 sshd 或密钥。请在终端运行 `wsl --update` 和 `wsl -l -v`：列不出任何发行版说明 WSL 本身尚未安装或注册。然后重试；若发行版列表正常但运行时仍无法启动，请重新打开该对话框。",
@@ -232,9 +237,13 @@ pub fn diagnose_with_platform(
         _ => None,
     }
     .map(str::to_string);
-    let log_command = log_path
-        .zip(host_alias)
-        .map(|(path, alias)| format!("ssh {alias} 'tail -n 200 {path}'"));
+    let log_command = log_path.zip(host_alias).map(|(path, alias)| {
+        if kind == SshDiagnosticKind::Wsl {
+            format!("wsl.exe -d {alias} -- tail -n 200 '{path}'")
+        } else {
+            format!("ssh {alias} 'tail -n 200 {path}'")
+        }
+    });
     let mut diagnostics = format!("code: {code}\nmessage: {message}\n");
     if let Some(alias) = host_alias {
         diagnostics.push_str(&format!("host: {alias}\n"));
@@ -288,7 +297,7 @@ fn is_macos(value: &str) -> bool {
 pub fn classify(code: &str) -> SshDiagnosticKind {
     match code {
         "ssh_client_missing" | "ssh_spawn_failed" => SshDiagnosticKind::MissingClient,
-        "ssh_auth_failed" => SshDiagnosticKind::Authentication,
+        "ssh_auth_failed" | "ssh_auth_passphrase_required" => SshDiagnosticKind::Authentication,
         "ssh_host_key_unknown" => SshDiagnosticKind::HostKeyUnknown,
         "ssh_host_key_changed" => SshDiagnosticKind::HostKeyChanged,
         "ssh_connection_refused" => SshDiagnosticKind::MissingSshd,
@@ -308,12 +317,17 @@ pub fn classify(code: &str) -> SshDiagnosticKind {
         | "ssh_runtime_health_timeout"
         | "ssh_runtime_port_conflict"
         | "ssh_runtime_still_running" => SshDiagnosticKind::Start,
-        "ssh_upgrade_incompatible" => SshDiagnosticKind::Version,
+        "ssh_upgrade_incompatible" | "ssh_environment_arch_unsupported" => {
+            SshDiagnosticKind::Version
+        }
         code if code.starts_with("ssh_tunnel") => SshDiagnosticKind::Tunnel,
         code if code.starts_with("ssh_pairing") || code.starts_with("remote_") => {
             SshDiagnosticKind::Pairing
         }
         code if code.starts_with("ssh_upgrade") => SshDiagnosticKind::Upgrade,
+        code if code.starts_with("ssh_install_") || code.starts_with("ssh_uninstall_") => {
+            SshDiagnosticKind::Start
+        }
         // Every WSL code names the same transport, so one card covers the
         // missing exe, a spawn that failed, a list that never answered and one
         // that exited non-zero. Falling through to Unknown used to offer
@@ -546,5 +560,37 @@ New key fingerprint is SHA256:newNewNewNewNew.\n";
         assert_eq!(card.kind, SshDiagnosticKind::Authentication);
         assert!(card.diagnostics.contains("incorrect passphrase"));
         assert!(card.diagnostics.contains("host: build-box"));
+    }
+
+    #[test]
+    fn glibc_diagnostic_provides_recovery_guidance() {
+        let card = diagnose(
+            "ssh_environment_glibc_too_old",
+            "glibc 2.28 is older than required",
+            "",
+            Some("legacy-box"),
+            None,
+        );
+        assert_eq!(card.kind, SshDiagnosticKind::Glibc);
+        assert!(
+            card.guidance
+                .as_deref()
+                .is_some_and(|g| g.contains("glibc"))
+        );
+    }
+
+    #[test]
+    fn wsl_diagnostic_formats_wsl_log_command_instead_of_ssh() {
+        let card = diagnose(
+            "wsl_exec_failed",
+            "wsl runtime failed",
+            "",
+            Some("Ubuntu-24.04"),
+            Some("/home/dev/.local/state/vibex/server/server.log"),
+        );
+        assert_eq!(card.kind, SshDiagnosticKind::Wsl);
+        let cmd = card.log_command.expect("wsl log command should be built");
+        assert!(cmd.starts_with("wsl.exe -d Ubuntu-24.04 -- tail -n 200 "));
+        assert!(!cmd.starts_with("ssh "));
     }
 }

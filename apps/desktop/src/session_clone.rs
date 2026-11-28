@@ -29,7 +29,7 @@ use gpui_component::{
     v_flex,
 };
 use vibex_backend::{
-    BackendError, BackendFacade, MutationRequest, NativeBackend, WorkspaceSummary,
+    BackendError, BackendErrorKind, BackendFacade, MutationRequest, NativeBackend, WorkspaceSummary,
 };
 use vibex_core::{
     AddModelProviderCredentialRequest, AgentId, AgentListRequest, AgentModelProviderBindRequest,
@@ -178,11 +178,30 @@ struct LoadedSourceCloneData {
     source_legacy_profiles: Vec<ProviderProfileSummary>,
 }
 
+struct EphemeralTargetLease {
+    remote: Option<Arc<vibex_remote_client::WebRemoteBackend>>,
+    /// Ephemeral SSH tunnel owned by this lease when cloning to an inactive SSH host.
+    _tunnel: Option<TunnelProcess>,
+}
+
+impl Drop for EphemeralTargetLease {
+    fn drop(&mut self) {
+        if let Some(remote) = self.remote.take()
+            && let Ok(handle) = tokio::runtime::Handle::try_current()
+        {
+            handle.spawn(async move {
+                let _ = remote.disconnect().await;
+            });
+        }
+    }
+}
+
 struct ConnectedTargetState {
     instance: CloneTargetInstance,
     backend: BackendFacade,
-    /// Ephemeral SSH tunnel owned by this dialog when cloning to an inactive SSH host.
-    _ephemeral_tunnel: Option<TunnelProcess>,
+    /// Keeps any ephemeral remote WebSocket + SSH tunnel alive while the dialog
+    /// or an active clone task uses this target, and cleans them up on drop.
+    ephemeral_lease: Option<Arc<EphemeralTargetLease>>,
     workspaces: Vec<WorkspaceSummary>,
     agents: Vec<AgentSnapshotEntry>,
     model_providers: Vec<ModelProviderProfile>,
@@ -1301,10 +1320,28 @@ fn rewrite_url_port(server_url: &str, new_port: u16) -> String {
     format!("{scheme}://{host}:{new_port}{path_tail}")
 }
 
+fn allow_unsupported_or_permission<T>(
+    result: Result<T, BackendError>,
+    fallback: T,
+) -> Result<T, String> {
+    match result {
+        Ok(value) => Ok(value),
+        Err(err)
+            if matches!(
+                err.kind,
+                BackendErrorKind::Unsupported | BackendErrorKind::Permission
+            ) =>
+        {
+            Ok(fallback)
+        }
+        Err(err) => Err(format!("{}: {}", err.code, err.message)),
+    }
+}
+
 async fn connect_target_instance(
     instance: CloneTargetInstance,
 ) -> Result<ConnectedTargetState, String> {
-    let (backend, ephemeral_tunnel) = match &instance.kind {
+    let (backend, ephemeral_lease) = match &instance.kind {
         CloneTargetKind::Local { runtime } => {
             let facade = Arc::new(NativeBackend::new(runtime.clone())).facade();
             (facade, None)
@@ -1343,13 +1380,25 @@ async fn connect_target_instance(
                     );
                 }
                 let launch = launch.with_runtime_home(profile.runtime_home_path());
-                if let Some(label) = launch.launch_agent_label.as_deref() {
-                    crate::ssh_connection::launchd::ensure_started(&command, &launch, label)
-                        .map_err(|err| format!("{}: {}", err.code, err.message))?;
-                } else {
-                    supervisor::ensure_started(&command, &launch)
-                        .map_err(|err| format!("{}: {}", err.code, err.message))?;
-                }
+                let start_command = command.clone();
+                let start_launch = launch.clone();
+                tokio::task::spawn_blocking(move || {
+                    if let Some(label) = start_launch.launch_agent_label.as_deref() {
+                        crate::ssh_connection::launchd::ensure_started(
+                            &start_command,
+                            &start_launch,
+                            label,
+                        )
+                        .map(|_| ())
+                        .map_err(|err| format!("{}: {}", err.code, err.message))
+                    } else {
+                        supervisor::ensure_started(&start_command, &start_launch)
+                            .map(|_| ())
+                            .map_err(|err| format!("{}: {}", err.code, err.message))
+                    }
+                })
+                .await
+                .map_err(|err| format!("ssh_start_task_failed: {err}"))??;
                 let local_port = select_local_port(0, 1)
                     .map_err(|err| format!("{}: {}", err.code, err.message))?;
                 let spec = TunnelSpec::new(
@@ -1364,10 +1413,15 @@ async fn connect_target_instance(
                     .map_err(|err| format!("{}: {}", err.code, err.message))?;
                 let deadline = std::time::Instant::now() + Duration::from_secs(10);
                 while !crate::ssh_connection::wsl::localhost_forwarded(local_port) {
-                    if std::time::Instant::now() >= deadline
-                        || tunnel.try_wait().ok().flatten().is_some()
-                    {
-                        break;
+                    if let Ok(Some(status)) = tunnel.try_wait() {
+                        return Err(format!(
+                            "ssh_tunnel_exited: SSH tunnel exited before forwarding became ready ({status})"
+                        ));
+                    }
+                    if std::time::Instant::now() >= deadline {
+                        return Err(format!(
+                            "ssh_tunnel_timeout: SSH tunnel on 127.0.0.1:{local_port} did not become ready within 10s"
+                        ));
                     }
                     tokio::time::sleep(Duration::from_millis(100)).await;
                 }
@@ -1382,7 +1436,12 @@ async fn connect_target_instance(
                 .connect()
                 .await
                 .map_err(|err| format!("{}: {}", err.code, err.message))?;
-            (web_backend.facade(), tunnel_guard)
+            let facade = web_backend.facade();
+            let lease = Arc::new(EphemeralTargetLease {
+                remote: Some(web_backend),
+                _tunnel: tunnel_guard,
+            });
+            (facade, Some(lease))
         }
     };
 
@@ -1391,37 +1450,37 @@ async fn connect_target_instance(
         .list_workspaces()
         .await
         .map_err(|err| format!("{}: {}", err.code, err.message))?;
-    let agents = backend
-        .management()
-        .list_agents(AgentListRequest {
-            include_disabled: true,
-        })
-        .await
-        .map(|resp| resp.agents)
-        .unwrap_or_default();
-    let model_providers = backend
-        .management()
-        .list_model_provider_profiles()
-        .await
-        .unwrap_or_default();
-    let bindings = backend
-        .management()
-        .list_agent_model_provider_bindings(AgentModelProviderBindingListRequest {
-            agent_id: None,
-            model_provider_profile_id: None,
-        })
-        .await
-        .unwrap_or_default();
-    let legacy_profiles = backend
-        .management()
-        .list_profiles()
-        .await
-        .unwrap_or_default();
+    let agents = allow_unsupported_or_permission(
+        backend
+            .management()
+            .list_agents(AgentListRequest {
+                include_disabled: true,
+            })
+            .await
+            .map(|resp| resp.agents),
+        Vec::new(),
+    )?;
+    let model_providers = allow_unsupported_or_permission(
+        backend.management().list_model_provider_profiles().await,
+        Vec::new(),
+    )?;
+    let bindings = allow_unsupported_or_permission(
+        backend
+            .management()
+            .list_agent_model_provider_bindings(AgentModelProviderBindingListRequest {
+                agent_id: None,
+                model_provider_profile_id: None,
+            })
+            .await,
+        Vec::new(),
+    )?;
+    let legacy_profiles =
+        allow_unsupported_or_permission(backend.management().list_profiles().await, Vec::new())?;
 
     Ok(ConnectedTargetState {
         instance,
         backend,
-        _ephemeral_tunnel: ephemeral_tunnel,
+        ephemeral_lease,
         workspaces,
         agents,
         model_providers,
@@ -1451,24 +1510,27 @@ async fn load_source_clone_data(
         exported_sessions.extend(bundle.sessions);
     }
 
-    let source_model_providers = source_backend
-        .management()
-        .list_model_provider_profiles()
-        .await
-        .unwrap_or_default();
-    let source_bindings = source_backend
-        .management()
-        .list_agent_model_provider_bindings(AgentModelProviderBindingListRequest {
-            agent_id: None,
-            model_provider_profile_id: None,
-        })
-        .await
-        .unwrap_or_default();
-    let source_legacy_profiles = source_backend
-        .management()
-        .list_profiles()
-        .await
-        .unwrap_or_default();
+    let source_model_providers = allow_unsupported_or_permission(
+        source_backend
+            .management()
+            .list_model_provider_profiles()
+            .await,
+        Vec::new(),
+    )?;
+    let source_bindings = allow_unsupported_or_permission(
+        source_backend
+            .management()
+            .list_agent_model_provider_bindings(AgentModelProviderBindingListRequest {
+                agent_id: None,
+                model_provider_profile_id: None,
+            })
+            .await,
+        Vec::new(),
+    )?;
+    let source_legacy_profiles = allow_unsupported_or_permission(
+        source_backend.management().list_profiles().await,
+        Vec::new(),
+    )?;
 
     Ok(LoadedSourceCloneData {
         source_workspace_root,
@@ -1605,7 +1667,7 @@ async fn map_and_sync_providers_for_clone(
 
                     if has_api_key && let Some(mp) = source_mp {
                         for cred in &mp.credentials {
-                            if let Ok(secret_resp) = source_backend
+                            let secret_resp = source_backend
                                 .management()
                                 .get_model_provider_credential_secret(
                                     ModelProviderCredentialSecretRequest {
@@ -1614,10 +1676,11 @@ async fn map_and_sync_providers_for_clone(
                                     },
                                 )
                                 .await
-                                && let Some(secret_value) =
-                                    secret_resp.value.filter(|v| !v.trim().is_empty())
+                                .map_err(|err| format!("{}: {}", err.code, err.message))?;
+                            if let Some(secret_value) =
+                                secret_resp.value.filter(|v| !v.trim().is_empty())
                             {
-                                let _ = target_backend
+                                target_backend
                                     .management()
                                     .add_model_provider_credential(MutationRequest::new(
                                         AddModelProviderCredentialRequest {
@@ -1627,13 +1690,14 @@ async fn map_and_sync_providers_for_clone(
                                             value: secret_value,
                                         },
                                     ))
-                                    .await;
+                                    .await
+                                    .map_err(|err| format!("{}: {}", err.code, err.message))?;
                             }
                         }
                     }
 
                     for agent_id in &agents_to_bind {
-                        let _ = target_backend
+                        target_backend
                             .management()
                             .bind_agent_model_provider(MutationRequest::new(
                                 AgentModelProviderBindRequest {
@@ -1643,7 +1707,8 @@ async fn map_and_sync_providers_for_clone(
                                     make_default: false,
                                 },
                             ))
-                            .await;
+                            .await
+                            .map_err(|err| format!("{}: {}", err.code, err.message))?;
                     }
                     synced_provider_count += 1;
                 }
@@ -1672,7 +1737,7 @@ async fn map_and_sync_providers_for_clone(
                                 });
                             }
                         }
-                        let _ = target_backend
+                        target_backend
                             .management()
                             .update_model_provider_profile(MutationRequest::new(
                                 ModelProviderProfileUpdateRequest {
@@ -1680,10 +1745,11 @@ async fn map_and_sync_providers_for_clone(
                                     expected_revision,
                                 },
                             ))
-                            .await;
+                            .await
+                            .map_err(|err| format!("{}: {}", err.code, err.message))?;
                     }
                     for agent_id in &missing_agent_bindings {
-                        let _ = target_backend
+                        target_backend
                             .management()
                             .bind_agent_model_provider(MutationRequest::new(
                                 AgentModelProviderBindRequest {
@@ -1695,7 +1761,8 @@ async fn map_and_sync_providers_for_clone(
                                     make_default: false,
                                 },
                             ))
-                            .await;
+                            .await
+                            .map_err(|err| format!("{}: {}", err.code, err.message))?;
                     }
                     synced_provider_count += 1;
                 }
@@ -1707,7 +1774,7 @@ async fn map_and_sync_providers_for_clone(
                 .management()
                 .list_model_provider_profiles()
                 .await
-                .unwrap_or(target_model_providers);
+                .map_err(|err| format!("{}: {}", err.code, err.message))?;
             target_bindings = target_backend
                 .management()
                 .list_agent_model_provider_bindings(AgentModelProviderBindingListRequest {
@@ -1715,16 +1782,15 @@ async fn map_and_sync_providers_for_clone(
                     model_provider_profile_id: None,
                 })
                 .await
-                .unwrap_or(target_bindings);
+                .map_err(|err| format!("{}: {}", err.code, err.message))?;
         }
     }
 
     let refreshed_legacy = if synced_provider_count > 0 {
-        target_backend
-            .management()
-            .list_profiles()
-            .await
-            .unwrap_or(target_legacy_profiles)
+        allow_unsupported_or_permission(
+            target_backend.management().list_profiles().await,
+            target_legacy_profiles,
+        )?
     } else {
         target_legacy_profiles
     };
@@ -2188,7 +2254,7 @@ impl SessionCloneDialog {
         let target_snapshot = ConnectedTargetState {
             instance: connected.instance.clone(),
             backend: connected.backend.clone(),
-            _ephemeral_tunnel: None,
+            ephemeral_lease: connected.ephemeral_lease.clone(),
             workspaces: connected.workspaces.clone(),
             agents: connected.agents.clone(),
             model_providers: connected.model_providers.clone(),
@@ -2206,14 +2272,19 @@ impl SessionCloneDialog {
 
         let scope_for_runner = scope.clone();
         let target_is_remote = target_instance.id != LOCAL_RUNTIME_ID;
+        let attempt_id = vibex_core::RequestId::new().to_string();
         let runner = gpui_tokio::Tokio::spawn(cx, async move {
+            let _ephemeral_lease = target_snapshot.ephemeral_lease.clone();
             let confirmed_root = if open_new_directory {
                 let opened = target_backend
                     .workspace()
-                    .open_workspace(MutationRequest::new(OpenWorkspaceRequest {
-                        root_path: target_root.clone(),
-                        mode: Some(target_mode),
-                    }))
+                    .open_workspace(
+                        MutationRequest::new(OpenWorkspaceRequest {
+                            root_path: target_root.clone(),
+                            mode: Some(target_mode),
+                        })
+                        .with_idempotency_key(format!("clone-{attempt_id}-open")),
+                    )
                     .await
                     .map_err(|err| format!("{}: {}", err.code, err.message))?;
                 opened.workspace.root_path
@@ -2251,15 +2322,18 @@ impl SessionCloneDialog {
             let mut imported_session_count = 0usize;
             let mut restorable_native_count = 0usize;
 
-            for chunk in entries.chunks(MAX_CLONE_SESSIONS_PER_BUNDLE) {
+            for (chunk_idx, chunk) in entries.chunks(MAX_CLONE_SESSIONS_PER_BUNDLE).enumerate() {
                 let result = target_backend
                     .agent()
-                    .import_session_clone_bundle(MutationRequest::new(SessionCloneImportRequest {
-                        source_workspace_root: source_data.source_workspace_root.clone(),
-                        target_workspace_root: confirmed_root.clone(),
-                        workspace_mode: target_mode,
-                        sessions: chunk.to_vec(),
-                    }))
+                    .import_session_clone_bundle(
+                        MutationRequest::new(SessionCloneImportRequest {
+                            source_workspace_root: source_data.source_workspace_root.clone(),
+                            target_workspace_root: confirmed_root.clone(),
+                            workspace_mode: target_mode,
+                            sessions: chunk.to_vec(),
+                        })
+                        .with_idempotency_key(format!("clone-{attempt_id}-chunk-{chunk_idx}")),
+                    )
                     .await
                     .map_err(|err| format!("{}: {}", err.code, err.message))?;
                 target_project_id = Some(result.target_project_id);
@@ -3428,6 +3502,11 @@ impl VibexWorkbench {
             let is_dark = cx.theme().is_dark();
             let popover = theme::semantic_color("popover", is_dark);
             let popover_foreground = theme::semantic_color("popover-foreground", is_dark);
+            let is_cloning = dialog_weak
+                .read_with(cx, |clone_dialog, _| {
+                    clone_dialog.phase == CloneDialogPhase::Cloning
+                })
+                .unwrap_or(false);
             let footer = dialog_weak
                 .update(cx, |clone_dialog, cx| {
                     clone_dialog.render_footer(cx).into_any_element()
@@ -3443,8 +3522,9 @@ impl VibexWorkbench {
                 .bg(popover)
                 .text_color(popover_foreground)
                 .border_color(popover_foreground.opacity(0.10))
+                .keyboard(!is_cloning)
                 .overlay(true)
-                .overlay_closable(true)
+                .overlay_closable(!is_cloning)
                 .content(move |content, _, _| {
                     content
                         .min_h_0()
