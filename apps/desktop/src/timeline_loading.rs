@@ -240,6 +240,7 @@ impl VibexWorkbench {
         {
             return TimelineInstall::AnchorLost;
         }
+        let pre_replay_end = prepared.timeline.authoritative_end_sequence;
         prepared.replay_live_updates(updates);
         self.capture_timeline_scroll_anchor();
         reset_pending_user_requests(
@@ -286,7 +287,11 @@ impl VibexWorkbench {
             self.timeline.leading_turn_start = prepared.leading_turn_start;
         }
         self.timeline_has_older = prepared.timeline_has_older;
-        self.timeline_has_live_gap = self.timeline.needs_authoritative_refetch;
+        self.timeline_live_gap_sequence = if self.timeline.needs_authoritative_refetch {
+            Some(pre_replay_end.unwrap_or(0))
+        } else {
+            None
+        };
         self.reconcile_optimistic_user_message();
         TimelineInstall::Installed
     }

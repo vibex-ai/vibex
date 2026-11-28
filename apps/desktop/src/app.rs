@@ -1029,9 +1029,10 @@ const AGENT_TIMELINE_WINDOW_TURN_ALIGN_PAGES: usize = 64;
 const AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS: usize = 20_000;
 /// How much a resumed load may pull before re-opening beats patching.
 ///
-/// Resuming from a view a long background run left far behind would make the
-/// wait grow with the session again, which a windowed open exists to avoid.
-const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = 2_000;
+/// Matches the turn-alignment walk budget: a long running turn streams
+/// thousands of uncompacted delta rows while parked, and falling back to a
+/// cold window costs just as much while dropping already-loaded history.
+const AGENT_TIMELINE_RESUME_MAX_ITEMS: usize = AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS;
 /// How far a replaced window may reach back to keep a reader's place.
 ///
 /// A reader who scrolled up holds rows below the newest window, and a
@@ -3513,10 +3514,12 @@ where
     let Some(cover_sequence) = cover_sequence else {
         return page;
     };
+    let initial_items = page.items.len();
     while let Some(start_sequence) = page.start_sequence {
+        let added_items = page.items.len().saturating_sub(initial_items);
         if start_sequence <= cover_sequence
             || !page.has_older
-            || page.items.len() >= AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS
+            || added_items >= AGENT_TIMELINE_ANCHOR_RECOVERY_MAX_ITEMS
         {
             break;
         }
@@ -3840,6 +3843,13 @@ impl TimelineWindowRead {
         }
     }
 
+    /// Attaches a verified tail-resume plan while keeping the fallback mode
+    /// (e.g. contiguous recovery) intact if the tail check rejects the prefix.
+    fn with_resume(mut self, resume: Option<TimelineResume>) -> Self {
+        self.resume = resume;
+        self
+    }
+
     /// Asks a replacement to keep the turn the reader's anchor names.
     ///
     /// The window then reaches back far enough for [`Self::cover_sequence`] to
@@ -3902,6 +3912,40 @@ fn timeline_item_is_in_progress(item: &vibex_core::TimelineItem) -> bool {
             request.status == vibex_core::ElicitationRequestStatus::Pending
         }
         _ => false,
+    }
+}
+
+/// Earliest still-active item inside the trailing unfinished turn(s).
+///
+/// Once a turn ends with a final answer or error, provider correlation upserts
+/// only touch rows after the next turn's user message, so an orphaned
+/// `Started`/`Progress` item left behind in an earlier settled turn cannot
+/// mutate anymore and must not pull the resume boundary back past settled
+/// history.
+fn timeline_earliest_active_sequence(items: &[vibex_core::TimelineItem]) -> Option<i64> {
+    let mut earliest = None;
+    for item in items.iter().rev() {
+        if matches!(
+            &item.payload,
+            TimelinePayload::AgentMessage(message) if message.is_final
+        ) || matches!(&item.payload, TimelinePayload::Error(_))
+        {
+            break;
+        }
+        if timeline_item_is_in_progress(item) {
+            earliest = Some(item.sequence);
+        }
+    }
+    earliest
+}
+
+fn combine_timeline_cover_sequence(
+    anchor_sequence: Option<i64>,
+    loaded_sequence: Option<i64>,
+) -> Option<i64> {
+    match (anchor_sequence, loaded_sequence) {
+        (Some(anchor), Some(loaded)) => Some(anchor.min(loaded)),
+        (anchor, loaded) => anchor.or(loaded),
     }
 }
 
@@ -6987,12 +7031,12 @@ pub struct SessionView {
     /// reader as they arrive. The leading turn reads as loading until its first
     /// row is here, and only then does it show a duration.
     timeline_starts_mid_turn: bool,
-    /// Whether a live event batch skipped sequences inside this view's loaded
-    /// items. A parked view that merely stopped applying live events while
-    /// hidden still holds a contiguous settled prefix and can resume from its
-    /// last turn boundary; a view with an internal live gap must reload
-    /// authoritatively instead.
-    timeline_has_live_gap: bool,
+    /// Earliest pre-gap sequence where a live event batch skipped rows in this
+    /// view. Every settled turn strictly before this sequence remains
+    /// contiguous and immutable, so a lagged resume can re-read from a turn
+    /// boundary at or before this sequence instead of dropping the whole
+    /// loaded transcript.
+    timeline_live_gap_sequence: Option<i64>,
     /// How many older pages this view has outstanding.
     timeline_older_in_flight: usize,
     /// Row ids whose tool detail is being read back right now.
@@ -7301,7 +7345,7 @@ impl SessionView {
             timeline_scroll: gpui::ListState::new(0, gpui::ListAlignment::Top, px(0.0)),
             timeline_has_older: false,
             timeline_starts_mid_turn: false,
-            timeline_has_live_gap: false,
+            timeline_live_gap_sequence: None,
             timeline_older_in_flight: 0,
             timeline_detail_in_flight: BTreeSet::new(),
             timeline_scroll_to_latest_pending: false,
@@ -13597,7 +13641,10 @@ impl VibexWorkbench {
     /// hooking each toggle keeps one place responsible for the read, and the
     /// map only holds rows a reader actually opened.
     fn request_expanded_timeline_details(&mut self, cx: &mut Context<Self>) {
-        if self.timeline_detail_in_flight.len() >= AGENT_TIMELINE_DETAIL_MAX_IN_FLIGHT {
+        if self.agent_loading
+            || self.timeline_load_updates.upgrade().is_some()
+            || self.timeline_detail_in_flight.len() >= AGENT_TIMELINE_DETAIL_MAX_IN_FLIGHT
+        {
             return;
         }
         let candidates = self
@@ -13720,6 +13767,9 @@ impl VibexWorkbench {
         self.timeline.items[index].payload = item.payload;
         self.timeline.items[index].payload_depth = vibex_core::TimelinePayloadDepth::Detail;
         self.timeline.revision = self.timeline.revision.wrapping_add(1);
+        if let Some(updates) = self.timeline_load_updates.upgrade() {
+            updates.borrow_mut().advance(self.timeline.revision);
+        }
         // Both projections are keyed by the row's sequence, which did not
         // change, so they would keep answering with the summary they folded
         // before the detail arrived.
@@ -30514,7 +30564,7 @@ impl VibexWorkbench {
             // for.
             this.timeline_has_older = false;
             this.timeline_starts_mid_turn = false;
-            this.timeline_has_live_gap = false;
+            this.timeline_live_gap_sequence = None;
             this.agent_loading = false;
             this.reconcile_optimistic_user_message();
             this.rebuild_timeline_sizes();
@@ -32279,7 +32329,8 @@ impl VibexWorkbench {
         }
         if self.selected_session_id.as_ref() == Some(&session_id)
             && self.timeline.session_id.as_ref() == Some(&session_id)
-            && !self.timeline.needs_authoritative_refetch
+            && (!self.timeline.needs_authoritative_refetch
+                || self.timeline_load_updates.upgrade().is_some())
         {
             return;
         }
@@ -32379,11 +32430,12 @@ impl VibexWorkbench {
         // view's anchor names — the same rule a refetch follows. A view that
         // was following the bottom has no anchor and reads the window alone.
         self.capture_timeline_scroll_anchor();
-        let cover_sequence = self
-            .timeline_follow
-            .anchor_span
-            .map(|span| span.first_sequence)
-            .or_else(|| self.loaded_timeline_cover_sequence_for_session(Some(&session_id)));
+        let cover_sequence = combine_timeline_cover_sequence(
+            self.timeline_follow
+                .anchor_span
+                .map(|span| span.first_sequence),
+            self.loaded_timeline_cover_sequence_for_session(Some(&session_id)),
+        );
         if let Some(runtime) = runtime.clone() {
             self.load_agent_session_timeline(
                 runtime.clone(),
@@ -33054,10 +33106,12 @@ impl VibexWorkbench {
             return;
         };
         self.capture_timeline_scroll_anchor();
-        let cover_sequence = self
-            .timeline_follow
-            .anchor_span
-            .map(|span| span.first_sequence);
+        let cover_sequence = combine_timeline_cover_sequence(
+            self.timeline_follow
+                .anchor_span
+                .map(|span| span.first_sequence),
+            self.loaded_timeline_cover_sequence_for_session(Some(&session_id)),
+        );
         let generation = self.session_generation;
         let window = TimelineWindowRead::contiguous()
             .covering(cover_sequence)
@@ -33083,13 +33137,14 @@ impl VibexWorkbench {
     /// to preserve its loaded prefix.
     ///
     /// A clean view resumes above `authoritative_end_sequence`. A view that was
-    /// parked while its session kept running (`needs_authoritative_refetch`
-    /// without an internal live-stream gap) still holds every settled turn
-    /// verbatim; only its trailing live turn (or any turn still holding an
-    /// unfinished activity) may have mutated in place or compacted in the
-    /// store. Re-reading from that turn's user message and verifying that row's
-    /// sequence and id preserves all earlier loaded turns without collapsing
-    /// the transcript to a short cold window.
+    /// parked while its session kept running (or observed a live-stream gap at
+    /// or after `timeline_live_gap_sequence`) still holds every settled turn
+    /// strictly before that boundary verbatim; only the trailing live turn (or
+    /// any unfinished turn at or after the gap) may have mutated in place,
+    /// missed live events, or compacted in the store. Re-reading from that
+    /// turn's user message and verifying that row's sequence and id preserves
+    /// all earlier loaded turns without collapsing the transcript to a short
+    /// cold window.
     fn timeline_resume_plan_for_session(
         &self,
         session_id: &VibexSessionId,
@@ -33108,41 +33163,35 @@ impl VibexWorkbench {
                 max_items: AGENT_TIMELINE_RESUME_MAX_ITEMS,
             });
         }
-        if self.timeline_has_live_gap {
-            return None;
-        }
-        let earliest_active_sequence = self
-            .timeline
-            .items
-            .iter()
-            .find(|item| timeline_item_is_in_progress(item))
-            .map(|item| item.sequence);
+        let earliest_active_sequence = timeline_earliest_active_sequence(&self.timeline.items);
+        let max_boundary_sequence =
+            match (earliest_active_sequence, self.timeline_live_gap_sequence) {
+                (Some(active), Some(gap)) => Some(active.min(gap)),
+                (active, gap) => active.or(gap),
+            };
         let boundary_index = self
             .timeline
             .items
             .iter()
             .enumerate()
             .rev()
-            .find(|(index, item)| {
-                *index > 0
-                    && item.kind == vibex_core::TimelineItemKind::UserMessage
-                    && earliest_active_sequence.is_none_or(|active| item.sequence <= active)
+            .find(|(_, item)| {
+                item.kind == vibex_core::TimelineItemKind::UserMessage
+                    && max_boundary_sequence.is_none_or(|limit| item.sequence <= limit)
             })
             .map(|(index, _)| index)?;
         let boundary = &self.timeline.items[boundary_index];
-        let after_sequence = boundary.sequence.saturating_sub(1);
-        if after_sequence <= 0 {
+        if boundary.sequence <= 0 {
             return None;
         }
+        let after_sequence = boundary.sequence.saturating_sub(1);
         let dropped_tail_items = self.timeline.items.len().saturating_sub(boundary_index);
         Some(TimelineResume {
             prefix: self.timeline.items[..boundary_index].to_vec(),
             after_sequence,
             timeline_has_older: self.timeline_has_older,
             verify_first: Some((boundary.sequence, boundary.id.clone())),
-            max_items: AGENT_TIMELINE_RESUME_MAX_ITEMS
-                .saturating_add(dropped_tail_items)
-                .min(AGENT_TIMELINE_WINDOW_TURN_ALIGN_MAX_ITEMS),
+            max_items: AGENT_TIMELINE_RESUME_MAX_ITEMS.saturating_add(dropped_tail_items),
         })
     }
 
@@ -33174,25 +33223,28 @@ impl VibexWorkbench {
         // the bottom: the anchor resolved to nothing, the old offset survived,
         // and the list clamped it to the newest row.
         self.capture_timeline_scroll_anchor();
-        let cover_sequence = self
-            .timeline_follow
-            .anchor_span
-            .map(|span| span.first_sequence)
-            .or_else(|| {
-                self.loaded_timeline_cover_sequence_for_session(self.selected_session_id.as_ref())
-            });
+        let cover_sequence = combine_timeline_cover_sequence(
+            self.timeline_follow
+                .anchor_span
+                .map(|span| span.first_sequence),
+            self.loaded_timeline_cover_sequence_for_session(self.selected_session_id.as_ref()),
+        );
         let (runtime, session_id) = (self.local_authority(), self.selected_session_id.clone());
         let (Some(runtime), Some(session_id)) = (runtime, session_id) else {
             if let Some(session_id) = self.selected_session_id.clone() {
                 self.timeline.mark_lagged();
+                let resume = self.timeline_resume_plan_for_session(&session_id, true);
                 let generation = self.session_generation;
                 // This is the recovery read: a window that skipped stored rows
                 // is refused and lands here, so it must not be answered with
-                // the same banded window again.
+                // the same banded window again. When a verified turn-boundary
+                // resume plan is available, patch from that turn instead of
+                // dropping already-loaded settled history.
+                let window = TimelineWindowRead::contiguous().covering(cover_sequence);
                 self.load_agent_session_timeline_remote(
                     session_id,
                     generation,
-                    TimelineWindowRead::contiguous().covering(cover_sequence),
+                    window.with_resume(resume),
                     cx,
                 );
             }
@@ -33202,12 +33254,14 @@ impl VibexWorkbench {
             .registered_session(session_id.as_str())
             .map(|session| session.workspace_id.clone());
         self.timeline.mark_lagged();
+        let resume = self.timeline_resume_plan_for_session(&session_id, true);
+        let window = TimelineWindowRead::contiguous().covering(cover_sequence);
         self.load_agent_session_timeline(
             runtime,
             session_id,
             workspace_id,
             self.session_generation,
-            TimelineWindowRead::contiguous().covering(cover_sequence),
+            window.with_resume(resume),
             cx,
         );
     }
@@ -33837,7 +33891,7 @@ impl VibexWorkbench {
             updates.borrow_mut().record(&events, self.timeline.revision);
         }
         let mut expected_end = self.timeline.authoritative_end_sequence;
-        let mut batch_has_gap = false;
+        let mut batch_gap_sequence: Option<i64> = None;
         for event in &events {
             if self.timeline.session_id.as_ref() != Some(&event.session_id)
                 || event.sequence != event.item.sequence
@@ -33845,13 +33899,18 @@ impl VibexWorkbench {
             {
                 continue;
             }
-            if expected_end.is_some_and(|end| event.sequence > end.saturating_add(1)) {
-                batch_has_gap = true;
+            if let Some(end) = expected_end
+                && event.sequence > end.saturating_add(1)
+            {
+                batch_gap_sequence = Some(batch_gap_sequence.map_or(end, |prev| prev.min(end)));
             }
             expected_end = Some(expected_end.map_or(event.sequence, |end| end.max(event.sequence)));
         }
-        if batch_has_gap {
-            self.timeline_has_live_gap = true;
+        if let Some(gap_sequence) = batch_gap_sequence {
+            self.timeline_live_gap_sequence = Some(
+                self.timeline_live_gap_sequence
+                    .map_or(gap_sequence, |existing| existing.min(gap_sequence)),
+            );
         }
         let changed = self.timeline.apply_live_batch(events);
         if let Some(updates) = load_updates {
