@@ -749,8 +749,9 @@ fn build_initialize_params(
 }
 
 /// Initialize params for one agent, including the dialect capabilities that
-/// change the config-option shape it returns. Live sessions and probes must
-/// agree, or the catalog would advertise a shape the session cannot accept.
+/// change the config-option shape or client-tool surface it exposes. Live
+/// sessions and probes must agree, or the catalog would advertise a shape the
+/// session cannot accept.
 fn build_agent_initialize_params(
     agent_id: &AgentId,
     read_text_file: bool,
@@ -759,9 +760,11 @@ fn build_agent_initialize_params(
     terminal_auth: bool,
     mcp_servers: bool,
 ) -> Value {
+    let advertise_client_fs =
+        crate::dialect::agent_advertises_client_fs_capabilities(agent_id.as_str());
     build_initialize_params(
-        read_text_file,
-        write_text_file,
+        read_text_file && advertise_client_fs,
+        write_text_file && advertise_client_fs,
         terminal_tools,
         terminal_auth,
         mcp_servers,
@@ -24496,6 +24499,23 @@ mod tests {
             build_initialize_params(true, true, true, true, false, false)["clientCapabilities"]["auth"]
                 ["terminal"],
             json!(true)
+        );
+    }
+
+    #[test]
+    fn antigravity_initialize_params_withhold_client_fs_capabilities() {
+        let antigravity = AgentId::parse("antigravity").unwrap();
+        let params = build_agent_initialize_params(&antigravity, true, true, false, true, true);
+        assert_eq!(
+            params["clientCapabilities"]["fs"],
+            json!({ "readTextFile": false, "writeTextFile": false })
+        );
+
+        let claude = AgentId::parse("claude").unwrap();
+        let claude_params = build_agent_initialize_params(&claude, true, true, false, true, true);
+        assert_eq!(
+            claude_params["clientCapabilities"]["fs"],
+            json!({ "readTextFile": true, "writeTextFile": true })
         );
     }
 

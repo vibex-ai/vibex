@@ -22,6 +22,7 @@
 //! | `host_request_dialects` | inbound request dispatch |
 //! | `restore_policy` | `AcpRuntimeClient::restore_policy_for_agent` |
 //! | `parameterized_model_picker` | `initialize` client capabilities |
+//! | `advertise_client_fs_capabilities` | `initialize` client capabilities |
 //!
 //! A descriptor always wins over a profile: managed adapters are exact-version
 //! contracts, profiles are best-effort family knowledge.
@@ -168,6 +169,12 @@ pub struct AgentDialectProfile {
     /// Without the capability the agent collapses each model into a single
     /// pre-parameterized variant id.
     pub parameterized_model_picker: bool,
+    /// Whether `initialize` should advertise `clientCapabilities.fs`
+    /// (`readTextFile` / `writeTextFile`). Most ACP agents work well with
+    /// host filesystem callbacks, but some swap in client-callback file tools
+    /// whose lifecycle updates are broken and work reliably only with their
+    /// own built-in file tools.
+    pub advertise_client_fs_capabilities: bool,
     /// The agent implements the bare `session/steer` method, which is not ACP
     /// core and carries no capability flag: it arrives over the extension
     /// channel, so `initialize` never announces it and the only way to learn
@@ -195,6 +202,7 @@ impl AgentDialectProfile {
             host_request_dialects: &[],
             restore_policy: RestorePolicy::ResumeThenLoadThenNew,
             parameterized_model_picker: false,
+            advertise_client_fs_capabilities: true,
             standard_steering: false,
             rationale: "generic ACP behavior only; capability comes from runtime probing",
             goal: GoalDialect::unsupported(),
@@ -242,6 +250,11 @@ impl AgentDialectProfile {
 
     const fn with_parameterized_model_picker(mut self) -> Self {
         self.parameterized_model_picker = true;
+        self
+    }
+
+    const fn without_client_fs_capabilities(mut self) -> Self {
+        self.advertise_client_fs_capabilities = false;
         self
     }
 
@@ -385,8 +398,20 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
     // content blocks, and `_meta.mcp` envelopes. Inherited Gemini/Vertex/gateway
     // environment variables override its OAuth account flow unless cleared on
     // the agent-account path.
+    //
+    // When `clientCapabilities.fs` is advertised, Antigravity registers custom
+    // client-callback file tools (`client_view_file`, `client_create_file`,
+    // `client_edit_file`) whose terminal completion updates are never emitted
+    // when the call succeeds. Those calls remain open until any later step
+    // error or turn abort sweeps every accumulated read/edit into a false
+    // failure carrying that unrelated error. Advertising `fs` capabilities as
+    // false keeps Antigravity on its native file tools (`view_file`,
+    // `create_file`, `edit_file`), which emit immediate terminal updates.
     AgentDialectProfile::generic("antigravity")
-        .profiled("Antigravity ACP event normalization and OAuth credential scrubbing")
+        .profiled(
+            "Antigravity ACP event normalization, OAuth credential scrubbing, \
+             and native file-tool selection",
+        )
         .with_credential_scrub(&[
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",
@@ -397,7 +422,8 @@ const AGENT_DIALECT_PROFILES: &[AgentDialectProfile] = &[
             "AGY_LLM_GATEWAY_MODELS",
             "AGY_ACP_ENABLE_GATEWAY_AUTH",
         ])
-        .with_enricher(AgentEventEnricherKind::Antigravity),
+        .with_enricher(AgentEventEnricherKind::Antigravity)
+        .without_client_fs_capabilities(),
     // Factory Droid rejects forwarded MCP entries; the catalog already opts
     // out of the preset feature, and this keeps the wire empty on every path.
     AgentDialectProfile::generic("factory-droid")
@@ -431,6 +457,11 @@ pub fn agent_dialect_profiles() -> &'static [AgentDialectProfile] {
 /// live sessions and probes must agree on it.
 pub fn agent_supports_parameterized_model_picker(agent_id: &str) -> bool {
     agent_dialect_profile(agent_id).parameterized_model_picker
+}
+
+/// Whether `initialize` should advertise `clientCapabilities.fs` for this agent.
+pub fn agent_advertises_client_fs_capabilities(agent_id: &str) -> bool {
+    agent_dialect_profile(agent_id).advertise_client_fs_capabilities
 }
 
 /// Whether this agent implements the bare `session/steer` method.
@@ -686,6 +717,14 @@ mod tests {
             AgentEventEnricherKind::Antigravity
         );
         assert!(antigravity.mcp_wire_delivery.forwards_servers());
+        assert!(!antigravity.advertise_client_fs_capabilities);
+        assert!(!agent_advertises_client_fs_capabilities("antigravity"));
+        for other in ["claude", "codex", "gemini", "cursor", "not-a-real-agent"] {
+            assert!(
+                agent_advertises_client_fs_capabilities(other),
+                "{other} should keep advertising ACP fs capabilities"
+            );
+        }
         for key in [
             "GEMINI_API_KEY",
             "GOOGLE_API_KEY",

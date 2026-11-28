@@ -9,9 +9,10 @@ use vibex_agent::ProviderEvent;
 use vibex_core::{
     AgentEventContentBlock, AgentEventLocation, AgentEventRawExtension, AgentEventRawOutput,
     AgentMessagePayload, CollaborationPayload, CommandPayload, CommandStatus, FileOperationKind,
-    FileOperationPayload, ImageGenerationPayload, PermissionRequest, PlanPayload, PlanStepPayload,
-    PlanStepStatus, ReasoningPayload, SystemNoticePayload, TimelinePayload, TimelineRedactionState,
-    TimelineSource, TodoUpdatePayload, ToolCallPayload, ToolCallStatus, WebSearchPayload,
+    FileOperationPatch, FileOperationPatchFormat, FileOperationPayload, ImageGenerationPayload,
+    PermissionRequest, PlanPayload, PlanStepPayload, PlanStepStatus, ReasoningPayload,
+    SystemNoticePayload, TimelinePayload, TimelineRedactionState, TimelineSource,
+    TodoUpdatePayload, ToolCallPayload, ToolCallStatus, WebSearchPayload,
 };
 
 use crate::registry::AgentEventEnricherKind;
@@ -750,6 +751,7 @@ fn antigravity_file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgent
                 "CodeContent",
                 "ReplacementContent",
                 "replacement_content",
+                "contents",
                 "content",
                 "text",
                 "after",
@@ -757,6 +759,7 @@ fn antigravity_file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgent
         );
         (old_text, new_text)
     };
+    let diff_blocks_patch = antigravity_diff_blocks_patch(raw_input);
     let operation = file_operation(raw_input, hint, old_text.as_deref(), new_text.as_deref());
     let extension = input.raw_extension();
     let snapshots = FileOperationPayload {
@@ -765,7 +768,7 @@ fn antigravity_file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgent
         path: public_text(&path),
         old_text,
         new_text,
-        patch: None,
+        patch: diff_blocks_patch,
         raw_extension: extension.clone(),
     };
     let patch = snapshots.canonical_patch();
@@ -778,6 +781,106 @@ fn antigravity_file_events(input: &AgentEventInput) -> Option<Vec<CanonicalAgent
             ..snapshots
         },
     )])
+}
+
+/// Renders Antigravity's native `edit_file` `diff_block` array into a unified
+/// diff patch so timeline cards show exact hunks without client-fs callbacks.
+fn antigravity_diff_blocks_patch(raw_input: &Value) -> Option<FileOperationPatch> {
+    let blocks = raw_input
+        .get("diff_block")
+        .or_else(|| raw_input.get("diffBlock"))
+        .and_then(Value::as_array)?;
+    if blocks.is_empty() {
+        return None;
+    }
+    let mut patch = String::from("--- old\n+++ new\n");
+    let mut emitted_hunk = false;
+    let mut line_delta: isize = 0;
+
+    for block in blocks {
+        let Some(lines) = block.get("lines").and_then(Value::as_array) else {
+            continue;
+        };
+        if lines.is_empty() {
+            continue;
+        }
+        let mut old_count: usize = 0;
+        let mut new_count: usize = 0;
+        let mut rendered = Vec::with_capacity(lines.len());
+
+        for line in lines {
+            let text = line
+                .get("text")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim_end_matches(['\r', '\n']);
+            let prefix = match line.get("action") {
+                Some(Value::String(action)) => match action.as_str() {
+                    "LINE_ACTION_INSERT" | "INSERT" => {
+                        new_count += 1;
+                        '+'
+                    }
+                    "LINE_ACTION_DELETE" | "DELETE" => {
+                        old_count += 1;
+                        '-'
+                    }
+                    _ => {
+                        old_count += 1;
+                        new_count += 1;
+                        ' '
+                    }
+                },
+                Some(Value::Number(action)) => match action.as_u64() {
+                    Some(1) => {
+                        new_count += 1;
+                        '+'
+                    }
+                    Some(2) => {
+                        old_count += 1;
+                        '-'
+                    }
+                    _ => {
+                        old_count += 1;
+                        new_count += 1;
+                        ' '
+                    }
+                },
+                _ => {
+                    old_count += 1;
+                    new_count += 1;
+                    ' '
+                }
+            };
+            rendered.push((prefix, text));
+        }
+
+        if rendered.is_empty() {
+            continue;
+        }
+        let old_start = block
+            .get("start_line")
+            .or_else(|| block.get("startLine"))
+            .and_then(Value::as_u64)
+            .filter(|line| *line > 0)
+            .unwrap_or(1) as usize;
+        let new_start = (old_start as isize + line_delta).max(1) as usize;
+        line_delta += new_count as isize - old_count as isize;
+
+        patch.push_str(&format!(
+            "@@ -{old_start},{old_count} +{new_start},{new_count} @@\n"
+        ));
+        for (prefix, text) in rendered {
+            patch.push(prefix);
+            patch.push_str(text);
+            patch.push('\n');
+        }
+        emitted_hunk = true;
+    }
+
+    emitted_hunk.then_some(FileOperationPatch {
+        format: FileOperationPatchFormat::UnifiedDiffV1,
+        text: patch,
+    })
 }
 
 fn antigravity_collaboration_event(input: &AgentEventInput) -> CanonicalAgentEvent {
@@ -2307,6 +2410,76 @@ mod tests {
         assert!(matches!(
             &normalize_agent_event(AgentEventEnricherKind::Antigravity, &interaction)[0].event,
             CanonicalAgentEvent::ToolCall(call) if call.tool_name == "ask_question"
+        ));
+    }
+
+    #[test]
+    fn antigravity_enricher_normalizes_native_create_and_edit_file_payloads() {
+        let mut create = input(
+            "edit",
+            json!({
+                "file_path": "/work/src/new_file.rs",
+                "contents": "pub fn hi() {}\n"
+            }),
+        );
+        create.title = "Running create_file".to_string();
+        let create_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &create);
+        match &create_events[0].event {
+            CanonicalAgentEvent::FileOperation(file) => {
+                assert_eq!(file.operation, FileOperationKind::Write);
+                assert_eq!(file.path, "/work/src/new_file.rs");
+                let patch = file
+                    .patch
+                    .as_ref()
+                    .expect("create_file should render patch");
+                assert!(patch.text.contains("+pub fn hi() {}"), "{}", patch.text);
+            }
+            other => panic!("expected FileOperation for create_file, got {other:?}"),
+        }
+
+        let mut native_edit = input(
+            "edit",
+            json!({
+                "file_path": "/work/src/lib.rs",
+                "diff_block": [{
+                    "start_line": 10,
+                    "end_line": 12,
+                    "lines": [
+                        {"text": "fn answer() -> u32 {", "action": "LINE_ACTION_NONE"},
+                        {"text": "    41", "action": "LINE_ACTION_DELETE"},
+                        {"text": "    42", "action": "LINE_ACTION_INSERT"},
+                        {"text": "}", "action": "LINE_ACTION_NONE"}
+                    ]
+                }]
+            }),
+        );
+        native_edit.title = "Running edit_file".to_string();
+        let edit_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &native_edit);
+        match &edit_events[0].event {
+            CanonicalAgentEvent::FileOperation(file) => {
+                assert_eq!(file.operation, FileOperationKind::Edit);
+                assert_eq!(file.path, "/work/src/lib.rs");
+                let patch = file.patch.as_ref().expect("edit_file should render patch");
+                assert!(patch.text.contains("@@ -10,3 +10,3 @@"), "{}", patch.text);
+                assert!(patch.text.contains("-    41\n"), "{}", patch.text);
+                assert!(patch.text.contains("+    42\n"), "{}", patch.text);
+            }
+            other => panic!("expected FileOperation for edit_file, got {other:?}"),
+        }
+
+        let mut view = input(
+            "read",
+            json!({
+                "file_path": "/work/src/lib.rs",
+                "start_line": 1,
+                "end_line": 40
+            }),
+        );
+        view.title = "Running view_file".to_string();
+        let view_events = normalize_agent_event(AgentEventEnricherKind::Antigravity, &view);
+        assert!(matches!(
+            &view_events[0].event,
+            CanonicalAgentEvent::ToolCall(call) if call.tool_name == "view_file"
         ));
     }
 }
