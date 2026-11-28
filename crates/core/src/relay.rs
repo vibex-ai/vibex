@@ -122,6 +122,10 @@ pub enum RelayTrafficLimitMode {
     Monthly,
 }
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 /// Public quota snapshot reported by a Relay server on `/api/info` and `/health`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -138,6 +142,14 @@ pub struct RelayTrafficQuotaStatus {
     pub exceeded: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub period: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_limit_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_used_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub daily_exceeded: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daily_period: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -648,6 +660,10 @@ mod tests {
             used_bytes: 1_000_000,
             exceeded: true,
             period: Some("2026-11".to_string()),
+            daily_limit_bytes: Some(100_000),
+            daily_used_bytes: Some(50_000),
+            daily_exceeded: false,
+            daily_period: Some("2026-11-29".to_string()),
         };
         let encoded = serde_json::to_value(&full).unwrap();
         assert_eq!(encoded["enabled"], true);

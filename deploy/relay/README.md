@@ -105,7 +105,18 @@ All hard limits are configurable and the effective values are reported by
 | `VIBEX_RELAY_MAX_BANDWIDTH_BYTES_PER_WINDOW` | `16777216` | `maxBandwidthBytesPerWindow` |
 | `VIBEX_RELAY_MAX_TRAFFIC_BYTES` | *(disabled)* | `limits.maxTrafficBytes` / `trafficQuota.limitBytes` |
 | `VIBEX_RELAY_TRAFFIC_LIMIT_MODE` | `monthly` | `limits.trafficLimitMode` / `trafficQuota.mode` |
+| `VIBEX_RELAY_MAX_DAILY_TRAFFIC_BYTES` | *(disabled)* | `limits.maxDailyTrafficBytes` / `trafficQuota.dailyLimitBytes` |
 | `VIBEX_RELAY_TRAFFIC_STATE_PATH` | *(in-memory)* | *(not exposed)* |
+| `VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_IP_PER_DAY` | *(disabled)* | `limits.maxTrafficBytesPerIpPerDay` |
+| `VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_ROOM_PER_DAY` | *(disabled)* | `limits.maxTrafficBytesPerRoomPerDay` |
+| `VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_ROOM` | *(disabled)* | `limits.sustainedBytesPerSecPerRoom` |
+| `VIBEX_RELAY_BURST_BYTES_PER_ROOM` | *(auto)* | `limits.burstBytesPerRoom` |
+| `VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_IP` | *(disabled)* | `limits.sustainedBytesPerSecPerIp` |
+| `VIBEX_RELAY_BURST_BYTES_PER_IP` | *(auto)* | `limits.burstBytesPerIp` |
+| `VIBEX_RELAY_IP_PENALTY_THRESHOLD` | *(disabled)* | `limits.ipPenaltyThreshold` |
+| `VIBEX_RELAY_IP_PENALTY_WINDOW_MS` | `300000` | *(not exposed)* |
+| `VIBEX_RELAY_IP_BAN_BASE_MS` | `600000` | *(not exposed)* |
+| `VIBEX_RELAY_IP_BAN_MAX_MS` | `86400000` | *(not exposed)* |
 | `VIBEX_RELAY_MAX_CONNECTIONS_PER_IP` | `32` | `maxConnectionsPerIp` |
 | `VIBEX_RELAY_MAX_CONNECTION_ATTEMPTS_PER_IP_PER_WINDOW` | `120` | `maxConnectionAttemptsPerIpPerWindow` |
 | `VIBEX_RELAY_MAX_ROOM_CREATES_PER_IP_PER_WINDOW` | `20` | `maxRoomCreatesPerIpPerWindow` |
@@ -151,6 +162,37 @@ VIBEX_RELAY_TRAFFIC_STATE_PATH=/var/lib/vibex-relay/traffic-quota.json
   - `/health` and `/api/info` remain `200 OK` with `trafficQuota.exceeded: true`
     so container healthchecks stay green and Desktop / Mobile clients immediately
     surface the quota-exhausted state.
+- Dual-layer protection: set `VIBEX_RELAY_MAX_DAILY_TRAFFIC_BYTES` alongside a
+  `monthly` or `total` `VIBEX_RELAY_MAX_TRAFFIC_BYTES` so a single day's abuse
+  cannot burn an entire month's traffic budget.
+
+### Optional anti-abuse hardening (per-IP/room quotas, token buckets, penalty box)
+
+All anti-abuse controls below are **disabled by default** and recommended for
+public relays:
+
+```bash
+# Per-IP and per-room UTC daily caps (isolate abusers without affecting others)
+VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_IP_PER_DAY=1GiB
+VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_ROOM_PER_DAY=500MiB
+
+# Dual-speed token buckets (allow short sync bursts, cap sustained flooding)
+VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_ROOM=256KiB
+VIBEX_RELAY_BURST_BYTES_PER_ROOM=6MiB
+VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_IP=384KiB
+VIBEX_RELAY_BURST_BYTES_PER_IP=8MiB
+
+# Escalating temporary ban box (10m -> 1h -> 6h -> 24h) on repeated violations
+VIBEX_RELAY_IP_PENALTY_THRESHOLD=12
+VIBEX_RELAY_IP_PENALTY_WINDOW_MS=300000
+VIBEX_RELAY_IP_BAN_BASE_MS=600000
+VIBEX_RELAY_IP_BAN_MAX_MS=86400000
+```
+
+When an IP hits `VIBEX_RELAY_IP_PENALTY_THRESHOLD` violations (rate limits,
+bandwidth/daily limits, queue limits, or malformed frames) within the penalty
+window, the relay logs `relay client ip temporarily banned` with `client_ip` and
+rejects that address with HTTP `429` before touching rooms or global quota.
 
 ### Per-client-address admission
 

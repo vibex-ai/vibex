@@ -8,7 +8,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::extract::ws::{Message, WebSocket, WebSocketUpgrade};
 use axum::extract::{ConnectInfo, DefaultBodyLimit, Path, State};
 use axum::http::header::AUTHORIZATION;
-use axum::http::{HeaderMap, HeaderValue, Method, StatusCode, header};
+use axum::http::{Extensions, HeaderMap, HeaderValue, Method, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -68,10 +68,38 @@ pub struct RelayServerConfig {
     pub push_adapter_auth_token: Option<String>,
     /// Optional cumulative traffic limit in bytes. Disabled (`None`) by default.
     pub max_traffic_bytes: Option<u64>,
-    /// Accumulation window when `max_traffic_bytes` is enabled (`total` or `monthly`).
+    /// Accumulation window when `max_traffic_bytes` is enabled
+    /// (`daily`, `weekly`, `monthly`, or `total`).
     pub traffic_limit_mode: RelayTrafficLimitMode,
+    /// Optional secondary daily global traffic cap (UTC day). Can be combined
+    /// with monthly/weekly/total `max_traffic_bytes` to prevent a single day's
+    /// abuse from draining an entire month's budget.
+    pub max_daily_traffic_bytes: Option<u64>,
     /// Optional path to persist traffic usage across restarts.
     pub traffic_state_path: Option<PathBuf>,
+    /// Optional per-client-IP daily traffic cap (UTC day). Disabled by default.
+    pub max_traffic_bytes_per_ip_per_day: Option<u64>,
+    /// Optional per-room daily traffic cap (UTC day). Disabled by default.
+    pub max_traffic_bytes_per_room_per_day: Option<u64>,
+    /// Optional sustained average throughput limit per room (bytes/sec token bucket).
+    pub sustained_bytes_per_sec_per_room: Option<u64>,
+    /// Optional burst capacity for per-room token bucket. Defaults to
+    /// `max(max_websocket_frame_bytes * 2, sustained * 8)` when sustained is set.
+    pub burst_bytes_per_room: Option<u64>,
+    /// Optional sustained average throughput limit per client IP (bytes/sec token bucket).
+    pub sustained_bytes_per_sec_per_ip: Option<u64>,
+    /// Optional burst capacity for per-IP token bucket. Defaults to
+    /// `max(max_websocket_frame_bytes * 2, sustained * 8)` when sustained is set.
+    pub burst_bytes_per_ip: Option<u64>,
+    /// Optional violation count within `ip_penalty_window_ms` that triggers a
+    /// temporary escalating ban for that client IP. Disabled by default.
+    pub ip_penalty_threshold: Option<usize>,
+    /// Sliding window for counting per-IP violations before banning (ms).
+    pub ip_penalty_window_ms: i64,
+    /// First-strike temporary ban duration for abusive IPs (ms).
+    pub ip_ban_base_ms: i64,
+    /// Maximum temporary ban duration after repeated strikes (ms).
+    pub ip_ban_max_ms: i64,
 }
 
 impl std::fmt::Debug for RelayServerConfig {
@@ -127,7 +155,30 @@ impl std::fmt::Debug for RelayServerConfig {
             )
             .field("max_traffic_bytes", &self.max_traffic_bytes)
             .field("traffic_limit_mode", &self.traffic_limit_mode)
+            .field("max_daily_traffic_bytes", &self.max_daily_traffic_bytes)
             .field("has_traffic_state_path", &self.traffic_state_path.is_some())
+            .field(
+                "max_traffic_bytes_per_ip_per_day",
+                &self.max_traffic_bytes_per_ip_per_day,
+            )
+            .field(
+                "max_traffic_bytes_per_room_per_day",
+                &self.max_traffic_bytes_per_room_per_day,
+            )
+            .field(
+                "sustained_bytes_per_sec_per_room",
+                &self.sustained_bytes_per_sec_per_room,
+            )
+            .field("burst_bytes_per_room", &self.burst_bytes_per_room)
+            .field(
+                "sustained_bytes_per_sec_per_ip",
+                &self.sustained_bytes_per_sec_per_ip,
+            )
+            .field("burst_bytes_per_ip", &self.burst_bytes_per_ip)
+            .field("ip_penalty_threshold", &self.ip_penalty_threshold)
+            .field("ip_penalty_window_ms", &self.ip_penalty_window_ms)
+            .field("ip_ban_base_ms", &self.ip_ban_base_ms)
+            .field("ip_ban_max_ms", &self.ip_ban_max_ms)
             .finish()
     }
 }
@@ -241,12 +292,7 @@ impl RelayServerConfig {
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
-        config.max_traffic_bytes = std::env::var("VIBEX_RELAY_MAX_TRAFFIC_BYTES")
-            .ok()
-            .map(|value| value.trim().to_string())
-            .filter(|value| !value.is_empty())
-            .map(|value| parse_traffic_limit_bytes(&value))
-            .transpose()?;
+        config.max_traffic_bytes = parse_optional_env_bytes("VIBEX_RELAY_MAX_TRAFFIC_BYTES")?;
         if let Some(mode) = std::env::var("VIBEX_RELAY_TRAFFIC_LIMIT_MODE")
             .ok()
             .map(|value| value.trim().to_string())
@@ -254,13 +300,63 @@ impl RelayServerConfig {
         {
             config.traffic_limit_mode = parse_traffic_limit_mode(&mode)?;
         }
+        config.max_daily_traffic_bytes =
+            parse_optional_env_bytes("VIBEX_RELAY_MAX_DAILY_TRAFFIC_BYTES")?;
         config.traffic_state_path = std::env::var("VIBEX_RELAY_TRAFFIC_STATE_PATH")
             .ok()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty())
             .map(PathBuf::from);
+        config.max_traffic_bytes_per_ip_per_day =
+            parse_optional_env_bytes("VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_IP_PER_DAY")?;
+        config.max_traffic_bytes_per_room_per_day =
+            parse_optional_env_bytes("VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_ROOM_PER_DAY")?;
+        config.sustained_bytes_per_sec_per_room =
+            parse_optional_env_bytes("VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_ROOM")?;
+        config.burst_bytes_per_room = parse_optional_env_bytes("VIBEX_RELAY_BURST_BYTES_PER_ROOM")?;
+        config.sustained_bytes_per_sec_per_ip =
+            parse_optional_env_bytes("VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_IP")?;
+        config.burst_bytes_per_ip = parse_optional_env_bytes("VIBEX_RELAY_BURST_BYTES_PER_IP")?;
+        config.ip_penalty_threshold = std::env::var("VIBEX_RELAY_IP_PENALTY_THRESHOLD")
+            .ok()
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .map(|value| {
+                value
+                    .parse::<usize>()
+                    .map_err(|_| "VIBEX_RELAY_IP_PENALTY_THRESHOLD must be a positive integer")
+            })
+            .transpose()?;
+        apply_env_i64(
+            &mut config.ip_penalty_window_ms,
+            "VIBEX_RELAY_IP_PENALTY_WINDOW_MS",
+        )?;
+        apply_env_i64(&mut config.ip_ban_base_ms, "VIBEX_RELAY_IP_BAN_BASE_MS")?;
+        apply_env_i64(&mut config.ip_ban_max_ms, "VIBEX_RELAY_IP_BAN_MAX_MS")?;
         config.validate()?;
         Ok(config)
+    }
+
+    fn has_global_traffic_limit(&self) -> bool {
+        self.max_traffic_bytes.is_some() || self.max_daily_traffic_bytes.is_some()
+    }
+
+    fn effective_room_burst_bytes(&self) -> Option<u64> {
+        let rate = self.sustained_bytes_per_sec_per_room?;
+        Some(self.burst_bytes_per_room.unwrap_or_else(|| {
+            (self.max_websocket_frame_bytes as u64)
+                .saturating_mul(2)
+                .max(rate.saturating_mul(8))
+        }))
+    }
+
+    fn effective_ip_burst_bytes(&self) -> Option<u64> {
+        let rate = self.sustained_bytes_per_sec_per_ip?;
+        Some(self.burst_bytes_per_ip.unwrap_or_else(|| {
+            (self.max_websocket_frame_bytes as u64)
+                .saturating_mul(2)
+                .max(rate.saturating_mul(8))
+        }))
     }
 
     fn validate(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -290,8 +386,25 @@ impl RelayServerConfig {
         {
             return Err("Relay limits must be positive".into());
         }
-        if self.max_traffic_bytes == Some(0) {
-            return Err("Relay traffic limit must be positive".into());
+        if self.max_traffic_bytes == Some(0)
+            || self.max_daily_traffic_bytes == Some(0)
+            || self.max_traffic_bytes_per_ip_per_day == Some(0)
+            || self.max_traffic_bytes_per_room_per_day == Some(0)
+            || self.sustained_bytes_per_sec_per_room == Some(0)
+            || self.burst_bytes_per_room == Some(0)
+            || self.sustained_bytes_per_sec_per_ip == Some(0)
+            || self.burst_bytes_per_ip == Some(0)
+            || self.ip_penalty_threshold == Some(0)
+        {
+            return Err("Relay traffic and abuse limits must be positive".into());
+        }
+        if self.ip_penalty_window_ms <= 0
+            || self.ip_ban_base_ms <= 0
+            || self.ip_ban_max_ms < self.ip_ban_base_ms
+        {
+            return Err(
+                "Relay IP penalty window and ban durations must be positive and valid".into(),
+            );
         }
         if self.max_connections_per_room != 1 {
             return Err("Relay supports exactly one authoritative PC per room".into());
@@ -387,7 +500,18 @@ fn apply_env_i64(target: &mut i64, name: &str) -> Result<(), Box<dyn std::error:
     Ok(())
 }
 
-pub fn parse_traffic_limit_bytes(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+pub fn parse_optional_env_bytes(name: &str) -> Result<Option<u64>, Box<dyn std::error::Error>> {
+    std::env::var(name)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .map(|value| {
+            parse_traffic_limit_bytes(&value).map_err(|err| format!("{name}: {err}").into())
+        })
+        .transpose()
+}
+
+fn parse_traffic_limit_bytes(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
         return Err("VIBEX_RELAY_MAX_TRAFFIC_BYTES must not be empty".into());
@@ -486,7 +610,18 @@ impl Default for RelayServerConfig {
             push_adapter_auth_token: None,
             max_traffic_bytes: None,
             traffic_limit_mode: RelayTrafficLimitMode::Monthly,
+            max_daily_traffic_bytes: None,
             traffic_state_path: None,
+            max_traffic_bytes_per_ip_per_day: None,
+            max_traffic_bytes_per_room_per_day: None,
+            sustained_bytes_per_sec_per_room: None,
+            burst_bytes_per_room: None,
+            sustained_bytes_per_sec_per_ip: None,
+            burst_bytes_per_ip: None,
+            ip_penalty_threshold: None,
+            ip_penalty_window_ms: 5 * 60 * 1000,
+            ip_ban_base_ms: 10 * 60 * 1000,
+            ip_ban_max_ms: 24 * 60 * 60 * 1000,
         }
     }
 }
@@ -564,6 +699,22 @@ pub struct RelayServerLimits {
     pub max_traffic_bytes: Option<u64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub traffic_limit_mode: Option<RelayTrafficLimitMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_daily_traffic_bytes: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_traffic_bytes_per_ip_per_day: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_traffic_bytes_per_room_per_day: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sustained_bytes_per_sec_per_room: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_bytes_per_room: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sustained_bytes_per_sec_per_ip: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_bytes_per_ip: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ip_penalty_threshold: Option<usize>,
 }
 
 #[derive(Clone)]
@@ -612,15 +763,63 @@ struct ClientIpLimits {
     last_pruned_at_ms: i64,
 }
 
+#[derive(Debug, Clone)]
+struct TokenBucket {
+    capacity_bytes: u64,
+    rate_bytes_per_sec: u64,
+    /// Available tokens scaled by 1000 (milli-bytes) for exact integer
+    /// millisecond refill without floating-point drift.
+    tokens_milli: u128,
+    last_refill_ms: i64,
+}
+
+impl TokenBucket {
+    fn new(capacity_bytes: u64, rate_bytes_per_sec: u64, now_ms: i64) -> Self {
+        Self {
+            capacity_bytes,
+            rate_bytes_per_sec,
+            tokens_milli: (capacity_bytes as u128).saturating_mul(1000),
+            last_refill_ms: now_ms,
+        }
+    }
+
+    fn consume(&mut self, bytes: usize, now_ms: i64) -> bool {
+        let elapsed_ms = now_ms.saturating_sub(self.last_refill_ms).max(0) as u128;
+        let max_milli = (self.capacity_bytes as u128).saturating_mul(1000);
+        // bytes/sec * ms == milli-bytes
+        let refill = elapsed_ms.saturating_mul(self.rate_bytes_per_sec as u128);
+        self.tokens_milli = self.tokens_milli.saturating_add(refill).min(max_milli);
+        self.last_refill_ms = now_ms;
+        let cost = (bytes as u128).saturating_mul(1000);
+        if self.tokens_milli < cost {
+            return false;
+        }
+        self.tokens_milli -= cost;
+        true
+    }
+}
+
 struct ClientIpLimitEntry {
     active_connections: usize,
     connection_window: RateWindow,
     room_window: RateWindow,
+    daily_traffic_period: String,
+    daily_traffic_bytes: u64,
+    daily_quota_warned: bool,
+    sustained_bucket: Option<TokenBucket>,
+    penalty_window: RateWindow,
+    ban_strikes: u32,
+    banned_until_ms: Option<i64>,
+    last_ban_expired_at_ms: Option<i64>,
     last_seen_at_ms: i64,
 }
 
 impl ClientIpLimitEntry {
-    fn new(now: i64) -> Self {
+    fn new(now: i64, config: &RelayServerConfig) -> Self {
+        let sustained_bucket = config
+            .sustained_bytes_per_sec_per_ip
+            .zip(config.effective_ip_burst_bytes())
+            .map(|(rate, burst)| TokenBucket::new(burst, rate, now));
         Self {
             active_connections: 0,
             connection_window: RateWindow {
@@ -631,9 +830,39 @@ impl ClientIpLimitEntry {
                 started_at_ms: now,
                 count: 0,
             },
+            daily_traffic_period: utc_year_month_day(now),
+            daily_traffic_bytes: 0,
+            daily_quota_warned: false,
+            sustained_bucket,
+            penalty_window: RateWindow {
+                started_at_ms: now,
+                count: 0,
+            },
+            ban_strikes: 0,
+            banned_until_ms: None,
+            last_ban_expired_at_ms: None,
             last_seen_at_ms: now,
         }
     }
+
+    fn refresh_day(&mut self, current_day: &str) {
+        if self.daily_traffic_period != current_day {
+            self.daily_traffic_period.clear();
+            self.daily_traffic_period.push_str(current_day);
+            self.daily_traffic_bytes = 0;
+            self.daily_quota_warned = false;
+        }
+    }
+
+    fn is_banned(&self, now: i64) -> bool {
+        self.banned_until_ms.is_some_and(|until| now < until)
+    }
+}
+
+#[derive(Default)]
+struct RoomDailyTrafficTable {
+    period: String,
+    bytes_by_room: HashMap<RelayRoomId, u64>,
 }
 
 const TRAFFIC_PERSIST_MIN_BYTES: u64 = 1024 * 1024;
@@ -647,79 +876,142 @@ struct PersistedTrafficQuotaState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     period: Option<String>,
     used_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    daily_period: Option<String>,
+    #[serde(default)]
+    daily_used_bytes: u64,
     updated_at_ms: i64,
 }
 
 struct TrafficQuotaTracker {
     limit_bytes: Option<u64>,
     mode: RelayTrafficLimitMode,
+    daily_limit_bytes: Option<u64>,
     state_path: Option<PathBuf>,
     used_bytes: u64,
     period: Option<String>,
+    daily_used_bytes: u64,
+    daily_period: Option<String>,
     last_persisted_bytes: u64,
+    last_persisted_daily_bytes: u64,
     last_persisted_at_ms: i64,
 }
 
 impl TrafficQuotaTracker {
     fn new(config: &RelayServerConfig, now_ms: i64) -> Self {
-        let current_period = traffic_period_key(config.traffic_limit_mode, now_ms);
+        let current_period = config
+            .max_traffic_bytes
+            .and_then(|_| traffic_period_key(config.traffic_limit_mode, now_ms));
+        let current_daily_period = config
+            .max_daily_traffic_bytes
+            .map(|_| utc_year_month_day(now_ms));
         let mut tracker = Self {
             limit_bytes: config.max_traffic_bytes,
             mode: config.traffic_limit_mode,
+            daily_limit_bytes: config.max_daily_traffic_bytes,
             state_path: config.traffic_state_path.clone(),
             used_bytes: 0,
             period: current_period.clone(),
+            daily_used_bytes: 0,
+            daily_period: current_daily_period.clone(),
             last_persisted_bytes: 0,
+            last_persisted_daily_bytes: 0,
             last_persisted_at_ms: now_ms,
         };
         if let Some(path) = config.traffic_state_path.as_deref()
             && let Some(loaded) = load_traffic_state(path)
-            && loaded.mode == config.traffic_limit_mode
-            && loaded.period == current_period
         {
-            tracker.used_bytes = loaded.used_bytes;
-            tracker.last_persisted_bytes = loaded.used_bytes;
-            tracker.last_persisted_at_ms = loaded.updated_at_ms;
+            if config.max_traffic_bytes.is_some()
+                && loaded.mode == config.traffic_limit_mode
+                && loaded.period == current_period
+            {
+                tracker.used_bytes = loaded.used_bytes;
+                tracker.last_persisted_bytes = loaded.used_bytes;
+                tracker.last_persisted_at_ms = loaded.updated_at_ms;
+            }
+            if config.max_daily_traffic_bytes.is_some()
+                && loaded.daily_period == current_daily_period
+            {
+                tracker.daily_used_bytes = loaded.daily_used_bytes;
+                tracker.last_persisted_daily_bytes = loaded.daily_used_bytes;
+                tracker.last_persisted_at_ms = loaded.updated_at_ms;
+            }
         }
         tracker
     }
 
-    /// Advances the active period when a daily/weekly/monthly UTC boundary rolls over.
+    fn has_any_limit(&self) -> bool {
+        self.limit_bytes.is_some() || self.daily_limit_bytes.is_some()
+    }
+
+    /// Advances active periods when primary (daily/weekly/monthly) or secondary
+    /// daily UTC boundaries roll over.
     /// Returns `(rolled_over, snapshot_to_persist)`.
     fn refresh_period(
         &mut self,
         now_ms: i64,
     ) -> (bool, Option<(PathBuf, PersistedTrafficQuotaState)>) {
-        let Some(current_period) = traffic_period_key(self.mode, now_ms) else {
-            return (false, None);
-        };
-        if self.period.as_deref() == Some(current_period.as_str()) {
+        let mut rolled = false;
+        if self.limit_bytes.is_some()
+            && let Some(current_period) = traffic_period_key(self.mode, now_ms)
+            && self.period.as_deref() != Some(current_period.as_str())
+        {
+            self.period = Some(current_period);
+            self.used_bytes = 0;
+            self.last_persisted_bytes = 0;
+            rolled = true;
+        }
+        if self.daily_limit_bytes.is_some() {
+            let current_day = utc_year_month_day(now_ms);
+            if self.daily_period.as_deref() != Some(current_day.as_str()) {
+                self.daily_period = Some(current_day);
+                self.daily_used_bytes = 0;
+                self.last_persisted_daily_bytes = 0;
+                rolled = true;
+            }
+        }
+        if !rolled {
             return (false, None);
         }
-        self.period = Some(current_period);
-        self.used_bytes = 0;
-        self.last_persisted_bytes = 0;
         self.last_persisted_at_ms = now_ms;
         let persist = self.snapshot_for_persist(now_ms);
         (true, persist)
     }
 
-    fn is_exceeded(&self) -> bool {
+    fn is_primary_exceeded(&self) -> bool {
         self.limit_bytes
             .is_some_and(|limit| self.used_bytes >= limit)
     }
 
+    fn is_daily_exceeded(&self) -> bool {
+        self.daily_limit_bytes
+            .is_some_and(|limit| self.daily_used_bytes >= limit)
+    }
+
+    fn is_exceeded(&self) -> bool {
+        self.is_primary_exceeded() || self.is_daily_exceeded()
+    }
+
     fn status(&self) -> RelayTrafficQuotaStatus {
-        let Some(limit) = self.limit_bytes else {
+        if !self.has_any_limit() {
             return RelayTrafficQuotaStatus::default();
-        };
+        }
+        let daily_exceeded = self.is_daily_exceeded();
         RelayTrafficQuotaStatus {
             enabled: true,
-            mode: Some(self.mode),
-            limit_bytes: Some(limit),
-            used_bytes: self.used_bytes,
-            exceeded: self.used_bytes >= limit,
+            mode: self.limit_bytes.map(|_| self.mode),
+            limit_bytes: self.limit_bytes,
+            used_bytes: if self.limit_bytes.is_some() {
+                self.used_bytes
+            } else {
+                self.daily_used_bytes
+            },
+            exceeded: self.is_exceeded(),
             period: self.period.clone(),
+            daily_limit_bytes: self.daily_limit_bytes,
+            daily_used_bytes: self.daily_limit_bytes.map(|_| self.daily_used_bytes),
+            daily_exceeded,
+            daily_period: self.daily_period.clone(),
         }
     }
 
@@ -732,6 +1024,8 @@ impl TrafficQuotaTracker {
                 mode: self.mode,
                 period: self.period.clone(),
                 used_bytes: self.used_bytes,
+                daily_period: self.daily_period.clone(),
+                daily_used_bytes: self.daily_used_bytes,
                 updated_at_ms: now_ms,
             },
         ))
@@ -743,7 +1037,11 @@ impl TrafficQuotaTracker {
         force: bool,
     ) -> Option<(PathBuf, PersistedTrafficQuotaState)> {
         self.state_path.as_ref()?;
-        let delta_bytes = self.used_bytes.saturating_sub(self.last_persisted_bytes);
+        let delta_primary = self.used_bytes.saturating_sub(self.last_persisted_bytes);
+        let delta_daily = self
+            .daily_used_bytes
+            .saturating_sub(self.last_persisted_daily_bytes);
+        let delta_bytes = delta_primary.max(delta_daily);
         let delta_ms = now_ms.saturating_sub(self.last_persisted_at_ms);
         if !force
             && delta_bytes < TRAFFIC_PERSIST_MIN_BYTES
@@ -752,6 +1050,7 @@ impl TrafficQuotaTracker {
             return None;
         }
         self.last_persisted_bytes = self.used_bytes;
+        self.last_persisted_daily_bytes = self.daily_used_bytes;
         self.last_persisted_at_ms = now_ms;
         self.snapshot_for_persist(now_ms)
     }
@@ -867,9 +1166,13 @@ struct RelayServerInner {
     started_at_ms: i64,
     active_connections: AtomicUsize,
     rooms: Mutex<HashMap<RelayRoomId, RoomState>>,
-    /// Per-client-address admission state. Kept separate from `rooms` so a
-    /// rejected connection never has to take the room lock.
+    /// Per-client-address admission, daily traffic, sustained bandwidth, and
+    /// penalty state. Kept separate from `rooms` so a rejected connection never
+    /// has to take the room lock.
     client_ip_limits: std::sync::Mutex<ClientIpLimits>,
+    /// Per-room daily traffic counters (UTC day), kept outside `rooms` so
+    /// disconnecting and reconnecting the same room does not reset its daily cap.
+    room_daily_traffic: std::sync::Mutex<RoomDailyTrafficTable>,
     /// Cumulative traffic quota state (disabled by default).
     traffic_quota: std::sync::Mutex<TrafficQuotaTracker>,
     /// Broadcasts `true` as soon as the configured traffic quota is exceeded,
@@ -911,6 +1214,7 @@ struct RoomState {
     pending: HashMap<CorrelationId, PendingBridgeRequest>,
     rate_window: RateWindow,
     bandwidth_window: RateWindow,
+    sustained_bucket: Option<TokenBucket>,
 }
 
 struct DeviceRoute {
@@ -1003,6 +1307,10 @@ impl RelayServerState {
                 active_connections: AtomicUsize::new(0),
                 rooms: Mutex::new(HashMap::new()),
                 client_ip_limits: std::sync::Mutex::new(ClientIpLimits::default()),
+                room_daily_traffic: std::sync::Mutex::new(RoomDailyTrafficTable {
+                    period: utc_year_month_day(now_ms),
+                    bytes_by_room: HashMap::new(),
+                }),
                 traffic_quota: std::sync::Mutex::new(tracker),
                 traffic_exhausted_tx,
                 clock_offset_ms: AtomicI64::new(0),
@@ -1035,7 +1343,7 @@ impl RelayServerState {
     }
 
     fn traffic_quota_status(&self) -> RelayTrafficQuotaStatus {
-        if self.config().max_traffic_bytes.is_none() {
+        if !self.config().has_global_traffic_limit() {
             return RelayTrafficQuotaStatus::default();
         }
         let now_ms = self.now_ms();
@@ -1052,7 +1360,7 @@ impl RelayServerState {
     }
 
     fn ensure_traffic_available(&self) -> Result<(), RelayServerError> {
-        if self.config().max_traffic_bytes.is_none() {
+        if !self.config().has_global_traffic_limit() {
             return Ok(());
         }
         let now_ms = self.now_ms();
@@ -1071,26 +1379,48 @@ impl RelayServerState {
         Ok(())
     }
 
-    /// Charges `bytes` to the global traffic quota when configured.
-    /// Returns `true` when traffic may continue, or `false` once the limit has
-    /// been reached or exceeded.
+    /// Charges `bytes` to the global traffic quota(s) when configured.
+    /// Returns `true` when traffic may continue, or `false` once either the
+    /// primary quota or the secondary daily cap has been reached.
     fn record_traffic_bytes(&self, bytes: usize) -> bool {
-        if self.config().max_traffic_bytes.is_none() {
+        if !self.config().has_global_traffic_limit() {
             return true;
         }
         let now_ms = self.now_ms();
-        let (allowed, newly_exceeded, exceeded, persist) = {
+        let (allowed, newly_exceeded, exceeded, primary_exceeded, daily_exceeded, persist) = {
             let mut tracker = self.traffic_quota_locked();
             let (_, rollover_persist) = tracker.refresh_period(now_ms);
             if tracker.is_exceeded() {
-                (false, false, true, rollover_persist)
+                (
+                    false,
+                    false,
+                    true,
+                    tracker.is_primary_exceeded(),
+                    tracker.is_daily_exceeded(),
+                    rollover_persist,
+                )
             } else {
-                tracker.used_bytes = tracker.used_bytes.saturating_add(bytes as u64);
-                let exceeded_now = tracker.is_exceeded();
+                if tracker.limit_bytes.is_some() {
+                    tracker.used_bytes = tracker.used_bytes.saturating_add(bytes as u64);
+                }
+                if tracker.daily_limit_bytes.is_some() {
+                    tracker.daily_used_bytes =
+                        tracker.daily_used_bytes.saturating_add(bytes as u64);
+                }
+                let primary_now = tracker.is_primary_exceeded();
+                let daily_now = tracker.is_daily_exceeded();
+                let exceeded_now = primary_now || daily_now;
                 let persist = tracker
                     .maybe_snapshot_for_persist(now_ms, exceeded_now)
                     .or(rollover_persist);
-                (!exceeded_now, exceeded_now, exceeded_now, persist)
+                (
+                    !exceeded_now,
+                    exceeded_now,
+                    exceeded_now,
+                    primary_now,
+                    daily_now,
+                    persist,
+                )
             }
         };
         if let Some((path, snapshot)) = persist {
@@ -1100,6 +1430,9 @@ impl RelayServerState {
         if newly_exceeded {
             warn!(
                 limit_bytes = self.config().max_traffic_bytes,
+                daily_limit_bytes = self.config().max_daily_traffic_bytes,
+                primary_exceeded,
+                daily_exceeded,
                 mode = ?self.config().traffic_limit_mode,
                 "relay traffic limit reached; refusing further service"
             );
@@ -1158,19 +1491,259 @@ impl RelayServerState {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
+    fn room_daily_traffic(&self) -> std::sync::MutexGuard<'_, RoomDailyTrafficTable> {
+        self.inner
+            .room_daily_traffic
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
     /// Drops stale address entries so a long-running public relay cannot grow
-    /// the table without bound. Entries for addresses that still hold a
-    /// connection are always kept.
+    /// the table without bound. Entries with active connections, active bans,
+    /// or today's per-IP traffic usage are retained.
     fn prune_client_ip_limits_locked(&self, limits: &mut ClientIpLimits, now: i64) {
         let config = self.config();
-        let retention_ms = config.ip_rate_limit_window_ms.saturating_mul(2).max(1);
+        let retention_ms = config
+            .ip_rate_limit_window_ms
+            .max(config.ip_penalty_window_ms)
+            .saturating_mul(2)
+            .max(1);
         if now - limits.last_pruned_at_ms < config.ip_rate_limit_window_ms {
             return;
         }
         limits.last_pruned_at_ms = now;
+        let current_day = utc_year_month_day(now);
         limits.entries.retain(|_, entry| {
-            entry.active_connections > 0 || now - entry.last_seen_at_ms <= retention_ms
+            entry.active_connections > 0
+                || entry.is_banned(now)
+                || (config.max_traffic_bytes_per_ip_per_day.is_some()
+                    && entry.daily_traffic_period == current_day
+                    && entry.daily_traffic_bytes > 0)
+                || now - entry.last_seen_at_ms <= retention_ms
         });
+    }
+
+    fn record_ip_violation_entry(
+        ip: IpAddr,
+        entry: &mut ClientIpLimitEntry,
+        now: i64,
+        config: &RelayServerConfig,
+        reason: &'static str,
+    ) {
+        let Some(threshold) = config.ip_penalty_threshold else {
+            return;
+        };
+        if entry.is_banned(now) {
+            return;
+        }
+        if let Some(expired_at) = entry.last_ban_expired_at_ms
+            && now.saturating_sub(expired_at) >= config.ip_ban_max_ms
+        {
+            entry.ban_strikes = 0;
+            entry.last_ban_expired_at_ms = None;
+        }
+        if now - entry.penalty_window.started_at_ms >= config.ip_penalty_window_ms {
+            entry.penalty_window.started_at_ms = now;
+            entry.penalty_window.count = 0;
+        }
+        entry.penalty_window.count = entry.penalty_window.count.saturating_add(1);
+        if entry.penalty_window.count >= threshold {
+            entry.penalty_window.count = 0;
+            entry.penalty_window.started_at_ms = now;
+            entry.ban_strikes = entry.ban_strikes.saturating_add(1);
+            let mut duration_ms = config.ip_ban_base_ms;
+            for _ in 1..entry.ban_strikes {
+                duration_ms = duration_ms.saturating_mul(6).min(config.ip_ban_max_ms);
+            }
+            duration_ms = duration_ms.min(config.ip_ban_max_ms);
+            entry.banned_until_ms = Some(now.saturating_add(duration_ms));
+            warn!(
+                client_ip = %ip,
+                reason,
+                ban_strikes = entry.ban_strikes,
+                ban_duration_ms = duration_ms,
+                "relay client ip temporarily banned"
+            );
+        }
+    }
+
+    fn record_client_ip_violation(&self, ip: Option<IpAddr>, reason: &'static str) {
+        let Some(ip) = ip else {
+            return;
+        };
+        let config = self.config();
+        if config.ip_penalty_threshold.is_none() {
+            return;
+        }
+        let now = self.now_ms();
+        let mut limits = self.client_ip_limits();
+        if !limits.entries.contains_key(&ip)
+            && limits.entries.len() >= config.max_tracked_client_ips
+        {
+            return;
+        }
+        let entry = limits
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ClientIpLimitEntry::new(now, config));
+        entry.last_seen_at_ms = now;
+        Self::record_ip_violation_entry(ip, entry, now, config, reason);
+    }
+
+    /// Rejects requests from temporarily banned IPs or IPs that have already
+    /// exhausted their per-IP daily traffic allowance.
+    fn ensure_client_ip_allowed(&self, ip: Option<IpAddr>) -> Result<(), RelayServerError> {
+        let Some(ip) = ip else {
+            return Ok(());
+        };
+        let config = self.config();
+        let now = self.now_ms();
+        let current_day = utc_year_month_day(now);
+        let mut limits = self.client_ip_limits();
+        if let Some(entry) = limits.entries.get_mut(&ip) {
+            if let Some(until) = entry.banned_until_ms {
+                if now < until {
+                    return Err(ip_temporarily_banned_error());
+                }
+                entry.banned_until_ms = None;
+                entry.last_ban_expired_at_ms = Some(until);
+            }
+            entry.refresh_day(&current_day);
+            if let Some(daily_limit) = config.max_traffic_bytes_per_ip_per_day
+                && entry.daily_traffic_bytes >= daily_limit
+            {
+                return Err(ip_daily_traffic_limit_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Charges `bytes` against per-IP ban status, sustained token bucket, and
+    /// per-IP daily traffic quota (when configured).
+    fn charge_client_ip_traffic(
+        &self,
+        ip: Option<IpAddr>,
+        bytes: usize,
+    ) -> Result<(), RelayServerError> {
+        let Some(ip) = ip else {
+            return Ok(());
+        };
+        let config = self.config();
+        if config.sustained_bytes_per_sec_per_ip.is_none()
+            && config.max_traffic_bytes_per_ip_per_day.is_none()
+            && config.ip_penalty_threshold.is_none()
+        {
+            return Ok(());
+        }
+        let now = self.now_ms();
+        let current_day = utc_year_month_day(now);
+        let mut limits = self.client_ip_limits();
+        if !limits.entries.contains_key(&ip)
+            && limits.entries.len() >= config.max_tracked_client_ips
+        {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::RateLimit,
+                "relay client address table is exhausted",
+            ));
+        }
+        let entry = limits
+            .entries
+            .entry(ip)
+            .or_insert_with(|| ClientIpLimitEntry::new(now, config));
+        entry.last_seen_at_ms = now;
+        if let Some(until) = entry.banned_until_ms {
+            if now < until {
+                return Err(ip_temporarily_banned_error());
+            }
+            entry.banned_until_ms = None;
+            entry.last_ban_expired_at_ms = Some(until);
+        }
+        entry.refresh_day(&current_day);
+        if let Some(daily_limit) = config.max_traffic_bytes_per_ip_per_day {
+            if entry.daily_traffic_bytes >= daily_limit {
+                Self::record_ip_violation_entry(ip, entry, now, config, "ip_daily_traffic");
+                return Err(ip_daily_traffic_limit_error());
+            }
+            let next_total = entry.daily_traffic_bytes.saturating_add(bytes as u64);
+            entry.daily_traffic_bytes = next_total;
+            if next_total >= daily_limit {
+                if !entry.daily_quota_warned {
+                    entry.daily_quota_warned = true;
+                    warn!(
+                        client_ip = %ip,
+                        used_bytes = next_total,
+                        limit_bytes = daily_limit,
+                        period = current_day.as_str(),
+                        "relay client ip daily traffic limit reached"
+                    );
+                }
+                Self::record_ip_violation_entry(ip, entry, now, config, "ip_daily_traffic");
+                return Err(ip_daily_traffic_limit_error());
+            }
+        }
+        if let Some(bucket) = entry.sustained_bucket.as_mut()
+            && !bucket.consume(bytes, now)
+        {
+            Self::record_ip_violation_entry(ip, entry, now, config, "ip_sustained_bandwidth");
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::BandwidthLimit,
+                "relay sustained bandwidth limit for this address exceeded",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Charges `bytes` against the per-room daily cumulative traffic cap (UTC
+    /// day), when configured.
+    fn charge_room_daily_traffic(
+        &self,
+        room_id: &RelayRoomId,
+        bytes: usize,
+        client_ip: Option<IpAddr>,
+    ) -> Result<(), RelayServerError> {
+        let Some(limit) = self.config().max_traffic_bytes_per_room_per_day else {
+            return Ok(());
+        };
+        let now = self.now_ms();
+        let current_day = utc_year_month_day(now);
+        let exceeded = {
+            let mut table = self.room_daily_traffic();
+            if table.period != current_day {
+                table.period = current_day.clone();
+                table.bytes_by_room.clear();
+            }
+            if !table.bytes_by_room.contains_key(room_id)
+                && table.bytes_by_room.len() >= self.config().max_tracked_client_ips
+            {
+                // Keep memory bounded while preferring to retain heavy rooms.
+                table.bytes_by_room.retain(|_, used| *used >= limit / 4);
+            }
+            let used = table.bytes_by_room.entry(room_id.clone()).or_insert(0);
+            if *used >= limit {
+                Some(*used)
+            } else {
+                *used = used.saturating_add(bytes as u64);
+                (*used >= limit).then_some(*used)
+            }
+        };
+        if let Some(used_bytes) = exceeded {
+            warn!(
+                room_id = room_id.as_str(),
+                used_bytes,
+                limit_bytes = limit,
+                period = current_day.as_str(),
+                "relay room daily traffic limit reached"
+            );
+            self.record_client_ip_violation(client_ip, "room_daily_traffic");
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::BandwidthLimit,
+                "relay room daily traffic limit exceeded",
+            ));
+        }
+        Ok(())
     }
 
     /// Charges one connection attempt to `ip` and reserves a concurrent slot.
@@ -1189,7 +1762,8 @@ impl RelayServerState {
             });
         };
         let config = self.config();
-        let now = unix_timestamp_ms();
+        let now = self.now_ms();
+        let current_day = utc_year_month_day(now);
         let mut limits = self.client_ip_limits();
         self.prune_client_ip_limits_locked(&mut limits, now);
         if !limits.entries.contains_key(&ip)
@@ -1204,14 +1778,28 @@ impl RelayServerState {
         let entry = limits
             .entries
             .entry(ip)
-            .or_insert_with(|| ClientIpLimitEntry::new(now));
+            .or_insert_with(|| ClientIpLimitEntry::new(now, config));
         entry.last_seen_at_ms = now;
+        if let Some(until) = entry.banned_until_ms {
+            if now < until {
+                return Err(ip_temporarily_banned_error());
+            }
+            entry.banned_until_ms = None;
+            entry.last_ban_expired_at_ms = Some(until);
+        }
+        entry.refresh_day(&current_day);
+        if let Some(daily_limit) = config.max_traffic_bytes_per_ip_per_day
+            && entry.daily_traffic_bytes >= daily_limit
+        {
+            return Err(ip_daily_traffic_limit_error());
+        }
         if !allow_window(
             &mut entry.connection_window,
             now,
             config.ip_rate_limit_window_ms,
             config.max_connection_attempts_per_ip_per_window,
         ) {
+            Self::record_ip_violation_entry(ip, entry, now, config, "ip_connection_rate");
             return Err(RelayServerError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 RelayErrorCode::RateLimit,
@@ -1219,6 +1807,7 @@ impl RelayServerState {
             ));
         }
         if entry.active_connections >= config.max_connections_per_ip {
+            Self::record_ip_violation_entry(ip, entry, now, config, "ip_connection_limit");
             return Err(RelayServerError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 RelayErrorCode::ConnectionLimit,
@@ -1241,20 +1830,28 @@ impl RelayServerState {
             return Ok(());
         };
         let config = self.config();
-        let now = unix_timestamp_ms();
+        let now = self.now_ms();
         let mut limits = self.client_ip_limits();
         self.prune_client_ip_limits_locked(&mut limits, now);
         let entry = limits
             .entries
             .entry(ip)
-            .or_insert_with(|| ClientIpLimitEntry::new(now));
+            .or_insert_with(|| ClientIpLimitEntry::new(now, config));
         entry.last_seen_at_ms = now;
+        if let Some(until) = entry.banned_until_ms {
+            if now < until {
+                return Err(ip_temporarily_banned_error());
+            }
+            entry.banned_until_ms = None;
+            entry.last_ban_expired_at_ms = Some(until);
+        }
         if !allow_window(
             &mut entry.room_window,
             now,
             config.ip_rate_limit_window_ms,
             config.max_room_creates_per_ip_per_window,
         ) {
+            Self::record_ip_violation_entry(ip, entry, now, config, "ip_room_create_rate");
             return Err(RelayServerError::new(
                 StatusCode::TOO_MANY_REQUESTS,
                 RelayErrorCode::RateLimit,
@@ -1321,6 +1918,14 @@ impl RelayServerState {
                 push_adapter_timeout_ms: config.push_adapter_timeout_ms,
                 max_traffic_bytes: config.max_traffic_bytes,
                 traffic_limit_mode: config.max_traffic_bytes.map(|_| config.traffic_limit_mode),
+                max_daily_traffic_bytes: config.max_daily_traffic_bytes,
+                max_traffic_bytes_per_ip_per_day: config.max_traffic_bytes_per_ip_per_day,
+                max_traffic_bytes_per_room_per_day: config.max_traffic_bytes_per_room_per_day,
+                sustained_bytes_per_sec_per_room: config.sustained_bytes_per_sec_per_room,
+                burst_bytes_per_room: config.effective_room_burst_bytes(),
+                sustained_bytes_per_sec_per_ip: config.sustained_bytes_per_sec_per_ip,
+                burst_bytes_per_ip: config.effective_ip_burst_bytes(),
+                ip_penalty_threshold: config.ip_penalty_threshold,
             },
             traffic_quota: self.traffic_quota_status(),
         }
@@ -1358,6 +1963,11 @@ impl RelayServerState {
 
         let connection_id = RelayConnectionId::new();
         let (disconnect_tx, _) = watch::channel(());
+        let sustained_bucket = self
+            .config()
+            .sustained_bytes_per_sec_per_room
+            .zip(self.config().effective_room_burst_bytes())
+            .map(|(rate, burst)| TokenBucket::new(burst, rate, self.now_ms()));
         rooms.insert(
             room_id.clone(),
             RoomState {
@@ -1378,6 +1988,7 @@ impl RelayServerState {
                     started_at_ms: now,
                     count: 0,
                 },
+                sustained_bucket,
             },
         );
 
@@ -1498,7 +2109,16 @@ impl RelayServerState {
                 "relay encrypted frame routing metadata did not match its peer envelope",
             ));
         }
-        let now = unix_timestamp_ms();
+        let now = self.now_ms();
+        if let Some(bucket) = room.sustained_bucket.as_mut()
+            && !bucket.consume(encoded.len(), now)
+        {
+            return Err(RelayServerError::new(
+                StatusCode::TOO_MANY_REQUESTS,
+                RelayErrorCode::BandwidthLimit,
+                "relay room sustained bandwidth limit exceeded",
+            ));
+        }
         tracing::debug!(
             target: "vibex_relay_server::route",
             room_id = message.room_id.as_str(),
@@ -1702,6 +2322,17 @@ impl RelayServerState {
             room.last_seen_at_ms = now;
 
             let size = encoded.len();
+            if let Some(bucket) = room.sustained_bucket.as_mut()
+                && !bucket.consume(size, self.now_ms())
+            {
+                room.pending.remove(&correlation_id);
+                return Err(RelayServerError::new(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    RelayErrorCode::BandwidthLimit,
+                    "relay room sustained bandwidth limit exceeded",
+                )
+                .with_correlation_id(correlation_id));
+            }
             if !reserve_queue_bytes(
                 &room.pc_queued_bytes,
                 size,
@@ -1951,6 +2582,22 @@ const fn traffic_limit_exceeded_error() -> RelayServerError {
     )
 }
 
+fn ip_temporarily_banned_error() -> RelayServerError {
+    RelayServerError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        RelayErrorCode::RateLimit,
+        "client address is temporarily banned due to repeated limit violations",
+    )
+}
+
+fn ip_daily_traffic_limit_error() -> RelayServerError {
+    RelayServerError::new(
+        StatusCode::TOO_MANY_REQUESTS,
+        RelayErrorCode::BandwidthLimit,
+        "relay daily traffic limit for this address is exhausted",
+    )
+}
+
 async fn wait_until_traffic_exhausted(rx: &mut watch::Receiver<bool>) {
     if *rx.borrow() {
         return;
@@ -1973,10 +2620,15 @@ async fn info(State(state): State<RelayServerState>) -> Json<RelayServerInfo> {
 
 async fn register_push(
     State(state): State<RelayServerState>,
+    extensions: Extensions,
     headers: HeaderMap,
     body: Result<Json<RelayPushRegistration>, JsonRejection>,
 ) -> Response {
     if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
+    let client_ip = client_ip_from_extensions(&extensions, &headers);
+    if let Err(error) = state.ensure_client_ip_allowed(client_ip) {
         return error.into_response();
     }
     if let Err(error) = require_push_provider_and_auth(&state, &headers) {
@@ -2033,10 +2685,15 @@ async fn register_push(
 
 async fn dispatch_push(
     State(state): State<RelayServerState>,
+    extensions: Extensions,
     headers: HeaderMap,
     body: Result<Json<RelayOpaqueNotification>, JsonRejection>,
 ) -> Response {
     if let Err(error) = state.ensure_traffic_available() {
+        return error.into_response();
+    }
+    let client_ip = client_ip_from_extensions(&extensions, &headers);
+    if let Err(error) = state.ensure_client_ip_allowed(client_ip) {
         return error.into_response();
     }
     if let Err(error) = require_push_provider_and_auth(&state, &headers) {
@@ -2266,6 +2923,13 @@ fn client_ip_from_request(peer: SocketAddr, headers: &HeaderMap) -> Option<IpAdd
     forwarded_client_ip(headers)
 }
 
+fn client_ip_from_extensions(extensions: &Extensions, headers: &HeaderMap) -> Option<IpAddr> {
+    if let Some(ConnectInfo(peer)) = extensions.get::<ConnectInfo<SocketAddr>>() {
+        return client_ip_from_request(*peer, headers);
+    }
+    forwarded_client_ip(headers)
+}
+
 fn forwarded_client_ip(headers: &HeaderMap) -> Option<IpAddr> {
     let value = headers.get("x-forwarded-for")?.to_str().ok()?;
     parse_forwarded_entry(value.rsplit(',').next()?)
@@ -2313,21 +2977,34 @@ async fn ws(
 
 async fn pair(
     State(state): State<RelayServerState>,
+    extensions: Extensions,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
     body: Result<Json<RelayControlMessage>, JsonRejection>,
 ) -> Response {
     if let Err(error) = state.ensure_traffic_available() {
         return error.into_response();
     }
+    let client_ip = client_ip_from_extensions(&extensions, &headers);
+    if let Err(error) = state.ensure_client_ip_allowed(client_ip) {
+        return error.into_response();
+    }
     let room_id = match parse_room_path(room_id) {
         Ok(room_id) => room_id,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            state.record_client_ip_violation(client_ip, "http_invalid_room");
+            return err.into_response();
+        }
     };
     let message = match decode_json_body(body) {
         Ok(message) => message,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            state.record_client_ip_violation(client_ip, "http_invalid_body");
+            return err.into_response();
+        }
     };
     let RelayControlMessage::Hello(hello) = message else {
+        state.record_client_ip_violation(client_ip, "http_invalid_frame");
         return RelayServerError::new(
             StatusCode::BAD_REQUEST,
             RelayErrorCode::InvalidFrame,
@@ -2344,6 +3021,7 @@ async fn pair(
         .into_response();
     }
     if hello.room_id != room_id {
+        state.record_client_ip_violation(client_ip, "http_room_mismatch");
         return RelayServerError::new(
             StatusCode::BAD_REQUEST,
             RelayErrorCode::InvalidRoom,
@@ -2353,13 +3031,19 @@ async fn pair(
     }
 
     let request_bytes = serde_json::to_vec(&hello).map(|v| v.len()).unwrap_or(0);
+    if let Err(err) = state.charge_client_ip_traffic(client_ip, request_bytes) {
+        return err.into_response();
+    }
+    if let Err(err) = state.charge_room_daily_traffic(&room_id, request_bytes, client_ip) {
+        return err.into_response();
+    }
     if !state.record_traffic_bytes(request_bytes) {
         return traffic_limit_exceeded_error().into_response();
     }
     let bridge_correlation_id = CorrelationId::new();
     match state
         .bridge(
-            room_id,
+            room_id.clone(),
             bridge_correlation_id,
             RelayFrameKind::PairRequest,
             RelayControlMessage::Hello(hello),
@@ -2368,32 +3052,62 @@ async fn pair(
     {
         Ok(response) => {
             let response_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+            if let Err(err) = state.charge_client_ip_traffic(client_ip, response_bytes) {
+                return err.into_response();
+            }
+            if let Err(err) = state.charge_room_daily_traffic(&room_id, response_bytes, client_ip) {
+                return err.into_response();
+            }
             if !state.record_traffic_bytes(response_bytes) {
                 return traffic_limit_exceeded_error().into_response();
             }
             Json(response).into_response()
         }
-        Err(err) => err.into_response(),
+        Err(err) => {
+            if matches!(
+                err.code,
+                RelayErrorCode::BandwidthLimit
+                    | RelayErrorCode::RateLimit
+                    | RelayErrorCode::QueueLimit
+            ) || err.status == StatusCode::TOO_MANY_REQUESTS
+            {
+                state.record_client_ip_violation(client_ip, err.code.as_str());
+            }
+            err.into_response()
+        }
     }
 }
 
 async fn command(
     State(state): State<RelayServerState>,
+    extensions: Extensions,
+    headers: HeaderMap,
     Path(room_id): Path<String>,
     body: Result<Json<RelayEncryptedFrame>, JsonRejection>,
 ) -> Response {
     if let Err(error) = state.ensure_traffic_available() {
         return error.into_response();
     }
+    let client_ip = client_ip_from_extensions(&extensions, &headers);
+    if let Err(error) = state.ensure_client_ip_allowed(client_ip) {
+        return error.into_response();
+    }
     let room_id = match parse_room_path(room_id) {
         Ok(room_id) => room_id,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            state.record_client_ip_violation(client_ip, "http_invalid_room");
+            return err.into_response();
+        }
     };
     let frame = match decode_json_body(body) {
         Ok(frame) => frame,
-        Err(err) => return err.into_response(),
+        Err(err) => {
+            state.record_client_ip_violation(client_ip, "http_invalid_body");
+            return err.into_response();
+        }
     };
     let Some(correlation_id) = frame.correlation_id.clone() else {
+        state.record_client_ip_violation(client_ip, "http_invalid_correlation");
         return RelayServerError::new(
             StatusCode::BAD_REQUEST,
             RelayErrorCode::InvalidCorrelation,
@@ -2411,6 +3125,7 @@ async fn command(
         .into_response();
     }
     if frame.room_id != room_id {
+        state.record_client_ip_violation(client_ip, "http_room_mismatch");
         return RelayServerError::new(
             StatusCode::BAD_REQUEST,
             RelayErrorCode::InvalidRoom,
@@ -2423,6 +3138,7 @@ async fn command(
         frame.kind,
         RelayFrameKind::Command | RelayFrameKind::PairRequest
     ) {
+        state.record_client_ip_violation(client_ip, "http_invalid_frame");
         return RelayServerError::new(
             StatusCode::BAD_REQUEST,
             RelayErrorCode::InvalidFrame,
@@ -2433,12 +3149,18 @@ async fn command(
     }
 
     let request_bytes = serde_json::to_vec(&frame).map(|v| v.len()).unwrap_or(0);
+    if let Err(err) = state.charge_client_ip_traffic(client_ip, request_bytes) {
+        return err.into_response();
+    }
+    if let Err(err) = state.charge_room_daily_traffic(&room_id, request_bytes, client_ip) {
+        return err.into_response();
+    }
     if !state.record_traffic_bytes(request_bytes) {
         return traffic_limit_exceeded_error().into_response();
     }
     match state
         .bridge(
-            room_id,
+            room_id.clone(),
             correlation_id,
             frame.kind,
             RelayControlMessage::Encrypted(frame),
@@ -2447,12 +3169,29 @@ async fn command(
     {
         Ok(response) => {
             let response_bytes = serde_json::to_vec(&response).map(|v| v.len()).unwrap_or(0);
+            if let Err(err) = state.charge_client_ip_traffic(client_ip, response_bytes) {
+                return err.into_response();
+            }
+            if let Err(err) = state.charge_room_daily_traffic(&room_id, response_bytes, client_ip) {
+                return err.into_response();
+            }
             if !state.record_traffic_bytes(response_bytes) {
                 return traffic_limit_exceeded_error().into_response();
             }
             Json(response).into_response()
         }
-        Err(err) => err.into_response(),
+        Err(err) => {
+            if matches!(
+                err.code,
+                RelayErrorCode::BandwidthLimit
+                    | RelayErrorCode::RateLimit
+                    | RelayErrorCode::QueueLimit
+            ) || err.status == StatusCode::TOO_MANY_REQUESTS
+            {
+                state.record_client_ip_violation(client_ip, err.code.as_str());
+            }
+            err.into_response()
+        }
     }
 }
 
@@ -2486,6 +3225,10 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
             return;
         }
     };
+    if let Err(err) = state.charge_client_ip_traffic(client_ip, first_text.len()) {
+        send_error_and_close(&mut ws_sender, err).await;
+        return;
+    }
     if !state.record_traffic_bytes(first_text.len()) {
         send_error_and_close(&mut ws_sender, traffic_limit_exceeded_error()).await;
         return;
@@ -2493,13 +3236,27 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
     let registration = match parse_registration(&first_text) {
         Ok(registration) => registration,
         Err(err) => {
+            state.record_client_ip_violation(client_ip, "ws_invalid_registration");
             send_error_and_close(&mut ws_sender, err).await;
             return;
         }
     };
     let (room_id, peer_id, role, hello) = registration;
+    if let Err(err) = state.charge_room_daily_traffic(&room_id, first_text.len(), client_ip) {
+        send_error_and_close(&mut ws_sender, err).await;
+        return;
+    }
     if role == RelayPeerRole::Device {
-        handle_device_socket_parts(ws_sender, ws_receiver, state, room_id, peer_id, hello).await;
+        handle_device_socket_parts(
+            ws_sender,
+            ws_receiver,
+            state,
+            room_id,
+            peer_id,
+            hello,
+            client_ip,
+        )
+        .await;
         return;
     }
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(128);
@@ -2522,6 +3279,7 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
     };
 
     let writer_state = state.clone();
+    let writer_room_id = room_id.clone();
     let mut writer_exhausted = state.subscribe_traffic_exhausted();
     let writer = tokio::spawn(async move {
         loop {
@@ -2540,6 +3298,20 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
                         break;
                     };
                     let bytes = encoded.len();
+                    if let Err(err) = writer_state
+                        .charge_client_ip_traffic(client_ip, bytes)
+                        .and_then(|()| {
+                            writer_state.charge_room_daily_traffic(&writer_room_id, bytes, client_ip)
+                        })
+                    {
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        send_error_and_close(&mut ws_sender, err).await;
+                        break;
+                    }
                     if !writer_state.record_traffic_bytes(bytes) {
                         release_queue_bytes(&queued_bytes, bytes);
                         outbound_rx.close();
@@ -2582,6 +3354,19 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
                     Ok(Message::Ping(_)) | Ok(Message::Pong(_)) => continue,
                     Ok(frame) => {
                         if let Ok(text) = frame_text(frame) {
+                            if let Err(err) = state
+                                .charge_client_ip_traffic(client_ip, text.len())
+                                .and_then(|()| {
+                                    state.charge_room_daily_traffic(&room_id, text.len(), client_ip)
+                                })
+                            {
+                                if let Ok(encoded) = serde_json::to_string(
+                                    &RelayControlMessage::Error(err.relay_error()),
+                                ) {
+                                    let _ = outbound_tx.try_send(encoded);
+                                }
+                                break;
+                            }
                             if !state.record_traffic_bytes(text.len()) {
                                 break;
                             }
@@ -2591,8 +3376,11 @@ async fn handle_socket(socket: WebSocket, state: RelayServerState, client_ip: Op
                                 &connection_id,
                                 &outbound_tx,
                                 text.as_str(),
+                                client_ip,
                             )
                             .await;
+                        } else {
+                            state.record_client_ip_violation(client_ip, "ws_invalid_frame");
                         }
                     }
                     Err(_) => break,
@@ -2618,6 +3406,7 @@ async fn handle_device_socket_parts(
     room_id: RelayRoomId,
     peer_id: RelayPeerId,
     hello: RelayHandshakeHello,
+    client_ip: Option<IpAddr>,
 ) {
     let (outbound_tx, mut outbound_rx) = mpsc::channel::<String>(128);
     let queued_bytes = std::sync::Arc::new(AtomicUsize::new(0));
@@ -2671,6 +3460,27 @@ async fn handle_device_socket_parts(
                         break;
                     };
                     let bytes = encoded.len();
+                    if let Err(err) = writer_state
+                        .charge_client_ip_traffic(client_ip, bytes)
+                        .and_then(|()| {
+                            writer_state.charge_room_daily_traffic(&writer_room_id, bytes, client_ip)
+                        })
+                    {
+                        release_queue_bytes(&queued_bytes, bytes);
+                        outbound_rx.close();
+                        while let Ok(pending) = outbound_rx.try_recv() {
+                            release_queue_bytes(&queued_bytes, pending.len());
+                        }
+                        send_peer_error_and_close(
+                            &mut ws_sender,
+                            writer_room_id.clone(),
+                            writer_pc_peer_id.clone(),
+                            writer_peer_id.clone(),
+                            err,
+                        )
+                        .await;
+                        break;
+                    }
                     if !writer_state.record_traffic_bytes(bytes) {
                         release_queue_bytes(&queued_bytes, bytes);
                         outbound_rx.close();
@@ -2733,34 +3543,70 @@ async fn handle_device_socket_parts(
                 };
                 match frame {
                     Ok(Message::Text(text)) => {
-                        if !state.record_traffic_bytes(text.len()) {
-                            break;
-                        }
-                        if let Ok(message) = serde_json::from_str::<RelayPeerMessage>(text.as_str())
-                            && message.room_id == room_id
-                            && message.sender_peer_id == peer_id
-                            && let Err(error) = state.route_peer_message(message.clone()).await
+                        if let Err(err) = state
+                            .charge_client_ip_traffic(client_ip, text.len())
+                            .and_then(|()| {
+                                state.charge_room_daily_traffic(&room_id, text.len(), client_ip)
+                            })
                         {
-                            warn!(
-                                code = error.code.as_str(),
-                                message = error.message,
-                                "relay device frame routing failed"
-                            );
                             if let Ok(encoded) = serde_json::to_string(&RelayPeerMessage {
                                 room_id: room_id.clone(),
                                 sender_peer_id: pc_peer_for_room(&state, &room_id)
                                     .await
                                     .unwrap_or_default(),
                                 recipient_peer_id: peer_id.clone(),
-                                message: RelayControlMessage::Error(error.relay_error()),
+                                message: RelayControlMessage::Error(err.relay_error()),
                             }) {
                                 let _ = outbound_tx.try_send(encoded);
                             }
                             break;
                         }
+                        if !state.record_traffic_bytes(text.len()) {
+                            break;
+                        }
+                        if let Ok(message) = serde_json::from_str::<RelayPeerMessage>(text.as_str())
+                            && message.room_id == room_id
+                            && message.sender_peer_id == peer_id
+                        {
+                            if let Err(error) = state.route_peer_message(message.clone()).await {
+                                if matches!(
+                                    error.code,
+                                    RelayErrorCode::BandwidthLimit
+                                        | RelayErrorCode::RateLimit
+                                        | RelayErrorCode::QueueLimit
+                                ) {
+                                    state.record_client_ip_violation(
+                                        client_ip,
+                                        error.code.as_str(),
+                                    );
+                                }
+                                warn!(
+                                    code = error.code.as_str(),
+                                    message = error.message,
+                                    "relay device frame routing failed"
+                                );
+                                if let Ok(encoded) = serde_json::to_string(&RelayPeerMessage {
+                                    room_id: room_id.clone(),
+                                    sender_peer_id: pc_peer_for_room(&state, &room_id)
+                                        .await
+                                        .unwrap_or_default(),
+                                    recipient_peer_id: peer_id.clone(),
+                                    message: RelayControlMessage::Error(error.relay_error()),
+                                }) {
+                                    let _ = outbound_tx.try_send(encoded);
+                                }
+                                break;
+                            }
+                        } else {
+                            state.record_client_ip_violation(client_ip, "ws_invalid_peer_frame");
+                        }
                     }
                     Ok(Message::Binary(bytes)) => {
                         if bytes.len() > state.config().max_body_bytes
+                            || state.charge_client_ip_traffic(client_ip, bytes.len()).is_err()
+                            || state
+                                .charge_room_daily_traffic(&room_id, bytes.len(), client_ip)
+                                .is_err()
                             || !state.record_traffic_bytes(bytes.len())
                         {
                             break;
@@ -2801,6 +3647,7 @@ async fn handle_pc_text(
     connection_id: &RelayConnectionId,
     outbound_tx: &mpsc::Sender<String>,
     text: &str,
+    client_ip: Option<IpAddr>,
 ) {
     if let Ok(peer_message) = serde_json::from_str::<RelayPeerMessage>(text) {
         if peer_message.room_id == *room_id
@@ -2809,6 +3656,14 @@ async fn handle_pc_text(
                 .await
             && let Err(error) = state.route_peer_message(peer_message).await
         {
+            if matches!(
+                error.code,
+                RelayErrorCode::BandwidthLimit
+                    | RelayErrorCode::RateLimit
+                    | RelayErrorCode::QueueLimit
+            ) {
+                state.record_client_ip_violation(client_ip, error.code.as_str());
+            }
             warn!(code = error.code.as_str(), "relay PC frame routing failed");
         }
         return;
@@ -2819,6 +3674,7 @@ async fn handle_pc_text(
     }
 
     let Ok(message) = serde_json::from_str::<RelayControlMessage>(text) else {
+        state.record_client_ip_violation(client_ip, "ws_invalid_json");
         warn!(
             room_id = room_id.as_str(),
             "relay websocket ignored invalid JSON frame"
@@ -4436,5 +5292,152 @@ mod tests {
         assert_eq!(rolled_week.used_bytes, 0);
         assert_ne!(rolled_week.period.as_deref(), Some(initial_week.as_str()));
         assert!(weekly_state.ensure_traffic_available().is_ok());
+    }
+
+    #[tokio::test]
+    async fn dual_layer_monthly_plus_daily_quota_resets_daily_while_preserving_monthly() {
+        let dir = tempfile::tempdir().unwrap();
+        let state_path = dir.path().join("dual-quota.json");
+
+        let mut config = test_config();
+        config.max_traffic_bytes = Some(1_000);
+        config.traffic_limit_mode = RelayTrafficLimitMode::Monthly;
+        config.max_daily_traffic_bytes = Some(300);
+        config.traffic_state_path = Some(state_path);
+
+        let state = RelayServerState::new(config.clone());
+        assert!(!state.record_traffic_bytes(350));
+        let status = state.traffic_quota_status();
+        assert!(status.enabled);
+        assert!(status.exceeded);
+        assert!(status.daily_exceeded);
+        assert_eq!(status.used_bytes, 350);
+        assert_eq!(status.daily_used_bytes, Some(350));
+        assert!(state.ensure_traffic_available().is_err());
+
+        // Persisting and restarting retains both monthly and daily usage.
+        let restarted = RelayServerState::new(config);
+        let restarted_status = restarted.traffic_quota_status();
+        assert!(restarted_status.exceeded);
+        assert!(restarted_status.daily_exceeded);
+        assert_eq!(restarted_status.used_bytes, 350);
+        assert_eq!(restarted_status.daily_used_bytes, Some(350));
+
+        // Next UTC day resets daily usage and re-opens service while keeping monthly usage.
+        restarted
+            .inner
+            .clock_offset_ms
+            .store(24 * 60 * 60 * 1000, Ordering::Release);
+        let next_day = restarted.traffic_quota_status();
+        assert!(!next_day.exceeded);
+        assert!(!next_day.daily_exceeded);
+        assert_eq!(next_day.daily_used_bytes, Some(0));
+        assert!(restarted.ensure_traffic_available().is_ok());
+    }
+
+    #[test]
+    fn token_bucket_allows_burst_and_caps_sustained_rate() {
+        let mut bucket = TokenBucket::new(1_000, 100, 10_000);
+        // Initial burst of 1_000 bytes succeeds immediately.
+        assert!(bucket.consume(600, 10_000));
+        assert!(bucket.consume(400, 10_000));
+        // Bucket is now empty; immediate send is rejected.
+        assert!(!bucket.consume(1, 10_000));
+        // After 500ms at 100 B/s, 50 bytes refilled.
+        assert!(!bucket.consume(51, 10_500));
+        assert!(bucket.consume(50, 10_500));
+        assert!(!bucket.consume(1, 10_500));
+    }
+
+    #[tokio::test]
+    async fn per_ip_and_per_room_daily_quotas_isolate_abusers_without_blocking_others() {
+        let mut config = test_config();
+        config.max_traffic_bytes_per_ip_per_day = Some(500);
+        config.max_traffic_bytes_per_room_per_day = Some(400);
+        let state = RelayServerState::new(config);
+
+        let abuser_ip: IpAddr = "198.51.100.42".parse().unwrap();
+        let good_ip: IpAddr = "203.0.113.9".parse().unwrap();
+        let abuser_room = RelayRoomId::new();
+        let good_room = RelayRoomId::new();
+
+        // Abuser IP hits per-IP daily quota.
+        assert!(state.charge_client_ip_traffic(Some(abuser_ip), 250).is_ok());
+        let err = state
+            .charge_client_ip_traffic(Some(abuser_ip), 300)
+            .unwrap_err();
+        assert_eq!(err.code, RelayErrorCode::BandwidthLimit);
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_err());
+
+        // Good IP is completely unaffected.
+        assert!(state.ensure_client_ip_allowed(Some(good_ip)).is_ok());
+        assert!(state.charge_client_ip_traffic(Some(good_ip), 200).is_ok());
+
+        // Abuser room hits per-room daily quota, while good room is unaffected.
+        assert!(
+            state
+                .charge_room_daily_traffic(&abuser_room, 200, Some(good_ip))
+                .is_ok()
+        );
+        let room_err = state
+            .charge_room_daily_traffic(&abuser_room, 250, Some(good_ip))
+            .unwrap_err();
+        assert_eq!(room_err.code, RelayErrorCode::BandwidthLimit);
+        assert!(
+            state
+                .charge_room_daily_traffic(&good_room, 200, Some(good_ip))
+                .is_ok()
+        );
+
+        // Next UTC day resets both per-IP and per-room counters.
+        state
+            .inner
+            .clock_offset_ms
+            .store(24 * 60 * 60 * 1000, Ordering::Release);
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_ok());
+        assert!(
+            state
+                .charge_room_daily_traffic(&abuser_room, 100, Some(abuser_ip))
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn ip_penalty_box_escalates_temporary_bans_and_expires() {
+        let mut config = test_config();
+        config.ip_penalty_threshold = Some(3);
+        config.ip_penalty_window_ms = 60_000;
+        config.ip_ban_base_ms = 10_000;
+        config.ip_ban_max_ms = 100_000;
+        let state = RelayServerState::new(config);
+
+        let abuser_ip: IpAddr = "198.51.100.77".parse().unwrap();
+        let innocent_ip: IpAddr = "203.0.113.77".parse().unwrap();
+
+        // Two violations do not ban yet; third triggers strike 1 (10s ban).
+        state.record_client_ip_violation(Some(abuser_ip), "test_violation");
+        state.record_client_ip_violation(Some(abuser_ip), "test_violation");
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_ok());
+
+        state.record_client_ip_violation(Some(abuser_ip), "test_violation");
+        let err = state.ensure_client_ip_allowed(Some(abuser_ip)).unwrap_err();
+        assert_eq!(err.code, RelayErrorCode::RateLimit);
+        assert!(state.ensure_client_ip_allowed(Some(innocent_ip)).is_ok());
+
+        // After 10s, first ban expires.
+        state.inner.clock_offset_ms.store(10_001, Ordering::Release);
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_ok());
+
+        // Another 3 violations triggers strike 2 (6x = 60s ban).
+        for _ in 0..3 {
+            state.record_client_ip_violation(Some(abuser_ip), "test_violation");
+        }
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_err());
+
+        // Still banned after 30s; unbanned after 61s.
+        state.inner.clock_offset_ms.store(40_001, Ordering::Release);
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_err());
+        state.inner.clock_offset_ms.store(71_001, Ordering::Release);
+        assert!(state.ensure_client_ip_allowed(Some(abuser_ip)).is_ok());
     }
 }

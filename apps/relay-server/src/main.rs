@@ -14,7 +14,23 @@ async fn main() -> Result<(), Box<dyn Error>> {
             "  VIBEX_RELAY_MAX_TRAFFIC_BYTES=<bytes|KB|MB|GB|TB> (optional, disabled by default)"
         );
         println!("  VIBEX_RELAY_TRAFFIC_LIMIT_MODE=daily|weekly|monthly|total (default: monthly)");
+        println!("  VIBEX_RELAY_MAX_DAILY_TRAFFIC_BYTES=<bytes|KB|MB|GB|TB> (optional daily cap)");
         println!("  VIBEX_RELAY_TRAFFIC_STATE_PATH=<path> (optional JSON state file)");
+        println!(
+            "  VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_IP_PER_DAY=<size> (optional per-IP daily cap)"
+        );
+        println!(
+            "  VIBEX_RELAY_MAX_TRAFFIC_BYTES_PER_ROOM_PER_DAY=<size> (optional per-room daily cap)"
+        );
+        println!(
+            "  VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_ROOM=<size> (optional room token bucket)"
+        );
+        println!("  VIBEX_RELAY_BURST_BYTES_PER_ROOM=<size> (optional room burst capacity)");
+        println!("  VIBEX_RELAY_SUSTAINED_BYTES_PER_SEC_PER_IP=<size> (optional IP token bucket)");
+        println!("  VIBEX_RELAY_BURST_BYTES_PER_IP=<size> (optional IP burst capacity)");
+        println!(
+            "  VIBEX_RELAY_IP_PENALTY_THRESHOLD=<count> (optional escalating IP ban threshold)"
+        );
         return Ok(());
     }
 

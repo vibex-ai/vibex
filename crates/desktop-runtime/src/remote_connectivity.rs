@@ -5444,6 +5444,7 @@ mod tests {
                 used_bytes: 1_000,
                 exceeded: true,
                 period: Some("2026-11".to_string()),
+                ..RelayTrafficQuotaStatus::default()
             },
         });
         let (controller, _gateway) =
