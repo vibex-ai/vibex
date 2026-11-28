@@ -91,6 +91,133 @@ pub struct DraggedRow {
     pub trailing: SharedString,
 }
 
+/// One posture the sidebar can narrow sessions by, matching the Desktop left
+/// sidebar's filter checkboxes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum SidebarSessionFilter {
+    Running,
+    WaitingForYou,
+    Unread,
+    Failed,
+    Pinned,
+}
+
+impl SidebarSessionFilter {
+    /// The selectable postures, in the order the filter surface lists them.
+    pub const ALL: [Self; 5] = [
+        Self::Running,
+        Self::WaitingForYou,
+        Self::Unread,
+        Self::Failed,
+        Self::Pinned,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => copy::text("Running", "运行中", "執行中"),
+            Self::WaitingForYou => copy::text("Waiting for you", "等待你处理", "等待你處理"),
+            Self::Unread => copy::text("Unread", "未读", "未讀"),
+            Self::Failed => copy::text("Failed", "失败", "失敗"),
+            Self::Pinned => copy::text("Pinned", "已置顶", "已置頂"),
+        }
+    }
+
+    const fn bit(self) -> u8 {
+        match self {
+            Self::Running => 1 << 0,
+            Self::WaitingForYou => 1 << 1,
+            Self::Unread => 1 << 2,
+            Self::Failed => 1 << 3,
+            Self::Pinned => 1 << 4,
+        }
+    }
+}
+
+/// The union of postures the sidebar keeps visible, held as independent toggles.
+///
+/// An empty set means every session is shown ("All sessions"). Checking
+/// multiple postures forms a union (OR): a session stays visible when it
+/// matches any checked posture.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SidebarSessionFilters {
+    bits: u8,
+}
+
+impl SidebarSessionFilters {
+    pub fn all_label() -> &'static str {
+        copy::text("All sessions", "全部会话", "全部會話")
+    }
+
+    pub const fn contains(self, filter: SidebarSessionFilter) -> bool {
+        self.bits & filter.bit() != 0
+    }
+
+    pub fn toggle(&mut self, filter: SidebarSessionFilter, checked: bool) {
+        if checked {
+            self.bits |= filter.bit();
+        } else {
+            self.bits &= !filter.bit();
+        }
+    }
+
+    pub fn flip(&mut self, filter: SidebarSessionFilter) {
+        self.bits ^= filter.bit();
+    }
+
+    pub fn clear(&mut self) {
+        self.bits = 0;
+    }
+
+    /// The checked postures, in the order the filter surface lists them.
+    pub fn selected(self) -> impl Iterator<Item = SidebarSessionFilter> {
+        SidebarSessionFilter::ALL
+            .into_iter()
+            .filter(move |filter| self.contains(*filter))
+    }
+
+    /// Whether the list is narrowed by at least one posture.
+    pub const fn narrowed(self) -> bool {
+        self.bits != 0
+    }
+
+    /// The checked postures joined as one caption, or "All sessions" when none
+    /// are selected.
+    pub fn label(self) -> String {
+        if !self.narrowed() {
+            return Self::all_label().to_string();
+        }
+        self.selected()
+            .map(SidebarSessionFilter::label)
+            .collect::<Vec<_>>()
+            .join(copy::text(", ", "、", "、"))
+    }
+}
+
+/// How the sidebar orders unpinned session rows, matching the Desktop left
+/// sidebar's sort radio group.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum SidebarSessionSortMode {
+    #[default]
+    Created,
+    Updated,
+    Title,
+    Manual,
+}
+
+impl SidebarSessionSortMode {
+    /// The sort choices in the order the filter/sort surface lists them.
+    pub const ALL: [Self; 4] = [Self::Created, Self::Updated, Self::Title, Self::Manual];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Created => copy::text("Creation time", "创建时间", "建立時間"),
+            Self::Updated => copy::text("Last updated", "更新时间", "更新時間"),
+            Self::Title => copy::text("Title", "名称", "名稱"),
+            Self::Manual => copy::text("Manual order", "手动排序", "手動排序"),
+        }
+    }
+}
+
 type Rows = Rc<dyn Fn(&str) -> Vec<SidebarRowView>>;
 type RowAction = Rc<dyn Fn(&SidebarRowView)>;
 /// Raises a row's menu, with how far down the page the row was held.
@@ -104,6 +231,11 @@ type MoveTargets = Rc<dyn Fn(&SidebarRowView) -> (bool, bool)>;
 pub struct SidebarTree {
     pub rows: Rows,
     pub detailed: Signal<bool>,
+    pub session_filters: Signal<SidebarSessionFilters>,
+    pub session_sort: Signal<SidebarSessionSortMode>,
+    pub on_toggle_filter: Rc<dyn Fn(SidebarSessionFilter)>,
+    pub on_clear_filters: Rc<dyn Fn()>,
+    pub on_set_sort: Rc<dyn Fn(SidebarSessionSortMode)>,
     pub on_toggle_hierarchy: Rc<dyn Fn()>,
     pub on_toggle_row: RowAction,
     pub on_collapse_all: Rc<dyn Fn()>,
@@ -140,6 +272,7 @@ pub(super) struct TreeActions {
     pub move_row: MoveRow,
     pub new_session: RowAction,
     pub batch_scope: BatchScope,
+    pub clear_filters: Rc<dyn Fn()>,
     /// Ends a carry the touch system can no longer report. The list's own
     /// edge scrolling recycles the row that holds the gesture, and a
     /// recycled row's release never arrives; the page watches the list
@@ -152,6 +285,7 @@ pub(super) struct TreeState {
     pub pager: Pager,
     pub rows: Memo<Vec<SidebarRowView>>,
     pub query: Signal<String>,
+    pub filters: Signal<SidebarSessionFilters>,
     pub select_mode: Signal<bool>,
     pub selected: Signal<Vec<String>>,
     pub locate: Signal<Option<String>>,
@@ -251,23 +385,76 @@ pub(super) fn list(state: TreeState, actions: TreeActions) -> impl IntoElement {
             state.locate.set(None);
         }
     });
+    let clear_filters = actions.clear_filters.clone();
     view()
         .flex_1()
         .min_h(px(0.0))
-        .child(when(
-            move || visible.with(Vec::is_empty),
+        .child(when(move || visible.with(Vec::is_empty), {
+            let clear_filters = clear_filters.clone();
             move || {
-                super::empty_hint(if state.query.with(|query| query.trim().is_empty()) {
-                    copy::text("No sessions yet", "还没有会话", "還沒有工作階段")
-                } else {
-                    copy::text(
-                        "No matching sessions",
-                        "没有匹配的会话",
-                        "沒有符合的工作階段",
+                let clear_filters = clear_filters.clone();
+                view()
+                    .flex_1()
+                    .px(px(theme::SPACING_XL))
+                    .flex_col()
+                    .items_center()
+                    .justify_center()
+                    .gap(px(theme::SPACING_SM))
+                    .child(
+                        text(move || {
+                            let filters = state.filters.get();
+                            if filters.narrowed() {
+                                format!(
+                                    "{} · {}",
+                                    filters.label(),
+                                    copy::text(
+                                        "No matching sessions",
+                                        "没有匹配的会话",
+                                        "沒有符合的工作階段",
+                                    )
+                                )
+                            } else if state.query.with(|query| query.trim().is_empty()) {
+                                copy::text("No sessions yet", "还没有会话", "還沒有工作階段")
+                                    .to_owned()
+                            } else {
+                                copy::text(
+                                    "No matching sessions",
+                                    "没有匹配的会话",
+                                    "沒有符合的工作階段",
+                                )
+                                .to_owned()
+                            }
+                        })
+                        .text_size(px(theme::font_detail()))
+                        .text_color(theme::text_muted),
                     )
-                })
-            },
-        ))
+                    .child(when(move || state.filters.get().narrowed(), {
+                        let clear_filters = clear_filters.clone();
+                        move || {
+                            let clear_filters = clear_filters.clone();
+                            button()
+                                .test_id("sidebar-clear-session-filter")
+                                .h(px(32.0))
+                                .px(px(theme::SPACING_MD))
+                                .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                                .items_center()
+                                .justify_center()
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_press(move || clear_filters())
+                                .child(
+                                    text(copy::text(
+                                        "Show all sessions",
+                                        "显示全部会话",
+                                        "顯示全部會話",
+                                    ))
+                                    .text_size(px(theme::font_caption()))
+                                    .font_weight(FontWeight::MEDIUM)
+                                    .text_color(theme::primary),
+                                )
+                        }
+                    }))
+            }
+        }))
         .child(
             virtual_list(
                 move || visible.with(Vec::len),

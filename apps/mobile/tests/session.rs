@@ -658,12 +658,17 @@ fn sidebar_fixture(
     pinned: Signal<Vec<String>>,
     sections: Signal<Vec<SidebarSectionView>>,
 ) -> SidebarTree {
+    let session_filters =
+        signal(vibex_mobile_ui::screens::session::SidebarSessionFilters::default());
+    let session_sort = signal(vibex_mobile_ui::screens::session::SidebarSessionSortMode::default());
     SidebarTree {
         rows: Rc::new(move |query| {
             let sessions = sessions.get();
             let sections = sections.get();
             let active = active.get();
             let pinned = pinned.get();
+            let filters = session_filters.get();
+            let sort = session_sort.get();
             let make_row = |session: &SessionSummary, indent: f32| SidebarRowView {
                 id: session.id.clone(),
                 title: session.title.clone(),
@@ -676,7 +681,34 @@ fn sidebar_fixture(
                 ..Default::default()
             };
             let query = query.to_lowercase();
-            let matches = |session: &&SessionSummary| session.title.to_lowercase().contains(&query);
+            let matches = |session: &&SessionSummary| {
+                if !session.title.to_lowercase().contains(&query) {
+                    return false;
+                }
+                if !filters.narrowed() {
+                    return true;
+                }
+                use vibex_mobile_ui::screens::session::SidebarSessionFilter;
+                (filters.contains(SidebarSessionFilter::Running)
+                    && session.state == SessionState::Running)
+                    || (filters.contains(SidebarSessionFilter::WaitingForYou)
+                        && session.state == SessionState::Waiting)
+                    || (filters.contains(SidebarSessionFilter::Failed)
+                        && session.state == SessionState::Failed)
+                    || (filters.contains(SidebarSessionFilter::Pinned)
+                        && pinned.contains(&session.id))
+            };
+            let mut matched = sessions.iter().filter(matches).collect::<Vec<_>>();
+            if sort == vibex_mobile_ui::screens::session::SidebarSessionSortMode::Title {
+                matched.sort_by(|left, right| {
+                    (!pinned.contains(&left.id))
+                        .cmp(&!pinned.contains(&right.id))
+                        .then_with(|| left.title.to_lowercase().cmp(&right.title.to_lowercase()))
+                });
+            }
+            if filters.narrowed() && matched.is_empty() {
+                return Vec::new();
+            }
             let mut rows = vec![SidebarRowView {
                 id: "p1".to_owned(),
                 kind: SidebarRowKind::Project,
@@ -685,9 +717,9 @@ fn sidebar_fixture(
                 ..Default::default()
             }];
             rows.extend(
-                sessions
+                matched
                     .iter()
-                    .filter(matches)
+                    .copied()
                     .filter(|session| {
                         !sections
                             .iter()
@@ -696,6 +728,14 @@ fn sidebar_fixture(
                     .map(|session| make_row(session, 12.0)),
             );
             for section in sections {
+                let members = matched
+                    .iter()
+                    .copied()
+                    .filter(|session| section.session_ids.contains(&session.id))
+                    .collect::<Vec<_>>();
+                if filters.narrowed() && members.is_empty() {
+                    continue;
+                }
                 rows.push(SidebarRowView {
                     id: section.id.clone(),
                     kind: if section.kind == SidebarSectionKind::Group {
@@ -710,10 +750,8 @@ fn sidebar_fixture(
                 });
                 if !section.collapsed {
                     rows.extend(
-                        sessions
-                            .iter()
-                            .filter(matches)
-                            .filter(|session| section.session_ids.contains(&session.id))
+                        members
+                            .into_iter()
                             // A folder's sessions hang one step in from it, as
                             // they do in the app: the step is what tells a
                             // folder's subtree from the rows around it.
@@ -729,6 +767,17 @@ fn sidebar_fixture(
             rows
         }),
         detailed: signal(false),
+        session_filters,
+        session_sort,
+        on_toggle_filter: Rc::new(move |filter| {
+            session_filters.update(|filters| filters.flip(filter));
+        }),
+        on_clear_filters: Rc::new(move || {
+            session_filters.set(Default::default());
+        }),
+        on_set_sort: Rc::new(move |sort| {
+            session_sort.set(sort);
+        }),
         on_toggle_hierarchy: Rc::new(|| {}),
         on_toggle_row: Rc::new(move |row| {
             sections.update(|sections| {
@@ -4438,4 +4487,60 @@ fn update_button_sits_left_of_settings_in_drawer_footer_and_queues_install() {
         .unwrap();
     app.wait_for("text:https://example.com/vibex-9.9.9.apk")
         .unwrap();
+}
+
+#[test]
+fn the_drawer_filter_and_sort_sheet_narrows_sorts_and_resets_from_empty_state() {
+    let config = EngineConfig::new(Root::of::<Shell>());
+    let mut app = Headless::start(config).unwrap();
+    app.wait_for("role:button[Sessions]").unwrap();
+    app.press("role:button[Sessions]").unwrap();
+    app.wait_for("id:sidebar-session-filter").unwrap();
+
+    // Open the filter & sort sheet from the Projects header funnel button.
+    app.press("id:sidebar-session-filter").unwrap();
+    app.wait_for("id:sidebar-session-filter-running").unwrap();
+    app.wait_for("id:sidebar-session-sort-title").unwrap();
+
+    // Narrow to Running: sheet stays open so multiple postures can be combined.
+    app.press("id:sidebar-session-filter-running").unwrap();
+    app.wait_for("id:sidebar-session-filter-failed").unwrap();
+
+    // Narrow to Failed instead (no sessions in fixture are Failed) -> empty state.
+    app.press("id:sidebar-session-filter-running").unwrap();
+    app.press("id:sidebar-session-filter-failed").unwrap();
+
+    // Back closes the filter sheet without leaving the drawer.
+    app.back().unwrap();
+    app.wait_for("id:sidebar-clear-session-filter").unwrap();
+
+    // Tapping "Show all sessions" in the empty state restores every session row.
+    app.press("id:sidebar-clear-session-filter").unwrap();
+    app.wait_for("id:sessions-page >> text:Good morning")
+        .unwrap();
+    app.wait_for("id:sessions-page >> text:Fix the tests")
+        .unwrap();
+
+    // Sort by Title puts "Fix the tests" above "Good morning".
+    app.press("id:sidebar-session-filter").unwrap();
+    app.wait_for("id:sidebar-session-sort-title").unwrap();
+    app.press("id:sidebar-session-sort-title").unwrap();
+    app.back().unwrap();
+
+    let fix_bounds = app
+        .screen()
+        .layout("id:sessions-page >> text:Fix the tests")
+        .unwrap()
+        .expect("Fix the tests row")
+        .bounds;
+    let morning_bounds = app
+        .screen()
+        .layout("id:sessions-page >> text:Good morning")
+        .unwrap()
+        .expect("Good morning row")
+        .bounds;
+    assert!(
+        fix_bounds.origin.y.0 < morning_bounds.origin.y.0,
+        "Title sort should place 'Fix the tests' above 'Good morning': fix={fix_bounds:?}, morning={morning_bounds:?}"
+    );
 }

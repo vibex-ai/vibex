@@ -83,8 +83,8 @@ use vibex_mobile_ui::{
         QuestionOption, QuestionResponse, QueuedMessageView, RuntimeChoiceView, RuntimeFeatureView,
         RuntimeOptionView, RuntimePickerHost, RuntimeSummaryView, ScheduledSendView, SessionHost,
         SessionState, SessionSummary, SessionTerminalHost, SidebarRowKind, SidebarRowView,
-        SidebarSectionKind, SidebarSectionView, SidebarTree, TimelineEntry, TokenUsageView,
-        TurnFileChange,
+        SidebarSectionKind, SidebarSectionView, SidebarSessionFilter, SidebarSessionFilters,
+        SidebarSessionSortMode, SidebarTree, TimelineEntry, TokenUsageView, TurnFileChange,
     },
     screens::team::TeamTaskView,
     screens::terminal::TerminalChoice,
@@ -297,6 +297,8 @@ pub struct SessionService {
     sidebar_sync: Rc<futures_util::lock::Mutex<()>>,
     sidebar_snapshot: Rc<RefCell<RemoteSidebarOrganizationSnapshot>>,
     sidebar_collapsed: Rc<RefCell<sidebar::LocalSidebarCollapseState>>,
+    sidebar_session_filters: Signal<SidebarSessionFilters>,
+    sidebar_session_sort: Signal<SidebarSessionSortMode>,
     sidebar_view: Signal<SidebarOrganizationView>,
     sidebar_detailed: Signal<bool>,
     sidebar_mode_pending: Rc<Cell<Option<bool>>>,
@@ -667,6 +669,7 @@ impl SessionService {
         let host_id = bundle.host_id().to_owned();
         let runtime_prefs = RuntimePreferences::load_for_host(&host_id);
         let sidebar_collapsed = sidebar::LocalSidebarCollapseState::load_for_host(&host_id);
+        let sidebar_session_sort = sidebar::load_sidebar_session_sort_for_host(&host_id);
         let service = Self {
             bundle_host_id: Rc::new(host_id),
             web,
@@ -679,6 +682,8 @@ impl SessionService {
             sidebar_sync: Rc::new(futures_util::lock::Mutex::new(())),
             sidebar_snapshot: Rc::new(RefCell::new(Default::default())),
             sidebar_collapsed: Rc::new(RefCell::new(sidebar_collapsed)),
+            sidebar_session_filters: signal(SidebarSessionFilters::default()),
+            sidebar_session_sort: signal(sidebar_session_sort),
             sidebar_view: signal(SidebarOrganizationView::default()),
             sidebar_detailed: signal(false),
             sidebar_mode_pending: Rc::new(Cell::new(None)),
@@ -7008,6 +7013,20 @@ impl SessionService {
                 Rc::new(move |query| service.sidebar_rows(query))
             },
             detailed: self.sidebar_detailed,
+            session_filters: self.sidebar_session_filters,
+            session_sort: self.sidebar_session_sort,
+            on_toggle_filter: {
+                let service = self.clone();
+                Rc::new(move |filter| service.toggle_sidebar_session_filter(filter))
+            },
+            on_clear_filters: {
+                let service = self.clone();
+                Rc::new(move || service.clear_sidebar_session_filters())
+            },
+            on_set_sort: {
+                let service = self.clone();
+                Rc::new(move |sort| service.set_sidebar_session_sort(sort))
+            },
             on_toggle_hierarchy: {
                 let service = self.clone();
                 Rc::new(move || service.toggle_sidebar_hierarchy())
@@ -7062,23 +7081,60 @@ impl SessionService {
             batch_scope: {
                 let service = self.clone();
                 Rc::new(move |row| {
-                    service.session_records.with(|sessions| match row.kind {
-                        SidebarRowKind::Project => sessions
-                            .iter()
-                            .filter(|session| {
-                                session.deleted_at_ms.is_none()
-                                    && session.project_id.as_str() == row.id
-                            })
-                            .map(|session| session.id.as_str().to_owned())
-                            .collect(),
-                        SidebarRowKind::Folder => service.sidebar_view.with(|view| {
-                            sidebar::folder_batch_ids(&view.organization, sessions, &row.id)
-                        }),
-                        _ => Vec::new(),
+                    let filters = service.sidebar_session_filters.get_untracked();
+                    service.sidebar_view.with(|view| {
+                        service.session_records.with(|sessions| {
+                            let mut ids = match row.kind {
+                                SidebarRowKind::Project => sessions
+                                    .iter()
+                                    .filter(|session| {
+                                        session.deleted_at_ms.is_none()
+                                            && session.project_id.as_str() == row.id
+                                    })
+                                    .map(|session| session.id.as_str().to_owned())
+                                    .collect(),
+                                SidebarRowKind::Folder => {
+                                    sidebar::folder_batch_ids(&view.organization, sessions, &row.id)
+                                }
+                                _ => Vec::new(),
+                            };
+                            if filters.narrowed() {
+                                ids.retain(|id| {
+                                    sessions
+                                        .iter()
+                                        .find(|session| session.id.as_str() == id)
+                                        .is_some_and(|session| {
+                                            sidebar::session_matches_filters(session, view, filters)
+                                        })
+                                });
+                            }
+                            ids
+                        })
                     })
                 })
             },
         }
+    }
+
+    fn toggle_sidebar_session_filter(&self, filter: SidebarSessionFilter) {
+        self.sidebar_session_filters.update(|filters| {
+            filters.flip(filter);
+        });
+    }
+
+    fn clear_sidebar_session_filters(&self) {
+        if self.sidebar_session_filters.get_untracked().narrowed() {
+            self.sidebar_session_filters
+                .set(SidebarSessionFilters::default());
+        }
+    }
+
+    fn set_sidebar_session_sort(&self, sort: SidebarSessionSortMode) {
+        if self.sidebar_session_sort.get_untracked() == sort {
+            return;
+        }
+        self.sidebar_session_sort.set(sort);
+        sidebar::save_sidebar_session_sort_for_host(&self.bundle_host_id, sort);
     }
 
     fn projected_sidebar(
@@ -7090,9 +7146,19 @@ impl SessionService {
             .active
             .get()
             .and_then(|id| VibexSessionId::parse(id).ok());
+        let filters = self.sidebar_session_filters.get();
+        let sort = sidebar::to_desktop_session_sort(self.sidebar_session_sort.get());
         self.workspace_records.with(|workspaces| {
             self.session_records.with(|sessions| {
-                sidebar::project_rows(view, workspaces, sessions, active.as_ref(), query)
+                sidebar::project_rows(
+                    view,
+                    workspaces,
+                    sessions,
+                    active.as_ref(),
+                    query,
+                    filters,
+                    sort,
+                )
             })
         })
     }
@@ -7295,6 +7361,21 @@ impl SessionService {
             return;
         };
         let view = self.sidebar_view.get_untracked();
+        let filters = self.sidebar_session_filters.get_untracked();
+        if filters.narrowed() {
+            let active_visible = self.session_records.with_untracked(|sessions| {
+                sessions
+                    .iter()
+                    .find(|session| session.id.as_str() == active)
+                    .is_some_and(|session| {
+                        sidebar::session_matches_filters(session, &view, filters)
+                    })
+            });
+            if !active_visible {
+                self.sidebar_session_filters
+                    .set(SidebarSessionFilters::default());
+            }
+        }
         let mut expanded = view.clone();
         expanded.collapsed_project_ids.clear();
         expanded.collapsed_workspace_ids.clear();
@@ -7347,6 +7428,9 @@ impl SessionService {
         ) + index as f32
             + 0.5;
         if let Some(operation) = sidebar::move_operation(&rows, index, position) {
+            if moved.kind == SidebarRowKind::Session {
+                self.set_sidebar_session_sort(SidebarSessionSortMode::Manual);
+            }
             self.sidebar_mutation(operation);
         }
     }
@@ -7449,6 +7533,9 @@ impl SessionService {
             SidebarRowKind::Group => RemoteSidebarItemKind::Group,
             _ => RemoteSidebarItemKind::Session,
         };
+        if row.kind == SidebarRowKind::Session {
+            self.set_sidebar_session_sort(SidebarSessionSortMode::Manual);
+        }
         self.sidebar_mutation(RemoteSidebarOrganizationMutation::MoveItems {
             items: vec![vibex_core::RemoteSidebarItemRef {
                 kind: moved_kind,
@@ -14923,6 +15010,126 @@ mod optimistic_send_tests {
         let config = EngineConfig::new(Root::of::<LocalSidebarCollapseProbe>());
         let mut app = Headless::start(config).unwrap();
         app.wait_for("local-sidebar-collapse-ok").unwrap();
+    }
+
+    #[component]
+    fn SidebarFilterSortProbe() -> impl IntoElement {
+        let done = signal(false);
+        let service = SessionService::build_unstarted(
+            &test_bundle(),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+            Rc::new(|_| {}),
+        )
+        .unwrap();
+
+        let (session_a, _) = seed_existing_session(&service);
+        let mut session_b = service.session_records.with_untracked(|s| s[0].clone());
+        session_b.id = VibexSessionId::new();
+        session_b.title = "Alpha running".to_owned();
+        session_b.state = AgentSessionState::Running;
+        session_b.created_at_ms = 50;
+        session_b.last_message_at_ms = 5_000;
+        service.session_records.update(|records| {
+            records[0].title = "Zebra idle".to_owned();
+            records[0].state = AgentSessionState::Idle;
+            records[0].created_at_ms = 500;
+            records[0].last_message_at_ms = 1_000;
+            records.push(session_b.clone());
+        });
+        service.active.set(Some(session_a.as_str().to_owned()));
+
+        // Default sort is Creation time: session_a (created 500) before session_b (created 50).
+        let created_ids: Vec<String> = service
+            .sidebar_rows("")
+            .into_iter()
+            .filter(|row| row.kind == SidebarRowKind::Session)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            created_ids,
+            vec![
+                session_a.as_str().to_owned(),
+                session_b.id.as_str().to_owned()
+            ]
+        );
+
+        // Switching to Title puts "Alpha running" first and persists locally.
+        service.set_sidebar_session_sort(SidebarSessionSortMode::Title);
+        assert_eq!(
+            sidebar::load_sidebar_session_sort_for_host(&service.bundle_host_id),
+            SidebarSessionSortMode::Title
+        );
+        let title_ids: Vec<String> = service
+            .sidebar_rows("")
+            .into_iter()
+            .filter(|row| row.kind == SidebarRowKind::Session)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(
+            title_ids,
+            vec![
+                session_b.id.as_str().to_owned(),
+                session_a.as_str().to_owned()
+            ]
+        );
+
+        // Filtering by Running hides idle session_a.
+        service.toggle_sidebar_session_filter(SidebarSessionFilter::Running);
+        let filtered_ids: Vec<String> = service
+            .sidebar_rows("")
+            .into_iter()
+            .filter(|row| row.kind == SidebarRowKind::Session)
+            .map(|row| row.id)
+            .collect();
+        assert_eq!(filtered_ids, vec![session_b.id.as_str().to_owned()]);
+
+        // Locating the active session (session_a, hidden by Running) clears the filter.
+        service.reveal_sidebar_session();
+        assert!(!service.sidebar_session_filters.get_untracked().narrowed());
+
+        // Locating session_b while Running is active keeps Running intact because session_b is visible.
+        service.active.set(Some(session_b.id.as_str().to_owned()));
+        service.toggle_sidebar_session_filter(SidebarSessionFilter::Running);
+        service.reveal_sidebar_session();
+        assert!(
+            service
+                .sidebar_session_filters
+                .get_untracked()
+                .contains(SidebarSessionFilter::Running)
+        );
+        service.clear_sidebar_session_filters();
+
+        // Stepping a session row switches sort mode to Manual.
+        let first_session = service
+            .sidebar_rows("")
+            .into_iter()
+            .find(|row| row.kind == SidebarRowKind::Session)
+            .expect("first session row");
+        service.move_sidebar_row_step(&first_session, false);
+        assert_eq!(
+            service.sidebar_session_sort.get_untracked(),
+            SidebarSessionSortMode::Manual
+        );
+
+        done.set(true);
+        view().child(text(move || {
+            if done.get() {
+                "sidebar-filter-sort-service-ok"
+            } else {
+                "pending"
+            }
+        }))
+    }
+
+    #[test]
+    fn mobile_sidebar_filter_and_sort_integrate_with_reveal_and_reorder() {
+        let config = EngineConfig::new(Root::of::<SidebarFilterSortProbe>());
+        let mut app = Headless::start(config).unwrap();
+        app.wait_for("sidebar-filter-sort-service-ok").unwrap();
     }
 
     fn make_timeline_page(

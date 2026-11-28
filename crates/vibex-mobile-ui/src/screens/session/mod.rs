@@ -45,7 +45,10 @@ mod tree;
 mod workbench;
 
 use pager::{Pager, ShellPage};
-pub use tree::{SidebarCardSlice, SidebarRowKind, SidebarRowView, SidebarTree};
+pub use tree::{
+    SidebarCardSlice, SidebarRowKind, SidebarRowView, SidebarSessionFilter, SidebarSessionFilters,
+    SidebarSessionSortMode, SidebarTree,
+};
 use workbench::WorkbenchTab;
 
 /// How a session is doing, for the drawer's dot.
@@ -7867,11 +7870,16 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
     });
     let sessions = host.sessions;
     let active = host.active;
+    let session_filters = host.sidebar.session_filters;
+    let session_sort = host.sidebar.session_sort;
+    let filter_open = signal(false);
     let query = signal(String::new());
     let select_mode = signal(false);
     let selected = signal(Vec::<String>::new());
     pager.on_sessions_back(move || {
-        if !query.with_untracked(String::is_empty) {
+        if filter_open.get_untracked() {
+            filter_open.set(false);
+        } else if !query.with_untracked(String::is_empty) {
             query.set(String::new());
             dismiss_keyboard();
         } else if select_mode.get_untracked() {
@@ -7925,25 +7933,67 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         let rows = host.sidebar.rows.clone();
         move || rows(&query.get())
     });
-    let matching = computed(move || {
-        let query = query.get().trim().to_lowercase();
-        sessions.with(|sessions| {
-            sessions
-                .iter()
-                .filter(|session| {
-                    query.is_empty()
-                        || [
-                            &session.title,
-                            &session.project_name,
-                            &session.workspace_label,
-                            &session.agent,
-                        ]
+    let matching = computed({
+        let batch_scope = host.sidebar.batch_scope.clone();
+        move || {
+            let filters = session_filters.get();
+            let query = query.get().trim().to_lowercase();
+            let matches_query = |session: &SessionSummary| {
+                query.is_empty()
+                    || [
+                        &session.title,
+                        &session.project_name,
+                        &session.workspace_label,
+                        &session.agent,
+                    ]
+                    .iter()
+                    .any(|value| value.to_lowercase().contains(&query))
+            };
+            if !filters.narrowed() {
+                return sessions.with(|sessions| {
+                    sessions
                         .iter()
-                        .any(|value| value.to_lowercase().contains(&query))
-                })
-                .map(|session| session.id.clone())
-                .collect::<Vec<_>>()
-        })
+                        .filter(|session| matches_query(session))
+                        .map(|session| session.id.clone())
+                        .collect::<Vec<_>>()
+                });
+            }
+            let mut ids = Vec::new();
+            rows.with(|rows| {
+                for row in rows {
+                    if row.kind == SidebarRowKind::Session {
+                        if !ids.contains(&row.id) {
+                            ids.push(row.id.clone());
+                        }
+                    } else if row.kind == SidebarRowKind::Project && row.collapsed {
+                        for id in batch_scope(row) {
+                            if !ids.contains(&id) {
+                                ids.push(id);
+                            }
+                        }
+                    }
+                }
+            });
+            if !query.is_empty() {
+                sessions.with(|sessions| {
+                    ids.retain(|id| {
+                        sessions
+                            .iter()
+                            .find(|session| &session.id == id)
+                            .is_some_and(matches_query)
+                    });
+                });
+            }
+            ids
+        }
+    });
+    effect(move || {
+        let _ = session_filters.get();
+        if !select_mode.get_untracked() {
+            return;
+        }
+        let visible = matching.get_untracked();
+        selected.update(|selected| selected.retain(|id| visible.contains(id)));
     });
     let can_group = computed(move || {
         let ids = selected.get();
@@ -8078,6 +8128,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
         move_row: host.sidebar.on_move_row.clone(),
         new_session: on_new_session_in,
         batch_scope: host.sidebar.batch_scope.clone(),
+        clear_filters: host.sidebar.on_clear_filters.clone(),
         // A carry whose row was recycled still has to land: the list reports
         // the lifted finger, and the row the drag started on is read from the
         // carry itself rather than from the element that began it.
@@ -8274,15 +8325,61 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                                 .text_color(theme::sidebar_text_muted),
                         ),
                 )
-                .child({
-                    let new_project = host.on_new_project.clone();
-                    drawer_text_action(
-                        Some(icon!("plus")),
-                        copy::text("New project", "新建项目", "新增專案"),
-                        move || new_project(),
-                    )
-                    .accessibility_label(copy::text("New project", "新建项目", "新增專案"))
-                }),
+                .child(
+                    view()
+                        .flex_row()
+                        .items_center()
+                        .gap(px(theme::SPACING_XS))
+                        .child(
+                            button()
+                                .test_id("sidebar-session-filter")
+                                .accessibility_label(copy::text(
+                                    "Filter sessions",
+                                    "筛选会话",
+                                    "篩選會話",
+                                ))
+                                .h(px(32.0))
+                                .min_w(px(32.0))
+                                .px(px(theme::SPACING_SM))
+                                .flex_shrink_0()
+                                .rounded(px(theme::SIDEBAR_ROW_RADIUS))
+                                .items_center()
+                                .justify_center()
+                                .bg(move || {
+                                    if session_filters.get().narrowed() {
+                                        theme::tint(theme::primary())
+                                    } else {
+                                        theme::primary().opacity(0.0)
+                                    }
+                                })
+                                .active(|style| style.bg(theme::row_pressed_bg()))
+                                .on_press(move || {
+                                    dismiss_keyboard();
+                                    filter_open.set(true);
+                                })
+                                .child(
+                                    svg(icon!("funnel"))
+                                        .w(px(14.0))
+                                        .h(px(14.0))
+                                        .text_color(move || {
+                                            if session_filters.get().narrowed() {
+                                                theme::primary()
+                                            } else {
+                                                theme::text_secondary()
+                                            }
+                                        }),
+                                ),
+                        )
+                        .child({
+                            let new_project = host.on_new_project.clone();
+                            drawer_text_action(
+                                Some(icon!("plus")),
+                                copy::text("New project", "新建项目", "新增專案"),
+                                move || new_project(),
+                            )
+                            .accessibility_label(copy::text("New project", "新建项目", "新增專案"))
+                        }),
+                ),
         )
         // The rows run out under the foot rather than being cut by a rule, the
         // way the transcript runs out under the conversation's header.
@@ -8300,6 +8397,7 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                         pager,
                         rows,
                         query,
+                        filters: session_filters,
                         select_mode,
                         selected,
                         locate,
@@ -8676,6 +8774,176 @@ fn drawer(host: SessionHost, pager: Pager, overlays: Overlays) -> impl IntoEleme
                 move || close()
             },
         ))
+        .child(sidebar_filter_sheet(
+            filter_open,
+            session_filters,
+            session_sort,
+            host.sidebar.on_toggle_filter.clone(),
+            host.sidebar.on_clear_filters.clone(),
+            host.sidebar.on_set_sort.clone(),
+        ))
+}
+
+fn sidebar_filter_sheet(
+    open: Signal<bool>,
+    filters: Signal<SidebarSessionFilters>,
+    sort: Signal<SidebarSessionSortMode>,
+    on_toggle_filter: Rc<dyn Fn(SidebarSessionFilter)>,
+    on_clear_filters: Rc<dyn Fn()>,
+    on_set_sort: Rc<dyn Fn(SidebarSessionSortMode)>,
+) -> impl IntoElement {
+    use crate::ui::sheet::{bottom_sheet, sheet_body, sheet_card, sheet_header};
+
+    let mut filter_card = sheet_card().child(
+        button()
+            .test_id("sidebar-session-filter-all")
+            .on_press({
+                let on_clear = on_clear_filters.clone();
+                move || on_clear()
+            })
+            .w_full()
+            .min_h(px(theme::MENU_ROW_HEIGHT))
+            .px(px(theme::SPACING_LG))
+            .flex_row()
+            .items_center()
+            .gap(px(theme::SPACING_MD))
+            .active(|style| style.bg(theme::row_pressed_bg()))
+            .child(surface::check_mark(move || {
+                (!filters.get().narrowed()).then_some(true)
+            }))
+            .child(
+                text(SidebarSessionFilters::all_label())
+                    .flex_1()
+                    .min_w(px(0.0))
+                    .truncate()
+                    .text_size(px(theme::font_body()))
+                    .text_color(theme::foreground),
+            ),
+    );
+    for filter in SidebarSessionFilter::ALL {
+        let on_toggle = on_toggle_filter.clone();
+        let test_id = match filter {
+            SidebarSessionFilter::Running => "sidebar-session-filter-running",
+            SidebarSessionFilter::WaitingForYou => "sidebar-session-filter-waiting",
+            SidebarSessionFilter::Unread => "sidebar-session-filter-unread",
+            SidebarSessionFilter::Failed => "sidebar-session-filter-failed",
+            SidebarSessionFilter::Pinned => "sidebar-session-filter-pinned",
+        };
+        filter_card = filter_card.child(
+            button()
+                .test_id(test_id)
+                .on_press(move || on_toggle(filter))
+                .w_full()
+                .min_h(px(theme::MENU_ROW_HEIGHT))
+                .px(px(theme::SPACING_LG))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_MD))
+                .border_t_1()
+                .border_t_color(theme::hairline)
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .child(surface::check_mark(move || {
+                    filters.get().contains(filter).then_some(true)
+                }))
+                .child(
+                    text(filter.label())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(theme::font_body()))
+                        .text_color(theme::foreground),
+                ),
+        );
+    }
+
+    let mut sort_card = sheet_card();
+    for (index, option) in SidebarSessionSortMode::ALL.into_iter().enumerate() {
+        let on_set = on_set_sort.clone();
+        let test_id = match option {
+            SidebarSessionSortMode::Created => "sidebar-session-sort-created",
+            SidebarSessionSortMode::Updated => "sidebar-session-sort-updated",
+            SidebarSessionSortMode::Title => "sidebar-session-sort-title",
+            SidebarSessionSortMode::Manual => "sidebar-session-sort-manual",
+        };
+        sort_card = sort_card.child(
+            button()
+                .test_id(test_id)
+                .on_press(move || on_set(option))
+                .w_full()
+                .min_h(px(theme::MENU_ROW_HEIGHT))
+                .px(px(theme::SPACING_LG))
+                .flex_row()
+                .items_center()
+                .gap(px(theme::SPACING_MD))
+                .when(index > 0, |row| {
+                    row.border_t_1().border_t_color(theme::hairline)
+                })
+                .active(|style| style.bg(theme::row_pressed_bg()))
+                .child(
+                    text(option.label())
+                        .flex_1()
+                        .min_w(px(0.0))
+                        .truncate()
+                        .text_size(px(theme::font_body()))
+                        .text_color(theme::foreground),
+                )
+                .child(when(
+                    move || sort.get() == option,
+                    || {
+                        svg(icon!("check"))
+                            .size(px(theme::ICON_MD))
+                            .flex_shrink_0()
+                            .text_color(theme::primary)
+                    },
+                )),
+        );
+    }
+
+    let section_title = |label: &'static str| {
+        text(label)
+            .px(px(theme::SPACING_XS))
+            .text_size(px(theme::font_caption()))
+            .font_weight(FontWeight::MEDIUM)
+            .text_color(theme::text_muted)
+    };
+
+    bottom_sheet(
+        move || open.get(),
+        move || open.set(false),
+        view()
+            .w_full()
+            .max_h(move || px(window().height.0 * 0.78))
+            .min_h(px(0.0))
+            .child(sheet_header(
+                copy::text("Filter & Sort", "筛选与排序", "篩選與排序"),
+                move || open.set(false),
+            ))
+            .child(
+                scroll().flex_shrink(1.0).min_h(px(0.0)).child(
+                    sheet_body()
+                        .child(
+                            view()
+                                .w_full()
+                                .flex_col()
+                                .gap(px(theme::SPACING_XS))
+                                .child(section_title(copy::text(
+                                    "Show sessions",
+                                    "显示会话",
+                                    "顯示會話",
+                                )))
+                                .child(filter_card),
+                        )
+                        .child(
+                            view()
+                                .w_full()
+                                .flex_col()
+                                .gap(px(theme::SPACING_XS))
+                                .child(section_title(copy::text("Sort by", "排序", "排序")))
+                                .child(sort_card),
+                        ),
+                ),
+            ),
+    )
 }
 
 fn group_members_sheet(
