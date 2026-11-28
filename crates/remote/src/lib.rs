@@ -90,8 +90,8 @@ mod lan_pairing;
 mod pairing_v2;
 mod zero_config_pairing;
 pub use gateway::{
-    GatewaySubscriptions, RelayAttachmentTasks, RelayRemoteOutbound, RemoteGateway,
-    RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
+    GatewayEventTasks, GatewaySubscriptions, RelayAttachmentTasks, RelayRemoteOutbound,
+    RemoteGateway, RemoteGatewayConfig, RemoteGatewayDeploymentMode, RemoteGatewayPairingRoutes,
     RemoteGatewayPeerLimits, RemoteGatewayStatus, RemoteGatewayTlsIdentity, RemoteGatewayTlsPolicy,
 };
 pub use zero_config_pairing::pinned_tls_certificate_base64;

@@ -1846,6 +1846,13 @@ impl RemoteGateway {
         Ok(messages)
     }
 
+    /// Opens the Relay outbound pump for one paired device.
+    ///
+    /// The returned [`GatewayEventTasks`] must outlive the session: it owns the
+    /// agent event pumps that feed this device. The desktop stores it on the
+    /// session so that dropping a session (a device reconnecting, or the Relay
+    /// link being torn down) stops the pumps instead of leaving them pushing
+    /// frames into a channel nobody reads.
     pub fn relay_outbound(
         &self,
         context: &RelayRemoteHandshakeContext,
@@ -1853,6 +1860,7 @@ impl RemoteGateway {
     ) -> VibexResult<(
         mpsc::Sender<RelayRemoteOutbound>,
         mpsc::Receiver<RelayRemoteOutbound>,
+        Arc<GatewayEventTasks>,
     )> {
         let (state, ticket) = self.relay_active_state(context)?;
         let (outbound, receiver) = mpsc::channel(state.config.outbound_queue_capacity);
@@ -1873,6 +1881,13 @@ impl RemoteGateway {
         let context = context.clone();
         let registry = state.registry.clone();
         let sender = outbound.clone();
+        // The caller owns the tasks; this loop only borrows them, so dropping
+        // the caller's handle stops the pumps even while the loop is still
+        // running. A strong clone here would keep them alive exactly in the
+        // case that matters: a session the desktop already dropped while the
+        // forwarding loop kept draining its channel.
+        let shared_tasks = Arc::new(event_tasks);
+        let loop_tasks = Arc::downgrade(&shared_tasks);
         tokio::spawn(async move {
             let mut validation = tokio::time::interval(Duration::from_millis(500));
             loop {
@@ -1922,10 +1937,12 @@ impl RemoteGateway {
                     }
                 }
             }
-            event_tasks.abort();
+            if let Some(tasks) = loop_tasks.upgrade() {
+                tasks.abort();
+            }
             registry.unregister(&connection_id);
         });
-        Ok((sender, receiver))
+        Ok((sender, receiver, shared_tasks))
     }
 
     fn relay_active_state(
@@ -4032,17 +4049,44 @@ fn update_subscriptions(
     }
 }
 
-struct GatewayEventTasks {
+pub struct GatewayEventTasks {
     timeline: JoinHandle<()>,
     notifications: JoinHandle<()>,
     domains: JoinHandle<()>,
 }
 
+impl std::fmt::Debug for GatewayEventTasks {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("GatewayEventTasks")
+            .field("timeline_finished", &self.timeline.is_finished())
+            .field("notifications_finished", &self.notifications.is_finished())
+            .field("domains_finished", &self.domains.is_finished())
+            .finish()
+    }
+}
+
 impl GatewayEventTasks {
-    fn abort(self) {
+    fn abort(&self) {
         self.timeline.abort();
         self.notifications.abort();
         self.domains.abort();
+    }
+}
+
+/// Dropping the owner must stop the event pumps.
+///
+/// The Relay path hands the tasks' handles to no one: `relay_outbound` spawns
+/// the forwarding loop and returns only the channel ends. Without this, a
+/// session dropped by the desktop (a device reconnecting, or the whole relay
+/// link going away) left three tasks per session alive, each still holding the
+/// agent event subscriptions and pushing frames at a `frames` sender whose
+/// receiver had been dropped. They only stopped if a send happened to fail
+/// after the fact, which is exactly the case where the desktop stops reading
+/// and the Relay link stalls.
+impl Drop for GatewayEventTasks {
+    fn drop(&mut self) {
+        self.abort();
     }
 }
 
@@ -8658,5 +8702,90 @@ mod tests {
         let listed: RemoteDeviceListResponse =
             serde_json::from_value(response.payload.unwrap()).unwrap();
         assert!(!listed.devices.is_empty());
+    }
+
+    /// Dropping the owner of the Relay event pumps must stop them.
+    ///
+    /// `relay_outbound` spawns three agent event pumps and hands the caller an
+    /// `Arc<GatewayEventTasks>`. The desktop stores that handle on the session,
+    /// so a session it replaces (`sessions.retain` when a device reconnects)
+    /// has to take the pumps down with it. They used to be left running: each
+    /// one still held its agent subscription and kept sealing timeline and
+    /// notification frames into a channel whose receiver had been moved to a
+    /// forwarding task, so nothing ever observed the session ending. The Relay
+    /// link then showed the desktop writing hundreds of KB/s while reading
+    /// almost nothing, and the phone timed out on heartbeats.
+    ///
+    /// A `JoinHandle` only detaches on drop, so this asserts the explicit
+    /// `Drop` really aborts rather than merely forgetting.
+    #[tokio::test]
+    async fn dropping_gateway_event_tasks_stops_its_pumps() {
+        let (timeline_tx, timeline_rx) = tokio::sync::oneshot::channel::<()>();
+        let (notifications_tx, notifications_rx) = tokio::sync::oneshot::channel::<()>();
+        let (domains_tx, domains_rx) = tokio::sync::oneshot::channel::<()>();
+
+        // Each pump reports through a sender dropped when the task is aborted.
+        let tasks = GatewayEventTasks {
+            timeline: tokio::spawn(async move {
+                let _hold = timeline_tx;
+                std::future::pending::<()>().await;
+            }),
+            notifications: tokio::spawn(async move {
+                let _hold = notifications_tx;
+                std::future::pending::<()>().await;
+            }),
+            domains: tokio::spawn(async move {
+                let _hold = domains_tx;
+                std::future::pending::<()>().await;
+            }),
+        };
+
+        // Nothing has finished yet, so every receiver is still pending.
+        assert!(!tasks.timeline.is_finished());
+        let owned = Arc::new(tasks);
+        assert_eq!(Arc::strong_count(&owned), 1);
+
+        // Dropping the only strong handle must abort all three pumps, which
+        // resolves each receiver with a cancellation error.
+        drop(owned);
+        assert!(
+            timeline_rx.await.is_err(),
+            "timeline pump outlived its owner"
+        );
+        assert!(
+            notifications_rx.await.is_err(),
+            "notification pump outlived its owner"
+        );
+        assert!(domains_rx.await.is_err(), "domain pump outlived its owner");
+    }
+
+    /// The forwarding loop must not keep the pumps alive by itself.
+    ///
+    /// `relay_outbound` gives that loop a `Weak`, not a strong clone: with a
+    /// strong one, a session the desktop had already dropped would leave the
+    /// pumps running for as long as the loop drained its channel, which is
+    /// precisely the stall this fix removes.
+    #[tokio::test]
+    async fn the_forwarding_loop_only_borrows_the_event_tasks() {
+        let (timeline_tx, timeline_rx) = tokio::sync::oneshot::channel::<()>();
+        let tasks = Arc::new(GatewayEventTasks {
+            timeline: tokio::spawn(async move {
+                let _hold = timeline_tx;
+                std::future::pending::<()>().await;
+            }),
+            notifications: tokio::spawn(async { std::future::pending::<()>().await }),
+            domains: tokio::spawn(async { std::future::pending::<()>().await }),
+        });
+
+        // This is what the spawned loop holds.
+        let borrowed = Arc::downgrade(&tasks);
+        assert_eq!(Arc::strong_count(&tasks), 1);
+
+        drop(tasks);
+        assert!(
+            borrowed.upgrade().is_none(),
+            "a weak handle must not keep the pumps alive"
+        );
+        assert!(timeline_rx.await.is_err(), "the pump outlived its owner");
     }
 }

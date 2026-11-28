@@ -153,6 +153,42 @@ struct ActiveRelaySession {
     attachment_tasks: RelayAttachmentTasks,
     outbound_sender: Option<mpsc::Sender<RelayRemoteOutbound>>,
     outbound: Option<mpsc::Receiver<RelayRemoteOutbound>>,
+    /// Owns the agent event pumps feeding this device.
+    ///
+    /// Held so the pumps stop when the session is dropped. `relay_outbound`
+    /// spawns them into a background loop that only aborts them if a send
+    /// happens to fail afterwards; a session dropped while the desktop still
+    /// reads kept them alive, and they kept sealing timeline and notification
+    /// frames for a device that had already reconnected.
+    event_tasks: Option<Arc<vibex_remote::GatewayEventTasks>>,
+    /// The task moving this session's outbound frames onto the Relay socket.
+    ///
+    /// It owns the `outbound` receiver, so it is the thing that has to be
+    /// stopped: while it lives, the gateway's outbound pump keeps finding a
+    /// receiver to hand frames to and never observes the session going away.
+    forwarder: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for ActiveRelaySession {
+    /// Stops everything this session owns.
+    ///
+    /// A `JoinHandle` only detaches on drop, so aborting has to be explicit.
+    /// Without this, a session the desktop replaced (`sessions.retain` on a
+    /// device reconnect) left its forwarder running, that forwarder kept the
+    /// gateway's outbound receiver alive, and the gateway's pump therefore
+    /// never noticed the session was gone — it kept sealing timeline and
+    /// notification frames for a peer that had already reconnected. On the
+    /// Relay link that showed up as the desktop writing hundreds of KB/s while
+    /// reading almost nothing, and the phone timing out on heartbeats.
+    fn drop(&mut self) {
+        if let Some(forwarder) = self.forwarder.take() {
+            forwarder.abort();
+        }
+        // `event_tasks` aborts its pumps through its own `Drop`.
+        self.event_tasks.take();
+        self.outbound.take();
+        self.outbound_sender.take();
+    }
 }
 
 struct SessionOutbound {
@@ -968,7 +1004,13 @@ impl RelayClientRuntime {
             };
             let recipient_peer_id = session.crypto.remote_peer_id().clone();
             let sender = sender.clone();
-            tokio::spawn(async move {
+            // Replacing a forwarder aborts the previous one: it was still
+            // holding the old receiver, and two forwarders for one session
+            // would duplicate every frame.
+            if let Some(previous) = session.forwarder.take() {
+                previous.abort();
+            }
+            session.forwarder = Some(tokio::spawn(async move {
                 while let Some(message) = receiver.recv().await {
                     if sender
                         .send(SessionOutbound {
@@ -981,7 +1023,7 @@ impl RelayClientRuntime {
                         break;
                     }
                 }
-            });
+            }));
         }
     }
 
@@ -1126,6 +1168,8 @@ impl RelayClientRuntime {
                 attachment_tasks: RelayAttachmentTasks::default(),
                 outbound_sender: None,
                 outbound: None,
+                event_tasks: None,
+                forwarder: None,
             },
         );
         let mut ready = RelayHandshakeReady::new(
@@ -1151,11 +1195,12 @@ impl RelayClientRuntime {
                 Ok(context) => {
                     if let Some(session) = sessions.get_mut(&ready.session_id) {
                         session.remote_context = Some(context.clone());
-                        if let Ok((sender, receiver)) =
+                        if let Ok((sender, receiver, event_tasks)) =
                             gateway.relay_outbound(&context, session.subscriptions.clone())
                         {
                             session.outbound_sender = Some(sender);
                             session.outbound = Some(receiver);
+                            session.event_tasks = Some(event_tasks);
                         }
                     }
                     ready.proof_challenge = Some(context.proof_challenge);
