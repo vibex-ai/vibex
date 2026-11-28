@@ -822,6 +822,16 @@ impl PairingService {
                     format!("the pairing task did not finish: {error}"),
                 )),
             };
+            // A claim failure is the only signal an operator has: `fail` just
+            // paints a caption, and the caption for an offline transport is the
+            // same sentence no matter which hop broke. Log the code and message
+            // so the reason survives the generic text.
+            match &result {
+                Ok(_) => log::info!("pairing claim succeeded"),
+                Err(error) => {
+                    log::warn!("pairing claim failed: {} ({})", error.code, error.message)
+                }
+            }
             service.finish_claim(result);
         });
     }
